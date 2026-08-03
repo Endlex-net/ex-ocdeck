@@ -702,6 +702,49 @@ body {
   margin-bottom: 10px;
 }
 
+/* ---------- 终端外观（settings pane） ---------- */
+
+.term-appearance {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.term-appearance-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.term-appearance-label {
+  width: 56px;
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.term-appearance-size {
+  min-width: 80px;
+  max-width: 120px;
+}
+
+.term-appearance-hint {
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.term-appearance-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.term-appearance-saved {
+  color: var(--green);
+  font-size: 12px;
+}
+
 /* ---------- git 面板（2.6） ---------- */
 
 .git-panel {

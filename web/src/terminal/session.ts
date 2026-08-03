@@ -2,6 +2,12 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { clearToken, getToken, wsURL, UNAUTHORIZED_EVENT } from '../api';
+import {
+  loadTermPrefs,
+  resolveFontFamily,
+  resolveFontSize,
+  type TermPreferences,
+} from './preferences';
 
 export type TermConnState =
   | 'idle'
@@ -43,9 +49,10 @@ export class TermSession {
     private wsPath: string,
     private onState: (s: TermConnState) => void,
   ) {
+    const prefs = loadTermPrefs();
     this.term = new Terminal({
-      fontFamily: '"JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace',
-      fontSize: 13,
+      fontFamily: resolveFontFamily(prefs),
+      fontSize: resolveFontSize(prefs),
       lineHeight: 1.15,
       cursorBlink: true,
       allowProposedApi: true,
@@ -216,6 +223,14 @@ export class TermSession {
 
   private setState(s: TermConnState): void {
     if (!this.disposed) this.onState(s);
+  }
+
+  /** 就地应用终端外观偏好（不重建实例、不断 WS）。下一帧 fit 并同步 winsize。 */
+  applyPreferences(prefs: TermPreferences): void {
+    if (this.disposed) return;
+    this.term.options.fontFamily = resolveFontFamily(prefs);
+    this.term.options.fontSize = resolveFontSize(prefs);
+    this.scheduleFit();
   }
 
   private scheduleFit(): void {

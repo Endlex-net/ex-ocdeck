@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../api';
 import { GlobalEnvEditor } from '../components/GlobalEnvEditor';
+import { TermAppearanceEditor } from '../components/TermAppearanceEditor';
 import { navigate } from '../router';
 import type { OcConfigContent, OcConfigInfo } from '../types';
 
@@ -113,10 +114,18 @@ export function ConfigsPage() {
           ← 项目
         </button>
         <span className="page-title">全局配置</span>
-        <span className="header-meta">opencode 配置文件（JSON）</span>
+        <span className="header-meta">配置文件 / 环境变量 / 终端外观</span>
       </header>
 
       {listError && <div className="error-line">{listError}</div>}
+
+      <section className="env-section global-env-section">
+        <div className="global-env-head">
+          <span className="global-env-title">终端外观</span>
+          <span className="header-meta">浏览器端偏好，对本机所有任务终端生效</span>
+        </div>
+        <TermAppearanceEditor />
+      </section>
 
       <section className="env-section global-env-section">
         <div className="global-env-head">

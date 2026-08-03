@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { TermSession, type TermConnState } from './session';
+import { loadTermPrefs, TERM_PREFS_CHANGED } from './preferences';
 import '@xterm/xterm/css/xterm.css';
 
 interface TerminalViewProps {
@@ -52,6 +53,19 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
       session.disconnect();
     }
   }, [active, wsPath]);
+
+  // 偏好变更即时生效：同页 CustomEvent + 跨标签页 storage 事件。
+  useEffect(() => {
+    const session = sessionRef.current;
+    if (!session) return;
+    const apply = () => session.applyPreferences(loadTermPrefs());
+    window.addEventListener(TERM_PREFS_CHANGED, apply);
+    window.addEventListener('storage', apply);
+    return () => {
+      window.removeEventListener(TERM_PREFS_CHANGED, apply);
+      window.removeEventListener('storage', apply);
+    };
+  }, [wsPath]);
 
   const showOverlay = state !== 'connected' && state !== 'idle';
 
