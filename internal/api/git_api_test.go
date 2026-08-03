@@ -1,0 +1,392 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"ocdeck/internal/task"
+)
+
+// mockGitBackend 嵌入 fakeTaskBackend 并允许注入 git 方法的返回值，
+// 供 git API 测试验证 handler→backend 映射与错误码透传（前端契约不变）。
+// 实际 git 执行（status/diff/commit/push 落盘）由 internal/task gitops 测试覆盖；
+// 此处仅断言 API 层：经 mock backend、mapTaskErr 映射、响应 JSON 字段。
+type mockGitBackend struct {
+	*fakeTaskBackend
+	statusFn  func(ctx context.Context, taskID string) (task.GitStatusDTO, error)
+	diffFn    func(ctx context.Context, taskID, ref, path string) (task.GitDiffDTO, error)
+	commitFn  func(ctx context.Context, taskID, message string, paths []string) error
+	pushFn    func(ctx context.Context, taskID string) error
+	commitMsg string
+	commitPth []string
+}
+
+func newMockGitBackend() *mockGitBackend {
+	return &mockGitBackend{fakeTaskBackend: &fakeTaskBackend{}}
+}
+
+func (m *mockGitBackend) GitStatus(ctx context.Context, taskID string) (task.GitStatusDTO, error) {
+	if m.statusFn != nil {
+		return m.statusFn(ctx, taskID)
+	}
+	return task.GitStatusDTO{}, nil
+}
+
+func (m *mockGitBackend) GitDiff(ctx context.Context, taskID, ref, path string) (task.GitDiffDTO, error) {
+	if m.diffFn != nil {
+		return m.diffFn(ctx, taskID, ref, path)
+	}
+	return task.GitDiffDTO{}, nil
+}
+
+func (m *mockGitBackend) GitCommit(ctx context.Context, taskID, message string, paths []string) error {
+	m.commitMsg = message
+	m.commitPth = paths
+	if m.commitFn != nil {
+		return m.commitFn(ctx, taskID, message, paths)
+	}
+	return nil
+}
+
+func (m *mockGitBackend) GitPush(ctx context.Context, taskID string) error {
+	if m.pushFn != nil {
+		return m.pushFn(ctx, taskID)
+	}
+	return nil
+}
+
+// gitTaskBackend 为 env/task API 测试提供可返回固定 TaskRow 的 TaskBackend。
+// （git API 测试改用 mockGitBackend 注入 git 方法，不再经真实 worktree。）
+type gitTaskBackend struct {
+	*fakeTaskBackend
+	tasks    map[string]task.TaskRow
+	statusFn func(ctx context.Context, taskID string) string
+}
+
+func newGitTaskBackend(rows ...task.TaskRow) *gitTaskBackend {
+	g := &gitTaskBackend{
+		fakeTaskBackend: &fakeTaskBackend{},
+		tasks:           map[string]task.TaskRow{},
+	}
+	for _, r := range rows {
+		g.tasks[r.ID] = r
+	}
+	return g
+}
+
+func (g *gitTaskBackend) Get(ctx context.Context, taskID string) (task.TaskRow, error) {
+	r, ok := g.tasks[taskID]
+	if !ok {
+		return task.TaskRow{}, &task.OpError{Code: "not_found", Err: errNotFound(taskID)}
+	}
+	return r, nil
+}
+
+func (g *gitTaskBackend) List(ctx context.Context, projectID string) ([]task.TaskRow, error) {
+	var out []task.TaskRow
+	for _, r := range g.tasks {
+		if r.ProjectID == projectID {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+func (g *gitTaskBackend) AgentStatus(ctx context.Context, taskID string) string {
+	if g.statusFn != nil {
+		return g.statusFn(ctx, taskID)
+	}
+	return ""
+}
+
+func errNotFound(id string) error {
+	return &notFoundErr{id: id}
+}
+
+type notFoundErr struct{ id string }
+
+func (e *notFoundErr) Error() string { return "task not found: " + e.id }
+
+// newGitAPIServer 构造带 git backend 的 Server。
+func newGitAPIServer(t *testing.T, tb TaskBackend) *Server {
+	t.Helper()
+	return newAPITestServer(t, tb)
+}
+
+func TestGitAPI_Status_JsonShape(t *testing.T) {
+	tb := newMockGitBackend()
+	tb.statusFn = func(ctx context.Context, taskID string) (task.GitStatusDTO, error) {
+		return task.GitStatusDTO{
+			Branch: "feature/x",
+			Files: []task.GitFileDTO{
+				{Path: "a.txt", X: " ", Y: "M", Staged: false, Unstaged: true, Untracked: false, Additions: 1, Deletions: 0, IsBinary: false},
+				{Path: "b.txt", X: "?", Y: "?", Staged: false, Unstaged: false, Untracked: true, Additions: 0, Deletions: 0, IsBinary: false},
+			},
+		}, nil
+	}
+	s := newGitAPIServer(t, tb)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/tasks/tk1/git/status", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var st gitStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Branch != "feature/x" {
+		t.Errorf("branch = %q, want feature/x", st.Branch)
+	}
+	if len(st.Files) != 2 {
+		t.Fatalf("files len = %d, want 2", len(st.Files))
+	}
+	// 字段名/类型契约（与改动前一致）。
+	if st.Files[0].Path != "a.txt" || st.Files[0].Y != "M" || !st.Files[0].Unstaged || st.Files[0].Additions != 1 {
+		t.Errorf("files[0] = %+v", st.Files[0])
+	}
+	if !st.Files[1].Untracked || st.Files[1].X != "?" || st.Files[1].Y != "?" {
+		t.Errorf("files[1] = %+v", st.Files[1])
+	}
+}
+
+func TestGitAPI_Diff_JsonShape(t *testing.T) {
+	tb := newMockGitBackend()
+	tb.diffFn = func(ctx context.Context, taskID, ref, path string) (task.GitDiffDTO, error) {
+		return task.GitDiffDTO{Diff: "hello diff", Truncated: false}, nil
+	}
+	s := newGitAPIServer(t, tb)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/tasks/tk1/git/diff?ref=HEAD&path=a.txt", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var d gitDiffResponse
+	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+		t.Fatal(err)
+	}
+	if d.Diff != "hello diff" {
+		t.Errorf("diff = %q, want 'hello diff'", d.Diff)
+	}
+	if d.Truncated {
+		t.Errorf("truncated = true, want false")
+	}
+}
+
+func TestGitAPI_Commit_OK(t *testing.T) {
+	tb := newMockGitBackend()
+	var gotMsg string
+	var gotPaths []string
+	tb.commitFn = func(ctx context.Context, taskID, message string, paths []string) error {
+		gotMsg = message
+		gotPaths = paths
+		return nil
+	}
+	s := newGitAPIServer(t, tb)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/tasks/tk1/git/commit", `{"message":"add a","paths":["a.txt"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if gotMsg != "add a" {
+		t.Errorf("message passed = %q, want 'add a'", gotMsg)
+	}
+	if len(gotPaths) != 1 || gotPaths[0] != "a.txt" {
+		t.Errorf("paths passed = %v, want [a.txt]", gotPaths)
+	}
+}
+
+func TestGitAPI_Push_OK(t *testing.T) {
+	tb := newMockGitBackend()
+	called := false
+	tb.pushFn = func(ctx context.Context, taskID string) error {
+		called = true
+		if taskID != "tk1" {
+			t.Errorf("taskID = %q, want tk1", taskID)
+		}
+		return nil
+	}
+	s := newGitAPIServer(t, tb)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/tasks/tk1/git/push", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if !called {
+		t.Error("GitPush not called")
+	}
+}
+
+// TestGitAPI_ErrorMapping 覆盖 not_found/conflict/invalid_input/git_error 映射。
+func TestGitAPI_ErrorMapping(t *testing.T) {
+	opErr := func(code, msg string) error {
+		return &task.OpError{Code: code, Err: strErr(msg)}
+	}
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		inject func(*mockGitBackend)
+		want   int
+		code   ErrorCode
+	}{
+		// status
+		{"status not_found", "GET", "/api/v1/tasks/nope/git/status", "",
+			func(b *mockGitBackend) {
+				b.statusFn = func(context.Context, string) (task.GitStatusDTO, error) {
+					return task.GitStatusDTO{}, opErr("not_found", "task not found")
+				}
+			},
+			http.StatusNotFound, CodeNotFound},
+		{"status conflict", "GET", "/api/v1/tasks/tk1/git/status", "",
+			func(b *mockGitBackend) {
+				b.statusFn = func(context.Context, string) (task.GitStatusDTO, error) {
+					return task.GitStatusDTO{}, opErr("conflict", "task busy")
+				}
+			},
+			http.StatusConflict, CodeConflict},
+		{"status git_error", "GET", "/api/v1/tasks/tk1/git/status", "",
+			func(b *mockGitBackend) {
+				b.statusFn = func(context.Context, string) (task.GitStatusDTO, error) {
+					return task.GitStatusDTO{}, opErr("git_error", "fatal: not a git repo")
+				}
+			},
+			http.StatusUnprocessableEntity, CodeGitError},
+		// diff
+		{"diff not_found", "GET", "/api/v1/tasks/nope/git/diff?ref=HEAD&path=a.txt", "",
+			func(b *mockGitBackend) {
+				b.diffFn = func(context.Context, string, string, string) (task.GitDiffDTO, error) {
+					return task.GitDiffDTO{}, opErr("not_found", "task not found")
+				}
+			},
+			http.StatusNotFound, CodeNotFound},
+		{"diff git_error", "GET", "/api/v1/tasks/tk1/git/diff", "",
+			func(b *mockGitBackend) {
+				b.diffFn = func(context.Context, string, string, string) (task.GitDiffDTO, error) {
+					return task.GitDiffDTO{}, opErr("git_error", "fatal: bad ref")
+				}
+			},
+			http.StatusUnprocessableEntity, CodeGitError},
+		// commit
+		{"commit not_found", "POST", "/api/v1/tasks/nope/git/commit", `{"message":"m"}`,
+			func(b *mockGitBackend) {
+				b.commitFn = func(context.Context, string, string, []string) error { return opErr("not_found", "task not found") }
+			},
+			http.StatusNotFound, CodeNotFound},
+		{"commit invalid_input (empty msg from backend)", "POST", "/api/v1/tasks/tk1/git/commit", `{"message":"","paths":[]}`,
+			func(b *mockGitBackend) {
+				b.commitFn = func(context.Context, string, string, []string) error {
+					return opErr("invalid_input", "commit message is required")
+				}
+			},
+			http.StatusUnprocessableEntity, CodeInvalidInput},
+		{"commit conflict", "POST", "/api/v1/tasks/tk1/git/commit", `{"message":"m"}`,
+			func(b *mockGitBackend) {
+				b.commitFn = func(context.Context, string, string, []string) error { return opErr("conflict", "task busy") }
+			},
+			http.StatusConflict, CodeConflict},
+		{"commit git_error", "POST", "/api/v1/tasks/tk1/git/commit", `{"message":"m"}`,
+			func(b *mockGitBackend) {
+				b.commitFn = func(context.Context, string, string, []string) error {
+					return opErr("git_error", "fatal: nothing to commit")
+				}
+			},
+			http.StatusUnprocessableEntity, CodeGitError},
+		// push
+		{"push not_found", "POST", "/api/v1/tasks/nope/git/push", "",
+			func(b *mockGitBackend) {
+				b.pushFn = func(context.Context, string) error { return opErr("not_found", "task not found") }
+			},
+			http.StatusNotFound, CodeNotFound},
+		{"push conflict", "POST", "/api/v1/tasks/tk1/git/push", "",
+			func(b *mockGitBackend) {
+				b.pushFn = func(context.Context, string) error { return opErr("conflict", "task busy") }
+			},
+			http.StatusConflict, CodeConflict},
+		{"push git_error (detached HEAD 透传 stderr)", "POST", "/api/v1/tasks/tk1/git/push", "",
+			func(b *mockGitBackend) {
+				b.pushFn = func(context.Context, string) error { return opErr("git_error", "fatal: HEAD is detached") }
+			},
+			http.StatusUnprocessableEntity, CodeGitError},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tb := newMockGitBackend()
+			c.inject(tb)
+			s := newGitAPIServer(t, tb)
+			ts := httptest.NewServer(s.mux)
+			defer ts.Close()
+
+			resp, err := http.DefaultClient.Do(authedReq(c.method, ts.URL+c.path, c.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != c.want {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, c.want)
+			}
+			var eb errorBody
+			if err := json.NewDecoder(resp.Body).Decode(&eb); err != nil {
+				t.Fatal(err)
+			}
+			if eb.Error.Code != c.code {
+				t.Errorf("code = %s, want %s (msg=%q)", eb.Error.Code, c.code, eb.Error.Message)
+			}
+		})
+	}
+}
+
+// TestGitAPI_Commit_InvalidJSONBody 验证 decodeJSON 失败→invalid_input。
+func TestGitAPI_Commit_InvalidJSONBody(t *testing.T) {
+	tb := newGitTaskBackend() // gitTaskBackend 仍提供 Get 等基础方法
+	s := newGitAPIServer(t, tb)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/tasks/tk1/git/commit", "{bad json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", resp.StatusCode)
+	}
+	var eb errorBody
+	if err := json.NewDecoder(resp.Body).Decode(&eb); err != nil {
+		t.Fatal(err)
+	}
+	if eb.Error.Code != CodeInvalidInput {
+		t.Errorf("code = %s, want invalid_input", eb.Error.Code)
+	}
+}
+
+type strErr string
+
+func (e strErr) Error() string { return string(e) }
