@@ -101,7 +101,7 @@ func DefaultBaseEnv(hostEnv func(string) (string, bool)) []string {
 		hostEnv = os.LookupEnv
 	}
 	base := []string{
-		"COLORTERM", "HOME", "USER", "PATH", "SHELL", "LANG", "TMPDIR", "SSH_AUTH_SOCK",
+		"COLORTERM", "HOME", "USER", "PATH", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "SSH_AUTH_SOCK",
 	}
 	out := make([]string, 0, len(base)+4)
 	// TERM 必须是 terminfo 库中存在的规范值（xterm.js 客户端即 xterm-256color），
@@ -120,6 +120,16 @@ func DefaultBaseEnv(hostEnv func(string) (string, bool)) []string {
 		if v, ok := hostEnv(k); ok && v != "" {
 			out = append(out, k+"="+v)
 		}
+	}
+	// Locale 兜底（design.md D0）：LANG/LC_ALL/LC_CTYPE 三者均未设置或为空串时注入默认
+	// LANG=en_US.UTF-8。launchd 启动的 server 常无 locale，导致 tmux attach 客户端
+	// client_utf8=0，CJK 输出被转写为 `_`。任一高位变量已设置非空值则原样透传（已在
+	// 上方基础集循环），此处仅兜底三者全无效的场景；空串视为未设置，不抑制注入。
+	langVal, _ := hostEnv("LANG")
+	lcAllVal, _ := hostEnv("LC_ALL")
+	lcCtypeVal, _ := hostEnv("LC_CTYPE")
+	if langVal == "" && lcAllVal == "" && lcCtypeVal == "" {
+		out = append(out, "LANG=en_US.UTF-8")
 	}
 	return out
 }

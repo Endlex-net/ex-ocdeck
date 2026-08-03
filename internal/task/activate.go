@@ -21,7 +21,7 @@ import (
 // TERM 不在透传列：必须强制为 terminfo 认识的 xterm-256color（见 mergeEnvSnapshot），
 // 宿主 TERM（如 xterm-ghostty）会导致 tmux 报 "missing or unsuitable terminal"。
 var envBaselineKeys = []string{
-	"COLORTERM", "HOME", "USER", "PATH", "SHELL", "LANG", "TMPDIR", "SSH_AUTH_SOCK",
+	"COLORTERM", "HOME", "USER", "PATH", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "SSH_AUTH_SOCK",
 	"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
 }
 
@@ -75,6 +75,16 @@ func (m *Manager) mergeEnvSnapshot(ctx context.Context, row TaskRow, port int) (
 		if v, ok := hostEnv(k); ok && v != "" {
 			merged[k] = v
 		}
+	}
+	// Locale 兜底（design.md D0）：LANG/LC_ALL/LC_CTYPE 三者均未设置或为空串时注入默认
+	// LANG=en_US.UTF-8，保证 serve/TUI/shell 会话进程拿到 UTF-8 locale（shell 内
+	// locale 敏感的 CLI 依赖它）。任一高位变量已设置非空值则原样透传（已在上方基础集循环），
+	// 不覆盖、不纠正；空串视为未设置，不抑制注入。
+	langVal, _ := hostEnv("LANG")
+	lcAllVal, _ := hostEnv("LC_ALL")
+	lcCtypeVal, _ := hostEnv("LC_CTYPE")
+	if langVal == "" && lcAllVal == "" && lcCtypeVal == "" {
+		merged["LANG"] = "en_US.UTF-8"
 	}
 	// 全局级 env（design.md §2：基础集 < 全局级 < 项目级 < 任务级）。
 	// manual → 存值；follow_host → 从服务端进程 env 解析，宿主未设置/空则跳过该变量（不注入空值）。

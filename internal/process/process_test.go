@@ -434,3 +434,86 @@ func TestTmuxExecEnv_EmptyTmpdirPassthrough(t *testing.T) {
 		t.Errorf("empty tmpdir should passthrough baseEnv, got %v", env)
 	}
 }
+
+// TestDefaultBaseEnv_LocaleDefault 验证 design.md D0 locale 兜底（透传 + 非空语义）：
+//   - (a) 宿主无 LANG/LC_ALL/LC_CTYPE → 注入 LANG=en_US.UTF-8；
+//   - (b) 宿主显式 LANG（含非 UTF-8 如 C）→ 原样透传不覆盖；
+//   - (c) 宿主无 LANG 但有 LC_ALL 或 LC_CTYPE → 不注入（高位变量透传且原值一致）；
+//   - (d) 宿主 LANG= 空串且 LC_ALL/LC_CTYPE 未设 → 注入默认（空串视为未设置）；
+//   - (e) 宿主 LC_ALL= 空串且 LANG 未设 → 注入默认（空串视为未设置）。
+func TestDefaultBaseEnv_LocaleDefault(t *testing.T) {
+	const def = "LANG=en_US.UTF-8"
+	// 固定一组非 locale 基础集值，避免宿主环境干扰断言。
+	baseHost := map[string]string{
+		"HOME": "/home/h", "USER": "u", "PATH": "/usr/bin",
+		"SHELL": "/bin/sh", "TMPDIR": "/tmp",
+	}
+	envOf := func(extra map[string]string) func(string) (string, bool) {
+		return func(k string) (string, bool) {
+			if v, ok := extra[k]; ok {
+				return v, true
+			}
+			v, ok := baseHost[k]
+			return v, ok
+		}
+	}
+	has := func(env []string, kv string) bool {
+		for _, e := range env {
+			if e == kv {
+				return true
+			}
+		}
+		return false
+	}
+
+	// (a) 无 locale 变量 → 注入默认。
+	got := DefaultBaseEnv(envOf(nil))
+	if !has(got, def) {
+		t.Errorf("case a: expected %q in env, got %v", def, got)
+	}
+
+	// (b) 显式 LANG=C → 透传不覆盖、不注入默认。
+	got = DefaultBaseEnv(envOf(map[string]string{"LANG": "C"}))
+	if has(got, def) {
+		t.Errorf("case b: default LANG should not be injected when LANG=C set, got %v", got)
+	}
+	if !has(got, "LANG=C") {
+		t.Errorf("case b: LANG=C should be passed through, got %v", got)
+	}
+
+	// (c1) 无 LANG 但有 LC_ALL → 透传 LC_ALL 原值且不注入默认。
+	got = DefaultBaseEnv(envOf(map[string]string{"LC_ALL": "en_US.UTF-8"}))
+	if has(got, def) {
+		t.Errorf("case c1: default LANG should not be injected when LC_ALL set, got %v", got)
+	}
+	if !has(got, "LC_ALL=en_US.UTF-8") {
+		t.Errorf("case c1: LC_ALL=en_US.UTF-8 should be passed through, got %v", got)
+	}
+
+	// (c2) 无 LANG 但有 LC_CTYPE → 透传 LC_CTYPE 原值且不注入默认。
+	got = DefaultBaseEnv(envOf(map[string]string{"LC_CTYPE": "en_US.UTF-8"}))
+	if has(got, def) {
+		t.Errorf("case c2: default LANG should not be injected when LC_CTYPE set, got %v", got)
+	}
+	if !has(got, "LC_CTYPE=en_US.UTF-8") {
+		t.Errorf("case c2: LC_CTYPE=en_US.UTF-8 should be passed through, got %v", got)
+	}
+
+	// (d) LANG= 空串且 LC_ALL/LC_CTYPE 未设 → 注入默认（空串视为未设置）。
+	got = DefaultBaseEnv(envOf(map[string]string{"LANG": ""}))
+	if !has(got, def) {
+		t.Errorf("case d: expected %q injected when LANG is empty string, got %v", def, got)
+	}
+	if has(got, "LANG=") {
+		t.Errorf("case d: empty LANG= should not be passed through, got %v", got)
+	}
+
+	// (e) LC_ALL= 空串且 LANG 未设 → 注入默认（空串视为未设置）。
+	got = DefaultBaseEnv(envOf(map[string]string{"LC_ALL": ""}))
+	if !has(got, def) {
+		t.Errorf("case e: expected %q injected when LC_ALL is empty string, got %v", def, got)
+	}
+	if has(got, "LC_ALL=") {
+		t.Errorf("case e: empty LC_ALL= should not be passed through, got %v", got)
+	}
+}
