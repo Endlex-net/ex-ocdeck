@@ -1,3 +1,6 @@
 .slim/deepwork/
 web/node_modules/
 web/dist/
+/ocdeck-server
+nohup.out
+.opencode/
