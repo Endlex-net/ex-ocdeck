@@ -1,0 +1,14 @@
+[
+  {
+    "id": "sess-001",
+    "title": "task A",
+    "time": { "created": 1700000000.5, "updated": 1700000010.5 },
+    "parentID": null,
+    "metadata": { "foo": "bar" }
+  },
+  {
+    "id": "sess-002",
+    "title": "task B",
+    "time": { "created": 1700000100.0, "updated": 1700000110.0 }
+  }
+]

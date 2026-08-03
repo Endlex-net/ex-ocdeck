@@ -1,0 +1,7 @@
+data: {"id":"evt_001","type":"server.connected","properties":{}}
+
+data: {"id":"evt_002","type":"session.created","properties":{"info":{"id":"sess-001","title":"task A","time":{"created":1700000000.5,"updated":1700000010.5}}}}
+
+data: {"id":"evt_003","type":"session.updated","properties":{"info":{"id":"sess-001","title":"task A (u)","time":{"created":1700000000.5,"updated":1700000020.5}}}}
+
+data: {"id":"evt_004","type":"session.deleted","properties":{"info":{"id":"sess-001"}}}

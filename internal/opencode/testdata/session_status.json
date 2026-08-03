@@ -1,0 +1,5 @@
+{
+  "sess-001": { "type": "idle", "updatedAt": 1700000010.5 },
+  "sess-002": { "type": "busy", "updatedAt": 1700000110.0 },
+  "sess-003": { "type": "retry", "updatedAt": 1700000200.0 }
+}
