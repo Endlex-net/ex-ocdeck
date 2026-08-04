@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"ocdeck/internal/config"
+	"ocdeck/internal/lifecycle"
 	"ocdeck/internal/opencode"
 	"ocdeck/internal/process"
 )
@@ -36,6 +37,15 @@ type TaskStore interface {
 	ArchiveTask(ctx context.Context, id string) error
 	RestoreTask(ctx context.Context, id string) error
 	DeleteTask(ctx context.Context, id string) error
+	// 生命周期配置（design.md §2.1）
+	GetLifecycleConfig(ctx context.Context, projectID string) (LifecycleConfigRow, error)
+	UpsertLifecycleConfig(ctx context.Context, projectID, inheritPatterns, initScript, preDeleteScript string) error
+	// init_status CAS（design.md §2.1/§3）
+	CommitCreated(ctx context.Context, taskID, expectedStatus, initStatus string) (bool, error)
+	ClaimInitRun(ctx context.Context, taskID string) (bool, error)
+	ClaimInitRerun(ctx context.Context, taskID string) (bool, error)
+	FinishInitRun(ctx context.Context, taskID, status string, initError sql.NullString) (bool, error)
+	ConvergeInterruptedInitRuns(ctx context.Context) (int64, error)
 	// env
 	ListGlobalEnvVars(ctx context.Context) ([]GlobalEnvVarRow, error)
 	ListProjectEnvVars(ctx context.Context, projectID string) ([]EnvVarRow, error)
@@ -91,11 +101,23 @@ type TaskRow struct {
 	CreatedAt    int64
 	UpdatedAt    int64
 	ArchivedAt   sql.NullInt64
+	InitStatus   string
+	InitError    sql.NullString
 }
 
 type EnvVarRow struct {
 	Key   string
 	Value string
+}
+
+// LifecycleConfigRow 项目生命周期配置行（design.md §2.1，解耦 store 包结构）。
+// 缺行读取时三脚本字段为空串（无配置 = 空配置语义）。
+type LifecycleConfigRow struct {
+	ProjectID       string
+	InheritPatterns string
+	InitScript      string
+	PreDeleteScript string
+	UpdatedAt       int64
 }
 
 // GlobalEnvVarRow 全局级 env 变量行（解耦 store 包，design.md §8/§2）。
@@ -164,9 +186,23 @@ type Manager struct {
 	// shutdownGate 控制自动激活触发准入（B2）：Shutdown 开始后拒绝新自动激活触发。
 	// shutdownGateMu 保护 shutdownStarted 与 autoActivateWG；autoActivateWG 登记所有
 	// triggerActivate goroutine，供 Shutdown 等待自动激活收尾后再清理。
-	shutdownGateMu sync.Mutex
+	shutdownGateMu  sync.Mutex
 	shutdownStarted bool
 	autoActivateWG  sync.WaitGroup
+
+	// lifecycleRunner 提供 init/pre-delete 脚本执行与 inherit 文件复制（design.md §7.1）。
+	// 为 nil 时跳过脚本执行与 inherit（无生命周期配置的旧路径行为）。
+	lifecycleRunner lifecycle.LifecycleRunner
+	// logDir 为生命周期脚本日志根目录（design.md §7.4：<dataDir>/logs）。
+	logDir string
+
+	// runnerCtx 是 InitRunner/pre-delete 脚本执行所用的独立 context（design.md §6.1）：
+	// 不复用 SetLifecycleCtx 的 signal ctx，仅 Shutdown 关 gate 后取消。
+	// runnerWG 登记全部 InitRunner 与 pre-delete 执行 goroutine，Shutdown 在关 gate 后
+	// cancel runnerCtx 并 wait runnerWG，确保脚本执行在 store.Close 前收敛（§6.1）。
+	runnerCtx    context.Context
+	runnerCancel context.CancelFunc
+	runnerWG     sync.WaitGroup
 }
 
 // orphanFailure 记录孤儿会话清理失败项（F3）：会话名 + kill 失败产生的 cleanup tickets。
@@ -228,23 +264,36 @@ type Options struct {
 	OCFactory OCClientFactory
 	// DebtStore 可选：注入后未收敛 orphan tickets 持久化跨重启恢复（design.md §10）。
 	DebtStore CleanupDebtStore
+	// LifecycleRunner 可选：注入后启用 init/pre-delete 脚本与 inherit 文件继承
+	//（design.md §7.1）。为 nil 时跳过脚本与 inherit（旧路径行为）。
+	LifecycleRunner lifecycle.LifecycleRunner
+	// LogDir 生命周期脚本日志根目录（design.md §7.4）。为空时回退 <cfg.DataDir>/logs。
+	LogDir string
 }
 
 // New 构造 Manager。OCFactory 为 nil 时用默认 opencode.Client 工厂。
 func New(opts Options) *Manager {
 	m := &Manager{
-		cfg:       opts.Cfg,
-		store:     opts.Store,
-		proc:      opts.Proc,
-		wt:        opts.Worktree,
-		ocFactory: opts.OCFactory,
-		debtStore: opts.DebtStore,
-		runtimes:  make(map[string]*taskRuntime),
-		lastGen:   make(map[string]int),
+		cfg:             opts.Cfg,
+		store:           opts.Store,
+		proc:            opts.Proc,
+		wt:              opts.Worktree,
+		ocFactory:       opts.OCFactory,
+		debtStore:       opts.DebtStore,
+		lifecycleRunner: opts.LifecycleRunner,
+		logDir:          opts.LogDir,
+		runtimes:        make(map[string]*taskRuntime),
+		lastGen:         make(map[string]int),
 	}
 	if m.ocFactory == nil {
 		m.ocFactory = defaultOCFactory
 	}
+	if m.logDir == "" && m.cfg != nil {
+		m.logDir = m.cfg.DataDir + "/logs"
+	}
+	// runnerCtx 独立于 SetLifecycleCtx 的 signal ctx（design.md §6.1）：
+	// 仅 Shutdown 关 gate 后取消，脚本执行不受 HTTP 请求 ctx 或信号 ctx 提前取消影响。
+	m.runnerCtx, m.runnerCancel = context.WithCancel(context.Background())
 	return m
 }
 
@@ -532,7 +581,23 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	m.shutdownGateMu.Lock()
 	m.shutdownStarted = true
 	m.shutdownGateMu.Unlock()
-	// 等待在途自动激活结束（Activate 内部走全部门禁/步骤，可能已建 serve/tui 会话）。
+
+	// §6.1 固定顺序：关 gate → cancel runnerCtx → wait runnerWG → 关 store。
+	// runnerCtx cancel 紧随 gate 关闭，立即终止在跑脚本进程组，避免被持锁 pre-delete 拉长 Shutdown。
+	// runnerWG wait 在 store.Close 前完成：脚本执行被终止后 InitRunner 用独立非取消 ctx 落账
+	//（仍在 WG 内，Done 在最终状态写库之后）。
+	if m.runnerCancel != nil {
+		m.runnerCancel()
+	}
+	m.runnerWG.Wait()
+	// 置空 runnerCtx/runnerCancel：Shutdown 后 Manager 若被复用（New 重建），
+	// 旧 cancel 不与新 ctx 共存误杀复用后 runner 工作。复用时由 New 重建 runnerCtx。
+	m.shutdownGateMu.Lock()
+	m.runnerCtx = nil
+	m.runnerCancel = nil
+	m.shutdownGateMu.Unlock()
+
+	// B2：等待在途自动激活结束（autoActivateWG 语义保持：triggerActivate goroutine 收尾）。
 	// 有界超时：避免 Shutdown 无限阻塞；超时后仍继续清理（残留自动激活 goroutine 走 lifecycle ctx，
 	// 由调用方在 Shutdown 后取消 lifecycle ctx 收尾）。
 	waitDone := make(chan struct{})

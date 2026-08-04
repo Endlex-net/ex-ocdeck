@@ -66,6 +66,23 @@ type envSnapshot struct {
 // 全局级 manual → 存值；follow_host → 从服务端进程 env 解析，宿主未设置/空则跳过该变量。
 // 返回合并后的 env map（含生命周期变量，不含密码），供 serve/tui/shell 注入时叠加密码。
 func (m *Manager) mergeEnvSnapshot(ctx context.Context, row TaskRow, port int) (map[string]string, error) {
+	merged, err := m.layerEnvSnapshot(ctx, row)
+	if err != nil {
+		return nil, err
+	}
+	merged["OCDECK_SERVE_PORT"] = strconv.Itoa(port)
+	// 持久化快照（不含密码）。
+	if err := m.persistEnvSnapshot(ctx, row.ID, merged); err != nil {
+		return nil, err
+	}
+	return merged, nil
+}
+
+// layerEnvSnapshot 合并 env 层叠快照（design.md §2 合并优先级 + §7.3 抽取点）。
+// 基础集 < 全局级 < 项目级 < 任务级 < 生命周期变量(OCDECK_*，不含 OCDECK_SERVE_PORT，由调用方按场景注入)。
+// 不含 port 参数与持久化——供 serve/tui/shell 与脚本执行复用同一层叠逻辑。
+// 行为不变量：serve/tui/shell 的 env 内容与顺序与抽取前完全一致（既有测试全绿）。
+func (m *Manager) layerEnvSnapshot(ctx context.Context, row TaskRow) (map[string]string, error) {
 	merged := map[string]string{}
 	// TERM 强制为 terminfo 认识的规范值（xterm.js 客户端即 xterm-256color），
 	// MUST NOT 继承宿主 TERM（如 xterm-ghostty 会致 tmux "missing or unsuitable terminal"）。
@@ -131,21 +148,15 @@ func (m *Manager) mergeEnvSnapshot(ctx context.Context, row TaskRow, port int) (
 		merged[e.Key] = e.Value
 	}
 	// 生命周期变量 OCDECK_*（env-management spec：注入 OCDECK_TASK_ID、OCDECK_TASK_NAME、
-	// OCDECK_TASK_PATH、OCDECK_PROJECT_PATH、OCDECK_SERVE_PORT 五个生命周期变量）。
+	// OCDECK_TASK_PATH、OCDECK_PROJECT_PATH；OCDECK_SERVE_PORT 由调用方按场景注入）。
 	proj, perr := m.store.GetProject(ctx, row.ProjectID)
 	if perr != nil {
 		return nil, fmt.Errorf("get project for lifecycle env: %w", perr)
 	}
-	merged["OCDECK_SERVE_PORT"] = strconv.Itoa(port)
 	merged["OCDECK_TASK_ID"] = row.ID
 	merged["OCDECK_TASK_NAME"] = row.Name
 	merged["OCDECK_TASK_PATH"] = row.WorktreePath
 	merged["OCDECK_PROJECT_PATH"] = proj.Path
-
-	// 持久化快照（不含密码）。
-	if err := m.persistEnvSnapshot(ctx, row.ID, merged); err != nil {
-		return nil, err
-	}
 	return merged, nil
 }
 
@@ -233,6 +244,25 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 		return newOpErr(codeInternal, err)
 	} else if hasRetryable {
 		return newOpErr(codeConflict, fmt.Errorf("task %s has uncleaned cleanup debt; resolve or force-delete first", taskID))
+	}
+
+	// init_status 门禁（design.md §5，tasks 3.5）：none|succeeded → 放行；
+	// pending|running → invalid_state "init in progress"；failed → invalid_state 含 init_error；
+	// 未知/空值 → invalid_state fail-closed。
+	switch row.InitStatus {
+	case InitStatusNone, InitStatusSucceeded:
+		// 放行。
+	case InitStatusPending, InitStatusRunning:
+		return newOpErr(codeInvalidState, fmt.Errorf("task %s init in progress (init_status=%s)", taskID, row.InitStatus))
+	case InitStatusFailed:
+		msg := fmt.Sprintf("init failed: %s", row.InitError.String)
+		if !row.InitError.Valid || row.InitError.String == "" {
+			msg = "init failed"
+		}
+		msg += "；修复脚本后 Re-run"
+		return newOpErr(codeInvalidState, errors.New(msg))
+	default:
+		return newOpErr(codeInvalidState, fmt.Errorf("task %s unknown init_status %q", taskID, row.InitStatus))
 	}
 
 	// ① 置 activating。

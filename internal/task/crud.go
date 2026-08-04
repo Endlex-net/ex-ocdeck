@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 )
 
 // Create 在项目下创建任务：生成 worktree + 分支，落库（design.md §19 Create 行）。
@@ -57,23 +58,55 @@ func (m *Manager) Create(ctx context.Context, projectID, taskName string) (TaskR
 		return row, newOpErr(codeGitError, fmt.Errorf("worktree add: %w", err))
 	}
 
-	// ④ 提交点：status=suspended。
-	if err := m.store.UpdateTaskStatus(ctx, taskID, StatusSuspended, sql.NullString{}); err != nil {
-		// worktree 已建但 DB 写失败 → creation_failed（design.md §19）。
-		le := sql.NullString{String: fmt.Errorf("update status: %w", err).Error(), Valid: true}
+	// ③ runInherit 编排（design.md §4，tasks 3.2-3.3）：读配置(唯一阻断点) → 枚举 → 复制 → 重写 inherit.log。
+	// 读配置失败 → creation_failed；枚举/复制失败 → 警告（非阻断）。
+	// 单配置快照：读到的 cfg 供后续 init_status 决策，避免二次读取把读错误静默当"无 init 脚本"
+	//（违反"配置读取失败=唯一阻断点"，design.md §4/不变量 5）。
+	cfg, warnings, inheritErr := m.runInherit(ctx, repoPath, wtPath, projectID)
+	if inheritErr != nil {
+		le := sql.NullString{String: fmt.Errorf("inherit: %w", inheritErr).Error(), Valid: true}
 		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusCreationFailed, le)
 		row, _ := m.store.GetTask(ctx, taskID)
-		return row, newOpErr(codeInternal, fmt.Errorf("commit status: %w", err))
+		return row, newOpErr(codeInternal, fmt.Errorf("inherit: %w", inheritErr))
+	}
+	// task 层重写 inherit.log（每次重写/无警告删除/1MB 截断/写失败仅服务端日志/0600+0700）。
+	m.writeInheritLog(m.inheritLogPath(taskID), warnings)
+
+	// ④ 提交点：CommitCreated 原子提交（design.md §4，tasks 3.3）。
+	// 配置有 init 脚本 → init_status=pending（待 InitRunner）；否则 none（直接激活）。
+	initStatus := InitStatusNone
+	if cfg.InitScript != "" {
+		initStatus = InitStatusPending
+	}
+	committed, err := m.store.CommitCreated(ctx, taskID, StatusCreating, initStatus)
+	if err != nil {
+		le := sql.NullString{String: fmt.Errorf("commit created: %w", err).Error(), Valid: true}
+		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusCreationFailed, le)
+		row, _ := m.store.GetTask(ctx, taskID)
+		return row, newOpErr(codeInternal, fmt.Errorf("commit created: %w", err))
+	}
+	if !committed {
+		// 状态已被并发改变（预期 creating → 已变），落 creation_failed。
+		le := sql.NullString{String: "commit created: status changed concurrently", Valid: true}
+		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusCreationFailed, le)
+		row, _ := m.store.GetTask(ctx, taskID)
+		return row, newOpErr(codeConflict, fmt.Errorf("commit created: status changed concurrently"))
 	}
 
+	// 调度不依赖 request-bound GetTask：用已持有数据（taskID）启动异步链。
+	// request ctx 取消/瞬时读失败不得留无人处理的 suspended+pending/none（design.md §4）。
+	// ④ 锁外异步链（design.md §4）：none → 直接 triggerActivate（现状）；pending → 启动 InitRunner。
+	if initStatus == InitStatusPending {
+		m.startInitRunner(taskID)
+	} else {
+		m.triggerActivate(taskID)
+	}
+	// 返回前读最新行（用 request ctx，失败仅影响返回值，不影响已提交状态与已调度异步链）。
 	row, err := m.store.GetTask(ctx, taskID)
 	if err != nil {
-		return TaskRow{}, newOpErr(codeInternal, err)
+		return TaskRow{ID: taskID, ProjectID: projectID, Name: taskName, Branch: branch,
+			Status: StatusSuspended, WorktreePath: wtPath}, newOpErr(codeInternal, err)
 	}
-	// ④ 自动触发激活（异步，design.md §19 Create 行）：等价于用户手动 Activate，
-	// 走同一入口（全部门禁 + session 锚定），挂 Manager 生命周期 ctx（不随 Create 请求 ctx 结束）。
-	// Create 立即返回 suspended，前端轮询看到激活推进；失败落 suspended+last_error 可手动重试。
-	m.triggerActivate(taskID)
 	return row, nil
 }
 
@@ -110,14 +143,17 @@ func (m *Manager) Retry(ctx context.Context, taskID string, confirmDirty bool) e
 		// B1：自动激活 MUST 在 keyed mutex 释放后启动（retryCreate 内不触发），
 		// 否则 goroutine 在 Retry 持锁期间调 Activate → tryLockTask 409 busy →
 		// 永久 suspended 无 last_error。
-		shouldActivate, rerr := m.retryCreate(ctx, row)
+		outcome, rerr := m.retryCreate(ctx, row)
 		if rerr != nil {
 			return rerr
 		}
-		// 先显式解锁再调度自动激活 goroutine，保证 Activate 的 tryLockTask 不自锁。
+		// 先显式解锁再调度异步链，保证 Activate/InitRunner 的 tryLockTask 不自锁。
 		unlockOnce()
-		if shouldActivate {
+		switch outcome {
+		case createDirectActivate:
 			m.triggerActivate(row.ID)
+		case createStartInit:
+			m.startInitRunner(row.ID)
 		}
 		return nil
 	case StatusDeleting, StatusDeletionFailed:
@@ -158,15 +194,16 @@ func (m *Manager) Retry(ctx context.Context, taskID string, confirmDirty bool) e
 	}
 }
 
-// retryCreate 重试创建：严格产物验证（design.md §19 Create Retry 行原文）——
-// 路径存在 + .git 文件 + rev-parse --is-inside-work-tree + 检出分支匹配 + 属预期 repo，
-// 全部通过才跳过 add；否则重新 add。
-// 返回 shouldActivate=true 表示创建已提交 suspended、调用方应在释放 keyed mutex 后触发自动激活
-//（B1：retryCreate 自身不触发，避免在 Retry 持锁期间 goroutine 调 Activate 自锁）。
-func (m *Manager) retryCreate(ctx context.Context, row TaskRow) (bool, error) {
+// retryCreate 重试创建（design.md §19 Create Retry 行 + §3.1，tasks 3.2-3.3）。
+// 严格产物验证——通过则跳过 add，否则重新 add。
+// 无论产物复用还是重建都重新枚举并幂等执行 inherit（§3.1）。
+// CommitCreated(expectedStatus='creation_failed')：从 creation_failed 原子提交到 suspended。
+// 读配置失败 → creation_failed（保留状态，调用方据 error 传播）。
+// 返回二态结果：createDirectActivate（none，调用方 triggerActivate）或 createStartInit（pending，调用方启动 InitRunner）。
+func (m *Manager) retryCreate(ctx context.Context, row TaskRow) (createOutcome, error) {
 	proj, err := m.store.GetProject(ctx, row.ProjectID)
 	if err != nil {
-		return false, newOpErr(codeInternal, fmt.Errorf("project gone during retry: %w", err))
+		return 0, newOpErr(codeInternal, fmt.Errorf("project gone during retry: %w", err))
 	}
 	// 严格产物验证：通过则跳过 add，否则重新 add。
 	if err := m.wt.VerifyWorktreeProduct(ctx, proj.Path, row.WorktreePath, row.Branch); err != nil {
@@ -174,24 +211,47 @@ func (m *Manager) retryCreate(ctx context.Context, row TaskRow) (bool, error) {
 		if exists, berr := m.wt.BranchExists(ctx, proj.Path, row.Branch); berr != nil {
 			le := sql.NullString{String: fmt.Errorf("branch existence check: %w", berr).Error(), Valid: true}
 			_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
-			return false, newOpErr(codeInternal, fmt.Errorf("branch existence check: %w", berr))
+			return 0, newOpErr(codeInternal, fmt.Errorf("branch existence check: %w", berr))
 		} else if exists {
 			le := sql.NullString{String: fmt.Errorf("branch %s already exists", row.Branch).Error(), Valid: true}
 			_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
-			return false, newOpErr(codeConflict, fmt.Errorf("branch %s already exists", row.Branch))
+			return 0, newOpErr(codeConflict, fmt.Errorf("branch %s already exists", row.Branch))
 		}
 		if _, err := m.wt.Add(ctx, proj.Path, row.ProjectID, row.ID, row.Branch, proj.DefaultBranch); err != nil {
 			le := sql.NullString{String: fmt.Errorf("retry worktree add: %w", err).Error(), Valid: true}
 			_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
-			return false, newOpErr(codeGitError, err)
+			return 0, newOpErr(codeGitError, err)
 		}
 	}
-	// 提交点：suspended。
-	if err := m.store.UpdateTaskStatus(ctx, row.ID, StatusSuspended, sql.NullString{}); err != nil {
-		return false, newOpErr(codeInternal, err)
+	// runInherit 编排（§3.1：总是幂等重跑）。读配置失败 → creation_failed。
+	// 单配置快照：cfg 供 init_status 决策（与 Create 一致，避免二次读取）。
+	cfg, warnings, inheritErr := m.runInherit(ctx, proj.Path, row.WorktreePath, row.ProjectID)
+	if inheritErr != nil {
+		le := sql.NullString{String: fmt.Errorf("inherit: %w", inheritErr).Error(), Valid: true}
+		_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
+		return 0, newOpErr(codeInternal, fmt.Errorf("inherit: %w", inheritErr))
 	}
-	// 创建完成即激活（语义与 Create 一致，design.md §19）：由调用方在解锁后触发。
-	return true, nil
+	m.writeInheritLog(m.inheritLogPath(row.ID), warnings)
+
+	// CommitCreated 原子提交（expectedStatus='creation_failed'，§3.1）。
+	initStatus := InitStatusNone
+	if cfg.InitScript != "" {
+		initStatus = InitStatusPending
+	}
+	committed, err := m.store.CommitCreated(ctx, row.ID, StatusCreationFailed, initStatus)
+	if err != nil {
+		le := sql.NullString{String: fmt.Errorf("commit created: %w", err).Error(), Valid: true}
+		_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
+		return 0, newOpErr(codeInternal, err)
+	}
+	if !committed {
+		// 状态已被并发改变，保留原状态。
+		return 0, newOpErr(codeConflict, fmt.Errorf("commit created: status changed concurrently"))
+	}
+	if initStatus == InitStatusPending {
+		return createStartInit, nil
+	}
+	return createDirectActivate, nil
 }
 
 // Archive 归档（design.md §19 Archive 行：纯 DB，状态须为 suspended）。
@@ -208,6 +268,10 @@ func (m *Manager) Archive(ctx context.Context, taskID string) error {
 	}
 	if row.Status != StatusSuspended {
 		return newOpErr(codeInvalidState, fmt.Errorf("archive requires suspended, got %s", row.Status))
+	}
+	// init_status 门禁（design.md tasks 3.7）：init 进行中拒绝归档。
+	if row.InitStatus == InitStatusPending || row.InitStatus == InitStatusRunning {
+		return newOpErr(codeInvalidState, fmt.Errorf("archive: task %s init in progress (init_status=%s)", taskID, row.InitStatus))
 	}
 	if err := m.store.ArchiveTask(ctx, taskID); err != nil {
 		return newOpErr(codeInternal, err)
@@ -253,6 +317,99 @@ func (m *Manager) List(ctx context.Context, projectID string) ([]TaskRow, error)
 	}
 	return rows, nil
 }
+
+// RerunInit 手动重跑 init 脚本（design.md §4/§6，tasks 3.6）。
+// 持任务 keyed mutex；先 admission（gate 已关闭 → 返回错误且 init_status 不变）；
+// 再门禁（status=suspended 且 init_status∈{failed, succeeded}，其余 invalid_state）
+// + ClaimInitRerun CAS（竞争 conflict）；admission 后所有同步退出恰好一次释放。
+// 成功 claim 后异步执行（不持锁）；成功不自动激活；覆盖 init.log。
+// 返回 claim 后的任务行（init_status=running），供 API 层 200+DTO（Phase C）。
+func (m *Manager) RerunInit(ctx context.Context, taskID string) (TaskRow, error) {
+	unlock, err := m.tryLockTask(taskID)
+	if err != nil {
+		return TaskRow{}, err
+	}
+
+	// admission：gate 已关闭 → 返回错误且 init_status 不变。
+	m.shutdownGateMu.Lock()
+	if m.shutdownStarted {
+		m.shutdownGateMu.Unlock()
+		unlock()
+		return TaskRow{}, newOpErr(codeConflict, fmt.Errorf("rerun init: shutdown in progress"))
+	}
+	m.runnerWG.Add(1)
+	m.shutdownGateMu.Unlock()
+
+	// admission 后所有同步退出路径恰好一次释放登记 + 解锁。
+	released := false
+	wgRelease := func() {
+		if !released {
+			released = true
+			m.runnerWG.Done()
+		}
+	}
+	unlocked := false
+	unlockOnce := func() {
+		if !unlocked {
+			unlocked = true
+			unlock()
+		}
+	}
+
+	// 同步退出：任务不存在/门禁失败/store error/CAS 失败。
+	row, err := m.store.GetTask(ctx, taskID)
+	if err != nil {
+		unlockOnce()
+		wgRelease()
+		return TaskRow{}, newOpErr(codeNotFound, fmt.Errorf("task not found: %w", err))
+	}
+	// 门禁：status=suspended 且 init_status∈{failed, succeeded}。
+	if row.Status != StatusSuspended {
+		unlockOnce()
+		wgRelease()
+		return TaskRow{}, newOpErr(codeInvalidState, fmt.Errorf("rerun init requires suspended, got %s", row.Status))
+	}
+	if row.InitStatus != InitStatusFailed && row.InitStatus != InitStatusSucceeded {
+		unlockOnce()
+		wgRelease()
+		return TaskRow{}, newOpErr(codeInvalidState, fmt.Errorf("rerun init requires init_status failed or succeeded, got %s", row.InitStatus))
+	}
+	// ClaimInitRerun CAS：竞争 conflict。
+	claimed, cerr := m.store.ClaimInitRerun(ctx, taskID)
+	if cerr != nil {
+		unlockOnce()
+		wgRelease()
+		return TaskRow{}, newOpErr(codeInternal, cerr)
+	}
+	if !claimed {
+		// 并发下已被 claim 或状态已变。
+		unlockOnce()
+		wgRelease()
+		return TaskRow{}, newOpErr(codeConflict, fmt.Errorf("rerun init: task %s state changed concurrently", taskID))
+	}
+
+	// 异步执行（不持锁）：释放 keyed mutex，脚本在 goroutine 内执行，wg 持有到落账完成。
+	// 返回 claim 后的任务行（init_status=running，init_error 已由 ClaimInitRerun 清空），供调用方展示。
+	// 用独立非取消 ctx 重试一次读取：request ctx 取消时仍能返回 claim 后的准确行；
+	// 读取仍失败时 fallback 构造行（MUST 与 ClaimInitRerun 后置一致：InitStatus=running、InitError 清空、
+	// UpdatedAt 取当前时间），避免 Phase C 返回 running+旧错误信息（design.md §3 ClaimInitRerun 后置）。
+	readCtx, readCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	claimedRow, readErr := m.store.GetTask(readCtx, taskID)
+	readCancel()
+	unlockOnce()
+	go m.runRerunInitAttempt(taskID, wgRelease)
+	if readErr == nil && claimedRow.ID != "" {
+		return claimedRow, nil
+	}
+	// fallback：构造 claim 后行（与 ClaimInitRerun 后置一致：running、init_error 清空）。
+	fallback := row
+	fallback.InitStatus = InitStatusRunning
+	fallback.InitError = sql.NullString{}
+	fallback.UpdatedAt = nowUnixI()
+	return fallback, nil
+}
+
+// runRerunInitAttempt 移至 init_run.go（与 runInitAttempt 共享落账语义）。
 
 // slugify 将任务名转为分支 slug（小写、非 [a-z0-9-] 替换为 -、折叠连续 -、去首尾 -）。
 func slugify(name string) string {

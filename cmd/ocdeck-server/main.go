@@ -17,6 +17,7 @@ import (
 
 	"ocdeck/internal/api"
 	"ocdeck/internal/config"
+	"ocdeck/internal/lifecycle"
 	"ocdeck/internal/process"
 	"ocdeck/internal/store"
 	"ocdeck/internal/task"
@@ -99,11 +100,13 @@ func run() error {
 	// TaskManager 构造（design.md §18）。
 	adapter := task.NewStoreAdapter(db)
 	tm := task.New(task.Options{
-		Cfg:       cfg,
-		Store:     adapter,
-		Proc:      task.NewProcessAdapter(procMgr),
-		Worktree:  task.NewWorktreeAdapter(wtMgr),
-		DebtStore: adapter, // R7：orphan tickets 持久化跨重启恢复（design.md §10）
+		Cfg:             cfg,
+		Store:           adapter,
+		Proc:            task.NewProcessAdapter(procMgr),
+		Worktree:        task.NewWorktreeAdapter(wtMgr),
+		DebtStore:       adapter,         // R7：orphan tickets 持久化跨重启恢复（design.md §10）
+		LifecycleRunner: lifecycle.New(), // design.md §7.1：init/pre-delete 脚本与 inherit
+		LogDir:          cfg.DataDir + "/logs",
 	})
 	// 注入 Manager 生命周期 context（design.md §4：SSE/退出监视挂进程 ctx，非 HTTP request ctx）。
 	tm.SetLifecycleCtx(ctx)

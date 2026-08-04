@@ -76,8 +76,8 @@ func TestResolveAnchorSession_HasRecordExistsReuseSession(t *testing.T) {
 	if id != "sess-existing" {
 		t.Errorf("id = %q, want sess-existing (reuse)", id)
 	}
-	if oc.createSessionCount != 0 {
-		t.Errorf("CreateSession called %d times, want 0 (record exists)", oc.createSessionCount)
+	if got := oc.createSessionCountLoad(); got != 0 {
+		t.Errorf("CreateSession called %d times, want 0 (record exists)", got)
 	}
 }
 
@@ -101,8 +101,8 @@ func TestResolveAnchorSession_Record404CreatesAndPersists(t *testing.T) {
 	if id != "sess-new" {
 		t.Errorf("id = %q, want sess-new (created)", id)
 	}
-	if oc.createSessionCount != 1 {
-		t.Errorf("CreateSession called %d times, want 1 (404 → create)", oc.createSessionCount)
+	if got := oc.createSessionCountLoad(); got != 1 {
+		t.Errorf("CreateSession called %d times, want 1 (404 → create)", got)
 	}
 	// 新 session MUST 已持久化（created/updated 取自 CreateSession 响应）。
 	rows, _ := tStore.ListTaskSessions(context.Background(), "t1")
@@ -136,8 +136,8 @@ func TestResolveAnchorSession_NoRecordCreatesAndPersists(t *testing.T) {
 	if id != "sess-fresh" {
 		t.Errorf("id = %q, want sess-fresh (created)", id)
 	}
-	if oc.createSessionCount != 1 {
-		t.Errorf("CreateSession called %d times, want 1 (no record → create)", oc.createSessionCount)
+	if got := oc.createSessionCountLoad(); got != 1 {
+		t.Errorf("CreateSession called %d times, want 1 (no record → create)", got)
 	}
 	rows, _ := tStore.ListTaskSessions(context.Background(), "t1")
 	if len(rows) != 1 || rows[0].SessionID != "sess-fresh" {
@@ -201,8 +201,8 @@ func TestResolveAnchorSession_GetSessionOtherErrorFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "session precheck") {
 		t.Errorf("error must mention session precheck, got: %v", err)
 	}
-	if oc.createSessionCount != 0 {
-		t.Errorf("CreateSession called %d times, want 0 (precheck non-404 must not fall back)", oc.createSessionCount)
+	if got := oc.createSessionCountLoad(); got != 0 {
+		t.Errorf("CreateSession called %d times, want 0 (precheck non-404 must not fall back)", got)
 	}
 }
 
@@ -224,8 +224,8 @@ func TestResolveAnchorSession_ListTaskSessionsErrorPropagates(t *testing.T) {
 	if !strings.Contains(err.Error(), "list top-level sessions") {
 		t.Errorf("error must mention list top-level sessions, got: %v", err)
 	}
-	if oc.createSessionCount != 0 {
-		t.Errorf("CreateSession called %d times, want 0 (list error must not fall back to create)", oc.createSessionCount)
+	if got := oc.createSessionCountLoad(); got != 0 {
+		t.Errorf("CreateSession called %d times, want 0 (list error must not fall back to create)", got)
 	}
 }
 

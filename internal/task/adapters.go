@@ -100,6 +100,45 @@ func (a *StoreAdapter) DeleteTask(ctx context.Context, id string) error {
 	return a.db.DeleteTask(ctx, id)
 }
 
+// --- 生命周期配置（design.md §2.1） ---
+
+func (a *StoreAdapter) GetLifecycleConfig(ctx context.Context, projectID string) (LifecycleConfigRow, error) {
+	c, err := a.db.GetLifecycleConfig(ctx, projectID)
+	if err != nil {
+		return LifecycleConfigRow{}, err
+	}
+	return LifecycleConfigRow{
+		ProjectID: c.ProjectID, InheritPatterns: c.InheritPatterns,
+		InitScript: c.InitScript, PreDeleteScript: c.PreDeleteScript, UpdatedAt: c.UpdatedAt,
+	}, nil
+}
+
+func (a *StoreAdapter) UpsertLifecycleConfig(ctx context.Context, projectID, inheritPatterns, initScript, preDeleteScript string) error {
+	return a.db.UpsertLifecycleConfig(ctx, projectID, inheritPatterns, initScript, preDeleteScript)
+}
+
+// --- init_status CAS（design.md §2.1/§3） ---
+
+func (a *StoreAdapter) CommitCreated(ctx context.Context, taskID, expectedStatus, initStatus string) (bool, error) {
+	return a.db.CommitCreated(ctx, taskID, expectedStatus, initStatus)
+}
+
+func (a *StoreAdapter) ClaimInitRun(ctx context.Context, taskID string) (bool, error) {
+	return a.db.ClaimInitRun(ctx, taskID)
+}
+
+func (a *StoreAdapter) ClaimInitRerun(ctx context.Context, taskID string) (bool, error) {
+	return a.db.ClaimInitRerun(ctx, taskID)
+}
+
+func (a *StoreAdapter) FinishInitRun(ctx context.Context, taskID, status string, initError sql.NullString) (bool, error) {
+	return a.db.FinishInitRun(ctx, taskID, status, initError)
+}
+
+func (a *StoreAdapter) ConvergeInterruptedInitRuns(ctx context.Context) (int64, error) {
+	return a.db.ConvergeInterruptedInitRuns(ctx)
+}
+
 func (a *StoreAdapter) ListProjectEnvVars(ctx context.Context, projectID string) ([]EnvVarRow, error) {
 	rows, err := a.db.ListProjectEnvVars(ctx, projectID)
 	if err != nil {
@@ -212,7 +251,7 @@ func toTaskRow(t store.TaskRow) TaskRow {
 		ID: t.ID, ProjectID: t.ProjectID, Name: t.Name, Branch: t.Branch, Status: t.Status,
 		WorktreePath: t.WorktreePath, LastPort: t.LastPort, LastError: t.LastError, Notice: t.Notice,
 		DeleteMode: t.DeleteMode, EnvSnapshot: t.EnvSnapshot, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
-		ArchivedAt: t.ArchivedAt,
+		ArchivedAt: t.ArchivedAt, InitStatus: t.InitStatus, InitError: t.InitError,
 	}
 }
 

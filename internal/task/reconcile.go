@@ -14,10 +14,19 @@ import (
 	"ocdeck/internal/process"
 )
 
-// Reconcile 启动 reconciliation（design.md §5 + §10 shutdownPolicy 三模式）。
+// Reconcile 启动 reconciliation（design.md §5 + §10 shutdownPolicy 三模式 + tasks 3.8）。
 // 必须在 HTTP 服务就绪前完成对账。调用方在 cmd 启动时调用。
 func (m *Manager) Reconcile(ctx context.Context) error {
 	policy := m.cfg.ShutdownPolicy
+
+	// tasks 3.8：ConvergeInterruptedInitRuns MUST 先于既有启动恢复步骤执行——
+	// 把 init_status∈{pending,running} 的任务收敛为 failed（interrupted by server restart）。
+	// 更新失败 MUST fail-closed 阻止 HTTP 开放。
+	if n, err := m.store.ConvergeInterruptedInitRuns(ctx); err != nil {
+		return fmt.Errorf("reconcile: converge interrupted init runs: %w", err)
+	} else if n > 0 {
+		log.Printf("reconcile: converged %d interrupted init runs", n)
+	}
 
 	// R7：恢复持久化的未收敛 orphan tickets 到内存（design.md §10：进程退出再启动后
 	// 从 cleanup_debts 表恢复重试，不随进程退出丢失）。先于一切处理，确保后台周期与
@@ -309,6 +318,7 @@ func (m *Manager) resumeActive(ctx context.Context, t TaskRow) error {
 // 调用方已 setRuntime + registerGroup(serve) + watchServeExit。此处补 TUI 与全部 shell：
 //   - tui 存活 → registerGroup(tui) + watchTUIExit；
 //   - 每个 shell-<n> 存活 → registerGroup(shell) + watchShellExit。
+//
 // B7b：shell 枚举 ListSessions 错误 MUST 传播（返回 error，调用方据此 fail-closed）。
 func (m *Manager) resumeRuntimeWatchers(taskID, serveName string) error {
 	tuiName := tuiSessionName(taskID)
@@ -481,7 +491,7 @@ func (m *Manager) reconcileDebtPrePassAll(ctx context.Context, tasks []TaskRow) 
 }
 
 // recordOrphanFailure 记录 orphan 清理失败到内存 orphanFailures 并立即持久化到 cleanup_debts
-//（P4 复评阻塞 3b：不等 30s 周期，崩溃窗口即丢失）。
+// （P4 复评阻塞 3b：不等 30s 周期，崩溃窗口即丢失）。
 // P4 复评阻塞 3e：恢复项与同会话新失败项重复时持久化 MUST union tickets（persistOrphanDebts
 // upsert 时读回既有 tickets 合并，不 latest-wins 覆盖）。
 // B2/第三轮：persistOrphanDebt 持久化失败（List/Upsert）MUST 返回错误传播——

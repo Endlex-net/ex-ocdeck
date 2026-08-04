@@ -39,8 +39,8 @@ func TestB3_AnchorIsolatesSubsession_LateLastSeen(t *testing.T) {
 	if id != "sess-top" {
 		t.Errorf("anchored session = %q, want sess-top (top-level, not sub-session)", id)
 	}
-	if oc.createSessionCount != 0 {
-		t.Errorf("CreateSession called %d times, want 0 (top-level session exists)", oc.createSessionCount)
+	if got := oc.createSessionCountLoad(); got != 0 {
+		t.Errorf("CreateSession called %d times, want 0 (top-level session exists)", got)
 	}
 }
 
@@ -153,7 +153,7 @@ func TestB3_AnchorIsolatesSubsession_SuspendRepair(t *testing.T) {
 }
 
 // TestB3_AlignSessions_PersistsParentID 验证 B3：全量对齐持久化 parent_id
-//（子 session 非空），后续 ListTopLevelTaskSessions 正确过滤。
+// （子 session 非空），后续 ListTopLevelTaskSessions 正确过滤。
 func TestB3_AlignSessions_PersistsParentID(t *testing.T) {
 	tStore := newMockStore()
 	seedSuspendedTask(tStore, "t1", "p1")
@@ -203,8 +203,8 @@ func TestB3_SSECapture_PersistsParentID(t *testing.T) {
 		"info": map[string]interface{}{
 			"id":        "sess-sub-ev",
 			"directory": "/wt/t1",
-			"time":       map[string]interface{}{"updated": float64(500)},
-			"parentID":   "sess-top-ev",
+			"time":      map[string]interface{}{"updated": float64(500)},
+			"parentID":  "sess-top-ev",
 		},
 	}}
 	if err := m.handleSSEEvent(context.Background(), "t1", "/wt/t1", ev); err != nil {
@@ -222,4 +222,3 @@ func TestB3_SSECapture_PersistsParentID(t *testing.T) {
 		t.Errorf("ListTopLevelTaskSessions = %d rows, want 0 (sub-session filtered)", len(top))
 	}
 }
-

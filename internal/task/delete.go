@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 // Delete 删除任务（design.md §19 Delete 行 + §12）。
 // 全部静态检查（包含性/dirty/分支占用）先于任何副作用（B8）；mode ∈ {normal, force}。
 // confirmDirty 表示用户已确认 dirty（API 层 confirmDirty=true）；未确认且 dirty → 拒绝（前置）。
-// Force 只跳过 oc session 删除，dirty 检查与确认要求同 Normal（design.md §19：Force 不得自动 confirmDirty）。
+// Force 跳过 oc session 删除与 pre-delete 脚本（project-lifecycle-config 扩展），dirty 检查与确认要求同 Normal（design.md §19：Force 不得自动 confirmDirty）。
 func (m *Manager) Delete(ctx context.Context, taskID string, mode DeleteMode, confirmDirty bool) error {
 	// D5：mode 校验——仅接受 normal|force，非法值 invalid_input（与 API 层校验一致，
 	// task 层防御性校验，避免其他调用方绕过 API）。
@@ -41,6 +42,10 @@ func (m *Manager) Delete(ctx context.Context, taskID string, mode DeleteMode, co
 	//   - Force：状态 ∈ {suspended, archived, creation_failed, deletion_failed}（强制删除 MUST 接受 deletion_failed）。
 	if !deleteAllowedStatus(row.Status, mode) {
 		return newOpErr(codeInvalidState, fmt.Errorf("delete not allowed from %s with mode %s", row.Status, mode))
+	}
+	// init_status 门禁（design.md tasks 3.7）：init 进行中拒绝删除。
+	if row.InitStatus == InitStatusPending || row.InitStatus == InitStatusRunning {
+		return newOpErr(codeInvalidState, fmt.Errorf("task %s init in progress (init_status=%s)", taskID, row.InitStatus))
 	}
 
 	// B8：静态安全检查（包含性/dirty/分支占用）先于任何副作用（oc session/进程清理之前）。
@@ -84,7 +89,7 @@ func (m *Manager) Delete(ctx context.Context, taskID string, mode DeleteMode, co
 // 幂等：资源不存在视为已成功；按持久化 delete_mode 重入。
 // preflightDirty 为 DirtyFiles 快照，供 wt.Remove 前做二次门禁——preflight 后新产生的
 // dirty（快照中不存在的条目）未经确认不得删（design.md §19）。nil 表示跳过二次门禁
-//（防御性保留：Delete 与 Retry 均传非 nil 快照，nil 仅用于无 worktree 等不适用场景）。
+// （防御性保留：Delete 与 Retry 均传非 nil 快照，nil 仅用于无 worktree 等不适用场景）。
 func (m *Manager) deleteResume(ctx context.Context, row TaskRow, mode DeleteMode, preflightDirty map[string]struct{}) error {
 	taskID := row.ID
 
@@ -168,24 +173,91 @@ func (m *Manager) deleteResume(ctx context.Context, row TaskRow, mode DeleteMode
 			}
 		}
 	}
+	// ⑤.5 pre-delete 脚本挂点（design.md §6，tasks 3.9）：二次 dirty 门禁后、wt.Remove 前。
+	// DeleteForce 跳过 pre-delete。worktree os.Stat 仅 IsNotExist → 跳过（其他 Stat 错误 → deletion_failed）。
+	// 配置无 pre_delete_script → 跳过。admission 失败 → 停止删除序列、绝不 wt.Remove、返回错误供 Retry。
+	// 执行失败 → deletion_failed + last_error 以 "pre-delete:" 前缀开头且 MUST NOT 执行 wt.Remove。
+	// WG 登记持有到删除序列成功提交（DB 行删除）或 deletion_failed 落账之后（design.md §6.1）：
+	// preDeleteRelease 由调用方在最终提交点/落账点后释放，而非脚本返回即释放。
+	var preDeleteRelease func()
+	if mode != DeleteForce {
+		rel, perr := m.runPreDeleteHook(row)
+		if perr != nil {
+			// token 覆盖范围内的落账 MUST 用非取消 ctx（design.md §6.1）：
+			// request ctx 取消/Shutdown 时 UpdateTaskStatus 真实响应取消，会留下 deleting 无落账。
+			finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), finishDeletionCtxTimeout)
+			le := sql.NullString{String: perr.Error(), Valid: true}
+			_ = m.store.UpdateTaskStatus(finalizeCtx, taskID, StatusDeletionFailed, le)
+			finalizeCancel()
+			if rel != nil {
+				rel()
+			}
+			return newOpErr(codeInvalidState, perr)
+		}
+		preDeleteRelease = rel
+	}
+
+	// preDeleteRelease 非 nil 时，本路径后续落账（wt.Remove 失败 / DB 删除失败）MUST 用非取消 ctx，
+	// 并在落账完成后释放 token。用 defer 结构性保证恰好一次释放。
+	if preDeleteRelease != nil {
+		defer preDeleteRelease()
+	}
+	finalizeOnFail := func(lastError string) {
+		finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), finishDeletionCtxTimeout)
+		le := sql.NullString{String: lastError, Valid: true}
+		_ = m.store.UpdateTaskStatus(finalizeCtx, taskID, StatusDeletionFailed, le)
+		finalizeCancel()
+	}
+
 	if err := m.wt.Remove(ctx, row.WorktreePath, worktreeRemoveOpts{
 		RepoPath:   proj.Path,
 		Branch:     row.Branch,
 		ForceDirty: true, // 删除已确认（前置 + 二次门禁通过），TaskManager 层强制清理
 	}); err != nil {
-		le := sql.NullString{String: fmt.Errorf("worktree remove: %w", err).Error(), Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, le)
+		finalizeOnFail(fmt.Errorf("worktree remove: %w", err).Error())
 		return newOpErr(codeGitError, err)
 	}
 
 	// ⑦ 删 DB 行（提交点）。
 	if err := m.store.DeleteTask(ctx, taskID); err != nil {
-		le := sql.NullString{String: fmt.Errorf("delete db row: %w", err).Error(), Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, le)
+		finalizeOnFail(fmt.Errorf("delete db row: %w", err).Error())
 		return newOpErr(codeInternal, err)
 	}
+	// 提交点：defer preDeleteRelease() 已保证释放（§6.1：持有到 DB 行删除成功）。
 	m.clearRuntime(taskID)
+	// 删除成功（DB 行删除后）→ best-effort 删除 <dataDir>/logs/<taskID>/（忽略错误，design.md §6）。
+	m.removeLifecycleLogDir(taskID)
 	return nil
+}
+
+// runPreDeleteHook 执行 pre-delete 脚本前置检查与执行（design.md §6，tasks 3.9）。
+// 返回 (release, error)：release 为 WG token，调用方 MUST 在删除序列成功提交或 deletion_failed
+// 落账之后释放（design.md §6.1：pre-delete WG 持有到提交点/落账点，非脚本返回即释放）。
+// worktree os.Stat 仅 IsNotExist → 跳过（release 为 nil）；其他 Stat 错误 → "pre-delete:" 前缀 error。
+// 读配置无 pre_delete_script → 脚本视为成功（admission 已登记，release 非 nil，随提交点释放）。admission 失败 → 返回错误（停止删除序列）。
+// env 合并/日志创建/脚本执行任一失败 → 返回 "pre-delete:" 前缀 error（调用方落 deletion_failed，绝不 wt.Remove）。
+func (m *Manager) runPreDeleteHook(row TaskRow) (func(), error) {
+	// worktree os.Stat：仅 IsNotExist → 跳过；其他错误 → deletion_failed 前缀。
+	if _, err := os.Stat(row.WorktreePath); err != nil {
+		if os.IsNotExist(err) {
+			// worktree 不存在：幂等跳过 pre-delete（无脚本可执行的目标）。
+			return nil, nil
+		}
+		return nil, fmt.Errorf("pre-delete: stat worktree: %w", err)
+	}
+	// admission（gate 检查 + runnerWG 登记）。release 返回给调用方，在提交点/落账点后释放。
+	release, aerr := m.admitPreDelete()
+	if aerr != nil {
+		// admission 失败（Shutdown 进行中）：停止删除序列，绝不 wt.Remove。
+		return nil, aerr
+	}
+	// 同步执行 pre-delete 脚本；失败时 release 由调用方在落 deletion_failed 后释放。
+	if scriptErr := m.runPreDeleteScript(row); scriptErr != nil {
+		// 返回 release（非 nil）让调用方在落 deletion_failed 后释放。
+		return release, scriptErr
+	}
+	// 脚本成功：release 由调用方在最终提交点后释放。
+	return release, nil
 }
 
 // deleteOCSessions 删除任务的 oc session 数据（逐个，404 幂等，design.md §12/§19）。
@@ -194,7 +266,7 @@ func (m *Manager) deleteResume(ctx context.Context, row TaskRow, mode DeleteMode
 // 404 幂等成功，其他错误聚合后返回（不短路，避免只删了一半就落 deletion_failed）。
 // 一次性 serve 的 KillSession 结果与 notice 写入错误 MUST 聚合返回（design.md §8/§19）：
 // 非 clean disposition 或 notice 写入失败时返回非 nil，使 Delete 阻止越过 DB 提交点
-//（返回 deletion_failed，notice 落库后才可重试，tickets 不随 CASCADE 丢失）。
+// （返回 deletion_failed，notice 落库后才可重试，tickets 不随 CASCADE 丢失）。
 func (m *Manager) deleteOCSessions(ctx context.Context, row TaskRow) error {
 	sessions, err := m.store.ListTaskSessions(ctx, row.ID)
 	if err != nil {

@@ -14,7 +14,7 @@ import (
 // probeEntered 在 Probe 进入阻塞前自增（断言 in-flight 已到达）。
 type blockingProbeOC struct {
 	*mockOC
-	probeCh     chan struct{}
+	probeCh      chan struct{}
 	probeEntered atomic.Int32
 }
 
@@ -79,13 +79,13 @@ func TestB2_ShutdownGate_JoinsInFlightAutoActivate(t *testing.T) {
 
 	// 验证 gate 已开始：触发新的自动激活 MUST 被拒绝。
 	// 被拒绝时 triggerActivate 仅记日志、不派发 goroutine；通过 CreateSession 计数间接验证。
-	createBefore := oc.createSessionCount
+	createBefore := oc.createSessionCountLoad()
 	m.triggerActivate(row.ID)
 	// 给可能（错误）派发的 goroutine 一点时间；gate 拒绝时不应有新 Probe/CreateSession。
 	time.Sleep(30 * time.Millisecond)
-	if oc.createSessionCount != createBefore {
+	if got := oc.createSessionCountLoad(); got != createBefore {
 		t.Errorf("gate did not reject new auto-activate after shutdown start: createSession %d -> %d",
-			createBefore, oc.createSessionCount)
+			createBefore, got)
 	}
 
 	// 释放 Probe 让 in-flight 自动激活完成 → Activate 推进 → WG Done → Shutdown join 成功。

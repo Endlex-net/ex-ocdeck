@@ -1,5 +1,5 @@
 // Package task 实现 TaskManager：任务状态转换、进程、worktree 操作的唯一入口
-//（design.md §1/§5/§18/§19）。
+// （design.md §1/§5/§18/§19）。
 //
 // 设计要点：
 //   - 每任务 keyed mutex（冲突操作返回 409，个人单用户场景不做 in-flight 结果共享）
@@ -42,6 +42,17 @@ const (
 	StatusSuspending     = "suspending"
 	StatusDeleting       = "deleting"
 	StatusDeletionFailed = "deletion_failed"
+)
+
+// InitStatus init_status 域（design.md §3：none | pending | running | succeeded | failed）。
+// Create 链按是否配置 init 脚本落 pending（待 InitRunner 执行）或 none（无脚本直接激活）。
+// 既有任务迁移为 none。Activate 门禁按 §5 五分支放行/拒绝。
+const (
+	InitStatusNone      = "none"
+	InitStatusPending   = "pending"
+	InitStatusRunning   = "running"
+	InitStatusSucceeded = "succeeded"
+	InitStatusFailed    = "failed"
 )
 
 // --- 依赖接口（design.md §18，供 mock 边界） ---

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"ocdeck/internal/config"
@@ -16,19 +17,21 @@ import (
 // --- mock store ---
 
 type mockStore struct {
-	mu        sync.Mutex
-	projects  map[string]ProjectRow
-	tasks     map[string]TaskRow
-	sessions  map[string][]SessionRow // taskID -> sessions
-	taskSeq   int
+	mu       sync.Mutex
+	projects map[string]ProjectRow
+	tasks    map[string]TaskRow
+	sessions map[string][]SessionRow // taskID -> sessions
+	taskSeq  int
 	// 记录状态转移历史，供断言。
 	statusCalls []statusCall
+	// deleteTaskCount 记录 DeleteTask 调用次数（测试经 deleteTaskCount() accessor 读取，避免直接读字段）。
+	deleteTaskCount int
 }
 
 type statusCall struct {
-	id        string
-	from, to  string
-	updated   bool
+	id       string
+	from, to string
+	updated  bool
 }
 
 func newMockStore() *mockStore {
@@ -75,6 +78,11 @@ func (s *mockStore) CreateTask(ctx context.Context, t TaskRow) error {
 	}
 	t.CreatedAt = 1
 	t.UpdatedAt = 1
+	// 与 store schema migration 0007 一致：新建任务 init_status 默认 none
+	//（design.md §3：既有任务迁移为 none；新建任务由 Create 链 CommitCreated 按配置落 pending/none）。
+	if t.InitStatus == "" {
+		t.InitStatus = InitStatusNone
+	}
 	s.tasks[t.ID] = t
 	return nil
 }
@@ -85,6 +93,12 @@ func (s *mockStore) GetTask(ctx context.Context, id string) (TaskRow, error) {
 	t, ok := s.tasks[id]
 	if !ok {
 		return TaskRow{}, fmt.Errorf("not found")
+	}
+	// 与 store schema migration 0007 一致：init_status 缺省为 none
+	//（design.md §3：既有任务迁移为 none）。测试直接构造 TaskRow 时可能未设置，
+	// 读回时归一化为 none，模拟 DB schema 默认值。
+	if t.InitStatus == "" {
+		t.InitStatus = InitStatusNone
 	}
 	return t, nil
 }
@@ -252,9 +266,17 @@ func (s *mockStore) RestoreTask(ctx context.Context, id string) error {
 func (s *mockStore) DeleteTask(ctx context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.deleteTaskCount++
 	delete(s.tasks, id)
 	delete(s.sessions, id)
 	return nil
+}
+
+// deleteTaskCountVal 返回 DeleteTask 调用次数（测试经 accessor 读取，避免直接读字段与并发写竞态）。
+func (s *mockStore) deleteTaskCountVal() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deleteTaskCount
 }
 
 func (s *mockStore) ListProjectEnvVars(ctx context.Context, projectID string) ([]EnvVarRow, error) {
@@ -296,7 +318,7 @@ func (s *mockStore) ListTaskSessions(ctx context.Context, taskID string) ([]Sess
 }
 
 // ListTopLevelTaskSessions 仅返回顶层会话（parent_id 为空），与 store.Queries 语义一致
-//（design.md §4 锚定隔离：锚定候选仅取顶层会话）。排序同 store.Queries 的 ORDER BY。
+// （design.md §4 锚定隔离：锚定候选仅取顶层会话）。排序同 store.Queries 的 ORDER BY。
 func (s *mockStore) ListTopLevelTaskSessions(ctx context.Context, taskID string) ([]SessionRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -352,29 +374,29 @@ func (s *mockStore) AlignSessions(ctx context.Context, taskID string, sessions [
 // --- mock process backend ---
 
 type mockProc struct {
-	mu          sync.Mutex
-	sessions    map[string]bool
-	killResults map[string]process.KillResult
+	mu            sync.Mutex
+	sessions      map[string]bool
+	killResults   map[string]process.KillResult
 	newSessionErr error
 	// hasSessionErr 非空时 HasSession 返回该错误（模拟基础设施错误，非 ErrNoTmuxServer）。
 	hasSessionErr error
-	watchCb     map[string]func(process.WatchEvent)
-	envValues   map[string]map[string]string // sessionName -> env
+	watchCb       map[string]func(process.WatchEvent)
+	envValues     map[string]map[string]string // sessionName -> env
 	// cmdArgvValues 记录 NewSession 的 CmdArgv（§4 锚定测试断言 --session <id>）。
 	cmdArgvValues map[string][]string
 	// killOrder 记录 KillSession 调用顺序（D1 测试断言 kill 顺序 tui→shells→serve）。
-	killOrder     []string
+	killOrder []string
 	// newSessionNames 记录 NewSession 调用顺序（D2 测试断言 serve 死亡不新建 tui）。
 	newSessionNames []string
 }
 
 func newMockProc() *mockProc {
 	return &mockProc{
-		sessions:       map[string]bool{},
-		killResults:    map[string]process.KillResult{},
-		watchCb:        map[string]func(process.WatchEvent){},
-		envValues:      map[string]map[string]string{},
-		cmdArgvValues:  map[string][]string{},
+		sessions:      map[string]bool{},
+		killResults:   map[string]process.KillResult{},
+		watchCb:       map[string]func(process.WatchEvent){},
+		envValues:     map[string]map[string]string{},
+		cmdArgvValues: map[string][]string{},
 	}
 }
 
@@ -487,15 +509,16 @@ func (p *mockProc) newSessionNamesSnapshot() []string {
 // mockWorktree 的 map 字段在并发 Create（TestKeyedMutex_ConcurrentCreate 等）下被多 goroutine
 // 同时读写，MUST 以 mu 串行化所有访问，否则 -race 报 data race。
 type mockWorktree struct {
-	mu            sync.Mutex
-	addErr        error
-	removeErr     error
-	addedPaths    map[string]bool
-	branches      map[string]bool // branch -> exists
-	products      map[string]bool // wtPath -> valid product
-	preflightErr  error
-	dirtyFiles    map[string]map[string]struct{} // wtPath -> dirty file set (B7c 二次门禁)
-	dirtyErr      error
+	mu              sync.Mutex
+	addErr          error
+	removeErr       error
+	addedPaths      map[string]bool
+	branches        map[string]bool // branch -> exists
+	products        map[string]bool // wtPath -> valid product
+	preflightErr    error
+	dirtyFiles      map[string]map[string]struct{} // wtPath -> dirty file set (B7c 二次门禁)
+	dirtyErr        error
+	removeCallCount int // Remove 调用计数（pre-delete admission 失败测试断言未调用 wt.Remove）
 }
 
 func newMockWorktree() *mockWorktree {
@@ -523,7 +546,14 @@ func (w *mockWorktree) Add(ctx context.Context, repoPath, projectID, taskID, bra
 func (w *mockWorktree) Remove(ctx context.Context, wtPath string, opts worktreeRemoveOpts) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.removeCallCount++
 	return w.removeErr
+}
+
+func (w *mockWorktree) removeCalls() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.removeCallCount
 }
 
 func (w *mockWorktree) BranchExists(ctx context.Context, repoPath, branch string) (bool, error) {
@@ -569,24 +599,25 @@ func (w *mockWorktree) DirtyFiles(ctx context.Context, wtPath string) (map[strin
 // --- mock OCClient ---
 
 type mockOC struct {
-	probeErr       error
-	healthOK       bool
-	sessions       []opencode.Session
-	getSessionErr  error
-	deleteErr      error
+	probeErr      error
+	healthOK      bool
+	sessions      []opencode.Session
+	getSessionErr error
+	deleteErr     error
 	// deleteErrByID 按 sessionID 返回特定错误（D3 测试：逐项错误聚合，非短路）。
-	deleteErrByID  map[string]error
-	subscribeErr   error
-	onReadyCh      chan struct{}
+	deleteErrByID map[string]error
+	subscribeErr  error
+	onReadyCh     chan struct{}
 	// sessionStatuses 预置 /session/status 返回（2.8 agentStatus 测试）。
 	sessionStatuses map[string]opencode.SessionStatus
 	// sessionStatusErr 非空时 SessionStatus 返回该错误（降级测试）。
 	sessionStatusErr error
 	// createSessionResult / createSessionErr 控制 CreateSession 返回（§4 锚定测试）。
-	// createSessionCount 记录 CreateSession 调用次数（断言是否走了创建路径）。
+	// createSessionCount 用 atomic 计数（测试桩线程安全：TestKeyedMutex_ConcurrentCreate 等并发测试
+	// 两个 auto-activate 同时调用 CreateSession，非 atomic 会触发 -race）。
 	createSessionResult opencode.Session
 	createSessionErr    error
-	createSessionCount   int
+	createSessionCount  int64
 }
 
 func newMockOC(healthOK bool) *mockOC {
@@ -626,7 +657,7 @@ func (c *mockOC) GetSession(ctx context.Context, dir, id string) (opencode.Sessi
 // CreateSession 模拟 POST /session 创建会话（§4 锚定测试）。
 // 默认返回新 session "sess-new"；createSessionResult/createSessionErr 可覆盖。
 func (c *mockOC) CreateSession(ctx context.Context, dir, title string) (opencode.Session, error) {
-	c.createSessionCount++
+	atomic.AddInt64(&c.createSessionCount, 1)
 	if c.createSessionErr != nil {
 		return opencode.Session{}, c.createSessionErr
 	}
@@ -634,6 +665,12 @@ func (c *mockOC) CreateSession(ctx context.Context, dir, title string) (opencode
 		return c.createSessionResult, nil
 	}
 	return opencode.Session{ID: "sess-new", Time: opencode.SessionTime{Created: 100, Updated: 100}}, nil
+}
+
+// createSessionCountLoad 返回 createSessionCount 的原子读（测试桩线程安全：
+// atomic 写与直接读混用在 -race 下报 data race，所有测试读经此 accessor）。
+func (c *mockOC) createSessionCountLoad() int64 {
+	return atomic.LoadInt64(&c.createSessionCount)
 }
 
 func (c *mockOC) DeleteSession(ctx context.Context, dir, id string) error {
@@ -669,7 +706,7 @@ func (c *mockOC) SubscribeEvents(ctx context.Context, dir string, onEvent func(o
 func newTestManager(t *testing.T, store TaskStore, proc ProcessBackend, wt WorktreeBackend, oc OCClient) *Manager {
 	t.Helper()
 	cfg := &config.Config{
-		DataDir:       t.TempDir(),
+		DataDir:        t.TempDir(),
 		ServePortRange: config.PortRange{Min: 50000, Max: 50999},
 		ShutdownPolicy: config.ShutdownPersist,
 	}
@@ -689,8 +726,10 @@ type readyOC struct {
 	onReady func()
 }
 
-func (c *readyOC) Health(ctx context.Context) (opencode.HealthResponse, error) { return c.inner.Health(ctx) }
-func (c *readyOC) Probe(ctx context.Context) (string, error)                   { return c.inner.Probe(ctx) }
+func (c *readyOC) Health(ctx context.Context) (opencode.HealthResponse, error) {
+	return c.inner.Health(ctx)
+}
+func (c *readyOC) Probe(ctx context.Context) (string, error) { return c.inner.Probe(ctx) }
 func (c *readyOC) ListSessions(ctx context.Context, dir string, limit int) ([]opencode.Session, error) {
 	return c.inner.ListSessions(ctx, dir, limit)
 }

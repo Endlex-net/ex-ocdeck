@@ -164,3 +164,32 @@ func TestMergeEnvSnapshot_LocaleDefault(t *testing.T) {
 		t.Errorf("case e: LANG = %q, want %q (empty LC_ALL treated as unset, default injected)", got, def)
 	}
 }
+
+// TestLayerEnvSnapshot_NoServePortNoPersist 直接验证 layerEnvSnapshot 抽取契约（§7.3）：
+//   - 不含 OCDECK_SERVE_PORT（由调用方按场景注入）；
+//   - 不持久化快照（UpdateTaskEnvSnapshot 不被调用）。
+//
+// 层序/reserved/生命周期变量的完整覆盖由既有 wrapper（mergeEnvSnapshot）测试保证，此处不重复。
+func TestLayerEnvSnapshot_NoServePortNoPersist(t *testing.T) {
+	store := newMockStore()
+	seedSuspendedTask(store, "t1", "p1")
+	m := newTestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
+
+	merged, err := m.layerEnvSnapshot(context.Background(), store.tasks["t1"])
+	if err != nil {
+		t.Fatalf("layerEnvSnapshot: %v", err)
+	}
+	if _, ok := merged["OCDECK_SERVE_PORT"]; ok {
+		t.Errorf("layerEnvSnapshot MUST NOT include OCDECK_SERVE_PORT (caller injects per-scenario)")
+	}
+	// 生命周期变量（非 port）仍应注入。
+	for _, k := range []string{"OCDECK_TASK_ID", "OCDECK_TASK_NAME", "OCDECK_TASK_PATH", "OCDECK_PROJECT_PATH"} {
+		if _, ok := merged[k]; !ok {
+			t.Errorf("layerEnvSnapshot missing lifecycle var %s", k)
+		}
+	}
+	// 不持久化：UpdateTaskEnvSnapshot 不应被调用。
+	if store.tasks["t1"].EnvSnapshot.Valid {
+		t.Errorf("layerEnvSnapshot MUST NOT persist snapshot; got EnvSnapshot=%+v", store.tasks["t1"].EnvSnapshot)
+	}
+}
