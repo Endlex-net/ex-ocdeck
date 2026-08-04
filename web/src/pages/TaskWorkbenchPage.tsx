@@ -2,13 +2,16 @@ import { useEffect, useState } from 'react';
 import { api, ApiError } from '../api';
 import { navigate } from '../router';
 import { usePoll } from '../hooks';
-import { isTransitional, parseNotice, type Task } from '../types';
+import { isTransitional, initActivateBlockReason, parseNotice, type Task } from '../types';
 import { StatusBadge } from '../components/StatusBadge';
 import { TaskActions } from '../components/TaskActions';
 import { DeleteTaskModal } from '../components/DeleteTaskModal';
 import { GitPanel } from '../components/GitPanel';
 import { EnvEditor } from '../components/EnvEditor';
 import { AgentStatusBadge } from '../components/AgentStatusBadge';
+import { InitStatusBadge } from '../components/InitStatusBadge';
+import { LifecycleLogModal } from '../components/LifecycleLogModal';
+import { RerunInitButton } from '../components/RerunInitButton';
 import { TerminalView } from '../terminal/TerminalView';
 
 const TUI_TAB = 'tui';
@@ -25,6 +28,8 @@ export function TaskWorkbenchPage({ taskID }: { taskID: string }) {
   const [notFound, setNotFound] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [addingShell, setAddingShell] = useState(false);
+  // 生命周期日志弹窗（init 日志入口始终可用；pre-delete 日志仅 pre-delete: 失败时）
+  const [logView, setLogView] = useState<'init' | 'pre-delete' | null>(null);
   // 功能面板首次访问后才挂载，挂载后常驻以保留面板内部状态
   const [visited, setVisited] = useState<Set<string>>(new Set([TUI_TAB]));
 
@@ -42,9 +47,13 @@ export function TaskWorkbenchPage({ taskID }: { taskID: string }) {
       else setError(err instanceof ApiError ? err.message : '加载失败');
     }
   };
-  usePoll(() => void load(), task && isTransitional(task.status) ? 2000 : 4000, [
-    task?.status,
-  ]);
+  // init_status pending|running 视为活跃（tasks.md 5.3：轮询条件不只看 task.status）
+  const initActive = task?.init_status === 'pending' || task?.init_status === 'running';
+  usePoll(
+    () => void load(),
+    (task && isTransitional(task.status)) || initActive ? 2000 : 4000,
+    [task?.status, task?.init_status],
+  );
 
   // shell 终端列表只需加载一次（新建/关闭由本页操作驱动）
   const loadShells = async () => {
@@ -106,6 +115,11 @@ export function TaskWorkbenchPage({ taskID }: { taskID: string }) {
   const notices = parseNotice(task?.notice);
   const status = task?.status ?? '';
   const tuiReady = status === 'active';
+  // init 门禁原因（空串 = 可激活）；失败展示以 init_error 为权威信息，日志仅辅助
+  const initBlock = task ? initActivateBlockReason(task) : '';
+  // pre-delete 失败以 last_error 的 `pre-delete:` 前缀稳定识别（tasks.md 5.3）
+  const preDeleteFailed =
+    status === 'deletion_failed' && (task?.last_error ?? '').startsWith('pre-delete:');
 
   return (
     <div className="workbench">
@@ -119,6 +133,16 @@ export function TaskWorkbenchPage({ taskID }: { taskID: string }) {
         <span className="page-title">{task?.name ?? '…'}</span>
         {task?.branch && <span className="header-meta mono">⎇ {task.branch}</span>}
         {task && <StatusBadge status={task.status} />}
+        {task && <InitStatusBadge task={task} />}
+        {task?.init_status === 'failed' && (
+          <button
+            className="btn btn-small btn-ghost"
+            title={task.init_error || 'init 失败'}
+            onClick={() => setLogView('init')}
+          >
+            日志
+          </button>
+        )}
         {task && <AgentStatusBadge agentStatus={task.agentStatus} />}
         <span className="header-spacer" />
         {error && <span className="header-error">{error}</span>}
@@ -139,6 +163,22 @@ export function TaskWorkbenchPage({ taskID }: { taskID: string }) {
       {task?.last_error && (
         <div className="alert-bar alert-error mono" title={task.last_error}>
           ⚠ {task.last_error}
+          {preDeleteFailed && (
+            <button className="btn btn-small" onClick={() => setLogView('pre-delete')}>
+              查看 pre-delete 日志
+            </button>
+          )}
+        </div>
+      )}
+      {task?.init_status === 'failed' && (
+        <div className="alert-bar alert-error">
+          <span className="mono" title={task.init_error}>
+            ⚠ init 失败：{task.init_error || '（无错误信息）'}
+          </span>
+          <button className="btn btn-small" onClick={() => setLogView('init')}>
+            查看日志
+          </button>
+          <RerunInitButton task={task} onDone={() => void load()} onError={setError} />
         </div>
       )}
       {notices.length > 0 && (
@@ -222,7 +262,15 @@ export function TaskWorkbenchPage({ taskID }: { taskID: string }) {
                 ) : status === 'suspended' ? (
                   <>
                     <span>任务已挂起，激活后可接入 opencode TUI</span>
-                    <ActivateButton task={task} onDone={() => void load()} onError={setError} />
+                    {initBlock && <span className="terminal-overlay-reason">{initBlock}</span>}
+                    <span className="terminal-overlay-actions">
+                      <ActivateButton task={task} onDone={() => void load()} onError={setError} />
+                      <RerunInitButton
+                        task={task}
+                        onDone={() => void load()}
+                        onError={setError}
+                      />
+                    </span>
                   </>
                 ) : (
                   <span>任务当前状态（{status}）不可用终端</span>
@@ -248,10 +296,33 @@ export function TaskWorkbenchPage({ taskID }: { taskID: string }) {
                 <div className="settings-title">任务级环境变量</div>
                 <EnvEditor base={`/tasks/${taskID}/env`} />
               </div>
+              <div className="settings-section">
+                <div className="settings-title">生命周期日志</div>
+                <div className="lc-log-entries">
+                  <button className="btn btn-small" onClick={() => setLogView('init')}>
+                    查看 init 日志
+                  </button>
+                  {preDeleteFailed && (
+                    <button className="btn btn-small" onClick={() => setLogView('pre-delete')}>
+                      查看 pre-delete 日志
+                    </button>
+                  )}
+                </div>
+              </div>
             </div>
           </div>
         )}
       </div>
+
+      {logView && task && (
+        <LifecycleLogModal
+          title={logView === 'init' ? 'init 日志' : 'pre-delete 日志'}
+          fetchLog={() =>
+            logView === 'init' ? api.getInitLog(task.id) : api.getPreDeleteLog(task.id)
+          }
+          onClose={() => setLogView(null)}
+        />
+      )}
 
       {deleting && task && (
         <DeleteTaskModal
@@ -274,10 +345,13 @@ function ActivateButton({
   onError: (m: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
+  // init 非 none|succeeded 时禁用并提示原因（tasks.md 5.3：覆盖 Workbench 内联激活入口）
+  const block = initActivateBlockReason(task);
   return (
     <button
       className="btn btn-primary btn-small"
-      disabled={busy}
+      disabled={busy || block !== ''}
+      title={block || undefined}
       onClick={async () => {
         setBusy(true);
         try {

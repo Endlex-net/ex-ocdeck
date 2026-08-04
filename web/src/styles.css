@@ -1268,3 +1268,91 @@ body {
 .configs-textarea:focus {
   border-color: var(--accent-dim);
 }
+
+/* ---------- 生命周期配置编辑器（project-lifecycle-config） ---------- */
+
+.lc-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.lc-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.lc-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.lc-note {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.lc-note-warn {
+  color: var(--red);
+}
+
+.lc-textarea {
+  width: 100%;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 8px 10px;
+  resize: vertical;
+  outline: none;
+  tab-size: 2;
+  box-sizing: border-box;
+}
+
+.lc-textarea:focus {
+  border-color: var(--accent-dim);
+}
+
+.lc-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.lc-log-entries {
+  display: flex;
+  gap: 8px;
+}
+
+/* 生命周期日志查看弹窗 */
+.modal-wide {
+  width: 720px;
+}
+
+.lc-log {
+  margin: 0;
+  max-height: 60vh;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 12px;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text);
+}
+
+.terminal-overlay-reason {
+  color: var(--red);
+}
+
+.terminal-overlay-actions {
+  display: inline-flex;
+  gap: 8px;
+}

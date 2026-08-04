@@ -64,7 +64,7 @@ export function DeleteTaskModal({ task, onClose, onDeleted }: DeleteTaskModalPro
                 checked={force}
                 onChange={(e) => setForce(e.target.checked)}
               />
-              强制删除（mode=force，跳过 opencode session 清理）
+              强制删除（mode=force，跳过 opencode session 清理，同时跳过 pre-delete 脚本）
             </label>
           )}
 

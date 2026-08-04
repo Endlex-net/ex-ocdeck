@@ -4,6 +4,7 @@ import type {
   GitStatus,
   GlobalEnvMode,
   GlobalEnvResponse,
+  LifecycleConfig,
   OcConfigContent,
   OcConfigInfo,
   OcConfigSaveResult,
@@ -100,6 +101,38 @@ export function wsURL(path: string): string {
   return `${proto}//${location.host}${path}`;
 }
 
+/** text/plain 端点（init-log / pre-delete-log）：空 body 返回空串。 */
+async function requestText(method: string, path: string): Promise<string> {
+  let res: Response;
+  try {
+    res = await fetch(`/api/v1${path}`, {
+      method,
+      headers: { Authorization: `Bearer ${getToken()}` },
+    });
+  } catch {
+    throw new ApiError(0, 'network_error', '无法连接服务端（ocdeck-server 未运行？）');
+  }
+  if (res.status === 401) {
+    clearToken();
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+    throw new ApiError(401, 'unauthorized', '认证失败，请重新输入 token');
+  }
+  const text = await res.text();
+  if (!res.ok) {
+    let code = 'unknown';
+    let message = `请求失败（HTTP ${res.status}）`;
+    try {
+      const errObj = (JSON.parse(text) as { error?: { code?: string; message?: string } }).error;
+      if (errObj?.code) code = errObj.code;
+      if (errObj?.message) message = errObj.message;
+    } catch {
+      /* 非 JSON 错误体 */
+    }
+    throw new ApiError(res.status, code, message);
+  }
+  return text;
+}
+
 export const api = {
   listProjects: () => request<Project[]>('GET', '/projects'),
   createProject: (name: string, path: string) =>
@@ -148,6 +181,17 @@ export const api = {
     request<EnvResponse>('PUT', base, { key, value }),
   deleteEnv: (base: string, key: string) =>
     request<EnvResponse>('DELETE', `${base}/${encodeURIComponent(key)}`),
+
+  /** 项目生命周期配置（project-lifecycle-config design.md §8/§9）：PUT 整体替换。 */
+  getLifecycleConfig: (projectID: string) =>
+    request<LifecycleConfig>('GET', `/projects/${projectID}/lifecycle-config`),
+  putLifecycleConfig: (projectID: string, config: LifecycleConfig) =>
+    request<LifecycleConfig>('PUT', `/projects/${projectID}/lifecycle-config`, config),
+  /** 成功返回最新任务 DTO（异步执行已登记，非同步完成）。 */
+  rerunInit: (taskID: string) => request<Task>('POST', `/tasks/${taskID}/rerun-init`),
+  /** text/plain：inherit 警告节 + init.log；无日志返回空串。 */
+  getInitLog: (taskID: string) => requestText('GET', `/tasks/${taskID}/init-log`),
+  getPreDeleteLog: (taskID: string) => requestText('GET', `/tasks/${taskID}/pre-delete-log`),
 
   /** 全局级 env（design.md 2.9）：follow_host 时 value 可空。保留 key 由服务端 422 拒绝。 */
   getGlobalEnv: () => request<GlobalEnvResponse>('GET', '/env'),

@@ -8,6 +8,9 @@ import { AgentStatusBadge } from '../components/AgentStatusBadge';
 import { TaskActions } from '../components/TaskActions';
 import { DeleteTaskModal } from '../components/DeleteTaskModal';
 import { EnvEditor } from '../components/EnvEditor';
+import { LifecycleConfigEditor } from '../components/LifecycleConfigEditor';
+import { InitStatusBadge } from '../components/InitStatusBadge';
+import { LifecycleLogModal } from '../components/LifecycleLogModal';
 
 export function ProjectDetailPage({ projectID }: { projectID: string }) {
   const [project, setProject] = useState<ProjectDetail | null>(null);
@@ -18,6 +21,9 @@ export function ProjectDetailPage({ projectID }: { projectID: string }) {
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<Task | null>(null);
   const [envOpen, setEnvOpen] = useState(false);
+  const [configOpen, setConfigOpen] = useState(false);
+  // init 失败任务的日志查看入口（tasks.md 5.3）
+  const [initLogTask, setInitLogTask] = useState<Task | null>(null);
 
   const load = async () => {
     try {
@@ -34,8 +40,12 @@ export function ProjectDetailPage({ projectID }: { projectID: string }) {
       setLoaded(true);
     }
   };
-  // 有过渡态任务时加快轮询以及时刷新 spinner 状态
-  const hasTransitional = tasks.some((t) => isTransitional(t.status));
+  // 有过渡态任务时加快轮询以及时刷新 spinner 状态；
+  // init_status pending|running 同样视为活跃（tasks.md 5.3：轮询条件不只看 task.status）
+  const hasTransitional = tasks.some(
+    (t) =>
+      isTransitional(t.status) || t.init_status === 'pending' || t.init_status === 'running',
+  );
   usePoll(() => void load(), hasTransitional ? 2000 : 5000, [hasTransitional]);
 
   const create = async (e: React.FormEvent) => {
@@ -104,6 +114,16 @@ export function ProjectDetailPage({ projectID }: { projectID: string }) {
         {envOpen && <EnvEditor base={`/projects/${projectID}/env`} />}
       </div>
 
+      <div className="env-section">
+        <button
+          className="btn btn-small btn-ghost env-toggle"
+          onClick={() => setConfigOpen((v) => !v)}
+        >
+          {configOpen ? '▾ Project Config' : '▸ Project Config'}
+        </button>
+        {configOpen && <LifecycleConfigEditor projectID={projectID} />}
+      </div>
+
       {loaded && tasks.length === 0 && (
         <div className="empty">暂无任务。创建一个任务以获得独立 worktree + opencode 会话。</div>
       )}
@@ -130,6 +150,19 @@ export function ProjectDetailPage({ projectID }: { projectID: string }) {
                 <span className="row-sub mono">{t.branch || t.worktree_path}</span>
               </div>
               <StatusBadge status={t.status} />
+              <InitStatusBadge task={t} />
+              {t.init_status === 'failed' && (
+                <button
+                  className="btn btn-small btn-ghost"
+                  title={t.init_error || 'init 失败'}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setInitLogTask(t);
+                  }}
+                >
+                  日志
+                </button>
+              )}
               <AgentStatusBadge agentStatus={t.agentStatus} />
               <TaskActions
                 task={t}
@@ -150,6 +183,14 @@ export function ProjectDetailPage({ projectID }: { projectID: string }) {
           );
         })}
       </ul>
+
+      {initLogTask && (
+        <LifecycleLogModal
+          title={`init 日志 · ${initLogTask.name}`}
+          fetchLog={() => api.getInitLog(initLogTask.id)}
+          onClose={() => setInitLogTask(null)}
+        />
+      )}
 
       {deleting && (
         <DeleteTaskModal

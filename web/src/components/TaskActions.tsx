@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { api, ApiError } from '../api';
-import { isTransitional, type Task } from '../types';
+import { initActivateBlockReason, isTransitional, type Task } from '../types';
+import { RerunInitButton } from './RerunInitButton';
 
 type Action = 'activate' | 'suspend' | 'archive' | 'restore' | 'retry';
 
@@ -43,6 +44,8 @@ export function TaskActions({ task, onDone, onError }: TaskActionsProps) {
   const [dirtyBusy, setDirtyBusy] = useState(false);
   const [dirtyError, setDirtyError] = useState('');
   const disabled = isTransitional(task.status) || pending !== null;
+  // init 非 none|succeeded 时激活入口禁用并提示原因（tasks.md 5.3）
+  const activateBlock = initActivateBlockReason(task);
 
   const run = async (action: Action) => {
     if (disabled) return;
@@ -100,7 +103,8 @@ export function TaskActions({ task, onDone, onError }: TaskActionsProps) {
         <button
           key={a}
           className="btn btn-small"
-          disabled={disabled}
+          disabled={disabled || (a === 'activate' && activateBlock !== '')}
+          title={a === 'activate' && activateBlock ? activateBlock : undefined}
           onClick={(e) => {
             e.stopPropagation();
             void run(a);
@@ -109,6 +113,8 @@ export function TaskActions({ task, onDone, onError }: TaskActionsProps) {
           {pending === a ? '…' : ACTION_LABEL[a]}
         </button>
       ))}
+
+      <RerunInitButton task={task} onDone={onDone} onError={onError} />
 
       {dirtyPrompt && (
         <div

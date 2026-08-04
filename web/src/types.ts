@@ -36,6 +36,10 @@ export interface Task {
   /** 服务端以 json.RawMessage 原样输出，客户端收到的是数组而非字符串。 */
   notice?: NoticeItem[];
   delete_mode?: string;
+  /** init 脚本状态（project-lifecycle-config）：none|pending|running|succeeded|failed。后端 DTO 始终返回。 */
+  init_status: string;
+  /** init 失败原因（权威信息，日志仅辅助）。 */
+  init_error?: string;
   created_at: number;
   updated_at: number;
   sessions?: TaskSession[];
@@ -73,6 +77,13 @@ export interface GitDiffResult {
 export interface EnvVar {
   key: string;
   value: string;
+}
+
+/** GET/PUT /projects/:id/lifecycle-config（project-lifecycle-config design.md §8）。 */
+export interface LifecycleConfig {
+  inherit_patterns: string;
+  init_script: string;
+  pre_delete_script: string;
 }
 
 /** GET env 响应；PUT/DELETE 响应仅含 restartRequired + warning。 */
@@ -141,6 +152,26 @@ export const FAILED_STATUS = new Set(['creation_failed', 'deletion_failed']);
 
 export function isTransitional(status: string): boolean {
   return TRANSITIONAL_STATUS.has(status);
+}
+
+/**
+ * init 门禁（tasks.md 5.3 / design.md §5）：仅 none|succeeded 可激活（空串原因）；
+ * 缺失/空串/未知值一律 fail-closed 阻断（同后端 Activate 门禁，防御契约漂移）。
+ * init_error 为权威失败信息。
+ */
+export function initActivateBlockReason(task: Task): string {
+  switch (task.init_status) {
+    case 'none':
+    case 'succeeded':
+      return '';
+    case 'pending':
+    case 'running':
+      return 'init 进行中，完成后方可激活';
+    case 'failed':
+      return task.init_error ? `init 失败：${task.init_error}` : 'init 失败，请查看日志';
+    default:
+      return `init 状态未知（${task.init_status ?? ''}），暂不可激活`;
+  }
 }
 
 export function parseNotice(raw: Task['notice']): NoticeItem[] {
