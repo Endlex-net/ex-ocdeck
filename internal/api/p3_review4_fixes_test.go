@@ -93,6 +93,18 @@ func (f *fakeTaskBackend) GitCommit(ctx context.Context, taskID, message string,
 }
 func (f *fakeTaskBackend) GitPush(ctx context.Context, taskID string) error { return nil }
 
+// Lifecycle config / init rerun / logs 默认实现（noop / 空值）：
+// 实际行为由 lifecycle_config_api_test.go 与具体场景注入 mock 覆盖。
+func (f *fakeTaskBackend) RerunInit(ctx context.Context, taskID string) (task.TaskRow, error) {
+	return task.TaskRow{}, nil
+}
+func (f *fakeTaskBackend) ReadInitLog(ctx context.Context, taskID string) (string, error) {
+	return "", nil
+}
+func (f *fakeTaskBackend) ReadPreDeleteLog(ctx context.Context, taskID string) (string, error) {
+	return "", nil
+}
+
 // newAPITestServer 构造带 TaskBackend 的 Server。
 func newAPITestServer(t *testing.T, tb TaskBackend) *Server {
 	t.Helper()

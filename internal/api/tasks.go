@@ -45,29 +45,41 @@ type TaskBackend interface {
 	GitDiff(ctx context.Context, taskID, ref, path string) (task.GitDiffDTO, error)
 	GitCommit(ctx context.Context, taskID, message string, paths []string) error
 	GitPush(ctx context.Context, taskID string) error
+	// RerunInit 手动重跑 init 脚本（design.md §8，tasks 3.6）。
+	// 返回 claim 后的任务行（init_status=running），供 API 层 200+DTO。
+	// task.OpError 映射：invalid_state → 422、conflict → 409。
+	RerunInit(ctx context.Context, taskID string) (task.TaskRow, error)
+	// ReadInitLog 读取 init 日志（design.md §7.4/§8）：inherit 警告节 + init.log 拼接，tail ≤64KB。
+	// 任务不存在 → not_found；无日志文件返回空串非错误。
+	ReadInitLog(ctx context.Context, taskID string) (string, error)
+	// ReadPreDeleteLog 读取 pre-delete 日志（design.md §7.4/§8）：pre-delete.log，tail ≤64KB。
+	// 任务不存在 → not_found；无日志文件返回空串非错误。
+	ReadPreDeleteLog(ctx context.Context, taskID string) (string, error)
 }
 
 // TaskRowDTO 任务详情 DTO（design.md §21 GET /tasks/:id）。
 type TaskRowDTO struct {
-	ID           string            `json:"id"`
-	ProjectID    string            `json:"project_id"`
-	Name         string            `json:"name"`
-	Branch       string            `json:"branch"`
-	Status       string            `json:"status"`
-	WorktreePath string            `json:"worktree_path"`
-	LastPort     int               `json:"last_port,omitempty"`
-	LastError    string            `json:"last_error,omitempty"`
-	Notice       json.RawMessage    `json:"notice,omitempty"`
-	DeleteMode   string            `json:"delete_mode,omitempty"`
-	CreatedAt    int64             `json:"created_at"`
-	UpdatedAt    int64             `json:"updated_at"`
-	Sessions     []SessionRowDTO   `json:"sessions,omitempty"`
+	ID           string          `json:"id"`
+	ProjectID    string          `json:"project_id"`
+	Name         string          `json:"name"`
+	Branch       string          `json:"branch"`
+	Status       string          `json:"status"`
+	WorktreePath string          `json:"worktree_path"`
+	LastPort     int             `json:"last_port,omitempty"`
+	LastError    string          `json:"last_error,omitempty"`
+	Notice       json.RawMessage `json:"notice,omitempty"`
+	DeleteMode   string          `json:"delete_mode,omitempty"`
+	CreatedAt    int64           `json:"created_at"`
+	UpdatedAt    int64           `json:"updated_at"`
+	InitStatus   string          `json:"init_status"`
+	InitError    string          `json:"init_error,omitempty"`
+	Sessions     []SessionRowDTO `json:"sessions,omitempty"`
 }
 
 // SessionRowDTO 会话归属 DTO。
 type SessionRowDTO struct {
-	SessionID string `json:"session_id"`
-	LastSeenAt int64 `json:"last_seen_at"`
+	SessionID  string `json:"session_id"`
+	LastSeenAt int64  `json:"last_seen_at"`
 }
 
 // registerTaskRoutes 注册 tasks 路由（design.md §21）。
@@ -83,6 +95,9 @@ func (s *Server) registerTaskRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/tasks/{id}/archive", s.handleTaskAction(s.tasks.Archive))
 	mux.HandleFunc("POST /api/v1/tasks/{id}/restore", s.handleTaskAction(s.tasks.Restore))
 	mux.HandleFunc("POST /api/v1/tasks/{id}/retry", s.handleRetryTask)
+	mux.HandleFunc("POST /api/v1/tasks/{id}/rerun-init", s.handleRerunInit)
+	mux.HandleFunc("GET /api/v1/tasks/{id}/init-log", s.handleReadInitLog)
+	mux.HandleFunc("GET /api/v1/tasks/{id}/pre-delete-log", s.handleReadPreDeleteLog)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/attach/reopen", s.handleReopenAttach)
 	mux.HandleFunc("DELETE /api/v1/tasks/{id}", s.handleDeleteTask)
 	mux.HandleFunc("GET /api/v1/tasks/{id}/terminals", s.handleListTerminals)
@@ -212,6 +227,48 @@ func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleRerunInit POST /api/v1/tasks/{id}/rerun-init（design.md §8）。
+// 独立 handler（非 handleTaskAction——既有 helper 返回 204）；成功 200 + 任务 DTO。
+// task.OpError 映射走 mapTaskErr（invalid_state → 422、conflict → 409）。
+func (s *Server) handleRerunInit(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("id")
+	row, err := s.tasks.RerunInit(r.Context(), taskID)
+	if err != nil {
+		writeApiError(w, mapTaskErr(err))
+		return
+	}
+	dto := toTaskDTO(row)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(dto)
+}
+
+// handleReadInitLog GET /api/v1/tasks/{id}/init-log（design.md §7.4/§8）。
+// text/plain；任务不存在 → not_found；无日志文件 → 200 空 body；tail ≤64KB。
+func (s *Server) handleReadInitLog(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("id")
+	content, err := s.tasks.ReadInitLog(r.Context(), taskID)
+	if err != nil {
+		writeApiError(w, mapTaskErr(err))
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte(content))
+}
+
+// handleReadPreDeleteLog GET /api/v1/tasks/{id}/pre-delete-log（design.md §7.4/§8）。
+// text/plain；任务不存在 → not_found；无日志文件 → 200 空 body；tail ≤64KB。
+func (s *Server) handleReadPreDeleteLog(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("id")
+	content, err := s.tasks.ReadPreDeleteLog(r.Context(), taskID)
+	if err != nil {
+		writeApiError(w, mapTaskErr(err))
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte(content))
+}
+
 func (s *Server) handleListTerminals(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
 	shells, err := s.tasks.ListShells(taskID)
@@ -262,6 +319,8 @@ type taskRowDTO struct {
 	DeleteMode   string          `json:"delete_mode,omitempty"`
 	CreatedAt    int64           `json:"created_at"`
 	UpdatedAt    int64           `json:"updated_at"`
+	InitStatus   string          `json:"init_status"`
+	InitError    string          `json:"init_error,omitempty"`
 	Sessions     []sessionRowDTO `json:"sessions,omitempty"`
 	AgentStatus  string          `json:"agentStatus,omitempty"`
 }
@@ -287,6 +346,11 @@ func toTaskDTO(t task.TaskRow) taskRowDTO {
 	}
 	if t.DeleteMode.Valid {
 		dto.DeleteMode = t.DeleteMode.String
+	}
+	// init_status 始终序列化（none 时前端用于判断徽标/入口），init_error 仅 failed 时有值。
+	dto.InitStatus = t.InitStatus
+	if t.InitError.Valid {
+		dto.InitError = t.InitError.String
 	}
 	return dto
 }

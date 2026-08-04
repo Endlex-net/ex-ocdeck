@@ -18,15 +18,16 @@ import (
 
 // Server 持有 HTTP 服务与依赖。本任务提供骨架与占位路由。
 type Server struct {
-	cfg     *config.Config
-	mux     *http.ServeMux
-	auth    *TokenAuthenticator
-	store   StoreRO
-	projs   ProjectStore
-	tasks   TaskBackend
-	envs    EnvStore
-	ocCfgs  OCConfigService
-	httpSrv *http.Server
+	cfg           *config.Config
+	mux           *http.ServeMux
+	auth          *TokenAuthenticator
+	store         StoreRO
+	projs         ProjectStore
+	tasks         TaskBackend
+	envs          EnvStore
+	lifecycleCfgs LifecycleConfigStore
+	ocCfgs        OCConfigService
+	httpSrv       *http.Server
 
 	// watchdogStateProvider 返回 watchdog 运行态字符串（off/running/degraded），
 	// 供 /server/status 接线（design.md §21）。nil 时回退 "off"。
@@ -96,6 +97,12 @@ func (s *Server) SetEnvStore(envs EnvStore) {
 	s.envs = envs
 }
 
+// SetLifecycleConfigStore 注入 LifecycleConfigStore（design.md §8 lifecycle-config 路由）。
+// 延迟注入需调用 RebuildRoutes。
+func (s *Server) SetLifecycleConfigStore(store LifecycleConfigStore) {
+	s.lifecycleCfgs = store
+}
+
 // SetOCConfigService 注入全局配置管理服务（design.md §13/§21 oc-configs 路由）。
 // 延迟注入需调用 RebuildRoutes。
 func (s *Server) SetOCConfigService(svc OCConfigService) {
@@ -122,6 +129,7 @@ func New(cfg *config.Config, store StoreRO) *Server {
 	if db, ok := store.(*storepkg.DB); ok && db != nil {
 		s.projs = NewProjectStoreAdapter(db)
 		s.envs = NewEnvStoreAdapter(db)
+		s.lifecycleCfgs = NewLifecycleConfigStoreAdapter(db)
 	}
 	s.registerRoutes()
 	return s
@@ -144,10 +152,11 @@ func (s *Server) registerRoutes() {
 	apiMux := http.NewServeMux()
 	apiMux.HandleFunc("GET /api/v1/server/status", s.handleServerStatus)
 	s.registerProjectRoutes(apiMux)
-	s.registerTaskRoutes(apiMux) // task 路由接入主 api 子 mux
-	s.registerGitRoutes(apiMux)  // git 状态/diff/commit/push（design.md §21）
-	s.registerEnvRoutes(apiMux)  // project/task env CRUD（design.md §21）
-	s.registerOCConfigRoutes(apiMux) // 全局 oc 配置管理（design.md §13/§21）
+	s.registerTaskRoutes(apiMux)            // task 路由接入主 api 子 mux
+	s.registerGitRoutes(apiMux)             // git 状态/diff/commit/push（design.md §21）
+	s.registerEnvRoutes(apiMux)             // project/task env CRUD（design.md §21）
+	s.registerLifecycleConfigRoutes(apiMux) // project lifecycle config（design.md §8）
+	s.registerOCConfigRoutes(apiMux)        // 全局 oc 配置管理（design.md §13/§21）
 
 	// /api/v1 前缀统一挂认证中间件（design.md §14/§21）。
 	// 已认证请求的未知路由/方法返回统一 JSON 404/405（design.md §21 错误结构）。
