@@ -16,7 +16,7 @@ func Status(ctx context.Context, dir string) ([]FileStatus, error) {
 		return nil, err
 	}
 
-	entries, perr := parseStatusPorcelainV2Z(strings.NewReader(out), MaxStatusFiles)
+	entries, perr := parseStatusPorcelainV2Z(strings.NewReader(out), MaxStatusFiles, false, nil)
 	if perr != nil {
 		return nil, perr
 	}
@@ -64,6 +64,61 @@ func mergeEntry(e *FileStatus, s *numstatEntry) {
 	}
 	e.Additions += s.additions
 	e.Deletions += s.deletions
+}
+
+// ListIgnoredUntracked 枚举 repoPath 工作区的 untracked 与 ignored 文件（design.md §7.2）。
+// 命令 MUST 为 `git status --porcelain=v2 -z --ignored=traditional --untracked-files=all`：
+// --ignored=traditional + -uall 才返回 ignored 目录内文件级记录（matching 仅返回目录级）。
+// 返回仅含 untracked(`?`) 与 ignored(`!`) 两类；`.git` 条目 MUST 排除。
+// 复用 boundedBuffer（有界输出）+ 参数白名单（无选项注入面）。变更文件数超过 MaxStatusFiles
+// 返回 ErrTooManyFilesChanged。只读操作，不进 repo 写锁。
+//
+// 有界计数只针对 `?`/`!` 目标条目：parser 经 kindFilter 在解析阶段即跳过 tracked
+// ordinary/rename/unmerged 条目（不分配 FileStatus、不计数），避免大量 modified tracked
+// 文件触发上限或造成无谓分配。达到 MaxStatusFiles+1 个目标条目即返回 ErrTooManyFilesChanged。
+func ListIgnoredUntracked(ctx context.Context, repoPath string) ([]FileStatus, error) {
+	out, _, err := run(ctx, repoPath, "status", "--porcelain=v2", "-z",
+		"--ignored=traditional", "--untracked-files=all")
+	if err != nil {
+		return nil, err
+	}
+	// kindFilter 仅保留 '?'(untracked) 与 '!'(ignored)；其余 kind（tracked）在解析阶段跳过。
+	entries, perr := parseStatusPorcelainV2Z(strings.NewReader(out), MaxStatusFiles, true,
+		func(kind byte) bool { return kind == '?' || kind == '!' })
+	if perr != nil {
+		return nil, perr
+	}
+	// 排除 `.git` 条目（design.md §7.2）。
+	var filtered []FileStatus
+	for _, e := range entries {
+		if isGitPath(e.Path) {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	return filtered, nil
+}
+
+// isGitPath 判断相对路径是否位于 .git 下（根 .git 或任意层级子目录）。
+// Path 为相对路径（porcelain v2 输出），含反斜杠需先归一。
+func isGitPath(p string) bool {
+	if p == ".git" {
+		return true
+	}
+	rest := p
+	for {
+		if rest == ".git" {
+			return true
+		}
+		i := strings.IndexByte(rest, '/')
+		if i < 0 {
+			return false
+		}
+		if rest[:i] == ".git" {
+			return true
+		}
+		rest = rest[i+1:]
+	}
 }
 
 func applyRenameNumstat(e *FileStatus, stagedByPath, stagedByRename, unstagedByPath, unstagedByRename map[string]*numstatEntry) {

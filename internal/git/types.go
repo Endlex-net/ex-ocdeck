@@ -4,7 +4,7 @@ import "errors"
 
 // FileStatus 描述单个文件在 porcelain v2 中的状态条目。
 type FileStatus struct {
-	// Kind 为条目类型：'1' ordinary / '2' rename / 'u' unmerged / '?' untracked。
+	// Kind 为条目类型：'1' ordinary / '2' rename / 'u' unmerged / '?' untracked / '!' ignored。
 	Kind string
 	// Path 为条目对应的文件路径（rename 时为新路径/目标路径）。
 	Path string
@@ -19,6 +19,9 @@ type FileStatus struct {
 	Unstaged bool
 	// Untracked 当条目为 '?' 时为 true。
 	Untracked bool
+	// Ignored 当条目为 '!'（--ignored=traditional 文件级枚举）时为 true。
+	// 既有 Status 调用默认不含 ignored 条目；仅 ListIgnoredUntracked 返回。
+	Ignored bool
 	// Additions / Deletions 为关联 numstat 的增删行数（未跟踪文件 additions 表示行数估算）。
 	Additions int
 	Deletions int

@@ -408,7 +408,7 @@ func TestStatusNonExistentDir(t *testing.T) {
 func TestParseStatusPorcelainV2ZUnmerged(t *testing.T) {
 	// 构造 unmerged 输入。
 	input := "u UU N... 100644 100644 100644 100644 78981922613b2afb6025042ff6bd878ac1994e85 975fbec8256d3e8a3797e7a3611380f27c49f4ac 587be6b4c3f93f93c489c0111bba5596147a26cb f.txt\x00"
-	entries, err := parseStatusPorcelainV2Z(strings.NewReader(input), 100)
+	entries, err := parseStatusPorcelainV2Z(strings.NewReader(input), 100, false, nil)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -417,6 +417,63 @@ func TestParseStatusPorcelainV2ZUnmerged(t *testing.T) {
 	}
 	if entries[0].X != 'U' || entries[0].Y != 'U' {
 		t.Errorf("want UU, got %c%c", entries[0].X, entries[0].Y)
+	}
+}
+
+// TestParseStatusPorcelainV2ZKindFilterSkipsRenamePreservesStream 验证 kindFilter 跳过 '2' rename
+// 条目时正确消费其第二条 NUL 记录（旧路径），保持流位置——紧跟其后的 `?`/`!` 目标条目应被正确解析。
+// 合成 porcelain v2 -z 输入：rename(2) + oldPath + untracked(?) + ignored(!)。
+func TestParseStatusPorcelainV2ZKindFilterSkipsRenamePreservesStream(t *testing.T) {
+	// "2 XY sub mH mI mW hO iO score newPath\x00oldPath\x00? untracked.txt\x00! ignored.log\x00"
+	input := "2 R. N... 100644 100644 100644 78981922613b2afb6025042ff6bd878ac1994e85 975fbec8256d3e8a3797e7a3611380f27c49f4ac 100 new.txt\x00old.txt\x00? untracked.txt\x00! ignored.log\x00"
+	// kindFilter 仅保留 '?' 与 '!'；'2' rename 被跳过但必须消费 oldPath NUL 记录。
+	entries, err := parseStatusPorcelainV2Z(strings.NewReader(input), 100, true,
+		func(kind byte) bool { return kind == '?' || kind == '!' })
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 target entries (rename skipped), got %d: %+v", len(entries), entries)
+	}
+	if entries[0].Kind != "?" || entries[0].Path != "untracked.txt" || !entries[0].Untracked {
+		t.Errorf("entry[0] wrong: %+v", entries[0])
+	}
+	if entries[1].Kind != "!" || entries[1].Path != "ignored.log" || !entries[1].Ignored {
+		t.Errorf("entry[1] wrong: %+v", entries[1])
+	}
+}
+
+// TestParseStatusPorcelainV2ZKindFilterSkipsTrackedOrdinary 验证 kindFilter 跳过 '1' ordinary
+// 条目时不分配、不计数；紧跟其后的目标条目被正确解析。
+func TestParseStatusPorcelainV2ZKindFilterSkipsTrackedOrdinary(t *testing.T) {
+	// "1 XY sub mH mI mW hO iO path\x00? untracked.txt\x00"
+	input := "1 .M N... 100644 100644 100644 78981922613b2afb6025042ff6bd878ac1994e85 975fbec8256d3e8a3797e7a3611380f27c49f4ac tracked.txt\x00? untracked.txt\x00"
+	entries, err := parseStatusPorcelainV2Z(strings.NewReader(input), 100, true,
+		func(kind byte) bool { return kind == '?' || kind == '!' })
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Kind != "?" || entries[0].Path != "untracked.txt" {
+		t.Fatalf("expected only untracked.txt (ordinary skipped), got %+v", entries)
+	}
+}
+
+// TestParseStatusPorcelainV2ZKindFilterTargetLimit 验证 kindFilter 路径下目标条目达 maxFiles+1 即 ErrTooManyFilesChanged，
+// tracked 条目不计数（合成输入：2 个 tracked ordinary + maxFiles+1 个 untracked）。
+func TestParseStatusPorcelainV2ZKindFilterTargetLimit(t *testing.T) {
+	var b strings.Builder
+	// 2 个 tracked ordinary（被 kindFilter 跳过，不计数）。
+	b.WriteString("1 .M N... 100644 100644 100644 78981922613b2afb6025042ff6bd878ac1994e85 975fbec8256d3e8a3797e7a3611380f27c49f4ac t1.txt\x00")
+	b.WriteString("1 .M N... 100644 100644 100644 78981922613b2afb6025042ff6bd878ac1994e85 975fbec8256d3e8a3797e7a3611380f27c49f4ac t2.txt\x00")
+	// maxFiles+1 个 untracked（目标条目，超限）。
+	const maxFiles = 5
+	for i := 0; i <= maxFiles; i++ {
+		b.WriteString("? u" + itoa(i) + ".txt\x00")
+	}
+	_, err := parseStatusPorcelainV2Z(strings.NewReader(b.String()), maxFiles, true,
+		func(kind byte) bool { return kind == '?' || kind == '!' })
+	if err != ErrTooManyFilesChanged {
+		t.Fatalf("want ErrTooManyFilesChanged (tracked not counted, %d targets), got %v", maxFiles+1, err)
 	}
 }
 
@@ -593,7 +650,7 @@ func TestDiffEmptyPathPrecountCarriesRef(t *testing.T) {
 
 // P2: 带 ref 的全仓 diff 文件数超过 DiffMaxFiles 时 MUST 截断（预统计带 ref）。
 // 构造：init 基线提交后，新增 >DiffMaxFiles 个文件并提交为 c1，回退工作区
-//（git reset --hard HEAD~1）使默认工作区 diff 文件数 = 0，但 ref=c1 的全仓 diff
+// （git reset --hard HEAD~1）使默认工作区 diff 文件数 = 0，但 ref=c1 的全仓 diff
 // 文件数 = DiffMaxFiles+5。旧实现预统计不带 ref → 文件数=0 不截断；实际 diff 带 ref
 // 输出超大（绕过限制）。修复后预统计带 ref → 文件数 > DiffMaxFiles → truncated=true。
 func TestDiffEmptyPathRefPrecountTruncates(t *testing.T) {
@@ -633,4 +690,179 @@ func currentRef(t *testing.T, dir string) string {
 		t.Fatalf("rev-parse HEAD: %v", err)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// findIgnoredEntry 在 entries 中查找指定路径的 ignored 条目。
+func findIgnoredEntry(entries []FileStatus, path string) (FileStatus, bool) {
+	for _, e := range entries {
+		if e.Path == path && e.Ignored {
+			return e, true
+		}
+	}
+	return FileStatus{}, false
+}
+
+// TestListIgnoredUntracked 验证 ListIgnoredUntracked 枚举 untracked + ignored 文件级记录（design.md §7.2）。
+// 覆盖：untracked/ignored/tracked 混合、ignored 目录内嵌套文件展开、-uall 展开、`.git` 排除。
+func TestListIgnoredUntracked(t *testing.T) {
+	repo := newTestRepo(t)
+	// tracked 文件（已在 newTestRepo 中提交 README.md）。
+	// untracked 普通文件。
+	writeFile(t, repo, "untracked.txt", "x\n")
+	// untracked 目录内嵌套文件（-uall 展开）。
+	writeFile(t, repo, "newdir/sub/deep.txt", "y\n")
+	// ignored：根 .gitignore + ignored 目录内嵌套文件。
+	writeFile(t, repo, ".gitignore", "ignored/\n*.log\n")
+	writeFile(t, repo, "ignored/nested/file.log", "z\n")
+	writeFile(t, repo, "root.log", "r\n")
+
+	entries, err := ListIgnoredUntracked(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("ListIgnoredUntracked: %v", err)
+	}
+
+	// untracked.txt 出现在 untracked 条目。
+	if u, ok := findEntry(entries, "untracked.txt"); !ok || !u.Untracked {
+		t.Errorf("untracked.txt missing or not untracked: %+v", u)
+	}
+	// newdir 下嵌套文件应被 -uall 展开（非目录占位）。
+	if _, ok := findEntry(entries, "newdir/sub/deep.txt"); !ok {
+		t.Errorf("newdir/sub/deep.txt should be expanded by -uall, got %v", entries)
+	}
+	// ignored 目录内嵌套文件应被 traditional + -uall 展开为文件级记录。
+	if _, ok := findIgnoredEntry(entries, "ignored/nested/file.log"); !ok {
+		t.Errorf("ignored/nested/file.log should be expanded (ignored), got %v", entries)
+	}
+	// root.log 被 *.log 匹配为 ignored。
+	if _, ok := findIgnoredEntry(entries, "root.log"); !ok {
+		t.Errorf("root.log should be ignored (*.log), got %v", entries)
+	}
+	// tracked 文件 README.md 不应出现。
+	if e, ok := findEntry(entries, "README.md"); ok && !e.Untracked && !e.Ignored {
+		t.Errorf("tracked README.md should not appear, got %+v", e)
+	}
+	// .git 条目 MUST 排除。
+	for _, e := range entries {
+		if isGitPath(e.Path) {
+			t.Errorf(".git path should be excluded: %+v", e)
+		}
+	}
+}
+
+// TestListIgnoredUntrackedTooManyFiles 验证有界输出超限返回 ErrTooManyFilesChanged。
+func TestListIgnoredUntrackedTooManyFiles(t *testing.T) {
+	repo := newTestRepo(t)
+	for i := 0; i < MaxStatusFiles+5; i++ {
+		writeFile(t, repo, "f"+pad(i)+".txt", "x\n")
+	}
+	_, err := ListIgnoredUntracked(context.Background(), repo)
+	if err != ErrTooManyFilesChanged {
+		t.Fatalf("want ErrTooManyFilesChanged, got %v", err)
+	}
+}
+
+// TestStatusExcludesIgnored 防回归：既有 Status 调用方默认不含 ignored 条目。
+func TestStatusExcludesIgnored(t *testing.T) {
+	repo := newTestRepo(t)
+	writeFile(t, repo, ".gitignore", "*.log\n")
+	writeFile(t, repo, "ignored.log", "x\n")
+	writeFile(t, repo, "untracked.txt", "y\n")
+
+	entries, err := Status(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if _, ok := findEntry(entries, "ignored.log"); ok {
+		t.Errorf("Status should exclude ignored entries, found ignored.log in %v", entries)
+	}
+	if _, ok := findEntry(entries, "untracked.txt"); !ok {
+		t.Errorf("Status should include untracked, missing untracked.txt in %v", entries)
+	}
+}
+
+// TestListIgnoredUntrackedExcludesModifiedTracked 验证 ListIgnoredUntracked 不返回修改过的 tracked 文件
+// （design.md §7.2：仅含 untracked(`?`) 与 ignored(`!`) 两类）。
+func TestListIgnoredUntrackedExcludesModifiedTracked(t *testing.T) {
+	repo := newTestRepo(t)
+	// 建立一个 tracked 文件。
+	writeFile(t, repo, "tracked.txt", "init\n")
+	runGit(t, repo, "add", "tracked.txt")
+	runGit(t, repo, "commit", "-qm", "add tracked")
+	// 修改 tracked 文件（ordinary 条目，非 untracked/ignored）。
+	writeFile(t, repo, "tracked.txt", "modified\n")
+	// 同时有 untracked 与 ignored。
+	writeFile(t, repo, ".gitignore", "*.log\n")
+	writeFile(t, repo, "ignored.log", "x\n")
+	writeFile(t, repo, "untracked.txt", "y\n")
+
+	entries, err := ListIgnoredUntracked(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("ListIgnoredUntracked: %v", err)
+	}
+	for _, e := range entries {
+		if !e.Untracked && !e.Ignored {
+			t.Errorf("ListIgnoredUntracked must only return untracked/ignored, got %v", e)
+		}
+	}
+	// 修改过的 tracked.txt 不应出现。
+	if e, ok := findEntry(entries, "tracked.txt"); ok {
+		t.Errorf("modified tracked file should not be returned, got %+v", e)
+	}
+}
+
+// TestListIgnoredUntrackedManyTrackedNotCounted 验证有界计数只针对 `?`/`!` 目标条目，
+// tracked 条目在解析阶段即跳过（不分配、不计数，design.md §7.2）。构造：超过 MaxStatusFiles
+// 个 modified tracked 文件 + 少量 untracked/ignored，证明 tracked 不计数、不超限、目标计数正确。
+func TestListIgnoredUntrackedManyTrackedNotCounted(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping >MaxStatusFiles tracked files test in -short mode")
+	}
+	repo := newTestRepo(t)
+	// 建立超过 MaxStatusFiles 个 tracked 文件并修改（ordinary 条目，经 kindFilter 在解析阶段跳过）。
+	const trackedCount = MaxStatusFiles + 50
+	for i := 0; i < trackedCount; i++ {
+		writeFile(t, repo, "t"+pad(i)+".txt", "init\n")
+	}
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-qm", "add tracked baseline")
+	for i := 0; i < trackedCount; i++ {
+		writeFile(t, repo, "t"+pad(i)+".txt", "modified\n")
+	}
+	// 少量 untracked + ignored（.gitignore 提交为 tracked，不参与目标计数）。
+	writeFile(t, repo, ".gitignore", "*.log\n")
+	runGit(t, repo, "add", ".gitignore")
+	runGit(t, repo, "commit", "-qm", "add gitignore")
+	writeFile(t, repo, "ignored.log", "x\n")
+	writeFile(t, repo, "untracked.txt", "y\n")
+
+	entries, err := ListIgnoredUntracked(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("ListIgnoredUntracked: %v (tracked files must not be counted toward limit)", err)
+	}
+	// 仅含 untracked/ignored，tracked 不返回。
+	for _, e := range entries {
+		if !e.Untracked && !e.Ignored {
+			t.Errorf("tracked file leaked: %+v", e)
+		}
+	}
+	// 目标条目计数 = 2（untracked.txt + ignored.log）。
+	if len(entries) != 2 {
+		t.Errorf("expected 2 target entries (1 untracked + 1 ignored), got %d: %v", len(entries), entries)
+	}
+}
+
+// TestListIgnoredUntrackedTargetLimit 验证达到 MaxStatusFiles+1 个目标条目（?/!）即 ErrTooManyFilesChanged。
+func TestListIgnoredUntrackedTargetLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping large target count test in -short mode")
+	}
+	repo := newTestRepo(t)
+	// 全部作为 untracked（不提交），超过 MaxStatusFiles 个目标条目。
+	for i := 0; i < MaxStatusFiles+1; i++ {
+		writeFile(t, repo, "u"+pad(i)+".txt", "x\n")
+	}
+	_, err := ListIgnoredUntracked(context.Background(), repo)
+	if err != ErrTooManyFilesChanged {
+		t.Fatalf("want ErrTooManyFilesChanged for %d target entries, got %v", MaxStatusFiles+1, err)
+	}
 }

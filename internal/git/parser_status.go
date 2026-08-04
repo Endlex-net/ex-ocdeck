@@ -9,10 +9,13 @@ import (
 	"strings"
 )
 
-// parseStatusPorcelainV2Z 流式解析 `git status --porcelain=v2 -z -uall` 的输出。
-// reader 中的条目以 NUL 分隔。当累计条目数超过 maxFiles 时返回 ErrTooManyFilesChanged。
-// 忽略未知条目类型与以 '!' 开头的 ignored 条目。
-func parseStatusPorcelainV2Z(reader io.Reader, maxFiles int) ([]FileStatus, error) {
+// parseStatusPorcelainV2Z 流式解析 `git status --porcelain=v2 -z` 的输出。
+// reader 中的条目以 NUL 分隔。当累计目标条目数超过 maxFiles 时返回 ErrTooManyFilesChanged。
+// includeIgnored=false 时跳过 '!' ignored 条目（既有 Status 调用方默认不含 ignored）。
+// kindFilter 为非 nil 时，仅首字节（kind）命中过滤器的记录才被解析/计数——非目标 kind
+// 在解析阶段即跳过（不分配 FileStatus、不计数），避免大量非目标条目（如 modified tracked）
+// 触发上限或造成无谓分配（design.md §7.2：ListIgnoredUntracked 仅需 ?/! 目标条目）。
+func parseStatusPorcelainV2Z(reader io.Reader, maxFiles int, includeIgnored bool, kindFilter func(byte) bool) ([]FileStatus, error) {
 	br := bufio.NewReader(reader)
 	var result []FileStatus
 	// 逐条读取 NUL 终止的记录。
@@ -33,9 +36,33 @@ func parseStatusPorcelainV2Z(reader io.Reader, maxFiles int) ([]FileStatus, erro
 			continue
 		}
 
+		// kind 过滤：非目标 kind 在解析阶段即跳过（不分配、不计数）。
+		// '2' rename 条目需额外读旧路径 NUL 记录——过滤时仍需跳过该记录以保持流位置。
+		kind := record[0]
+		if kindFilter != nil && !kindFilter(kind) {
+			if kind == '2' {
+				// rename 有第二条 NUL 记录（旧路径），必须消费以保持流位置。
+				if _, nerr := readNullTerminated(br); nerr != nil && nerr != io.EOF {
+					return nil, fmt.Errorf("read porcelain v2 rename path (filtered): %w", nerr)
+				}
+			}
+			if err == io.EOF {
+				break
+			}
+			continue
+		}
+
 		entry, perr := parsePorcelainEntry(record)
 		if perr != nil {
 			// 未能识别的条目类型：跳过该条记录。
+			if err == io.EOF {
+				break
+			}
+			continue
+		}
+		// ignored 条目：仅 includeIgnored=true 时保留（design.md §7.2：既有 Status 调用方
+		// 默认不含 ignored；ListIgnoredUntracked 单独入口）。
+		if entry != nil && entry.Kind == "!" && !includeIgnored {
 			if err == io.EOF {
 				break
 			}
@@ -114,8 +141,8 @@ func parsePorcelainEntry(record []byte) (*FileStatus, error) {
 	case '?':
 		return parseUntracked(record)
 	case '!':
-		// ignored 条目：跳过。
-		return nil, errors.New("ignored entry")
+		// ignored 条目（--ignored=traditional）：解析路径。
+		return parseIgnored(record)
 	default:
 		return nil, fmt.Errorf("unknown porcelain v2 entry kind %q", kind)
 	}
@@ -192,6 +219,21 @@ func parseUntracked(record []byte) (*FileStatus, error) {
 		X:         '?',
 		Y:         '?',
 		Untracked: true,
+	}, nil
+}
+
+// ignored: "! path"（--ignored=traditional 的文件级记录，design.md §7.2）。
+func parseIgnored(record []byte) (*FileStatus, error) {
+	s := string(record)
+	path := strings.TrimPrefix(s, "! ")
+	if path == s {
+		// 无前缀空格的异常，直接使用整条。
+		path = s
+	}
+	return &FileStatus{
+		Kind:    "!",
+		Path:    path,
+		Ignored: true,
 	}, nil
 }
 
