@@ -45,6 +45,8 @@ type ProjectRow struct {
 }
 
 // TaskRow tasks 表行映射。env_snapshot 为激活时合并的 env JSON（design.md §2/§8）。
+// InitStatus/InitError 对应 migration 0007 新增列（design.md §2 项目生命周期配置）：
+// init_status ∈ none | pending | running | succeeded | failed；init_error 仅 failed 时非空。
 type TaskRow struct {
 	ID           string
 	ProjectID    string
@@ -60,6 +62,18 @@ type TaskRow struct {
 	CreatedAt    int64
 	UpdatedAt    int64
 	ArchivedAt   sql.NullInt64
+	InitStatus   string
+	InitError    sql.NullString
+}
+
+// LifecycleConfigRow project_lifecycle_configs 表行映射（design.md §2，migration 0007）。
+// 缺行读取时三脚本字段为空串（无配置 = 空配置语义）。
+type LifecycleConfigRow struct {
+	ProjectID       string
+	InheritPatterns string
+	InitScript      string
+	PreDeleteScript string
+	UpdatedAt       int64
 }
 
 // EnvVarRow env 变量行映射（project_env_vars / task_env_vars 共用）。
@@ -237,6 +251,36 @@ func (q *Queries) DeleteProjectEnvVar(ctx context.Context, projectID, key string
 	return err
 }
 
+// GetLifecycleConfig 读取项目生命周期配置（design.md §2，migration 0007）。
+// 缺行返回空配置（三脚本字段空串），非错误：无配置项目无行，读时缺行 = 空配置语义。
+func (q *Queries) GetLifecycleConfig(ctx context.Context, projectID string) (LifecycleConfigRow, error) {
+	row := q.db.QueryRowContext(ctx,
+		`SELECT project_id, inherit_patterns, init_script, pre_delete_script, updated_at
+		 FROM project_lifecycle_configs WHERE project_id = ?`, projectID)
+	var c LifecycleConfigRow
+	err := row.Scan(&c.ProjectID, &c.InheritPatterns, &c.InitScript, &c.PreDeleteScript, &c.UpdatedAt)
+	if err == sql.ErrNoRows {
+		// 缺行 = 空配置（非错误），保留 ProjectID 供调用方定位。
+		return LifecycleConfigRow{ProjectID: projectID}, nil
+	}
+	return c, err
+}
+
+// UpsertLifecycleConfig 整体替换项目生命周期配置（design.md §2.1，INSERT … ON CONFLICT）。
+// 刷新 updated_at；调用方传入的 updatedAt 由本方法置为当前时间戳。
+func (q *Queries) UpsertLifecycleConfig(ctx context.Context, projectID, inheritPatterns, initScript, preDeleteScript string) error {
+	_, err := q.db.ExecContext(ctx,
+		`INSERT INTO project_lifecycle_configs (project_id, inherit_patterns, init_script, pre_delete_script, updated_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(project_id) DO UPDATE SET
+		   inherit_patterns = excluded.inherit_patterns,
+		   init_script = excluded.init_script,
+		   pre_delete_script = excluded.pre_delete_script,
+		   updated_at = excluded.updated_at`,
+		projectID, inheritPatterns, initScript, preDeleteScript, nowUnix())
+	return err
+}
+
 // SetGlobalEnvVar 插入或更新全局级 env 变量（upsert，design.md §8/§2）。
 // mode ∈ follow_host | manual；follow_host 时 value 忽略，可传空。
 func (q *Queries) SetGlobalEnvVar(ctx context.Context, key, mode, value string) error {
@@ -281,11 +325,11 @@ func (q *Queries) CreateTask(ctx context.Context, t TaskRow) error {
 	return err
 }
 
-// GetTask 按 ID 查询任务（含 env_snapshot）。
+// GetTask 按 ID 查询任务（含 env_snapshot、init_status/init_error）。
 func (q *Queries) GetTask(ctx context.Context, id string) (TaskRow, error) {
 	row := q.db.QueryRowContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
-		        delete_mode, env_snapshot, created_at, updated_at, archived_at
+		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error
 		 FROM tasks WHERE id = ?`, id)
 	return scanTaskRow(row)
 }
@@ -294,7 +338,7 @@ func (q *Queries) GetTask(ctx context.Context, id string) (TaskRow, error) {
 func (q *Queries) ListTasksByProject(ctx context.Context, projectID string) ([]TaskRow, error) {
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
-		        delete_mode, env_snapshot, created_at, updated_at, archived_at
+		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error
 		 FROM tasks WHERE project_id = ? ORDER BY created_at ASC`, projectID)
 	if err != nil {
 		return nil, err
@@ -307,7 +351,7 @@ func (q *Queries) ListTasksByProject(ctx context.Context, projectID string) ([]T
 func (q *Queries) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
-		        delete_mode, env_snapshot, created_at, updated_at, archived_at
+		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error
 		 FROM tasks ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
@@ -562,6 +606,97 @@ func joinPlaceholders(p []string) string {
 	return string(out)
 }
 
+// --- 项目生命周期配置 CAS（design.md §2.1，migration 0007） ---
+//
+// 以下方法全部 CAS / 原子：条件不满足时返回 rows=0（updated=false），而非 error。
+// 统一约定（与 UpdateTaskStatus 语义一致）：均刷新 updated_at。
+
+// CommitCreated 原子提交 Create/retryCreate 的最终状态：单条 UPDATE 把 status 从
+// expectedStatus 置为 suspended 并写入 initStatus（design.md §2.1/§3）。
+// 后置条件 MUST 含 last_error=NULL（清空旧 creation_failed 错误）与 updated_at=now。
+// expectedStatus ∈ {creating, creation_failed}；initStatus ∈ {pending, none}。
+// rows=0（updated=false）表示提交失败（状态已被并发改变）。
+func (q *Queries) CommitCreated(ctx context.Context, taskID, expectedStatus, initStatus string) (updated bool, err error) {
+	res, err := q.db.ExecContext(ctx,
+		`UPDATE tasks SET status = 'suspended', last_error = NULL, init_status = ?, updated_at = ?
+		 WHERE id = ? AND status = ?`,
+		initStatus, nowUnix(), taskID, expectedStatus)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// ClaimInitRun 置 init_status=running，要求 status=suspended 且 init_status=pending
+// （design.md §2.1/§3：InitRunner 初次执行 claim）。rows=0 表示未获得（并发下另一执行者已 claim）。
+func (q *Queries) ClaimInitRun(ctx context.Context, taskID string) (updated bool, err error) {
+	res, err := q.db.ExecContext(ctx,
+		`UPDATE tasks SET init_status = 'running', updated_at = ?
+		 WHERE id = ? AND status = 'suspended' AND init_status = 'pending'`,
+		nowUnix(), taskID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// ClaimInitRerun 置 init_status=running 并清空旧 init_error，要求 status=suspended 且
+// init_status ∈ {failed, succeeded}（design.md §2.1/§3：RerunInit claim）。
+func (q *Queries) ClaimInitRerun(ctx context.Context, taskID string) (updated bool, err error) {
+	res, err := q.db.ExecContext(ctx,
+		`UPDATE tasks SET init_status = 'running', init_error = NULL, updated_at = ?
+		 WHERE id = ? AND status = 'suspended' AND init_status IN ('failed', 'succeeded')`,
+		nowUnix(), taskID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// FinishInitRun 落账 InitRunner 执行结果，要求 init_status=running（design.md §2.1/§3）。
+// status 为 'succeeded' 或 'failed'：成功时 initError 应为空（清空），失败时写 initError。
+// rows=0 表示任务已被外部收敛（如服务重启），调用方记录警告。
+func (q *Queries) FinishInitRun(ctx context.Context, taskID, status string, initError sql.NullString) (updated bool, err error) {
+	res, err := q.db.ExecContext(ctx,
+		`UPDATE tasks SET init_status = ?, init_error = ?, updated_at = ?
+		 WHERE id = ? AND init_status = 'running'`,
+		status, initError, nowUnix(), taskID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// ConvergeInterruptedInitRuns 启动收敛：把 init_status ∈ {pending, running} 的任务
+// 置为 failed 并写 init_error='interrupted by server restart'（design.md §2.1/§3）。
+// 返回受影响行数。用于 Reconcile 启动时收敛上次进程未完成的 init 执行。
+func (q *Queries) ConvergeInterruptedInitRuns(ctx context.Context) (int64, error) {
+	res, err := q.db.ExecContext(ctx,
+		`UPDATE tasks SET init_status = 'failed', init_error = 'interrupted by server restart', updated_at = ?
+		 WHERE init_status IN ('pending', 'running')`,
+		nowUnix())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // DeleteAbsentSessions 删除任务中不在 keepSet 内的会话归属行。
 // 设计依据 design.md §4：仅完整对齐结果（count < limit）可删缺席行。
 func (q *Queries) DeleteAbsentSessions(ctx context.Context, taskID string, keepSet []string) error {
@@ -666,7 +801,7 @@ func scanTaskRow(row rowScanner) (TaskRow, error) {
 	var t TaskRow
 	err := row.Scan(&t.ID, &t.ProjectID, &t.Name, &t.Branch, &t.Status, &t.WorktreePath,
 		&t.LastPort, &t.LastError, &t.Notice, &t.DeleteMode, &t.EnvSnapshot,
-		&t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt)
+		&t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.InitStatus, &t.InitError)
 	return t, err
 }
 
