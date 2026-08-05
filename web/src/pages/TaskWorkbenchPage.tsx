@@ -18,7 +18,14 @@ const TUI_TAB = 'tui';
 const GIT_TAB = 'git';
 const SETTINGS_TAB = 'settings';
 
-export function TaskWorkbenchPage({ taskID }: { taskID: string }) {
+export function TaskWorkbenchPage({
+  taskID,
+  fromActive = false,
+}: {
+  taskID: string;
+  /** 从活跃会话页（#/active）进入时为 true：返回链接指回活跃列表。 */
+  fromActive?: boolean;
+}) {
   const [task, setTask] = useState<Task | null>(null);
   const [shells, setShells] = useState<string[]>([]);
   // 区分"无 shell 终端"与"列表获取失败"：失败时给出错误提示并可重试
@@ -124,12 +131,19 @@ export function TaskWorkbenchPage({ taskID }: { taskID: string }) {
   return (
     <div className="workbench">
       <header className="page-header">
-        <button
-          className="btn btn-small btn-ghost"
-          onClick={() => task && navigate(`/project/${task.project_id}`)}
-        >
-          ← 任务列表
-        </button>
+        {/* 来源感知返回：从活跃列表进入则指回活跃列表，否则回到任务列表 */}
+        {fromActive ? (
+          <button className="btn btn-small btn-ghost" onClick={() => navigate('/active')}>
+            ← 活跃会话
+          </button>
+        ) : (
+          <button
+            className="btn btn-small btn-ghost"
+            onClick={() => task && navigate(`/project/${task.project_id}`)}
+          >
+            ← 任务列表
+          </button>
+        )}
         <span className="page-title">{task?.name ?? '…'}</span>
         {task?.branch && <span className="header-meta mono">⎇ {task.branch}</span>}
         {task && <StatusBadge status={task.status} />}
