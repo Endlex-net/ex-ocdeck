@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"ocdeck/internal/ai"
 	"ocdeck/internal/config"
 	storepkg "ocdeck/internal/store"
 )
@@ -27,6 +28,7 @@ type Server struct {
 	envs          EnvStore
 	lifecycleCfgs LifecycleConfigStore
 	ocCfgs        OCConfigService
+	aiConfig      *ai.Store
 	httpSrv       *http.Server
 
 	// watchdogStateProvider 返回 watchdog 运行态字符串（off/running/degraded），
@@ -157,6 +159,7 @@ func (s *Server) registerRoutes() {
 	s.registerEnvRoutes(apiMux)             // project/task env CRUD（design.md §21）
 	s.registerLifecycleConfigRoutes(apiMux) // project lifecycle config（design.md §8）
 	s.registerOCConfigRoutes(apiMux)        // 全局 oc 配置管理（design.md §13/§21）
+	s.registerAIConfigRoutes(apiMux)        // 全局 AI provider 配置（design.md D6）
 
 	// /api/v1 前缀统一挂认证中间件（design.md §14/§21）。
 	// 已认证请求的未知路由/方法返回统一 JSON 404/405（design.md §21 错误结构）。

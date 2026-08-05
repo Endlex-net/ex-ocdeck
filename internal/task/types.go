@@ -86,7 +86,9 @@ type OCClientFactory func(port int, password string, opts opencode.Options) OCCl
 
 // WorktreeBackend 抽象 worktree.Manager。
 type WorktreeBackend interface {
-	Add(ctx context.Context, repoPath, projectID, taskID, branch, baseRef string) (string, error)
+	// Add 在 dest 创建 worktree（dest 由调用方计算，MUST 位于 worktrees 根之下；
+	// 副作用前 worktree.Manager 会先做 checkContainment）。失败时由 Manager 走 cleanupFailedAdd。
+	Add(ctx context.Context, repoPath, dest, branch, baseRef string) error
 	Remove(ctx context.Context, wtPath string, opts worktreeRemoveOpts) error
 	// BranchExists 判断分支是否已存在（B1：Create 落库前检查分支冲突）。
 	BranchExists(ctx context.Context, repoPath, branch string) (bool, error)
@@ -103,6 +105,16 @@ type WorktreeBackend interface {
 	// DirtyFiles 返回 worktree 中 dirty/untracked 文件路径集合（B7c：删除二次门禁用）。
 	// worktree 不存在返回空集 + nil。
 	DirtyFiles(ctx context.Context, wtPath string) (map[string]struct{}, error)
+}
+
+// BranchNamer 将任务名提炼为分支 slug（design.md ai-worktree-naming D3/D4）。
+//
+// Slug 永不返回 error：由实现内部决定 AI 提炼或回退到机械 slugify（fallback 由 wiring 注入，
+// 通常是 task.Slugify）。返回的 slug 已经过清洗或 fallback，调用方直接拼 `ocdeck/` 前缀即可。
+// 本接口只定义抽象，避免 task 包 import internal/ai；具体实现（ai.SlugNamer）在 main.go
+// wiring 阶段注入（tasks 3.3）。Manager 持有 namer 为 nil 时回退到本包 Slugify（防 panic）。
+type BranchNamer interface {
+	Slug(ctx context.Context, taskName string) string
 }
 
 // PreflightDeleteOpts 删除前置检查选项（B8）。

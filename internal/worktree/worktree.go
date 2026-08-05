@@ -1,7 +1,8 @@
 // Package worktree 实现任务 worktree 的创建与删除（design.md §6、§18）。
 //
-// 位置约定：<dataDir>/worktrees/<projectID>/<taskID>/
-// 创建：每 repo 写锁（git.RepoLock）串行，check-ref-format 校验分支名，add 前 prune。
+// 位置约定：<dataDir>/worktrees/...（具体路径由调用方计算并传入 dest，ai-worktree-naming）。
+// 创建：每 repo 写锁（git.RepoLock）串行，check-ref-format 校验分支名，add 前 prune；
+// 任何文件/git 副作用前 MUST 先 checkContainment(dest)，拒绝 dest 逃逸 worktrees 根。
 // 删除：canonical path + filepath.Rel 包含性校验，dirty 检查，分支占用检查，prune。
 package worktree
 
@@ -16,19 +17,6 @@ import (
 	"ocdeck/internal/git"
 )
 
-// validateIdent 校验 projectID/taskID 仅含 [a-z0-9-]，防止路径注入。
-func validateIdent(id string) error {
-	if id == "" {
-		return errors.New("worktree: empty id")
-	}
-	for _, c := range id {
-		if !(c >= 'a' && c <= 'z') && !(c >= '0' && c <= '9') && c != '-' {
-			return fmt.Errorf("worktree: invalid id %q (allowed [a-z0-9-])", id)
-		}
-	}
-	return nil
-}
-
 // Manager 管理 worktree 的创建与删除，基于 config.DataDir。
 type Manager struct {
 	dataDir string
@@ -39,28 +27,26 @@ func New(dataDir string) *Manager {
 	return &Manager{dataDir: filepath.Clean(dataDir)}
 }
 
-// Add 在 <dataDir>/worktrees/<projectID>/<taskID>/ 创建 worktree，基于 baseRef 新建 branch。
-// 返回 worktree 的绝对路径。每 repo 写锁串行化仓库级写操作（design.md §6/§17）。
+// Add 在 dest 创建 worktree，基于 baseRef 新建 branch。dest 由调用方计算（绝对路径），
+// MUST 位于 <dataDir>/worktrees/ 之下（副作用前先 checkContainment 校验）。
+// 每 repo 写锁串行化仓库级写操作（design.md §6/§17）。
 //
 // 幂等性/补偿（design.md §19）：目标存在检查在 repo 写锁内完成，避免并发 Add
 // 在锁外各自通过存在性检查后锁内争抢；WorktreeAdd 失败时回收"本次创建"的产物——
 // worktree 目录、新建分支、worktree metadata（prune）——MUST 限定为本操作产物，
 // 不得删除并发另一次成功创建的 worktree（锁内串行保证本 Add 独占，故回收安全）。
-func (m *Manager) Add(ctx context.Context, repoPath, projectID, taskID, branch, baseRef string) (string, error) {
-	if err := validateIdent(projectID); err != nil {
-		return "", err
-	}
-	if err := validateIdent(taskID); err != nil {
-		return "", err
-	}
+func (m *Manager) Add(ctx context.Context, repoPath, dest, branch, baseRef string) error {
 	if branch == "" {
-		return "", errors.New("worktree: empty branch")
+		return errors.New("worktree: empty branch")
 	}
 	if baseRef == "" {
-		return "", errors.New("worktree: empty base ref")
+		return errors.New("worktree: empty base ref")
 	}
 
-	dest := m.worktreePath(projectID, taskID)
+	// 副作用前 MUST 先做包含性校验：dest 逃逸 worktrees 根时拒绝，且无任何文件/git 副作用。
+	if err := m.checkContainment(dest); err != nil {
+		return err
+	}
 
 	repoLock := git.RepoLock(repoPath)
 	repoLock.Lock()
@@ -68,14 +54,14 @@ func (m *Manager) Add(ctx context.Context, repoPath, projectID, taskID, branch, 
 
 	// 目标已存在检查移入锁内（B8）：锁外检查通过后锁内可能被并发 Add 抢先创建。
 	if _, err := os.Stat(dest); err == nil {
-		return "", fmt.Errorf("worktree: target already exists: %s", dest)
+		return fmt.Errorf("worktree: target already exists: %s", dest)
 	}
 
 	if err := git.WorktreePrune(ctx, repoPath); err != nil {
-		return "", fmt.Errorf("worktree: prune before add: %w", err)
+		return fmt.Errorf("worktree: prune before add: %w", err)
 	}
 	if err := git.ValidateBranchName(ctx, repoPath, branch); err != nil {
-		return "", err
+		return err
 	}
 	// 记录分支创建前是否存在（B1）：补偿时仅当分支确为本次创建才删，
 	// 不得 branch -D 既有分支（design.md §19 Create 补偿范围限定）。
@@ -87,9 +73,9 @@ func (m *Manager) Add(ctx context.Context, repoPath, projectID, taskID, branch, 
 		// branchCreatedHere = !branchExistedBefore：补偿方向 MUST 与"是否本次创建"一致，
 		// 反向传入会误删既有分支、残留新建分支。
 		cleanupFailedAdd(ctx, repoPath, dest, branch, !branchExistedBefore)
-		return "", fmt.Errorf("worktree: add: %w", err)
+		return fmt.Errorf("worktree: add: %w", err)
 	}
-	return dest, nil
+	return nil
 }
 
 // gitBranchExists 判断分支是否已存在（用于补偿范围判定，B1）。
@@ -221,11 +207,6 @@ func (m *Manager) Remove(ctx context.Context, wtPath string, opts RemoveOpts) er
 		return fmt.Errorf("%w: %v", ErrPruneIncomplete, err)
 	}
 	return nil
-}
-
-// worktreePath 返回 <dataDir>/worktrees/<projectID>/<taskID>。
-func (m *Manager) worktreePath(projectID, taskID string) string {
-	return filepath.Join(m.dataDir, "worktrees", projectID, taskID)
 }
 
 // BranchExists 判断分支是否已存在（B1：Create 落库前检查分支冲突）。

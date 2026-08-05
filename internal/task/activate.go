@@ -276,29 +276,76 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 
 	if err := m.activateRun(ctx, taskID); err != nil {
 		// 失败：清理已建会话（serve/tui/shell）→ suspended + last_error（design.md §19 补偿）。
-		// notice 持久化失败 MUST 聚合进 last_error，不静默（design.md §8）。
-		cleanupErr := m.cleanupActivationRuntime(ctx, taskID)
-		// 清除 env 快照（design.md §2：Activate 失败清快照）。
-		_ = m.store.UpdateTaskEnvSnapshot(ctx, taskID, sql.NullString{})
-		le := sql.NullString{String: err.Error(), Valid: true}
-		if cleanupErr != nil {
-			le = sql.NullString{String: fmt.Errorf("%w; cleanup notice: %v", err, cleanupErr).Error(), Valid: true}
-		}
-		_, _ = m.store.UpdateTaskStatusConditional(ctx, taskID, StatusActivating, StatusSuspended, le)
+		// 补偿 MUST 用脱离调用方取消的 context：activateRun 可能在 probe 退避/健康检查等
+		// 步骤因 ctx 取消返回，此时调用方 ctx 已取消，真实 store 用 ExecContext 会因 ctx 取消
+		// 失败 → 清快照/状态回退/notice 持久化全部失败且错误被忽略 → 任务卡 activating。
+		// 故补偿路径统一用 compCtx（WithoutCancel + 独立短超时），各步错误记录日志但不跳过后续步骤。
+		m.runActivateFailureCompensation(ctx, taskID, err)
 		return err
 	}
 	// 提交点：active。提交失败补偿（杀已建会话回 suspended，B5）。
 	if err := m.store.UpdateTaskStatus(ctx, taskID, StatusActive, sql.NullString{}); err != nil {
-		cleanupErr := m.cleanupActivationRuntime(ctx, taskID)
-		_ = m.store.UpdateTaskEnvSnapshot(ctx, taskID, sql.NullString{})
-		le := sql.NullString{String: fmt.Errorf("commit active: %w", err).Error(), Valid: true}
-		if cleanupErr != nil {
-			le = sql.NullString{String: fmt.Errorf("%w; cleanup notice: %v", err, cleanupErr).Error(), Valid: true}
-		}
-		_, _ = m.store.UpdateTaskStatusConditional(ctx, taskID, StatusActivating, StatusSuspended, le)
+		commitErr := fmt.Errorf("commit active: %w", err)
+		m.runActivateFailureCompensation(ctx, taskID, commitErr)
 		return newOpErr(codeInternal, err)
 	}
 	return nil
+}
+
+// activateCompensationTimeout 是 cleanup 阶段（kill 已建会话、枚举 shell、记 residual notice）
+// 所用 context 的独立短超时。补偿 MUST 脱离调用方 ctx 的取消：调用方 ctx 可能已取消
+//（probe 退避取消/健康检查超时），真实 store 用 ExecContext 会因 ctx 取消失败导致任务卡 activating。
+// 用 context.WithoutCancel + 此超时保证 cleanup 有界完成。cleanup 内部 proc 调用不接收 compCtx、
+// 各自用 context.Background() 超时（单次 KillSession 可达 30s，多会话串行更久），故此预算仅约束
+// cleanup 内经 compCtx 的 store 写（notice 持久化）；超 30s 后 cleanup 内未完成的 store 写被取消，
+// 但不影响后续 DB 收敛（见 activateCompensationFinalizeTimeout）。超时选 30s：与单次 KillSession 上限相当。
+const activateCompensationTimeout = 30 * time.Second
+
+// activateCompensationFinalizeTimeout 是 cleanup 结束后「最终 DB 收敛」的独立短超时
+//（清 env 快照 + 状态回退 activating→suspended + last_error）。MUST 在 cleanup 结束后另起新 bounded
+// context：无论 cleanup 耗时/成败，状态回退总有全新预算，避免 cleanup 耗尽 30s 预算后清快照/CAS
+// 拿到 deadline exceeded 的 compCtx 导致任务卡 activating。超时选 10s：两次 DB 写足够。
+const activateCompensationFinalizeTimeout = 10 * time.Second
+
+// runActivateFailureCompensation 执行 Activate 失败的统一补偿（design.md §19 补偿）：
+// kill 已建会话 → 清 env 快照 → 状态回退 activating→suspended + last_error。
+//
+// 补偿用脱离调用方取消的 compCtx（WithoutCancel + activateCompensationTimeout），
+// 避免调用方 ctx 已取消时真实 store 的 ExecContext 失败导致任务卡 activating。
+// 预算拆分：cleanup 用 compCtx；最终 DB 收敛（清快照 + 状态回退 + last_error）在 cleanup 结束后
+// 另起新 bounded context（activateCompensationFinalizeTimeout），保证无论 cleanup 耗时/成败，
+// 状态回退总有全新预算。
+// 各步错误 MUST 记录日志但不跳过后续补偿步骤（不静默吞错，但保证补偿尽量收敛）。
+// last_error 聚合原始错误与 cleanup notice 错误（design.md §8：notice 持久化失败不静默）。
+func (m *Manager) runActivateFailureCompensation(reqCtx context.Context, taskID string, cause error) {
+	compCtx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), activateCompensationTimeout)
+	defer cancel()
+
+	cleanupErr := m.cleanupActivationRuntime(compCtx, taskID)
+	if cleanupErr != nil {
+		log.Printf("activate: cleanup runtime for task %s: %v", taskID, cleanupErr)
+	}
+
+	// 最终 DB 收敛：另起全新 bounded context，不受 cleanup 耗时影响。
+	finalCtx, finalCancel := context.WithTimeout(context.WithoutCancel(reqCtx), activateCompensationFinalizeTimeout)
+	defer finalCancel()
+
+	if err := m.store.UpdateTaskEnvSnapshot(finalCtx, taskID, sql.NullString{}); err != nil {
+		log.Printf("activate: clear env snapshot for task %s: %v", taskID, err)
+	}
+	le := sql.NullString{String: cause.Error(), Valid: true}
+	if cleanupErr != nil {
+		le = sql.NullString{String: fmt.Errorf("%w; cleanup notice: %v", cause, cleanupErr).Error(), Valid: true}
+	}
+	updated, err := m.store.UpdateTaskStatusConditional(finalCtx, taskID, StatusActivating, StatusSuspended, le)
+	if err != nil {
+		log.Printf("activate: rollback activating→suspended for task %s: %v", taskID, err)
+		return
+	}
+	if !updated {
+		// 无 error 但 updated=false：状态已被并发改动（非 activating），便于诊断卡 activating 场景。
+		log.Printf("activate: rollback activating→suspended for task %s: status changed concurrently (not activating)", taskID)
+	}
 }
 
 // activateRun 执行激活的外部副作用序列（serve → probe → SSE → tui）。
@@ -432,6 +479,71 @@ func probeErrToOpCode(err error) (string, error) {
 // servePortRetries EADDRINUSE 换端口重试上限（design.md §3，B5）。
 const servePortRetries = 3
 
+// probeColdStartAttempts 是 capability probe 冷启动重试总次数（design.md D8）：
+// 首次 + 2 次重试 = 3 次尝试。全新 worktree 是 opencode 冷项目，首次 /session/status
+// 可超 10s（实测 7.3s+，负载下超时）归类 ErrServeNotReady；首次超时后服务端初始化已完成，
+// 二次命中热路径，故只覆盖冷启动窗口。
+const probeColdStartAttempts = 3
+
+// defaultProbeColdStartBackoff 返回冷启动重试默认退避序列（design.md D8：2s、4s）。
+// 用函数返回新 slice 避免包级变量被并发改写（未来 t.Parallel 下 race）；
+// 调用方按需注入更短序列供测试。
+func defaultProbeColdStartBackoff() []time.Duration {
+	return []time.Duration{2 * time.Second, 4 * time.Second}
+}
+
+// probeWithColdStartRetry 执行 capability probe，遇 ErrServeNotReady 短退避重试（design.md D8）。
+//
+// 全新 worktree 是 opencode 冷项目，serve 启动后首次 /session/status 可超 10s → Probe 归类
+// ErrServeNotReady。此时 serve 进程仍健康，仅能力端点未就绪，故重试期间会话保活（不在重试内 kill）。
+// 共 probeColdStartAttempts 次尝试（首次 + 2 次），退避按 probeColdStartBackoff（2s、4s）。
+// 退避用 timer + ctx.Done 尊重取消：ctx 取消时立即返回 ctx.Err()（已是最后一次尝试时不再 sleep）。
+// 其他错误（ErrCapabilityMismatch / ErrUnauthorized / 未知）立即返回，不重试。
+// 成功返回 nil。
+func (m *Manager) probeWithColdStartRetry(ctx context.Context, oc OCClient) error {
+	backoffFn := m.probeColdStartBackoffFn
+	if backoffFn == nil {
+		backoffFn = defaultProbeColdStartBackoff
+	}
+	return runProbeColdStartRetry(ctx, oc, backoffFn())
+}
+
+// runProbeColdStartRetry 执行 capability probe，遇 ErrServeNotReady 短退避重试（design.md D8）。
+//
+// 全新 worktree 是 opencode 冷项目，serve 启动后首次 /session/status 可超 10s → Probe 归类
+// ErrServeNotReady。此时 serve 进程仍健康，仅能力端点未就绪，故重试期间会话保活（不在重试内 kill）。
+// 共 probeColdStartAttempts 次尝试（首次 + 2 次），退避按 backoff（默认 2s、4s，测试可注入更短序列）。
+// 退避用 timer + ctx.Done 尊重取消：ctx 取消时立即返回 ctx.Err()（已是最后一次尝试时不再 sleep）。
+// 其他错误（ErrCapabilityMismatch / ErrUnauthorized / 未知）立即返回，不重试。
+// 成功返回 nil。
+func runProbeColdStartRetry(ctx context.Context, oc OCClient, backoff []time.Duration) error {
+	var lastErr error
+	for attempt := 0; attempt < probeColdStartAttempts; attempt++ {
+		_, err := oc.Probe(ctx)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !errors.Is(err, opencode.ErrServeNotReady) {
+			// 非冷启动错误：立即失败，不重试（mismatch/unauthorized/未知）。
+			return err
+		}
+		// ErrServeNotReady：若非最后一次尝试，退避后重试。
+		if attempt == probeColdStartAttempts-1 {
+			break
+		}
+		wait := backoff[attempt]
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return fmt.Errorf("after %d attempts: %w", probeColdStartAttempts, lastErr)
+}
+
 // startServeWithPortRetry 创建 serve 会话并健康检查；EADDRINUSE 自动换端口重试（design.md §3，B5）。
 // 端口被占时 serve 进程启动但健康检查不就绪 → 换新端口重新合并 env + 重建 serve 会话。
 // 端口变更时 MUST 同步三处 OCDECK_SERVE_PORT（design.md §3 E1，§2 line 68）：
@@ -480,7 +592,12 @@ func (m *Manager) startServeWithPortRetry(ctx context.Context, row TaskRow, serv
 			continue
 		}
 		// 健康就绪 → 能力探测。
-		if _, err := oc.Probe(ctx); err != nil {
+		// D8：全新 worktree 是 opencode 冷项目，serve 启动后首次 /session/status 可超 10s
+		//（实测 7.3s+，负载下超时）→ Probe 归类 ErrServeNotReady。此时 serve 进程仍健康，
+		// 仅能力端点未就绪，故不 kill 会话，短退避重试（首次 + 2 次，退避 2s/4s）。
+		// 首次超时后服务端初始化已完成，二次命中热路径。其他错误（mismatch/unauthorized/未知）
+		// 立即按 probeErrToOpCode 失败并 kill 会话。
+		if err := m.probeWithColdStartRetry(ctx, oc); err != nil {
 			_, _ = m.proc.KillSession(serveName)
 			code, ferr := probeErrToOpCode(err)
 			return port, newOpErr(code, ferr)

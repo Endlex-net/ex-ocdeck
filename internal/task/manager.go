@@ -147,6 +147,17 @@ type Manager struct {
 	proc      ProcessBackend
 	wt        WorktreeBackend
 	ocFactory OCClientFactory
+	// namer 将任务名提炼为分支 slug（ai-worktree-naming）。nil 时 Create 回退到 Slugify
+	//（构造期或测试未注入时的防御）。生产 wiring 在 main.go 注入 ai.SlugNamer（tasks 3.3）。
+	namer BranchNamer
+	// rand4Fn 生成 4 位 [a-z0-9] 随机串，供 newWorktreePath 碰撞重试。可测试注入以确定性
+	// 构造碰撞/rand 失败场景。默认用 crypto/rand（Go 1.24 起 Read 永不返回 error，失败 fatal；
+	// 故 rand4 的 error 分支为防御性保留，生产路径不可达）。
+	rand4Fn func() (string, error)
+	// probeColdStartBackoffFn 返回 capability probe 冷启动重试退避序列（design.md D8）。
+	// 默认 defaultProbeColdStartBackoff（2s、4s）；测试可注入更短序列避免拖慢。
+	// nil 防御回退默认值（直接 &Manager{} 构造的测试）。
+	probeColdStartBackoffFn func() []time.Duration
 
 	// keyedMu 提供每任务互斥锁（design.md §1：每任务 keyed mutex，冲突返回 409）。
 	keyedMu sync.Map // taskID -> *keyedLock
@@ -262,6 +273,9 @@ type Options struct {
 	Proc      ProcessBackend
 	Worktree  WorktreeBackend
 	OCFactory OCClientFactory
+	// Namer 可选：注入后 Create 用其提炼分支 slug（ai-worktree-naming）。
+	// 为 nil 时回退到本包 Slugify（构造期或测试未注入时防御）。
+	Namer BranchNamer
 	// DebtStore 可选：注入后未收敛 orphan tickets 持久化跨重启恢复（design.md §10）。
 	DebtStore CleanupDebtStore
 	// LifecycleRunner 可选：注入后启用 init/pre-delete 脚本与 inherit 文件继承
@@ -279,11 +293,14 @@ func New(opts Options) *Manager {
 		proc:            opts.Proc,
 		wt:              opts.Worktree,
 		ocFactory:       opts.OCFactory,
+		namer:           opts.Namer,
 		debtStore:       opts.DebtStore,
 		lifecycleRunner: opts.LifecycleRunner,
 		logDir:          opts.LogDir,
-		runtimes:        make(map[string]*taskRuntime),
-		lastGen:         make(map[string]int),
+		runtimes:                make(map[string]*taskRuntime),
+		lastGen:                 make(map[string]int),
+		rand4Fn:                 rand4,
+		probeColdStartBackoffFn: defaultProbeColdStartBackoff,
 	}
 	if m.ocFactory == nil {
 		m.ocFactory = defaultOCFactory

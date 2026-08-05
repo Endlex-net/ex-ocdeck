@@ -115,6 +115,10 @@ export function ConfigsPage() {
         </button>
         <span className="page-title">全局配置</span>
         <span className="header-meta">配置文件 / 环境变量 / 终端外观</span>
+        <span className="header-spacer" />
+        <button className="btn btn-small btn-ghost" onClick={() => navigate('/ai-config')}>
+          AI 配置
+        </button>
       </header>
 
       {listError && <div className="error-line">{listError}</div>}

@@ -79,8 +79,8 @@ func TestSlugify(t *testing.T) {
 		"UPPER":     "upper",
 	}
 	for in, want := range cases {
-		if got := slugify(in); got != want {
-			t.Errorf("slugify(%q) = %q, want %q", in, got, want)
+		if got := Slugify(in); got != want {
+			t.Errorf("Slugify(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
