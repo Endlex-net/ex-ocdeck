@@ -7,6 +7,7 @@ import { ProjectsPage } from './pages/ProjectsPage';
 import { ProjectDetailPage } from './pages/ProjectDetailPage';
 import { TaskWorkbenchPage } from './pages/TaskWorkbenchPage';
 import { ConfigsPage } from './pages/ConfigsPage';
+import { AIConfigPage } from './pages/AIConfigPage';
 
 export function App() {
   const [authed, setAuthed] = useState(() => getToken() !== '');
@@ -27,6 +28,7 @@ export function App() {
 
   let page: React.ReactNode;
   if (route === '/configs') page = <ConfigsPage />;
+  else if (route === '/ai-config') page = <AIConfigPage />;
   else if (projectMatch) page = <ProjectDetailPage projectID={projectMatch[1]} />;
   else if (taskMatch) page = <TaskWorkbenchPage taskID={taskMatch[1]} />;
   else page = <ProjectsPage />;

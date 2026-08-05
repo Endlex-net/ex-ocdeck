@@ -263,8 +263,8 @@ type WorktreeAdapter struct {
 // NewWorktreeAdapter 构造 WorktreeBackend 适配器。
 func NewWorktreeAdapter(m *worktree.Manager) *WorktreeAdapter { return &WorktreeAdapter{m: m} }
 
-func (a *WorktreeAdapter) Add(ctx context.Context, repoPath, projectID, taskID, branch, baseRef string) (string, error) {
-	return a.m.Add(ctx, repoPath, projectID, taskID, branch, baseRef)
+func (a *WorktreeAdapter) Add(ctx context.Context, repoPath, dest, branch, baseRef string) error {
+	return a.m.Add(ctx, repoPath, dest, branch, baseRef)
 }
 
 func (a *WorktreeAdapter) Remove(ctx context.Context, wtPath string, opts worktreeRemoveOpts) error {

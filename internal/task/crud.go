@@ -2,16 +2,22 @@ package task
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
-// Create 在项目下创建任务：生成 worktree + 分支，落库（design.md §19 Create 行）。
-// 分支名 ocdeck/<task-name-slug>，worktree 路径 <dataDir>/worktrees/<projectID>/<taskID>/。
+// Create 在项目下创建任务：生成 worktree + 分支，落库（design.md §19 Create 行，ai-worktree-naming D5）。
+// 分支名 ocdeck/<task-name-slug>，worktree 路径 <dataDir>/worktrees/<projectNameSlug>/<branchPathSlug>-<rand4>。
+//
+// D5 主流程顺序：项目存在 → slug → branch → 分支校验/冲突检查 → dest 生成循环 → 落库 → 副作用。
+// 分支校验与冲突检查先于 dest 生成，保证分支冲突 409 语义不被 stat/rand 异常覆盖。
 func (m *Manager) Create(ctx context.Context, projectID, taskName string) (TaskRow, error) {
 	if strings.TrimSpace(taskName) == "" {
 		return TaskRow{}, newOpErr(codeInvalidInput, errors.New("task name is required"))
@@ -23,13 +29,19 @@ func (m *Manager) Create(ctx context.Context, projectID, taskName string) (TaskR
 	}
 
 	taskID := newTaskID()
-	branch := "ocdeck/" + slugify(taskName)
-	wtPath := m.worktreePath(projectID, taskID)
+	// 分支 slug 经 Namer 提炼（ai-worktree-naming D3/D4）：nil 时回退到本包 Slugify
+	//（构造期或测试未注入时的防御，杜绝 panic）。
+	slug := Slugify(taskName)
+	if m.namer != nil {
+		slug = m.namer.Slug(ctx, taskName)
+	}
+	branch := "ocdeck/" + slug
+	repoPath := proj.Path
 
 	// P1：Create 前置检查（design.md §19：项目存在、分支名 check-ref-format、分支名不冲突）
 	// MUST 全部完成于插入 creating 行之前——先插行后查分支冲突时，前置失败会残留
-	// creation_failed 行。调整顺序：全部前置检查（无副作用）→ 插入 creating → worktree add。
-	repoPath := proj.Path
+	// creation_failed 行。D5 顺序：分支校验/冲突检查先于 dest 生成循环，保证冲突 409
+	// 不被 stat/rand 异常覆盖（无副作用阶段全部前置完成）。
 	// 分支名合法性校验（check-ref-format）：无副作用，前置完成于落库前。
 	if err := m.wt.ValidateBranchName(ctx, repoPath, branch); err != nil {
 		return TaskRow{}, newOpErr(codeInvalidInput, fmt.Errorf("invalid branch name %q: %w", branch, err))
@@ -41,6 +53,13 @@ func (m *Manager) Create(ctx context.Context, projectID, taskName string) (TaskR
 		return TaskRow{}, newOpErr(codeConflict, fmt.Errorf("branch %s already exists", branch))
 	}
 
+	// dest 生成循环（D5：分支检查通过后再生成路径）：rand4+os.Stat≤3 次碰撞重试。
+	// 碰撞/rand/stat 异常 → 直接返回错误，零副作用（无落库、无 Add）。
+	wtPath, err := m.newWorktreePath(proj, branch)
+	if err != nil {
+		return TaskRow{}, newOpErr(codeInternal, fmt.Errorf("compute worktree path: %w", err))
+	}
+
 	// ① 意图落库：插入任务行（status=creating）。
 	if err := m.store.CreateTask(ctx, TaskRow{
 		ID: taskID, ProjectID: projectID, Name: taskName,
@@ -50,7 +69,7 @@ func (m *Manager) Create(ctx context.Context, projectID, taskName string) (TaskR
 	}
 
 	// ② worktree add（仓库级写锁在 worktree.Add 内）。
-	if _, err := m.wt.Add(ctx, repoPath, projectID, taskID, branch, proj.DefaultBranch); err != nil {
+	if err := m.wt.Add(ctx, repoPath, wtPath, branch, proj.DefaultBranch); err != nil {
 		// worktree add 失败 → creation_failed（前置检查已通过，失败发生在副作用阶段）。
 		le := sql.NullString{String: fmt.Errorf("worktree add: %w", err).Error(), Valid: true}
 		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusCreationFailed, le)
@@ -217,7 +236,7 @@ func (m *Manager) retryCreate(ctx context.Context, row TaskRow) (createOutcome, 
 			_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
 			return 0, newOpErr(codeConflict, fmt.Errorf("branch %s already exists", row.Branch))
 		}
-		if _, err := m.wt.Add(ctx, proj.Path, row.ProjectID, row.ID, row.Branch, proj.DefaultBranch); err != nil {
+		if err := m.wt.Add(ctx, proj.Path, row.WorktreePath, row.Branch, proj.DefaultBranch); err != nil {
 			le := sql.NullString{String: fmt.Errorf("retry worktree add: %w", err).Error(), Valid: true}
 			_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
 			return 0, newOpErr(codeGitError, err)
@@ -411,32 +430,91 @@ func (m *Manager) RerunInit(ctx context.Context, taskID string) (TaskRow, error)
 
 // runRerunInitAttempt 移至 init_run.go（与 runInitAttempt 共享落账语义）。
 
-// slugify 将任务名转为分支 slug（小写、非 [a-z0-9-] 替换为 -、折叠连续 -、去首尾 -）。
-func slugify(name string) string {
-	s := strings.ToLower(strings.TrimSpace(name))
-	var b strings.Builder
-	prevDash := true // 首字符也禁止 -，等价于首字符前视为 -
-	for _, c := range s {
-		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
-			b.WriteRune(c)
-			prevDash = false
-			continue
-		}
-		if !prevDash {
-			b.WriteByte('-')
-			prevDash = true
-		}
+// slugify 已迁移为导出版 Slugify（util.go），行为不变。
+
+// rand4 生成 4 位 [a-z0-9] 随机串。
+// Go 1.24 起 crypto/rand.Read 保证填充成功，失败时进程 fatal，故返回的 error 永远为 nil。
+// 此处保留 error 返回值仅为可注入熵源（Manager.rand4Fn）的测试路径服务：生产路径不可达，
+// 属防御性分支。
+func rand4() (string, error) {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	buf := make([]byte, 4)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
 	}
-	out := strings.Trim(b.String(), "-")
-	if out == "" {
-		return "task"
+	for i, b := range buf {
+		buf[i] = alphabet[int(b)%len(alphabet)]
 	}
-	return out
+	return string(buf), nil
 }
 
-// worktreePath 返回 <dataDir>/worktrees/<projectID>/<taskID>（与 worktree.Manager 约定一致）。
-func (m *Manager) worktreePath(projectID, taskID string) string {
-	return m.cfg.DataDir + "/worktrees/" + projectID + "/" + taskID
+// projectDirSlug 由项目名派生目录段：normalizeSlug(proj.Name)，空 → project-<id 前 8>，
+// 截断 ≤50 后去尾部 -。
+func projectDirSlug(proj ProjectRow) string {
+	slug := normalizeSlug(proj.Name)
+	if slug == "" {
+		if len(proj.ID) >= 8 {
+			slug = "project-" + proj.ID[:8]
+		} else {
+			slug = "project-" + proj.ID
+		}
+	}
+	if len(slug) > 50 {
+		slug = slug[:50]
+		slug = strings.TrimRight(slug, "-")
+	}
+	return slug
+}
+
+// branchDirSlug 由分支名派生目录段：去 ocdeck/ 前缀，normalizeSlug 截断 ≤50，
+// 去尾部 -，截空兜底 task。分支名本身不变——目录段只是派生展示。
+func branchDirSlug(branch string) string {
+	seg := branch
+	if strings.HasPrefix(seg, "ocdeck/") {
+		seg = strings.TrimPrefix(seg, "ocdeck/")
+	}
+	seg = normalizeSlug(seg)
+	if len(seg) > 50 {
+		seg = seg[:50]
+		seg = strings.TrimRight(seg, "-")
+	}
+	if seg == "" {
+		seg = "task"
+	}
+	return seg
+}
+
+// newWorktreePath 计算并校验新 worktree 路径（task 包唯一计算点，ai-worktree-naming）：
+// <dataDir>/worktrees/<projectNameSlug>/<branchPathSlug>-<rand4>。
+// 碰撞预检（落库前、无副作用）：rand4 → dest → os.Stat(dest) 已存在则重生（≤3 次）；
+// 3 次均碰撞 → 返回错误；os.Stat 返回 IsNotExist 以外错误 → 直接返回错误。
+func (m *Manager) newWorktreePath(proj ProjectRow, branch string) (string, error) {
+	projSlug := projectDirSlug(proj)
+	branchSlug := branchDirSlug(branch)
+	base := filepath.Join(m.cfg.DataDir, "worktrees", projSlug)
+	// rand4Fn 默认由 New 注入为 crypto/rand 实现；直接构造 &Manager{} 的测试需经
+	// newManagerWithDataDir 等助手或显式赋值，此处 nil 防御回退包级 rand4 杜绝 panic。
+	rand4Fn := m.rand4Fn
+	if rand4Fn == nil {
+		rand4Fn = rand4
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		r, err := rand4Fn()
+		if err != nil {
+			return "", fmt.Errorf("rand4: %w", err)
+		}
+		dest := filepath.Join(base, branchSlug+"-"+r)
+		info, err := os.Stat(dest)
+		if err == nil {
+			_ = info
+			continue // 碰撞，重试
+		}
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("stat worktree dest: %w", err)
+		}
+		return dest, nil
+	}
+	return "", errors.New("worktree: path collision after 3 attempts")
 }
 
 // triggerActivate 异步触发自动激活（design.md §19 Create/Retry 行 ④）。

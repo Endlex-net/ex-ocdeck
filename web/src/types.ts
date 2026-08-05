@@ -140,6 +140,18 @@ export interface ServerStatus {
   versionVerified: boolean;
 }
 
+/** 全局 AI provider 配置（ai-worktree-naming design.md D6）：GET/PUT /ai/config 同形响应。 */
+export interface AIConfig {
+  configured: boolean;
+  provider: string;
+  base_url: string;
+  model: string;
+  api_key_masked: string;
+  /** 思考强度："" = 未设置/默认（不下发参数），否则 off | low | medium | high。 */
+  thinking: string;
+  load_error?: string;
+}
+
 /** 过渡态：操作进行中，UI 禁用操作并显示 spinner。 */
 export const TRANSITIONAL_STATUS = new Set([
   'creating',

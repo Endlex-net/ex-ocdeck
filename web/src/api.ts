@@ -1,4 +1,5 @@
 import type {
+  AIConfig,
   EnvResponse,
   GitDiffResult,
   GitStatus,
@@ -209,4 +210,15 @@ export const api = {
       mtime,
       hash,
     }),
+
+  /** 全局 AI provider 配置（ai-worktree-naming design.md D6）。
+   *  PUT 的 api_key 传掩码值（含 ***）或空串 = 保留原 key。 */
+  getAIConfig: () => request<AIConfig>('GET', '/ai/config'),
+  saveAIConfig: (body: {
+    provider: string;
+    api_key: string;
+    base_url: string;
+    model: string;
+    thinking: string;
+  }) => request<AIConfig>('PUT', '/ai/config', body),
 };

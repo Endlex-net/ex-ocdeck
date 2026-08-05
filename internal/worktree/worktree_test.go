@@ -48,30 +48,23 @@ func TestAdd_Success(t *testing.T) {
 	mgr := New(t.TempDir())
 	ctx := context.Background()
 
-	wt, err := mgr.Add(ctx, repo, "proj1", "task1", "ocdeck/task-1", "main")
-	if err != nil {
+	dest := filepath.Join(mgr.dataDir, "worktrees", "proj1", "task1")
+	if err := mgr.Add(ctx, repo, dest, "ocdeck/task-1", "main"); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(wt, ".git")); err != nil {
+	if _, err := os.Stat(filepath.Join(dest, ".git")); err != nil {
 		t.Fatalf("worktree .git missing: %v", err)
-	}
-	// worktree 应在 <dataDir>/worktrees/proj1/task1 下。
-	wantBase := filepath.Join(mgr.dataDir, "worktrees", "proj1", "task1")
-	if wt != wantBase {
-		t.Errorf("wt path = %s, want %s", wt, wantBase)
 	}
 }
 
-func TestAdd_InvalidIDRejected(t *testing.T) {
+func TestAdd_EmptyBranchRejected(t *testing.T) {
 	repo := newTestRepo(t)
 	mgr := New(t.TempDir())
 	ctx := context.Background()
-	for _, id := range []string{"", "Task1", "task_1", "task.1", "task/1"} {
-		if _, err := mgr.Add(ctx, repo, id, "task1", "ocdeck/b", "main"); err == nil {
-			t.Errorf("projectID %q should be rejected", id)
-		}
-		if _, err := mgr.Add(ctx, repo, "proj1", id, "ocdeck/b", "main"); err == nil {
-			t.Errorf("taskID %q should be rejected", id)
+	dest := filepath.Join(mgr.dataDir, "worktrees", "p1", "t1")
+	for _, br := range []string{"", "  "} {
+		if err := mgr.Add(ctx, repo, dest, br, "main"); err == nil {
+			t.Errorf("branch %q should be rejected", br)
 		}
 	}
 }
@@ -80,11 +73,13 @@ func TestAdd_BranchConflict(t *testing.T) {
 	repo := newTestRepo(t)
 	mgr := New(t.TempDir())
 	ctx := context.Background()
-	if _, err := mgr.Add(ctx, repo, "p1", "t1", "ocdeck/same", "main"); err != nil {
+	d1 := filepath.Join(mgr.dataDir, "worktrees", "p1", "t1")
+	if err := mgr.Add(ctx, repo, d1, "ocdeck/same", "main"); err != nil {
 		t.Fatalf("first Add: %v", err)
 	}
 	// 同分支名再次 add 应失败。
-	if _, err := mgr.Add(ctx, repo, "p1", "t2", "ocdeck/same", "main"); err == nil {
+	d2 := filepath.Join(mgr.dataDir, "worktrees", "p1", "t2")
+	if err := mgr.Add(ctx, repo, d2, "ocdeck/same", "main"); err == nil {
 		t.Fatal("second Add with same branch should fail")
 	}
 }
@@ -93,13 +88,12 @@ func TestAdd_FailureCleansHalfBaked(t *testing.T) {
 	repo := newTestRepo(t)
 	mgr := New(t.TempDir())
 	ctx := context.Background()
+	dest := filepath.Join(mgr.dataDir, "worktrees", "p1", "t1")
 	// 无效分支名让 add 失败。
-	_, err := mgr.Add(ctx, repo, "p1", "t1", "ocdeck/bad..name", "main")
-	if err == nil {
+	if err := mgr.Add(ctx, repo, dest, "ocdeck/bad..name", "main"); err == nil {
 		t.Fatal("expected error for invalid branch name")
 	}
 	// 目标目录不应残留。
-	dest := filepath.Join(mgr.dataDir, "worktrees", "p1", "t1")
 	if _, err := os.Stat(dest); err == nil {
 		t.Errorf("half-baked dir should be cleaned: %s", dest)
 	}
@@ -114,8 +108,23 @@ func TestAdd_TargetExistsRejected(t *testing.T) {
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mgr.Add(ctx, repo, "p1", "t1", "ocdeck/b", "main"); err == nil {
+	if err := mgr.Add(ctx, repo, dest, "ocdeck/b", "main"); err == nil {
 		t.Fatal("Add should reject existing target")
+	}
+}
+
+// TestAdd_ContainmentBeforeSideEffect 验证 dest 逃逸 worktrees 根时在无任何副作用前报错（ai-worktree-naming 2.5）。
+func TestAdd_ContainmentBeforeSideEffect(t *testing.T) {
+	repo := newTestRepo(t)
+	mgr := New(t.TempDir())
+	ctx := context.Background()
+	escaped := filepath.Join(t.TempDir(), "evil", "task1")
+	if err := mgr.Add(ctx, repo, escaped, "ocdeck/b", "main"); err == nil {
+		t.Fatal("Add should reject dest escaping worktrees root")
+	}
+	// 逃逸目录不应被创建。
+	if _, err := os.Stat(escaped); err == nil {
+		t.Errorf("escaped dest should not be created: %s", escaped)
 	}
 }
 
@@ -123,8 +132,8 @@ func TestRemove_CleanClosedLoop(t *testing.T) {
 	repo := newTestRepo(t)
 	mgr := New(t.TempDir())
 	ctx := context.Background()
-	wt, err := mgr.Add(ctx, repo, "p1", "t1", "ocdeck/task-1", "main")
-	if err != nil {
+	wt := filepath.Join(mgr.dataDir, "worktrees", "p1", "t1")
+	if err := mgr.Add(ctx, repo, wt, "ocdeck/task-1", "main"); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
 	if err := mgr.Remove(ctx, wt, RemoveOpts{RepoPath: repo, Branch: "ocdeck/task-1"}); err != nil {
@@ -156,12 +165,12 @@ func TestRemove_DirtyRejectedWithoutForce(t *testing.T) {
 	repo := newTestRepo(t)
 	mgr := New(t.TempDir())
 	ctx := context.Background()
-	wt, err := mgr.Add(ctx, repo, "p1", "t1", "ocdeck/task-1", "main")
-	if err != nil {
+	wt := filepath.Join(mgr.dataDir, "worktrees", "p1", "t1")
+	if err := mgr.Add(ctx, repo, wt, "ocdeck/task-1", "main"); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
 	writeFile(t, wt, "dirty.txt", "x\n")
-	err = mgr.Remove(ctx, wt, RemoveOpts{RepoPath: repo, Branch: "ocdeck/task-1"})
+	err := mgr.Remove(ctx, wt, RemoveOpts{RepoPath: repo, Branch: "ocdeck/task-1"})
 	if err == nil {
 		t.Fatal("Remove should reject dirty worktree without ForceDirty")
 	}
@@ -191,8 +200,8 @@ func TestRemove_BranchOccupiedRejected(t *testing.T) {
 	mgr := New(t.TempDir())
 	ctx := context.Background()
 	// 第一个 worktree 检出 ocdeck/shared。
-	wt1, err := mgr.Add(ctx, repo, "p1", "t1", "ocdeck/shared", "main")
-	if err != nil {
+	wt1 := filepath.Join(mgr.dataDir, "worktrees", "p1", "t1")
+	if err := mgr.Add(ctx, repo, wt1, "ocdeck/shared", "main"); err != nil {
 		t.Fatalf("Add wt1: %v", err)
 	}
 	// 直接尝试 Remove 一个不存在的 worktree 路径但分支被 wt1 占用：
@@ -229,8 +238,7 @@ func TestAdd_FailureFullCompensation(t *testing.T) {
 	dest := filepath.Join(mgr.dataDir, "worktrees", "p1", "t1")
 
 	// 用一个会让 worktree add 失败的 baseRef（不存在），但 check-ref-format 通过的分支。
-	_, err := mgr.Add(ctx, repo, "p1", "t1", "ocdeck/goodname", "refs/heads/nonexistent-base")
-	if err == nil {
+	if err := mgr.Add(ctx, repo, dest, "ocdeck/goodname", "refs/heads/nonexistent-base"); err == nil {
 		t.Fatal("Add with nonexistent baseRef should fail")
 	}
 	// 目录应被清理。
@@ -254,8 +262,8 @@ func TestRemove_RetryAfterPartialFailure(t *testing.T) {
 	repo := newTestRepo(t)
 	mgr := New(t.TempDir())
 	ctx := context.Background()
-	wt, err := mgr.Add(ctx, repo, "p1", "t1", "ocdeck/retry-1", "main")
-	if err != nil {
+	wt := filepath.Join(mgr.dataDir, "worktrees", "p1", "t1")
+	if err := mgr.Add(ctx, repo, wt, "ocdeck/retry-1", "main"); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
 	// 模拟删除中途 worktree 已被 git 正确移除但分支未删（元数据已清，分支残留）。
@@ -292,8 +300,8 @@ func TestRemove_BranchAlreadyGoneIdempotent(t *testing.T) {
 	repo := newTestRepo(t)
 	mgr := New(t.TempDir())
 	ctx := context.Background()
-	wt, err := mgr.Add(ctx, repo, "p1", "t1", "ocdeck/gone", "main")
-	if err != nil {
+	wt := filepath.Join(mgr.dataDir, "worktrees", "p1", "t1")
+	if err := mgr.Add(ctx, repo, wt, "ocdeck/gone", "main"); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
 	// 先删除分支（worktree 仍存在但分支关联解除），再用不存在的分支 Remove。

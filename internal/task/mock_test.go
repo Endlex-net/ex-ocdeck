@@ -530,17 +530,16 @@ func newMockWorktree() *mockWorktree {
 	}
 }
 
-func (w *mockWorktree) Add(ctx context.Context, repoPath, projectID, taskID, branch, baseRef string) (string, error) {
+func (w *mockWorktree) Add(ctx context.Context, repoPath, dest, branch, baseRef string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.addErr != nil {
-		return "", w.addErr
+		return w.addErr
 	}
-	p := "/data/worktrees/" + projectID + "/" + taskID
-	w.addedPaths[p] = true
+	w.addedPaths[dest] = true
 	w.branches[branch] = true
-	w.products[p] = true
-	return p, nil
+	w.products[dest] = true
+	return nil
 }
 
 func (w *mockWorktree) Remove(ctx context.Context, wtPath string, opts worktreeRemoveOpts) error {

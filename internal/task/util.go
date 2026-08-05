@@ -14,6 +14,36 @@ func newTaskID() string {
 	return hex.EncodeToString(b)
 }
 
+// normalizeSlug 将名称规范化为 slug：小写、非 [a-z0-9] 折叠为 -、去首尾 -。
+// 允许返回空（调用方决定空兜底策略）。与 Slugify 共享同一规范化逻辑。
+func normalizeSlug(name string) string {
+	s := strings.ToLower(strings.TrimSpace(name))
+	var b strings.Builder
+	prevDash := true // 首字符也禁止 -，等价于首字符前视为 -
+	for _, c := range s {
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			b.WriteRune(c)
+			prevDash = false
+			continue
+		}
+		if !prevDash {
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+// Slugify 将名称转为 slug：normalizeSlug + 空兜底 "task"。
+// 行为与历史 slugify 完全一致（分支名派生用）。
+func Slugify(name string) string {
+	out := normalizeSlug(name)
+	if out == "" {
+		return "task"
+	}
+	return out
+}
+
 // parsePort 解析端口字符串为 int 并校验 1..65535 范围。替代 fmt.Sscanf（后者不报错地
 // 接受 "123abc"→123、空串→0 等非法输入）。返回 (port, ok)。
 func parsePort(s string) (int, bool) {

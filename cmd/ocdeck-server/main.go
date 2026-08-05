@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"ocdeck/internal/ai"
 	"ocdeck/internal/api"
 	"ocdeck/internal/config"
 	"ocdeck/internal/lifecycle"
@@ -97,6 +98,11 @@ func run() error {
 	})
 	wtMgr := worktree.New(cfg.DataDir)
 
+	// AI 配置 Store（design.md D7 wiring）：单实例同时注入命名链与 API 层。
+	// LoadStore 对不存在/损坏/非法配置均不返回致命错误（保持启动），故无需 err 处理。
+	aiStore := ai.LoadStore(cfg.DataDir)
+	namer := ai.NewSlugNamer(aiStore, task.Slugify) // fallback 用本包 Slugify（避免 ai→task 循环依赖）
+
 	// TaskManager 构造（design.md §18）。
 	adapter := task.NewStoreAdapter(db)
 	tm := task.New(task.Options{
@@ -107,6 +113,7 @@ func run() error {
 		DebtStore:       adapter,         // R7：orphan tickets 持久化跨重启恢复（design.md §10）
 		LifecycleRunner: lifecycle.New(), // design.md §7.1：init/pre-delete 脚本与 inherit
 		LogDir:          cfg.DataDir + "/logs",
+		Namer:           namer, // ai-worktree-naming：Create 经 LLM 提炼分支 slug，未配置时内部回退 Slugify
 	})
 	// 注入 Manager 生命周期 context（design.md §4：SSE/退出监视挂进程 ctx，非 HTTP request ctx）。
 	tm.SetLifecycleCtx(ctx)
@@ -122,6 +129,9 @@ func run() error {
 
 	srv := api.New(cfg, db)
 	srv.SetTaskBackend(tm)
+	// AI 配置 Store 注入 API 层（design.md D7 wiring）：单实例同时供给命名链。
+	// 沿用 SetTaskBackend 位置模式，须在 RebuildRoutes 前生效。
+	srv.SetAIConfigStore(aiStore)
 	// 全局 oc 配置管理（design.md §13/§21）：~/.config/opencode/ 下 *.json/*.jsonc。
 	ocCfgDir, ocCfgErr := config.DefaultOCConfigDir()
 	if ocCfgErr == nil {
