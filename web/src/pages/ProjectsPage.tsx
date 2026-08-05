@@ -65,6 +65,9 @@ export function ProjectsPage() {
         <span className="brand">ocdeck</span>
         <span className="page-title">项目</span>
         <span className="header-spacer" />
+        <button className="btn btn-small btn-ghost" onClick={() => navigate('/active')}>
+          活跃会话
+        </button>
         <button className="btn btn-small btn-ghost" onClick={() => navigate('/configs')}>
           全局配置
         </button>

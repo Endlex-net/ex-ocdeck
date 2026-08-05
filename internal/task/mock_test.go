@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -122,6 +123,58 @@ func (s *mockStore) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 	for _, t := range s.tasks {
 		out = append(out, t)
 	}
+	return out, nil
+}
+
+// ListActiveTaskOverview 镜像 store.ListActiveTaskOverview SQL 语义：
+// 仅 active；last_active_at = COALESCE(MAX(归一化后 sessions.last_seen_at), t.updated_at)
+// —— 有 session 行时只用 sessions 的 MAX（不含 updated_at），无 session 回退 updated_at；
+// last_seen_at ≥1e11 视为毫秒 ÷1000 归一化为秒；按 last_active_at DESC、id ASC。
+func (s *mockStore) ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOverviewRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	const msThreshold int64 = 100000000000
+	normalize := func(v int64) int64 {
+		if v >= msThreshold {
+			return v / 1000
+		}
+		return v
+	}
+	var out []ActiveTaskOverviewRow
+	for _, t := range s.tasks {
+		if t.Status != StatusActive {
+			continue
+		}
+		project, ok := s.projects[t.ProjectID]
+		if !ok {
+			// store 用 INNER JOIN：无项目行不返回。
+			continue
+		}
+		var last int64
+		sessions := s.sessions[t.ID]
+		if len(sessions) > 0 {
+			// COALESCE：有 session 行时取归一化后 sessions 的 MAX，不混入 updated_at。
+			last = normalize(sessions[0].LastSeenAt)
+			for _, sess := range sessions[1:] {
+				if n := normalize(sess.LastSeenAt); n > last {
+					last = n
+				}
+			}
+		} else {
+			// 无 session → 回退 updated_at（已是秒，无需归一化）。
+			last = t.UpdatedAt
+		}
+		out = append(out, ActiveTaskOverviewRow{
+			ID: t.ID, ProjectID: t.ProjectID, ProjectName: project.Name,
+			Name: t.Name, Branch: t.Branch, WorktreePath: t.WorktreePath, LastActiveAt: last,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].LastActiveAt != out[j].LastActiveAt {
+			return out[i].LastActiveAt > out[j].LastActiveAt
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out, nil
 }
 
@@ -456,6 +509,10 @@ func (p *mockProc) ShowSessionEnv(name, key string) (string, error) {
 		return env[key], nil
 	}
 	return "", nil
+}
+
+func (p *mockProc) ShowSessionEnvContext(ctx context.Context, name, key string) (string, error) {
+	return p.ShowSessionEnv(name, key)
 }
 
 func (p *mockProc) WatchExit(name string, callback func(process.WatchEvent)) (func(), <-chan struct{}) {

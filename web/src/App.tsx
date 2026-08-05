@@ -8,6 +8,7 @@ import { ProjectDetailPage } from './pages/ProjectDetailPage';
 import { TaskWorkbenchPage } from './pages/TaskWorkbenchPage';
 import { ConfigsPage } from './pages/ConfigsPage';
 import { AIConfigPage } from './pages/AIConfigPage';
+import { ActiveSessionsPage } from './pages/ActiveSessionsPage';
 
 export function App() {
   const [authed, setAuthed] = useState(() => getToken() !== '');
@@ -23,14 +24,18 @@ export function App() {
     return <TokenGate onSaved={() => setAuthed(true)} />;
   }
 
-  const projectMatch = route.match(/^\/project\/([^/]+)$/);
-  const taskMatch = route.match(/^\/task\/([^/]+)$/);
+  // 拆分 query：来源感知导航等参数不得混入路径匹配（如 taskID 捕获）
+  const [path, query = ''] = route.split('?');
+  const projectMatch = path.match(/^\/project\/([^/]+)$/);
+  const taskMatch = path.match(/^\/task\/([^/]+)$/);
+  const fromActive = new URLSearchParams(query).get('from') === 'active';
 
   let page: React.ReactNode;
-  if (route === '/configs') page = <ConfigsPage />;
-  else if (route === '/ai-config') page = <AIConfigPage />;
+  if (path === '/configs') page = <ConfigsPage />;
+  else if (path === '/ai-config') page = <AIConfigPage />;
+  else if (path === '/active') page = <ActiveSessionsPage />;
   else if (projectMatch) page = <ProjectDetailPage projectID={projectMatch[1]} />;
-  else if (taskMatch) page = <TaskWorkbenchPage taskID={taskMatch[1]} />;
+  else if (taskMatch) page = <TaskWorkbenchPage taskID={taskMatch[1]} fromActive={fromActive} />;
   else page = <ProjectsPage />;
 
   // 应用级骨架：server 状态告警 banner 在所有页面顶部可见；

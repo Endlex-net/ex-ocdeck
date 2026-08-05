@@ -65,6 +65,8 @@ type ProcessBackend interface {
 	HasSession(name string) (bool, error)
 	ListSessions() ([]string, error)
 	ShowSessionEnv(name, key string) (string, error)
+	// ShowSessionEnvContext 同 ShowSessionEnv 但使用调用方 ctx（cross-project-active-sessions D0）。
+	ShowSessionEnvContext(ctx context.Context, name, key string) (string, error)
 	WatchExit(name string, callback func(process.WatchEvent)) (cancel func(), done <-chan struct{})
 	AttachPty(name string, cols, rows int) (*pty.Pty, error)
 }

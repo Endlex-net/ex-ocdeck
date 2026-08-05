@@ -66,6 +66,21 @@ func (a *StoreAdapter) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 	return out, nil
 }
 
+func (a *StoreAdapter) ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOverviewRow, error) {
+	rows, err := a.db.ListActiveTaskOverview(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ActiveTaskOverviewRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, ActiveTaskOverviewRow{
+			ID: r.ID, ProjectID: r.ProjectID, ProjectName: r.ProjectName, Name: r.Name,
+			Branch: r.Branch, WorktreePath: r.WorktreePath, LastActiveAt: r.LastActiveAt,
+		})
+	}
+	return out, nil
+}
+
 func (a *StoreAdapter) UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) error {
 	return a.db.UpdateTaskStatus(ctx, id, status, lastError)
 }
@@ -318,6 +333,9 @@ func (a *ProcessAdapter) HasSession(name string) (bool, error)         { return 
 func (a *ProcessAdapter) ListSessions() ([]string, error)              { return a.m.ListSessions() }
 func (a *ProcessAdapter) ShowSessionEnv(name, key string) (string, error) {
 	return a.m.ShowSessionEnv(name, key)
+}
+func (a *ProcessAdapter) ShowSessionEnvContext(ctx context.Context, name, key string) (string, error) {
+	return a.m.ShowSessionEnvContext(ctx, name, key)
 }
 func (a *ProcessAdapter) WatchExit(name string, callback func(process.WatchEvent)) (func(), <-chan struct{}) {
 	return a.m.WatchExit(name, callback)
