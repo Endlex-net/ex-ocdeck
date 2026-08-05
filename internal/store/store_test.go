@@ -252,6 +252,329 @@ func TestUpdateTaskStatusConditional(t *testing.T) {
 	}
 }
 
+// seedActiveTaskOverview 在多项目多任务场景下构造测试数据
+// （cross-project-active-sessions D2：跨项目 active 概览聚合）。
+// 所有 active 任务均带 session 以便用可控的 last_seen_at 验证排序（updated_at 由
+// CreateTask 用 nowUnix() 写入，真实时间戳不可控，故排序测试不依赖它）。
+func seedActiveTaskOverview(t *testing.T, db *DB) {
+	t.Helper()
+	ctx := context.Background()
+	if err := db.CreateProject(ctx, "p1", "projA", "/tmp/repoA", "main"); err != nil {
+		t.Fatalf("create project p1: %v", err)
+	}
+	if err := db.CreateProject(ctx, "p2", "projB", "/tmp/repoB", "main"); err != nil {
+		t.Fatalf("create project p2: %v", err)
+	}
+	// active 任务跨两个项目；non-active 用于验证排除。
+	tasks := []TaskRow{
+		{ID: "t-active-a", ProjectID: "p1", Name: "taskA", Branch: "bA", Status: "active", WorktreePath: "/tmp/wtA"},
+		{ID: "t-active-b", ProjectID: "p2", Name: "taskB", Branch: "bB", Status: "active", WorktreePath: "/tmp/wtB"},
+		{ID: "t-active-c", ProjectID: "p1", Name: "taskC", Branch: "bC", Status: "active", WorktreePath: "/tmp/wtC"},
+		{ID: "t-suspended", ProjectID: "p1", Name: "taskS", Branch: "bS", Status: "suspended", WorktreePath: "/tmp/wtS"},
+	}
+	for _, tk := range tasks {
+		if err := db.CreateTask(ctx, tk); err != nil {
+			t.Fatalf("create task %s: %v", tk.ID, err)
+		}
+	}
+	// 会话：t-active-a 有两个 session（MAX last_seen_at 应取较大者），
+	// t-active-c 有一个 session，t-active-b 一个 session。
+	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "t-active-a", SessionID: "s1", SessionCreatedAt: 1, FirstSeenAt: 10, LastSeenAt: 100})
+	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "t-active-a", SessionID: "s2", SessionCreatedAt: 1, FirstSeenAt: 10, LastSeenAt: 300})
+	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "t-active-b", SessionID: "s1", SessionCreatedAt: 1, FirstSeenAt: 10, LastSeenAt: 200})
+	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "t-active-c", SessionID: "s1", SessionCreatedAt: 1, FirstSeenAt: 10, LastSeenAt: 50})
+}
+
+func TestListActiveTaskOverview_Aggregation(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	seedActiveTaskOverview(t, db)
+
+	rows, err := db.ListActiveTaskOverview(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	// 仅 3 个 active 任务；suspended 被排除。
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3 (active only): %+v", len(rows), rows)
+	}
+
+	got := map[string]ActiveTaskOverviewRow{}
+	for _, r := range rows {
+		got[r.ID] = r
+	}
+	// t-active-a: MAX(s1=100, s2=300) = 300。
+	if r := got["t-active-a"]; r.LastActiveAt != 300 || r.ProjectName != "projA" || r.Branch != "bA" || r.WorktreePath != "/tmp/wtA" {
+		t.Errorf("t-active-a = %+v, want last_active_at=300 projA bA /tmp/wtA", r)
+	}
+	// t-active-b: single session last_seen_at=200。
+	if r := got["t-active-b"]; r.LastActiveAt != 200 || r.ProjectName != "projB" {
+		t.Errorf("t-active-b = %+v, want last_active_at=200 projB", r)
+	}
+	// t-active-c: single session last_seen_at=50。
+	if r := got["t-active-c"]; r.LastActiveAt != 50 || r.ProjectName != "projA" {
+		t.Errorf("t-active-c = %+v, want last_active_at=50 projA", r)
+	}
+	// suspended 不应出现。
+	if _, ok := got["t-suspended"]; ok {
+		t.Error("t-suspended appeared in active overview (must be excluded)")
+	}
+}
+
+func TestListActiveTaskOverview_SortOrder(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	seedActiveTaskOverview(t, db)
+
+	rows, err := db.ListActiveTaskOverview(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	// 期望 last_active_at DESC：t-active-a(300) > t-active-b(200) > t-active-c(50)。
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3", len(rows))
+	}
+	want := []string{"t-active-a", "t-active-b", "t-active-c"}
+	for i, w := range want {
+		if rows[i].ID != w {
+			t.Errorf("rows[%d].ID = %s, want %s", i, rows[i].ID, w)
+		}
+	}
+	if !(rows[0].LastActiveAt > rows[1].LastActiveAt && rows[1].LastActiveAt > rows[2].LastActiveAt) {
+		t.Errorf("not strictly DESC: %+v", rows)
+	}
+}
+
+// TestListActiveTaskOverview_NoSessionFallbackToUpdatedAt 验证无 session 时
+// last_active_at 回退到 t.updated_at（cross-project-active-sessions D2）。
+func TestListActiveTaskOverview_NoSessionFallbackToUpdatedAt(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	seedProjectTask(t, db, "t1")
+	// seedProjectTask 默认 suspended；切到 active 以纳入概览。
+	if _, err := db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "active", sql.NullString{}); err != nil {
+		t.Fatalf("activate t1: %v", err)
+	}
+	task, _ := db.GetTask(ctx, "t1")
+
+	rows, err := db.ListActiveTaskOverview(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	if rows[0].LastActiveAt != task.UpdatedAt {
+		t.Errorf("last_active_at = %d, want updated_at fallback %d", rows[0].LastActiveAt, task.UpdatedAt)
+	}
+}
+
+func TestListActiveTaskOverview_TieBreakerByID(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	_ = db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main")
+	// 两个 active 任务带相同 last_seen_at 的 session → tie-breaker 按 t.id ASC。
+	_ = db.CreateTask(ctx, TaskRow{ID: "zeta", ProjectID: "p1", Name: "n", Branch: "b", Status: "active", WorktreePath: "/tmp/wt"})
+	_ = db.CreateTask(ctx, TaskRow{ID: "alpha", ProjectID: "p1", Name: "n", Branch: "b", Status: "active", WorktreePath: "/tmp/wt"})
+	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "zeta", SessionID: "s", SessionCreatedAt: 1, FirstSeenAt: 1, LastSeenAt: 500})
+	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "alpha", SessionID: "s", SessionCreatedAt: 1, FirstSeenAt: 1, LastSeenAt: 500})
+	rows, err := db.ListActiveTaskOverview(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(rows))
+	}
+	// 同 last_active_at → id ASC: alpha < zeta。
+	if rows[0].ID != "alpha" || rows[1].ID != "zeta" {
+		t.Errorf("tie-breaker order = [%s,%s], want [alpha,zeta]", rows[0].ID, rows[1].ID)
+	}
+}
+
+func TestListActiveTaskOverview_EmptyReturnsEmptySlice(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	// 无任务 → nil slice（store 层语义；API 层保证 JSON `[]`）。
+	rows, err := db.ListActiveTaskOverview(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if rows != nil {
+		t.Errorf("rows = %v, want nil (no active tasks)", rows)
+	}
+}
+
+// seedMixedUnitOverview 构造 ms（13 位，opencode time.updated）与秒（updated_at）
+// 混存的测试数据（cross-project-active-sessions D2 单位归一化）。
+// updated_at 直接经 SQL UPDATE 设为可控秒值（CreateTask 用 nowUnix 不可控）。
+func seedMixedUnitOverview(t *testing.T, db *DB, msA, msB, secC int64) {
+	t.Helper()
+	ctx := context.Background()
+	if err := db.CreateProject(ctx, "p1", "projA", "/tmp/repo", "main"); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	for _, id := range []string{"t-ms-a", "t-ms-b", "t-sec-c"} {
+		if err := db.CreateTask(ctx, TaskRow{ID: id, ProjectID: "p1", Name: id, Branch: "b", Status: "active", WorktreePath: "/tmp/wt"}); err != nil {
+			t.Fatalf("create task %s: %v", id, err)
+		}
+	}
+	// 直接控制 updated_at 为可控秒值。
+	if _, err := db.ExecContext(ctx, `UPDATE tasks SET updated_at = ? WHERE id = ?`, secC, "t-sec-c"); err != nil {
+		t.Fatalf("set updated_at: %v", err)
+	}
+	// 两个 ms 单位 session（13 位），一个秒单位任务无 session（回退 updated_at）。
+	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "t-ms-a", SessionID: "s1", SessionCreatedAt: 1, FirstSeenAt: 10, LastSeenAt: msA})
+	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "t-ms-b", SessionID: "s1", SessionCreatedAt: 1, FirstSeenAt: 10, LastSeenAt: msB})
+}
+
+// TestListActiveTaskOverview_MsNormalizedToSeconds 验证 ms 单位 last_seen_at
+// 被归一化为秒（÷1000），输出始终为 Unix 秒（cross-project-active-sessions D2）。
+func TestListActiveTaskOverview_MsNormalizedToSeconds(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	// msA = 1785797826297 → 归一化为 1785797826 秒。
+	seedMixedUnitOverview(t, db, 1785797826297, 1785797000000, 1785795000)
+
+	rows, err := db.ListActiveTaskOverview(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3: %+v", len(rows), rows)
+	}
+	got := map[string]ActiveTaskOverviewRow{}
+	for _, r := range rows {
+		got[r.ID] = r
+	}
+	if r := got["t-ms-a"]; r.LastActiveAt != 1785797826 {
+		t.Errorf("t-ms-a last_active_at = %d, want 1785797826 (ms ÷1000)", r.LastActiveAt)
+	}
+	if r := got["t-ms-b"]; r.LastActiveAt != 1785797000 {
+		t.Errorf("t-ms-b last_active_at = %d, want 1785797000 (ms ÷1000)", r.LastActiveAt)
+	}
+	// t-sec-c 无 session → 回退 updated_at（已是秒，不归一化）。
+	if r := got["t-sec-c"]; r.LastActiveAt != 1785795000 {
+		t.Errorf("t-sec-c last_active_at = %d, want 1785795000 (updated_at seconds)", r.LastActiveAt)
+	}
+}
+
+// TestListActiveTaskOverview_MsOlderThanSecondsFallback 验证 ms 行实际更老
+// （归一化后秒值 < 回退任务的 updated_at）时，秒回退任务排在前面（单位归一化后排序正确）。
+// 使用真实 13 位 ms 值（≥1e11）确保命中归一化分支——若用 <1e11 的秒值，CASE 被删测试仍会通过。
+func TestListActiveTaskOverview_MsOlderThanSecondsFallback(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	// msA/msB = 1000000000000（13 位）→ 归一化为 1000000000 秒；秒回退任务 updated_at = 1700000000（更新）。
+	seedMixedUnitOverview(t, db, 1000000000000, 1000000000000, 1700000000)
+
+	rows, err := db.ListActiveTaskOverview(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3", len(rows))
+	}
+	got := map[string]int64{}
+	for _, r := range rows {
+		got[r.ID] = r.LastActiveAt
+	}
+	// 归一化输出必须为秒值（1000000000），证明命中归一化分支。
+	if got["t-ms-a"] != 1000000000 {
+		t.Errorf("t-ms-a last_active_at = %d, want 1000000000 (13-digit ms ÷1000)", got["t-ms-a"])
+	}
+	if got["t-ms-b"] != 1000000000 {
+		t.Errorf("t-ms-b last_active_at = %d, want 1000000000 (13-digit ms ÷1000)", got["t-ms-b"])
+	}
+	if got["t-sec-c"] != 1700000000 {
+		t.Errorf("t-sec-c last_active_at = %d, want 1700000000 (updated_at seconds)", got["t-sec-c"])
+	}
+	// 排序：t-sec-c(1700000000) 首位，两个 ms 行(1000000000) 在后 tie-break by id。
+	if rows[0].ID != "t-sec-c" {
+		t.Errorf("rows[0] = %s, want t-sec-c (seconds fallback 1700000000 > normalized ms 1000000000)", rows[0].ID)
+	}
+}
+
+// TestListActiveTaskOverview_SameTaskMixedUnits 验证同一任务同时存在秒值 session
+// （<1e11，实际更新）与 ms 值 session（≥1e11，归一化后更老）时，last_active_at = 秒值。
+// 锁定"逐行归一化在 MAX 之前完成"：若 MAX 在归一化前跑，原始 ms 值（1e12+）会恒胜。
+func TestListActiveTaskOverview_SameTaskMixedUnits(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main"); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if err := db.CreateTask(ctx, TaskRow{ID: "t1", ProjectID: "p1", Name: "n", Branch: "b", Status: "active", WorktreePath: "/tmp/wt"}); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	// 秒值 session（<1e11，实际更新，1700000000）+ ms 值 session（≥1e11，归一化为 1000000000，更老）。
+	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "t1", SessionID: "seconds", SessionCreatedAt: 1, FirstSeenAt: 1, LastSeenAt: 1700000000})
+	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "t1", SessionID: "ms", SessionCreatedAt: 1, FirstSeenAt: 1, LastSeenAt: 1000000000000})
+
+	rows, err := db.ListActiveTaskOverview(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	if rows[0].LastActiveAt != 1700000000 {
+		t.Errorf("last_active_at = %d, want 1700000000 (per-row normalize before MAX: seconds row wins over normalized ms 1000000000)", rows[0].LastActiveAt)
+	}
+}
+
+// TestListActiveTaskOverview_SameTaskMixedUnitsInverse 验证反方向：ms session 归一化后
+// 比秒值 session 更新 → ms（归一化后）胜。锁定归一化后 MAX 正确性。
+func TestListActiveTaskOverview_SameTaskMixedUnitsInverse(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main"); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if err := db.CreateTask(ctx, TaskRow{ID: "t1", ProjectID: "p1", Name: "n", Branch: "b", Status: "active", WorktreePath: "/tmp/wt"}); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	// 秒值 session（<1e11，1000000000，更老）+ ms 值 session（≥1e11，归一化为 1800000000，更新）。
+	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "t1", SessionID: "seconds", SessionCreatedAt: 1, FirstSeenAt: 1, LastSeenAt: 1000000000})
+	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "t1", SessionID: "ms", SessionCreatedAt: 1, FirstSeenAt: 1, LastSeenAt: 1800000000000})
+
+	rows, err := db.ListActiveTaskOverview(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	if rows[0].LastActiveAt != 1800000000 {
+		t.Errorf("last_active_at = %d, want 1800000000 (normalized ms wins over seconds row)", rows[0].LastActiveAt)
+	}
+}
+
+// TestListActiveTaskOverview_MsNewerThanSecondsFallback 验证 ms 行实际更新
+// （归一化后秒值 > 回退任务 updated_at）时，ms 行排在前面。
+func TestListActiveTaskOverview_MsNewerThanSecondsFallback(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	// msA = 1800000000000 → 归一化为 1800000000 秒；秒回退任务 updated_at = 1700000000（更老）。
+	seedMixedUnitOverview(t, db, 1800000000000, 1750000000000, 1700000000)
+
+	rows, err := db.ListActiveTaskOverview(ctx)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d, want 3", len(rows))
+	}
+	if rows[0].ID != "t-ms-a" {
+		t.Errorf("rows[0] = %s, want t-ms-a (normalized ms 1800000000 > seconds fallback 1700000000)", rows[0].ID)
+	}
+	if rows[1].ID != "t-ms-b" {
+		t.Errorf("rows[1] = %s, want t-ms-b (normalized ms 1750000000)", rows[1].ID)
+	}
+	if rows[2].ID != "t-sec-c" {
+		t.Errorf("rows[2] = %s, want t-sec-c (seconds fallback 1700000000)", rows[2].ID)
+	}
+}
+
 func TestBeginDeleteIntent_Atomic(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
