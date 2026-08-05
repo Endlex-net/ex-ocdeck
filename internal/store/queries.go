@@ -360,6 +360,59 @@ func (q *Queries) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 	return scanTaskRows(rows)
 }
 
+// ActiveTaskOverviewRow 跨项目 active 任务概览投影行（cross-project-active-sessions D2）。
+// 仅供 GET /api/v1/sessions/active 读模型：不含 status/init 等详情字段，不携带 agentStatus。
+// last_active_at 为 MAX(task_sessions.last_seen_at)，无 session 时回退 t.updated_at。
+type ActiveTaskOverviewRow struct {
+	ID           string
+	ProjectID    string
+	ProjectName  string
+	Name         string
+	Branch       string
+	WorktreePath string
+	LastActiveAt int64
+}
+
+// ListActiveTaskOverview 聚合全部 active 任务的跨项目概览（cross-project-active-sessions D2）。
+// JOIN projects 取项目名；LEFT JOIN task_sessions 以 MAX(last_seen_at) 为最近活跃时间，
+// 无 session 回退 t.updated_at；按 last_active_at DESC、t.id ASC 排序。
+//
+// 单位归一化（实测确认）：task_sessions.last_seen_at 持久化 opencode time.updated
+// 为毫秒（≈1.78e12，如 1785797826297）；tasks.updated_at 为 nowUnix() 秒（≈1.78e9）。
+// 逐行 CASE 归一化（阈值 1e11）：≥1e11 视为毫秒 ÷1000 取整，否则按秒原值；在 MAX 之前完成，
+// 读侧兼容存量与新写入数据，不触碰写路径。
+func (q *Queries) ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOverviewRow, error) {
+	rows, err := q.db.QueryContext(ctx,
+		`SELECT t.id, t.project_id, p.name AS project_name, t.name, t.branch, t.worktree_path,
+		        COALESCE(
+		          MAX(CASE
+		            WHEN s.last_seen_at >= 100000000000
+		            THEN CAST(s.last_seen_at / 1000 AS INTEGER)
+		            ELSE s.last_seen_at
+		          END),
+		          t.updated_at
+		        ) AS last_active_at
+		 FROM tasks t
+		 JOIN projects p ON p.id = t.project_id
+		 LEFT JOIN task_sessions s ON s.task_id = t.id
+		 WHERE t.status = 'active'
+		 GROUP BY t.id
+		 ORDER BY last_active_at DESC, t.id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ActiveTaskOverviewRow
+	for rows.Next() {
+		var r ActiveTaskOverviewRow
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.ProjectName, &r.Name, &r.Branch, &r.WorktreePath, &r.LastActiveAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // UpdateTaskStatus 更新任务状态与 last_error，刷新 updated_at。
 func (q *Queries) UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) error {
 	_, err := q.db.ExecContext(ctx,

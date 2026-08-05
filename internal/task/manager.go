@@ -58,6 +58,9 @@ type TaskStore interface {
 	ListTopLevelTaskSessions(ctx context.Context, taskID string) ([]SessionRow, error)
 	DeleteTaskSession(ctx context.Context, taskID, sessionID string) error
 	AlignSessions(ctx context.Context, taskID string, sessions []SessionRow, complete bool, noticeFn func(sql.NullString) sql.NullString) error
+	// ListActiveTaskOverview 聚合全部 active 任务的跨项目概览
+	//（cross-project-active-sessions D2：JOIN projects + LEFT JOIN task_sessions）。
+	ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOverviewRow, error)
 }
 
 // CleanupDebtStore 持久化未收敛的 orphan cleanup tickets（design.md §10）。
@@ -136,6 +139,19 @@ type SessionRow struct {
 	LastSeenAt       int64
 	// ParentID 非空表示 background subagent 子会话；空为顶层会话（design.md §4 锚定隔离）。
 	ParentID string
+}
+
+// ActiveTaskOverviewRow 跨项目 active 任务概览投影行（cross-project-active-sessions D1/D2）。
+// 仅供 GET /api/v1/sessions/active 读模型：字段与 store.ActiveTaskOverviewRow 一一对应，
+// 不携带 agentStatus（由 API 层 hydration worker 并发填充到 DTO）。
+type ActiveTaskOverviewRow struct {
+	ID           string
+	ProjectID    string
+	ProjectName  string
+	Name         string
+	Branch       string
+	WorktreePath string
+	LastActiveAt int64
 }
 
 // --- Manager ---

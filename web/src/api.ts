@@ -1,4 +1,5 @@
 import type {
+  ActiveSessionItem,
   AIConfig,
   EnvResponse,
   GitDiffResult,
@@ -164,6 +165,9 @@ export const api = {
   closeTerminal: (tid: string) => request<void>('DELETE', `/terminals/${tid}`),
 
   serverStatus: () => request<ServerStatus>('GET', '/server/status'),
+
+  /** 跨项目活跃会话列表（design.md D3）：快照语义，agentStatus 不可用时缺省。 */
+  listActiveSessions: () => request<ActiveSessionItem[]>('GET', '/sessions/active'),
 
   gitStatus: (taskID: string) => request<GitStatus>('GET', `/tasks/${taskID}/git/status`),
   gitDiff: (taskID: string, ref: string, path: string) =>

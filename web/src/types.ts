@@ -51,6 +51,20 @@ export interface TerminalInfo {
   terminal_id: string;
 }
 
+/** GET /sessions/active 响应元素（cross-project-active-sessions design.md D3）。
+ *  agentStatus 水合失败/超时时省略，渲染按未知降级处理。 */
+export interface ActiveSessionItem {
+  task_id: string;
+  project_id: string;
+  project_name: string;
+  name: string;
+  branch: string;
+  worktree_path: string;
+  /** 最近活跃时间（Unix 秒）：task_sessions.last_seen_at 的 MAX，无会话行回退 tasks.updated_at。 */
+  last_active_at: number;
+  agentStatus?: string;
+}
+
 /** GET /tasks/:id/git/status 文件条目。x/y 为 git status --short 双字母状态码。 */
 export interface GitFileEntry {
   path: string;

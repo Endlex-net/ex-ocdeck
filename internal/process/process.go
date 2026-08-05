@@ -80,6 +80,9 @@ type Manager struct {
 	baseEnv []string
 	// psProvider ps 命令实现注入点（Darwin 默认 darwinPSProvider）。
 	psProvider psProvider
+	// execTmuxFn 测试注入点：非 nil 时 execTmux 委托给它（用于观测 ctx deadline 等，
+	// 避免测试依赖 5s 真实墙钟）。生产留空走真实 exec.CommandContext 路径。
+	execTmuxFn func(ctx context.Context, args ...string) (stdout, stderr string, err error)
 }
 
 // Options 构造 Manager 的可注入参数，便于测试隔离。
@@ -195,6 +198,9 @@ func (m *Manager) tmuxArgs(sub ...string) []string {
 // env = baseEnv + TMUX_TMPDIR=<tmpdir>（design.md §2：socket 隔离不变量 MUST 落到 cmd.Env，
 // 不能依赖宿主环境变量隐式继承）。ctx 取消会杀子进程；输出有界（execOutputLimit）。
 func (m *Manager) execTmux(ctx context.Context, args ...string) (stdout, stderr string, err error) {
+	if m.execTmuxFn != nil {
+		return m.execTmuxFn(ctx, args...)
+	}
 	full := m.tmuxArgs(args...)
 	cmd := exec.CommandContext(ctx, "tmux", full...)
 	cmd.Env = m.tmuxExecEnv()
@@ -445,16 +451,19 @@ func (m *Manager) ListSessions() ([]string, error) {
 	return sessions, nil
 }
 
-// ShowSessionEnv 读取会话内某个环境变量值（design.md §18，密码/端口恢复）。
+// ShowSessionEnvContext 读取会话内某个环境变量值，语义与 ShowSessionEnv 一致，
+// 但使用调用方 ctx（design.md §18 / cross-project-active-sessions D0：ctx-aware 聚合）。
+// 内部再以 5s 封顶（context.WithTimeout）：调用方更短的 deadline 照常优先生效，
+// 无 deadline 的调用方（既有项目任务列表/任务详情端点请求 ctx）获得与改造前相同的 5s 保护。
 // 不存在返回 ("", nil)；tmux 命令失败返回 error。
-func (m *Manager) ShowSessionEnv(name, key string) (string, error) {
+func (m *Manager) ShowSessionEnvContext(ctx context.Context, name, key string) (string, error) {
 	if err := ValidateSessionName(name); err != nil {
 		return "", err
 	}
 	if err := validateEnvKey(key); err != nil {
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	stdout, _, err := m.execTmux(ctx, "show-environment", "-t", "="+name, key)
 	if err != nil {
@@ -471,6 +480,15 @@ func (m *Manager) ShowSessionEnv(name, key string) (string, error) {
 		return "", nil
 	}
 	return line[idx+1:], nil
+}
+
+// ShowSessionEnv 读取会话内某个环境变量值（design.md §18，密码/端口恢复）。
+// 兼容既有调用方：固定 5s 超时，委托 ShowSessionEnvContext。外部行为不变。
+// 不存在返回 ("", nil)；tmux 命令失败返回 error。
+func (m *Manager) ShowSessionEnv(name, key string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return m.ShowSessionEnvContext(ctx, name, key)
 }
 
 // --- 退出监视 ---

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sync"
+	"time"
 
 	"ocdeck/internal/pty"
 	"ocdeck/internal/task"
@@ -34,6 +36,10 @@ type TaskBackend interface {
 	// ListAllActiveTaskIDs 返回当前 active 任务 ID
 	//（供全局配置保存后受影响任务提示，design.md §13）。
 	ListAllActiveTaskIDs(ctx context.Context) ([]string, error)
+	// ListActiveTaskOverview 聚合全部 active 任务的跨项目概览
+	//（cross-project-active-sessions：GET /api/v1/sessions/active 读模型来源）。
+	// 返回不含 agentStatus 的投影行；agentStatus 由 handler 并发 hydration 填充。
+	ListActiveTaskOverview(ctx context.Context) ([]task.ActiveTaskOverviewRow, error)
 
 	// Git 状态/diff/commit/push 经 TaskManager GitOps（design.md §9/§21）。
 	// 持任务锁与 Suspend/Delete 等生命周期操作互斥，避免 api 绕过 TaskManager 致
@@ -103,6 +109,7 @@ func (s *Server) registerTaskRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/tasks/{id}/terminals", s.handleListTerminals)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/terminals", s.handleCreateTerminal)
 	mux.HandleFunc("DELETE /api/v1/terminals/{tid}", s.handleCloseTerminal)
+	mux.HandleFunc("GET /api/v1/sessions/active", s.handleListActiveSessions)
 	// WS 端点由 registerWSRoutes 单独挂载（不走 api 子 mux，design.md §21）。
 }
 
@@ -330,6 +337,20 @@ type sessionRowDTO struct {
 	LastSeenAt int64  `json:"last_seen_at"`
 }
 
+// activeSessionDTO 跨项目 active 任务概览 DTO（cross-project-active-sessions D3/D4）。
+// 读模型（task.ActiveTaskOverviewRow）不含 agentStatus；handler hydration worker 并发填充。
+// AgentStatus 失败/超时为空串，经 omitempty 省略（idle/busy/retry 三态）。
+type activeSessionDTO struct {
+	TaskID       string `json:"task_id"`
+	ProjectID    string `json:"project_id"`
+	ProjectName  string `json:"project_name"`
+	Name         string `json:"name"`
+	Branch       string `json:"branch"`
+	WorktreePath string `json:"worktree_path"`
+	LastActiveAt int64  `json:"last_active_at"`
+	AgentStatus  string `json:"agentStatus,omitempty"`
+}
+
 func toTaskDTO(t task.TaskRow) taskRowDTO {
 	dto := taskRowDTO{
 		ID: t.ID, ProjectID: t.ProjectID, Name: t.Name, Branch: t.Branch, Status: t.Status,
@@ -361,6 +382,47 @@ func toSessionDTOs(rows []task.SessionRow) []sessionRowDTO {
 		out = append(out, sessionRowDTO{SessionID: s.SessionID, LastSeenAt: s.LastSeenAt})
 	}
 	return out
+}
+
+// handleListActiveSessions GET /api/v1/sessions/active（cross-project-active-sessions D3/D4）。
+// 纯读聚合：store 查询 → DTO 转换 → 并发 hydration agentStatus（per-request cap 8、3s budget）。
+// store 失败 → 500，不进入 hydration；空结果 → JSON `[]`（非 null）；agentStatus 失败/超时省略字段。
+func (s *Server) handleListActiveSessions(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.tasks.ListActiveTaskOverview(r.Context())
+	if err != nil {
+		writeError(w, CodeInternal, "list active sessions failed")
+		return
+	}
+	out := make([]activeSessionDTO, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, activeSessionDTO{
+			TaskID: row.ID, ProjectID: row.ProjectID, ProjectName: row.ProjectName,
+			Name: row.Name, Branch: row.Branch, WorktreePath: row.WorktreePath,
+			LastActiveAt: row.LastActiveAt,
+		})
+	}
+	// Hydration worker（D4）：per-request 信号量 cap 8、3s budget；每 goroutine 仅写自己的 out[i]。
+	hctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for i := range out {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-hctx.Done():
+				return
+			}
+			out[i].AgentStatus = s.tasks.AgentStatus(hctx, out[i].TaskID)
+		}(i)
+	}
+	wg.Wait()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 // mapTaskErr 将 task.OpError 映射为 *ApiError（design.md §21）。
