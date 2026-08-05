@@ -81,6 +81,12 @@ func (f *fakeTaskBackend) ListAllActiveTaskIDs(ctx context.Context) ([]string, e
 	return []string{}, nil
 }
 
+// ListActiveTaskOverview 默认返回空切片（cross-project-active-sessions API 测试默认空响应）；
+// 具体 store 聚合行为由 internal/store 测试覆盖，hydration 行为由 active_sessions_api_test 覆盖。
+func (f *fakeTaskBackend) ListActiveTaskOverview(ctx context.Context) ([]task.ActiveTaskOverviewRow, error) {
+	return []task.ActiveTaskOverviewRow{}, nil
+}
+
 // Git 默认实现（noop / 零值）：git API 测试在 gitTaskBackend / mockGitBackend 中覆盖。
 func (f *fakeTaskBackend) GitStatus(ctx context.Context, taskID string) (task.GitStatusDTO, error) {
 	return task.GitStatusDTO{}, nil

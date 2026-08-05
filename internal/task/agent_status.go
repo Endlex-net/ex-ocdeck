@@ -10,7 +10,7 @@ import (
 
 // AgentStatus 返回任务的 agent 运行态（design.md 2.8：任务详情/列表 DTO 增加 agentStatus，
 // idle/busy/retry/空串）。任务 active 时经该任务 serve 的 GET /session/status 实时查询：
-// 取该任务最近 session（ListTaskSessions 首项，已按 last_seen_at DESC 排序）的状态。
+// 聚合该任务全部 session 状态（busy > retry > idle，未记录在 status map 的 session 默认 idle）。
 // 查询失败或非 active 时返回空串（降级不阻塞详情返回）。
 func (m *Manager) AgentStatus(ctx context.Context, taskID string) string {
 	row, err := m.store.GetTask(ctx, taskID)
@@ -18,11 +18,13 @@ func (m *Manager) AgentStatus(ctx context.Context, taskID string) string {
 		return ""
 	}
 	serveName := serveSessionName(taskID)
-	password := m.recoverPassword(ctx, taskID)
-	if password == "" {
+	// D0：AgentStatus 直接经 ShowSessionEnvContext 读取 serve 会话 env（ctx-aware，
+	// 受调用方 deadline 约束），不再经 recoverPassword 间接包一层 Background+5s。
+	password, perr := m.proc.ShowSessionEnvContext(ctx, serveName, "OPENCODE_SERVER_PASSWORD")
+	if perr != nil || password == "" {
 		return ""
 	}
-	portStr, perr := m.proc.ShowSessionEnv(serveName, "OCDECK_SERVE_PORT")
+	portStr, perr := m.proc.ShowSessionEnvContext(ctx, serveName, "OCDECK_SERVE_PORT")
 	if perr != nil || portStr == "" {
 		return ""
 	}
@@ -77,4 +79,10 @@ func (m *Manager) ListAllActiveTaskIDs(ctx context.Context) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// ListActiveTaskOverview 聚合全部 active 任务的跨项目概览
+//（cross-project-active-sessions D1：纯读聚合查询，委托 store）。
+func (m *Manager) ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOverviewRow, error) {
+	return m.store.ListActiveTaskOverview(ctx)
 }
