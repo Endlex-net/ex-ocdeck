@@ -1,9 +1,6 @@
-# Git Operations Specification
+# Delta: git-operations
 
-## Purpose
-在 Web 端提供任务 worktree 的状态查看、diff 渲染、提交与推送能力，全部经本机 git CLI 执行并保障并发与命令注入安全。
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: 工作区状态查询
 系统 SHALL 提供任务 worktree 的 git 状态查询（基于 `git status --porcelain=v2 -z -uall`），展示已暂存/未暂存/未跟踪文件及增删行数统计（`git diff --numstat [--cached]`）。变更文件数 MUST 有上限（默认 10000），超限返回明确错误而非截断。
@@ -51,6 +48,8 @@
 - **WHEN** 文件超过服务端限制或为二进制
 - **THEN** 前端显示截断/不支持标记，不冻结浏览器
 
+## ADDED Requirements
+
 ### Requirement: diff 视图渲染对齐
 diff 视图 SHALL 在任意视口宽度与滚动位置下保持行号（gutter）与代码行一一对齐：行号与代码 MUST 位于同一表格行且行高一致（相同固定 line-height）；代码行 MUST NOT 折行（`white-space: nowrap`，长行横向滚动；不得用 `pre`——diff2html 模板含换行空白会致行高爆炸）；横向滚动的唯一 owner MUST 是 `.d2h-wrapper`（其余容器 `.git-diff`/`.git-panel`/`.d2h-file-diff` MUST 关闭横向滚动），且 diff 表格按内容撑宽（`width: max-content; min-width: 100%`）；diff2html gutter 为 `position:absolute` 的 td，MUST 通过 `.d2h-code-wrapper{position:relative}` 锚定进滚动内容内部，MUST NOT 给 `.d2h-file-diff`/`.d2h-diff-table` 添加 transform/filter 或新定位上下文，MUST NOT 覆盖 diff2html 内置 gutter padding。窄屏（≤1024px）断点下 MUST 保持上述不变量。
 
@@ -61,50 +60,3 @@ diff 视图 SHALL 在任意视口宽度与滚动位置下保持行号（gutter�
 #### Scenario: 窄屏多行滚动
 - **WHEN** 视口宽度 ≤1024px 且 diff 跨多个 hunk，用户纵向滚动到中部/底部
 - **THEN** 行号与代码行保持逐行对齐，无错位
-
-### Requirement: 提交改动
-系统 SHALL 支持在任务 worktree 上执行 commit：用户选择要提交的文件（或全部）并输入 commit message。系统 MUST 使用本机 git CLI 执行，保持与用户环境一致（含 hooks、签名）。
-
-#### Scenario: 提交全部改动
-- **WHEN** 用户输入 commit message 并提交
-- **THEN** 系统在 worktree 中执行 stage + commit 并返回结果
-
-#### Scenario: commit hook 失败
-- **WHEN** commit 被 git hook 拒绝
-- **THEN** 系统将 git 的错误输出原样展示给用户
-
-### Requirement: 推送分支
-系统 SHALL 支持将任务分支 push 到远端（含首次 push 时设置 upstream）。系统 MUST NOT 自动 force-push。
-
-#### Scenario: 首次推送
-- **WHEN** 用户对未推送过的任务分支执行 push
-- **THEN** 系统执行 `git push -u origin <branch>` 并返回结果
-
-#### Scenario: 推送被拒绝
-- **WHEN** push 被远端拒绝（non-fast-forward 等）
-- **THEN** 系统展示 git 错误，不自动采取任何补救动作
-
-### Requirement: git 操作串行化
-对同一项目仓库的 worktree 增删等仓库级写操作 SHALL 经每 repo 锁串行执行，避免并发 git 锁冲突；status/diff 等只读操作 MUST NOT 进入写队列。
-
-#### Scenario: 并发创建任务
-- **WHEN** 用户同时创建多个任务
-- **THEN** worktree 创建操作排队串行执行，全部成功
-
-### Requirement: git 执行安全约束
-系统 SHALL 以固定命令白名单 + argv 数组调用 git CLI，MUST NOT 拼接 shell 字符串。分支名 MUST 经 `git check-ref-format` 校验。全部 git 命令 MUST 支持 context 取消，stdout/stderr 有界读取。
-
-#### Scenario: 非法分支名
-- **WHEN** 任务名称生成的分支名不合法
-- **THEN** 创建被拒绝并提示修正任务名称
-
-### Requirement: 纯目录项目任务的 git 操作降级
-对 `kind=dir` 项目的任务，任务级 git 操作（status/diff/commit/push）SHALL 统一拒绝并返回明确错误（invalid_input，消息说明该项目为纯目录类型、非 git 仓库），MUST NOT 对任务目录执行任何 git 命令，MUST NOT 尝试探测目录内的子仓库。Web UI SHALL 对 dir 项目的任务隐藏 git 面板入口（status/diff/commit/push），不展示分支名。
-
-#### Scenario: dir 任务请求 git 状态
-- **WHEN** 对 `kind=dir` 项目的任务调用 git status/diff/commit/push 任一 API
-- **THEN** 系统返回 invalid_input 错误，明确说明纯目录项目不支持 git 操作，且未执行任何 git 命令
-
-#### Scenario: dir 任务的 UI 降级
-- **WHEN** 用户在 Web UI 打开 dir 项目的任务
-- **THEN** git 面板入口不可见，任务不显示分支名；项目列表/详情显示项目类型标识
