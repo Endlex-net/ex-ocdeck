@@ -10,18 +10,21 @@ interface FileGroup {
   files: GitFileEntry[];
   /** 该组文件请求 diff 时使用的 ref（暂存组用 HEAD 才能看到索引内容）。 */
   ref: string;
+  /** untracked 组用 `git diff --no-index` 合成 new-file diff（design.md D1）。 */
+  untracked: boolean;
 }
 
 function groupFiles(files: GitFileEntry[]): FileGroup[] {
   const groups: FileGroup[] = [
-    { key: 'staged', title: '已暂存', ref: 'HEAD', files: files.filter((f) => f.staged) },
+    { key: 'staged', title: '已暂存', ref: 'HEAD', untracked: false, files: files.filter((f) => f.staged) },
     {
       key: 'unstaged',
       title: '未暂存',
       ref: '',
+      untracked: false,
       files: files.filter((f) => f.unstaged && !f.untracked),
     },
-    { key: 'untracked', title: '未跟踪', ref: '', files: files.filter((f) => f.untracked) },
+    { key: 'untracked', title: '未跟踪', ref: '', untracked: true, files: files.filter((f) => f.untracked) },
   ];
   return groups.filter((g) => g.files.length > 0);
 }
@@ -81,13 +84,13 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
     setSelected(next);
   };
 
-  const openDiff = async (path: string, ref: string) => {
+  const openDiff = async (path: string, ref: string, untracked: boolean) => {
     setSelFile({ path, ref });
     setDiff(null);
     setDiffError('');
     setDiffLoading(true);
     try {
-      setDiff(await api.gitDiff(taskID, ref, path));
+      setDiff(await api.gitDiff(taskID, ref, path, untracked));
     } catch (err) {
       setDiffError(err instanceof ApiError ? err.message : '加载 diff 失败');
     } finally {
@@ -190,7 +193,7 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
                   <span
                     className="git-file-path mono"
                     title={f.path}
-                    onClick={() => void openDiff(f.path, g.ref)}
+                    onClick={() => void openDiff(f.path, g.ref, g.untracked)}
                   >
                     {f.path}
                   </span>
