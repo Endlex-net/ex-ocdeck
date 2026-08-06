@@ -61,7 +61,7 @@ func TestCreate_UsesNamerForBranchSlug(t *testing.T) {
 	namer := &mockNamer{slug: "ai-refined-slug"}
 	m := newTestManagerWithNamer(t, store, wt, namer)
 
-	row, err := m.Create(context.Background(), "p1", "修复登录bug")
+	row, err := m.Create(context.Background(), "p1", "修复登录bug", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestCreate_NamerFallbackValuePassThrough(t *testing.T) {
 	namer := &mockNamer{slug: "my-task"}
 	m := newTestManagerWithNamer(t, store, wt, namer)
 
-	row, err := m.Create(context.Background(), "p1", "My Task")
+	row, err := m.Create(context.Background(), "p1", "My Task", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestCreate_NilNamerUsesSlugify(t *testing.T) {
 	// 不注入 Namer：newTestManager 走 nil 路径。
 	m := newTestManager(t, store, newMockProc(), wt, newMockOC(true))
 
-	row, err := m.Create(context.Background(), "p1", "My Task")
+	row, err := m.Create(context.Background(), "p1", "My Task", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestCreate_NamerBranchConflictUnchanged(t *testing.T) {
 	namer := &mockNamer{slug: "dup-slug"}
 	m := newTestManagerWithNamer(t, store, wt, namer)
 
-	_, err := m.Create(context.Background(), "p1", "anything")
+	_, err := m.Create(context.Background(), "p1", "anything", "")
 	if err == nil {
 		t.Fatal("expected conflict on duplicate branch")
 	}
@@ -144,7 +144,7 @@ func TestRetryCreate_NamerNotInvoked(t *testing.T) {
 	store := newMockStore()
 	store.seedProject(ProjectRow{ID: "p1", Name: "proj", Path: "/repo", DefaultBranch: "main"})
 	t1 := TaskRow{ID: "t1", ProjectID: "p1", Name: "task", Branch: "ocdeck/old-branch",
-		Status: StatusCreationFailed, WorktreePath: "/data/worktrees/p1/t1"}
+		Status: StatusCreationFailed, WorktreePath: "/data/worktrees/p1/t1", BaseRef: "refs/heads/main"}
 	store.tasks["t1"] = t1
 	wt := newMockWorktree()
 	namer := &mockNamer{slug: "should-not-be-used"}
@@ -174,7 +174,7 @@ func TestCreate_NamerInvalidSlugRejectedByValidateBranchName(t *testing.T) {
 	namer := &mockNamer{slug: "bad slug"}
 	m := newTestManagerWithNamer(t, store, &wtValidateErr, namer)
 
-	_, err := m.Create(context.Background(), "p1", "task")
+	_, err := m.Create(context.Background(), "p1", "task", "")
 	if err == nil {
 		t.Fatal("expected invalid_input on invalid branch name")
 	}

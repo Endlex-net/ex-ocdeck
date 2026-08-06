@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -23,7 +25,7 @@ func openTestDB(t *testing.T) *DB {
 func seedProjectTask(t *testing.T, db *DB, taskID string) {
 	t.Helper()
 	ctx := context.Background()
-	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main"); err != nil {
+	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo"); err != nil {
 		t.Fatalf("create project: %v", err)
 	}
 	if err := db.CreateTask(ctx, TaskRow{
@@ -72,7 +74,7 @@ func TestDBFilePermissions_0600(t *testing.T) {
 func TestForeignKeys_On(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
-	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main"); err != nil {
+	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo"); err != nil {
 		t.Fatalf("create project: %v", err)
 	}
 	// 插入任务后删除项目，任务应被 CASCADE 删除。
@@ -96,7 +98,7 @@ func TestForeignKeys_On(t *testing.T) {
 func TestTaskEnvVars_CascadeOnDelete(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
-	_ = db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main")
+	_ = db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo")
 	_ = db.CreateTask(ctx, TaskRow{
 		ID: "t1", ProjectID: "p1", Name: "task", Branch: "b", Status: "suspended", WorktreePath: "/tmp/wt",
 	})
@@ -116,7 +118,7 @@ func TestTaskEnvVars_CascadeOnDelete(t *testing.T) {
 func TestProjectEnvVars_Upsert(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
-	_ = db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main")
+	_ = db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo")
 	_ = db.SetProjectEnvVar(ctx, "p1", "K", "v1")
 	_ = db.SetProjectEnvVar(ctx, "p1", "K", "v2")
 	vars, err := db.ListProjectEnvVars(ctx, "p1")
@@ -131,7 +133,7 @@ func TestProjectEnvVars_Upsert(t *testing.T) {
 func TestTaskSession_UpsertMaxLastSeen(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
-	_ = db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main")
+	_ = db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo")
 	_ = db.CreateTask(ctx, TaskRow{
 		ID: "t1", ProjectID: "p1", Name: "task", Branch: "b", Status: "suspended", WorktreePath: "/tmp/wt",
 	})
@@ -259,10 +261,10 @@ func TestUpdateTaskStatusConditional(t *testing.T) {
 func seedActiveTaskOverview(t *testing.T, db *DB) {
 	t.Helper()
 	ctx := context.Background()
-	if err := db.CreateProject(ctx, "p1", "projA", "/tmp/repoA", "main"); err != nil {
+	if err := db.CreateProject(ctx, "p1", "projA", "/tmp/repoA", "main", "repo"); err != nil {
 		t.Fatalf("create project p1: %v", err)
 	}
-	if err := db.CreateProject(ctx, "p2", "projB", "/tmp/repoB", "main"); err != nil {
+	if err := db.CreateProject(ctx, "p2", "projB", "/tmp/repoB", "main", "repo"); err != nil {
 		t.Fatalf("create project p2: %v", err)
 	}
 	// active 任务跨两个项目；non-active 用于验证排除。
@@ -372,7 +374,7 @@ func TestListActiveTaskOverview_NoSessionFallbackToUpdatedAt(t *testing.T) {
 func TestListActiveTaskOverview_TieBreakerByID(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
-	_ = db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main")
+	_ = db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo")
 	// 两个 active 任务带相同 last_seen_at 的 session → tie-breaker 按 t.id ASC。
 	_ = db.CreateTask(ctx, TaskRow{ID: "zeta", ProjectID: "p1", Name: "n", Branch: "b", Status: "active", WorktreePath: "/tmp/wt"})
 	_ = db.CreateTask(ctx, TaskRow{ID: "alpha", ProjectID: "p1", Name: "n", Branch: "b", Status: "active", WorktreePath: "/tmp/wt"})
@@ -410,7 +412,7 @@ func TestListActiveTaskOverview_EmptyReturnsEmptySlice(t *testing.T) {
 func seedMixedUnitOverview(t *testing.T, db *DB, msA, msB, secC int64) {
 	t.Helper()
 	ctx := context.Background()
-	if err := db.CreateProject(ctx, "p1", "projA", "/tmp/repo", "main"); err != nil {
+	if err := db.CreateProject(ctx, "p1", "projA", "/tmp/repo", "main", "repo"); err != nil {
 		t.Fatalf("create project: %v", err)
 	}
 	for _, id := range []string{"t-ms-a", "t-ms-b", "t-sec-c"} {
@@ -500,7 +502,7 @@ func TestListActiveTaskOverview_MsOlderThanSecondsFallback(t *testing.T) {
 func TestListActiveTaskOverview_SameTaskMixedUnits(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
-	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main"); err != nil {
+	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo"); err != nil {
 		t.Fatalf("create project: %v", err)
 	}
 	if err := db.CreateTask(ctx, TaskRow{ID: "t1", ProjectID: "p1", Name: "n", Branch: "b", Status: "active", WorktreePath: "/tmp/wt"}); err != nil {
@@ -527,7 +529,7 @@ func TestListActiveTaskOverview_SameTaskMixedUnits(t *testing.T) {
 func TestListActiveTaskOverview_SameTaskMixedUnitsInverse(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
-	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main"); err != nil {
+	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo"); err != nil {
 		t.Fatalf("create project: %v", err)
 	}
 	if err := db.CreateTask(ctx, TaskRow{ID: "t1", ProjectID: "p1", Name: "n", Branch: "b", Status: "active", WorktreePath: "/tmp/wt"}); err != nil {
@@ -705,7 +707,7 @@ func TestMigration_IdempotentAfterReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open1: %v", err)
 	}
-	if err := db1.CreateProject(context.Background(), "p1", "proj", "/tmp/r", "main"); err != nil {
+	if err := db1.CreateProject(context.Background(), "p1", "proj", "/tmp/r", "main", "repo"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	db1.Close()
@@ -741,7 +743,7 @@ func TestTaskSessions_CascadeOnDelete(t *testing.T) {
 func TestDeleteProjectIfEmpty_Empty(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
-	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main"); err != nil {
+	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo"); err != nil {
 		t.Fatalf("create project: %v", err)
 	}
 	deleted, err := db.DeleteProjectIfEmpty(ctx, "p1")
@@ -794,7 +796,7 @@ func TestDeleteProjectIfEmpty_Atomic(t *testing.T) {
 	// 无竞态窗口。此处用单连接模型验证语义：有任务时确不删，无任务时确删。
 	db := openTestDB(t)
 	ctx := context.Background()
-	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main"); err != nil {
+	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo"); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	// 无任务 → 删除。
@@ -803,7 +805,7 @@ func TestDeleteProjectIfEmpty_Atomic(t *testing.T) {
 		t.Error("first delete should succeed (empty)")
 	}
 	// 重建并加任务。
-	if err := db.CreateProject(ctx, "p2", "proj2", "/tmp/repo2", "main"); err != nil {
+	if err := db.CreateProject(ctx, "p2", "proj2", "/tmp/repo2", "main", "repo"); err != nil {
 		t.Fatalf("create p2: %v", err)
 	}
 	if err := db.CreateTask(ctx, TaskRow{ID: "t2", ProjectID: "p2", Name: "task", Branch: "b", Status: "suspended", WorktreePath: "/tmp/wt"}); err != nil {
@@ -867,5 +869,323 @@ func TestMigrate_0003_GlobalEnvVarsTable(t *testing.T) {
 	}
 	if err := db.SetGlobalEnvVar(ctx, "K", "manual", "v"); err != nil {
 		t.Fatalf("set manual: %v", err)
+	}
+}
+
+// --- session 归属隔离 store 层测试（add-plain-dir-project D8） ---
+
+// TestClaimTaskSession_NoConflictInserts 验证无冲突时 claim 插入本任务行。
+func TestClaimTaskSession_NoConflictInserts(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.CreateProject(ctx, "p1", "proj", "/repo", "main", "repo"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateTask(ctx, TaskRow{ID: "t1", ProjectID: "p1", Name: "task", Branch: "b",
+		Status: "suspended", WorktreePath: "/wt"}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, owner, err := db.ClaimTaskSession(ctx, "t1", "sess-1", 10, 11, 12, "parent-x")
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !claimed || owner != "" {
+		t.Fatalf("claimed=%v owner=%q, want true/empty", claimed, owner)
+	}
+	sessions, _ := db.ListTaskSessions(ctx, "t1")
+	if len(sessions) != 1 || sessions[0].SessionID != "sess-1" {
+		t.Fatalf("sessions = %+v, want [sess-1]", sessions)
+	}
+	if sessions[0].ParentID != "parent-x" {
+		t.Errorf("parent_id = %q, want parent-x", sessions[0].ParentID)
+	}
+}
+
+// TestClaimTaskSession_ConflictReturnsOwner 验证已被他任务拥有时 claim 返回 false+owner，不写入。
+func TestClaimTaskSession_ConflictReturnsOwner(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.CreateProject(ctx, "p1", "proj", "/repo", "main", "repo"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateTask(ctx, TaskRow{ID: "t1", ProjectID: "p1", Name: "task", Branch: "b",
+		Status: "suspended", WorktreePath: "/wt"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateTask(ctx, TaskRow{ID: "t2", ProjectID: "p1", Name: "task2", Branch: "b2",
+		Status: "suspended", WorktreePath: "/wt2"}); err != nil {
+		t.Fatal(err)
+	}
+	// t1 claim sess-shared。
+	if claimed, _, err := db.ClaimTaskSession(ctx, "t1", "sess-shared", 1, 1, 1, ""); err != nil || !claimed {
+		t.Fatalf("t1 claim: %v %v", claimed, err)
+	}
+	// t2 claim 同一 session → 冲突。
+	claimed, owner, err := db.ClaimTaskSession(ctx, "t2", "sess-shared", 2, 2, 2, "")
+	if err != nil {
+		t.Fatalf("t2 claim: %v", err)
+	}
+	if claimed {
+		t.Errorf("t2 claim should fail (conflict)")
+	}
+	if owner != "t1" {
+		t.Errorf("owner = %q, want t1", owner)
+	}
+	// t2 不应有该行。
+	t2Sessions, _ := db.ListTaskSessions(ctx, "t2")
+	for _, s := range t2Sessions {
+		if s.SessionID == "sess-shared" {
+			t.Errorf("t2 should not own sess-shared")
+		}
+	}
+}
+
+// TestClaimTaskSession_IdempotentOwnTask 验证本任务已拥有时 claim 幂等刷新 last_seen/parent。
+func TestClaimTaskSession_IdempotentOwnTask(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.CreateProject(ctx, "p1", "proj", "/repo", "main", "repo"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateTask(ctx, TaskRow{ID: "t1", ProjectID: "p1", Name: "task", Branch: "b",
+		Status: "suspended", WorktreePath: "/wt"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.ClaimTaskSession(ctx, "t1", "sess-1", 1, 1, 1, "p1"); err != nil {
+		t.Fatal(err)
+	}
+	// 再次 claim 同任务同 session，last_seen 更新、parent 更新。
+	if claimed, _, err := db.ClaimTaskSession(ctx, "t1", "sess-1", 5, 5, 99, "p2"); err != nil || !claimed {
+		t.Fatalf("idempotent claim: %v %v", claimed, err)
+	}
+	sessions, _ := db.ListTaskSessions(ctx, "t1")
+	if len(sessions) != 1 || sessions[0].LastSeenAt != 99 || sessions[0].ParentID != "p2" {
+		t.Errorf("after idempotent claim = %+v, want last_seen=99 parent=p2", sessions)
+	}
+}
+
+// TestTouchOwnedTaskSession_NoInsert 验证条件 UPDATE 仅本任务已归属行，绝不插入。
+func TestTouchOwnedTaskSession_NoInsert(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.CreateProject(ctx, "p1", "proj", "/repo", "main", "repo"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateTask(ctx, TaskRow{ID: "t1", ProjectID: "p1", Name: "task", Branch: "b",
+		Status: "suspended", WorktreePath: "/wt"}); err != nil {
+		t.Fatal(err)
+	}
+	// 未归属 → updated=false，不插入。
+	updated, err := db.TouchOwnedTaskSession(ctx, "t1", "sess-unowned", 99)
+	if err != nil {
+		t.Fatalf("touch unowned: %v", err)
+	}
+	if updated {
+		t.Errorf("touch unowned should return false")
+	}
+	sessions, _ := db.ListTaskSessions(ctx, "t1")
+	if len(sessions) != 0 {
+		t.Errorf("unowned touch MUST NOT insert, got %+v", sessions)
+	}
+	// 预置归属后再 touch → updated=true，刷新 last_seen。
+	if _, _, err := db.ClaimTaskSession(ctx, "t1", "sess-1", 1, 1, 10, ""); err != nil {
+		t.Fatal(err)
+	}
+	updated, err = db.TouchOwnedTaskSession(ctx, "t1", "sess-1", 99)
+	if err != nil || !updated {
+		t.Fatalf("touch owned: updated=%v err=%v", updated, err)
+	}
+	sessions, _ = db.ListTaskSessions(ctx, "t1")
+	if sessions[0].LastSeenAt != 99 {
+		t.Errorf("last_seen = %d, want 99", sessions[0].LastSeenAt)
+	}
+}
+
+// TestAlignTaskSessions_RepoClaimConflicts 验证 repo 模式逐个 claim，冲突 ID 上报。
+func TestAlignTaskSessions_RepoClaimConflicts(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.CreateProject(ctx, "p1", "proj", "/repo", "main", "repo"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateTask(ctx, TaskRow{ID: "t1", ProjectID: "p1", Name: "task", Branch: "b",
+		Status: "suspended", WorktreePath: "/wt"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateTask(ctx, TaskRow{ID: "t2", ProjectID: "p1", Name: "task2", Branch: "b2",
+		Status: "suspended", WorktreePath: "/wt2"}); err != nil {
+		t.Fatal(err)
+	}
+	// t2 拥有 sess-shared。
+	if _, _, err := db.ClaimTaskSession(ctx, "t2", "sess-shared", 1, 1, 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	// t1 repo 对齐：listed=[sess-shared, sess-own]。
+	listed := []SessionObservation{
+		{SessionID: "sess-shared", UpdatedAt: 20},
+		{SessionID: "sess-own", UpdatedAt: 20},
+	}
+	conflicts, err := db.AlignTaskSessions(ctx, "t1", AlignModeRepo, listed, true, nil)
+	if err != nil {
+		t.Fatalf("align: %v", err)
+	}
+	if len(conflicts) != 1 || conflicts[0] != "sess-shared" {
+		t.Errorf("conflicts = %v, want [sess-shared]", conflicts)
+	}
+	t1, _ := db.ListTaskSessions(ctx, "t1")
+	ids := map[string]bool{}
+	for _, s := range t1 {
+		ids[s.SessionID] = true
+	}
+	if ids["sess-shared"] {
+		t.Errorf("t1 MUST NOT claim sess-shared (owned by t2)")
+	}
+	if !ids["sess-own"] {
+		t.Errorf("t1 should claim sess-own")
+	}
+}
+
+// TestAlignTaskSessions_OwnedOnlyNoClaim 验证 ownedOnly 模式仅刷新 listed∩owned，绝不 claim。
+func TestAlignTaskSessions_OwnedOnlyNoClaim(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.CreateProject(ctx, "p1", "proj", "/repo", "main", "repo"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateTask(ctx, TaskRow{ID: "t1", ProjectID: "p1", Name: "task", Branch: "b",
+		Status: "suspended", WorktreePath: "/wt"}); err != nil {
+		t.Fatal(err)
+	}
+	// t1 预置 owned: sess-a。
+	if _, _, err := db.ClaimTaskSession(ctx, "t1", "sess-a", 1, 1, 10, ""); err != nil {
+		t.Fatal(err)
+	}
+	// listed=[sess-a, sess-b, sess-foreign]；ownedOnly 仅刷新 sess-a，不 claim b/foreign。
+	listed := []SessionObservation{
+		{SessionID: "sess-a", UpdatedAt: 20},
+		{SessionID: "sess-b", UpdatedAt: 20},
+		{SessionID: "sess-foreign", UpdatedAt: 20},
+	}
+	conflicts, err := db.AlignTaskSessions(ctx, "t1", AlignModeOwnedOnly, listed, true, nil)
+	if err != nil {
+		t.Fatalf("align: %v", err)
+	}
+	if len(conflicts) != 0 {
+		t.Errorf("ownedOnly should not report conflicts, got %v", conflicts)
+	}
+	t1, _ := db.ListTaskSessions(ctx, "t1")
+	ids := map[string]bool{}
+	for _, s := range t1 {
+		ids[s.SessionID] = true
+	}
+	if !ids["sess-a"] {
+		t.Errorf("sess-a should still be owned")
+	}
+	if ids["sess-b"] || ids["sess-foreign"] {
+		t.Errorf("ownedOnly MUST NOT claim sess-b/sess-foreign")
+	}
+	// sess-a last_seen 被刷新到 20。
+	for _, s := range t1 {
+		if s.SessionID == "sess-a" && s.LastSeenAt != 20 {
+			t.Errorf("sess-a last_seen = %d, want 20", s.LastSeenAt)
+		}
+	}
+}
+
+// TestAlignTaskSessions_UnknownModeFailClosed 验证未知 mode fail-closed 返回错误。
+func TestAlignTaskSessions_UnknownModeFailClosed(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.CreateProject(ctx, "p1", "proj", "/repo", "main", "repo"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateTask(ctx, TaskRow{ID: "t1", ProjectID: "p1", Name: "task", Branch: "b",
+		Status: "suspended", WorktreePath: "/wt"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.ClaimTaskSession(ctx, "t1", "sess-a", 1, 1, 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	_, err := db.AlignTaskSessions(ctx, "t1", AlignMode(99),
+		[]SessionObservation{{SessionID: "x"}}, true, nil)
+	if err == nil {
+		t.Fatal("unknown mode should fail (fail-closed)")
+	}
+	// 无写入：sess-a 仍存在。
+	t1, _ := db.ListTaskSessions(ctx, "t1")
+	if len(t1) != 1 || t1[0].SessionID != "sess-a" {
+		t.Errorf("after unknown mode align = %+v, want [sess-a] (no writes)", t1)
+	}
+}
+
+// TestClaimTaskSession_ConcurrentUniqueOwnership_RealSQLite 验证真实 SQLite 下并发 claim 同一 sessionID：
+// 原子 claim 仅一个成功，失败方按路径语义返回 false + owner。验证生产 SQLite 事务原子性
+// （非 mockStore）。go test -race 下并发 goroutine 经 MaxOpenConns(1) 串行化，无 data race。
+func TestClaimTaskSession_ConcurrentUniqueOwnership_RealSQLite(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.CreateProject(ctx, "p1", "proj", "/repo", "main", "repo"); err != nil {
+		t.Fatal(err)
+	}
+	// 两任务竞争同一 sessionID。
+	for _, taskID := range []string{"ta", "tb"} {
+		if err := db.CreateTask(ctx, TaskRow{ID: taskID, ProjectID: "p1", Name: taskID, Branch: "b",
+			Status: "suspended", WorktreePath: "/wt-" + taskID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	const sharedSess = "shared-sess"
+	var wg sync.WaitGroup
+	var successCount int32
+	var claimOwner atomic.Value // string
+	claimOwner.Store("")
+	for i, taskID := range []string{"ta", "tb"} {
+		wg.Add(1)
+		go func(idx int, tid string) {
+			defer wg.Done()
+			claimed, owner, err := db.ClaimTaskSession(ctx, tid, sharedSess, 1, 1, 1, "")
+			if err != nil {
+				t.Errorf("claim %s: %v", tid, err)
+				return
+			}
+			if claimed {
+				atomic.AddInt32(&successCount, 1)
+				claimOwner.Store(tid)
+			} else if owner != "" {
+				// 失败方应得到 owner（另一个任务 ID）。
+				_ = idx
+			}
+		}(i, taskID)
+	}
+	wg.Wait()
+
+	// 恰好一个 claim 成功。
+	if got := atomic.LoadInt32(&successCount); got != 1 {
+		t.Fatalf("expected exactly one claim success, got %d", got)
+	}
+	owner := claimOwner.Load().(string)
+	if owner != "ta" && owner != "tb" {
+		t.Fatalf("claim owner = %q, want ta or tb", owner)
+	}
+	// 失败方调用应返回 owner = 成功方。
+	loser := "tb"
+	if owner == "tb" {
+		loser = "ta"
+	}
+	// 再次 claim（失败方重试）应返回 owner=成功方、claimed=false。
+	claimed2, owner2, err := db.ClaimTaskSession(ctx, loser, sharedSess, 1, 1, 1, "")
+	if err != nil {
+		t.Fatalf("retry claim loser: %v", err)
+	}
+	if claimed2 || owner2 != owner {
+		t.Errorf("loser re-claim: claimed=%v owner=%q, want false/%q", claimed2, owner2, owner)
+	}
+	// 最终该 session 仅归属一个任务。
+	sessA, _ := db.ListTaskSessions(ctx, "ta")
+	sessB, _ := db.ListTaskSessions(ctx, "tb")
+	total := len(sessA) + len(sessB)
+	if total != 1 {
+		t.Errorf("total sessions across ta+tb = %d, want 1 (unique ownership)", total)
 	}
 }

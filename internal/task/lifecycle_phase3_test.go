@@ -105,7 +105,7 @@ func TestCreateChain_NoInitScript_DirectActivate(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 
-	row, err := m.Create(context.Background(), "p1", "mytask")
+	row, err := m.Create(context.Background(), "p1", "mytask", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestCreateChain_WithInitScript_StartsInitRunner(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 
-	row, err := m.Create(context.Background(), "p1", "mytask")
+	row, err := m.Create(context.Background(), "p1", "mytask", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestCreateChain_InitScriptFails_InitFailed(t *testing.T) {
 	runner := &mockLifecycleRunner{runScriptErr: fmt.Errorf("script boom")}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 
-	row, err := m.Create(context.Background(), "p1", "mytask")
+	row, err := m.Create(context.Background(), "p1", "mytask", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestCreateChain_InheritConfigReadFails_CreationFailed(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 
-	_, err := m.Create(context.Background(), "p1", "mytask")
+	_, err := m.Create(context.Background(), "p1", "mytask", "")
 	if err == nil {
 		t.Fatalf("Create must fail when lifecycle config read fails")
 	}
@@ -748,7 +748,7 @@ func TestRetryCreate_IdempotentReRunInherit(t *testing.T) {
 	wtPath := "/data/worktrees/p1/t1"
 	wt.products[wtPath] = true
 	wt.branches["ocdeck/mytask"] = true
-	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Name: "mytask", Status: StatusCreationFailed, WorktreePath: wtPath, Branch: "ocdeck/mytask", InitStatus: InitStatusNone}
+	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Name: "mytask", Status: StatusCreationFailed, WorktreePath: wtPath, Branch: "ocdeck/mytask", InitStatus: InitStatusNone, BaseRef: "refs/heads/main"}
 	if err := m.Retry(context.Background(), "t1", false); err != nil {
 		t.Fatalf("Retry: %v", err)
 	}
@@ -864,7 +864,7 @@ func TestCreateChain_InitScriptSucceeded_TriggersActivate(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 
-	row, err := m.Create(context.Background(), "p1", "mytask")
+	row, err := m.Create(context.Background(), "p1", "mytask", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}

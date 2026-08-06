@@ -48,28 +48,45 @@ func (m *Manager) Delete(ctx context.Context, taskID string, mode DeleteMode, co
 		return newOpErr(codeInvalidState, fmt.Errorf("task %s init in progress (init_status=%s)", taskID, row.InitStatus))
 	}
 
-	// B8：静态安全检查（包含性/dirty/分支占用）先于任何副作用（oc session/进程清理之前）。
-	// dirty 检查与确认要求同 Normal 与 Force（design.md §19：Force 只跳过 oc session 删除，
-	// dirty 检查与确认要求同 Normal——Force 不得自动 confirmDirty，仍需用户显式 confirmDirty）。
+	// 解析项目 kind（add-plain-dir-project D3）：dir 跳过 PreflightDelete / dirty 快照等 git 静态检查
+	// （dir 无 git worktree/branch，包含性/dirty/分支占用门禁不适用，confirmDirty 接受但忽略）。
+	// 未知 kind fail-closed：在 BeginDeleteIntent 之前返回，零副作用（状态不变）。
 	proj, err := m.store.GetProject(ctx, row.ProjectID)
 	if err != nil {
 		return newOpErr(codeNotFound, fmt.Errorf("project not found: %w", err))
 	}
-	if perr := m.wt.PreflightDelete(ctx, row.WorktreePath, PreflightDeleteOpts{
-		RepoPath:     proj.Path,
-		Branch:       row.Branch,
-		ConfirmDirty: confirmDirty,
-	}); perr != nil {
-		return newOpErr(codeConflict, perr)
+	switch proj.Kind {
+	case ProjectKindRepo:
+	case ProjectKindDir:
+		// dir 跳过 PreflightDelete / DirtyFiles 快照（git 静态检查不适用）。
+	default:
+		// 未知持久化 kind（DB 损坏值）→ internal（D1：区别于用户请求非法 kind 的 invalid_input）。
+		return newOpErr(codeInternal, fmt.Errorf("task %s unknown project kind %q", taskID, proj.Kind))
 	}
 
-	// B7c：捕获 preflight 时刻的 dirty 快照，供 deleteResume 在 wt.Remove 前做二次门禁——
-	// preflight 后新产生的 dirty（未经确认）不得删。快照探测失败 MUST fail-closed：
-	// DirtyFiles 错误意味着无法判定当前 dirty 集合，不得当空集强删用户数据。
-	// 在删除意图提交前返回，状态不变（suspended 等），用户可排查后重试。
-	preflightDirty, derr := m.wt.DirtyFiles(ctx, row.WorktreePath)
-	if derr != nil {
-		return newOpErr(codeGitError, fmt.Errorf("delete: preflight dirty snapshot: %w", derr))
+	// B8：静态安全检查（包含性/dirty/分支占用）先于任何副作用（oc session/进程清理之前）。
+	// dirty 检查与确认要求同 Normal 与 Force（design.md §19：Force 只跳过 oc session 删除，
+	// dirty 检查与确认要求同 Normal——Force 不得自动 confirmDirty，仍需用户显式 confirmDirty）。
+	// dir 在上面已跳过（无 git）。
+	var preflightDirty map[string]struct{}
+	if proj.Kind == ProjectKindRepo {
+		if perr := m.wt.PreflightDelete(ctx, row.WorktreePath, PreflightDeleteOpts{
+			RepoPath:     proj.Path,
+			Branch:       row.Branch,
+			ConfirmDirty: confirmDirty,
+		}); perr != nil {
+			return newOpErr(codeConflict, perr)
+		}
+
+		// B7c：捕获 preflight 时刻的 dirty 快照，供 deleteResume 在 wt.Remove 前做二次门禁——
+		// preflight 后新产生的 dirty（未经确认）不得删。快照探测失败 MUST fail-closed：
+		// DirtyFiles 错误意味着无法判定当前 dirty 集合，不得当空集强删用户数据。
+		// 在删除意图提交前返回，状态不变（suspended 等），用户可排查后重试。
+		snap, derr := m.wt.DirtyFiles(ctx, row.WorktreePath)
+		if derr != nil {
+			return newOpErr(codeGitError, fmt.Errorf("delete: preflight dirty snapshot: %w", derr))
+		}
+		preflightDirty = snap
 	}
 
 	// ① 持久化 delete_mode + 置 deleting（原子）。
@@ -85,49 +102,105 @@ func (m *Manager) Delete(ctx context.Context, taskID string, mode DeleteMode, co
 	return m.deleteResume(ctx, row, mode, preflightDirty)
 }
 
-// deleteResume 执行删除副作用序列（design.md §19/§12）。
+// deleteResume 执行删除副作用序列（design.md §19/§12，add-plain-dir-project D3）。
 // 幂等：资源不存在视为已成功；按持久化 delete_mode 重入。
-// preflightDirty 为 DirtyFiles 快照，供 wt.Remove 前做二次门禁——preflight 后新产生的
-// dirty（快照中不存在的条目）未经确认不得删（design.md §19）。nil 表示跳过二次门禁
-// （防御性保留：Delete 与 Retry 均传非 nil 快照，nil 仅用于无 worktree 等不适用场景）。
+//
+// add-plain-dir-project D3：入口按 proj.Kind 一次性分流为 repo/dir 两条序列（显式 repo/dir，
+// 未知 kind fail-closed 落 deletion_failed + last_error，零破坏性副作用：不 wt.Remove、不 DeleteTask）。
+// MUST NOT 依赖 Branch=="" 等隐式信号逐步跳过——kind 即唯一分流依据。
+//
+// repo 序列：retryDebt → oc sessions → kill 残余会话 → 二次 dirty 门禁 → pre-delete → wt.Remove → DB 删除 → 日志清理。
+// dir 序列：retryDebt → oc sessions → kill 残余会话 → pre-delete（cwd=项目目录）→ DB 删除 → 日志清理。
+//   - dir 跳过 PreflightDelete（前置）、preflight dirty 快照与二次门禁（DirtyFiles）、wt.Remove、DeleteBranch；
+//     confirmDirty 接受但忽略（dir 无 git，dirty 门禁不适用）。
+//   - dir force 与 repo force 一致：跳过 ③⑥，不跳过 ②retryDebt。
+//   - dir 重入：preflightDirty 参数被忽略（dir 永不读 dirty 快照），按持久化 delete_mode 重入同一 dir 序列。
+//
+// preflightDirty 为 repo 路径的 DirtyFiles 快照，供 wt.Remove 前做二次门禁——preflight 后新产生的
+// dirty（快照中不存在的条目）未经确认不得删（design.md §19）。nil 表示跳过二次门禁。
 func (m *Manager) deleteResume(ctx context.Context, row TaskRow, mode DeleteMode, preflightDirty map[string]struct{}) error {
 	taskID := row.ID
 
-	// ② RetryReap 既有 cleanup debt（remaining 非空 → deletion_failed，不得继续）。
-	// JSON 损坏视为有 debt（fail-closed，B6）。
-	entries, perr := parseNotices(row.Notice)
-	if perr != nil {
-		le := sql.NullString{String: "notice json corrupted", Valid: true}
+	// 入口分流（D3）：按 proj.Kind 一次性分叉。未知 kind fail-closed 落 deletion_failed + last_error，
+	// 不执行任何破坏性操作（无 wt.Remove / DeleteTask）。
+	proj, err := m.store.GetProject(ctx, row.ProjectID)
+	if err != nil {
+		le := sql.NullString{String: fmt.Errorf("get project for delete resume: %w", err).Error(), Valid: true}
 		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, le)
+		return newOpErr(codeNotFound, fmt.Errorf("project not found for delete resume: %w", err))
+	}
+	switch proj.Kind {
+	case ProjectKindRepo:
+		return m.deleteResumeRepo(ctx, row, mode, proj, preflightDirty)
+	case ProjectKindDir:
+		return m.deleteResumeDir(ctx, row, mode)
+	default:
+		// 未知持久化 kind（DB 损坏值）→ internal（D1）。落 deletion_failed 保留行供排查。
+		le := sql.NullString{String: fmt.Sprintf("unknown project kind %q", proj.Kind), Valid: true}
+		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, le)
+		return newOpErr(codeInternal, fmt.Errorf("task %s unknown project kind %q", taskID, proj.Kind))
+	}
+}
+
+// finalizeDeletionFailed 在 token 覆盖范围内（pre-delete WG token 持有期间）的落账 MUST 用
+// 非取消 ctx（design.md §6.1）：request ctx 取消/Shutdown 时 UpdateTaskStatus 真实响应取消，
+// 会留下 deleting 无落账。使用 context.Background() + finishDeletionCtxTimeout。
+func (m *Manager) finalizeDeletionFailed(taskID, lastError string) {
+	finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), finishDeletionCtxTimeout)
+	le := sql.NullString{String: lastError, Valid: true}
+	_ = m.store.UpdateTaskStatus(finalizeCtx, taskID, StatusDeletionFailed, le)
+	finalizeCancel()
+}
+
+// retryDebtGate 执行 ② RetryReap 既有 cleanup debt 门禁（design.md §19/§8）。
+// remaining 非空 → deletion_failed，不得继续。JSON 损坏视为有 debt（fail-closed，B6）。
+// casWriteNotices 失败 MUST 聚合进 last_error（P4 复评阻塞 2），保留 DB 既有 notice
+// （CAS 失败=未覆盖，debt 仍在，下次 Retry 仍经门禁）。返回非 nil 表示门禁未通过（已落 deletion_failed）。
+func (m *Manager) retryDebtGate(ctx context.Context, taskID string, notice sql.NullString) error {
+	entries, perr := parseNotices(notice)
+	if perr != nil {
+		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, sql.NullString{String: "notice json corrupted", Valid: true})
 		return newOpErr(codeConflict, fmt.Errorf("task %s notice corrupted: %w", taskID, perr))
 	}
-	if hasDebtTickets(entries) {
-		remaining, derr := m.retryDebt(ctx, taskID, entries)
-		if derr != nil {
-			// B8：进程错误不得忽略 → deletion_failed。
-			// remaining 含本轮新产生的 tickets（KillSession 合并的 CleanupTickets），
-			// MUST CAS 写回，不得随 deletion_failed 丢失（逃逸进程下次 Retry 需 tickets 定位）。
-			// P4 复评阻塞 2：casWriteNotices 失败 MUST 聚合进 last_error（不静默），
-			// 保留 DB 既有 notice（CAS 失败=未覆盖，debt 仍在，下次 Retry 仍经门禁）。
-			le := derr.Error()
-			if cerr := m.casWriteNotices(ctx, taskID, remaining); cerr != nil {
-				le = fmt.Sprintf("%s; cas write notices: %v", le, cerr)
-			}
-			_ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, sql.NullString{String: le, Valid: true})
-			return newOpErr(codeProcessError, derr)
+	if !hasDebtTickets(entries) {
+		return nil
+	}
+	remaining, derr := m.retryDebt(ctx, taskID, entries)
+	if derr != nil {
+		// B8：进程错误不得忽略 → deletion_failed。
+		// remaining 含本轮新产生的 tickets（KillSession 合并的 CleanupTickets），
+		// MUST CAS 写回，不得随 deletion_failed 丢失（逃逸进程下次 Retry 需 tickets 定位）。
+		le := derr.Error()
+		if cerr := m.casWriteNotices(ctx, taskID, remaining); cerr != nil {
+			le = fmt.Sprintf("%s; cas write notices: %v", le, cerr)
 		}
-		// retryable 已清但仍有 degraded/overflow 时 MUST NOT 阻止 Delete（仅 retryable 阻止，
-		// design.md §8/§19）。remaining 中的 degraded/overflow 项 CAS 写回后随删除流程丢弃（非逃逸进程 debt）。
-		if hasDebtTickets(remaining) {
-			// remaining MUST CAS 写回（新 tickets 不丢失，design.md §8/§19）。
-			// casWriteNotices 失败 MUST 聚合进 last_error（P4 复评阻塞 2）。
-			le := "cleanup debt not converged"
-			if cerr := m.casWriteNotices(ctx, taskID, remaining); cerr != nil {
-				le = fmt.Sprintf("cleanup debt not converged; cas write notices: %v", cerr)
-			}
-			_ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, sql.NullString{String: le, Valid: true})
-			return newOpErr(codeConflict, fmt.Errorf("task %s has uncleaned cleanup debt", taskID))
+		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, sql.NullString{String: le, Valid: true})
+		return newOpErr(codeProcessError, derr)
+	}
+	// retryable 已清但仍有 degraded/overflow 时 MUST NOT 阻止 Delete（仅 retryable 阻止，
+	// design.md §8/§19）。remaining 中的 degraded/overflow 项 CAS 写回后随删除流程丢弃（非逃逸进程 debt）。
+	if hasDebtTickets(remaining) {
+		// remaining MUST CAS 写回（新 tickets 不丢失，design.md §8/§19）。
+		// casWriteNotices 失败 MUST 聚合进 last_error（P4 复评阻塞 2）。
+		le := "cleanup debt not converged"
+		if cerr := m.casWriteNotices(ctx, taskID, remaining); cerr != nil {
+			le = fmt.Sprintf("cleanup debt not converged; cas write notices: %v", cerr)
 		}
+		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, sql.NullString{String: le, Valid: true})
+		return newOpErr(codeConflict, fmt.Errorf("task %s has uncleaned cleanup debt", taskID))
+	}
+	return nil
+}
+
+// deleteResumeRepo 执行 repo 项目的删除副作用序列（design.md §19/§12）。
+// 保留全部不可回归点：非取消落账 ctx、pre-delete WG token 恰好一次释放、notice CAS 失败聚合、
+// oc session 逐项错误聚合不短路、tickets 不随 CASCADE 丢失（wt.Remove 失败 MUST 落 deletion_failed 保留行）。
+func (m *Manager) deleteResumeRepo(ctx context.Context, row TaskRow, mode DeleteMode, proj ProjectRow, preflightDirty map[string]struct{}) error {
+	taskID := row.ID
+
+	// ② RetryReap 既有 cleanup debt 门禁。
+	if err := m.retryDebtGate(ctx, taskID, row.Notice); err != nil {
+		return err
 	}
 
 	// ③ 删 oc sessions（逐个，404 幂等落账）。Force 跳过 ③。
@@ -185,10 +258,7 @@ func (m *Manager) deleteResume(ctx context.Context, row TaskRow, mode DeleteMode
 		if perr != nil {
 			// token 覆盖范围内的落账 MUST 用非取消 ctx（design.md §6.1）：
 			// request ctx 取消/Shutdown 时 UpdateTaskStatus 真实响应取消，会留下 deleting 无落账。
-			finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), finishDeletionCtxTimeout)
-			le := sql.NullString{String: perr.Error(), Valid: true}
-			_ = m.store.UpdateTaskStatus(finalizeCtx, taskID, StatusDeletionFailed, le)
-			finalizeCancel()
+			m.finalizeDeletionFailed(taskID, perr.Error())
 			if rel != nil {
 				rel()
 			}
@@ -203,10 +273,7 @@ func (m *Manager) deleteResume(ctx context.Context, row TaskRow, mode DeleteMode
 		defer preDeleteRelease()
 	}
 	finalizeOnFail := func(lastError string) {
-		finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), finishDeletionCtxTimeout)
-		le := sql.NullString{String: lastError, Valid: true}
-		_ = m.store.UpdateTaskStatus(finalizeCtx, taskID, StatusDeletionFailed, le)
-		finalizeCancel()
+		m.finalizeDeletionFailed(taskID, lastError)
 	}
 
 	if err := m.wt.Remove(ctx, row.WorktreePath, worktreeRemoveOpts{
@@ -218,7 +285,7 @@ func (m *Manager) deleteResume(ctx context.Context, row TaskRow, mode DeleteMode
 		return newOpErr(codeGitError, err)
 	}
 
-	// ⑦ 删 DB 行（提交点）。
+	// ⑨ 删 DB 行（提交点）。
 	if err := m.store.DeleteTask(ctx, taskID); err != nil {
 		finalizeOnFail(fmt.Errorf("delete db row: %w", err).Error())
 		return newOpErr(codeInternal, err)
@@ -226,6 +293,83 @@ func (m *Manager) deleteResume(ctx context.Context, row TaskRow, mode DeleteMode
 	// 提交点：defer preDeleteRelease() 已保证释放（§6.1：持有到 DB 行删除成功）。
 	m.clearRuntime(taskID)
 	// 删除成功（DB 行删除后）→ best-effort 删除 <dataDir>/logs/<taskID>/（忽略错误，design.md §6）。
+	m.removeLifecycleLogDir(taskID)
+	return nil
+}
+
+// deleteResumeDir 执行 dir（纯目录）项目的删除副作用序列（add-plain-dir-project D3）。
+//
+// dir 硬不变量：内建逻辑对用户目录零写删 syscall（pre-delete 用户脚本为唯一例外）。
+// 因此跳过 PreflightDelete（前置已在 Delete 入口跳过）、preflight dirty 快照与二次门禁（DirtyFiles）、
+// wt.Remove、DeleteBranch。confirmDirty 接受但忽略（dir 无 git，dirty 门禁不适用）。
+//
+// 步骤序列：② retryDebt → ③ oc sessions（!force）→ ④ kill 残余会话 → ⑥ pre_delete（!force，
+// cwd=项目目录即 row.WorktreePath）→ ⑨ DeleteTask → ⑩ removeLifecycleLogDir + clearRuntime。
+// dir force 跳过 ③⑥，不跳过 ②（与 repo force 契约一致）。
+//
+// 保留全部不可回归点：非取消落账 ctx（finalizeDeletionFailed）、pre-delete WG token 恰好一次释放
+// （defer preDeleteRelease）、notice CAS 失败聚合（retryDebtGate）、oc session 逐项错误聚合不短路
+// （deleteOCSessions）、tickets 不随 CASCADE 丢失（dir 无 wt.Remove；DeleteTask 失败落 deletion_failed 保留行）。
+func (m *Manager) deleteResumeDir(ctx context.Context, row TaskRow, mode DeleteMode) error {
+	taskID := row.ID
+
+	// ② RetryReap 既有 cleanup debt 门禁（dir 与 repo 共享，debt 收敛语义不因 kind 改变）。
+	if err := m.retryDebtGate(ctx, taskID, row.Notice); err != nil {
+		return err
+	}
+
+	// ③ 删 oc sessions（逐个，404 幂等落账，仅删本任务 task_sessions 拥有的 session）。
+	// Force 跳过 ③（与 repo force 一致）。
+	if mode != DeleteForce {
+		if err := m.deleteOCSessions(ctx, row); err != nil {
+			le := sql.NullString{String: fmt.Errorf("delete oc sessions: %w", err).Error(), Valid: true}
+			_ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, le)
+			return newOpErr(codeProcessError, err)
+		}
+	}
+
+	// ④ KillSession 残余会话（若有）。
+	if err := m.killResidualSessions(ctx, taskID); err != nil {
+		le := sql.NullString{String: err.Error(), Valid: true}
+		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, le)
+		return newOpErr(codeProcessError, err)
+	}
+
+	// ⑥ pre-delete 脚本挂点（dir：cwd=项目目录即 row.WorktreePath，design.md §6.1/D3）。
+	// DeleteForce 跳过 pre-delete。保留 runPreDeleteHook 语义：Stat IsNotExist → 跳过（release=nil）；
+	// 其他 Stat 错误 / admission 失败 / 脚本执行失败 → "pre-delete:" 前缀 deletion_failed，绝不 DeleteTask。
+	// WG token 持有到 DB 提交点/落账点后恰好一次释放。
+	var preDeleteRelease func()
+	if mode != DeleteForce {
+		rel, perr := m.runPreDeleteHook(row)
+		if perr != nil {
+			// token 覆盖范围内的落账 MUST 用非取消 ctx（design.md §6.1）。
+			m.finalizeDeletionFailed(taskID, perr.Error())
+			if rel != nil {
+				rel()
+			}
+			return newOpErr(codeInvalidState, perr)
+		}
+		preDeleteRelease = rel
+	}
+
+	// preDeleteRelease 非 nil 时，本路径后续落账（DB 删除失败）MUST 用非取消 ctx，
+	// 并在落账完成后释放 token。用 defer 结构性保证恰好一次释放。
+	if preDeleteRelease != nil {
+		defer preDeleteRelease()
+	}
+	finalizeOnFail := func(lastError string) {
+		m.finalizeDeletionFailed(taskID, lastError)
+	}
+
+	// ⑨ 删 DB 行（提交点）。dir 不 wt.Remove——用户目录零写删（pre-delete 脚本为唯一例外）。
+	if err := m.store.DeleteTask(ctx, taskID); err != nil {
+		finalizeOnFail(fmt.Errorf("delete db row: %w", err).Error())
+		return newOpErr(codeInternal, err)
+	}
+	// 提交点：defer preDeleteRelease() 已保证释放（§6.1：持有到 DB 行删除成功）。
+	m.clearRuntime(taskID)
+	// ⑩ 删除成功（DB 行删除后）→ best-effort 删除 <dataDir>/logs/<taskID>/（忽略错误，design.md §6）。
 	m.removeLifecycleLogDir(taskID)
 	return nil
 }

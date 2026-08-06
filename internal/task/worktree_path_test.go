@@ -311,7 +311,7 @@ func TestRetryCreate_UsesDBWorktreePathNotRecomputed(t *testing.T) {
 	store.seedProject(ProjectRow{ID: "p1", Name: "proj", Path: "/repo", DefaultBranch: "main"})
 	// 既有任务的 DB worktree_path 为旧格式 /data/worktrees/p1/t1。
 	t1 := TaskRow{ID: "t1", ProjectID: "p1", Name: "task", Branch: "ocdeck/task",
-		Status: StatusCreationFailed, WorktreePath: "/data/worktrees/p1/t1"}
+		Status: StatusCreationFailed, WorktreePath: "/data/worktrees/p1/t1", BaseRef: "refs/heads/main"}
 	store.tasks["t1"] = t1
 	wt := newMockWorktree()
 	// products 不含该路径 → VerifyWorktreeProduct 失败 → 重新 add。

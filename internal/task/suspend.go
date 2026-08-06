@@ -13,6 +13,9 @@ import (
 
 // Suspend 挂起任务（design.md §19 Suspend 行 + §5 互斥决策树三分支）。
 // 前置：状态须为 active。置 suspending → 停 SSE → KillSession 全部会话 → 按决策树收敛。
+//
+// add-plain-dir-project D8：入口在状态转换/运行时副作用前解析并校验项目 kind（未知值零副作用报错），
+// 解析后的对齐模式传入 repair 路径（tryRepairRuntime 复用，不重复查询）。
 func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 	unlock, err := m.tryLockTask(taskID)
 	if err != nil {
@@ -27,6 +30,15 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 	if row.Status != StatusActive {
 		return newOpErr(codeInvalidState, fmt.Errorf("suspend requires active, got %s", row.Status))
 	}
+	// D8：状态转换前解析项目 kind（任何副作用前 fail-closed）。未知持久化 kind → internal（D1）。
+	proj, perr := m.store.GetProject(ctx, row.ProjectID)
+	if perr != nil {
+		return newOpErr(codeNotFound, fmt.Errorf("project gone: %w", perr))
+	}
+	mode, kerr := alignModeForKind(proj.Kind)
+	if kerr != nil {
+		return newOpErr(codeInternal, kerr)
+	}
 	updated, err := m.store.UpdateTaskStatusConditional(ctx, taskID, StatusActive, StatusSuspending, sql.NullString{})
 	if err != nil {
 		return newOpErr(codeInternal, err)
@@ -34,7 +46,7 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 	if !updated {
 		return newOpErr(codeConflict, fmt.Errorf("task %s state changed before suspend", taskID))
 	}
-	return m.suspendRun(ctx, taskID)
+	return m.suspendRun(ctx, taskID, mode)
 }
 
 // suspendRun 执行挂起的外部副作用并按互斥决策树收敛（design.md §5）。
@@ -48,7 +60,9 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 // active 或 suspended，不得停留 suspending（Retry 不接受 suspending，只能重启 reconcile，
 // design.md §5）。infra 错误（HasSession/ListSessions）MUST 经 forceKillAll + finishSuspend
 // 落 suspended + last_error，不得直接返回 error 留 suspending。
-func (m *Manager) suspendRun(ctx context.Context, taskID string) error {
+//
+// mode 为 Suspend 入口已解析的对齐模式，传入 repair 路径复用（D8：不重复查询项目 kind）。
+func (m *Manager) suspendRun(ctx context.Context, taskID string, mode AlignMode) error {
 	// 停 SSE 订阅 + 退出监视。
 	m.clearRuntime(taskID)
 
@@ -94,7 +108,7 @@ func (m *Manager) suspendRun(ctx context.Context, taskID string) error {
 	}
 
 	// 分支 c：serve 存活但有 kill 失败 → 尝试修复运行时（恢复完整运行时，B7）。
-	fixed, ferr := m.tryRepairRuntime(ctx, taskID)
+	fixed, ferr := m.tryRepairRuntime(ctx, taskID, mode)
 	if ferr == nil && fixed {
 		// 修复成功 → 回 active + last_error（design.md §5）。
 		le := sql.NullString{String: "suspend partially failed, runtime repaired", Valid: true}
@@ -201,8 +215,10 @@ func (m *Manager) finishSuspend(ctx context.Context, taskID string, results []ki
 // 修复 MUST 恢复完整运行时（SSE 订阅 + 全量对齐 + watchers + RuntimeGroup 重建）才算成功回 active。
 // 修复期间产生的 retryable notice 不得被后台拿去杀刚修复的 serve（后台重试须校验 generation/注册表，
 // 由 sessionOwnedByRuntime 保证）。
+//
+// mode 为 Suspend 入口已解析的对齐模式（D8：复用传入值，不重复查询项目 kind）。
 // 返回 (fixed, err)：serve 存活且完整运行时重建成功 → (true, nil)；否则 (false, err)。
-func (m *Manager) tryRepairRuntime(ctx context.Context, taskID string) (bool, error) {
+func (m *Manager) tryRepairRuntime(ctx context.Context, taskID string, mode AlignMode) (bool, error) {
 	serveName := serveSessionName(taskID)
 	alive, err := m.proc.HasSession(serveName)
 	if err != nil || !alive {
@@ -231,11 +247,11 @@ func (m *Manager) tryRepairRuntime(ctx context.Context, taskID string) (bool, er
 	if _, err := oc.Health(ctx); err != nil {
 		return false, fmt.Errorf("health check: %w", err)
 	}
-	// 重建运行时 → SSE 订阅 + 全量对齐（B7：恢复完整运行时）。
+	// 重建运行时 → SSE 订阅 + 全量对齐（B7：恢复完整运行时）。mode 由 Suspend 入口传入。
 	rt := m.newRuntime(taskID)
 	m.setRuntime(taskID, rt)
 	rt.registerGroup("serve", serveName)
-	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password); err != nil {
+	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode); err != nil {
 		m.clearRuntime(taskID)
 		return false, fmt.Errorf("sse resubscribe: %w", err)
 	}

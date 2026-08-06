@@ -155,16 +155,20 @@ func TestMigration0007_ExistingTasksInitStatusDefaultNone(t *testing.T) {
 func TestMigration0007_PreExistingTaskBackfilledDefaultNone(t *testing.T) {
 	db := openTestDBRaw(t)
 	ctx := context.Background()
-	// 阶段 1：仅应用 0001-0004，tasks 此时无 init_status/init_error 列。
+	// 阶段 1：仅应用 0001-0004，projects/tasks 此时无 kind/base_ref/init_status/init_error 列。
 	applyMigrationsUpto(t, db, 4)
-	// 阶段 2：插入任务（迁移前已有数据）。
-	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main"); err != nil {
-		t.Fatalf("create project: %v", err)
+	// 阶段 2：插入项目与任务（迁移前已有数据）。queries.CreateProject/CreateTask 现引用 0008 列，
+	// 在 0008 未应用前不可用，故用原始 SQL 插入以保留本测试对 0007 回填的验证意图。
+	if _, err := db.Exec(
+		`INSERT INTO projects (id, name, path, default_branch, created_at) VALUES (?, ?, ?, ?, ?)`,
+		"p1", "proj", "/tmp/repo", "main", time.Now().Unix()); err != nil {
+		t.Fatalf("raw insert project: %v", err)
 	}
-	if err := db.CreateTask(ctx, TaskRow{
-		ID: "t1", ProjectID: "p1", Name: "task", Branch: "b", Status: "suspended", WorktreePath: "/tmp/wt",
-	}); err != nil {
-		t.Fatalf("create task: %v", err)
+	if _, err := db.Exec(
+		`INSERT INTO tasks (id, project_id, name, branch, status, worktree_path, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"t1", "p1", "task", "b", "suspended", "/tmp/wt", time.Now().Unix(), time.Now().Unix()); err != nil {
+		t.Fatalf("raw insert task: %v", err)
 	}
 	// 确认此时查询 init_status 列不存在（验证 0007 尚未应用）。
 	var dummy string
@@ -190,7 +194,7 @@ func TestMigration0007_PreExistingTaskBackfilledDefaultNone(t *testing.T) {
 func TestLifecycleConfig_GetMissingRowReturnsEmpty(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
-	_ = db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main")
+	_ = db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo")
 	cfg, err := db.GetLifecycleConfig(ctx, "p1")
 	if err != nil {
 		t.Fatalf("GetLifecycleConfig missing row: %v", err)
@@ -207,7 +211,7 @@ func TestLifecycleConfig_GetMissingRowReturnsEmpty(t *testing.T) {
 func TestLifecycleConfig_UpsertReplaceAndGet(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
-	_ = db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main")
+	_ = db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo")
 	if err := db.UpsertLifecycleConfig(ctx, "p1", "pat-a", "init-a", "predel-a"); err != nil {
 		t.Fatalf("upsert 1: %v", err)
 	}
@@ -239,7 +243,7 @@ func TestLifecycleConfig_UpsertReplaceAndGet(t *testing.T) {
 func TestLifecycleConfig_CascadeOnDeleteProject(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
-	_ = db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main")
+	_ = db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo")
 	_ = db.UpsertLifecycleConfig(ctx, "p1", "pat", "init", "predel")
 	if err := db.DeleteProject(ctx, "p1"); err != nil {
 		t.Fatalf("delete project: %v", err)
@@ -550,7 +554,7 @@ func TestConvergeInterruptedInitRuns_PendingOrRunningToFailed(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 	// 三个任务同属一个项目，seedProjectTask 每次都建同一项目会冲突，故手动 seed。
-	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main"); err != nil {
+	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo"); err != nil {
 		t.Fatalf("create project: %v", err)
 	}
 	for _, id := range []string{"t1", "t2", "t3"} {
@@ -587,5 +591,163 @@ func TestConvergeInterruptedInitRuns_PendingOrRunningToFailed(t *testing.T) {
 	affected2, _ := db.ConvergeInterruptedInitRuns(ctx)
 	if affected2 != 0 {
 		t.Errorf("second converge affected = %d, want 0 (idempotent)", affected2)
+	}
+}
+
+// --- migration 0008：project kind / task base_ref（add-plain-dir-project D1/D10） ---
+
+// TestMigration0008_ProjectKindDefaultRepo 验证 migration 0008 后 projects.kind 列存在，
+// CreateProject 写入 kind，缺省（列默认）为 'repo'，GetProject/ListProjects 往返一致。
+func TestMigration0008_ProjectKindDefaultRepo(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	// 列存在且默认 repo：直接 INSERT 不写 kind，读取应得列默认 'repo'。
+	if _, err := db.Exec(
+		`INSERT INTO projects (id, name, path, default_branch, created_at) VALUES (?, ?, ?, ?, ?)`,
+		"raw", "raw-proj", "/tmp/raw", "main", time.Now().Unix()); err != nil {
+		t.Fatalf("raw insert project: %v", err)
+	}
+	raw, err := db.GetProject(ctx, "raw")
+	if err != nil {
+		t.Fatalf("get raw project: %v", err)
+	}
+	if raw.Kind != "repo" {
+		t.Errorf("raw project Kind = %q, want 'repo' (column default)", raw.Kind)
+	}
+	// CreateProject 写入 kind=dir 往返。
+	if err := db.CreateProject(ctx, "pdir", "dir-proj", "/tmp/dir", "", "dir"); err != nil {
+		t.Fatalf("create dir project: %v", err)
+	}
+	got, err := db.GetProject(ctx, "pdir")
+	if err != nil {
+		t.Fatalf("get dir project: %v", err)
+	}
+	if got.Kind != "dir" {
+		t.Errorf("dir project Kind = %q, want 'dir'", got.Kind)
+	}
+	if got.DefaultBranch != "" {
+		t.Errorf("dir project DefaultBranch = %q, want '' (dir 无默认分支)", got.DefaultBranch)
+	}
+	// CreateProject 写入 kind=repo 往返。
+	if err := db.CreateProject(ctx, "prep", "repo-proj", "/tmp/repo2", "main", "repo"); err != nil {
+		t.Fatalf("create repo project: %v", err)
+	}
+	gotRepo, err := db.GetProject(ctx, "prep")
+	if err != nil {
+		t.Fatalf("get repo project: %v", err)
+	}
+	if gotRepo.Kind != "repo" {
+		t.Errorf("repo project Kind = %q, want 'repo'", gotRepo.Kind)
+	}
+	// ListProjects 也带 kind。
+	list, err := db.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("list projects: %v", err)
+	}
+	kindByID := map[string]string{}
+	for _, p := range list {
+		kindByID[p.ID] = p.Kind
+	}
+	if kindByID["raw"] != "repo" || kindByID["pdir"] != "dir" || kindByID["prep"] != "repo" {
+		t.Errorf("ListProjects kinds = %+v, want raw=repo pdir=dir prep=repo", kindByID)
+	}
+}
+
+// TestMigration0008_TaskBaseRefRoundtrip 验证 CreateTask 写入 base_ref，GetTask/List* 往返一致。
+func TestMigration0008_TaskBaseRefRoundtrip(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo"); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	// repo 任务带 base_ref。
+	if err := db.CreateTask(ctx, TaskRow{
+		ID: "t1", ProjectID: "p1", Name: "task", Branch: "b", Status: "suspended",
+		WorktreePath: "/tmp/wt", BaseRef: "refs/heads/main",
+	}); err != nil {
+		t.Fatalf("create task t1: %v", err)
+	}
+	// dir 风格任务（base_ref 空串）。
+	if err := db.CreateProject(ctx, "pdir", "dir-proj", "/tmp/dir", "", "dir"); err != nil {
+		t.Fatalf("create dir project: %v", err)
+	}
+	if err := db.CreateTask(ctx, TaskRow{
+		ID: "t2", ProjectID: "pdir", Name: "dir-task", Branch: "b", Status: "suspended",
+		WorktreePath: "/tmp/wt2", BaseRef: "",
+	}); err != nil {
+		t.Fatalf("create task t2: %v", err)
+	}
+	t1, err := db.GetTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("get t1: %v", err)
+	}
+	if t1.BaseRef != "refs/heads/main" {
+		t.Errorf("t1 BaseRef = %q, want 'refs/heads/main'", t1.BaseRef)
+	}
+	t2, err := db.GetTask(ctx, "t2")
+	if err != nil {
+		t.Fatalf("get t2: %v", err)
+	}
+	if t2.BaseRef != "" {
+		t.Errorf("t2 BaseRef = %q, want ''", t2.BaseRef)
+	}
+	// ListTasksByProject 往返。
+	tasks, err := db.ListTasksByProject(ctx, "p1")
+	if err != nil || len(tasks) != 1 || tasks[0].BaseRef != "refs/heads/main" {
+		t.Fatalf("ListTasksByProject p1 = %+v err=%v, want t1 base_ref=refs/heads/main", tasks, err)
+	}
+	// ListAllTasks 往返。
+	all, err := db.ListAllTasks(ctx)
+	if err != nil {
+		t.Fatalf("ListAllTasks: %v", err)
+	}
+	baseByID := map[string]string{}
+	for _, tk := range all {
+		baseByID[tk.ID] = tk.BaseRef
+	}
+	if baseByID["t1"] != "refs/heads/main" || baseByID["t2"] != "" {
+		t.Errorf("ListAllTasks base_ref = %+v, want t1=refs/heads/main t2=''", baseByID)
+	}
+}
+
+// TestMigration0008_PreExistingTaskBackfilledBaseRef 验证真实"0008 前已有任务"场景：
+// 应用 0001-0007 → 插入项目与任务（tasks 无 base_ref 列）→ 应用 0008（ALTER + 回填）→
+// 断言存量任务 base_ref 被回填为 'refs/heads/' || default_branch。
+func TestMigration0008_PreExistingTaskBackfilledBaseRef(t *testing.T) {
+	db := openTestDBRaw(t)
+	ctx := context.Background()
+	// 阶段 1：应用 0001-0007（projects/tasks 此时无 kind/base_ref 列）。
+	applyMigrationsUpto(t, db, 7)
+	// 阶段 2：插入项目（default_branch=main）与任务（迁移前已有数据）。
+	// CreateProject/CreateTask 现引用 0008 列，在 0008 未应用前不可用，故用原始 SQL。
+	if _, err := db.Exec(
+		`INSERT INTO projects (id, name, path, default_branch, created_at) VALUES (?, ?, ?, ?, ?)`,
+		"p1", "proj", "/tmp/repo", "main", time.Now().Unix()); err != nil {
+		t.Fatalf("raw insert project: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO tasks (id, project_id, name, branch, status, worktree_path, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"t1", "p1", "task", "b", "suspended", "/tmp/wt", time.Now().Unix(), time.Now().Unix()); err != nil {
+		t.Fatalf("raw insert task: %v", err)
+	}
+	// 阶段 3：应用剩余 migration（0008），ALTER + 回填 base_ref。
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate applies 0008: %v", err)
+	}
+	// 阶段 4：存量任务被回填 base_ref='refs/heads/main'，项目 kind='repo'。
+	task, err := db.GetTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("get after migration 0008: %v", err)
+	}
+	if task.BaseRef != "refs/heads/main" {
+		t.Errorf("BaseRef = %q, want 'refs/heads/main' (backfilled from project default_branch)", task.BaseRef)
+	}
+	proj, err := db.GetProject(ctx, "p1")
+	if err != nil {
+		t.Fatalf("get project after migration 0008: %v", err)
+	}
+	if proj.Kind != "repo" {
+		t.Errorf("project Kind = %q, want 'repo' (backfilled column default)", proj.Kind)
 	}
 }

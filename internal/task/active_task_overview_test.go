@@ -35,7 +35,7 @@ func TestStoreAdapter_ListActiveTaskOverview_Conversion(t *testing.T) {
 	adapter, db := openRealStore(t)
 	ctx := context.Background()
 	// 第二个项目 + 跨项目 active 任务。
-	if err := db.CreateProject(ctx, "p2", "projB", "/repoB", "main"); err != nil {
+	if err := db.CreateProject(ctx, "p2", "projB", "/repoB", "main", "repo"); err != nil {
 		t.Fatalf("create project p2: %v", err)
 	}
 	if err := db.CreateTask(ctx, store.TaskRow{

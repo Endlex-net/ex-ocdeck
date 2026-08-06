@@ -235,6 +235,17 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 	if row.Status != StatusSuspended {
 		return newOpErr(codeInvalidState, fmt.Errorf("activate requires suspended, got %s", row.Status))
 	}
+	// add-plain-dir-project D8：早期 kind 门禁——在任何状态修改/副作用前解析并校验项目 kind，
+	// 未知值零副作用报错（MUST NOT 在 serve 启动后才发现未知 kind）。mode 显式传入后续 startSSE/alignSessions。
+	proj, err := m.store.GetProject(ctx, row.ProjectID)
+	if err != nil {
+		return newOpErr(codeNotFound, fmt.Errorf("project gone: %w", err))
+	}
+	mode, err := alignModeForKind(proj.Kind)
+	if err != nil {
+		// 未知持久化 kind（DB 损坏值）→ internal（D1：区别于用户请求非法 kind 的 invalid_input）。
+		return newOpErr(codeInternal, err)
+	}
 	// 前置检查：无未清理的旧代残留会话（tmux ls 中仍存在该任务会话则拒绝）。
 	if err := m.checkNoResidualSessions(ctx, taskID); err != nil {
 		return err
@@ -274,7 +285,7 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 		return newOpErr(codeConflict, fmt.Errorf("task %s state changed before activate commit", taskID))
 	}
 
-	if err := m.activateRun(ctx, taskID); err != nil {
+	if err := m.activateRun(ctx, taskID, mode); err != nil {
 		// 失败：清理已建会话（serve/tui/shell）→ suspended + last_error（design.md §19 补偿）。
 		// 补偿 MUST 用脱离调用方取消的 context：activateRun 可能在 probe 退避/健康检查等
 		// 步骤因 ctx 取消返回，此时调用方 ctx 已取消，真实 store 用 ExecContext 会因 ctx 取消
@@ -349,16 +360,12 @@ func (m *Manager) runActivateFailureCompensation(reqCtx context.Context, taskID 
 }
 
 // activateRun 执行激活的外部副作用序列（serve → probe → SSE → tui）。
-func (m *Manager) activateRun(ctx context.Context, taskID string) error {
+// mode 由 Activate 早期 kind 门禁解析后传入（add-plain-dir-project D8）。
+func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode) error {
 	row, err := m.store.GetTask(ctx, taskID)
 	if err != nil {
 		return err
 	}
-	proj, err := m.store.GetProject(ctx, row.ProjectID)
-	if err != nil {
-		return fmt.Errorf("project gone: %w", err)
-	}
-	_ = proj
 
 	// ② 分配端口、合并 env 快照并持久化。
 	port, err := m.allocatePort(row.LastPort)
@@ -397,7 +404,7 @@ func (m *Manager) activateRun(ctx context.Context, taskID string) error {
 	m.setRuntime(taskID, rt)
 	// 注册 serve group（B4：groups 真实写入注册表）。
 	rt.registerGroup("serve", serveName)
-	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password); err != nil {
+	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode); err != nil {
 		return newOpErr(codeProcessError, fmt.Errorf("sse subscribe: %w", err))
 	}
 
@@ -626,7 +633,7 @@ func (m *Manager) persistEnvSnapshot(ctx context.Context, taskID string, merged 
 // onReady 后先全量对齐再放行业务事件：对齐竞态期间 SSE 事件 MUST 缓冲，
 // 对齐完成后按序重放（缓冲起止与对齐替换 MUST 原子，B5）。
 // 对齐错误传播（返回 error，不吞，B5）。
-func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath string, port int, password string) error {
+func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath string, port int, password string, mode AlignMode) error {
 	// SSE 挂 Manager 生命周期 context，非传入的 HTTP request ctx。
 	sseCtx, cancel := context.WithCancel(m.lifecycleCtx())
 	sseDone := make(chan struct{})
@@ -724,7 +731,7 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 			buffering = true
 			buffered = nil
 			bufMu.Unlock()
-			if err := m.alignSessions(sseCtx, taskID, wtPath, ocWithReady); err != nil {
+			if err := m.alignSessions(sseCtx, taskID, wtPath, ocWithReady, mode); err != nil {
 				// 重连对齐失败 MUST 收敛任务状态（design.md §4）：不得只取消 SSE 留 active 假象。
 				// serve 可能仍存活但无法追踪会话，视同运行时不可确定 → cleanup runtime + suspended + last_error。
 				// 在新 goroutine 收敛：onReconnect 在 SSE goroutine 内，cleanup 会 kill serve（结束本 goroutine ctx），
@@ -757,7 +764,7 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 	select {
 	case <-readyCh:
 		alignMu.Lock()
-		if err := m.alignSessions(sseCtx, taskID, wtPath, ocWithReady); err != nil {
+		if err := m.alignSessions(sseCtx, taskID, wtPath, ocWithReady, mode); err != nil {
 			alignMu.Unlock()
 			cancel()
 			return fmt.Errorf("sse initial align: %w", err)
@@ -798,27 +805,35 @@ func (m *Manager) handleSSEEvent(ctx context.Context, taskID, wtPath string, ev 
 				taskID, ev.Type, sid, dir, ok, wtPath)
 			return nil
 		}
+		if ev.Type == "session.updated" {
+			// D8：session.updated 仅刷新本任务已归属行的 last_seen_at，绝不创建归属。
+			// 未归属 session 的 updated 一律忽略（updated=false 正常路径，记 debug 不报错）。
+			updatedTS, hasTS := ev.TimeUpdated()
+			if !hasTS {
+				return nil
+			}
+			updated, uerr := m.store.TouchOwnedTaskSession(ctx, taskID, sid, int64(updatedTS))
+			if uerr != nil {
+				return fmt.Errorf("touch owned session %s: %w", sid, uerr)
+			}
+			if !updated {
+				log.Printf("task %s: session.updated for unowned session %s; ignoring", taskID, sid)
+			}
+			return nil
+		}
+		// session.created：原子 claim（D8）。冲突 → 忽略 + 记诊断日志（不阻断）。
+		var createdAt, lastSeen int64
 		if updated, ok := ev.TimeUpdated(); ok {
-			created := int64(0)
-			_ = created
-			if err := m.store.UpsertTaskSession(ctx, SessionRow{
-				TaskID: taskID, SessionID: sid,
-				SessionCreatedAt: int64(updated),
-				FirstSeenAt:      nowUnixI(),
-				LastSeenAt:       int64(updated),
-				// B3：SSE 捕获持久化 parent_id（子 session 非空），锚定候选据此过滤顶层会话。
-				ParentID: ev.ParentID(),
-			}); err != nil {
-				return fmt.Errorf("upsert session %s: %w", sid, err)
-			}
-		} else {
-			if err := m.store.UpsertTaskSession(ctx, SessionRow{
-				TaskID: taskID, SessionID: sid,
-				FirstSeenAt: nowUnixI(), LastSeenAt: nowUnixI(),
-				ParentID: ev.ParentID(),
-			}); err != nil {
-				return fmt.Errorf("upsert session %s: %w", sid, err)
-			}
+			createdAt = int64(updated)
+			lastSeen = int64(updated)
+		}
+		claimed, owner, cerr := m.store.ClaimTaskSession(ctx, taskID, sid, createdAt, nowUnixI(), lastSeen, ev.ParentID())
+		if cerr != nil {
+			return fmt.Errorf("claim session %s: %w", sid, cerr)
+		}
+		if !claimed {
+			log.Printf("task %s: sse session.created for session %s conflict (owned by task %s); skipping",
+				taskID, sid, owner)
 		}
 	case "session.deleted":
 		sid := ev.SessionID()
@@ -869,15 +884,22 @@ func (m *Manager) sessionBelongsToTask(ctx context.Context, taskID, sid string) 
 	return false, nil
 }
 
-// alignSessions 全量对齐（design.md §4）：GET /session?directory=<wt>&limit=1000。
-// count<limit → upsert + 删缺席行（complete=true）；count==limit → 仅 upsert MUST NOT 删缺席行，
-// 写 session_overflow notice，后续完整对齐清除（B5）。
-// 返回 error（不吞，B5）：非 overflow 错误传播；AlignSessions store 错误传播。
-func (m *Manager) alignSessions(ctx context.Context, taskID, wtPath string, oc OCClient) error {
+// alignSessions 全量对齐（design.md §4 + add-plain-dir-project D8）：
+// GET /session?directory=<wt>&limit=1000。count<limit → complete=true（删 owned 缺席行）；
+// count==limit → overflow，complete=false，先经事务外 CAS 写 session_overflow notice 再调对齐
+//（对齐失败 notice 保留，B5）。
+//
+// mode=AlignModeRepo：listed 逐个原子 claim（单任务场景 guard 不命中，行为与既有 upsert 一致），
+// 冲突 ID 经 store 层上报（此处仅传播 error，冲突 session 在 store 内被跳过）。
+// mode=AlignModeOwnedOnly（dir）：仅对 listed∩owned 刷新 last_seen_at（store 层处理），绝不 claim。
+// complete/overflow 判定 MUST 基于原始目录列表（过滤之前，D8 算法第 1 步）。
+//
+// 返回 error（不吞，B5）：非 overflow 错误传播；AlignTaskSessions store 错误传播。
+func (m *Manager) alignSessions(ctx context.Context, taskID, wtPath string, oc OCClient, mode AlignMode) error {
 	sessions, err := oc.ListSessions(ctx, wtPath, 1000)
 	complete := true
 	if err != nil {
-		// 溢出（count==limit）仅 upsert 不删缺席行，写 session_overflow notice（B5）。
+		// 溢出（count==limit）仅刷新不删缺席行，写 session_overflow notice（B5）。
 		if isOverflow(err) {
 			complete = false
 			if oerr := m.recordSessionOverflowNotice(ctx, taskID); oerr != nil {
@@ -888,15 +910,13 @@ func (m *Manager) alignSessions(ctx context.Context, taskID, wtPath string, oc O
 			return fmt.Errorf("list sessions: %w", err)
 		}
 	}
-	rows := make([]SessionRow, 0, len(sessions))
+	obs := make([]SessionObservation, 0, len(sessions))
 	for _, s := range sessions {
-		updated := int64(s.Time.Updated)
-		created := int64(s.Time.Created)
-		rows = append(rows, SessionRow{
-			TaskID: taskID, SessionID: s.ID,
-			SessionCreatedAt: created, FirstSeenAt: nowUnixI(), LastSeenAt: updated,
-			// B3：全量对齐持久化 parent_id（子 session 非空），锚定候选据此过滤顶层会话。
-			ParentID: s.ParentID,
+		obs = append(obs, SessionObservation{
+			SessionID: s.ID,
+			CreatedAt: int64(s.Time.Created),
+			UpdatedAt: int64(s.Time.Updated),
+			ParentID:  s.ParentID,
 		})
 	}
 	// 完整对齐时清除 session_overflow notice（design.md §4）。
@@ -916,7 +936,16 @@ func (m *Manager) alignSessions(ctx context.Context, taskID, wtPath string, oc O
 			return encodeNotices(out)
 		}
 	}
-	return m.store.AlignSessions(ctx, taskID, rows, complete, noticeFn)
+	conflicts, aerr := m.store.AlignTaskSessions(ctx, taskID, mode, obs, complete, noticeFn)
+	if aerr != nil {
+		return aerr
+	}
+	// repo/dir 对齐路径冲突 → 忽略 + 记诊断日志（不阻断，D8）。dir 模式无 claim 故无冲突；
+	// repo 单任务场景 guard 不命中，conflicts 为空。
+	for _, sid := range conflicts {
+		log.Printf("task %s: align session %s conflict (owned by other task); skipping", taskID, sid)
+	}
+	return nil
 }
 
 // startTUI 锚定确定 session 并创建 TUI 会话（design.md §4 恢复与锚定）。
@@ -984,17 +1013,16 @@ func (m *Manager) resolveAnchorSession(ctx context.Context, oc OCClient, row Tas
 	if cerr != nil {
 		return "", fmt.Errorf("create anchor session: %w", cerr)
 	}
-	// 持久化 task_sessions（与 SSE 对齐：session_created_at=time.created、first_seen_at/last_seen_at=time.updated）。
-	// ParentID 留空（顶层会话，design.md §4）。
-	if err := m.store.UpsertTaskSession(ctx, SessionRow{
-		TaskID:           row.ID,
-		SessionID:        created.ID,
-		SessionCreatedAt: int64(created.Time.Created),
-		FirstSeenAt:      int64(created.Time.Updated),
-		LastSeenAt:       int64(created.Time.Updated),
-	}); err != nil {
-		// 已建 session 可经后续全量对齐补记，不算泄漏；但当前激活 MUST 失败以避免归属不一致。
-		return "", fmt.Errorf("persist anchor session %s: %w", created.ID, err)
+	// D8：原子 claim 归属（锚定创建路径冲突 → 激活失败，MUST NOT attach 不属本任务的 session）。
+	// 新建 session 理论上必不冲突，但 claim 冲突（边界）时返回错误以避免归属不一致。
+	claimed, owner, perr := m.store.ClaimTaskSession(ctx, row.ID, created.ID,
+		int64(created.Time.Created), int64(created.Time.Updated), int64(created.Time.Updated), "")
+	if perr != nil {
+		// store 错误：已建 session 可经后续全量对齐补记，但当前激活 MUST 失败以避免归属不一致。
+		return "", fmt.Errorf("persist anchor session %s: %w", created.ID, perr)
+	}
+	if !claimed {
+		return "", fmt.Errorf("anchor session %s conflict (owned by task %s); MUST NOT attach", created.ID, owner)
 	}
 	return created.ID, nil
 }

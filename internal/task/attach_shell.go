@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -33,6 +34,16 @@ func (m *Manager) ReopenAttach(ctx context.Context, taskID string) (TerminalID, 
 	// lockTaskWait 已在拿锁后复查 active；此处仅为防御性二次校验（持锁期间状态不变）。
 	if row.Status != StatusActive {
 		return "", newOpErr(codeInvalidState, fmt.Errorf("reopen attach requires active, got %s", row.Status))
+	}
+	// add-plain-dir-project D8：TUI 重开路径在任何状态修改/运行时副作用前校验项目 kind，
+	// 未知值零副作用报错。kind 不改变对齐（ReopenAttach 无对齐），但满足四入口校验一致。
+	proj, perr := m.store.GetProject(ctx, row.ProjectID)
+	if perr != nil {
+		return "", newOpErr(codeNotFound, fmt.Errorf("project gone: %w", perr))
+	}
+	if _, kerr := alignModeForKind(proj.Kind); kerr != nil {
+		// 未知持久化 kind（DB 损坏值）→ internal（D1）。
+		return "", newOpErr(codeInternal, kerr)
 	}
 	tuiName := tuiSessionName(taskID)
 	// 已存在则复用（幂等）。HasSession 基础设施错误（非 ErrNoTmuxServer）MUST 传播
@@ -71,6 +82,13 @@ func (m *Manager) ReopenAttach(ctx context.Context, taskID string) (TerminalID, 
 	oc := m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 5 * time.Second})
 	sessionID, aerr := m.resolveAnchorSession(ctx, oc, row)
 	if aerr != nil {
+		// add-plain-dir-project D8：锚定 claim 冲突 → 记 last_error，任务保持 active 不收敛
+		//（TUI 重开失败可重试），MUST NOT attach 不属本任务的 session。
+		// UpdateTaskStatus 写 last_error 同时保持 status=active（不收敛状态）。
+		le := sql.NullString{String: fmt.Sprintf("reopen attach: %v", aerr), Valid: true}
+		if uerr := m.store.UpdateTaskStatus(ctx, taskID, StatusActive, le); uerr != nil {
+			log.Printf("reopen attach: record last_error for task %s: %v", taskID, uerr)
+		}
 		return "", newOpErr(codeProcessError, fmt.Errorf("reopen attach: %w", aerr))
 	}
 	if err := m.proc.NewSession(newSessionSpec(tuiName, row.WorktreePath, tuiEnv,

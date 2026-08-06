@@ -58,6 +58,16 @@ type TaskStore interface {
 	ListTopLevelTaskSessions(ctx context.Context, taskID string) ([]SessionRow, error)
 	DeleteTaskSession(ctx context.Context, taskID, sessionID string) error
 	AlignSessions(ctx context.Context, taskID string, sessions []SessionRow, complete bool, noticeFn func(sql.NullString) sql.NullString) error
+	// ClaimTaskSession 原子 claim 一个 session 至本任务（add-plain-dir-project D8）。
+	// 单事务"仅当 sessionID 未被他任务拥有时插入/更新本任务行；已被他任务拥有则 claimed=false + ownerTaskID"。
+	// 不加跨任务唯一索引；冲突语义由调用方按入口处理（SSE/对齐忽略+诊断，锚定失败+last_error）。
+	ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (claimed bool, ownerTaskID string, err error)
+	// TouchOwnedTaskSession 条件 UPDATE 仅本任务已归属行的 last_seen_at（D8）。
+	// 绝不插入；updated=false（未归属行）为正常路径。供 session.updated 事件使用（MUST NOT 创建归属）。
+	TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (updated bool, err error)
+	// AlignTaskSessions 单事务原子对齐（D8）：读 owned → 按 mode（repo claim/ownedOnly 刷新）→
+	// complete 删 owned 缺席行 → noticeFn 事务内读写 notice。conflicts 为 repo 模式下被他任务拥有的 sessionID。
+	AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, noticeFn func(sql.NullString) sql.NullString) (conflicts []string, err error)
 	// ListActiveTaskOverview 聚合全部 active 任务的跨项目概览
 	//（cross-project-active-sessions D2：JOIN projects + LEFT JOIN task_sessions）。
 	ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOverviewRow, error)
@@ -81,11 +91,14 @@ type CleanupDebtRow struct {
 }
 
 // ProjectRow / TaskRow / EnvVarRow / SessionRow 解耦 store 包结构（design.md §18）。
+// ProjectRow.Kind ∈ repo | dir（add-plain-dir-project D1）；TaskRow.BaseRef 为 repo 任务的
+// 基线分支全引用，dir 项目任务为空串（D10）。
 type ProjectRow struct {
 	ID            string
 	Name          string
 	Path          string
 	DefaultBranch string
+	Kind          string
 	CreatedAt     int64
 }
 
@@ -106,6 +119,7 @@ type TaskRow struct {
 	ArchivedAt   sql.NullInt64
 	InitStatus   string
 	InitError    sql.NullString
+	BaseRef      string
 }
 
 type EnvVarRow struct {

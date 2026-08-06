@@ -101,7 +101,7 @@ func TestAlignSessions_OverflowNotice(t *testing.T) {
 	m := newTestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
 	// 用一个返回 overflow 错误的 OCClient。
 	oc := &overflowOC{}
-	if err := m.alignSessions(context.Background(), "t1", "/wt", oc); err != nil {
+	if err := m.alignSessions(context.Background(), "t1", "/wt", oc, AlignModeRepo); err != nil {
 		t.Fatalf("alignSessions: %v", err)
 	}
 	row, _ := store.GetTask(context.Background(), "t1")
@@ -400,7 +400,7 @@ func TestCreate_BranchConflictPreservesExisting(t *testing.T) {
 	wt.branches["ocdeck/my-task"] = true
 	m := newTestManager(t, store, newMockProc(), wt, newMockOC(true))
 
-	_, err := m.Create(context.Background(), "p1", "My Task")
+	_, err := m.Create(context.Background(), "p1", "My Task", "")
 	if err == nil || OpErrorCode(err) != codeConflict {
 		t.Errorf("want conflict on existing branch, got %v", err)
 	}
@@ -421,7 +421,7 @@ func TestRetryCreate_StrictProductVerification(t *testing.T) {
 	store.seedProject(ProjectRow{ID: "p1", Name: "proj", Path: "/repo", DefaultBranch: "main"})
 	// 任务处于 creation_failed，worktree 产物不完整。
 	t1 := TaskRow{ID: "t1", ProjectID: "p1", Name: "task", Branch: "ocdeck/task",
-		Status: StatusCreationFailed, WorktreePath: "/data/worktrees/p1/t1"}
+		Status: StatusCreationFailed, WorktreePath: "/data/worktrees/p1/t1", BaseRef: "refs/heads/main"}
 	store.tasks["t1"] = t1
 	wt := newMockWorktree()
 	// products 不含该路径 → VerifyWorktreeProduct 失败 → 重新 add。
