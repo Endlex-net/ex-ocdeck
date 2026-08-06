@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { TermSession, type TermConnState } from './session';
 import { loadTermPrefs, TERM_PREFS_CHANGED } from './preferences';
+import { useMediaQuery } from '../hooks';
 import '@xterm/xterm/css/xterm.css';
+import './mobile.css';
 
 interface TerminalViewProps {
   /** WS 路径，如 /ws/terminal/<taskID> 或 /ws/terminal/shell/<tid>。 */
@@ -25,21 +27,30 @@ const STATE_LABEL: Record<TermConnState, string> = {
 
 export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
   const hostRef = useRef<HTMLDivElement>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
   const sessionRef = useRef<TermSession | null>(null);
   const [state, setState] = useState<TermConnState>('idle');
+  const [locked, setLocked] = useState(false);
   const onStateRef = useRef(onState);
   onStateRef.current = onState;
 
+  // 按钮可见性 = 视图侧 coarse pointer（与 session 锁状态正交）。
+  const coarsePointer = useMediaQuery('(pointer: coarse)');
+
   useEffect(() => {
     const host = hostRef.current;
-    if (!host) return;
-    const session = new TermSession(host, wsPath, (s) => {
+    const wrap = wrapRef.current;
+    if (!host || !wrap) return;
+    const session = new TermSession(host, wrap, wsPath, (s) => {
       setState(s);
       onStateRef.current?.(s);
     });
     sessionRef.current = session;
+    setLocked(session.isLocked());
+    const unsubLock = session.onLockChange(setLocked);
     return () => {
       sessionRef.current = null;
+      unsubLock();
       session.dispose();
     };
   }, [wsPath]);
@@ -70,8 +81,22 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
   const showOverlay = state !== 'connected' && state !== 'idle';
 
   return (
-    <div className="terminal-wrap">
+    <div className="terminal-wrap" ref={wrapRef}>
       <div className="terminal-host" ref={hostRef} />
+      {coarsePointer && (
+        <button
+          type="button"
+          className="terminal-lock-button"
+          onClick={() => {
+            const session = sessionRef.current;
+            if (!session) return;
+            if (session.isLocked()) session.unlock();
+            else session.lock();
+          }}
+        >
+          {locked ? '🔒 锁定中 · 点此解锁' : '🔓 已解锁 · 点此锁定'}
+        </button>
+      )}
       {showOverlay && (
         <div className="terminal-overlay">
           <div className="terminal-overlay-box">
