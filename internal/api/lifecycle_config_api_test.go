@@ -254,8 +254,10 @@ func TestLifecycleAPI_ProjectNotFound_PUT(t *testing.T) {
 
 func TestLifecycleAPI_RerunInit_InvalidState_422(t *testing.T) {
 	projs := newFakeProjectStore()
+	projs.projects["p1"] = storeProjectRow{ID: "p1", Name: "p", Path: "/x", DefaultBranch: "main", Kind: "repo"}
 	lc := newFakeLifecycleConfigStore()
-	tb := newLifecycleTaskBackend()
+	// Get 必须返回带 ProjectID 的行，供 RerunInit 副作用前预取 kind（D6 fail-closed）。
+	tb := newLifecycleTaskBackend(task.TaskRow{ID: "t1", ProjectID: "p1", Status: task.StatusSuspended})
 	tb.rerunFn = func(ctx context.Context, taskID string) (task.TaskRow, error) {
 		return task.TaskRow{}, &task.OpError{Code: "invalid_state", Err: errNotFound(taskID)}
 	}
@@ -282,8 +284,9 @@ func TestLifecycleAPI_RerunInit_InvalidState_422(t *testing.T) {
 
 func TestLifecycleAPI_RerunInit_Conflict_409(t *testing.T) {
 	projs := newFakeProjectStore()
+	projs.projects["p1"] = storeProjectRow{ID: "p1", Name: "p", Path: "/x", DefaultBranch: "main", Kind: "repo"}
 	lc := newFakeLifecycleConfigStore()
-	tb := newLifecycleTaskBackend()
+	tb := newLifecycleTaskBackend(task.TaskRow{ID: "t1", ProjectID: "p1", Status: task.StatusSuspended})
 	tb.rerunFn = func(ctx context.Context, taskID string) (task.TaskRow, error) {
 		return task.TaskRow{}, &task.OpError{Code: "conflict", Err: errNotFound(taskID)}
 	}
@@ -310,8 +313,9 @@ func TestLifecycleAPI_RerunInit_Conflict_409(t *testing.T) {
 
 func TestLifecycleAPI_RerunInit_Success_200WithTaskDTO(t *testing.T) {
 	projs := newFakeProjectStore()
+	projs.projects["p1"] = storeProjectRow{ID: "p1", Name: "p", Path: "/x", DefaultBranch: "main", Kind: "repo"}
 	lc := newFakeLifecycleConfigStore()
-	tb := newLifecycleTaskBackend()
+	tb := newLifecycleTaskBackend(task.TaskRow{ID: "t1", ProjectID: "p1", Status: task.StatusSuspended})
 	tb.rerunFn = func(ctx context.Context, taskID string) (task.TaskRow, error) {
 		return task.TaskRow{ID: "t1", ProjectID: "p1", Status: task.StatusSuspended, InitStatus: task.InitStatusRunning}, nil
 	}
@@ -511,4 +515,257 @@ func TestLifecycleAPI_PutFieldLimit_64KBPlus1_Still422(t *testing.T) {
 	if eb.Error.Code != CodeInvalidInput {
 		t.Errorf("code = %v, want invalid_input", eb.Error.Code)
 	}
+}
+
+// --- add-plain-dir-project D6：task DTO project_kind 填充 ---
+
+// projectKindTaskBackend 覆盖 Create/List/Get/RerunInit，返回固定 ProjectID 的任务，
+// 供 project_kind 填充测试。
+type projectKindTaskBackend struct {
+	*fakeTaskBackend
+	projectID string
+}
+
+func (b *projectKindTaskBackend) Create(ctx context.Context, projectID, taskName, baseRef string) (task.TaskRow, error) {
+	return task.TaskRow{ID: "t-new", ProjectID: projectID, Name: taskName, Status: task.StatusSuspended}, nil
+}
+func (b *projectKindTaskBackend) Get(ctx context.Context, taskID string) (task.TaskRow, error) {
+	return task.TaskRow{ID: taskID, ProjectID: b.projectID, Status: task.StatusSuspended}, nil
+}
+func (b *projectKindTaskBackend) List(ctx context.Context, projectID string) ([]task.TaskRow, error) {
+	return []task.TaskRow{{ID: "t1", ProjectID: projectID, Status: task.StatusSuspended}}, nil
+}
+func (b *projectKindTaskBackend) RerunInit(ctx context.Context, taskID string) (task.TaskRow, error) {
+	return task.TaskRow{ID: taskID, ProjectID: b.projectID, Status: task.StatusSuspended, InitStatus: task.InitStatusRunning}, nil
+}
+
+// TestTaskDTO_ProjectKind_FilledAtListCreateGetRerunInit 验证 task DTO 的 project_kind 字段
+// 在 List/Create/Get/RerunInit 四个响应消费点均从项目详情填充（D6）。
+func TestTaskDTO_ProjectKind_FilledAtListCreateGetRerunInit(t *testing.T) {
+	projs := newFakeProjectStore()
+	projs.projects["pdir"] = storeProjectRow{ID: "pdir", Name: "d", Path: "/d", Kind: "dir"}
+	projs.projects["prep"] = storeProjectRow{ID: "prep", Name: "r", Path: "/r", Kind: "repo"}
+	lc := newFakeLifecycleConfigStore()
+
+	newSrv := func(projectID string) *Server {
+		tb := &projectKindTaskBackend{fakeTaskBackend: &fakeTaskBackend{}, projectID: projectID}
+		return newLifecycleAPIServer(t, projs, lc, tb)
+	}
+
+	t.Run("List_dir", func(t *testing.T) {
+		s := newSrv("pdir")
+		ts := httptest.NewServer(s.mux)
+		defer ts.Close()
+		resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/projects/pdir/tasks", ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		var list []taskRowDTO
+		if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+			t.Fatal(err)
+		}
+		if len(list) != 1 || list[0].ProjectKind != "dir" {
+			t.Errorf("list = %+v, want project_kind=dir", list)
+		}
+	})
+
+	t.Run("Create_repo", func(t *testing.T) {
+		s := newSrv("prep")
+		ts := httptest.NewServer(s.mux)
+		defer ts.Close()
+		resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects/prep/tasks", `{"name":"x"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("status = %d, want 201", resp.StatusCode)
+		}
+		var dto taskRowDTO
+		if err := json.NewDecoder(resp.Body).Decode(&dto); err != nil {
+			t.Fatal(err)
+		}
+		if dto.ProjectKind != "repo" {
+			t.Errorf("ProjectKind = %q, want 'repo'", dto.ProjectKind)
+		}
+	})
+
+	t.Run("Get_dir", func(t *testing.T) {
+		s := newSrv("pdir")
+		ts := httptest.NewServer(s.mux)
+		defer ts.Close()
+		resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/tasks/t1", ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		var dto taskRowDTO
+		if err := json.NewDecoder(resp.Body).Decode(&dto); err != nil {
+			t.Fatal(err)
+		}
+		if dto.ProjectKind != "dir" {
+			t.Errorf("ProjectKind = %q, want 'dir'", dto.ProjectKind)
+		}
+	})
+
+	t.Run("RerunInit_repo", func(t *testing.T) {
+		s := newSrv("prep")
+		ts := httptest.NewServer(s.mux)
+		defer ts.Close()
+		resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/tasks/t1/rerun-init", ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		var dto taskRowDTO
+		if err := json.NewDecoder(resp.Body).Decode(&dto); err != nil {
+			t.Fatal(err)
+		}
+		if dto.ProjectKind != "repo" {
+			t.Errorf("ProjectKind = %q, want 'repo' (prefetched before RerunInit side-effect)", dto.ProjectKind)
+		}
+	})
+}
+
+// --- add-plain-dir-project D1/D6：API fail-closed 路径 ---
+
+// TestTaskDTO_FailClosed_ProjectNotFound 验证各消费点项目不存在时返回 not_found（404），
+// 不输出空 project_kind / 不执行副作用。
+func TestTaskDTO_FailClosed_ProjectNotFound(t *testing.T) {
+	projs := newFakeProjectStore() // 无项目
+	lc := newFakeLifecycleConfigStore()
+	tb := newLifecycleTaskBackend(task.TaskRow{ID: "t1", ProjectID: "missing", Status: task.StatusSuspended})
+	doReq := func(t *testing.T, method, url string) *http.Response {
+		t.Helper()
+		resp, err := http.DefaultClient.Do(authedReq(method, url, ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	t.Run("List_404", func(t *testing.T) {
+		s := newLifecycleAPIServer(t, projs, lc, tb)
+		ts := httptest.NewServer(s.mux)
+		defer ts.Close()
+		resp := doReq(t, "GET", ts.URL+"/api/v1/projects/missing/tasks")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", resp.StatusCode)
+		}
+	})
+	t.Run("Get_404", func(t *testing.T) {
+		s := newLifecycleAPIServer(t, projs, lc, tb)
+		ts := httptest.NewServer(s.mux)
+		defer ts.Close()
+		resp := doReq(t, "GET", ts.URL+"/api/v1/tasks/t1")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", resp.StatusCode)
+		}
+	})
+	t.Run("Create_404", func(t *testing.T) {
+		s := newLifecycleAPIServer(t, projs, lc, tb)
+		ts := httptest.NewServer(s.mux)
+		defer ts.Close()
+		resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects/missing/tasks", `{"name":"x"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404 (no create before kind resolved)", resp.StatusCode)
+		}
+	})
+	t.Run("RerunInit_404_no_side_effect", func(t *testing.T) {
+		// 项目不存在 → MUST NOT 调用 RerunInit（零 claim/脚本副作用）。
+		called := false
+		tb2 := newLifecycleTaskBackend(task.TaskRow{ID: "t1", ProjectID: "missing", Status: task.StatusSuspended})
+		tb2.rerunFn = func(ctx context.Context, taskID string) (task.TaskRow, error) {
+			called = true
+			return task.TaskRow{}, nil
+		}
+		s := newLifecycleAPIServer(t, projs, lc, tb2)
+		ts := httptest.NewServer(s.mux)
+		defer ts.Close()
+		resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/tasks/t1/rerun-init", ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", resp.StatusCode)
+		}
+		if called {
+			t.Error("RerunInit was called despite project not found (must fail-closed before side-effect)")
+		}
+	})
+}
+
+// TestTaskDTO_FailClosed_UnknownPersistedKind_500 验证未知持久化 kind → internal（500），
+// 不执行副作用（D1：持久化未知 kind 区别于用户请求非法 kind 的 invalid_input）。
+func TestTaskDTO_FailClosed_UnknownPersistedKind_500(t *testing.T) {
+	projs := newFakeProjectStore()
+	projs.projects["pbad"] = storeProjectRow{ID: "pbad", Name: "p", Path: "/x", Kind: "weird"}
+	lc := newFakeLifecycleConfigStore()
+	tb := newLifecycleTaskBackend(task.TaskRow{ID: "t1", ProjectID: "pbad", Status: task.StatusSuspended})
+
+	t.Run("List_500", func(t *testing.T) {
+		s := newLifecycleAPIServer(t, projs, lc, tb)
+		ts := httptest.NewServer(s.mux)
+		defer ts.Close()
+		resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/projects/pbad/tasks", ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500 (unknown persisted kind)", resp.StatusCode)
+		}
+	})
+	t.Run("Create_500", func(t *testing.T) {
+		s := newLifecycleAPIServer(t, projs, lc, tb)
+		ts := httptest.NewServer(s.mux)
+		defer ts.Close()
+		resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects/pbad/tasks", `{"name":"x"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500 (no create, unknown persisted kind)", resp.StatusCode)
+		}
+	})
+	t.Run("RerunInit_500_no_side_effect", func(t *testing.T) {
+		called := false
+		tb2 := newLifecycleTaskBackend(task.TaskRow{ID: "t1", ProjectID: "pbad", Status: task.StatusSuspended})
+		tb2.rerunFn = func(ctx context.Context, taskID string) (task.TaskRow, error) {
+			called = true
+			return task.TaskRow{}, nil
+		}
+		s := newLifecycleAPIServer(t, projs, lc, tb2)
+		ts := httptest.NewServer(s.mux)
+		defer ts.Close()
+		resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/tasks/t1/rerun-init", ""))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", resp.StatusCode)
+		}
+		if called {
+			t.Error("RerunInit was called despite unknown persisted kind (must fail-closed)")
+		}
+	})
 }

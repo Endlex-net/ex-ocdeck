@@ -46,7 +46,7 @@ func TestB2_ShutdownGate_JoinsInFlightAutoActivate(t *testing.T) {
 	m.cfg.ShutdownPolicy = config.ShutdownPersist
 
 	// Create 返回 suspended 后立即触发自动激活 goroutine（阻塞在 Probe）。
-	row, err := m.Create(context.Background(), "p1", "Gate Task")
+	row, err := m.Create(context.Background(), "p1", "Gate Task", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestB2_ShutdownTimeoutOnStuckAutoActivate(t *testing.T) {
 	m, _ := newTestManagerWithLifecycle(t, store, proc, wt, oc)
 	m.cfg.ShutdownPolicy = config.ShutdownPersist
 
-	if _, err := m.Create(context.Background(), "p1", "Stuck Task"); err != nil {
+	if _, err := m.Create(context.Background(), "p1", "Stuck Task", ""); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	// 等待自动激活 in-flight（阻塞在 Probe）。

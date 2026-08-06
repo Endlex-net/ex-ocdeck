@@ -32,11 +32,11 @@ func newFakeProjectStore() *fakeProjectStore {
 	}
 }
 
-func (f *fakeProjectStore) CreateProject(ctx context.Context, id, name, path, defaultBranch string) error {
+func (f *fakeProjectStore) CreateProject(ctx context.Context, id, name, path, defaultBranch, kind string) error {
 	if _, ok := f.byPath[path]; ok {
 		return errors.New("UNIQUE constraint failed: projects.path")
 	}
-	f.projects[id] = storeProjectRow{ID: id, Name: name, Path: path, DefaultBranch: defaultBranch, CreatedAt: 1}
+	f.projects[id] = storeProjectRow{ID: id, Name: name, Path: path, DefaultBranch: defaultBranch, Kind: kind, CreatedAt: 1}
 	f.byPath[path] = id
 	return nil
 }
@@ -609,4 +609,448 @@ type countErrStore struct {
 
 func (c *countErrStore) CountProjectTasks(ctx context.Context, projectID string) (storeTaskCounts, error) {
 	return storeTaskCounts{}, errors.New("count boom")
+}
+
+// --- add-plain-dir-project Lane 2：项目 kind 注册（D1）与分支只读 API（D10） ---
+
+// TestCreateProject_DirKind_Success 验证 kind=dir 注册成功：仅校验路径存在且为目录，
+// default_branch 落空串，DTO 含 kind=dir。
+func TestCreateProject_DirKind_Success(t *testing.T) {
+	dir := t.TempDir()
+	srv, db := newServerWithRealStore(t)
+	ts := httptest.NewServer(srv.mux)
+	defer ts.Close()
+
+	body := `{"name":"dir project","kind":"dir","path":` + quoteJSON(dir) + `}`
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+	var dto projectDTO
+	if err := json.NewDecoder(resp.Body).Decode(&dto); err != nil {
+		t.Fatal(err)
+	}
+	dirCanon, _ := filepath.EvalSymlinks(dir)
+	if dto.Kind != "dir" {
+		t.Errorf("kind = %q, want 'dir'", dto.Kind)
+	}
+	if dto.DefaultBranch != "" {
+		t.Errorf("default_branch = %q, want '' (dir 无默认分支)", dto.DefaultBranch)
+	}
+	if dto.Path != dirCanon {
+		t.Errorf("path = %q, want %q", dto.Path, dirCanon)
+	}
+	// 落库 kind 一致。
+	p, _ := db.GetProject(context.Background(), dto.ID)
+	if p.Kind != "dir" || p.DefaultBranch != "" {
+		t.Errorf("store row = %+v, want kind=dir default_branch=''", p)
+	}
+}
+
+// TestCreateProject_DirKind_NonexistentPath_422 验证 dir kind 拒绝不存在的路径。
+func TestCreateProject_DirKind_NonexistentPath_422(t *testing.T) {
+	srv, _ := newServerWithRealStore(t)
+	ts := httptest.NewServer(srv.mux)
+	defer ts.Close()
+
+	body := `{"name":"p","kind":"dir","path":"/nonexistent-xyz-abc-123"}`
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", resp.StatusCode)
+	}
+}
+
+// TestCreateProject_DirKind_PathIsFile_422 验证 dir kind 拒绝指向文件（非目录）的路径。
+func TestCreateProject_DirKind_PathIsFile_422(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "a-file")
+	if err := os.WriteFile(filePath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv, _ := newServerWithRealStore(t)
+	ts := httptest.NewServer(srv.mux)
+	defer ts.Close()
+
+	body := `{"name":"p","kind":"dir","path":` + quoteJSON(filePath) + `}`
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", resp.StatusCode)
+	}
+}
+
+// TestCreateProject_RepoKind_NonRepoDirNotDowngraded 验证 kind=repo（含缺省）校验失败时
+// MUST NOT 自动降级为 dir，直接 422。
+func TestCreateProject_RepoKind_NonRepoDirNotDowngraded(t *testing.T) {
+	notRepo := t.TempDir() // 空 dir，非 git repo
+	// 显式 kind=repo。
+	t.Run("explicit_repo", func(t *testing.T) {
+		srv, _ := newServerWithRealStore(t)
+		ts := httptest.NewServer(srv.mux)
+		defer ts.Close()
+		body := `{"name":"p","kind":"repo","path":` + quoteJSON(notRepo) + `}`
+		resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want 422 (no downgrade to dir)", resp.StatusCode)
+		}
+		var eb errorBody
+		json.NewDecoder(resp.Body).Decode(&eb)
+		if eb.Error.Code != CodeInvalidInput {
+			t.Errorf("code = %s, want invalid_input", eb.Error.Code)
+		}
+	})
+	// 缺省 kind（应等价 repo）。
+	t.Run("default_kind", func(t *testing.T) {
+		srv, _ := newServerWithRealStore(t)
+		ts := httptest.NewServer(srv.mux)
+		defer ts.Close()
+		body := `{"name":"p","path":` + quoteJSON(notRepo) + `}`
+		resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want 422 (default repo, no downgrade)", resp.StatusCode)
+		}
+	})
+}
+
+// TestCreateProject_InvalidKind_422 验证非法 kind 值返回 422。
+func TestCreateProject_InvalidKind_422(t *testing.T) {
+	dir := t.TempDir()
+	srv, _ := newServerWithRealStore(t)
+	ts := httptest.NewServer(srv.mux)
+	defer ts.Close()
+
+	body := `{"name":"p","kind":"bogus","path":` + quoteJSON(dir) + `}`
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", resp.StatusCode)
+	}
+	var eb errorBody
+	json.NewDecoder(resp.Body).Decode(&eb)
+	if eb.Error.Code != CodeInvalidInput {
+		t.Errorf("code = %s, want invalid_input", eb.Error.Code)
+	}
+}
+
+// TestCreateProject_DTOHasKind 验证 repo 注册响应 DTO 含 kind=repo。
+func TestCreateProject_DTOHasKind(t *testing.T) {
+	repo := newTestRepo(t)
+	srv, _ := newServerWithRealStore(t)
+	ts := httptest.NewServer(srv.mux)
+	defer ts.Close()
+
+	body := `{"name":"p","path":` + quoteJSON(repo) + `}`
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+	var dto projectDTO
+	json.NewDecoder(resp.Body).Decode(&dto)
+	if dto.Kind != "repo" {
+		t.Errorf("kind = %q, want 'repo'", dto.Kind)
+	}
+}
+
+// TestListProjectBranches_SortedDedupedExcludesSymbolicHead 验证 repo 项目分支列表：
+// 本地在前、远端在后，稳定排序、去重，排除 origin/HEAD 等 symbolic HEAD。
+func TestListProjectBranches_SortedDedupedExcludesSymbolicHead(t *testing.T) {
+	repo := newTestRepo(t)
+	// 建本地分支 feature-x。
+	runGitCmd(t, repo, "branch", "feature-x")
+	// 添加远端并推送本地与远端分支，制造 origin/HEAD symbolic ref。
+	remote := t.TempDir()
+	runGitCmd(t, remote, "init", "--bare", "-q")
+	runGitCmd(t, repo, "remote", "add", "origin", remote)
+	runGitCmd(t, repo, "push", "-q", "origin", "main")
+	runGitCmd(t, repo, "push", "-q", "origin", "feature-x")
+	// 设置 origin/HEAD 指向 origin/main（产生 symbolic HEAD 远端条目）。
+	runGitCmd(t, repo, "remote", "set-head", "origin", "main")
+
+	srv, _ := newServerWithRealStore(t)
+	ts := httptest.NewServer(srv.mux)
+	defer ts.Close()
+	body := `{"name":"p","path":` + quoteJSON(repo) + `}`
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created projectDTO
+	json.NewDecoder(resp.Body).Decode(&created)
+	resp.Body.Close()
+
+	resp2, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/projects/"+created.ID+"/branches", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp2.StatusCode)
+	}
+	var branches []string
+	if err := json.NewDecoder(resp2.Body).Decode(&branches); err != nil {
+		t.Fatal(err)
+	}
+	// 期望本地在前（feature-x, main）、远端在后（origin/feature-x, origin/main），排除 origin/HEAD。
+	want := []string{"feature-x", "main", "origin/feature-x", "origin/main"}
+	if len(branches) != len(want) {
+		t.Fatalf("branches = %v, want %v", branches, want)
+	}
+	for i, b := range branches {
+		if b != want[i] {
+			t.Errorf("branches[%d] = %q, want %q (full=%v)", i, b, want[i], branches)
+			break
+		}
+	}
+	// 显式断言不含 origin/HEAD。
+	for _, b := range branches {
+		if b == "origin/HEAD" {
+			t.Errorf("branches contains origin/HEAD, must be excluded: %v", branches)
+		}
+	}
+}
+
+// TestListProjectBranches_DirKind_422 验证 dir 项目请求分支列表返回 422。
+func TestListProjectBranches_DirKind_422(t *testing.T) {
+	dir := t.TempDir()
+	srv, _ := newServerWithRealStore(t)
+	ts := httptest.NewServer(srv.mux)
+	defer ts.Close()
+	body := `{"name":"p","kind":"dir","path":` + quoteJSON(dir) + `}`
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created projectDTO
+	json.NewDecoder(resp.Body).Decode(&created)
+	resp.Body.Close()
+
+	resp2, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/projects/"+created.ID+"/branches", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (dir kind has no branches)", resp2.StatusCode)
+	}
+	var eb errorBody
+	json.NewDecoder(resp2.Body).Decode(&eb)
+	if eb.Error.Code != CodeInvalidInput {
+		t.Errorf("code = %s, want invalid_input", eb.Error.Code)
+	}
+}
+
+// --- add-plain-dir-project D10：branches refresh API（tasks 2.7） ---
+
+// setupBranchesTestRepo 构造 repo + bare remote + producer clone，注册为项目，返回 server/createdID/producer。
+func setupBranchesTestRepo(t *testing.T) (ts *httptest.Server, createdID, repo, remote, producer string) {
+	t.Helper()
+	repo = newTestRepo(t)
+	remote = t.TempDir()
+	runGitCmd(t, remote, "init", "--bare", "-q")
+	runGitCmd(t, repo, "remote", "add", "origin", remote)
+	runGitCmd(t, repo, "push", "-q", "origin", "main")
+	runGitCmd(t, repo, "remote", "set-head", "origin", "main")
+	// producer clone 在 remote 侧建/删/推分支。
+	producer = t.TempDir()
+	runGitCmd(t, producer, "clone", "-q", remote, ".")
+	runGitCmd(t, producer, "config", "user.email", "t@t.com")
+	runGitCmd(t, producer, "config", "user.name", "tester")
+
+	srv, _ := newServerWithRealStore(t)
+	ts = httptest.NewServer(srv.mux)
+	body := `{"name":"p","path":` + quoteJSON(repo) + `}`
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var c projectDTO
+	json.NewDecoder(resp.Body).Decode(&c)
+	resp.Body.Close()
+	createdID = c.ID
+	return ts, createdID, repo, remote, producer
+}
+
+// TestRefreshBranches_RemoteNewBranchAppears 验证远端新建分支后 refresh API 返回含新分支
+// （而 GET 仍不含）。
+func TestRefreshBranches_RemoteNewBranchAppears(t *testing.T) {
+	ts, id, _, _, producer := setupBranchesTestRepo(t)
+	defer ts.Close()
+
+	// producer 在 remote 新建 feature-x 并 push。
+	runGitCmd(t, producer, "checkout", "-q", "-b", "feature-x")
+	if err := os.WriteFile(filepath.Join(producer, "fx.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitCmd(t, producer, "add", "fx.txt")
+	runGitCmd(t, producer, "commit", "-qm", "fx")
+	runGitCmd(t, producer, "push", "-q", "origin", "feature-x")
+
+	// GET 仍不含（本地未 fetch）。
+	respGET, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/projects/"+id+"/branches", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var getBranches []string
+	json.NewDecoder(respGET.Body).Decode(&getBranches)
+	respGET.Body.Close()
+	for _, b := range getBranches {
+		if b == "origin/feature-x" {
+			t.Fatalf("GET before refresh should not contain origin/feature-x: %v", getBranches)
+		}
+	}
+
+	// refresh 返回含 origin/feature-x。
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects/"+id+"/branches/refresh", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("refresh status = %d, want 200", resp.StatusCode)
+	}
+	var branches []string
+	if err := json.NewDecoder(resp.Body).Decode(&branches); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, b := range branches {
+		if b == "origin/feature-x" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("refresh branches = %v, want origin/feature-x", branches)
+	}
+}
+
+// TestRefreshBranches_RemoteDeleteBranchPruned 验证远端删除分支后 refresh 移除列表条目。
+func TestRefreshBranches_RemoteDeleteBranchPruned(t *testing.T) {
+	ts, id, _, _, producer := setupBranchesTestRepo(t)
+	defer ts.Close()
+	// 先建 feature-x 并 push，再 refresh 拿到。
+	runGitCmd(t, producer, "checkout", "-q", "-b", "feature-x")
+	if err := os.WriteFile(filepath.Join(producer, "fx.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitCmd(t, producer, "add", "fx.txt")
+	runGitCmd(t, producer, "commit", "-qm", "fx")
+	runGitCmd(t, producer, "push", "-q", "origin", "feature-x")
+	if resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects/"+id+"/branches/refresh", "")); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("initial refresh: err=%v status=%d", err, resp.StatusCode)
+	} else {
+		resp.Body.Close()
+	}
+	// 删除远端分支。
+	runGitCmd(t, producer, "push", "-q", "origin", "--delete", "feature-x")
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects/"+id+"/branches/refresh", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("refresh status = %d, want 200", resp.StatusCode)
+	}
+	var branches []string
+	json.NewDecoder(resp.Body).Decode(&branches)
+	for _, b := range branches {
+		if b == "origin/feature-x" {
+			t.Errorf("after prune refresh, branches = %v, want origin/feature-x removed", branches)
+		}
+	}
+}
+
+// TestRefreshBranches_DirKind_422 验证 dir 项目 refresh 返回 422。
+func TestRefreshBranches_DirKind_422(t *testing.T) {
+	dir := t.TempDir()
+	srv, _ := newServerWithRealStore(t)
+	ts := httptest.NewServer(srv.mux)
+	defer ts.Close()
+	body := `{"name":"p","kind":"dir","path":` + quoteJSON(dir) + `}`
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created projectDTO
+	json.NewDecoder(resp.Body).Decode(&created)
+	resp.Body.Close()
+
+	resp2, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects/"+created.ID+"/branches/refresh", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (dir kind)", resp2.StatusCode)
+	}
+	var eb errorBody
+	json.NewDecoder(resp2.Body).Decode(&eb)
+	if eb.Error.Code != CodeInvalidInput {
+		t.Errorf("code = %s, want invalid_input", eb.Error.Code)
+	}
+}
+
+// TestRefreshBranches_UnknownPersistedKind_500 验证未知持久化 kind refresh 返回 500。
+func TestRefreshBranches_UnknownPersistedKind_500(t *testing.T) {
+	srv, db := newServerWithRealStore(t)
+	ts := httptest.NewServer(srv.mux)
+	defer ts.Close()
+	// 直接落库一个未知 kind 的项目。
+	ctx := context.Background()
+	if err := db.CreateProject(ctx, "pbad", "p", "/x", "main", "weird"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects/pbad/branches/refresh", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (unknown persisted kind)", resp.StatusCode)
+	}
+	var eb errorBody
+	json.NewDecoder(resp.Body).Decode(&eb)
+	if eb.Error.Code != CodeInternal {
+		t.Errorf("code = %s, want internal", eb.Error.Code)
+	}
+}
+
+// TestRefreshBranches_ProjectNotFound_404 验证项目不存在 refresh 返回 404。
+func TestRefreshBranches_ProjectNotFound_404(t *testing.T) {
+	srv, _ := newServerWithRealStore(t)
+	ts := httptest.NewServer(srv.mux)
+	defer ts.Close()
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects/nope/branches/refresh", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
 }

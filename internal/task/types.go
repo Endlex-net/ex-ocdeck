@@ -14,6 +14,7 @@ package task
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"ocdeck/internal/opencode"
 	"ocdeck/internal/process"
@@ -97,6 +98,11 @@ type WorktreeBackend interface {
 	// ValidateBranchName 用 git check-ref-format 校验分支名合法性（P1：Create 前置检查，
 	// design.md §19）。无副作用，前置完成于落库前。
 	ValidateBranchName(ctx context.Context, repoPath, branch string) error
+	// ResolveBaseRef 将 base_ref 短名解析为全限定 ref（add-plain-dir-project D10）。
+	// 解析顺序 refs/heads/<name> → refs/remotes/<name>（heads 优先），仅接受这两个命名空间；
+	// 不存在返回错误（调用方映射 invalid_input）。调用方 MUST 先经 ValidateBranchName 做规范校验。
+	// 无副作用只读，前置完成于落库前。task 包不直接依赖 internal/git，经此端口解析。
+	ResolveBaseRef(ctx context.Context, repoPath, shortName string) (string, error)
 	// VerifyWorktreeProduct 严格产物验证（B1：RetryCreate 幂等跳过 add 的判定依据，
 	// design.md §19 Create Retry 行）。校验：路径存在 + .git 文件 + rev-parse --is-inside-work-tree
 	// + 检出分支匹配 + 属预期 repo。全部通过返回 nil，否则返回明确错误。
@@ -124,6 +130,50 @@ type PreflightDeleteOpts struct {
 	RepoPath     string
 	Branch       string
 	ConfirmDirty bool // 用户已确认 dirty（API 层 confirmDirty=true）
+}
+
+// --- session 归属隔离（add-plain-dir-project D8） ---
+
+// AlignMode 对齐模式（task 层常量，StoreAdapter 映射到 store.AlignMode；
+// 合法值仅两种，未知值 MUST 在任何写入前返回错误——fail-closed）。
+type AlignMode int
+
+const (
+	// AlignModeRepo 目录私有：listed 逐个原子 claim，冲突 ID 上报；complete 删 owned 缺席行。
+	// 单任务场景 claim guard 永不命中，与既有 upsert 行为逐点一致。
+	AlignModeRepo AlignMode = iota + 1
+	// AlignModeOwnedOnly 目录可共享（dir）：仅对 listed∩owned 刷新 last_seen_at，绝不 claim；
+	// complete 仅删 owned 缺席行。
+	AlignModeOwnedOnly
+)
+
+// SessionObservation 持久化中立的会话观测（application 层从 opencode DTO 转换，
+// 仅含归属写回所需字段：SessionID/CreatedAt/UpdatedAt/ParentID）。StoreAdapter 映射到 store 层类型。
+type SessionObservation struct {
+	SessionID string
+	CreatedAt int64
+	UpdatedAt int64
+	ParentID  string
+}
+
+// ProjectKind 项目类型枚举（add-plain-dir-project D1）。未知值 fail-closed。
+const (
+	ProjectKindRepo = "repo"
+	ProjectKindDir  = "dir"
+)
+
+// alignModeForKind 按项目 kind 解析对齐模式（add-plain-dir-project D8）。
+// repo → AlignModeRepo；dir → AlignModeOwnedOnly；未知值 fail-closed 返回错误。
+// 调用方 MUST 在任何副作用前调用本函数取得 mode（design.md D8：MUST NOT 在 serve 启动后才发现未知 kind）。
+func alignModeForKind(kind string) (AlignMode, error) {
+	switch kind {
+	case ProjectKindRepo:
+		return AlignModeRepo, nil
+	case ProjectKindDir:
+		return AlignModeOwnedOnly, nil
+	default:
+		return 0, fmt.Errorf("task: unknown project kind %q", kind)
+	}
 }
 
 // worktreeRemoveOpts 解耦 worktree.RemoveOpts（避免 task 直接依赖 worktree 包结构）。

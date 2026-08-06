@@ -127,7 +127,7 @@ func TestRegisterRuntime_ServeDeadBeforeRegister(t *testing.T) {
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 
 	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActivating })
-	err := m.activateRun(context.Background(), "t1")
+	err := m.activateRun(context.Background(), "t1", AlignModeRepo)
 	if err == nil {
 		t.Fatal("expected error when serve dies before register")
 	}

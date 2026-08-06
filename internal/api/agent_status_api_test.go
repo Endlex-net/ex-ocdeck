@@ -13,19 +13,44 @@ import (
 // agentStatusTaskBackend 返回固定 agentStatus 供 DTO 测试。
 type agentStatusTaskBackend struct {
 	*fakeTaskBackend
-	status string
+	status    string
+	getTaskID string
 }
 
 func (a *agentStatusTaskBackend) AgentStatus(ctx context.Context, taskID string) string {
 	return a.status
 }
 
+// Get 返回带 ProjectID 的零值任务行，供 handleGetTask 在 fail-closed kind 校验下通过。
+func (a *agentStatusTaskBackend) Get(ctx context.Context, taskID string) (task.TaskRow, error) {
+	return task.TaskRow{ID: taskID, ProjectID: a.getTaskID}, nil
+}
+
+// newAgentStatusServer 构造带 ProjectStore + TaskBackend 的 Server（agentStatus 测试用）。
+func newAgentStatusServer(t *testing.T, tb TaskBackend, projectID, kind string) *Server {
+	t.Helper()
+	cfg := testConfig()
+	projs := newFakeProjectStore()
+	projs.projects[projectID] = storeProjectRow{ID: projectID, Name: "p", Path: "/x", DefaultBranch: "main", Kind: kind}
+	s := &Server{
+		cfg:       cfg,
+		mux:       http.NewServeMux(),
+		auth:      NewTokenAuthenticator(cfg.Token),
+		wsClients: newWSClientRegistry(),
+		projs:     projs,
+		tasks:     tb,
+	}
+	s.registerRoutes()
+	return s
+}
+
 func TestTaskDTO_AgentStatus_Populated(t *testing.T) {
 	tb := &agentStatusTaskBackend{
 		fakeTaskBackend: &fakeTaskBackend{},
-		status:          "busy",
+		status:           "busy",
+		getTaskID:        "p1",
 	}
-	s := newAPITestServer(t, tb)
+	s := newAgentStatusServer(t, tb, "p1", "repo")
 	ts := httptest.NewServer(s.mux)
 	defer ts.Close()
 
@@ -51,8 +76,9 @@ func TestTaskDTO_AgentStatus_EmptyWhenDegraded(t *testing.T) {
 	tb := &agentStatusTaskBackend{
 		fakeTaskBackend: &fakeTaskBackend{},
 		status:          "", // 降级返回空串
+		getTaskID:       "p1",
 	}
-	s := newAPITestServer(t, tb)
+	s := newAgentStatusServer(t, tb, "p1", "repo")
 	ts := httptest.NewServer(s.mux)
 	defer ts.Close()
 

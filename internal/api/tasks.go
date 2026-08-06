@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 // TaskBackend 是 api 层调用的 TaskManager 能力（design.md §18 task 行 + §21 路由）。
 // api handler 只做 DTO/HTTP 语义，不做编排。返回 task.TaskRow + error（api 做 DTO 转换）。
 type TaskBackend interface {
-	Create(ctx context.Context, projectID, taskName string) (task.TaskRow, error)
+	Create(ctx context.Context, projectID, taskName, baseRef string) (task.TaskRow, error)
 	Activate(ctx context.Context, taskID string) error
 	Suspend(ctx context.Context, taskID string) error
 	Archive(ctx context.Context, taskID string) error
@@ -113,9 +114,11 @@ func (s *Server) registerTaskRoutes(mux *http.ServeMux) {
 	// WS 端点由 registerWSRoutes 单独挂载（不走 api 子 mux，design.md §21）。
 }
 
-// createTaskReq 创建任务请求体。
+// createTaskReq 创建任务请求体。base_ref 为可选基线分支短名（add-plain-dir-project D10，
+// 仅 repo 项目接受；dir 项目提供即 invalid_input，由 task 层校验）。
 type createTaskReq struct {
-	Name string `json:"name"`
+	Name    string `json:"name"`
+	BaseRef string `json:"base_ref"`
 }
 
 func (r createTaskReq) validate() *ApiError {
@@ -125,16 +128,58 @@ func (r createTaskReq) validate() *ApiError {
 	return nil
 }
 
+// projectKindFor 查询项目 kind（add-plain-dir-project D6）。projs 未注入返回空串
+// （兼容测试 fixture 未注入 ProjectStore 的场景；生产路径 projs 必注入）。
+// 查询失败或未知 kind 不在此吞错——需 fail-closed 的入口用 requireProjectKind。
+func (s *Server) projectKindFor(ctx context.Context, projectID string) string {
+	if s.projs == nil {
+		return ""
+	}
+	p, err := s.projs.GetProject(ctx, projectID)
+	if err != nil {
+		return ""
+	}
+	return p.Kind
+}
+
+// requireProjectKind 解析项目 kind 并做 fail-closed 校验（add-plain-dir-project D1/D6）。
+// projs 未注入、项目查询失败、未知持久化 kind → 返回 *ApiError（调用方不得执行后续副作用）：
+//   - projs 未注入 → internal（生产配置错误）
+//   - 项目不存在   → not_found
+//   - 未知持久化 kind → internal（DB 损坏值，D1 区分于用户请求非法 kind 的 invalid_input）
+//
+// 仅 repo/dir 为合法持久化值。
+func (s *Server) requireProjectKind(ctx context.Context, projectID string) (string, *ApiError) {
+	if s.projs == nil {
+		return "", NewError(CodeInternal, "project store not configured")
+	}
+	p, err := s.projs.GetProject(ctx, projectID)
+	if err != nil {
+		return "", NewError(CodeNotFound, "project not found")
+	}
+	if p.Kind != projectKindRepo && p.Kind != projectKindDir {
+		return "", NewError(CodeInternal, "unknown project kind: "+p.Kind)
+	}
+	return p.Kind, nil
+}
+
 func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	projectID := r.PathValue("id")
+	// fail-closed：项目查询失败/未知 kind MUST 返回错误，不得输出空 project_kind（D6）。
+	kind, ae := s.requireProjectKind(r.Context(), projectID)
+	if ae != nil {
+		writeApiError(w, ae)
+		return
+	}
 	tasks, err := s.tasks.List(r.Context(), projectID)
 	if err != nil {
 		writeApiError(w, mapTaskErr(err))
 		return
 	}
+	// 复用一次项目详情填充 project_kind，避免 N+1（D6）。
 	out := make([]taskRowDTO, 0, len(tasks))
 	for _, t := range tasks {
-		dto := toTaskDTO(t)
+		dto := toTaskDTO(t, kind)
 		dto.AgentStatus = s.tasks.AgentStatus(r.Context(), t.ID)
 		out = append(out, dto)
 	}
@@ -153,14 +198,21 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeApiError(w, ae)
 		return
 	}
-	t, err := s.tasks.Create(r.Context(), projectID, req.Name)
+	// fail-closed：在调用 TaskBackend.Create 副作用前取得并校验项目 kind（D6）。
+	// 查询失败/未知 kind → 不创建，返回明确错误（not_found/internal）。
+	kind, ae := s.requireProjectKind(r.Context(), projectID)
+	if ae != nil {
+		writeApiError(w, ae)
+		return
+	}
+	t, err := s.tasks.Create(r.Context(), projectID, req.Name, strings.TrimSpace(req.BaseRef))
 	if err != nil {
 		writeApiError(w, mapTaskErr(err))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(toTaskDTO(t))
+	_ = json.NewEncoder(w).Encode(toTaskDTO(t, kind))
 }
 
 func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
@@ -170,8 +222,14 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 		writeApiError(w, mapTaskErr(err))
 		return
 	}
+	// fail-closed：项目查询失败/未知 kind MUST 返回错误，不得输出空 project_kind（D6）。
+	kind, ae := s.requireProjectKind(r.Context(), t.ProjectID)
+	if ae != nil {
+		writeApiError(w, ae)
+		return
+	}
 	sessions, _ := s.tasks.ListTaskSessions(r.Context(), taskID)
-	dto := toTaskDTO(t)
+	dto := toTaskDTO(t, kind)
 	dto.Sessions = toSessionDTOs(sessions)
 	// 2.8：active 时经该任务 serve 实时查询 agentStatus；非 active/查询失败降级为空串。
 	dto.AgentStatus = s.tasks.AgentStatus(r.Context(), taskID)
@@ -237,14 +295,28 @@ func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
 // handleRerunInit POST /api/v1/tasks/{id}/rerun-init（design.md §8）。
 // 独立 handler（非 handleTaskAction——既有 helper 返回 204）；成功 200 + 任务 DTO。
 // task.OpError 映射走 mapTaskErr（invalid_state → 422、conflict → 409）。
+//
+// fail-closed（D6）：RerunInit 会在 claim/执行脚本产生副作用；project_kind MUST 在副作用前
+// 取得。预取（Get + requireProjectKind）失败 MUST NOT 调用 RerunInit，直接返回错误
+// （not_found/internal），避免"脚本已跑但 API 500"的部分成功窗口。
 func (s *Server) handleRerunInit(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
+	existing, gerr := s.tasks.Get(r.Context(), taskID)
+	if gerr != nil {
+		writeApiError(w, mapTaskErr(gerr))
+		return
+	}
+	kind, ae := s.requireProjectKind(r.Context(), existing.ProjectID)
+	if ae != nil {
+		writeApiError(w, ae)
+		return
+	}
 	row, err := s.tasks.RerunInit(r.Context(), taskID)
 	if err != nil {
 		writeApiError(w, mapTaskErr(err))
 		return
 	}
-	dto := toTaskDTO(row)
+	dto := toTaskDTO(row, kind)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(dto)
@@ -313,6 +385,8 @@ func (s *Server) handleCloseTerminal(w http.ResponseWriter, r *http.Request) {
 }
 
 // taskRowDTO 任务详情 DTO（design.md §21 GET /tasks/:id）。
+// project_kind ∈ repo | dir（add-plain-dir-project D6），由 handler 从项目详情填充；
+// projs 未注入时为空串（API 层降级，不阻塞详情返回）。
 type taskRowDTO struct {
 	ID           string          `json:"id"`
 	ProjectID    string          `json:"project_id"`
@@ -328,6 +402,7 @@ type taskRowDTO struct {
 	UpdatedAt    int64           `json:"updated_at"`
 	InitStatus   string          `json:"init_status"`
 	InitError    string          `json:"init_error,omitempty"`
+	ProjectKind  string          `json:"project_kind"`
 	Sessions     []sessionRowDTO `json:"sessions,omitempty"`
 	AgentStatus  string          `json:"agentStatus,omitempty"`
 }
@@ -351,10 +426,11 @@ type activeSessionDTO struct {
 	AgentStatus  string `json:"agentStatus,omitempty"`
 }
 
-func toTaskDTO(t task.TaskRow) taskRowDTO {
+func toTaskDTO(t task.TaskRow, projectKind string) taskRowDTO {
 	dto := taskRowDTO{
 		ID: t.ID, ProjectID: t.ProjectID, Name: t.Name, Branch: t.Branch, Status: t.Status,
 		WorktreePath: t.WorktreePath, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
+		ProjectKind: projectKind,
 	}
 	if t.LastPort.Valid {
 		dto.LastPort = int(t.LastPort.Int64)

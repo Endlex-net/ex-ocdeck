@@ -39,7 +39,13 @@ func newMockStore() *mockStore {
 	return &mockStore{projects: map[string]ProjectRow{}, tasks: map[string]TaskRow{}, sessions: map[string][]SessionRow{}}
 }
 
-func (s *mockStore) seedProject(p ProjectRow) { s.projects[p.ID] = p }
+func (s *mockStore) seedProject(p ProjectRow) {
+	// add-plain-dir-project D8/3.5：缺省回填 kind=repo，避免零值 unknown 触发 fail-closed。
+	if p.Kind == "" {
+		p.Kind = ProjectKindRepo
+	}
+	s.projects[p.ID] = p
+}
 
 // mutTask 取出任务、修改、放回（Go map 值不可直接赋字段）。
 func (s *mockStore) mutTask(id string, fn func(*TaskRow)) {
@@ -424,6 +430,149 @@ func (s *mockStore) AlignSessions(ctx context.Context, taskID string, sessions [
 	return nil
 }
 
+// --- session 归属隔离 mock（add-plain-dir-project D8） ---
+
+// ClaimTaskSession 镜像 store.ClaimTaskSession：仅当 sessionID 未被他任务拥有时插入/更新本任务行。
+func (s *mockStore) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (bool, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 查是否被他任务拥有。
+	for other, list := range s.sessions {
+		if other == taskID {
+			continue
+		}
+		for _, e := range list {
+			if e.SessionID == sessionID {
+				return false, other, nil
+			}
+		}
+	}
+	// 无冲突：upsert 本任务行。
+	list := s.sessions[taskID]
+	for i, e := range list {
+		if e.SessionID == sessionID {
+			if lastSeen > e.LastSeenAt {
+				list[i].LastSeenAt = lastSeen
+			}
+			list[i].ParentID = parentID
+			s.sessions[taskID] = list
+			return true, "", nil
+		}
+	}
+	s.sessions[taskID] = append(list, SessionRow{
+		TaskID: taskID, SessionID: sessionID, SessionCreatedAt: createdAt,
+		FirstSeenAt: firstSeen, LastSeenAt: lastSeen, ParentID: parentID,
+	})
+	return true, "", nil
+}
+
+// TouchOwnedTaskSession 镜像 store.TouchOwnedTaskSession：条件 UPDATE 本任务已归属行。
+func (s *mockStore) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	list := s.sessions[taskID]
+	for i, e := range list {
+		if e.SessionID == sessionID {
+			if lastSeenAt > e.LastSeenAt {
+				list[i].LastSeenAt = lastSeenAt
+			}
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// AlignTaskSessions 镜像 store.AlignTaskSessions：按 mode 对齐，repo 逐个 claim（冲突上报），
+// ownedOnly 仅刷新 listed∩owned；complete 删 owned 缺席行；noticeFn 事务内读写 notice（mock 不维护 notice，noop）。
+func (s *mockStore) AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, noticeFn func(sql.NullString) sql.NullString) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if mode != AlignModeRepo && mode != AlignModeOwnedOnly {
+		return nil, fmt.Errorf("mock: unknown AlignMode %d", mode)
+	}
+	// owned 集合 O。
+	ownedSet := map[string]bool{}
+	for _, e := range s.sessions[taskID] {
+		ownedSet[e.SessionID] = true
+	}
+	var conflicts []string
+	switch mode {
+	case AlignModeRepo:
+		for _, ob := range listed {
+			// 查是否被他任务拥有。
+			var owner string
+			for other, list := range s.sessions {
+				if other == taskID {
+					continue
+				}
+				for _, e := range list {
+					if e.SessionID == ob.SessionID {
+						owner = other
+						break
+					}
+				}
+				if owner != "" {
+					break
+				}
+			}
+			if owner != "" {
+				conflicts = append(conflicts, ob.SessionID)
+				continue
+			}
+			// upsert 本任务行。
+			list := s.sessions[taskID]
+			found := false
+			for i, e := range list {
+				if e.SessionID == ob.SessionID {
+					if ob.UpdatedAt > e.LastSeenAt {
+						list[i].LastSeenAt = ob.UpdatedAt
+					}
+					list[i].ParentID = ob.ParentID
+					found = true
+					break
+				}
+			}
+			if !found {
+				s.sessions[taskID] = append(list, SessionRow{
+					TaskID: taskID, SessionID: ob.SessionID, SessionCreatedAt: ob.CreatedAt,
+					FirstSeenAt: nowUnixI(), LastSeenAt: ob.UpdatedAt, ParentID: ob.ParentID,
+				})
+			}
+		}
+	case AlignModeOwnedOnly:
+		for _, ob := range listed {
+			if !ownedSet[ob.SessionID] {
+				continue
+			}
+			list := s.sessions[taskID]
+			for i, e := range list {
+				if e.SessionID == ob.SessionID {
+					if ob.UpdatedAt > e.LastSeenAt {
+						list[i].LastSeenAt = ob.UpdatedAt
+					}
+					break
+				}
+			}
+		}
+	}
+	if complete {
+		keep := map[string]bool{}
+		for _, ob := range listed {
+			keep[ob.SessionID] = true
+		}
+		list := s.sessions[taskID]
+		out := list[:0]
+		for _, e := range list {
+			if keep[e.SessionID] {
+				out = append(out, e)
+			}
+		}
+		s.sessions[taskID] = out
+	}
+	// noticeFn 在 mock 下不维护 notice 列，noop（测试需断言 notice 经专门路径覆盖）。
+	return conflicts, nil
+}
+
 // --- mock process backend ---
 
 type mockProc struct {
@@ -620,6 +769,16 @@ func (w *mockWorktree) BranchExists(ctx context.Context, repoPath, branch string
 
 func (w *mockWorktree) ValidateBranchName(ctx context.Context, repoPath, branch string) error {
 	return nil
+}
+
+// ResolveBaseRef 满足 WorktreeBackend 新增端口（add-plain-dir-project D10）。
+// 默认返回 `refs/heads/<shortName>`，供 repo 创建路径默认/存在分支测试使用；
+// 具体分支解析行为在 crud 测试的独立 mock 中覆盖。
+func (w *mockWorktree) ResolveBaseRef(ctx context.Context, repoPath, shortName string) (string, error) {
+	if shortName == "" {
+		return "", fmt.Errorf("empty base_ref short name")
+	}
+	return "refs/heads/" + shortName, nil
 }
 
 func (w *mockWorktree) VerifyWorktreeProduct(ctx context.Context, repoPath, wtPath, branch string) error {

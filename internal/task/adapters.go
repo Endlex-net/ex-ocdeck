@@ -24,13 +24,13 @@ func (a *StoreAdapter) GetProject(ctx context.Context, id string) (ProjectRow, e
 	if err != nil {
 		return ProjectRow{}, err
 	}
-	return ProjectRow{ID: p.ID, Name: p.Name, Path: p.Path, DefaultBranch: p.DefaultBranch, CreatedAt: p.CreatedAt}, nil
+	return ProjectRow{ID: p.ID, Name: p.Name, Path: p.Path, DefaultBranch: p.DefaultBranch, Kind: p.Kind, CreatedAt: p.CreatedAt}, nil
 }
 
 func (a *StoreAdapter) CreateTask(ctx context.Context, t TaskRow) error {
 	return a.db.CreateTask(ctx, store.TaskRow{
 		ID: t.ID, ProjectID: t.ProjectID, Name: t.Name, Branch: t.Branch,
-		Status: t.Status, WorktreePath: t.WorktreePath,
+		Status: t.Status, WorktreePath: t.WorktreePath, BaseRef: t.BaseRef,
 	})
 }
 
@@ -236,6 +236,43 @@ func (a *StoreAdapter) AlignSessions(ctx context.Context, taskID string, session
 	return a.db.AlignSessions(ctx, taskID, ss, complete, noticeFn)
 }
 
+// --- session 归属隔离（add-plain-dir-project D8：原子 claim / 对齐 / 条件刷新） ---
+
+// toStoreAlignMode 映射 task.AlignMode → store.AlignMode。
+func toStoreAlignMode(mode AlignMode) store.AlignMode {
+	switch mode {
+	case AlignModeRepo:
+		return store.AlignModeRepo
+	case AlignModeOwnedOnly:
+		return store.AlignModeOwnedOnly
+	default:
+		// 未知值由 store 层 AlignTaskSessions fail-closed 拒绝（返回错误）；此处映射为零值，
+		// store 层会拒绝零值（非 AlignModeRepo/OwnedOnly）。
+		return 0
+	}
+}
+
+// ClaimTaskSession 原子 claim（D8）：单事务仅当 sessionID 未被他任务拥有时插入/更新本任务行。
+func (a *StoreAdapter) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (bool, string, error) {
+	return a.db.ClaimTaskSession(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+}
+
+// TouchOwnedTaskSession 条件 UPDATE 仅本任务已归属行的 last_seen_at（D8）。
+func (a *StoreAdapter) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (bool, error) {
+	return a.db.TouchOwnedTaskSession(ctx, taskID, sessionID, lastSeenAt)
+}
+
+// AlignTaskSessions 单事务原子对齐（D8）：task 层 AlignMode/SessionObservation 映射到 store 层类型。
+func (a *StoreAdapter) AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, noticeFn func(sql.NullString) sql.NullString) ([]string, error) {
+	obs := make([]store.SessionObservation, 0, len(listed))
+	for _, s := range listed {
+		obs = append(obs, store.SessionObservation{
+			SessionID: s.SessionID, CreatedAt: s.CreatedAt, UpdatedAt: s.UpdatedAt, ParentID: s.ParentID,
+		})
+	}
+	return a.db.AlignTaskSessions(ctx, taskID, toStoreAlignMode(mode), obs, complete, noticeFn)
+}
+
 // --- CleanupDebtStore 适配（design.md §10：orphan tickets 跨重启持久化） ---
 
 // UpsertCleanupDebt 插入或按 session_name 原地替换未收敛 orphan tickets。
@@ -266,7 +303,7 @@ func toTaskRow(t store.TaskRow) TaskRow {
 		ID: t.ID, ProjectID: t.ProjectID, Name: t.Name, Branch: t.Branch, Status: t.Status,
 		WorktreePath: t.WorktreePath, LastPort: t.LastPort, LastError: t.LastError, Notice: t.Notice,
 		DeleteMode: t.DeleteMode, EnvSnapshot: t.EnvSnapshot, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
-		ArchivedAt: t.ArchivedAt, InitStatus: t.InitStatus, InitError: t.InitError,
+		ArchivedAt: t.ArchivedAt, InitStatus: t.InitStatus, InitError: t.InitError, BaseRef: t.BaseRef,
 	}
 }
 
@@ -298,6 +335,12 @@ func (a *WorktreeAdapter) BranchExists(ctx context.Context, repoPath, branch str
 // design.md §19）。委托 internal/git.ValidateBranchName，保持 worktree 包不引入新公开方法。
 func (a *WorktreeAdapter) ValidateBranchName(ctx context.Context, repoPath, branch string) error {
 	return git.ValidateBranchName(ctx, repoPath, branch)
+}
+
+// ResolveBaseRef 将 base_ref 短名解析为全限定 ref（add-plain-dir-project D10）。
+// 委托 internal/git.ResolveBaseRef；task 包不直接依赖 internal/git，经此端口解析。
+func (a *WorktreeAdapter) ResolveBaseRef(ctx context.Context, repoPath, shortName string) (string, error) {
+	return git.ResolveBaseRef(ctx, repoPath, shortName)
 }
 
 func (a *WorktreeAdapter) VerifyWorktreeProduct(ctx context.Context, repoPath, wtPath, branch string) error {

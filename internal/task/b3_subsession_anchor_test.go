@@ -165,7 +165,7 @@ func TestB3_AlignSessions_PersistsParentID(t *testing.T) {
 	}
 	m := newTestManager(t, tStore, newMockProc(), newMockWorktree(), oc)
 
-	if err := m.alignSessions(context.Background(), "t1", "/wt", oc); err != nil {
+	if err := m.alignSessions(context.Background(), "t1", "/wt", oc, AlignModeRepo); err != nil {
 		t.Fatalf("alignSessions: %v", err)
 	}
 	all, _ := tStore.ListTaskSessions(context.Background(), "t1")

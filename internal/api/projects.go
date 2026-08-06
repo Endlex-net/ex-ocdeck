@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -26,16 +27,20 @@ func (s *Server) registerProjectRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/projects", s.handleCreateProject)
 	mux.HandleFunc("GET /api/v1/projects/{id}", s.handleGetProject)
 	mux.HandleFunc("DELETE /api/v1/projects/{id}", s.handleDeleteProject)
+	mux.HandleFunc("GET /api/v1/projects/{id}/branches", s.handleListProjectBranches)
+	mux.HandleFunc("POST /api/v1/projects/{id}/branches/refresh", s.handleRefreshProjectBranches)
 }
 
 // projectDTO 项目列表/创建响应 DTO。
 // task_count 与 tasks_by_status：项目列表与详情均返回（与前端 Project 类型对齐，
 // project-management spec 增强一致性）。列表经逐项目 CountProjectTasks 取概况。
+// kind ∈ repo | dir（add-plain-dir-project D1）。
 type projectDTO struct {
 	ID            string         `json:"id"`
 	Name          string         `json:"name"`
 	Path          string         `json:"path"`
 	DefaultBranch string         `json:"default_branch"`
+	Kind          string         `json:"kind"`
 	CreatedAt     int64          `json:"created_at"`
 	TaskCount     int            `json:"task_count"`
 	Tasks         map[string]int `json:"tasks_by_status"`
@@ -46,11 +51,18 @@ type projectDetailDTO struct {
 	projectDTO
 }
 
-// createProjectReq 注册请求体。
+// createProjectReq 注册请求体。kind 缺省为 repo（add-plain-dir-project D1）。
 type createProjectReq struct {
 	Name string `json:"name"`
 	Path string `json:"path"`
+	Kind string `json:"kind"`
 }
+
+// 有效项目类型（add-plain-dir-project D1）。
+const (
+	projectKindRepo = "repo"
+	projectKindDir  = "dir"
+)
 
 func (r createProjectReq) validate() *ApiError {
 	if strings.TrimSpace(r.Name) == "" {
@@ -58,6 +70,13 @@ func (r createProjectReq) validate() *ApiError {
 	}
 	if strings.TrimSpace(r.Path) == "" {
 		return NewError(CodeInvalidInput, "path is required")
+	}
+	if r.Kind == "" {
+		// 缺省 repo，校验阶段不赋值（赋值在 handler，保持 validate 纯校验）。
+		return nil
+	}
+	if r.Kind != projectKindRepo && r.Kind != projectKindDir {
+		return NewError(CodeInvalidInput, "kind must be repo or dir")
 	}
 	return nil
 }
@@ -89,7 +108,8 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCreateProject POST /api/v1/projects（design.md §21，spec：项目注册）。
-// 校验路径存在且为 git 仓库（含 .git 或 git rev-parse），探测默认分支，落库。
+// kind=repo：校验路径为 git 仓库、探测默认分支；kind=dir：仅校验路径存在且为目录，default_branch 落空串。
+// 非法 kind → 422；repo 校验失败不降级为 dir（MUST NOT 隐式推断，add-plain-dir-project D1）。
 func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	if s.projs == nil {
 		writeError(w, CodeInternal, "project store not configured")
@@ -104,10 +124,14 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		writeApiError(w, ae)
 		return
 	}
+	kind := req.Kind
+	if kind == "" {
+		kind = projectKindRepo
+	}
 	path := strings.TrimSpace(req.Path)
 
 	// path 绝对化 + EvalSymlinks 归一（B9）：避免相对路径漂移与 symlink 别名
-	// 导致同一仓库注册多次或唯一性判断失真。
+	// 导致同一仓库/目录注册多次或唯一性判断失真。
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		writeApiError(w, NewError(CodeInvalidInput, "cannot resolve absolute path: "+path))
@@ -115,27 +139,48 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	canonPath, err := filepath.EvalSymlinks(absPath)
 	if err != nil {
-		// 路径不存在（含 symlink 断链）按非仓库拒绝。
+		// 路径不存在（含 symlink 断链）按非法路径拒绝。
 		writeApiError(w, NewError(CodeInvalidInput, "path does not exist or is a broken symlink: "+path))
 		return
 	}
 	path = canonPath
 
-	// git 仓库校验（spec：含 .git 或 git rev-parse）。
-	isRepo, err := git.IsGitRepo(r.Context(), path)
-	if err != nil {
-		writeError(w, CodeGitError, "git repo check failed")
-		return
-	}
-	if !isRepo {
-		writeApiError(w, NewError(CodeInvalidInput, "path is not a git repository: "+path))
-		return
-	}
-
-	// 默认分支探测。
-	branch, err := git.ResolveDefaultBranch(r.Context(), path)
-	if err != nil {
-		writeError(w, CodeGitError, "detect default branch failed")
+	// 按 kind 分支校验。未知 kind 已在 validate 拒绝；此处 fail-closed，不默认落入某分支。
+	var branch string
+	switch kind {
+	case projectKindRepo:
+		// git 仓库校验（spec：含 .git 或 git rev-parse）。
+		isRepo, gerr := git.IsGitRepo(r.Context(), path)
+		if gerr != nil {
+			writeError(w, CodeGitError, "git repo check failed")
+			return
+		}
+		if !isRepo {
+			writeApiError(w, NewError(CodeInvalidInput, "path is not a git repository: "+path))
+			return
+		}
+		// 默认分支探测。
+		branch, err = git.ResolveDefaultBranch(r.Context(), path)
+		if err != nil {
+			writeError(w, CodeGitError, "detect default branch failed")
+			return
+		}
+	case projectKindDir:
+		// dir 项目仅校验路径存在且为目录（canonPath 已 EvalSymlinks 确认存在）。
+		info, serr := os.Stat(path)
+		if serr != nil {
+			writeApiError(w, NewError(CodeInvalidInput, "path is not accessible: "+path))
+			return
+		}
+		if !info.IsDir() {
+			writeApiError(w, NewError(CodeInvalidInput, "path is not a directory: "+path))
+			return
+		}
+		// dir 项目无默认分支。
+		branch = ""
+	default:
+		// fail-closed：未知 kind 不默认落入某分支（防御性，validate 已挡）。
+		writeApiError(w, NewError(CodeInvalidInput, "kind must be repo or dir"))
 		return
 	}
 
@@ -146,7 +191,7 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := newID()
-	if err := s.projs.CreateProject(r.Context(), id, strings.TrimSpace(req.Name), path, branch); err != nil {
+	if err := s.projs.CreateProject(r.Context(), id, strings.TrimSpace(req.Name), path, branch, kind); err != nil {
 		if isUniqueViolation(err) {
 			writeApiError(w, NewError(CodeConflict, "project already registered for path: "+path))
 			return
@@ -220,6 +265,89 @@ func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleListProjectBranches GET /api/v1/projects/{id}/branches（add-plain-dir-project D10）。
+// 只读返回仓库分支短名列表（本地在前、远端在后，排序去重、排除远端 symbolic HEAD）。
+// dir 项目 → 422（分支语义仅适用于 repo 项目）。不进 repo 写锁。
+func (s *Server) handleListProjectBranches(w http.ResponseWriter, r *http.Request) {
+	if s.projs == nil {
+		writeError(w, CodeInternal, "project store not configured")
+		return
+	}
+	id := r.PathValue("id")
+	p, err := s.projs.GetProject(r.Context(), id)
+	if err != nil {
+		writeApiError(w, NewError(CodeNotFound, "project not found"))
+		return
+	}
+	// fail-closed：未知 kind 不默认落入某分支。
+	switch p.Kind {
+	case projectKindRepo:
+		// repo：枚举分支。
+	case projectKindDir:
+		writeApiError(w, NewError(CodeInvalidInput, "project is not a git repository; branches not available"))
+		return
+	default:
+		// 未知持久化 kind（DB 损坏值）→ internal（D1：区别于用户请求非法 kind 的 invalid_input）。
+		writeApiError(w, NewError(CodeInternal, "unknown project kind: "+p.Kind))
+		return
+	}
+	branches, err := git.ListBranches(r.Context(), p.Path)
+	if err != nil {
+		writeError(w, CodeGitError, "list branches failed")
+		return
+	}
+	if branches == nil {
+		branches = []string{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(branches)
+}
+
+// handleRefreshProjectBranches POST /api/v1/projects/{id}/branches/refresh
+// （add-plain-dir-project D10：显式拉取最新远端分支后返回与 GET 同构的短名数组）。
+//
+// fetch 经 git.RefreshBranchesSingleflight：获取 canonical repo 写锁（与 worktree.Add/Remove、
+// GitPush 串行）→ fetch --all --prune --no-write-fetch-head → 同锁内 ListBranches。
+// 同 repo 并发 refresh 合并为单次 fetch，等待者共享结果；不同 repo 并行。
+//
+// fail-closed：fetch 失败/超时/取消 → git_error（透传 git stderr 风格），MUST NOT 返回 200 伪装最新；
+// dir 项目 → invalid_input；未知持久化 kind → internal（与 branches GET 一致）。
+func (s *Server) handleRefreshProjectBranches(w http.ResponseWriter, r *http.Request) {
+	if s.projs == nil {
+		writeError(w, CodeInternal, "project store not configured")
+		return
+	}
+	id := r.PathValue("id")
+	p, err := s.projs.GetProject(r.Context(), id)
+	if err != nil {
+		writeApiError(w, NewError(CodeNotFound, "project not found"))
+		return
+	}
+	// fail-closed：未知 kind 不默认落入某分支（与 GET 一致）。
+	switch p.Kind {
+	case projectKindRepo:
+		// repo：fetch + 枚举。
+	case projectKindDir:
+		writeApiError(w, NewError(CodeInvalidInput, "project is not a git repository; branches not available"))
+		return
+	default:
+		// 未知持久化 kind（DB 损坏值）→ internal（D1）。
+		writeApiError(w, NewError(CodeInternal, "unknown project kind: "+p.Kind))
+		return
+	}
+	branches, err := git.RefreshBranchesSingleflight(r.Context(), p.Path)
+	if err != nil {
+		// 透传 git stderr 风格（含 fetch: 前缀）；context 取消/超时也走 git_error，不伪装 200。
+		writeError(w, CodeGitError, err.Error())
+		return
+	}
+	if branches == nil {
+		branches = []string{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(branches)
+}
+
 // toProjectDTO 将 storeProjectRow 转为 projectDTO，附带任务概况。
 // counts.ByStatus 为空 map（无任务）时仍输出非 nil，保证前端字段稳定。
 func toProjectDTO(p storeProjectRow, counts storeTaskCounts) projectDTO {
@@ -232,6 +360,7 @@ func toProjectDTO(p storeProjectRow, counts storeTaskCounts) projectDTO {
 		Name:          p.Name,
 		Path:          p.Path,
 		DefaultBranch: p.DefaultBranch,
+		Kind:          p.Kind,
 		CreatedAt:     p.CreatedAt,
 		TaskCount:     counts.Total,
 		Tasks:         byStatus,

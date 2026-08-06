@@ -36,17 +36,21 @@ func New(db DBTX) *Queries {
 }
 
 // ProjectRow projects 表行映射。
+// Kind ∈ repo | dir（migration 0008，add-plain-dir-project D1）：repo 为 git 仓库，dir 为纯目录。
 type ProjectRow struct {
 	ID            string
 	Name          string
 	Path          string
 	DefaultBranch string
+	Kind          string
 	CreatedAt     int64
 }
 
 // TaskRow tasks 表行映射。env_snapshot 为激活时合并的 env JSON（design.md §2/§8）。
 // InitStatus/InitError 对应 migration 0007 新增列（design.md §2 项目生命周期配置）：
 // init_status ∈ none | pending | running | succeeded | failed；init_error 仅 failed 时非空。
+// BaseRef 对应 migration 0008 新增列（add-plain-dir-project D10）：repo 任务的基线分支全引用
+// （如 refs/heads/main），dir 项目任务为空串。
 type TaskRow struct {
 	ID           string
 	ProjectID    string
@@ -64,6 +68,7 @@ type TaskRow struct {
 	ArchivedAt   sql.NullInt64
 	InitStatus   string
 	InitError    sql.NullString
+	BaseRef      string
 }
 
 // LifecycleConfigRow project_lifecycle_configs 表行映射（design.md §2，migration 0007）。
@@ -104,36 +109,36 @@ type SessionRow struct {
 // nowUnix 返回当前 Unix 时间戳。
 func nowUnix() int64 { return time.Now().Unix() }
 
-// CreateProject 插入项目行。
-func (q *Queries) CreateProject(ctx context.Context, id, name, path, defaultBranch string) error {
+// CreateProject 插入项目行。kind ∈ repo | dir（migration 0008）。
+func (q *Queries) CreateProject(ctx context.Context, id, name, path, defaultBranch, kind string) error {
 	_, err := q.db.ExecContext(ctx,
-		`INSERT INTO projects (id, name, path, default_branch, created_at) VALUES (?, ?, ?, ?, ?)`,
-		id, name, path, defaultBranch, nowUnix())
+		`INSERT INTO projects (id, name, path, default_branch, kind, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		id, name, path, defaultBranch, kind, nowUnix())
 	return err
 }
 
 // GetProject 按 ID 查询项目。
 func (q *Queries) GetProject(ctx context.Context, id string) (ProjectRow, error) {
 	row := q.db.QueryRowContext(ctx,
-		`SELECT id, name, path, default_branch, created_at FROM projects WHERE id = ?`, id)
+		`SELECT id, name, path, default_branch, kind, created_at FROM projects WHERE id = ?`, id)
 	var p ProjectRow
-	err := row.Scan(&p.ID, &p.Name, &p.Path, &p.DefaultBranch, &p.CreatedAt)
+	err := row.Scan(&p.ID, &p.Name, &p.Path, &p.DefaultBranch, &p.Kind, &p.CreatedAt)
 	return p, err
 }
 
 // GetProjectByPath 按 path 查询项目（path 唯一）。
 func (q *Queries) GetProjectByPath(ctx context.Context, path string) (ProjectRow, error) {
 	row := q.db.QueryRowContext(ctx,
-		`SELECT id, name, path, default_branch, created_at FROM projects WHERE path = ?`, path)
+		`SELECT id, name, path, default_branch, kind, created_at FROM projects WHERE path = ?`, path)
 	var p ProjectRow
-	err := row.Scan(&p.ID, &p.Name, &p.Path, &p.DefaultBranch, &p.CreatedAt)
+	err := row.Scan(&p.ID, &p.Name, &p.Path, &p.DefaultBranch, &p.Kind, &p.CreatedAt)
 	return p, err
 }
 
 // ListProjects 返回全部项目。
 func (q *Queries) ListProjects(ctx context.Context) ([]ProjectRow, error) {
 	rows, err := q.db.QueryContext(ctx,
-		`SELECT id, name, path, default_branch, created_at FROM projects ORDER BY created_at ASC`)
+		`SELECT id, name, path, default_branch, kind, created_at FROM projects ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +146,7 @@ func (q *Queries) ListProjects(ctx context.Context) ([]ProjectRow, error) {
 	var out []ProjectRow
 	for rows.Next() {
 		var p ProjectRow
-		if err := rows.Scan(&p.ID, &p.Name, &p.Path, &p.DefaultBranch, &p.CreatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.Path, &p.DefaultBranch, &p.Kind, &p.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -316,20 +321,21 @@ func (q *Queries) DeleteGlobalEnvVar(ctx context.Context, key string) error {
 	return err
 }
 
-// CreateTask 插入任务行。
+// CreateTask 插入任务行。base_ref 为 repo 任务的基线分支全引用，dir 项目任务传空串
+// （migration 0008，add-plain-dir-project D10）。
 func (q *Queries) CreateTask(ctx context.Context, t TaskRow) error {
 	_, err := q.db.ExecContext(ctx,
-		`INSERT INTO tasks (id, project_id, name, branch, status, worktree_path, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.ProjectID, t.Name, t.Branch, t.Status, t.WorktreePath, nowUnix(), nowUnix())
+		`INSERT INTO tasks (id, project_id, name, branch, status, worktree_path, base_ref, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.ProjectID, t.Name, t.Branch, t.Status, t.WorktreePath, t.BaseRef, nowUnix(), nowUnix())
 	return err
 }
 
-// GetTask 按 ID 查询任务（含 env_snapshot、init_status/init_error）。
+// GetTask 按 ID 查询任务（含 env_snapshot、init_status/init_error、base_ref）。
 func (q *Queries) GetTask(ctx context.Context, id string) (TaskRow, error) {
 	row := q.db.QueryRowContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
-		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error
+		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref
 		 FROM tasks WHERE id = ?`, id)
 	return scanTaskRow(row)
 }
@@ -338,7 +344,7 @@ func (q *Queries) GetTask(ctx context.Context, id string) (TaskRow, error) {
 func (q *Queries) ListTasksByProject(ctx context.Context, projectID string) ([]TaskRow, error) {
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
-		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error
+		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref
 		 FROM tasks WHERE project_id = ? ORDER BY created_at ASC`, projectID)
 	if err != nil {
 		return nil, err
@@ -351,7 +357,7 @@ func (q *Queries) ListTasksByProject(ctx context.Context, projectID string) ([]T
 func (q *Queries) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
-		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error
+		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref
 		 FROM tasks ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
@@ -854,7 +860,7 @@ func scanTaskRow(row rowScanner) (TaskRow, error) {
 	var t TaskRow
 	err := row.Scan(&t.ID, &t.ProjectID, &t.Name, &t.Branch, &t.Status, &t.WorktreePath,
 		&t.LastPort, &t.LastError, &t.Notice, &t.DeleteMode, &t.EnvSnapshot,
-		&t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.InitStatus, &t.InitError)
+		&t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.InitStatus, &t.InitError, &t.BaseRef)
 	return t, err
 }
 
@@ -866,6 +872,204 @@ func scanTaskRows(rows *sql.Rows) ([]TaskRow, error) {
 			return nil, err
 		}
 		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// --- session 归属隔离（add-plain-dir-project D8：原子 claim / 对齐 / 条件刷新） ---
+
+// AlignMode store 层对齐模式（add-plain-dir-project D8：task 层 AlignMode 经 adapter 映射）。
+// 合法值仅两种，未知值 MUST 在任何写入前返回错误（fail-closed）。
+type AlignMode int
+
+const (
+	// AlignModeRepo 目录私有：listed 逐个原子 claim（未被他任务拥有才插入/更新），
+	// 冲突 ID 经 AlignTaskSessions 返回值上报；complete 时删 owned 缺席行。
+	AlignModeRepo AlignMode = iota + 1
+	// AlignModeOwnedOnly 目录可共享（dir）：仅对 listed∩owned 刷新 last_seen_at，
+	// 绝不 claim；complete 时仅删 owned 缺席行。
+	AlignModeOwnedOnly
+)
+
+// SessionObservation 持久化中立的会话观测（store 层；task 层经 adapter 转换）。
+// 仅含归属写回所需字段：SessionID/CreatedAt/UpdatedAt/ParentID。
+type SessionObservation struct {
+	SessionID string
+	CreatedAt int64
+	UpdatedAt int64
+	ParentID  string
+}
+
+// ClaimTaskSession 原子 claim 一个 session 至本任务（add-plain-dir-project D8）。
+// 单事务内"仅当该 sessionID 未被其他任务拥有时插入/更新本任务行；已被他任务拥有则
+// claimed=false + ownerTaskID"。不加跨任务唯一索引（避免对存量数据做迁移）。
+// SQLite 单写者语义下事务无竞态。
+//
+// 冲突判定：存在 task_id != 本任务 且 session_id == sessionID 的行即冲突（ownerTaskID 为他任务）。
+// 本任务已拥有（task_id == 本任务）→ claimed=true，刷新 last_seen_at/parent_id（幂等 upsert）。
+// 无任何归属 → 插入本任务行。
+//
+// created/firstSeen/lastSeen 与既有 UpsertTaskSession 语义一致。
+func (q *Queries) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (claimed bool, ownerTaskID string, err error) {
+	if _, isTx := q.db.(*sql.Tx); isTx {
+		return q.claimTaskSessionInTx(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+	}
+	var c bool
+	var owner string
+	txErr := withTxQueries(ctx, q.db, func(qtx *Queries) error {
+		var cerr error
+		c, owner, cerr = qtx.claimTaskSessionInTx(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+		return cerr
+	})
+	return c, owner, txErr
+}
+
+// claimTaskSessionInTx 在已绑定事务内执行 claim 逻辑，供事务与非事务路径复用。
+func (q *Queries) claimTaskSessionInTx(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (bool, string, error) {
+	// 先查是否被他任务拥有。
+	row := q.db.QueryRowContext(ctx,
+		`SELECT task_id FROM task_sessions WHERE session_id = ? AND task_id != ?`, sessionID, taskID)
+	var owner string
+	err := row.Scan(&owner)
+	if err == nil {
+		// 被他任务拥有 → 冲突，不写入。
+		return false, owner, nil
+	}
+	if err != sql.ErrNoRows {
+		return false, "", err
+	}
+	// 无冲突：upsert 本任务行（与 UpsertTaskSession 一致语义）。
+	_, err = q.db.ExecContext(ctx,
+		`INSERT INTO task_sessions (task_id, session_id, session_created_at, first_seen_at, last_seen_at, parent_id)
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(task_id, session_id) DO UPDATE SET
+		   last_seen_at = MAX(excluded.last_seen_at, task_sessions.last_seen_at),
+		   parent_id = excluded.parent_id`,
+		taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+	if err != nil {
+		return false, "", err
+	}
+	return true, "", nil
+}
+
+// TouchOwnedTaskSession 条件 UPDATE 仅本任务已归属行的 last_seen_at（add-plain-dir-project D8）。
+// 绝不插入；updated=false（未归属行）为正常路径，调用方记 debug 不报错。
+func (q *Queries) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (updated bool, err error) {
+	res, err := q.db.ExecContext(ctx,
+		`UPDATE task_sessions SET last_seen_at = MAX(?, last_seen_at)
+		 WHERE task_id = ? AND session_id = ?`,
+		lastSeenAt, taskID, sessionID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// AlignTaskSessions 单事务原子对齐（add-plain-dir-project D8）：
+//   - 读 owned 集合 O（本任务已有归属行）；
+//   - mode=repo：对 listed 逐个原子 claim（冲突 ID 经返回值上报）；
+//   - mode=ownedOnly：仅对 listed∩O 刷新 last_seen_at（绝不 claim）；
+//   - complete=true：仅删 O 中缺席行（不在 listed 内的 owned 行）；complete=false 不删；
+//   - noticeFn 事务内读写 notice（complete 时调用方用于清除 session_overflow notice）。
+//
+// 沿用 AlignSessions 的事务/noticeFn 模式。owned 快照与刷新/删除/notice 同事务，
+// 杜绝"事务外 O 快照期间新 claim 行被 complete 误删"。
+func (q *Queries) AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, noticeFn func(current sql.NullString) sql.NullString) (conflicts []string, err error) {
+	if _, isTx := q.db.(*sql.Tx); isTx {
+		return q.alignTaskSessionsInTx(ctx, taskID, mode, listed, complete, noticeFn)
+	}
+	var c []string
+	txErr := withTxQueries(ctx, q.db, func(qtx *Queries) error {
+		var cerr error
+		c, cerr = qtx.alignTaskSessionsInTx(ctx, taskID, mode, listed, complete, noticeFn)
+		return cerr
+	})
+	return c, txErr
+}
+
+// alignTaskSessionsInTx 在已绑定事务内执行对齐逻辑，供事务与非事务路径复用。
+func (q *Queries) alignTaskSessionsInTx(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, noticeFn func(sql.NullString) sql.NullString) ([]string, error) {
+	if mode != AlignModeRepo && mode != AlignModeOwnedOnly {
+		// fail-closed：未知 mode MUST 在任何写入前返回错误（D8）。
+		return nil, fmt.Errorf("store: unknown AlignMode %d", mode)
+	}
+	// 读 owned 集合 O（本任务已有归属行）。
+	owned, err := q.listOwnedSessions(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	ownedSet := make(map[string]bool, len(owned))
+	for _, sid := range owned {
+		ownedSet[sid] = true
+	}
+	var conflicts []string
+	switch mode {
+	case AlignModeRepo:
+		// listed 逐个原子 claim（冲突 ID 上报，不写入）。
+		for _, s := range listed {
+			claimed, _, cerr := q.claimTaskSessionInTx(ctx, taskID, s.SessionID, s.CreatedAt, nowUnix(), s.UpdatedAt, s.ParentID)
+			if cerr != nil {
+				return nil, cerr
+			}
+			if !claimed {
+				conflicts = append(conflicts, s.SessionID)
+			}
+		}
+	case AlignModeOwnedOnly:
+		// 仅对 listed∩O 刷新 last_seen_at，绝不 claim。
+		for _, s := range listed {
+			if !ownedSet[s.SessionID] {
+				continue
+			}
+			if _, uerr := q.TouchOwnedTaskSession(ctx, taskID, s.SessionID, s.UpdatedAt); uerr != nil {
+				return nil, uerr
+			}
+		}
+	}
+	if complete {
+		// 仅删 owned 缺席行（listed 内的 session_id 不删，本任务其他 owned 行删除）。
+		keep := make([]string, 0, len(listed))
+		for _, s := range listed {
+			keep = append(keep, s.SessionID)
+		}
+		if err := q.DeleteAbsentSessions(ctx, taskID, keep); err != nil {
+			return nil, err
+		}
+	}
+	if noticeFn != nil {
+		row := q.db.QueryRowContext(ctx, `SELECT notice FROM tasks WHERE id = ?`, taskID)
+		var current sql.NullString
+		if err := row.Scan(&current); err != nil {
+			return nil, err
+		}
+		next := noticeFn(current)
+		if _, err := q.db.ExecContext(ctx,
+			`UPDATE tasks SET notice = ?, updated_at = ? WHERE id = ?`, next, nowUnix(), taskID); err != nil {
+			return nil, err
+		}
+	}
+	return conflicts, nil
+}
+
+// listOwnedSessions 返回本任务已拥有的 session_id 列表（O 集合）。
+func (q *Queries) listOwnedSessions(ctx context.Context, taskID string) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx,
+		`SELECT session_id FROM task_sessions WHERE task_id = ?`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var sid string
+		if err := rows.Scan(&sid); err != nil {
+			return nil, err
+		}
+		out = append(out, sid)
 	}
 	return out, rows.Err()
 }

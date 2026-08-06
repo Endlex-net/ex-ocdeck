@@ -23,8 +23,10 @@ var allowedSubcommands = map[string]struct{}{
 	"symbolic-ref":     {},
 	"ls-files":         {},
 	"merge-base":       {},
-	"worktree":         {},
-	"branch":           {},
+	"worktree":          {},
+	"branch":            {},
+	"fetch":             {},
+	"remote":            {},
 }
 
 // execOutputLimit 是单次命令 stdout/stderr 的硬上限。
@@ -171,4 +173,60 @@ func RepoLock(repoPath string) *sync.Mutex {
 		repoLocks[key] = mu
 	}
 	return mu
+}
+
+// repoLockAcquiredHook 供测试观察锁获取/释放，断言临界区不重叠（add-plain-dir-project D10）。
+// 签名：hook(canonicalPath, acquired bool)。生产路径为 nil。
+var repoLockAcquiredHook func(canonicalPath string, acquired bool)
+
+// RepoLockAcquiredHookForTest 是 repoLockAcquiredHook 的导出别名，供跨包测试
+// （internal/worktree）注入观察 hook。仅测试使用，生产路径保持 nil。
+var RepoLockAcquiredHookForTest func(canonicalPath string, acquired bool)
+
+// canonicalLockKey 归一 repoPath 为 canonical path（与 RepoLock 同 key）。
+func canonicalLockKey(repoPath string) string {
+	if resolved, err := filepath.EvalSymlinks(repoPath); err == nil && resolved != "" {
+		return resolved
+	}
+	return repoPath
+}
+
+// AcquireRepoLock 获取 repoPath 的仓库级写锁，支持 context 取消（add-plain-dir-project D10
+// refresh fetch 等待锁时可取消）。repoPath 经 EvalSymlinks 归一为 canonical path，与 RepoLock
+// 共享同一锁池，故与 worktree.Add/Remove、GitPush(-u) 串行。
+//
+// 成功返回 unlock 函数（MUST 调用释放）；ctx 在等锁期间取消返回 ctx.Err()，未获取锁、不执行任何操作。
+// 锁内操作仍按既有语义串行（sync.Mutex，不可取消执行中操作）。
+func AcquireRepoLock(ctx context.Context, repoPath string) (unlock func(), err error) {
+	mu := RepoLock(repoPath)
+	// sync.Mutex 无 context 通道；用 done 信号 + goroutine 等待，ctx 先到则放弃。
+	done := make(chan struct{})
+	go func() {
+		mu.Lock()
+		close(done)
+	}()
+	select {
+	case <-done:
+		hook := repoLockAcquiredHook
+		if hook == nil {
+			hook = RepoLockAcquiredHookForTest
+		}
+		if hook != nil {
+			canon := canonicalLockKey(repoPath)
+			hook(canon, true)
+			return func() {
+				hook(canon, false)
+				mu.Unlock()
+			}, nil
+		}
+		return mu.Unlock, nil
+	case <-ctx.Done():
+		// ctx 先到：goroutine 仍会随后取锁（竞争极小），用额外 goroutine 在 done 后释放，
+		// 避免锁泄漏。此处不等待 goroutine，它会在取锁后经下方释放路径释放。
+		go func() {
+			<-done
+			mu.Unlock()
+		}()
+		return nil, ctx.Err()
+	}
 }

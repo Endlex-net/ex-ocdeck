@@ -7,7 +7,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+
+	"ocdeck/internal/git"
 )
 
 // helper: 在 t.TempDir() 创建真实 git 仓库，返回仓库路径。
@@ -312,5 +316,70 @@ func TestRemove_BranchAlreadyGoneIdempotent(t *testing.T) {
 	// 二次 Remove：worktree 与分支均已不存在，应幂等成功。
 	if err := mgr.Remove(ctx, wt, RemoveOpts{RepoPath: repo, Branch: "ocdeck/gone"}); err != nil {
 		t.Fatalf("second Remove should be idempotent (already gone): %v", err)
+	}
+}
+
+// TestFetchVsWorktreeAdd_CriticalSectionNonOverlap 验证 git.RefreshBranches（fetch + ListBranches）
+// 与 worktree.Add 使用同一 canonical repo 写锁，临界区不重叠（add-plain-dir-project D10）。
+// 用 git.repoLockAcquiredHook 观察锁获取/释放，断言并发期间同时持锁数永不超过 1。
+func TestFetchVsWorktreeAdd_CriticalSectionNonOverlap(t *testing.T) {
+	repo := newTestRepo(t)
+	// 建一个 bare remote 供 RefreshBranches fetch。
+	remote := t.TempDir()
+	runGit(t, remote, "init", "--bare", "-q")
+	runGit(t, repo, "remote", "add", "origin", remote)
+	runGit(t, repo, "push", "-q", "origin", "main")
+
+	// 安装锁观察 hook：统计并发持锁数（应永不超过 1）。
+	var active int32
+	var maxOverlap int32
+	origHook := git.RepoLockAcquiredHookForTest
+	git.RepoLockAcquiredHookForTest = func(canonPath string, acquired bool) {
+		if acquired {
+			cur := atomic.AddInt32(&active, 1)
+			for {
+				m := atomic.LoadInt32(&maxOverlap)
+				if cur <= m || atomic.CompareAndSwapInt32(&maxOverlap, m, cur) {
+					break
+				}
+			}
+		} else {
+			atomic.AddInt32(&active, -1)
+		}
+	}
+	defer func() { git.RepoLockAcquiredHookForTest = origHook }()
+
+	mgr := New(t.TempDir())
+	ctx := context.Background()
+	const n = 4
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start
+			if idx%2 == 0 {
+				// 并发 RefreshBranches（fetch+枚举，持锁）。
+				_, errs[idx] = git.RefreshBranches(ctx, repo)
+			} else {
+				// 并发 worktree.Add（持锁）。
+				wt := filepath.Join(mgr.dataDir, "worktrees", "p1", fmt.Sprintf("t%d", idx))
+				errs[idx] = mgr.Add(ctx, repo, wt, fmt.Sprintf("ocdeck/t%d", idx), "main")
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	if maxOverlap > 1 {
+		t.Errorf("max concurrent repo-lock holders = %d, want <= 1 (critical section MUST not overlap)", maxOverlap)
+	}
+	// 错误检查（Add 可能因分支冲突失败，但 RefreshBranches 应成功；核心是锁串行不重叠）。
+	for i, e := range errs {
+		if e != nil && i%2 == 0 { // RefreshBranches 不应失败
+			t.Errorf("RefreshBranches %d: %v", i, e)
+		}
 	}
 }
