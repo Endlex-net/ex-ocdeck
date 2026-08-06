@@ -14,19 +14,23 @@ interface RerunInitButtonProps {
   task: Task;
   onDone: () => void;
   onError?: (msg: string) => void;
+  /** 窄屏工作台 header：渲染为图标按钮，默认 false 保持桌面样式 */
+  compact?: boolean;
 }
 
 /**
  * Re-run init 按钮：仅在 canRerunInit 满足时渲染（archived+failed 不出现必然 422 的按钮）。
  * 成功返回最新任务 DTO（异步执行已登记，非同步完成），成功后不自动激活。
  */
-export function RerunInitButton({ task, onDone, onError }: RerunInitButtonProps) {
+export function RerunInitButton({ task, onDone, onError, compact = false }: RerunInitButtonProps) {
   const [busy, setBusy] = useState(false);
   if (!canRerunInit(task)) return null;
   return (
     <button
       className="btn btn-small"
       disabled={busy}
+      title={compact ? '重跑初始化' : undefined}
+      aria-label={compact ? '重跑初始化' : undefined}
       onClick={(e) => {
         e.stopPropagation();
         if (busy) return;
@@ -50,7 +54,7 @@ export function RerunInitButton({ task, onDone, onError }: RerunInitButtonProps)
         })();
       }}
     >
-      {busy ? '…' : 'Re-run init'}
+      {busy ? '…' : compact ? '⟳' : 'Re-run init'}
     </button>
   );
 }

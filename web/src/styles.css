@@ -27,6 +27,8 @@ html,
 body,
 #root {
   height: 100%;
+  height: 100vh; /* fallback 在前：不支持 dvh 的浏览器停在 vh */
+  height: 100dvh; /* dvh：iOS Safari 地址栏伸缩时跟随可视视口；不支持的浏览器忽略本声明 */
   margin: 0;
 }
 
@@ -353,8 +355,15 @@ body {
 
 .app-shell {
   height: 100%;
+  height: 100vh; /* fallback 在前：不支持 dvh 的浏览器停在 vh */
+  height: 100dvh; /* dvh：iOS Safari 地址栏伸缩时跟随可视视口 */
   display: flex;
   flex-direction: column;
+  /* 安全区：env() 不支持时为 0，优雅降级 */
+  padding-top: env(safe-area-inset-top);
+  padding-right: env(safe-area-inset-right);
+  padding-bottom: env(safe-area-inset-bottom);
+  padding-left: env(safe-area-inset-left);
 }
 
 .app-content {
@@ -1471,4 +1480,175 @@ select.input {
 .terminal-overlay-actions {
   display: inline-flex;
   gap: 8px;
+}
+
+/* ---------- 小屏松绑（移动端/iPad 适配 L0） ----------
+   作用域 MUST 限定 .workbench：.input / .modal-wide / .git-side 是全局 class，
+   被 AIConfig / Projects / TokenGate 等管理页复用，全局覆盖属于越界。
+   仅在 ≤1024px 媒体查询内生效，桌面端（≥1025px）零回归。 */
+@media (max-width: 1024px) {
+  .workbench .input {
+    min-width: 0;
+  }
+
+  .workbench .modal-wide {
+    width: auto;
+    max-width: calc(100vw - 32px);
+  }
+
+  .workbench .git-side {
+    width: 100%;
+    flex-shrink: 1;
+  }
+}
+
+/* ---------- 工作台窄屏布局（移动端/iPad 适配 L1，design D3） ----------
+   全部限定 .workbench 作用域 + ≤1024px 媒体查询，桌面端（≥1025px）零回归。
+   结构性切换（溢出菜单渲染）由 TaskWorkbenchPage 的 useMediaQuery 驱动，
+   此处只做样式收缩，断点与 JS 侧一致（max-width: 1024px）。 */
+@media (max-width: 1024px) {
+  /* header 收窄：保留返回按钮 + 标题（截断）；分支 meta 让位（Git tab 内可见）；
+     badge 保留但缩小 */
+  .workbench .page-header {
+    gap: 6px;
+    padding: 6px 8px;
+  }
+
+  .workbench .page-title {
+    min-width: 0;
+    flex-shrink: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .workbench .page-header .header-meta {
+    display: none;
+  }
+
+  .workbench .page-header .badge {
+    font-size: 9px;
+    padding: 1px 5px;
+  }
+
+  /* 「⋯」溢出菜单（仅窄屏由 JS 渲染；样式同断点守护） */
+  .workbench .header-overflow {
+    position: relative;
+    flex-shrink: 0;
+  }
+
+  .workbench .overflow-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+  }
+
+  .workbench .overflow-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 41;
+    min-width: 148px;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-panel);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    padding: 4px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  }
+
+  .workbench .overflow-item {
+    background: none;
+    border: none;
+    border-radius: 4px;
+    color: var(--text);
+    font-size: 12px;
+    text-align: left;
+    padding: 9px 10px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .workbench .overflow-item:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
+
+  .workbench .overflow-item:disabled {
+    color: var(--text-dim);
+    cursor: default;
+  }
+
+  .workbench .overflow-item-danger {
+    color: var(--red);
+  }
+
+  /* tabstrip：横向滚动，不换行不裁剪 */
+  .workbench .tabstrip {
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .workbench .tabstrip::-webkit-scrollbar {
+    display: none;
+  }
+
+  .workbench .tabstrip .tab,
+  .workbench .tabstrip .tab-sep {
+    flex-shrink: 0;
+  }
+
+  /* Git 面板：侧栏改为纵向区块堆叠（L0 已松绑宽度，此处完成布局堆叠） */
+  .workbench .git-panel {
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  .workbench .git-side {
+    flex-shrink: 0;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .workbench .git-files {
+    flex: none;
+    max-height: 40vh;
+    overflow-y: auto;
+  }
+
+  .workbench .git-diff {
+    flex: none;
+    overflow: visible;
+  }
+
+  /* 设置 Tab：边距收窄；EnvEditor 表单最小可用（可换行，不横向溢出） */
+  .workbench .settings-pane {
+    padding: 12px 12px 48px;
+  }
+
+  .workbench .env-add {
+    flex-wrap: wrap;
+  }
+}
+
+/* ---------- phone（≤767px，design D1 断点）header 进一步收窄 ----------
+   三 badge + 图标操作同时出现时单行放不下：允许 header 折行，
+   操作组整体右对齐落到第二行，标题在首行截断保留。 */
+@media (max-width: 767px) {
+  .workbench .page-header {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+
+  .workbench .page-header .header-spacer {
+    display: none;
+  }
+
+  .workbench .page-title {
+    flex: 1 1 auto;
+  }
+
+  .workbench .page-header .task-actions {
+    margin-left: auto;
+  }
 }

@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { navigate } from '../router';
-import { usePoll } from '../hooks';
+import { usePoll, useMediaQuery } from '../hooks';
 import { isTransitional, initActivateBlockReason, parseNotice, type Task } from '../types';
 import { StatusBadge } from '../components/StatusBadge';
 import { TaskActions } from '../components/TaskActions';
@@ -39,6 +39,29 @@ export function TaskWorkbenchPage({
   const [logView, setLogView] = useState<'init' | 'pre-delete' | null>(null);
   // 功能面板首次访问后才挂载，挂载后常驻以保留面板内部状态
   const [visited, setVisited] = useState<Set<string>>(new Set([TUI_TAB]));
+  // 窄屏（≤1024px）结构性切换：header 主操作图标化 + 次级操作收「⋯」溢出菜单（design D3）
+  const isNarrow = useMediaQuery('(max-width: 1024px)');
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuTriggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // 视口从窄屏切回桌面（再切回）时复位菜单，避免 menuOpen 残留导致菜单复现
+  useEffect(() => {
+    if (!isNarrow) setMenuOpen(false);
+  }, [isNarrow]);
+
+  // disclosure 模式：打开后焦点进入菜单内首个可用项
+  useEffect(() => {
+    if (menuOpen) {
+      menuRef.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
+    }
+  }, [menuOpen]);
+
+  // 关闭溢出菜单；键盘取消（Escape）/失焦兜底后焦点恢复触发器
+  const closeMenu = (restoreFocus: boolean) => {
+    setMenuOpen(false);
+    if (restoreFocus) menuTriggerRef.current?.focus();
+  };
 
   const switchTab = (t: string) => {
     setTab(t);
@@ -136,9 +159,9 @@ export function TaskWorkbenchPage({
     status === 'deletion_failed' && (task?.last_error ?? '').startsWith('pre-delete:');
 
   return (
-    <div className="workbench">
+    <div className={`workbench${isNarrow ? ' workbench-narrow' : ''}`}>
       <header className="page-header">
-        {/* 来源感知返回：从活跃列表进入则指回活跃列表，否则回到任务列表 */}
+        {/* 来源感知返回：从活跃列表进入则指回活跃列表，否则回到任务列表（窄屏同样保留双变体） */}
         {fromActive ? (
           <button className="btn btn-small btn-ghost" onClick={() => navigate('/active')}>
             ← 活跃会话
@@ -155,7 +178,7 @@ export function TaskWorkbenchPage({
         {task?.branch && !isDir && <span className="header-meta mono">⎇ {task.branch}</span>}
         {task && <StatusBadge status={task.status} />}
         {task && <InitStatusBadge task={task} />}
-        {task?.init_status === 'failed' && (
+        {task?.init_status === 'failed' && !isNarrow && (
           <button
             className="btn btn-small btn-ghost"
             title={task.init_error || 'init 失败'}
@@ -166,8 +189,8 @@ export function TaskWorkbenchPage({
         )}
         {task && <AgentStatusBadge agentStatus={task.agentStatus} />}
         <span className="header-spacer" />
-        {error && <span className="header-error">{error}</span>}
-        {task && (
+        {error && !isNarrow && <span className="header-error">{error}</span>}
+        {task && !isNarrow && (
           <>
             <TaskActions task={task} onDone={() => void load()} onError={setError} />
             <button
@@ -179,7 +202,83 @@ export function TaskWorkbenchPage({
             </button>
           </>
         )}
+        {/* 窄屏（design D3）：主操作图标化保留在 header，次级操作（init 日志/删除）收「⋯」溢出菜单。
+            普通 disclosure 模式（非 ARIA menu）：打开聚焦首个可用项、Escape 关闭并恢复焦点、
+            焦点离开菜单即关闭——菜单仅 2 项，disclosure 更轻量且满足可访问性 */}
+        {task && isNarrow && (
+          <>
+            <TaskActions task={task} onDone={() => void load()} onError={setError} compact />
+            <span
+              className="header-overflow"
+              onBlur={(e) => {
+                // React onBlur 冒泡：焦点离开整个溢出区（触发器+菜单）即关闭，避免菜单悬空开着。
+                // 鼠标点击项时 relatedTarget 为被点按钮（在区内），不误关。
+                const next = e.relatedTarget as Node | null;
+                if (!e.currentTarget.contains(next)) closeMenu(false);
+              }}
+            >
+              <button
+                ref={menuTriggerRef}
+                className="btn btn-small btn-ghost"
+                aria-label="更多操作"
+                aria-expanded={menuOpen}
+                aria-controls="workbench-overflow-menu"
+                onClick={() => setMenuOpen((o) => !o)}
+                onKeyDown={(e) => {
+                  // 菜单开着但焦点仍在触发器（如菜单项全 disabled 未移焦）时 Escape 也可关闭
+                  if (e.key === 'Escape' && menuOpen) {
+                    e.stopPropagation();
+                    closeMenu(false);
+                  }
+                }}
+              >
+                ⋯
+              </button>
+              {menuOpen && (
+                <>
+                  <div className="overflow-backdrop" onClick={() => closeMenu(true)} />
+                  <div
+                    ref={menuRef}
+                    id="workbench-overflow-menu"
+                    className="overflow-menu"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') {
+                        e.stopPropagation();
+                        closeMenu(true);
+                      }
+                    }}
+                  >
+                    {task.init_status === 'failed' && (
+                      <button
+                        className="overflow-item"
+                        onClick={() => {
+                          setMenuOpen(false);
+                          setLogView('init');
+                        }}
+                      >
+                        查看 init 日志
+                      </button>
+                    )}
+                    <button
+                      className="overflow-item overflow-item-danger"
+                      disabled={isTransitional(task.status)}
+                      onClick={() => {
+                        setMenuOpen(false);
+                        setDeleting(true);
+                      }}
+                    >
+                      删除任务
+                    </button>
+                  </div>
+                </>
+              )}
+            </span>
+          </>
+        )}
       </header>
+
+      {/* 窄屏：操作错误从 header 移出为整宽提示条，避免挤占标题/操作空间 */}
+      {isNarrow && error && <div className="alert-bar alert-error mono">{error}</div>}
 
       {task?.last_error && (
         <div className="alert-bar alert-error mono" title={task.last_error}>

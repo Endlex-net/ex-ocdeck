@@ -13,6 +13,15 @@ const ACTION_LABEL: Record<Action, string> = {
   retry: '重试',
 };
 
+/** 窄屏 header 图标化（design D3）：glyph 只用于 compact，aria/title 仍给完整中文标签 */
+const ACTION_ICON: Record<Action, string> = {
+  activate: '▶',
+  suspend: '⏸',
+  archive: '▼',
+  restore: '▲',
+  retry: '⟳',
+};
+
 /** 按状态机给出可用操作（非法操作服务端会 409，前端尽量前置隐藏）。 */
 export function actionsFor(status: string): Action[] {
   switch (status) {
@@ -34,9 +43,11 @@ interface TaskActionsProps {
   task: Task;
   onDone: () => void;
   onError?: (msg: string) => void;
+  /** 窄屏工作台 header：按钮渲染为图标（design D3 主操作图标化），默认 false 保持桌面样式 */
+  compact?: boolean;
 }
 
-export function TaskActions({ task, onDone, onError }: TaskActionsProps) {
+export function TaskActions({ task, onDone, onError, compact = false }: TaskActionsProps) {
   const [pending, setPending] = useState<Action | null>(null);
   // deletion_failed 的 retry 被 409（dirty 未确认）拒绝后弹出确认对话框
   const [dirtyPrompt, setDirtyPrompt] = useState(false);
@@ -104,17 +115,24 @@ export function TaskActions({ task, onDone, onError }: TaskActionsProps) {
           key={a}
           className="btn btn-small"
           disabled={disabled || (a === 'activate' && activateBlock !== '')}
-          title={a === 'activate' && activateBlock ? activateBlock : undefined}
+          title={
+            a === 'activate' && activateBlock
+              ? activateBlock
+              : compact
+                ? ACTION_LABEL[a]
+                : undefined
+          }
+          aria-label={compact ? ACTION_LABEL[a] : undefined}
           onClick={(e) => {
             e.stopPropagation();
             void run(a);
           }}
         >
-          {pending === a ? '…' : ACTION_LABEL[a]}
+          {pending === a ? '…' : compact ? ACTION_ICON[a] : ACTION_LABEL[a]}
         </button>
       ))}
 
-      <RerunInitButton task={task} onDone={onDone} onError={onError} />
+      <RerunInitButton task={task} onDone={onDone} onError={onError} compact={compact} />
 
       {dirtyPrompt && (
         <div
