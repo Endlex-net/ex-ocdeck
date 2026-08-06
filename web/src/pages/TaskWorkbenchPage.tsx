@@ -106,6 +106,13 @@ export function TaskWorkbenchPage({
     if (tab === tid) setTab(TUI_TAB);
   };
 
+  // dir 任务无 git 功能（D7）：隐藏 Git tab 与分支名，依据 project_kind 而非判空推断
+  const isDir = task?.project_kind === 'dir';
+  // kind 解析为 dir 时若正停在 Git tab，回退到 TUI tab
+  useEffect(() => {
+    if (isDir && tab === GIT_TAB) setTab(TUI_TAB);
+  }, [isDir, tab]);
+
   if (notFound) {
     return (
       <div className="page">
@@ -145,7 +152,7 @@ export function TaskWorkbenchPage({
           </button>
         )}
         <span className="page-title">{task?.name ?? '…'}</span>
-        {task?.branch && <span className="header-meta mono">⎇ {task.branch}</span>}
+        {task?.branch && !isDir && <span className="header-meta mono">⎇ {task.branch}</span>}
         {task && <StatusBadge status={task.status} />}
         {task && <InitStatusBadge task={task} />}
         {task?.init_status === 'failed' && (
@@ -235,12 +242,14 @@ export function TaskWorkbenchPage({
           +
         </button>
         <span className="tab-sep" />
-        <button
-          className={`tab ${tab === GIT_TAB ? 'tab-active' : ''}`}
-          onClick={() => switchTab(GIT_TAB)}
-        >
-          Git
-        </button>
+        {!isDir && (
+          <button
+            className={`tab ${tab === GIT_TAB ? 'tab-active' : ''}`}
+            onClick={() => switchTab(GIT_TAB)}
+          >
+            Git
+          </button>
+        )}
         <button
           className={`tab ${tab === SETTINGS_TAB ? 'tab-active' : ''}`}
           onClick={() => switchTab(SETTINGS_TAB)}
@@ -298,7 +307,7 @@ export function TaskWorkbenchPage({
             <TerminalView wsPath={`/ws/terminal/shell/${tid}`} active={tab === tid} />
           </div>
         ))}
-        {visited.has(GIT_TAB) && (
+        {visited.has(GIT_TAB) && !isDir && (
           <div className={`pane pane-scroll ${tab === GIT_TAB ? '' : 'pane-hidden'}`}>
             <GitPanel taskID={taskID} active={tab === GIT_TAB} />
           </div>
