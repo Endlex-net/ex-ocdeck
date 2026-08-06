@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -864,5 +865,572 @@ func TestListIgnoredUntrackedTargetLimit(t *testing.T) {
 	_, err := ListIgnoredUntracked(context.Background(), repo)
 	if err != ErrTooManyFilesChanged {
 		t.Fatalf("want ErrTooManyFilesChanged for %d target entries, got %v", MaxStatusFiles+1, err)
+	}
+}
+
+// --- fix-git-diff-new-file-and-linenum 任务 1.4：DiffUntracked ---
+
+// cachedDiff 返回 repo 当前 `git diff --cached` 输出，供 index 不变性断言。
+func cachedDiff(t *testing.T, dir string) string {
+	t.Helper()
+	cmd := exec.Command("git", "diff", "--cached")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git diff --cached: %v", err)
+	}
+	return string(out)
+}
+
+func TestDiffUntracked_NonEmptyNewFile(t *testing.T) {
+	repo := newTestRepo(t)
+	writeFile(t, repo, "new.txt", "line1\nline2\nline3\n")
+	out, trunc, err := DiffUntracked(context.Background(), repo, "new.txt")
+	if err != nil {
+		t.Fatalf("DiffUntracked: %v", err)
+	}
+	if trunc {
+		t.Errorf("unexpected truncation for non-empty new file")
+	}
+	if !strings.Contains(out, "new file mode") {
+		t.Errorf("diff missing 'new file mode': %q", out)
+	}
+	if !strings.Contains(out, "+line1") || !strings.Contains(out, "+line2") || !strings.Contains(out, "+line3") {
+		t.Errorf("diff missing additions: %q", out)
+	}
+}
+
+func TestDiffUntracked_EmptyNewFile(t *testing.T) {
+	repo := newTestRepo(t)
+	writeFile(t, repo, "empty.txt", "")
+	out, trunc, err := DiffUntracked(context.Background(), repo, "empty.txt")
+	if err != nil {
+		t.Fatalf("DiffUntracked empty: %v", err)
+	}
+	if trunc {
+		t.Errorf("unexpected truncation for empty new file")
+	}
+	// 空文件仅元数据 diff（含 new file mode，无 hunk）。
+	if !strings.Contains(out, "new file mode") {
+		t.Errorf("empty file diff missing 'new file mode': %q", out)
+	}
+	if strings.Contains(out, "@@") {
+		t.Errorf("empty file diff should have no hunk header: %q", out)
+	}
+}
+
+func TestDiffUntracked_BinaryReturnsTruncated(t *testing.T) {
+	repo := newTestRepo(t)
+	bin := []byte{0x00, 0x01, 0x02, 0x03, 0xff, 0xfe}
+	if err := os.WriteFile(filepath.Join(repo, "bin.dat"), bin, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, trunc, err := DiffUntracked(context.Background(), repo, "bin.dat")
+	if err != nil {
+		t.Fatalf("DiffUntracked binary: %v", err)
+	}
+	if !trunc {
+		t.Errorf("binary file should return truncated=true, got out=%q", out)
+	}
+	if out != "" {
+		t.Errorf("binary file should return empty diff, got %q", out)
+	}
+}
+
+func TestDiffUntracked_NonExistentPathReturnsError(t *testing.T) {
+	repo := newTestRepo(t)
+	_, _, err := DiffUntracked(context.Background(), repo, "nope.txt")
+	if err == nil {
+		t.Fatal("non-existent path should return error")
+	}
+}
+
+func TestDiffUntracked_RejectsAbsolute(t *testing.T) {
+	repo := newTestRepo(t)
+	writeFile(t, repo, "x.txt", "x\n")
+	abs := filepath.Join(repo, "x.txt")
+	_, _, err := DiffUntracked(context.Background(), repo, abs)
+	if !errors.Is(err, ErrInvalidDiffPath) {
+		t.Fatalf("absolute path should return ErrInvalidDiffPath; got %v", err)
+	}
+}
+
+func TestDiffUntracked_RejectsParentEscape(t *testing.T) {
+	repo := newTestRepo(t)
+	for _, p := range []string{"../x", "../../etc/passwd", "a/../../b"} {
+		_, _, err := DiffUntracked(context.Background(), repo, p)
+		if !errors.Is(err, ErrInvalidDiffPath) {
+			t.Errorf("path %q should return ErrInvalidDiffPath; got %v", p, err)
+		}
+	}
+}
+
+func TestDiffUntracked_RejectsNUL(t *testing.T) {
+	repo := newTestRepo(t)
+	_, _, err := DiffUntracked(context.Background(), repo, "a\x00b")
+	if !errors.Is(err, ErrInvalidDiffPath) {
+		t.Fatalf("NUL path should return ErrInvalidDiffPath; got %v", err)
+	}
+}
+
+func TestDiffUntracked_IndexInvariant(t *testing.T) {
+	repo := newTestRepo(t)
+	writeFile(t, repo, "tracked.txt", "init\n")
+	runGit(t, repo, "add", "tracked.txt")
+	before := cachedDiff(t, repo)
+
+	writeFile(t, repo, "new.txt", "new content\n")
+	_, _, err := DiffUntracked(context.Background(), repo, "new.txt")
+	if err != nil {
+		t.Fatalf("DiffUntracked: %v", err)
+	}
+	after := cachedDiff(t, repo)
+	if before != after {
+		t.Errorf("index changed after DiffUntracked: before=%q after=%q", before, after)
+	}
+}
+
+func TestDiffUntracked_OutputTruncated(t *testing.T) {
+	repo := newTestRepo(t)
+	// 构造超大输出触发 ErrOutputTruncated：写入大量内容使 diff 超过 16MB exec 输出上限。
+	// diff 输出约为内容字节的 1 倍（每行加 "+" 前缀），写 ~17MB 文本即可触发溢出。
+	big := strings.Repeat("x\n", 9*1024*1024) // ~18MB
+	if err := os.WriteFile(filepath.Join(repo, "big.txt"), []byte(big), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, trunc, err := DiffUntracked(context.Background(), repo, "big.txt")
+	// 真值表：溢出 + stdout 非空 + stderr 空 → 512KB 前缀 + truncated=true。
+	if err != nil {
+		t.Fatalf("overflow should be handled as truncated, got err=%v", err)
+	}
+	if !trunc {
+		t.Errorf("overflow should return truncated=true")
+	}
+	if len(out) > DiffMaxBytes {
+		t.Errorf("overflow output should be capped at DiffMaxBytes, got %d", len(out))
+	}
+}
+
+func TestDiffUntracked_TrackedPathDiffUnchanged(t *testing.T) {
+	// 对已跟踪路径传 DiffUntracked 仍返回 new-file diff（调用方声明语义，design D1.4）。
+	// 已跟踪路径的普通 Diff 行为不受影响——单独验证 Diff。
+	repo := newTestRepo(t)
+	writeFile(t, repo, "tracked.txt", "v1\n")
+	runGit(t, repo, "add", "tracked.txt")
+	runGit(t, repo, "commit", "-qm", "add tracked")
+	writeFile(t, repo, "tracked.txt", "v1\nv2\n")
+	// 普通 Diff 返回修改 diff。
+	out, _, err := Diff(context.Background(), repo, "HEAD", "tracked.txt")
+	if err != nil {
+		t.Fatalf("Diff tracked: %v", err)
+	}
+	if !strings.Contains(out, "+v2") {
+		t.Errorf("Diff tracked missing +v2: %q", out)
+	}
+	// DiffUntracked 对已跟踪路径返回 new-file diff（全文新增）。
+	out2, _, err := DiffUntracked(context.Background(), repo, "tracked.txt")
+	if err != nil {
+		t.Fatalf("DiffUntracked tracked: %v", err)
+	}
+	if !strings.Contains(out2, "new file mode") {
+		t.Errorf("DiffUntracked tracked should synthesize new-file diff: %q", out2)
+	}
+}
+
+// --- fix-git-diff-new-file-and-linenum 任务 2.4：untracked 行数统计 ---
+
+func TestUntrackedLineCount_100Lines(t *testing.T) {
+	repo := newTestRepo(t)
+	var b strings.Builder
+	for i := 0; i < 100; i++ {
+		b.WriteString("line\n")
+	}
+	writeFile(t, repo, "hundred.txt", b.String())
+	entries, err := Status(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	e, ok := findEntry(entries, "hundred.txt")
+	if !ok {
+		t.Fatalf("missing hundred.txt in %v", entries)
+	}
+	if e.Additions != 100 {
+		t.Errorf("additions = %d, want 100", e.Additions)
+	}
+	if e.Deletions != 0 {
+		t.Errorf("deletions = %d, want 0", e.Deletions)
+	}
+}
+
+func TestUntrackedLineCount_NoTrailingNewline(t *testing.T) {
+	repo := newTestRepo(t)
+	writeFile(t, repo, "notrail.txt", "a\nb\nc") // 2 newlines + 末行无换行 → 3
+	entries, err := Status(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	e, ok := findEntry(entries, "notrail.txt")
+	if !ok {
+		t.Fatalf("missing notrail.txt in %v", entries)
+	}
+	if e.Additions != 3 {
+		t.Errorf("additions = %d, want 3", e.Additions)
+	}
+}
+
+func TestUntrackedLineCount_BinaryNotCounted(t *testing.T) {
+	repo := newTestRepo(t)
+	bin := []byte("text\nwith\x00nul\nin\nit\n")
+	if err := os.WriteFile(filepath.Join(repo, "bin.txt"), bin, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := Status(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	e, ok := findEntry(entries, "bin.txt")
+	if !ok {
+		t.Fatalf("missing bin.txt in %v", entries)
+	}
+	if !e.IsBinary {
+		t.Errorf("IsBinary should be true for file with NUL, got %+v", e)
+	}
+	if e.Additions != 0 {
+		t.Errorf("binary additions should be 0, got %d", e.Additions)
+	}
+}
+
+func TestUntrackedLineCount_SymlinkSkipped(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root; symlink permissions may differ")
+	}
+	repo := newTestRepo(t)
+	// 先建一个目标文件（tracked），再建指向它的 symlink（untracked）。
+	writeFile(t, repo, "target.txt", "target content\n")
+	runGit(t, repo, "add", "target.txt")
+	runGit(t, repo, "commit", "-qm", "add target")
+	link := filepath.Join(repo, "link.txt")
+	if err := os.Symlink(filepath.Join(repo, "target.txt"), link); err != nil {
+		t.Skipf("cannot create symlink: %v", err)
+	}
+	entries, err := Status(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	e, ok := findEntry(entries, "link.txt")
+	if !ok {
+		t.Fatalf("missing link.txt symlink in %v", entries)
+	}
+	if e.Additions != 0 {
+		t.Errorf("symlink additions should be 0, got %d", e.Additions)
+	}
+}
+
+func TestUntrackedLineCount_Over16MBFileSkipsCounting(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping >16MB file test in -short mode")
+	}
+	repo := newTestRepo(t)
+	// 写入 16MB + 1 字节，超过单文件预算，行计数应跳过（additions=0）。
+	// 含换行以区分"超限跳过（0）"与"计算后无换行（0）"——超限时即便有换行也必须为 0。
+	content := strings.Repeat("x\n", untrackedFileBudget/2+1) // >16MB，每行 2 字节
+	if err := os.WriteFile(filepath.Join(repo, "big.txt"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := Status(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	e, ok := findEntry(entries, "big.txt")
+	if !ok {
+		t.Fatalf("missing big.txt in %v", entries)
+	}
+	if e.Additions != 0 {
+		t.Errorf("file >16MB additions should be 0 (skip counting), got %d", e.Additions)
+	}
+}
+
+func TestUntrackedLineCount_64MBCumulativeBudgetExhausted(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping 64MB cumulative budget test in -short mode")
+	}
+	repo := newTestRepo(t)
+	// 4 个 16MB 文本文件耗尽累计 64MB 预算；第 5 个文件应仅嗅探不计行（additions=0）。
+	// 用单行大文件：每文件 16MB（无换行），单文件恰好等于预算（不超限）。
+	for i := 0; i < 4; i++ {
+		content := strings.Repeat("x", untrackedFileBudget)
+		writeFile(t, repo, "f"+itoa(i)+".txt", content)
+	}
+	// 第 5 个小文件（累计预算已耗尽）：仅嗅探，additions=0。
+	writeFile(t, repo, "small.txt", "line\n")
+	entries, err := Status(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	small, ok := findEntry(entries, "small.txt")
+	if !ok {
+		t.Fatalf("missing small.txt in %v", entries)
+	}
+	if small.Additions != 0 {
+		t.Errorf("small.txt after budget exhaustion additions should be 0, got %d", small.Additions)
+	}
+}
+
+func TestUntrackedLineCount_IOError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root; permission bits may not deny read")
+	}
+	repo := newTestRepo(t)
+	writeFile(t, repo, "noperm.txt", "content\n")
+	p := filepath.Join(repo, "noperm.txt")
+	if err := os.Chmod(p, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(p, 0o644) })
+	_, err := Status(context.Background(), repo)
+	if err == nil {
+		// 某些环境（如 root 或 FS 不强制权限）可能不报错——降级验证不阻塞。
+		t.Skip("read succeeded despite 0o000 (filesystem does not enforce permissions)")
+	}
+	if !strings.Contains(err.Error(), "noperm.txt") {
+		t.Errorf("IO error should contain path, got %v", err)
+	}
+}
+
+// --- fix-git-diff 评审修复补充测试 ---
+
+// TestUntrackedLineCount_ENOENTSkipsSilently 验证 Lstat/open not-exist 静默跳过
+// （status 快照后文件被并发删除属正常竞态，不阻塞 status、不报错）。
+func TestUntrackedLineCount_ENOENTSkipsSilently(t *testing.T) {
+	repo := newTestRepo(t)
+	writeFile(t, repo, "gone.txt", "content\n")
+	// 先获取 status 快照（含 gone.txt untracked 条目），再删除文件模拟竞态。
+	// 直接构造 entries 调 countUntrackedLines：更精确地触发 ENOENT 路径。
+	entries := []FileStatus{{Kind: "?", Path: "gone.txt", Untracked: true}}
+	os.Remove(filepath.Join(repo, "gone.txt"))
+	err := countUntrackedLines(context.Background(), repo, entries)
+	if err != nil {
+		t.Fatalf("ENOENT should skip silently, got err=%v", err)
+	}
+	// 被删文件 additions 保持 0（未计行）。
+	if entries[0].Additions != 0 {
+		t.Errorf("ENOENT additions should be 0, got %d", entries[0].Additions)
+	}
+}
+
+// TestUntrackedLineCount_BinaryDoesNotConsumeTextBudget 验证二进制 prefix 不消耗文本预算
+// （否则多个小二进制文件即可耗尽 64MB 使后续文本 additions=0）。
+// 用 countUntrackedFileLines + 注入小预算避免创建大文件。
+func TestUntrackedLineCount_BinaryDoesNotConsumeTextBudget(t *testing.T) {
+	dir := t.TempDir()
+	// 二进制文件（含 NUL）。
+	binPath := filepath.Join(dir, "bin.dat")
+	if err := os.WriteFile(binPath, []byte("text\x00binary\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 文本文件（应在二进制之后仍能计行——证明二进制未消耗预算）。
+	textPath := filepath.Join(dir, "text.txt")
+	if err := os.WriteFile(textPath, []byte("a\nb\nc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	totalRemaining := untrackedTotalBudget // 64MB，足够两个小文件
+
+	// 处理二进制文件。
+	binEntry := FileStatus{Kind: "?", Path: "bin.dat", Untracked: true}
+	f1, err := os.Open(binPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binAdditions, binUsed, berr := countUntrackedFileLines(context.Background(), f1, &binEntry, &totalRemaining)
+	f1.Close()
+	if berr != nil {
+		t.Fatalf("binary count: %v", berr)
+	}
+	if binAdditions != 0 {
+		t.Errorf("binary additions should be 0, got %d", binAdditions)
+	}
+	if binUsed != 0 {
+		t.Errorf("binary used should be 0 (not consuming text budget), got %d", binUsed)
+	}
+	if !binEntry.IsBinary {
+		t.Errorf("binary file should be marked IsBinary")
+	}
+	// 关键断言：二进制不消耗文本预算，totalRemaining 仍为 64MB。
+	if totalRemaining != untrackedTotalBudget {
+		t.Errorf("binary should not consume text budget: remaining=%d, want %d", totalRemaining, untrackedTotalBudget)
+	}
+
+	// 处理文本文件——应正常计行（预算未被二进制消耗）。
+	textEntry := FileStatus{Kind: "?", Path: "text.txt", Untracked: true}
+	f2, err := os.Open(textPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	additions, used, terr := countUntrackedFileLines(context.Background(), f2, &textEntry, &totalRemaining)
+	f2.Close()
+	if terr != nil {
+		t.Fatalf("text count: %v", terr)
+	}
+	if textEntry.IsBinary {
+		t.Errorf("text file should not be binary")
+	}
+	if additions != 3 {
+		t.Errorf("text additions = %d, want 3 (binary did not consume budget)", additions)
+	}
+	if used != 6 {
+		t.Errorf("used = %d, want 6", used)
+	}
+}
+
+// TestUntrackedLineCount_RemainingLessThanPrefixSkips 验证剩余预算小于 prefix 时跳过行计数
+// （修复前小文件会在突破 64MB 后仍返回有效行数）。
+func TestUntrackedLineCount_RemainingLessThanPrefixSkips(t *testing.T) {
+	dir := t.TempDir()
+	// 小文本文件（< 8000 字节，prefix 读取全部内容）。
+	textPath := filepath.Join(dir, "small.txt")
+	if err := os.WriteFile(textPath, []byte("a\nb\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 注入极小预算（< prefix 长度 4）→ 该文件跳过行计数，additions=0。
+	totalRemaining := 2
+	entry := FileStatus{Kind: "?", Path: "small.txt", Untracked: true}
+	f, err := os.Open(textPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	additions, used, rerr := countUntrackedFileLines(context.Background(), f, &entry, &totalRemaining)
+	f.Close()
+	if rerr != nil {
+		t.Fatalf("count: %v", rerr)
+	}
+	if additions != 0 {
+		t.Errorf("remaining < prefix should skip counting: additions=%d, want 0", additions)
+	}
+	if used != 0 {
+		t.Errorf("skipped file should consume no budget: used=%d, want 0", used)
+	}
+}
+
+// TestUntrackedLineCount_BudgetExhaustedBinaryStillMarked 验证预算耗尽后二进制嗅探仍执行、IsBinary 仍标记。
+func TestUntrackedLineCount_BudgetExhaustedBinaryStillMarked(t *testing.T) {
+	dir := t.TempDir()
+	binPath := filepath.Join(dir, "bin.dat")
+	if err := os.WriteFile(binPath, []byte("text\x00nul\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 预算耗尽（0）→ 嗅探仍执行、IsBinary 标记、不计行。
+	totalRemaining := 0
+	entry := FileStatus{Kind: "?", Path: "bin.dat", Untracked: true}
+	f, err := os.Open(binPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	additions, used, rerr := countUntrackedFileLines(context.Background(), f, &entry, &totalRemaining)
+	f.Close()
+	if rerr != nil {
+		t.Fatalf("count: %v", rerr)
+	}
+	if !entry.IsBinary {
+		t.Errorf("budget exhausted: binary sniff should still mark IsBinary")
+	}
+	if additions != 0 {
+		t.Errorf("budget exhausted: additions should be 0, got %d", additions)
+	}
+	if used != 0 {
+		t.Errorf("budget exhausted: binary should not consume budget, used=%d", used)
+	}
+}
+
+// TestUntrackedLineCount_CtxCancelReturnsError 验证 ctx 取消时返回 ctx.Err()（非静默）。
+func TestUntrackedLineCount_CtxCancelReturnsError(t *testing.T) {
+	repo := newTestRepo(t)
+	writeFile(t, repo, "a.txt", "x\n")
+	writeFile(t, repo, "b.txt", "y\n")
+	entries := []FileStatus{
+		{Kind: "?", Path: "a.txt", Untracked: true},
+		{Kind: "?", Path: "b.txt", Untracked: true},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := countUntrackedLines(ctx, repo, entries)
+	if err == nil {
+		t.Fatal("cancelled ctx should return error, got nil")
+	}
+	if !strings.Contains(err.Error(), "cancelled") {
+		t.Errorf("error should mention cancelled, got %v", err)
+	}
+}
+
+// TestUntrackedLineCount_OversizedFileConsumesActualReadBytes 验证超限分支报告实际读取字节
+// （prefix + 已成功续读 + 触发超限的本次读取），使调用方按实际扣减后累计预算归零，后续文件不再获得读取额度。
+// 用 countUntrackedFileLines + 注入小预算直接测超限分支 used 值。
+func TestUntrackedLineCount_OversizedFileConsumesActualReadBytes(t *testing.T) {
+	dir := t.TempDir()
+	// 构造一个大于累计预算的文本文件（无 NUL）。
+	// totalRemaining=10000：prefix 读取 8000 字节（< 10000，通过），
+	// 续读预算 = 10000 - 8000 = 2000；文件剩余 12000 字节 > 2000 → 超限分支触发。
+	// 超限分支应报告 used = 8000 + 已续读 + 本次读取（>8000），使调用方扣减后预算归零。
+	content := strings.Repeat("x\n", 10000) // 20000 字节
+	bigPath := filepath.Join(dir, "big.txt")
+	if err := os.WriteFile(bigPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	totalRemaining := 10000
+	entry := FileStatus{Kind: "?", Path: "big.txt", Untracked: true}
+	f, err := os.Open(bigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	additions, used, rerr := countUntrackedFileLines(context.Background(), f, &entry, &totalRemaining)
+	f.Close()
+	if rerr != nil {
+		t.Fatalf("count: %v", rerr)
+	}
+	if additions != 0 {
+		t.Errorf("oversized file additions should be 0, got %d", additions)
+	}
+	// used 应远大于 prefix（8000），包含实际续读+触发超限的读取。
+	if used <= untrackedSniffBytes {
+		t.Errorf("oversized file used should exceed prefix (actual read bytes): used=%d, want > %d", used, untrackedSniffBytes)
+	}
+	// 模拟调用方扣减（clamp 防负数）。
+	if used >= totalRemaining {
+		totalRemaining = 0
+	} else {
+		totalRemaining -= used
+	}
+	if totalRemaining != 0 {
+		t.Errorf("after clamp, totalRemaining should be 0: got %d (used=%d)", totalRemaining, used)
+	}
+}
+
+// TestUntrackedLineCount_MultipleOversizedFilesDepleteBudget 集成用例：
+// 多个 >16MB 文件不能重复获得近 16MB 读取额度——累计预算被正确扣减后后续文件不再全量读取。
+// 用 Status 层验证：2 个 ~17MB 文本文件，第一个消耗 ~16MB+ 预算，第二个因预算耗尽 additions=0。
+func TestUntrackedLineCount_MultipleOversizedFilesDepleteBudget(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping multi-oversized-files test in -short mode")
+	}
+	repo := newTestRepo(t)
+	// 2 个 >16MB 文本文件（含换行以区分"超限跳过 0"与"计算后无换行 0"）。
+	content := strings.Repeat("x\n", 9*1024*1024) // ~18MB per file
+	writeFile(t, repo, "big1.txt", content)
+	writeFile(t, repo, "big2.txt", content)
+
+	entries, err := Status(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	// 两个文件都应 additions=0（超限跳过计数）。
+	for _, name := range []string{"big1.txt", "big2.txt"} {
+		e, ok := findEntry(entries, name)
+		if !ok {
+			t.Fatalf("missing %s in entries", name)
+		}
+		if e.Additions != 0 {
+			t.Errorf("%s additions = %d, want 0 (budget exhausted after first oversized file)", name, e.Additions)
+		}
 	}
 }

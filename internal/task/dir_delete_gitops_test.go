@@ -370,7 +370,7 @@ func TestGitops_Dir_StatusDiffCommitPush_InvalidInput(t *testing.T) {
 		t.Fatalf("GitStatus dir err must mention dir kind; got %v", err)
 	}
 	// GitDiff
-	_, err = m.GitDiff(context.Background(), "t1", "", "")
+	_, err = m.GitDiff(context.Background(), "t1", "", "", false)
 	if !isOpErrCode(err, codeInvalidInput) {
 		t.Fatalf("GitDiff dir: err = %v, want codeInvalidInput", err)
 	}
@@ -403,7 +403,7 @@ func TestGitops_UnknownKind_FailClosed(t *testing.T) {
 	if !strings.Contains(err.Error(), "unknown project kind") {
 		t.Fatalf("GitStatus unknown kind err must mention unknown kind; got %v", err)
 	}
-	_, err = m.GitDiff(context.Background(), "t1", "", "")
+	_, err = m.GitDiff(context.Background(), "t1", "", "", false)
 	if !isOpErrCode(err, codeInternal) {
 		t.Fatalf("GitDiff unknown kind: err = %v, want codeInternal (D1)", err)
 	}
@@ -554,7 +554,7 @@ func TestRetry_RepoDirtyGate_UnchangedRegression(t *testing.T) {
 	// Delete: preflight 快照干净 → 二次门禁出现 new.txt → 拒绝。
 	// Retry: preflight 快照含 new.txt → 非空且 !confirmDirty → 拒绝。
 	wt.results = []map[string]struct{}{
-		{},             // Delete #1 preflight 快照：干净
+		{},              // Delete #1 preflight 快照：干净
 		{"new.txt": {}}, // Delete #2 二次门禁：新增 dirty → 拒绝
 		{"new.txt": {}}, // Retry #1 preflight 快照：dirty 非空 → !confirmDirty → 拒绝
 	}

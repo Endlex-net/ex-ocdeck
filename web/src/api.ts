@@ -182,10 +182,11 @@ export const api = {
   listActiveSessions: () => request<ActiveSessionItem[]>('GET', '/sessions/active'),
 
   gitStatus: (taskID: string) => request<GitStatus>('GET', `/tasks/${taskID}/git/status`),
-  gitDiff: (taskID: string, ref: string, path: string) =>
+  gitDiff: (taskID: string, ref: string, path: string, untracked: boolean) =>
     request<GitDiffResult>('GET', `/tasks/${taskID}/git/diff`, undefined, {
       ...(ref ? { ref } : {}),
       ...(path ? { path } : {}),
+      ...(untracked ? { untracked: '1' } : {}),
     }),
   /** paths 为空数组 = 提交全部改动。 */
   gitCommit: (taskID: string, message: string, paths: string[]) =>

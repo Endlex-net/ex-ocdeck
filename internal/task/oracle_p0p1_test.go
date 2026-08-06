@@ -18,9 +18,9 @@ import (
 // 覆盖 Delete 首次 + Retry 重入的二次门禁序列。
 type programmableDirtyWorktree struct {
 	*mockWorktree
-	mu       sync.Mutex
-	results  []map[string]struct{} // 按调用序号返回的 dirty 集（1-based 通过 len 判定）
-	calls    int
+	mu      sync.Mutex
+	results []map[string]struct{} // 按调用序号返回的 dirty 集（1-based 通过 len 判定）
+	calls   int
 }
 
 func (w *programmableDirtyWorktree) DirtyFiles(ctx context.Context, wtPath string) (map[string]struct{}, error) {
@@ -47,9 +47,9 @@ func TestP0_DeleteRetry_SecondDirtyGate_ReRejectsNewDirty(t *testing.T) {
 	// Retry 调用 DirtyFiles 2 次（重入 preflight 快照 + 重入二次门禁）。
 	// 全程 preflight 快照为空，二次门禁时出现 new.txt（新增 dirty）。
 	wt.results = []map[string]struct{}{
-		{}, // Delete #1 preflight 快照：干净
+		{},              // Delete #1 preflight 快照：干净
 		{"new.txt": {}}, // Delete #2 二次门禁：新增 dirty → 拒绝
-		{}, // Retry #1 preflight 快照：干净
+		{},              // Retry #1 preflight 快照：干净
 		{"new.txt": {}}, // Retry #2 二次门禁：仍新增 dirty → MUST 再次拒绝
 	}
 	m := newTestManager(t, store, newMockProc(), wt, newMockOC(true))
@@ -83,10 +83,10 @@ func TestP0_DeleteRetry_SecondDirtyGate_AllowsWhenClean(t *testing.T) {
 	seedSuspendedTask(store, "t1", "p1")
 	wt := &programmableDirtyWorktree{mockWorktree: newMockWorktree()}
 	wt.results = []map[string]struct{}{
-		{},               // Delete preflight 快照：干净
-		{"new.txt": {}},   // Delete 二次门禁：新增 dirty → 拒绝
-		{},               // Retry preflight 快照：干净
-		{},               // Retry 二次门禁：干净 → 通过 → 删除成功
+		{},              // Delete preflight 快照：干净
+		{"new.txt": {}}, // Delete 二次门禁：新增 dirty → 拒绝
+		{},              // Retry preflight 快照：干净
+		{},              // Retry 二次门禁：干净 → 通过 → 删除成功
 	}
 	m := newTestManager(t, store, newMockProc(), wt, newMockOC(true))
 
@@ -517,7 +517,7 @@ func TestP1_GitOps_LockMutexWithLifecycle(t *testing.T) {
 	if err == nil || OpErrorCode(err) != codeConflict {
 		t.Errorf("GitStatus with held lock MUST return conflict; got %v", err)
 	}
-	_, err = m.GitDiff(context.Background(), "t1", "", "")
+	_, err = m.GitDiff(context.Background(), "t1", "", "", false)
 	if err == nil || OpErrorCode(err) != codeConflict {
 		t.Errorf("GitDiff with held lock MUST return conflict; got %v", err)
 	}
@@ -540,7 +540,7 @@ func TestP1_GitOps_NotFoundSemantics(t *testing.T) {
 	if _, err := m.GitStatus(context.Background(), "nope"); err == nil || OpErrorCode(err) != codeNotFound {
 		t.Errorf("GitStatus not_found; got %v", err)
 	}
-	if _, err := m.GitDiff(context.Background(), "nope", "", ""); err == nil || OpErrorCode(err) != codeNotFound {
+	if _, err := m.GitDiff(context.Background(), "nope", "", "", false); err == nil || OpErrorCode(err) != codeNotFound {
 		t.Errorf("GitDiff not_found; got %v", err)
 	}
 	if err := m.GitCommit(context.Background(), "nope", "msg", nil); err == nil || OpErrorCode(err) != codeNotFound {
@@ -567,8 +567,8 @@ func TestB1_RetryDirty_NeedsConfirmDirty(t *testing.T) {
 	// Retry: preflight 快照（DirtyFiles #3）含 new.txt → 非空且 !confirmDirty → 拒绝。
 	wt.results = []map[string]struct{}{
 		{},              // Delete #1 preflight 快照：干净
-		{"new.txt": {}},  // Delete #2 二次门禁：新增 dirty → 拒绝
-		{"new.txt": {}},  // Retry #1 preflight 快照：dirty 非空 → !confirmDirty → 拒绝
+		{"new.txt": {}}, // Delete #2 二次门禁：新增 dirty → 拒绝
+		{"new.txt": {}}, // Retry #1 preflight 快照：dirty 非空 → !confirmDirty → 拒绝
 	}
 	m := newTestManager(t, store, newMockProc(), wt, newMockOC(true))
 
@@ -595,7 +595,7 @@ func TestB1_RetryDirty_WithConfirmDeletes(t *testing.T) {
 	seedSuspendedTask(store, "t1", "p1")
 	wt := &programmableDirtyWorktree{mockWorktree: newMockWorktree()}
 	wt.results = []map[string]struct{}{
-		{},             // Delete #1 preflight 快照：干净
+		{},              // Delete #1 preflight 快照：干净
 		{"new.txt": {}}, // Delete #2 二次门禁：新增 dirty → 拒绝
 		{"new.txt": {}}, // Retry #1 preflight 快照：dirty 非空（confirmDirty=true 通过）
 		{"new.txt": {}}, // Retry #2 二次门禁：dirty 与快照一致（无新增）→ 通过 → 删除成功
@@ -623,10 +623,10 @@ func TestB1_RetryDirty_NoDirtyContinues(t *testing.T) {
 	seedSuspendedTask(store, "t1", "p1")
 	wt := &programmableDirtyWorktree{mockWorktree: newMockWorktree()}
 	wt.results = []map[string]struct{}{
-		{},             // Delete #1 preflight 快照：干净
+		{},              // Delete #1 preflight 快照：干净
 		{"new.txt": {}}, // Delete #2 二次门禁：新增 dirty → 拒绝
-		{},             // Retry #1 preflight 快照：干净（无需确认）
-		{},             // Retry #2 二次门禁：干净 → 删除成功
+		{},              // Retry #1 preflight 快照：干净（无需确认）
+		{},              // Retry #2 二次门禁：干净 → 删除成功
 	}
 	m := newTestManager(t, store, newMockProc(), wt, newMockOC(true))
 
@@ -650,12 +650,12 @@ func TestB1_RetryDirty_NoDirtyContinues(t *testing.T) {
 // listErrAfterN 让 ListCleanupDebts 在第 N 次调用（1-based）后才返回错误，
 // 以区分 restoreCleanupDebts（第 1 次）与 persistOrphanDebts（后续）的 List 调用。
 type failingDebtStore struct {
-	listErr      error
+	listErr       error
 	listErrAfterN int
-	listCalls    int
-	upsertErr    error
-	deleteErr    error
-	upsertd      map[string]string
+	listCalls     int
+	upsertErr     error
+	deleteErr     error
+	upsertd       map[string]string
 }
 
 func newFailingDebtStore(listErr error, upsertErr, deleteErr error) *failingDebtStore {

@@ -91,7 +91,7 @@ func (f *fakeTaskBackend) ListActiveTaskOverview(ctx context.Context) ([]task.Ac
 func (f *fakeTaskBackend) GitStatus(ctx context.Context, taskID string) (task.GitStatusDTO, error) {
 	return task.GitStatusDTO{}, nil
 }
-func (f *fakeTaskBackend) GitDiff(ctx context.Context, taskID, ref, path string) (task.GitDiffDTO, error) {
+func (f *fakeTaskBackend) GitDiff(ctx context.Context, taskID, ref, path string, untracked bool) (task.GitDiffDTO, error) {
 	return task.GitDiffDTO{}, nil
 }
 func (f *fakeTaskBackend) GitCommit(ctx context.Context, taskID, message string, paths []string) error {

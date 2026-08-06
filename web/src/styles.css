@@ -1044,7 +1044,9 @@ select.input {
   flex: 1;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
+  /* 纵向滚动保留、横向关闭：横向滚动 owner 唯一为 .d2h-wrapper（design D3 不变量 3） */
+  overflow-y: auto;
+  overflow-x: hidden;
   display: flex;
   flex-direction: column;
 }
@@ -1081,8 +1083,36 @@ select.input {
 .diff-view .d2h-wrapper {
   border: 1px solid var(--border);
   border-radius: 6px;
-  overflow: hidden;
+  /* 唯一横向滚动 owner（design D3 不变量 3）：gutter 与代码同容器同向滚动；
+     overflow-y:hidden 保持圆角裁剪，纵向滚动仍由 .git-diff 承担 */
+  overflow-x: auto;
+  overflow-y: hidden;
   background: var(--bg);
+}
+
+/* diff2html 内置 .d2h-file-diff{overflow-y:hidden} 会令其成为横向 scroll container，
+   与 gutter 绝对定位冲突造成错位；此处设为非 scroll container，横向溢出由 .d2h-wrapper 接管。
+   中间容器（file-wrapper/file-diff/code-wrapper）随 table 按内容撑宽（min-width:100%
+   保持短行 diff 占满容器），保证 scrollWidth>clientWidth 的元素唯一为 .d2h-wrapper */
+.diff-view .d2h-file-diff {
+  overflow: visible;
+}
+
+.diff-view .d2h-file-wrapper,
+.diff-view .d2h-file-diff,
+.diff-view .d2h-code-wrapper {
+  width: max-content;
+  min-width: 100%;
+}
+
+/* diff2html gutter（.d2h-code-linenumber）是绝对定位 td：无定位祖先时锚定 ICB，
+   任何元素级滚动（横向 .d2h-wrapper / 纵向 .git-diff）都会让 gutter 原地不动而代码滚动，
+   即行号错位根因。给 .d2h-code-wrapper（diff2html 内置无样式、不在 D3 禁止新建定位
+   上下文的 .d2h-file-diff/.d2h-diff-table 之列）加 position:relative，gutter 锚定到
+   滚动内容内部，双向滚动均与代码行同动；静止位置实测不变（static position 不受
+   containing block 切换影响），不产生 gutter 漂移 */
+.diff-view .d2h-code-wrapper {
+  position: relative;
 }
 
 .diff-view .d2h-file-header {
@@ -1122,6 +1152,17 @@ select.input {
   color: var(--text);
   font-family: var(--mono);
   font-size: 12px;
+  /* 按内容撑宽，超出部分由 .d2h-wrapper 横向滚动；min-width:100% 保持
+     短行 diff 占满容器宽度（不破坏 diff2html 百分比宽度布局） */
+  width: max-content;
+  min-width: 100%;
+}
+
+/* 行号 cell 与代码 cell 同一 <tr>（不变量 1），两侧设相同固定 line-height，
+   保证每行高度恒定、gutter 与代码逐行对齐（design D3）。
+   UA 默认 td{padding:1px} 会让代码 cell 内容比 gutter 低 1px，归零使逐行精确对齐 */
+.diff-view .d2h-diff-table td {
+  padding: 0;
 }
 
 .diff-view .d2h-code-linenumber,
@@ -1129,14 +1170,23 @@ select.input {
   background: var(--bg-panel);
   color: var(--text-dim);
   border-color: var(--border);
+  line-height: 18px;
 }
 
 .diff-view .d2h-code-line,
 .diff-view .d2h-code-side-line {
   color: var(--text);
   background: var(--bg);
-  padding-left: 8px;
-  padding-right: 8px;
+  /* 水平 padding 沿用 diff2html 内置值（line: 0 8em / side: 0 4.5em），
+     左侧 8em 为 gutter（7.5em 宽）预留空间；此前覆盖为 8px 会让代码文本
+     与行号 gutter 重叠，属错位根因之一，故不再覆盖（design D3：不破坏
+     gutter padding 计算） */
+  line-height: 18px;
+  /* 不变量 2：代码行禁止折行，长行横向滚动而非 wrap。
+     注意 MUST 用 nowrap 而非 pre：diff2html 生成的 HTML 模板含换行/缩进空白，
+     pre 会把这些源码换行渲染为真实行高导致行高爆炸；代码内容的空白保留由
+     diff2html 内置 .d2h-code-line-ctn{white-space:pre} 承担 */
+  white-space: nowrap;
 }
 
 .diff-view .d2h-code-line-prefix {
@@ -1598,10 +1648,13 @@ select.input {
     flex-shrink: 0;
   }
 
-  /* Git 面板：侧栏改为纵向区块堆叠（L0 已松绑宽度，此处完成布局堆叠） */
+  /* Git 面板：侧栏改为纵向区块堆叠（L0 已松绑宽度，此处完成布局堆叠）；
+     overflow-y:auto 会使横轴计算为 auto，MUST 显式关闭横向滚动，
+     横向滚动 owner 唯一为 .d2h-wrapper（design D3 不变量 3） */
   .workbench .git-panel {
     flex-direction: column;
     overflow-y: auto;
+    overflow-x: hidden;
   }
 
   .workbench .git-side {

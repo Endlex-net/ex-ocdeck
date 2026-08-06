@@ -98,12 +98,24 @@ func (m *Manager) GitStatus(ctx context.Context, taskID string) (GitStatusDTO, e
 // GitDiff 返回任务 worktree 中 path 相对 ref 的 unified diff（design.md §9/§21）。
 // 持任务锁（与生命周期操作互斥，冲突 409）。ref 可选（空=工作区 vs 索引/HEAD），
 // path 可选（空=全仓 diff，受 git.DiffMaxFiles 限制）。
-func (m *Manager) GitDiff(ctx context.Context, taskID, ref, path string) (GitDiffDTO, error) {
+// untracked=true 时调用 git.DiffUntracked 合成新文件 diff；此时 path 必填、ref 必空，
+// 否则返回 invalid_input（在任何 git 命令前校验）。
+func (m *Manager) GitDiff(ctx context.Context, taskID, ref, path string, untracked bool) (GitDiffDTO, error) {
 	unlock, err := m.tryLockTask(taskID)
 	if err != nil {
 		return GitDiffDTO{}, err
 	}
 	defer unlock()
+
+	// 用例不变量（在任何 git 命令前校验）：untracked 模式下 path 必填、ref 必空。
+	if untracked {
+		if path == "" {
+			return GitDiffDTO{}, newOpErr(codeInvalidInput, errors.New("untracked diff requires a path"))
+		}
+		if ref != "" {
+			return GitDiffDTO{}, newOpErr(codeInvalidInput, errors.New("untracked diff does not accept a ref"))
+		}
+	}
 
 	row, err := m.store.GetTask(ctx, taskID)
 	if err != nil {
@@ -116,6 +128,18 @@ func (m *Manager) GitDiff(ctx context.Context, taskID, ref, path string) (GitDif
 	if _, err := m.assertGitRepoTask(ctx, row); err != nil {
 		return GitDiffDTO{}, err
 	}
+
+	if untracked {
+		diff, truncated, derr := git.DiffUntracked(ctx, row.WorktreePath, path)
+		if derr != nil {
+			if errors.Is(derr, git.ErrInvalidDiffPath) {
+				return GitDiffDTO{}, newOpErr(codeInvalidInput, derr)
+			}
+			return GitDiffDTO{}, newOpErr(codeGitError, fmt.Errorf("%s", git.StderrOf(derr)))
+		}
+		return GitDiffDTO{Diff: diff, Truncated: truncated}, nil
+	}
+
 	diff, truncated, derr := git.Diff(ctx, row.WorktreePath, ref, path)
 	if derr != nil {
 		return GitDiffDTO{}, newOpErr(codeGitError, fmt.Errorf("%s", git.StderrOf(derr)))

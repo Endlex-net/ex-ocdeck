@@ -51,20 +51,48 @@ func (s *Server) handleGitStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(st)
 }
 
-// handleGitDiff GET /api/v1/tasks/:id/git/diff?ref=&path=（design.md §9/§21）。
+// handleGitDiff GET /api/v1/tasks/:id/git/diff?ref=&path=&untracked=（design.md §9/§21、fix-git-diff）。
 // ref 可选（默认工作区 vs 索引/HEAD），path 可选（空=全仓 diff，受 DiffMaxFiles 限制）。
+// untracked 查询参数值域：absent / "0" / "1"，其他值 → invalid_input。
+// untracked=1 时透传 untracked=true，调用方声明模式，服务端不二次探测。
 // 经 TaskManager.GitDiff 持任务锁，DTO 直接复用 task.GitDiffDTO。
 func (s *Server) handleGitDiff(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
 	ref := r.URL.Query().Get("ref")
 	path := r.URL.Query().Get("path")
-	d, err := s.tasks.GitDiff(r.Context(), taskID, ref, path)
+	untracked, ae := parseUntrackedParam(r)
+	if ae != nil {
+		writeApiError(w, ae)
+		return
+	}
+	d, err := s.tasks.GitDiff(r.Context(), taskID, ref, path, untracked)
 	if err != nil {
 		writeApiError(w, mapTaskErr(err))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(d)
+}
+
+// parseUntrackedParam 解析 untracked 查询参数。值域：absent / "0" / "1"。
+// absent → false；present 且单值 "0"/"1" → 对应 bool；空值、其他值、重复参数 → invalid_input。
+// 用 r.URL.Query()["untracked"] 区分 absent 与显式空值（Get 无法区分 ?untracked= 与不存在）。
+func parseUntrackedParam(r *http.Request) (bool, *ApiError) {
+	values, present := r.URL.Query()["untracked"]
+	if !present {
+		return false, nil // absent → false
+	}
+	if len(values) != 1 {
+		return false, NewError(CodeInvalidInput, "untracked must be 0 or 1")
+	}
+	switch values[0] {
+	case "0":
+		return false, nil
+	case "1":
+		return true, nil
+	default:
+		return false, NewError(CodeInvalidInput, "untracked must be 0 or 1")
+	}
 }
 
 // handleGitCommit POST /api/v1/tasks/:id/git/commit（design.md §9/§21）。
