@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"ocdeck/internal/config"
+	"ocdeck/internal/opencode"
 )
 
 func TestAuthMiddleware_MissingToken_401(t *testing.T) {
@@ -265,7 +266,7 @@ func TestAuthenticatedWrongMethod_JSON404(t *testing.T) {
 
 func TestServerStatus_VersionVerifiedReal(t *testing.T) {
 	cfg := testConfig()
-	cfg.OpenCodeVersion = "1.18.9"
+	cfg.OpenCodeVersion = opencode.ContractBaseline
 	cfg.VersionVerified = config.VersionMatches(cfg.OpenCodeVersion, config.ContractBaseline)
 	srv := New(cfg, nil)
 	ts := httptest.NewServer(srv.mux)

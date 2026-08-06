@@ -843,14 +843,14 @@ func (c *mockOC) Health(ctx context.Context) (opencode.HealthResponse, error) {
 	if !c.healthOK {
 		return opencode.HealthResponse{}, opencode.ErrServeNotReady
 	}
-	return opencode.HealthResponse{Healthy: true, Version: "1.18.9"}, nil
+	return opencode.HealthResponse{Healthy: true, Version: opencode.ContractBaseline}, nil
 }
 
 func (c *mockOC) Probe(ctx context.Context) (string, error) {
 	if c.probeErr != nil {
 		return "", c.probeErr
 	}
-	return "1.18.9", nil
+	return opencode.ContractBaseline, nil
 }
 
 func (c *mockOC) ListSessions(ctx context.Context, dir string, limit int) ([]opencode.Session, error) {
