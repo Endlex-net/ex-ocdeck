@@ -249,6 +249,17 @@ func (m *Manager) reconcileKill(ctx context.Context, tasks []TaskRow, sessions [
 // 端口以会话内 OCDECK_SERVE_PORT 为准（读回失败 → suspended+last_error，不得静默用 last_port，B9）。
 // env snapshot 解析错误传播（B9）。
 func (m *Manager) resumeActive(ctx context.Context, t TaskRow) error {
+	// add-plain-dir-project D8：persist 恢复路径在任何状态修改/运行时副作用前校验项目 kind，
+	// 未知值零副作用报错；mode 显式传入 startSSE/alignSessions。
+	proj, perr := m.store.GetProject(ctx, t.ProjectID)
+	if perr != nil {
+		return fmt.Errorf("project gone: %w", perr)
+	}
+	mode, kerr := alignModeForKind(proj.Kind)
+	if kerr != nil {
+		// 未知持久化 kind（DB 损坏值）→ internal（D1）。
+		return newOpErr(codeInternal, kerr)
+	}
 	serveName := serveSessionName(t.ID)
 	pw, err := m.proc.ShowSessionEnv(serveName, "OPENCODE_SERVER_PASSWORD")
 	if err != nil || pw == "" {
@@ -282,7 +293,7 @@ func (m *Manager) resumeActive(ctx context.Context, t TaskRow) error {
 	rt := m.newRuntime(t.ID)
 	m.setRuntime(t.ID, rt)
 	rt.registerGroup("serve", serveName)
-	if err := m.startSSE(ctx, rt, t.ID, t.WorktreePath, port, pw); err != nil {
+	if err := m.startSSE(ctx, rt, t.ID, t.WorktreePath, port, pw, mode); err != nil {
 		m.clearRuntime(t.ID)
 		return err
 	}

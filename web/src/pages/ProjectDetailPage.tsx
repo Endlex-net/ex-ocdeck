@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { navigate } from '../router';
 import { usePoll } from '../hooks';
@@ -11,6 +11,7 @@ import { EnvEditor } from '../components/EnvEditor';
 import { LifecycleConfigEditor } from '../components/LifecycleConfigEditor';
 import { InitStatusBadge } from '../components/InitStatusBadge';
 import { LifecycleLogModal } from '../components/LifecycleLogModal';
+import { BranchCombobox } from '../components/BranchCombobox';
 
 export function ProjectDetailPage({ projectID }: { projectID: string }) {
   const [project, setProject] = useState<ProjectDetail | null>(null);
@@ -19,6 +20,28 @@ export function ProjectDetailPage({ projectID }: { projectID: string }) {
   const [loaded, setLoaded] = useState(false);
   const [newName, setNewName] = useState('');
   const [creating, setCreating] = useState(false);
+  // repo 任务基线分支（D10）：候选来自 GET /projects/:id/branches，默认选中项目默认分支；
+  // dir 项目不请求、不展示该控件。branchesTick 递增触发重新拉取（失败重试入口）
+  const [branches, setBranches] = useState<string[]>([]);
+  const [branchesError, setBranchesError] = useState('');
+  const [branchesTick, setBranchesTick] = useState(0);
+  const [baseRef, setBaseRef] = useState('');
+  // 远端分支刷新（D10 7.6）：首次打开选择器自动一次 + 显式刷新按钮；
+  // refreshing 期间禁止提交创建；失败保留本地快照并显式标注
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState('');
+  const autoRefreshDoneRef = useRef(false);
+  const refreshInFlightRef = useRef(false);
+  // 初始 GET 与 refresh 共享的写入代际：任一写入 branches 的路径都必须确认
+  // 自己仍是最新一代；refresh 发起时递增，使此前未完成的 GET 响应失效
+  const branchesGenRef = useRef(0);
+  const unmountedRef = useRef(false);
+  useEffect(
+    () => () => {
+      unmountedRef.current = true;
+    },
+    [],
+  );
   const [deleting, setDeleting] = useState<Task | null>(null);
   const [envOpen, setEnvOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
@@ -48,13 +71,85 @@ export function ProjectDetailPage({ projectID }: { projectID: string }) {
   );
   usePoll(() => void load(), hasTransitional ? 2000 : 5000, [hasTransitional]);
 
+  // 分支列表只取一次（不随任务轮询刷新）；dir 项目不调用（后端对 dir 返回错误）。
+  // 页面已按 projectID key 重挂载，此处默认分支可无条件覆盖；
+  // cancelled 竞态防护：effect 失效（切换项目/卸载）后旧请求结果不得写入状态。
+  useEffect(() => {
+    if (!project || project.kind === 'dir') return;
+    setBaseRef(project.default_branch);
+    setBranchesError('');
+    let cancelled = false;
+    // 捕获当前代际：若期间发生 refresh（代际递增），本响应属于旧快照，不得回写
+    const gen = branchesGenRef.current;
+    api
+      .listBranches(projectID)
+      .then((bs) => {
+        if (!cancelled && gen === branchesGenRef.current) setBranches(bs);
+      })
+      .catch((err) => {
+        if (!cancelled && gen === branchesGenRef.current)
+          setBranchesError(
+            err instanceof ApiError ? `[${err.code}] ${err.message}` : '获取分支列表失败',
+          );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectID, project?.kind, project?.default_branch, branchesTick]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 保证当前选中值总在选项内（默认分支可能不在远端/本地列表中）：
+  // 派生新数组，绝不原地修改 branches state
+  const branchOptions = (() => {
+    const base = branches.length > 0 ? branches : project ? [project.default_branch] : [];
+    return baseRef && !base.includes(baseRef) ? [baseRef, ...base] : base;
+  })();
+
+  // refresh 竞态防护：共享代际 + 卸载标志，项目切换/卸载后旧响应不得写入状态；
+  // 发起时递增代际，使此前未完成的初始 GET 响应失效（不得覆盖 refresh 结果）；
+  // inFlight 去重（连点/自动+手动并发只跑一个）
+  const refreshBranches = async () => {
+    if (!project || project.kind === 'dir') return;
+    if (refreshInFlightRef.current) return;
+    refreshInFlightRef.current = true;
+    const gen = ++branchesGenRef.current;
+    setRefreshing(true);
+    setRefreshError('');
+    try {
+      const bs = await api.refreshBranches(projectID);
+      if (unmountedRef.current || gen !== branchesGenRef.current) return;
+      setBranches(bs);
+      setBranchesError('');
+    } catch (err) {
+      if (unmountedRef.current || gen !== branchesGenRef.current) return;
+      setRefreshError(
+        err instanceof ApiError ? `[${err.code}] ${err.message}` : '刷新远端分支失败',
+      );
+    } finally {
+      refreshInFlightRef.current = false;
+      if (!unmountedRef.current && gen === branchesGenRef.current) setRefreshing(false);
+    }
+  };
+
+  // 首次打开/聚焦基线选择器时自动 refresh 一次（每个页面挂载周期内仅一次）
+  const handlePickerOpen = () => {
+    if (autoRefreshDoneRef.current) return;
+    autoRefreshDoneRef.current = true;
+    void refreshBranches();
+  };
+
   const create = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (creating || !newName.trim()) return;
+    // refreshing 期间禁止提交：防止基于陈旧快照误提交远端基线（D10 7.6）
+    if (creating || refreshing || !newName.trim()) return;
     setCreating(true);
     setError('');
     try {
-      const t = await api.createTask(projectID, newName.trim());
+      const isDir = project?.kind === 'dir';
+      const t = await api.createTask(
+        projectID,
+        newName.trim(),
+        isDir ? undefined : baseRef || undefined,
+      );
       setNewName('');
       await load();
       navigate(`/task/${t.id}`);
@@ -75,8 +170,12 @@ export function ProjectDetailPage({ projectID }: { projectID: string }) {
         </button>
         <span className="page-title">{project?.name ?? '…'}</span>
         {project && (
+          <span className="flag flag-kind">{project.kind === 'dir' ? '目录' : 'git'}</span>
+        )}
+        {project && (
           <span className="header-meta mono">
-            {project.path} · {project.default_branch}
+            {project.path}
+            {project.kind !== 'dir' && ` · ${project.default_branch}`}
           </span>
         )}
         <span className="header-spacer" />
@@ -99,10 +198,67 @@ export function ProjectDetailPage({ projectID }: { projectID: string }) {
           value={newName}
           onChange={(e) => setNewName(e.target.value)}
         />
-        <button className="btn btn-primary" type="submit" disabled={creating}>
+        {project && project.kind !== 'dir' && (
+          <>
+            <BranchCombobox
+              options={branchOptions}
+              value={baseRef}
+              defaultBranch={project.default_branch}
+              onChange={setBaseRef}
+              onOpen={handlePickerOpen}
+              loading={refreshing}
+              title="基线分支（新 worktree 从此分支创建，默认为项目默认分支）"
+            />
+            <button
+              type="button"
+              className="btn"
+              disabled={refreshing}
+              title="从远端拉取最新分支列表（git fetch）"
+              onClick={() => void refreshBranches()}
+            >
+              {refreshing ? (
+                <>
+                  <span className="spinner" aria-hidden /> 刷新中…
+                </>
+              ) : (
+                '⟳ 刷新远端分支'
+              )}
+            </button>
+          </>
+        )}
+        <button className="btn btn-primary" type="submit" disabled={creating || refreshing}>
           {creating ? '创建中…' : '新建任务'}
         </button>
       </form>
+
+      {/* 分支列表拉取失败：显式报错 + 重试，不静默退化为仅默认分支选项 */}
+      {branchesError && (
+        <div className="alert-bar alert-error">
+          <span className="mono">获取分支列表失败：{branchesError}</span>
+          <button className="btn btn-small" onClick={() => setBranchesTick((t) => t + 1)}>
+            重试
+          </button>
+        </div>
+      )}
+
+      {/* refresh 失败：保留本地快照并显式标注（D10，不静默冒充最新） */}
+      {refreshError && (
+        <div className="alert-bar alert-error">
+          <span className="mono">
+            远端分支刷新失败，当前为本地快照（未刷新）：{refreshError}
+          </span>
+          <button className="btn btn-small" onClick={() => void refreshBranches()}>
+            重试
+          </button>
+        </div>
+      )}
+
+      {/* dir 项目多活跃任务无文件隔离提示（D7，纯前端判断：活跃 = status active） */}
+      {project?.kind === 'dir' && tasks.filter((t) => t.status === 'active').length >= 2 && (
+        <div className="alert-bar alert-notice">
+          <span>多个活跃任务共享同一目录、无文件隔离，并行改动可能相互影响。</span>
+        </div>
+      )}
 
       <div className="env-section">
         <button
@@ -125,7 +281,11 @@ export function ProjectDetailPage({ projectID }: { projectID: string }) {
       </div>
 
       {loaded && tasks.length === 0 && (
-        <div className="empty">暂无任务。创建一个任务以获得独立 worktree + opencode 会话。</div>
+        <div className="empty">
+          {project?.kind === 'dir'
+            ? '暂无任务。创建一个任务以在该目录中启动 opencode 会话。'
+            : '暂无任务。创建一个任务以获得独立 worktree + opencode 会话。'}
+        </div>
       )}
 
       <ul className="row-list">
@@ -147,7 +307,10 @@ export function ProjectDetailPage({ projectID }: { projectID: string }) {
                     </span>
                   )}
                 </span>
-                <span className="row-sub mono">{t.branch || t.worktree_path}</span>
+                {/* dir 任务无分支概念，直接展示项目目录路径（依据 project_kind，非判空推断） */}
+                <span className="row-sub mono">
+                  {t.project_kind === 'dir' ? t.worktree_path : t.branch || t.worktree_path}
+                </span>
               </div>
               <StatusBadge status={t.status} />
               <InitStatusBadge task={t} />

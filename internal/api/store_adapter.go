@@ -17,8 +17,8 @@ func NewProjectStoreAdapter(db *store.DB) ProjectStore {
 	return &storeProjectAdapter{db: db}
 }
 
-func (a *storeProjectAdapter) CreateProject(ctx context.Context, id, name, path, defaultBranch string) error {
-	return a.db.CreateProject(ctx, id, name, path, defaultBranch)
+func (a *storeProjectAdapter) CreateProject(ctx context.Context, id, name, path, defaultBranch, kind string) error {
+	return a.db.CreateProject(ctx, id, name, path, defaultBranch, kind)
 }
 
 func (a *storeProjectAdapter) GetProject(ctx context.Context, id string) (storeProjectRow, error) {
@@ -31,6 +31,7 @@ func (a *storeProjectAdapter) GetProject(ctx context.Context, id string) (storeP
 		Name:          p.Name,
 		Path:          p.Path,
 		DefaultBranch: p.DefaultBranch,
+		Kind:          p.Kind,
 		CreatedAt:     p.CreatedAt,
 	}, nil
 }
@@ -45,6 +46,7 @@ func (a *storeProjectAdapter) GetProjectByPath(ctx context.Context, path string)
 		Name:          p.Name,
 		Path:          p.Path,
 		DefaultBranch: p.DefaultBranch,
+		Kind:          p.Kind,
 		CreatedAt:     p.CreatedAt,
 	}, nil
 }
@@ -61,6 +63,7 @@ func (a *storeProjectAdapter) ListProjects(ctx context.Context) ([]storeProjectR
 			Name:          p.Name,
 			Path:          p.Path,
 			DefaultBranch: p.DefaultBranch,
+			Kind:          p.Kind,
 			CreatedAt:     p.CreatedAt,
 		})
 	}

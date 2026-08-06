@@ -665,7 +665,7 @@ func openRealStore(t *testing.T) (*StoreAdapter, *store.DB) {
 	}
 	t.Cleanup(func() { db.Close() })
 	ctx := context.Background()
-	if err := db.CreateProject(ctx, "p1", "proj", "/repo", "main"); err != nil {
+	if err := db.CreateProject(ctx, "p1", "proj", "/repo", "main", "repo"); err != nil {
 		t.Fatalf("create project: %v", err)
 	}
 	if err := db.CreateTask(ctx, store.TaskRow{

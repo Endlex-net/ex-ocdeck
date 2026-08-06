@@ -48,9 +48,13 @@ func (m *Manager) Add(ctx context.Context, repoPath, dest, branch, baseRef strin
 		return err
 	}
 
-	repoLock := git.RepoLock(repoPath)
-	repoLock.Lock()
-	defer repoLock.Unlock()
+	// 仓库级写锁（add-plain-dir-project D10：升级为 context-aware AcquireRepoLock，
+	// 与 refresh fetch、GitPush(-u) 串行；ctx 取消及时返回不进锁）。
+	unlock, err := git.AcquireRepoLock(ctx, repoPath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	// 目标已存在检查移入锁内（B8）：锁外检查通过后锁内可能被并发 Add 抢先创建。
 	if _, err := os.Stat(dest); err == nil {
@@ -154,9 +158,13 @@ func (m *Manager) Remove(ctx context.Context, wtPath string, opts RemoveOpts) er
 		return err
 	}
 
-	repoLock := git.RepoLock(opts.RepoPath)
-	repoLock.Lock()
-	defer repoLock.Unlock()
+	// 仓库级写锁（add-plain-dir-project D10：升级为 context-aware AcquireRepoLock，
+	// 与 refresh fetch、GitPush(-u) 串行；ctx 取消及时返回不进锁）。
+	unlock, err := git.AcquireRepoLock(ctx, opts.RepoPath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	// S3：destructive 前二次包含性校验，缩小 TOCTOU 窗口。
 	if err := m.checkContainment(wtPath); err != nil {

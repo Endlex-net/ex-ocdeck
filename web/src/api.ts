@@ -12,6 +12,7 @@ import type {
   OcConfigSaveResult,
   Project,
   ProjectDetail,
+  ProjectKind,
   ServerStatus,
   Task,
   TerminalInfo,
@@ -137,14 +138,25 @@ async function requestText(method: string, path: string): Promise<string> {
 
 export const api = {
   listProjects: () => request<Project[]>('GET', '/projects'),
-  createProject: (name: string, path: string) =>
-    request<Project>('POST', '/projects', { name, path }),
+  /** kind 缺省 repo；dir 仅校验路径存在（add-plain-dir-project D1/D6）。 */
+  createProject: (name: string, path: string, kind: ProjectKind = 'repo') =>
+    request<Project>('POST', '/projects', { name, path, kind }),
   getProject: (id: string) => request<ProjectDetail>('GET', `/projects/${id}`),
   deleteProject: (id: string) => request<void>('DELETE', `/projects/${id}`),
+  /** 分支短名列表（D10）：本地在前、远端在后；dir 项目返回错误（前端不调用）。 */
+  listBranches: (projectID: string) =>
+    request<string[]>('GET', `/projects/${projectID}/branches`),
+  /** 远端刷新（D10）：git fetch 后返回同构短名数组；秒级延迟，失败 git_error。 */
+  refreshBranches: (projectID: string) =>
+    request<string[]>('POST', `/projects/${projectID}/branches/refresh`),
 
   listTasks: (projectID: string) => request<Task[]>('GET', `/projects/${projectID}/tasks`),
-  createTask: (projectID: string, name: string) =>
-    request<Task>('POST', `/projects/${projectID}/tasks`, { name }),
+  /** baseRef 仅 repo 项目可选（短名，空 = 项目默认分支）；dir 项目不提供。 */
+  createTask: (projectID: string, name: string, baseRef?: string) =>
+    request<Task>('POST', `/projects/${projectID}/tasks`, {
+      name,
+      ...(baseRef ? { base_ref: baseRef } : {}),
+    }),
   getTask: (id: string) => request<Task>('GET', `/tasks/${id}`),
   taskAction: (id: string, action: 'activate' | 'suspend' | 'archive' | 'restore' | 'retry') =>
     request<void>('POST', `/tasks/${id}/${action}`),

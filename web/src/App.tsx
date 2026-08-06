@@ -34,8 +34,12 @@ export function App() {
   if (path === '/configs') page = <ConfigsPage />;
   else if (path === '/ai-config') page = <AIConfigPage />;
   else if (path === '/active') page = <ActiveSessionsPage />;
-  else if (projectMatch) page = <ProjectDetailPage projectID={projectMatch[1]} />;
-  else if (taskMatch) page = <TaskWorkbenchPage taskID={taskMatch[1]} fromActive={fromActive} />;
+  // 按路由 ID key 页面组件：直接项目→项目 / 任务→任务导航时整体重挂载，
+  // 避免跨项目/跨任务复用旧状态（如基线分支、分支列表）
+  else if (projectMatch)
+    page = <ProjectDetailPage key={projectMatch[1]} projectID={projectMatch[1]} />;
+  else if (taskMatch)
+    page = <TaskWorkbenchPage key={taskMatch[1]} taskID={taskMatch[1]} fromActive={fromActive} />;
   else page = <ProjectsPage />;
 
   // 应用级骨架：server 状态告警 banner 在所有页面顶部可见；

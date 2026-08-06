@@ -96,7 +96,7 @@ func TestStopAndJoinAllRuntimes_NoLeak(t *testing.T) {
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
 	rt.registerGroup("serve", serveSessionName("t1"))
-	if err := m.startSSE(lifeCtx, rt, "t1", "/wt", 50001, "pw"); err != nil {
+	if err := m.startSSE(lifeCtx, rt, "t1", "/wt", 50001, "pw", AlignModeRepo); err != nil {
 		t.Fatalf("startSSE: %v", err)
 	}
 	m.watchServeExit("t1", serveSessionName("t1"))

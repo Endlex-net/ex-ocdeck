@@ -295,6 +295,13 @@ body {
   background: #3a3120;
 }
 
+/* 项目类型徽标（repo/dir）：中性色，与 error/notice 区分 */
+.flag-kind {
+  color: var(--text-dim);
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+}
+
 .task-actions {
   display: inline-flex;
   gap: 6px;
@@ -788,6 +795,70 @@ body {
 
 select.input {
   cursor: pointer;
+}
+
+/* ---------- 分支 combobox（add-plain-dir-project D10） ---------- */
+.combobox {
+  position: relative;
+}
+
+.combobox-input {
+  min-width: 220px;
+}
+
+.combobox-list {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  min-width: 100%;
+  max-width: 340px;
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 2px;
+  z-index: 30;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+}
+
+.combobox-option {
+  display: block;
+  width: 100%;
+  padding: 4px 8px;
+  border: none;
+  border-radius: 3px;
+  background: none;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.combobox-option-active {
+  background: var(--bg-hover);
+}
+
+.combobox-option-selected {
+  color: var(--accent);
+}
+
+.combobox-empty {
+  padding: 5px 8px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+/* 表单帮助文本（注册/创建引导文案） */
+.form-hint {
+  margin: -10px 0 12px;
+  padding: 0 2px;
+  color: var(--text-dim);
+  font-size: 11px;
 }
 
 /* ---------- git 面板（2.6） ---------- */

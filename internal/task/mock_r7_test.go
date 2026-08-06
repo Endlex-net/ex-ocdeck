@@ -60,6 +60,26 @@ func (s *sessionTraceStore) DeleteTaskSession(ctx context.Context, taskID, sessi
 	return s.TaskStore.DeleteTaskSession(ctx, taskID, sessionID)
 }
 
+// add-plain-dir-project D8：ClaimTaskSession 取代 session.created 的 upsert，trace 记为 "upsert:<sid>"
+//（归属创建语义一致，保留 replay 顺序断言不变）。
+func (s *sessionTraceStore) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (bool, string, error) {
+	s.mu.Lock()
+	s.trace = append(s.trace, "upsert:"+sessionID)
+	s.mu.Unlock()
+	return s.TaskStore.ClaimTaskSession(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+}
+
+// TouchOwnedTaskSession 取代 session.updated 的 upsert；trace 不记录（updated 不创建归属，
+// replay 顺序测试关注 created/deleted 顺序）。
+func (s *sessionTraceStore) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (bool, error) {
+	return s.TaskStore.TouchOwnedTaskSession(ctx, taskID, sessionID, lastSeenAt)
+}
+
+// AlignTaskSessions 首次对齐不记 trace（测试关注实时事件 replay 顺序，非首次对齐）。
+func (s *sessionTraceStore) AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, noticeFn func(sql.NullString) sql.NullString) ([]string, error) {
+	return s.TaskStore.AlignTaskSessions(ctx, taskID, mode, listed, complete, noticeFn)
+}
+
 func (s *sessionTraceStore) snapshot() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -257,6 +277,26 @@ func (w *sessionStoreErrWrapper) ListTopLevelTaskSessions(ctx context.Context, t
 		return nil, w.listTopErr
 	}
 	return w.TaskStore.ListTopLevelTaskSessions(ctx, taskID)
+}
+
+// add-plain-dir-project D8：claim/touch 归属写入口经 wrapper，复用 upsertErr 触发
+//（实时 session.created 走 ClaimTaskSession、session.updated 走 TouchOwnedTaskSession，
+// 失败语义同既有 upsert 失败：归属写入错误传播，收敛运行时）。AlignTaskSessions 不在此拦截
+//（对齐错误由专用测试覆盖，且 Activate 内首次对齐失败会导致 Activate 失败而非 SSE 实时收敛路径）。
+func (w *sessionStoreErrWrapper) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (bool, string, error) {
+	if w.upsertErr != nil {
+		return false, "", w.upsertErr
+	}
+	return w.TaskStore.ClaimTaskSession(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+}
+func (w *sessionStoreErrWrapper) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (bool, error) {
+	if w.upsertErr != nil {
+		return false, w.upsertErr
+	}
+	return w.TaskStore.TouchOwnedTaskSession(ctx, taskID, sessionID, lastSeenAt)
+}
+func (w *sessionStoreErrWrapper) AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, noticeFn func(sql.NullString) sql.NullString) ([]string, error) {
+	return w.TaskStore.AlignTaskSessions(ctx, taskID, mode, listed, complete, noticeFn)
 }
 
 // memCleanupDebtStore 内存实现 CleanupDebtStore（用于 orphan ticket 持久化测试）。

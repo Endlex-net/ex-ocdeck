@@ -56,7 +56,7 @@ func TestCreate_AutoActivateTriggered(t *testing.T) {
 	oc := newMockOC(true)
 	m, _ := newTestManagerWithLifecycle(t, store, proc, wt, oc)
 
-	row, err := m.Create(context.Background(), "p1", "Auto Task")
+	row, err := m.Create(context.Background(), "p1", "Auto Task", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestCreate_AutoActivateFailureFallsToSuspended(t *testing.T) {
 	oc.probeErr = errors.New("capability mismatch boom")
 	m, _ := newTestManagerWithLifecycle(t, store, proc, wt, oc)
 
-	row, err := m.Create(context.Background(), "p1", "Fail Task")
+	row, err := m.Create(context.Background(), "p1", "Fail Task", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestRetryCreationFailed_AutoActivateTriggered(t *testing.T) {
 	store := newMockStore()
 	store.seedProject(ProjectRow{ID: "p1", Name: "proj", Path: "/repo", DefaultBranch: "main"})
 	t1 := TaskRow{ID: "t1", ProjectID: "p1", Name: "task", Branch: "ocdeck/task",
-		Status: StatusCreationFailed, WorktreePath: "/data/worktrees/p1/t1"}
+		Status: StatusCreationFailed, WorktreePath: "/data/worktrees/p1/t1", BaseRef: "refs/heads/main"}
 	store.tasks["t1"] = t1
 	wt := newMockWorktree()
 	proc := newMockProc()
@@ -159,7 +159,7 @@ func TestCreate_AutoActivateUsesLifecycleCtxNotRequestCtx(t *testing.T) {
 
 	// Create 用可取消请求 ctx，Create 返回后立即取消请求 ctx。
 	reqCtx, reqCancel := context.WithCancel(context.Background())
-	row, err := m.Create(reqCtx, "p1", "Ctx Task")
+	row, err := m.Create(reqCtx, "p1", "Ctx Task", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}

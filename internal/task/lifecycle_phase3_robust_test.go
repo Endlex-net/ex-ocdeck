@@ -1789,7 +1789,7 @@ func TestRetryCreate_BothPaths_RerunInherit(t *testing.T) {
 				wt.products[wtPath] = true
 				wt.branches["ocdeck/mytask"] = true
 			}
-			store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Name: "mytask", Status: StatusCreationFailed, WorktreePath: wtPath, Branch: "ocdeck/mytask", InitStatus: InitStatusNone}
+			store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Name: "mytask", Status: StatusCreationFailed, WorktreePath: wtPath, Branch: "ocdeck/mytask", InitStatus: InitStatusNone, BaseRef: "refs/heads/main"}
 			if err := m.Retry(context.Background(), "t1", false); err != nil {
 				t.Fatalf("Retry: %v", err)
 			}

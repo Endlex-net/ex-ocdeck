@@ -266,10 +266,25 @@ func Commit(ctx context.Context, dir, msg string, paths []string) error {
 }
 
 // Push 将 dir 所在分支推送到 origin。首次推送含 -u 设置 upstream。MUST NOT force-push。
+// Push 推送分支到 origin 并设置上游（-u 写共享 .git/config）。
+// add-plain-dir-project D10：-u 写共享 .git/config 纳入 canonical repo 写锁，与 worktree.Add/Remove、
+// refresh fetch 串行。dir 可为 worktree 路径，经 WorktreeDir 解析为 canonical repo 根再上锁。
 func Push(ctx context.Context, dir, branch string) error {
 	if branch == "" {
 		return errors.New("git: empty branch")
 	}
+	// 解析 canonical repo 根（dir 可为 worktree；--git-common-dir 的父目录即 repo 根）。
+	repoRoot, rerr := WorktreeDir(ctx, dir)
+	if rerr != nil {
+		// 解析失败回退用 dir 上锁（best-effort，保持既有串行；不阻塞 push）。
+		repoRoot = dir
+	}
+	unlock, lerr := AcquireRepoLock(ctx, repoRoot)
+	if lerr != nil {
+		return lerr
+	}
+	defer unlock()
+
 	if err := ValidateBranchName(ctx, dir, branch); err != nil {
 		return err
 	}

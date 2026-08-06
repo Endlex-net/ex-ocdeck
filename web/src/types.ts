@@ -1,9 +1,14 @@
 // 与 internal/api DTO 对齐的前端类型（design.md §21）。
 
+/** 项目类型（add-plain-dir-project D1/D6）：repo=git 仓库，dir=纯目录（无 git 功能）。 */
+export type ProjectKind = 'repo' | 'dir';
+
 export interface Project {
   id: string;
   name: string;
   path: string;
+  /** 项目类型：repo（缺省）| dir。UI 降级判断的唯一依据，MUST NOT 前端自行推断。 */
+  kind: ProjectKind;
   default_branch: string;
   created_at: number;
   /** 任务总数与状态分布（列表与详情均返回，字段一致）。 */
@@ -27,6 +32,8 @@ export interface NoticeItem {
 export interface Task {
   id: string;
   project_id: string;
+  /** 所属项目类型（add-plain-dir-project D6）：UI 降级判断的唯一依据。 */
+  project_kind: ProjectKind;
   name: string;
   branch: string;
   status: string;

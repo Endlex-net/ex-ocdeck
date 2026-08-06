@@ -49,7 +49,7 @@ type StoreRO interface {
 // ProjectStore 项目注册所需的 store 能力（design.md §21 projects 路由）。
 // 复用 internal/store 既有 Queries 方法签名。
 type ProjectStore interface {
-	CreateProject(ctx context.Context, id, name, path, defaultBranch string) error
+	CreateProject(ctx context.Context, id, name, path, defaultBranch, kind string) error
 	GetProject(ctx context.Context, id string) (storeProjectRow, error)
 	GetProjectByPath(ctx context.Context, path string) (storeProjectRow, error)
 	ListProjects(ctx context.Context) ([]storeProjectRow, error)
@@ -60,11 +60,13 @@ type ProjectStore interface {
 }
 
 // storeProjectRow 解耦 store.ProjectRow，避免 api 直接依赖 store 包结构。
+// Kind ∈ repo | dir（migration 0008，add-plain-dir-project D1）。
 type storeProjectRow struct {
 	ID            string
 	Name          string
 	Path          string
 	DefaultBranch string
+	Kind          string
 	CreatedAt     int64
 }
 
