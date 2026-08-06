@@ -1,8 +1,7 @@
-# Task Lifecycle Specification
+# Delta: task-lifecycle
 
-## Purpose
-以独立 git worktree + 分支建模任务，定义活跃/挂起/归档/删除状态机与挂起恢复、删除清理、重启 reconciliation 等生命周期行为。
-## Requirements
+## MODIFIED Requirements
+
 ### Requirement: 任务创建
 
 系统 SHALL 支持在项目下创建任务。`kind=repo` 项目的每个任务 MUST 拥有独立的 git worktree 与独立分支（从选定基线切出，缺省为项目默认分支）。`kind=dir`（纯目录）项目的任务 MUST NOT 创建 worktree 与分支：分支记录为空、`worktree_path` 记录为项目路径本身、分支命名（LLM slug 与机械 slugify）、分支校验/冲突检查、worktree 路径生成与碰撞重试、worktree add、inherit 文件继承全部跳过；init script 保留（仍按项目配置决定 `init_status` 并触发 InitRunner/自动激活）。dir 任务创建在落库前 MUST 做无副作用预检：项目路径存在且为目录，否则以 invalid_state 拒绝且 MUST NOT 落 creating 行。dir 任务创建 MUST 为零文件/git 副作用（除落库与后续激活/init 的进程副作用外），`creation_failed` 仅可能来自 lifecycle 配置读取失败或提交点失败。以下 worktree/分支义务均仅适用于 `kind=repo` 项目。
@@ -169,58 +168,6 @@ repo 任务创建 SHALL 支持可选基线分支参数 `base_ref`：外部输入
 - **WHEN** 同一 dir 项目下已存在活跃任务，用户再创建/激活新任务
 - **THEN** 系统允许并行（无互斥锁，符合无人工并发配额语义），UI 显示"多任务共享同一目录、无文件隔离"提示
 
-### Requirement: 任务状态机
-任务 SHALL 具有三种用户可见状态：活跃、挂起、归档；删除为**硬删除**（成功后记录移除，无"已删除"展示态）。合法流转 MUST 限定为：挂起→活跃、活跃→挂起、挂起→归档、归档→挂起、活跃→挂起（自动，kill 模式服务端重启；persist 模式重启且会话存活时保持活跃）、挂起/归档/创建失败→删除。系统 SHALL 额外维护内部过渡状态（creating/creation_failed/activating/suspending/deleting/deletion_failed）与 `last_error` 字段，用于表达部分失败与恢复；对过渡态任务的 Retry 操作 MUST 幂等（外部资源不存在视为该步骤已成功）。
-
-#### Scenario: 激活挂起任务
-- **WHEN** 用户对挂起任务执行激活
-- **THEN** 系统启动该任务的 opencode 会话组（serve + TUI）并置为活跃；中途失败则回退为挂起并记录 last_error
-
-#### Scenario: 挂起活跃任务
-- **WHEN** 用户对活跃任务执行挂起
-- **THEN** 系统停止该任务全部 tmux 会话、保留 worktree 并置为挂起
-
-挂起结果 MUST 按以下互斥决策树收敛（按序判定取首个命中分支）：
-
-#### Scenario: 分支 a — serve 已死
-- **WHEN** 挂起过程中发现 serve 进程已退出
-- **THEN** 系统继续完成剩余清理后落为挂起；个别会话杀不掉时注册残留会话、记录 notice 并后台重试
-
-#### Scenario: 分支 b — serve 存活且清理全部成功
-- **WHEN** serve 存活且全部会话终止成功
-- **THEN** 任务落为挂起
-
-#### Scenario: 分支 c — serve 存活但清理部分失败
-- **WHEN** serve 仍存活但存在 kill 失败
-- **THEN** 系统尝试修复运行时（重订阅 SSE、重开 attach）；修复成功回活跃 + last_error；修复失败或期间 serve 死亡则转分支 a 落挂起
-
-#### Scenario: 存在残留时拒绝激活
-- **WHEN** 任务存在未清理的旧代残留会话或残留进程 cleanup debt，用户执行激活
-- **THEN** 系统拒绝激活并提示先清理或强制删除（管理面与强制删除保持可用）
-
-#### Scenario: 归档与恢复
-- **WHEN** 用户对挂起任务执行归档
-- **THEN** 任务收起展示但 worktree 保留，且可恢复为挂起
-
-#### Scenario: 创建中途失败
-- **WHEN** 创建任务时 worktree 已建但 DB 写入失败
-- **THEN** 任务呈 creation_failed 并记录 last_error，用户可重试（仅补 DB 写）或删除（清理 worktree 与分支）
-
-### Requirement: 挂起后恢复会话
-系统 SHALL 持久化任务关联的 opencode session ID（经 serve SSE 事件捕获与全量对齐，取 `last_seen_at` 最大者）。**激活 MUST 立即锚定确定 session，MUST NOT 使用 `--continue`**（其"目录最近会话"语义不等于本任务会话）：有记录时以 `attach --session <最近 sessionID>` 恢复本任务会话（启动前经 `GET /session/:id` 预检）；**无记录或预检 404 时，ocdeck MUST 先经 `POST /session` 创建新会话并持久化到 task_sessions，再以 `attach --session <newID>` 启动**——任务首次激活即产生确定 session 归属，用户未输入任何内容也可确定性恢复。认证失败、网络失败等其他 attach 失败 MUST NOT 触发任何回退。
-
-#### Scenario: 按 session ID 恢复
-- **WHEN** 用户激活一个曾活跃过且有 session 记录的任务
-- **THEN** attach 以 `--session <id>` 恢复，用户看到本任务之前的对话历史
-
-#### Scenario: session 已不存在
-- **WHEN** 记录的 sessionID 已被删除（serve 返回 404）
-- **THEN** ocdeck 经 REST 创建新会话并持久化，attach 以 `--session <newID>` 启动（不使用 --continue）
-
-#### Scenario: 无 session 记录
-- **WHEN** 任务无任何 session 记录
-- **THEN** ocdeck 经 REST 创建新会话并持久化到 task_sessions，attach 以 `--session <newID>` 启动，任务立即拥有确定 session 归属
-
 ### Requirement: 任务删除清理
 
 系统 SHALL 在删除任务前完成全部前置检查（dirty/untracked 确认、分支被其他 worktree 占用检查、路径包含性校验），**全部通过后才允许任何副作用**。此外，任务 init 进行中（`init_status ∈ {pending,running}`）时 MUST 拒绝删除与归档（invalid_state，提示 init 进行中）。删除副作用 MUST 按序执行：① 持久化 delete_mode + 置 deleting ② **RetryReap 既有 cleanup debt**（remaining 非空则落 deletion_failed，不得继续）③ 删 oc session 数据（逐个，404 幂等视为成功）④ kill 残余 tmux 会话（若有）⑤ 二次 dirty 门禁 ⑥ pre_delete script（项目配置时；worktree 不存在则幂等跳过；语义见 project-lifecycle-config spec）⑦ 删 worktree ⑧ 删本地分支 ⑨ 删 DB 记录 ⑩ best-effort 清理任务日志目录（忽略错误）。远端分支 MUST NOT 被删除。**Force 模式只能跳过 ③ 与 ⑥，MUST NOT 跳过 ② 进程收割**。
@@ -307,29 +254,3 @@ repo 任务创建 SHALL 支持可选基线分支参数 `base_ref`：外部输入
 
 - **WHEN** 服务端重启后 reconcile 遇到 dir 项目的 creating/creation_failed 任务
 - **THEN** 与 repo 任务语义完全一致：creating 落 creation_failed（可 Retry），creation_failed 保持原状；reconcile 不执行任何 git/产物验证，dir 任务的目录存在性仅在创建前置与 Retry 时校验
-
-### Requirement: 无人工并发配额
-系统 SHALL NOT 设置并行活跃任务数量的人工配额；当端口、文件描述符或磁盘等资源耗尽时 MUST 返回明确错误而非静默失败。
-
-#### Scenario: 并行多任务
-- **WHEN** 用户同时激活多个任务
-- **THEN** 系统为每个任务独立运行 tmux 会话组，互不干扰
-
-#### Scenario: 端口范围耗尽
-- **WHEN** 可配置端口范围内无可用端口
-- **THEN** 激活失败并提示端口耗尽，任务回退挂起
-
-### Requirement: 任务 init 状态可见性
-
-任务 DTO SHALL 携带 init_status 与 init_error 字段，UI SHALL 在任务列表/工作台展示全部 init 状态：`pending|running` 显示"init 进行中"标识；`failed` 显示失败标识与日志查看入口；`none|succeeded` 不显示 init 徽标；Re-run 入口 MUST 仅在 `status=suspended 且 init_status ∈ {failed,succeeded}` 时提供（与后端门禁一致，archived 任务不出现必然被拒的按钮）；init_status 非 `none|succeeded` 时全部激活入口（含工作台内联激活按钮）MUST 禁用并说明原因；任务详情 MUST 始终提供 init 日志查看入口（inherit 警告经此可见）。删除因 pre_delete script 失败（deletion_failed，以 last_error 的 `pre-delete:` 前缀识别）时，UI SHALL 提供 pre-delete 日志查看入口；删除确认弹窗的 Force 选项 SHALL 说明其同时跳过 pre-delete 脚本。
-
-#### Scenario: init 失败的任务展示
-
-- **WHEN** 任务 status=suspended 且 init_status=failed
-- **THEN** UI 显示失败标识，提供日志查看与 Re-run 按钮，激活按钮禁用并提示需先 Re-run init；archived 任务不提供 Re-run 入口
-
-#### Scenario: pre-delete 失败可诊断
-
-- **WHEN** 任务因 pre_delete script 失败落 deletion_failed
-- **THEN** UI 提供 pre-delete 日志查看入口，用户可据日志修复后重试或强制删除
-
