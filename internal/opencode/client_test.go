@@ -62,7 +62,7 @@ func TestHealth_OK(t *testing.T) {
 			t.Fatalf("path: %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"healthy":true,"version":"1.18.9"}`)
+		_, _ = io.WriteString(w, fmt.Sprintf(`{"healthy":true,"version":"%s"}`, ContractBaseline))
 	}))
 	defer srv.Close()
 
@@ -71,7 +71,7 @@ func TestHealth_OK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Health: %v", err)
 	}
-	if !h.Healthy || h.Version != "1.18.9" {
+	if !h.Healthy || h.Version != ContractBaseline {
 		t.Fatalf("Health body: %+v", h)
 	}
 }
@@ -449,7 +449,7 @@ func TestProbe_OK(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/global/health":
-			_, _ = io.WriteString(w, `{"healthy":true,"version":"1.18.9"}`)
+			_, _ = io.WriteString(w, fmt.Sprintf(`{"healthy":true,"version":"%s"}`, ContractBaseline))
 		case "/session/status":
 			_, _ = io.WriteString(w, `{"s1":{"type":"idle"}}`)
 		case "/session":
@@ -466,14 +466,14 @@ func TestProbe_OK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Probe: %v", err)
 	}
-	if v != "1.18.9" {
+	if v != ContractBaseline {
 		t.Fatalf("version: %s", v)
 	}
 }
 
 func TestProbe_Unhealthy(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"healthy":false,"version":"1.18.9"}`)
+		_, _ = io.WriteString(w, fmt.Sprintf(`{"healthy":false,"version":"%s"}`, ContractBaseline))
 	}))
 	defer srv.Close()
 
@@ -511,7 +511,7 @@ func TestProbe_BadSessionShape(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/global/health":
-			_, _ = io.WriteString(w, `{"healthy":true,"version":"1.18.9"}`)
+			_, _ = io.WriteString(w, fmt.Sprintf(`{"healthy":true,"version":"%s"}`, ContractBaseline))
 		case "/session/status":
 			_, _ = io.WriteString(w, `{"s1":{"type":"idle"}}`)
 		case "/session":

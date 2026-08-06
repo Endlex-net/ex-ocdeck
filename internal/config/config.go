@@ -18,6 +18,8 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+
+	"ocdeck/internal/opencode"
 )
 
 // ShutdownPolicy 关停策略（design.md §10）。
@@ -31,7 +33,8 @@ const (
 
 // ContractBaseline 是 opencode 契约基准版本（design.md §11/§20）。
 // 版本号仅作告警非门禁；激活门禁是能力探测。
-const ContractBaseline = "1.18.9"
+// 唯一真值定义在 internal/opencode（契约归属方），这里通过常量别名引用，避免跨包重复字面量。
+const ContractBaseline = opencode.ContractBaseline
 
 // PortRange serve 端口分配范围（design.md §3）。
 type PortRange struct {
@@ -349,7 +352,7 @@ func stripVersionSuffix(s string) string {
 }
 
 // compareOCVersion 比较探测到的 opencode 版本与契约基准（design.md §11）。
-// 形如 "opencode 1.18.9" 或 "1.18.9"；按 semver major.minor.patch 比较。
+// 形如 "opencode 1.18.14" 或 "1.18.14"；按 semver major.minor.patch 比较。
 // 返回 true 表示相等（versionVerified），false 触发告警。
 func compareOCVersion(detected, baseline string) bool {
 	return normalizeOCVersion(detected) == normalizeOCVersion(baseline)
@@ -364,7 +367,7 @@ func VersionMatches(detected, baseline string) bool {
 func normalizeOCVersion(s string) string {
 	ver := s
 	if i := strings.IndexByte(ver, ' '); i >= 0 {
-		// 形如 "opencode 1.18.9" → 取最后一段。
+		// 形如 "opencode 1.18.14" → 取最后一段。
 		ver = strings.TrimSpace(ver[i+1:])
 	}
 	ver = strings.TrimPrefix(ver, "v")

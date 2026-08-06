@@ -31,14 +31,14 @@ func (c *probeSequenceOC) Probe(ctx context.Context) (string, error) {
 	if idx >= len(c.seq) {
 		// 超出序列：默认成功（避免无限失败拖慢断言）。
 		c.mu.Unlock()
-		return "1.18.9", nil
+		return opencode.ContractBaseline, nil
 	}
 	err := c.seq[idx]
 	c.mu.Unlock()
 	if err != nil {
 		return "", err
 	}
-	return "1.18.9", nil
+	return opencode.ContractBaseline, nil
 }
 
 func (c *probeSequenceOC) probeCalls() int {

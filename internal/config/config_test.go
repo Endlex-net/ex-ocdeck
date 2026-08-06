@@ -11,7 +11,7 @@ func TestLoad_RejectsMissingToken(t *testing.T) {
 	opts := Options{
 		EnvLookup:     emptyEnv(),
 		OS:            OSInfo{GOOS: "darwin"},
-		OpenCodeProbe: func() (string, error) { return "1.18.9", nil },
+		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
 		TmuxProbe:     func() (string, error) { return "tmux 3.4", nil },
 	}
 	_ = opts
@@ -41,7 +41,7 @@ func TestLoad_RejectsEmptyToken(t *testing.T) {
 			return "", false
 		},
 		OS:            OSInfo{GOOS: "darwin"},
-		OpenCodeProbe: func() (string, error) { return "1.18.9", nil },
+		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
 		TmuxProbe:     func() (string, error) { return "tmux 3.4", nil },
 	})
 	if err == nil {
@@ -62,7 +62,7 @@ func TestLoad_DefaultPersist(t *testing.T) {
 			return "", false
 		},
 		OS:            OSInfo{GOOS: "darwin"},
-		OpenCodeProbe: func() (string, error) { return "1.18.9", nil },
+		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
 		TmuxProbe:     func() (string, error) { return "tmux 3.4", nil },
 	})
 	if err != nil {
@@ -92,7 +92,7 @@ func TestLoad_GOOSNonDarwinRejected(t *testing.T) {
 			return "", false
 		},
 		OS:            OSInfo{GOOS: "linux"},
-		OpenCodeProbe: func() (string, error) { return "1.18.9", nil },
+		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
 		TmuxProbe:     func() (string, error) { return "tmux 3.4", nil },
 	})
 	if err == nil {
@@ -115,7 +115,7 @@ func TestLoad_InvalidShutdownPolicy(t *testing.T) {
 			return "", false
 		},
 		OS:            OSInfo{GOOS: "darwin"},
-		OpenCodeProbe: func() (string, error) { return "1.18.9", nil },
+		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
 		TmuxProbe:     func() (string, error) { return "tmux 3.4", nil },
 	})
 	if err == nil {
@@ -157,7 +157,7 @@ func TestLoad_TmuxTooOldRejected(t *testing.T) {
 			return "", false
 		},
 		OS:            OSInfo{GOOS: "darwin"},
-		OpenCodeProbe: func() (string, error) { return "1.18.9", nil },
+		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
 		TmuxProbe:     func() (string, error) { return "tmux 3.1", nil },
 	})
 	if err == nil {
@@ -178,7 +178,7 @@ func TestLoad_SingleInstanceLock(t *testing.T) {
 			return "", false
 		},
 		OS:            OSInfo{GOOS: "darwin"},
-		OpenCodeProbe: func() (string, error) { return "1.18.9", nil },
+		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
 		TmuxProbe:     func() (string, error) { return "tmux 3.4", nil },
 	}
 	_, release, err := Load(opts)
@@ -266,7 +266,7 @@ func TestLoad_LockBeforeProbe(t *testing.T) {
 		OS: OSInfo{GOOS: "darwin"},
 		OpenCodeProbe: func() (string, error) {
 			probeCalled = true
-			return "1.18.9", nil
+			return ContractBaseline, nil
 		},
 		TmuxProbe: func() (string, error) { return "tmux 3.4", nil },
 	})
@@ -291,7 +291,7 @@ func TestLoad_DataDirCreated(t *testing.T) {
 			return "", false
 		},
 		OS:            OSInfo{GOOS: "darwin"},
-		OpenCodeProbe: func() (string, error) { return "1.18.9", nil },
+		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
 		TmuxProbe:     func() (string, error) { return "tmux 3.4", nil },
 	})
 	if err != nil {
@@ -313,12 +313,12 @@ func TestCompareOCVersion(t *testing.T) {
 		baseline string
 		want     bool
 	}{
-		{"1.18.9", "1.18.9", true},
-		{"opencode 1.18.9", "1.18.9", true},
-		{"1.19.0", "1.18.9", false},
-		{"1.18.8", "1.18.9", false},
-		{"v1.18.9", "1.18.9", true},
-		{"test-1.0.0", "1.18.9", false},
+		{"1.18.14", "1.18.14", true},
+		{"opencode 1.18.14", "1.18.14", true},
+		{"1.19.0", "1.18.14", false},
+		{"1.18.8", "1.18.14", false},
+		{"v1.18.14", "1.18.14", true},
+		{"test-1.0.0", "1.18.14", false},
 	}
 	for _, c := range cases {
 		got := VersionMatches(c.detected, c.baseline)
@@ -370,7 +370,7 @@ func TestLoad_DataDirAbsolutized(t *testing.T) {
 			return "", false
 		},
 		OS:            OSInfo{GOOS: "darwin"},
-		OpenCodeProbe: func() (string, error) { return "1.18.9", nil },
+		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
 		TmuxProbe:     func() (string, error) { return "tmux 3.4", nil },
 	})
 	if err != nil {
