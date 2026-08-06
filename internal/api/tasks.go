@@ -49,7 +49,7 @@ type TaskBackend interface {
 	// 错误语义经 *task.OpError 携带：not_found/conflict/invalid_input/git_error，
 	// 由 mapTaskErr 统一映射 HTTP code/msg。
 	GitStatus(ctx context.Context, taskID string) (task.GitStatusDTO, error)
-	GitDiff(ctx context.Context, taskID, ref, path string) (task.GitDiffDTO, error)
+	GitDiff(ctx context.Context, taskID, ref, path string, untracked bool) (task.GitDiffDTO, error)
 	GitCommit(ctx context.Context, taskID, message string, paths []string) error
 	GitPush(ctx context.Context, taskID string) error
 	// RerunInit 手动重跑 init 脚本（design.md §8，tasks 3.6）。

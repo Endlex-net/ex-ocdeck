@@ -22,15 +22,22 @@ type FileStatus struct {
 	// Ignored 当条目为 '!'（--ignored=traditional 文件级枚举）时为 true。
 	// 既有 Status 调用默认不含 ignored 条目；仅 ListIgnoredUntracked 返回。
 	Ignored bool
-	// Additions / Deletions 为关联 numstat 的增删行数（未跟踪文件 additions 表示行数估算）。
+	// Additions / Deletions 为关联 numstat 的增删行数。
+	// 未跟踪文件（Untracked）无 numstat，Additions 为按行读取估算的文件行数（deletions=0），
+	// IsBinary 由前 8000 字节 NUL 嗅探标记；单文件 16MB / 累计 64MB 预算耗尽时 Additions=0 但 IsBinary 仍标记。
 	Additions int
 	Deletions int
 	// IsBinary 当 numstat 报告二进制（'-' '-'）时为 true。
+	// 未跟踪文件经前 8000 字节 NUL 嗅探判定（对齐 git 启发式）。
 	IsBinary bool
 }
 
 // ErrTooManyFilesChanged 表示变更文件数超过上限。
 var ErrTooManyFilesChanged = errors.New("too many changed files")
+
+// ErrInvalidDiffPath 表示 DiffUntracked 的路径校验失败（绝对路径 / `..` 逃逸 / NUL 等）。
+// Manager 据此映射 invalid_input，MUST 用 errors.Is 判定，禁止字符串匹配。
+var ErrInvalidDiffPath = errors.New("invalid diff path")
 
 // MaxStatusFiles 变更文件数上限。
 const MaxStatusFiles = 10000
