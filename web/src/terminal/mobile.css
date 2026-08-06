@@ -1,0 +1,57 @@
+/*
+ * 终端移动端样式（design D5/D8）。
+ *
+ * 仅在 TerminalView 引入，不进 styles.css（P2 lane 并行施工，避免写冲突）。
+ * z-index 自底向上（design D5 层叠关系）：
+ *   终端画面 < 锁定 overlay < 浮动按钮 < 连接状态 overlay（最顶层，确保控件可点）。
+ */
+
+/* 锁定 overlay：覆盖终端画面，拦截全部 pointer/touch，阻止 textarea 聚焦。
+ * 锁定时透明可见终端输出但不可交互。 */
+.terminal-lock-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  background: transparent;
+  cursor: default;
+  touch-action: none; /* 阻止浏览器原生滚动/双击缩放，交由手势层合成 */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* 浮动锁定/解锁按钮：锚定 .terminal-wrap 右下角。
+ * 高于锁定 overlay（锁定时可点解锁），低于连接状态 overlay（断线时连接控件最顶层）。 */
+.terminal-lock-button {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text-dim, #8a93a6);
+  background: var(--bg-panel, #141821);
+  border: 1px solid var(--border-strong, #2a3345);
+  border-radius: 6px;
+  cursor: pointer;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.terminal-lock-button:hover {
+  color: var(--text, #d6deeb);
+  border-color: var(--accent, #5ccfe6);
+}
+
+.terminal-lock-button:active {
+  transform: scale(0.97);
+}
+
+/* 连接状态 overlay 提升至最顶层（> 浮动按钮），确保「重新连接/接管」控件可点。
+ * 仅在 .terminal-wrap 作用域内覆盖 styles.css 的 z-index:5。 */
+.terminal-wrap .terminal-overlay {
+  z-index: 6;
+}
