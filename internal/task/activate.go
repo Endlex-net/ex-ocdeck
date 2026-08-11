@@ -305,7 +305,7 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 
 // activateCompensationTimeout 是 cleanup 阶段（kill 已建会话、枚举 shell、记 residual notice）
 // 所用 context 的独立短超时。补偿 MUST 脱离调用方 ctx 的取消：调用方 ctx 可能已取消
-//（probe 退避取消/健康检查超时），真实 store 用 ExecContext 会因 ctx 取消失败导致任务卡 activating。
+// （probe 退避取消/健康检查超时），真实 store 用 ExecContext 会因 ctx 取消失败导致任务卡 activating。
 // 用 context.WithoutCancel + 此超时保证 cleanup 有界完成。cleanup 内部 proc 调用不接收 compCtx、
 // 各自用 context.Background() 超时（单次 KillSession 可达 30s，多会话串行更久），故此预算仅约束
 // cleanup 内经 compCtx 的 store 写（notice 持久化）；超 30s 后 cleanup 内未完成的 store 写被取消，
@@ -313,7 +313,7 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 const activateCompensationTimeout = 30 * time.Second
 
 // activateCompensationFinalizeTimeout 是 cleanup 结束后「最终 DB 收敛」的独立短超时
-//（清 env 快照 + 状态回退 activating→suspended + last_error）。MUST 在 cleanup 结束后另起新 bounded
+// （清 env 快照 + 状态回退 activating→suspended + last_error）。MUST 在 cleanup 结束后另起新 bounded
 // context：无论 cleanup 耗时/成败，状态回退总有全新预算，避免 cleanup 耗尽 30s 预算后清快照/CAS
 // 拿到 deadline exceeded 的 compCtx 导致任务卡 activating。超时选 10s：两次 DB 写足够。
 const activateCompensationFinalizeTimeout = 10 * time.Second
@@ -740,6 +740,8 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 				go m.convergeToSuspendedForGen(taskID, "sse reconnect align failed: "+err.Error(), rt.generation, rt.instanceID)
 				return
 			}
+			// D6 注意力对账（align 路径）：session align 成功后、drainAndRelease 前。失败不影响任务状态机。
+			m.reconcileTaskAttention(sseCtx, rt, ocWithReady, wtPath)
 			// B4b：先排空全部缓冲事件再置 buffering=false 放行实时事件（design.md §4）。
 			drainAndRelease()
 		}
@@ -769,6 +771,8 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 			cancel()
 			return fmt.Errorf("sse initial align: %w", err)
 		}
+		// D6 注意力对账（align 路径）：首次 align 成功后、drainAndRelease 前。
+		m.reconcileTaskAttention(sseCtx, rt, ocWithReady, wtPath)
 		// B4b：先排空全部缓冲事件再置 buffering=false 放行实时事件（design.md §4）。
 		drainAndRelease()
 		alignMu.Unlock()
@@ -851,6 +855,14 @@ func (m *Manager) handleSSEEvent(ctx context.Context, taskID, wtPath string, ev 
 			return fmt.Errorf("delete session %s: %w", sid, err)
 		}
 	default:
+		// D6 注意力事件：permission/question v1+v2 家族。ParseAttentionEvent 命中则应用，
+		// 未知/缺字段静默忽略。注意力事件处理永不返回错误（不影响任务状态机）。
+		if aev, ok := opencode.ParseAttentionEvent(ev); ok {
+			if rt := m.getRuntime(taskID); rt != nil {
+				rt.applyAttentionEvent(aev)
+			}
+			return nil
+		}
 		// B3b：status/diff 等无 properties.info 的事件，sessionID 取 properties.sessionID
 		//（VERIFICATION.md 实测，回退 properties.info.id），反查 task_sessions 归属，
 		// 命中本任务才处理（design.md §4 补注）。未命中本任务的 session 不动本任务数据。
@@ -887,7 +899,7 @@ func (m *Manager) sessionBelongsToTask(ctx context.Context, taskID, sid string) 
 // alignSessions 全量对齐（design.md §4 + add-plain-dir-project D8）：
 // GET /session?directory=<wt>&limit=1000。count<limit → complete=true（删 owned 缺席行）；
 // count==limit → overflow，complete=false，先经事务外 CAS 写 session_overflow notice 再调对齐
-//（对齐失败 notice 保留，B5）。
+// （对齐失败 notice 保留，B5）。
 //
 // mode=AlignModeRepo：listed 逐个原子 claim（单任务场景 guard 不命中，行为与既有 upsert 一致），
 // 冲突 ID 经 store 层上报（此处仅传播 error，冲突 session 在 store 内被跳过）。

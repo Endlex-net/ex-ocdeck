@@ -87,6 +87,16 @@ func (f *fakeTaskBackend) ListActiveTaskOverview(ctx context.Context) ([]task.Ac
 	return []task.ActiveTaskOverviewRow{}, nil
 }
 
+// Attention 默认返回空快照（design.md D6 API 透出测试默认空响应）。
+func (f *fakeTaskBackend) Attention(taskID string) (task.Attention, bool) {
+	return task.Attention{Permissions: []task.PendingPermission{}, Questions: []task.PendingQuestion{}}, false
+}
+
+// ListProjectTaskSummaries 默认返回空切片（projects tasks 摘要测试默认空响应）。
+func (f *fakeTaskBackend) ListProjectTaskSummaries(ctx context.Context) ([]task.ProjectTaskSummary, error) {
+	return []task.ProjectTaskSummary{}, nil
+}
+
 // Git 默认实现（noop / 零值）：git API 测试在 gitTaskBackend / mockGitBackend 中覆盖。
 func (f *fakeTaskBackend) GitStatus(ctx context.Context, taskID string) (task.GitStatusDTO, error) {
 	return task.GitStatusDTO{}, nil

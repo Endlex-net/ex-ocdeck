@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -124,11 +125,11 @@ func TestListActiveSessions_HappyPath(t *testing.T) {
 	}
 	// 字段断言 + sort（last_active_at DESC）。
 	want := []activeSessionDTO{
-		{TaskID: "t1", ProjectID: "p1", ProjectName: "projA", Name: "taskA", Branch: "bA", WorktreePath: "/wtA", LastActiveAt: 300, AgentStatus: "busy"},
-		{TaskID: "t2", ProjectID: "p2", ProjectName: "projB", Name: "taskB", Branch: "bB", WorktreePath: "/wtB", LastActiveAt: 200, AgentStatus: "idle"},
+		{TaskID: "t1", ProjectID: "p1", ProjectName: "projA", Name: "taskA", Branch: "bA", WorktreePath: "/wtA", LastActiveAt: 300, AgentStatus: "busy", Attention: attentionDTO{Permissions: []permissionDTO{}, Questions: []questionDTO{}}},
+		{TaskID: "t2", ProjectID: "p2", ProjectName: "projB", Name: "taskB", Branch: "bB", WorktreePath: "/wtB", LastActiveAt: 200, AgentStatus: "idle", Attention: attentionDTO{Permissions: []permissionDTO{}, Questions: []questionDTO{}}},
 	}
 	for i, w := range want {
-		if got[i] != w {
+		if !reflect.DeepEqual(got[i], w) {
 			t.Errorf("dto[%d] = %+v, want %+v", i, got[i], w)
 		}
 	}

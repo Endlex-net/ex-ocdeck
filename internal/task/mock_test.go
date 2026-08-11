@@ -833,6 +833,11 @@ type mockOC struct {
 	createSessionResult opencode.Session
 	createSessionErr    error
 	createSessionCount  int64
+	// 注意力信号（D6）：ListPermissions/ListQuestions 返回。
+	listPermissionsResult []opencode.PermissionRequest
+	listPermissionsErr    error
+	listQuestionsResult   []opencode.QuestionRequest
+	listQuestionsErr      error
 }
 
 func newMockOC(healthOK bool) *mockOC {
@@ -916,6 +921,24 @@ func (c *mockOC) SubscribeEvents(ctx context.Context, dir string, onEvent func(o
 	return ctx.Err()
 }
 
+func (c *mockOC) ListPermissions(ctx context.Context, dir string) ([]opencode.PermissionRequest, error) {
+	if c.listPermissionsErr != nil {
+		return nil, c.listPermissionsErr
+	}
+	out := make([]opencode.PermissionRequest, len(c.listPermissionsResult))
+	copy(out, c.listPermissionsResult)
+	return out, nil
+}
+
+func (c *mockOC) ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error) {
+	if c.listQuestionsErr != nil {
+		return nil, c.listQuestionsErr
+	}
+	out := make([]opencode.QuestionRequest, len(c.listQuestionsResult))
+	copy(out, c.listQuestionsResult)
+	return out, nil
+}
+
 // --- test manager builder ---
 
 func newTestManager(t *testing.T, store TaskStore, proc ProcessBackend, wt WorktreeBackend, oc OCClient) *Manager {
@@ -965,4 +988,10 @@ func (c *readyOC) SubscribeEvents(ctx context.Context, dir string, onEvent func(
 		c.onReady()
 	}
 	return c.inner.SubscribeEvents(ctx, dir, onEvent, onReconnect)
+}
+func (c *readyOC) ListPermissions(ctx context.Context, dir string) ([]opencode.PermissionRequest, error) {
+	return c.inner.ListPermissions(ctx, dir)
+}
+func (c *readyOC) ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error) {
+	return c.inner.ListQuestions(ctx, dir)
 }

@@ -17,8 +17,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"ocdeck/internal/git"
+	"ocdeck/internal/task"
 )
 
 // registerProjectRoutes 注册 projects 相关路由（design.md §21）。
@@ -34,16 +37,35 @@ func (s *Server) registerProjectRoutes(mux *http.ServeMux) {
 // projectDTO 项目列表/创建响应 DTO。
 // task_count 与 tasks_by_status：项目列表与详情均返回（与前端 Project 类型对齐，
 // project-management spec 增强一致性）。列表经逐项目 CountProjectTasks 取概况。
+// tasks：项目任务摘要数组（design.md D4 + project-management spec MODIFIED），
+// 11 字段 = 10 存储字段 + attention_count，agentStatus 由 handler 水合填充。无任务为 []。
 // kind ∈ repo | dir（add-plain-dir-project D1）。
 type projectDTO struct {
-	ID            string         `json:"id"`
-	Name          string         `json:"name"`
-	Path          string         `json:"path"`
-	DefaultBranch string         `json:"default_branch"`
-	Kind          string         `json:"kind"`
-	CreatedAt     int64          `json:"created_at"`
-	TaskCount     int            `json:"task_count"`
-	Tasks         map[string]int `json:"tasks_by_status"`
+	ID            string                  `json:"id"`
+	Name          string                  `json:"name"`
+	Path          string                  `json:"path"`
+	DefaultBranch string                  `json:"default_branch"`
+	Kind          string                  `json:"kind"`
+	CreatedAt     int64                   `json:"created_at"`
+	TaskCount     int                     `json:"task_count"`
+	Tasks         map[string]int          `json:"tasks_by_status"`
+	TaskSummaries []projectTaskSummaryDTO `json:"tasks"`
+}
+
+// projectTaskSummaryDTO 项目任务摘要 DTO（design.md D4 11 字段）。
+// notice 为 NoticeItem[] 原样透传（无 notice 时省略）；agentStatus 水合失败省略。
+type projectTaskSummaryDTO struct {
+	ID             string          `json:"id"`
+	Name           string          `json:"name"`
+	Status         string          `json:"status"`
+	InitStatus     string          `json:"init_status"`
+	Branch         string          `json:"branch"`
+	WorktreePath   string          `json:"worktree_path"`
+	LastError      string          `json:"last_error,omitempty"`
+	Notice         json.RawMessage `json:"notice,omitempty"`
+	UpdatedAt      int64           `json:"updated_at"`
+	AgentStatus    string          `json:"agentStatus,omitempty"`
+	AttentionCount int             `json:"attention_count"`
 }
 
 // projectDetailDTO 项目详情 DTO（design.md §21）。
@@ -84,6 +106,8 @@ func (r createProjectReq) validate() *ApiError {
 // handleListProjects GET /api/v1/projects。
 // 每项含任务概况（task_count/tasks_by_status，与详情字段一致、与前端 Project 类型对齐）。
 // 逐项目 CountProjectTasks 取概况（个人规模 N+1 可接受，spec project-management 增强一致性）。
+// 附加 tasks 摘要数组（design.md D4 + project-management spec MODIFIED）：覆盖全部非删除态任务，
+// agentStatus 并发水合（cap 8/3s，单任务失败降级省略，store 失败 500 不水合，全链路纯读）。
 func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 	if s.projs == nil {
 		writeError(w, CodeInternal, "project store not configured")
@@ -94,6 +118,16 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 		writeError(w, CodeInternal, "list projects failed")
 		return
 	}
+	// 先取全部任务摘要（store 失败 → 500 不水合，spec）。
+	var summaries []task.ProjectTaskSummary
+	if s.tasks != nil {
+		summaries, err = s.tasks.ListProjectTaskSummaries(r.Context())
+		if err != nil {
+			writeError(w, CodeInternal, "list project task summaries failed")
+			return
+		}
+	}
+	byProject := groupSummariesByProject(summaries)
 	out := make([]projectDTO, 0, len(rows))
 	for _, p := range rows {
 		counts, cerr := s.projs.CountProjectTasks(r.Context(), p.ID)
@@ -101,10 +135,106 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 			writeError(w, CodeInternal, "count project tasks failed")
 			return
 		}
-		out = append(out, toProjectDTO(p, counts))
+		dto := toProjectDTO(p, counts)
+		dto.TaskSummaries = toProjectTaskSummaryDTOs(byProject[p.ID])
+		out = append(out, dto)
 	}
+	// agentStatus 水合（D4 cap8/3s）：对全部 active 任务摘要并发水合，单任务失败降级省略。
+	hydrateProjectTaskAgentStatuses(r.Context(), s, out)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+// groupSummariesByProject 按项目分组任务摘要。
+func groupSummariesByProject(summaries []task.ProjectTaskSummary) map[string][]task.ProjectTaskSummary {
+	out := make(map[string][]task.ProjectTaskSummary)
+	for _, s := range summaries {
+		out[s.ProjectID] = append(out[s.ProjectID], s)
+	}
+	return out
+}
+
+// toProjectTaskSummaryDTOs 转换任务摘要为 DTO（不含 agentStatus，由水合填充）。
+func toProjectTaskSummaryDTOs(summaries []task.ProjectTaskSummary) []projectTaskSummaryDTO {
+	out := make([]projectTaskSummaryDTO, 0, len(summaries))
+	for _, s := range summaries {
+		dto := projectTaskSummaryDTO{
+			ID: s.TaskID, Name: s.Name, Status: s.Status, InitStatus: s.InitStatus,
+			Branch: s.Branch, WorktreePath: s.WorktreePath, LastError: s.LastError,
+			UpdatedAt: s.UpdatedAt, AttentionCount: s.AttentionCount,
+		}
+		if s.Notice != "" {
+			dto.Notice = json.RawMessage(s.Notice)
+		}
+		out = append(out, dto)
+	}
+	return out
+}
+
+// hydrateProjectTaskAgentStatuses 对项目列表内全部 active 任务摘要并发水合 agentStatus
+// （D4 cap8/3s，单任务失败降级省略，spec）。
+func hydrateProjectTaskAgentStatuses(ctx context.Context, s *Server, projects []projectDTO) {
+	type target struct {
+		projIdx int
+		taskIdx int
+		taskID  string
+	}
+	var targets []target
+	for i := range projects {
+		for j := range projects[i].TaskSummaries {
+			if projects[i].TaskSummaries[j].Status == task.StatusActive {
+				targets = append(targets, target{i, j, projects[i].TaskSummaries[j].ID})
+			}
+		}
+	}
+	runAgentStatusHydration(ctx, s, len(targets), func(hctx context.Context, i int) {
+		t := targets[i]
+		projects[t.projIdx].TaskSummaries[t.taskIdx].AgentStatus = s.tasks.AgentStatus(hctx, t.taskID)
+	})
+}
+
+// hydrateSingleProjectAgentStatuses 对单个项目（详情）水合 agentStatus。
+func hydrateSingleProjectAgentStatuses(ctx context.Context, s *Server, p *projectDTO) {
+	type target struct {
+		taskIdx int
+		taskID  string
+	}
+	var targets []target
+	for j := range p.TaskSummaries {
+		if p.TaskSummaries[j].Status == task.StatusActive {
+			targets = append(targets, target{j, p.TaskSummaries[j].ID})
+		}
+	}
+	runAgentStatusHydration(ctx, s, len(targets), func(hctx context.Context, i int) {
+		t := targets[i]
+		p.TaskSummaries[t.taskIdx].AgentStatus = s.tasks.AgentStatus(hctx, t.taskID)
+	})
+}
+
+// runAgentStatusHydration 并发执行 agentStatus 水合（cap8/3s），单任务失败/超时降级省略。
+// fn 在获取信号量后以 hctx（3s deadline）执行；失败/超时经 omitempty 省略。
+func runAgentStatusHydration(ctx context.Context, s *Server, n int, fn func(hctx context.Context, i int)) {
+	if n == 0 {
+		return
+	}
+	hctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-hctx.Done():
+				return
+			}
+			fn(hctx, idx)
+		}(i)
+	}
+	wg.Wait()
 }
 
 // handleCreateProject POST /api/v1/projects（design.md §21，spec：项目注册）。
@@ -210,7 +340,7 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(toProjectDTO(p, storeTaskCounts{ByStatus: map[string]int{}}))
 }
 
-// handleGetProject GET /api/v1/projects/:id（含任务概况）。
+// handleGetProject GET /api/v1/projects/:id（含任务概况 + tasks 摘要）。
 func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 	if s.projs == nil {
 		writeError(w, CodeInternal, "project store not configured")
@@ -230,6 +360,16 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 	dto := projectDetailDTO{projectDTO: toProjectDTO(p, counts)}
 	if dto.Tasks == nil {
 		dto.Tasks = map[string]int{}
+	}
+	// tasks 摘要（design.md D4）：取全部任务摘要并按项目过滤。
+	if s.tasks != nil {
+		summaries, serr := s.tasks.ListProjectTaskSummaries(r.Context())
+		if serr != nil {
+			writeError(w, CodeInternal, "list project task summaries failed")
+			return
+		}
+		dto.TaskSummaries = toProjectTaskSummaryDTOs(groupSummariesByProject(summaries)[id])
+		hydrateSingleProjectAgentStatuses(r.Context(), s, &dto.projectDTO)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(dto)

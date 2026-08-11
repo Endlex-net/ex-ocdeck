@@ -268,7 +268,9 @@ type taskRuntime struct {
 	sseDone      chan struct{}              // SSE goroutine 退出信号（stopAll 时 join）
 	watchCancels map[string]func()          // sessionName -> watch cancel
 	watchDones   map[string]<-chan struct{} // sessionName -> watch goroutine 退出信号（join 用）
-	mu           sync.Mutex
+	// attention 任务注意力状态（design.md D6）。懒初始化（激活对账时构造）。
+	attention *attentionState
+	mu        sync.Mutex
 }
 
 // runtimeGroup 对应 design.md §2 RuntimeGroup。
@@ -318,15 +320,15 @@ type Options struct {
 // New 构造 Manager。OCFactory 为 nil 时用默认 opencode.Client 工厂。
 func New(opts Options) *Manager {
 	m := &Manager{
-		cfg:             opts.Cfg,
-		store:           opts.Store,
-		proc:            opts.Proc,
-		wt:              opts.Worktree,
-		ocFactory:       opts.OCFactory,
-		namer:           opts.Namer,
-		debtStore:       opts.DebtStore,
-		lifecycleRunner: opts.LifecycleRunner,
-		logDir:          opts.LogDir,
+		cfg:                     opts.Cfg,
+		store:                   opts.Store,
+		proc:                    opts.Proc,
+		wt:                      opts.Worktree,
+		ocFactory:               opts.OCFactory,
+		namer:                   opts.Namer,
+		debtStore:               opts.DebtStore,
+		lifecycleRunner:         opts.LifecycleRunner,
+		logDir:                  opts.LogDir,
 		runtimes:                make(map[string]*taskRuntime),
 		lastGen:                 make(map[string]int),
 		rand4Fn:                 rand4,
@@ -502,12 +504,15 @@ func (m *Manager) setRuntime(taskID string, rt *taskRuntime) {
 }
 
 // clearRuntime 移除任务的运行时并停止其 SSE/退出监视。
+// D6：先 clearAttention 推进 attentionEpoch 并清空 pending，使在途后台对账写回被拒，
+// 再 stopAll 停 SSE/watch（挂起/删除竞态防护，design.md D6）。
 func (m *Manager) clearRuntime(taskID string) {
 	m.rtMu.Lock()
 	rt := m.runtimes[taskID]
 	delete(m.runtimes, taskID)
 	m.rtMu.Unlock()
 	if rt != nil {
+		rt.clearAttention()
 		rt.stopAll()
 	}
 }
@@ -607,6 +612,8 @@ func (m *Manager) backgroundLoop(ctx context.Context) {
 				// B2：后台周期不阻塞，但 cleanup_debt 持久化错误 MUST 记录（不静默吞没）。
 				log.Printf("background: retry orphan sessions: %v", err)
 			}
+			// D6：degraded 注意力能力状态周期重试（复用 backgroundLoop，不新增 goroutine/定时器）。
+			m.retryAttentionDegraded(ctx)
 		}
 	}
 }
