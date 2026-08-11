@@ -1,51 +1,4 @@
-## Purpose
-
-跨项目活跃会话总览：为用户提供单实例内所有项目的活跃任务聚合视图（独立 API 与前端页面），用于在多项目多 worktree 并行工作时快速跟进各任务状态并跳转回任务工作台。
-
-## Requirements
-
-### Requirement: 跨项目活跃任务查询
-
-系统 SHALL 提供跨项目活跃任务聚合查询：返回所有 `tasks.status='active'` 的任务，每行包含任务 ID、所属项目 ID 与名称、任务名、分支、worktree 路径、最近活跃时间。最近活跃时间 MUST 取该任务 `task_sessions.last_seen_at` 的最大值；任务无任何会话行时 MUST 回退为 `tasks.updated_at`。`last_seen_at` 直接持久化自 opencode `time.updated`（毫秒），与秒级 `tasks.updated_at` 在存量库中混存；查询 MUST 在取最大值与排序前将毫秒值（≥ 1e11）归一化为 Unix 秒，保证混合单位数据的排序与输出一致。结果 MUST 按最近活跃时间倒序排列，时间相同则以任务 ID 升序作 tie-breaker。该查询 MUST NOT 引起数据库 schema 变更。
-
-#### Scenario: 多项目活跃任务聚合
-
-- **WHEN** 项目 A 有 2 个 active 任务、项目 B 有 1 个 active 任务、项目 C 无 active 任务
-- **THEN** 查询返回 3 行，每行携带正确的项目名称，且按最近活跃时间倒序
-
-#### Scenario: 混合单位数据排序正确
-
-- **WHEN** 任务甲有毫秒级 `last_seen_at`（如 1785797826297，实际时间较早），任务乙无会话行且 `updated_at`（秒）实际时间较晚
-- **THEN** 归一化后任务乙排在任务甲之前，两者输出的最近活跃时间均为 Unix 秒
-
-#### Scenario: 无会话行的任务回退时间
-
-- **WHEN** 某 active 任务没有任何 `task_sessions` 行
-- **THEN** 该行的最近活跃时间为 `tasks.updated_at`
-
-#### Scenario: 非 active 任务不出现
-
-- **WHEN** 存在 suspended / archived / creating 等非 active 状态任务
-- **THEN** 查询结果中不包含这些任务
-
-#### Scenario: 排序 tie-breaker
-
-- **WHEN** 两个 active 任务的最近活跃时间相同
-- **THEN** 任务 ID 较小者排在前面，结果顺序在多次查询间稳定
-
-### Requirement: 水合调用链 context 收敛
-
-系统 SHALL 使 agent 状态水合调用链（`AgentStatus` → tmux 环境读取 → opencode HTTP）全程遵守调用方传入的 context：取消或超时 MUST 使水合在预算内终止。`process` 层 MUST 提供 context-aware 的会话环境读取能力；既有非 context 接口的对外行为 MUST 保持不变（既有调用方不受影响）。
-
-#### Scenario: 超时内终止水合
-
-- **WHEN** 水合 context 已超时或取消，而底层 tmux 环境读取尚未返回
-- **THEN** 水合调用在 context 到期后迅速返回，不等待底层固定超时
-
-#### Scenario: 既有接口行为不变
-
-- **WHEN** 存量代码路径（suspend/attach/reconcile/delete）继续调用非 context 的会话环境读取接口
-- **THEN** 其行为（含超时上限与错误语义）与收敛前一致
+## MODIFIED Requirements
 
 ### Requirement: 活跃会话列表 API
 
@@ -90,15 +43,6 @@
 
 - **WHEN** 请求缺失或携带错误 token
 - **THEN** 返回 401，不泄露任何资源信息
-
-### Requirement: 列表全链路只读
-
-跨项目活跃列表的完整请求路径（数据库查询、tmux 环境读取、opencode 状态查询）MUST 为纯读操作：MUST NOT 写数据库、MUST NOT 触发会话 align、MUST NOT 改变任务状态机、MUST NOT 启动或停止任何进程。
-
-#### Scenario: 列表请求无写副作用
-
-- **WHEN** 连续发起多次活跃列表请求
-- **THEN** 数据库内容、任务状态与进程集合除外部因素外不发生变化
 
 ### Requirement: 前端活跃会话页面
 
