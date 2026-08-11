@@ -8,6 +8,7 @@ import {
   TERM_PREFS_CHANGED,
   validateFontSize,
 } from '../terminal/preferences';
+import { InfoIcon } from '../icons';
 
 const CJK_HINT =
   '自定义字体栈需自行包含 CJK 字体（如 PingFang SC / 更纱黑体），否则中文无法显示。';
@@ -93,7 +94,23 @@ export function TermAppearanceEditor() {
           onChange={(e) => setFontSize(e.target.value)}
         />
       </div>
-      <div className="term-appearance-hint">ⓘ {CJK_HINT}</div>
+      {/* 终端样式实时预览（对齐设计稿 configs.html term-preview）：深底等宽示例文本，
+          草稿态字体栈/字号即时反映（纯 CSS 变量驱动，非法字号回退默认） */}
+      <div
+        className="od-term od-term-inset term-preview"
+        data-od-id="term-preview"
+        style={
+          {
+            '--term-preview-font': fontFamily.trim() || DEFAULT_FONT_FAMILY,
+            '--term-preview-size': `${validateFontSize(fontSize.trim()) ?? DEFAULT_FONT_SIZE}px`,
+          } as React.CSSProperties
+        }
+      >
+        <div>$ ocdeck serve</div>
+        <div className="term-preview-ok">✓ 服务已就绪 127.0.0.1:56445</div>
+        <div className="term-preview-muted">3 个项目 · 4 个活跃任务</div>
+      </div>
+      <div className="term-appearance-hint"><InfoIcon /> {CJK_HINT}</div>
       <div className="term-appearance-actions">
         <button className="btn btn-primary btn-small" onClick={handleSave}>
           保存

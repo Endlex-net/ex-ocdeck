@@ -14,9 +14,58 @@ export interface Project {
   /** 任务总数与状态分布（列表与详情均返回，字段一致）。 */
   task_count: number;
   tasks_by_status: Record<string, number>;
+  /** 项目任务摘要数组（design.md D4，GET /projects 与 /projects/:id 透出）。
+   *  11 字段 = 10 存储字段 + attention_count；agentStatus 水合失败省略。无任务为 []。 */
+  tasks: TaskSummary[];
 }
 
 export interface ProjectDetail extends Project {}
+
+/** 项目任务摘要（GET /projects 与 /projects/:id 的 tasks[] 元素）。
+ *  字段名与 internal/api projectTaskSummaryDTO 对齐。 */
+export interface TaskSummary {
+  id: string;
+  name: string;
+  status: string;
+  init_status: string;
+  branch: string;
+  worktree_path: string;
+  last_error?: string;
+  /** json.RawMessage 原样透传：客户端收到的是数组而非字符串。 */
+  notice?: NoticeItem[];
+  updated_at: number;
+  /** agent 运行态（idle/busy/retry）；非 active 或水合失败省略。 */
+  agentStatus?: string;
+  attention_count: number;
+}
+
+/** 权限请求信号（attentionDTO.permissions[] 元素）。 */
+export interface PermissionSignal {
+  id: string;
+  permission: string;
+  patterns: string[];
+  since: number;
+}
+
+/** 提问信号单个条目。 */
+export interface QuestionItem {
+  header: string;
+  question: string;
+}
+
+/** 提问请求信号（attentionDTO.questions[] 元素）。 */
+export interface QuestionSignal {
+  id: string;
+  questions: QuestionItem[];
+  since: number;
+}
+
+/** 注意力信号快照（design.md D6 GET /tasks/:id 与 /sessions/active 透出）。
+ *  空集合为非 nil 空数组（后端保证）；unsupported 透出空数组。 */
+export interface Attention {
+  permissions: PermissionSignal[];
+  questions: QuestionSignal[];
+}
 
 export interface TaskSession {
   session_id: string;
@@ -52,6 +101,8 @@ export interface Task {
   sessions?: TaskSession[];
   /** agent 运行态（design.md 2.8）：idle/busy/retry；非 active 或查询失败为空串。 */
   agentStatus?: string;
+  /** 注意力信号快照（design.md D6 GET /tasks/:id 透出）。空数组非 null；unsupported 为空数组。 */
+  attention?: Attention;
 }
 
 export interface TerminalInfo {
@@ -70,6 +121,8 @@ export interface ActiveSessionItem {
   /** 最近活跃时间（Unix 秒）：task_sessions.last_seen_at 的 MAX，无会话行回退 tasks.updated_at。 */
   last_active_at: number;
   agentStatus?: string;
+  /** 注意力信号快照（design.md D6 GET /sessions/active 透出）。空数组非 null；unsupported 为空数组。 */
+  attention?: Attention;
 }
 
 /** GET /tasks/:id/git/status 文件条目。x/y 为 git status --short 双字母状态码。 */

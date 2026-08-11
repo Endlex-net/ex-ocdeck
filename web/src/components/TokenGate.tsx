@@ -25,22 +25,27 @@ export function TokenGate({ onSaved }: { onSaved: (token: string) => void }) {
   };
 
   return (
-    <div className="token-gate">
-      <form className="token-card" onSubmit={submit}>
-        <div className="token-logo">ocdeck</div>
-        <p className="token-hint">
+    <div className="od-token-gate">
+      <form className="od-card od-token-card" onSubmit={submit}>
+        <div className="od-brand-mark od-token-logo">oc</div>
+        <h1 className="od-token-title">ocdeck</h1>
+        <p className="muted od-token-hint">
           输入服务端访问 token（ocdeck-server 启动时生成，全部 API 需 Bearer 认证）。
         </p>
         <input
-          className="input"
+          className="od-input"
           type="password"
           placeholder="Bearer token"
           value={value}
           autoFocus
           onChange={(e) => setValue(e.target.value)}
         />
-        {error && <div className="error-line">{error}</div>}
-        <button className="btn btn-primary" type="submit" disabled={busy || !value.trim()}>
+        {error && (
+          <div className="od-alert od-alert-danger od-token-error">
+            <span className="od-alert-body">{error}</span>
+          </div>
+        )}
+        <button className="od-btn od-btn-primary od-token-submit" type="submit" disabled={busy || !value.trim()}>
           {busy ? '验证中…' : '连接'}
         </button>
       </form>

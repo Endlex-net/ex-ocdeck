@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../api';
 import type { EnvVar } from '../types';
+import { WarnIcon, InfoIcon } from '../icons';
 
 const RESTART_HINT = '需重启任务（挂起后激活）生效';
 
@@ -99,10 +100,10 @@ export function EnvEditor({ base }: { base: string }) {
     <div className="env-editor">
       {warning && (
         <div className="warn-box env-warning">
-          <p>⚠ {warning}</p>
+          <p><WarnIcon /> {warning}</p>
         </div>
       )}
-      {restartHint && <div className="env-hint">ⓘ {RESTART_HINT}</div>}
+      {restartHint && <div className="env-hint"><InfoIcon /> {RESTART_HINT}</div>}
       {error && <div className="error-line">{error}</div>}
 
       {loaded && vars.length === 0 && <div className="env-empty">暂无环境变量。</div>}

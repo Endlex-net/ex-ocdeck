@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { api, ApiError } from '../api';
 import { initActivateBlockReason, isTransitional, type Task } from '../types';
 import { RerunInitButton } from './RerunInitButton';
+import { PlayIcon, PauseIcon, ArchiveIcon, RestoreIcon, RetryIcon } from '../icons';
 
 type Action = 'activate' | 'suspend' | 'archive' | 'restore' | 'retry';
 
@@ -13,13 +14,13 @@ const ACTION_LABEL: Record<Action, string> = {
   retry: '重试',
 };
 
-/** 窄屏 header 图标化（design D3）：glyph 只用于 compact，aria/title 仍给完整中文标签 */
-const ACTION_ICON: Record<Action, string> = {
-  activate: '▶',
-  suspend: '⏸',
-  archive: '▼',
-  restore: '▲',
-  retry: '⟳',
+/** 窄屏 header 图标化（design D3）：SVG 图标只用于 compact，aria/title 仍给完整中文标签 */
+const ACTION_ICON: Record<Action, (props: { title?: string }) => JSX.Element> = {
+  activate: PlayIcon,
+  suspend: PauseIcon,
+  archive: ArchiveIcon,
+  restore: RestoreIcon,
+  retry: RetryIcon,
 };
 
 /** 按状态机给出可用操作（非法操作服务端会 409，前端尽量前置隐藏）。 */
@@ -85,7 +86,8 @@ export function TaskActions({ task, onDone, onError, compact = false }: TaskActi
             : `[${err.code}] ${err.message}`
           : '操作失败';
       onError?.(msg);
-      onDone(); // 刷新以拿到最新状态
+      // onDone 仅在成功后调用：失败不触发刷新（调用方已通过 onError 感知失败）。
+      // 旧调用方（TaskWorkbenchPage）的失败自动刷新由 P4 适配。
     } finally {
       setPending(null);
     }
@@ -110,27 +112,30 @@ export function TaskActions({ task, onDone, onError, compact = false }: TaskActi
 
   return (
     <span className="task-actions">
-      {actionsFor(task.status).map((a) => (
-        <button
-          key={a}
-          className="btn btn-small"
-          disabled={disabled || (a === 'activate' && activateBlock !== '')}
-          title={
-            a === 'activate' && activateBlock
-              ? activateBlock
-              : compact
-                ? ACTION_LABEL[a]
-                : undefined
-          }
-          aria-label={compact ? ACTION_LABEL[a] : undefined}
-          onClick={(e) => {
-            e.stopPropagation();
-            void run(a);
-          }}
-        >
-          {pending === a ? '…' : compact ? ACTION_ICON[a] : ACTION_LABEL[a]}
-        </button>
-      ))}
+      {actionsFor(task.status).map((a) => {
+        const Icon = ACTION_ICON[a];
+        return (
+          <button
+            key={a}
+            className="btn btn-small"
+            disabled={disabled || (a === 'activate' && activateBlock !== '')}
+            title={
+              a === 'activate' && activateBlock
+                ? activateBlock
+                : compact
+                  ? ACTION_LABEL[a]
+                  : undefined
+            }
+            aria-label={compact ? ACTION_LABEL[a] : undefined}
+            onClick={(e) => {
+              e.stopPropagation();
+              void run(a);
+            }}
+          >
+            {pending === a ? '…' : compact ? <Icon /> : ACTION_LABEL[a]}
+          </button>
+        );
+      })}
 
       <RerunInitButton task={task} onDone={onDone} onError={onError} compact={compact} />
 
@@ -140,7 +145,6 @@ export function TaskActions({ task, onDone, onError, compact = false }: TaskActi
           onClick={(e) => {
             e.stopPropagation();
             setDirtyPrompt(false);
-            onDone();
           }}
         >
           <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -165,7 +169,6 @@ export function TaskActions({ task, onDone, onError, compact = false }: TaskActi
                 disabled={dirtyBusy}
                 onClick={() => {
                   setDirtyPrompt(false);
-                  onDone();
                 }}
               >
                 取消

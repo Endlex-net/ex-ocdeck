@@ -1,8 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { navigate } from '../router';
-import { usePoll, useMediaQuery } from '../hooks';
+import { resolveBackHref, type FromSource } from '../router';
+import { usePoll, useMediaQuery, useProjects, useProjectsRefresh } from '../hooks';
 import { isTransitional, initActivateBlockReason, parseNotice, type Task } from '../types';
+import { shouldCloseOverflowOnBlur } from './workbench-overflow';
 import { StatusBadge } from '../components/StatusBadge';
 import { TaskActions } from '../components/TaskActions';
 import { DeleteTaskModal } from '../components/DeleteTaskModal';
@@ -13,18 +15,123 @@ import { InitStatusBadge } from '../components/InitStatusBadge';
 import { LifecycleLogModal } from '../components/LifecycleLogModal';
 import { RerunInitButton } from '../components/RerunInitButton';
 import { TerminalView } from '../terminal/TerminalView';
+import { BranchIcon, CaretDownIcon, MoreIcon, WarnIcon, InfoIcon } from '../icons';
 
 const TUI_TAB = 'tui';
 const GIT_TAB = 'git';
 const SETTINGS_TAB = 'settings';
 
+/** 页头「⋯」溢出菜单（design task-workbench.html wb-overflow）：删除等次级操作。
+ *  桌面与窄屏同一入口；窄屏主操作图标化由 TaskActions compact 承担。
+ *  普通 disclosure 模式（非 ARIA menu）：打开聚焦首个可用项、Escape 关闭并恢复焦点、
+ *  焦点真实移出菜单即关闭（见 shouldCloseOverflowOnBlur）——菜单项少，disclosure 更轻量且满足可访问性。 */
+function WorkbenchOverflow({
+  task,
+  onShowInitLog,
+  onDelete,
+}: {
+  task: Task;
+  onShowInitLog: () => void;
+  onDelete: () => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuTriggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // disclosure 模式：打开后焦点进入菜单内首个可用项
+  useEffect(() => {
+    if (menuOpen) {
+      menuRef.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
+    }
+  }, [menuOpen]);
+
+  // 关闭溢出菜单；键盘取消（Escape）/失焦兜底后焦点恢复触发器
+  const closeMenu = (restoreFocus: boolean) => {
+    setMenuOpen(false);
+    if (restoreFocus) menuTriggerRef.current?.focus();
+  };
+
+  return (
+    <span
+      className="header-overflow"
+      onBlur={(e) => {
+        // React onBlur 冒泡：焦点真实落到溢出区之外才关闭（触屏/Safari 的
+        // relatedTarget=null 失焦不关，否则菜单项随菜单卸载导致点击丢失，
+        // 由全屏 backdrop 的 click 兜底；详见 shouldCloseOverflowOnBlur）。
+        const next = e.relatedTarget as Node | null;
+        if (shouldCloseOverflowOnBlur(next, (n) => e.currentTarget.contains(n))) closeMenu(false);
+      }}
+    >
+      <button
+        ref={menuTriggerRef}
+        className="btn btn-small btn-ghost"
+        aria-label="更多操作"
+        aria-expanded={menuOpen}
+        aria-controls="workbench-overflow-menu"
+        onClick={() => setMenuOpen((o) => !o)}
+        onKeyDown={(e) => {
+          // 菜单开着但焦点仍在触发器（如菜单项全 disabled 未移焦）时 Escape 也可关闭
+          if (e.key === 'Escape' && menuOpen) {
+            e.stopPropagation();
+            closeMenu(false);
+          }
+        }}
+      >
+        <MoreIcon />
+      </button>
+      {menuOpen && (
+        <>
+          <div className="overflow-backdrop" onClick={() => closeMenu(true)} />
+          <div
+            ref={menuRef}
+            id="workbench-overflow-menu"
+            className="overflow-menu"
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') {
+                e.stopPropagation();
+                closeMenu(true);
+              }
+            }}
+          >
+            {task.init_status === 'failed' && (
+              <button
+                className="overflow-item"
+                onClick={() => {
+                  setMenuOpen(false);
+                  onShowInitLog();
+                }}
+              >
+                查看 init 日志
+              </button>
+            )}
+            {/* 活跃态不出现删除（design D9） */}
+            {task.status !== 'active' && (
+              <button
+                className="overflow-item overflow-item-danger"
+                disabled={isTransitional(task.status)}
+                onClick={() => {
+                  setMenuOpen(false);
+                  onDelete();
+                }}
+              >
+                删除任务
+              </button>
+            )}
+          </div>
+        </>
+      )}
+    </span>
+  );
+}
+
 export function TaskWorkbenchPage({
   taskID,
-  fromActive = false,
+  from = 'home',
 }: {
   taskID: string;
-  /** 从活跃会话页（#/active）进入时为 true：返回链接指回活跃列表。 */
-  fromActive?: boolean;
+  /** 来源感知返回链接（归一后）：home → #/，projects → #/projects#<projectID>。
+   *  legacy fromActive 已废弃（P8 路由归一：active → home）。 */
+  from?: FromSource;
 }) {
   const [task, setTask] = useState<Task | null>(null);
   const [shells, setShells] = useState<string[]>([]);
@@ -41,27 +148,13 @@ export function TaskWorkbenchPage({
   const [visited, setVisited] = useState<Set<string>>(new Set([TUI_TAB]));
   // 窄屏（≤1024px）结构性切换：header 主操作图标化 + 次级操作收「⋯」溢出菜单（design D3）
   const isNarrow = useMediaQuery('(max-width: 1024px)');
-  const [menuOpen, setMenuOpen] = useState(false);
-  const menuTriggerRef = useRef<HTMLButtonElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
-
-  // 视口从窄屏切回桌面（再切回）时复位菜单，避免 menuOpen 残留导致菜单复现
-  useEffect(() => {
-    if (!isNarrow) setMenuOpen(false);
-  }, [isNarrow]);
-
-  // disclosure 模式：打开后焦点进入菜单内首个可用项
-  useEffect(() => {
-    if (menuOpen) {
-      menuRef.current?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
-    }
-  }, [menuOpen]);
-
-  // 关闭溢出菜单；键盘取消（Escape）/失焦兜底后焦点恢复触发器
-  const closeMenu = (restoreFocus: boolean) => {
-    setMenuOpen(false);
-    if (restoreFocus) menuTriggerRef.current?.focus();
-  };
+  // ≤767px 侧栏任务组隐藏，页头任务切换器承担任务直达（design D12 裁决 3）
+  const isMobile = useMediaQuery('(max-width: 767px)');
+  const [switcherOpen, setSwitcherOpen] = useState(false);
+  // 共享 store refresh：任务操作成功后同步侧栏/指挥中心（tasks 8.8 refresh 审计）
+  const refreshShared = useProjectsRefresh();
+  // 页头任务切换器数据源：与侧栏同一共享 store（design D8/D12）
+  const { projects } = useProjects();
 
   const switchTab = (t: string) => {
     setTab(t);
@@ -84,6 +177,13 @@ export function TaskWorkbenchPage({
     (task && isTransitional(task.status)) || initActive ? 2000 : 4000,
     [task?.status, task?.init_status],
   );
+
+  /** 任务操作成功后的统一回调：刷新本任务 + 共享 store（侧栏/指挥中心同步，tasks 8.8）。
+   *  TaskActions/RerunInitButton 仅在成功时调 onDone（P3 修复），失败走 onError + 本页轮询。 */
+  const onTaskActionDone = () => {
+    void load();
+    void refreshShared().catch(() => {});
+  };
 
   // shell 终端列表只需加载一次（新建/关闭由本页操作驱动）
   const loadShells = async () => {
@@ -136,13 +236,54 @@ export function TaskWorkbenchPage({
     if (isDir && tab === GIT_TAB) setTab(TUI_TAB);
   }, [isDir, tab]);
 
+  // 页头任务切换器候选：与侧栏任务组同源（共享 store），仅活跃+挂起任务（归档不显示）。
+  // data-od-id / wb-* class 对齐设计稿 task-workbench.html:229
+  // 注意：以下 Hook 必须在任何条件 return 之前（404 分支不得改变 Hook 调用次数）。
+  const switcherTasks = useMemo(() => {
+    const out: Array<{ taskID: string; name: string; branch: string; projectName: string; agentStatus?: string; current: boolean }> = [];
+    for (const p of projects) {
+      // 与侧栏 SidebarTaskGroups 同源：仅 active+suspended（归档/失败等不显示）
+      for (const t of (p.tasks ?? []).filter((x) => x.status === 'active' || x.status === 'suspended')) {
+        out.push({
+          taskID: t.id,
+          name: t.name,
+          branch: t.branch,
+          projectName: p.name,
+          agentStatus: t.agentStatus,
+          current: t.id === taskID,
+        });
+      }
+    }
+    return out;
+  }, [projects, taskID]);
+  // 切换器按项目分组
+  const switcherGroups = useMemo(() => {
+    const m = new Map<string, typeof switcherTasks>();
+    for (const t of switcherTasks) {
+      const arr = m.get(t.projectName) ?? [];
+      arr.push(t);
+      m.set(t.projectName, arr);
+    }
+    return Array.from(m.entries());
+  }, [switcherTasks]);
+  const switcherRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!switcherOpen) return;
+    const onDocDown = (e: MouseEvent) => {
+      if (switcherRef.current && !switcherRef.current.contains(e.target as Node)) setSwitcherOpen(false);
+    };
+    document.addEventListener('mousedown', onDocDown);
+    return () => document.removeEventListener('mousedown', onDocDown);
+  }, [switcherOpen]);
+
   if (notFound) {
+    // fullbleed 工作台路由无外层 padding；用自持边距容器（非已删 .page）
     return (
-      <div className="page">
+      <div className="wb-not-found">
         <div className="empty">
           任务不存在或已删除。{' '}
           <button className="btn btn-small" onClick={() => navigate('/')}>
-            返回项目列表
+            返回指挥中心
           </button>
         </div>
       </div>
@@ -161,21 +302,68 @@ export function TaskWorkbenchPage({
   return (
     <div className={`workbench${isNarrow ? ' workbench-narrow' : ''}`}>
       <header className="page-header">
-        {/* 来源感知返回：从活跃列表进入则指回活跃列表，否则回到任务列表（窄屏同样保留双变体） */}
-        {fromActive ? (
-          <button className="btn btn-small btn-ghost" onClick={() => navigate('/active')}>
-            ← 活跃会话
-          </button>
+        {/* 来源感知返回（design.md D3 归一映射）：home → #/，projects → #/projects#<projectID>。
+            窄屏同样保留返回入口；任务未加载时回退 home。 */}
+        <button
+          className="btn btn-small btn-ghost"
+          onClick={() => navigate(resolveBackHref(from, task?.project_id))}
+        >
+          ← {from === 'projects' ? '任务列表' : '指挥中心'}
+        </button>
+        {/* 页头任务切换器：≤767px 侧栏任务组隐藏时的任务直达入口（design D12 裁决 3）。
+            切换执行 navigate(#/task/:id) + key={taskID} 重挂载，数据来自共享 store。 */}
+        {isMobile ? (
+          <div className="wb-switcher" ref={switcherRef}>
+            <button
+              className="wb-switcher-btn"
+              aria-haspopup="true"
+              aria-expanded={switcherOpen}
+              title="切换任务"
+              onClick={() => setSwitcherOpen((o) => !o)}
+            >
+              <span className="wb-switcher-title">{task?.name ?? '…'}</span>
+              <CaretDownIcon />
+            </button>
+            {switcherOpen && (
+              <div className="wb-switcher-menu" role="menu">
+                {switcherGroups.map(([projName, items]) => (
+                  <div key={projName}>
+                    <div className="wb-sw-group">{projName}</div>
+                    {items.map((t) => (
+                      <button
+                        key={t.taskID}
+                        className={`wb-sw-item${t.current ? ' current' : ''}`}
+                        role="menuitem"
+                        onClick={() => {
+                          setSwitcherOpen(false);
+                          navigate(`/task/${t.taskID}`);
+                        }}
+                      >
+                        <span className={`od-agent od-agent-${t.agentStatus ?? ''}`}><span className="od-agent-dot" /></span>
+                        <span className="wb-sw-name">{t.name}</span>
+                        <span className="mono">{t.branch}</span>
+                      </button>
+                    ))}
+                  </div>
+                ))}
+                <a
+                  className="wb-sw-all"
+                  href="#/"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    setSwitcherOpen(false);
+                    navigate('/');
+                  }}
+                >
+                  查看全部任务 →
+                </a>
+              </div>
+            )}
+          </div>
         ) : (
-          <button
-            className="btn btn-small btn-ghost"
-            onClick={() => task && navigate(`/project/${task.project_id}`)}
-          >
-            ← 任务列表
-          </button>
+          <span className="page-title">{task?.name ?? '…'}</span>
         )}
-        <span className="page-title">{task?.name ?? '…'}</span>
-        {task?.branch && !isDir && <span className="header-meta mono">⎇ {task.branch}</span>}
+        {task?.branch && !isDir && <span className="header-meta mono"><BranchIcon /> {task.branch}</span>}
         {task && <StatusBadge status={task.status} />}
         {task && <InitStatusBadge task={task} />}
         {task?.init_status === 'failed' && !isNarrow && (
@@ -192,87 +380,27 @@ export function TaskWorkbenchPage({
         {error && !isNarrow && <span className="header-error">{error}</span>}
         {task && !isNarrow && (
           <>
-            <TaskActions task={task} onDone={() => void load()} onError={setError} />
-            <button
-              className="btn btn-small btn-ghost"
-              disabled={isTransitional(task.status)}
-              onClick={() => setDeleting(true)}
-            >
-              删除
-            </button>
+            {/* 主操作按状态机呈现（actionsFor：活跃=挂起；挂起=激活/归档；归档=恢复；失败=重试） */}
+            <TaskActions task={task} onDone={onTaskActionDone} onError={setError} />
+            {/* 「⋯」溢出菜单：删除等次级操作（对齐设计稿 task-workbench.html 页头 wb-overflow） */}
+            <WorkbenchOverflow
+              key="wide"
+              task={task}
+              onShowInitLog={() => setLogView('init')}
+              onDelete={() => setDeleting(true)}
+            />
           </>
         )}
-        {/* 窄屏（design D3）：主操作图标化保留在 header，次级操作（init 日志/删除）收「⋯」溢出菜单。
-            普通 disclosure 模式（非 ARIA menu）：打开聚焦首个可用项、Escape 关闭并恢复焦点、
-            焦点离开菜单即关闭——菜单仅 2 项，disclosure 更轻量且满足可访问性 */}
+        {/* 窄屏（design D3）：主操作图标化保留在 header，次级操作（init 日志/删除）收同一「⋯」溢出菜单。 */}
         {task && isNarrow && (
           <>
-            <TaskActions task={task} onDone={() => void load()} onError={setError} compact />
-            <span
-              className="header-overflow"
-              onBlur={(e) => {
-                // React onBlur 冒泡：焦点离开整个溢出区（触发器+菜单）即关闭，避免菜单悬空开着。
-                // 鼠标点击项时 relatedTarget 为被点按钮（在区内），不误关。
-                const next = e.relatedTarget as Node | null;
-                if (!e.currentTarget.contains(next)) closeMenu(false);
-              }}
-            >
-              <button
-                ref={menuTriggerRef}
-                className="btn btn-small btn-ghost"
-                aria-label="更多操作"
-                aria-expanded={menuOpen}
-                aria-controls="workbench-overflow-menu"
-                onClick={() => setMenuOpen((o) => !o)}
-                onKeyDown={(e) => {
-                  // 菜单开着但焦点仍在触发器（如菜单项全 disabled 未移焦）时 Escape 也可关闭
-                  if (e.key === 'Escape' && menuOpen) {
-                    e.stopPropagation();
-                    closeMenu(false);
-                  }
-                }}
-              >
-                ⋯
-              </button>
-              {menuOpen && (
-                <>
-                  <div className="overflow-backdrop" onClick={() => closeMenu(true)} />
-                  <div
-                    ref={menuRef}
-                    id="workbench-overflow-menu"
-                    className="overflow-menu"
-                    onKeyDown={(e) => {
-                      if (e.key === 'Escape') {
-                        e.stopPropagation();
-                        closeMenu(true);
-                      }
-                    }}
-                  >
-                    {task.init_status === 'failed' && (
-                      <button
-                        className="overflow-item"
-                        onClick={() => {
-                          setMenuOpen(false);
-                          setLogView('init');
-                        }}
-                      >
-                        查看 init 日志
-                      </button>
-                    )}
-                    <button
-                      className="overflow-item overflow-item-danger"
-                      disabled={isTransitional(task.status)}
-                      onClick={() => {
-                        setMenuOpen(false);
-                        setDeleting(true);
-                      }}
-                    >
-                      删除任务
-                    </button>
-                  </div>
-                </>
-              )}
-            </span>
+            <TaskActions task={task} onDone={onTaskActionDone} onError={setError} compact />
+            <WorkbenchOverflow
+              key="narrow"
+              task={task}
+              onShowInitLog={() => setLogView('init')}
+              onDelete={() => setDeleting(true)}
+            />
           </>
         )}
       </header>
@@ -282,7 +410,7 @@ export function TaskWorkbenchPage({
 
       {task?.last_error && (
         <div className="alert-bar alert-error mono" title={task.last_error}>
-          ⚠ {task.last_error}
+          <WarnIcon /> {task.last_error}
           {preDeleteFailed && (
             <button className="btn btn-small" onClick={() => setLogView('pre-delete')}>
               查看 pre-delete 日志
@@ -293,19 +421,19 @@ export function TaskWorkbenchPage({
       {task?.init_status === 'failed' && (
         <div className="alert-bar alert-error">
           <span className="mono" title={task.init_error}>
-            ⚠ init 失败：{task.init_error || '（无错误信息）'}
+            <WarnIcon /> init 失败：{task.init_error || '（无错误信息）'}
           </span>
           <button className="btn btn-small" onClick={() => setLogView('init')}>
             查看日志
           </button>
-          <RerunInitButton task={task} onDone={() => void load()} onError={setError} />
+          <RerunInitButton task={task} onDone={onTaskActionDone} onError={setError} />
         </div>
       )}
       {notices.length > 0 && (
         <div className="alert-bar alert-notice">
           {notices.slice(-3).map((n, i) => (
             <span key={i} className="mono" title={new Date(n.ts * 1000).toLocaleString()}>
-              ⓘ [{n.code}] {n.message}
+              <InfoIcon /> [{n.code}] {n.message}
             </span>
           ))}
         </div>
@@ -386,10 +514,10 @@ export function TaskWorkbenchPage({
                     <span>任务已挂起，激活后可接入 opencode TUI</span>
                     {initBlock && <span className="terminal-overlay-reason">{initBlock}</span>}
                     <span className="terminal-overlay-actions">
-                      <ActivateButton task={task} onDone={() => void load()} onError={setError} />
+                      <ActivateButton task={task} onDone={onTaskActionDone} onError={setError} />
                       <RerunInitButton
                         task={task}
-                        onDone={() => void load()}
+                        onDone={onTaskActionDone}
                         onError={setError}
                       />
                     </span>
@@ -450,7 +578,11 @@ export function TaskWorkbenchPage({
         <DeleteTaskModal
           task={task}
           onClose={() => setDeleting(false)}
-          onDeleted={() => navigate(`/project/${task.project_id}`)}
+          onDeleted={() => {
+            // 删除成功：触发共享 store refresh（侧栏/指挥中心同步）再导航离开（tasks 8.8）。
+            void refreshShared().catch(() => {});
+            navigate(resolveBackHref(from, task.project_id));
+          }}
         />
       )}
     </div>
@@ -480,8 +612,8 @@ function ActivateButton({
           await api.taskAction(task.id, 'activate');
           onDone();
         } catch (err) {
+          // 失败仅走 onError（不调 onDone/refresh）；状态由本页轮询收敛（与 TaskActions 语义一致，P3 修复 7）。
           onError(err instanceof ApiError ? err.message : '激活失败');
-          onDone();
         } finally {
           setBusy(false);
         }

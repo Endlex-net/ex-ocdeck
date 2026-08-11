@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { api } from '../api';
 import { usePoll } from '../hooks';
 import type { ServerStatus } from '../types';
+import { WarnIcon, InfoIcon } from '../icons';
 
 /**
  * 应用级服务端状态告警 banner：
@@ -31,17 +32,19 @@ export function ServerStatusBanner() {
   return (
     <div className="server-banners">
       {degraded && (
-        <div className="alert-bar alert-critical">
-          <span className="mono">
-            ⚠ watchdog 已降级（degraded）：kill_immediate 模式下服务端异常死亡时将无法兜底清理
+        <div className="od-alert od-alert-danger">
+          <WarnIcon title="watchdog 降级" />
+          <span className="od-alert-body mono">
+            watchdog 已降级（degraded）：kill_immediate 模式下服务端异常死亡时将无法兜底清理
             opencode 进程，建议尽快重启 ocdeck-server。
           </span>
         </div>
       )}
       {unverified && (
-        <div className="alert-bar alert-notice">
-          <span className="mono">
-            ⓘ opencode 版本未验证：当前 {status.opencodeVersion || '未知'}，契约基准{' '}
+        <div className="od-alert od-alert-info">
+          <InfoIcon title="版本未验证" />
+          <span className="od-alert-body mono">
+            opencode 版本未验证：当前 {status.opencodeVersion || '未知'}，契约基准{' '}
             {status.contractBaseline || '未知'}，TUI 行为可能与预期不符。
           </span>
         </div>

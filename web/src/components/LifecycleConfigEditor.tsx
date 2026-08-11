@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../api';
+import { InfoIcon } from '../icons';
 
 /** tasks.md 5.2 给定文案（勿改）。 */
 const INHERIT_NOTE = '仅复制 gitignored/untracked 文件';
@@ -87,7 +88,7 @@ export function LifecycleConfigEditor({ projectID }: { projectID: string }) {
         </div>
       )}
       {saveError && <div className="error-line">{saveError}</div>}
-      {saved && !saveError && <div className="env-hint">ⓘ 已保存</div>}
+      {saved && !saveError && <div className="env-hint"><InfoIcon /> 已保存</div>}
 
       <div className="lc-field">
         <div className="lc-label">Inherit patterns</div>

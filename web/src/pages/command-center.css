@@ -1,0 +1,264 @@
+/* 指挥中心页面样式（command-center design.md D7 + spec.md）。
+ *  复用 design-system.css 的 od-* 组件类；本文件仅补充页面级布局与指挥中心特有样式。
+ *  派生色走 color-mix(in oklch, …)，无新增 hex。 */
+
+/* 普通块级流：设计稿（command-center.html）依赖兄弟 margin 折叠——页头 margin-bottom:22
+ * 与首分区 .cc-section margin-top:26 折叠为 26px。若用 flex 列容器，flex item 间 margin
+ * 不折叠，22+26 叠加成 48px（再叠 h2 行高偏移，页头下方出现大片空白带，移动端两行页头下
+ * 尤其明显，实测用户反馈为"白底空盒"）。块级流下各子元素均为块级全宽，无 flex 依赖。 */
+.cc-page {
+  display: block;
+}
+
+.cc-head-sub {
+  font-size: 13px;
+}
+
+.cc-poll-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.cc-section {
+  margin-top: 26px;
+}
+
+/* 「需要关注」行：左侧色条强化优先级 */
+.cc-attention .od-row {
+  border-color: color-mix(in oklch, var(--warn) 30%, var(--border));
+}
+.cc-row-failed {
+  border-left: 3px solid color-mix(in oklch, var(--danger) 70%, var(--border));
+}
+
+.cc-row-hint {
+  font-size: 12.5px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+.cc-row-hint.urgent {
+  color: color-mix(in oklch, var(--warn) 55%, var(--fg));
+  font-weight: 500;
+}
+.cc-row-hint.urgent a {
+  color: inherit;
+}
+
+.cc-row-error {
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: color-mix(in oklch, var(--danger) 75%, var(--fg));
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.cc-row-secondary {
+  margin-top: 4px;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.cc-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 150px;
+  justify-content: flex-end;
+}
+
+.cc-row-trans .badge {
+  /* 过渡徽章沿用 design-system 的 badge-pending 样式（SpinnerBadge 由 StatusBadge 提供） */
+}
+
+.cc-rel-time {
+  font-size: 12.5px;
+}
+
+/* 挂起与归档行右侧 */
+.cc-park-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ============ 行内操作按钮视觉归一 ============
+   TaskActions / RerunInitButton 是共享 legacy 组件（.btn.btn-small：mono 字体 + surface 底 +
+   border-strong 粗边框），与本页 od-btn 体系混排时字体/边框/内边距不一致，
+   移动端同高 44px 下视觉差异更明显。限定指挥中心作用域归一为 od-btn-sm 视觉，
+   其他页（工作台页头等）沿用 legacy 外观零影响。 */
+.cc-page .task-actions > .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 26px;
+  padding: 2px 10px;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--fg);
+}
+.cc-page .task-actions > .btn:hover:not(:disabled) {
+  background: var(--surface);
+  border-color: var(--border-strong);
+}
+
+/* ≤767px：触控目标 ≥44px（对齐 od-btn-sm 移动端规则，覆盖上面归一的 26px）；
+   行右侧操作区独占一行整体右对齐，避免与相对时间挤在标题旁换行 */
+@media (max-width: 767px) {
+  .cc-page .task-actions > .btn {
+    min-height: 35px; /* 按钮触控档 35px（用户实测决策，覆盖 44px） */
+  }
+  .cc-page .od-row-side {
+    flex: 1 1 100%;
+    min-width: 0;
+    justify-content: flex-end;
+    margin-top: 6px;
+  }
+}
+
+/* 空态（限定指挥中心，避免污染其他页 .od-empty） */
+.cc-page .od-empty {
+  padding: 24px 16px;
+  color: var(--muted);
+  font-size: 14px;
+  text-align: center;
+}
+.cc-empty-guide p {
+  margin: 0;
+}
+
+/* ============ ≤767px：页头两行布局 ============
+   设计稿移动端处理（ocdeck-ui.css:509）：od-page-actions 独占整行置于标题块之下。
+   全局规则只给了 width:100%，但 flex 默认收缩会把标题块与操作区挤回同一行
+   （副标题折行、按钮在「刚刚刷新」下换行）——此处显式禁止收缩，保证两行布局：
+   第一行标题块整行，第二行「刚刚刷新 + 新建任务」整行左对齐，垂直居中、间距走 gap。 */
+@media (max-width: 767px) {
+  .cc-page .od-page-head .od-page-title {
+    flex: 1 1 100%;
+  }
+  .cc-page .od-page-head .od-page-actions {
+    flex: 0 0 100%;
+    justify-content: flex-start;
+    align-items: center;
+  }
+}
+
+/* ==================== 内联新建任务面板 ==================== */
+
+.cc-new-task-panel {
+  padding: 16px 18px;
+  margin-bottom: 20px;
+}
+
+.cc-combo {
+  position: relative;
+}
+.cc-combo-list {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 40;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-pop, 0 4px 12px color-mix(in oklch, var(--fg) 12%, transparent));
+  padding: 4px;
+  display: none;
+  max-height: 220px;
+  overflow: auto;
+}
+.cc-combo-list.open {
+  display: block;
+}
+.cc-combo-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  background: none;
+  border-radius: var(--radius);
+  font: inherit;
+  font-size: 12.5px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  text-align: left;
+  color: var(--fg);
+}
+.cc-combo-item:hover,
+.cc-combo-item.hl {
+  background: var(--surface);
+}
+.cc-combo-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  background: none;
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 var(--radius) var(--radius);
+  font: inherit;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.cc-combo-foot:hover {
+  color: var(--fg);
+}
+.cc-combo-empty {
+  padding: 10px;
+  font-size: 12.5px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.cc-kind {
+  margin-left: auto;
+  font-family: var(--font-ui);
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.cc-field-error {
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.cc-dir-warn {
+  margin-top: 10px;
+}
+
+.cc-store-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.cc-form-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
+/* 通用 muted badge（次要标记） */
+.badge-muted {
+  background: var(--surface);
+  color: var(--muted);
+  border: 1px solid var(--border);
+}

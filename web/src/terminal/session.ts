@@ -8,6 +8,7 @@ import {
   resolveFontSize,
   type TermPreferences,
 } from './preferences';
+import { readCurrentTermTheme, resolveXtermTheme, watchTermTheme } from './theme';
 import { createLockController, type LockController } from './lock';
 import { attachTouchGestures, type GestureHandle } from './touch-gestures';
 import { shouldSendInput, encodeBinaryInput, createSyntheticGate, type SyntheticGate } from './input-gate';
@@ -67,6 +68,8 @@ export class TermSession {
   private pointerCoarse = false;
   private pointerMql: MediaQueryList | null = null;
   private readonly lockChangeCallbacks = new Set<(locked: boolean) => void>();
+  /** 应用主题订阅退订（终端配色跟随主题，dispose 时退订防泄漏）。 */
+  private unwatchTermTheme: (() => void) | null = null;
 
   // IME 补偿器 + 原生 onData tap（全平台启用，design D7）。
   private imeCompensator: ImeCompensator | null = null;
@@ -90,29 +93,9 @@ export class TermSession {
       cursorBlink: true,
       allowProposedApi: true,
       scrollback: 5000,
-      theme: {
-        background: '#0b0e14',
-        foreground: '#d6deeb',
-        cursor: '#5ccfe6',
-        cursorAccent: '#0b0e14',
-        selectionBackground: '#2a3345',
-        black: '#1c2430',
-        red: '#ef6b73',
-        green: '#7fd88f',
-        yellow: '#e5c07b',
-        blue: '#61afef',
-        magenta: '#c678dd',
-        cyan: '#5ccfe6',
-        white: '#d6deeb',
-        brightBlack: '#5a6478',
-        brightRed: '#ef6b73',
-        brightGreen: '#7fd88f',
-        brightYellow: '#e5c07b',
-        brightBlue: '#61afef',
-        brightMagenta: '#c678dd',
-        brightCyan: '#5ccfe6',
-        brightWhite: '#ffffff',
-      },
+      // 终端配色跟随应用主题（terminal/theme.ts，token 对齐常量）；
+      // 切换由下方 watchTermTheme 订阅即时应用到已挂载终端，无需重连。
+      theme: resolveXtermTheme(readCurrentTermTheme()),
     });
     this.term.loadAddon(this.fit);
     this.term.open(host);
@@ -121,6 +104,13 @@ export class TermSession {
     } catch {
       /* WebGL 不可用时回退 canvas 渲染 */
     }
+
+    // 应用主题切换 → 即时翻转终端配色（term.options.theme 运行时赋值，无需重连）；
+    // dispose 时退订（每个已挂载 TermSession 各自订阅，全部即时生效）。
+    this.unwatchTermTheme = watchTermTheme((t) => {
+      if (this.disposed) return;
+      this.term.options.theme = resolveXtermTheme(t);
+    });
 
     this.wrap = wrap;
 
@@ -285,6 +275,8 @@ export class TermSession {
     this.clearTimer();
     this.closeSocket();
     this.observer.disconnect();
+    this.unwatchTermTheme?.();
+    this.unwatchTermTheme = null;
     if (this.fitRaf) cancelAnimationFrame(this.fitRaf);
     // visualViewport 监听清理：先移除 resize/scroll listener（防全局 visualViewport 持续引用已销毁 session），再清引用、取消 pending rAF、清除 wrap maxHeight 内联样式。
     this.detachVisualViewportListener();

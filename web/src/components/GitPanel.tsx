@@ -3,6 +3,7 @@ import { html as renderDiffHtml } from 'diff2html';
 import 'diff2html/bundles/css/diff2html.min.css';
 import { api, ApiError } from '../api';
 import type { GitDiffResult, GitFileEntry, GitStatus } from '../types';
+import { BranchIcon } from '../icons';
 
 interface FileGroup {
   key: string;
@@ -150,7 +151,7 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
       <div className="git-side">
         <div className="git-toolbar">
           <span className="mono git-branch" title="当前分支">
-            ⎇ {status?.branch ?? '…'}
+            <BranchIcon /> {status?.branch ?? '…'}
           </span>
           <span className="header-spacer" />
           <button

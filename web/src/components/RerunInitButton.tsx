@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { api, ApiError } from '../api';
 import type { Task } from '../types';
+import { RetryIcon } from '../icons';
 
 /** Re-run 入口渲染门禁（tasks.md 5.3，与后端门禁一致）：仅 suspended 且 failed|succeeded。 */
 export function canRerunInit(task: Task): boolean {
@@ -47,14 +48,15 @@ export function RerunInitButton({ task, onDone, onError, compact = false }: Reru
                   : `[${err.code}] ${err.message}`
                 : 'Re-run 失败';
             onError?.(msg);
-            onDone(); // 刷新以拿到最新状态
+            // onDone 仅在成功后调用：失败不触发刷新（调用方已通过 onError 感知失败）。
+            // 旧调用方（TaskWorkbenchPage）的失败自动刷新由 P4 适配。
           } finally {
             setBusy(false);
           }
         })();
       }}
     >
-      {busy ? '…' : compact ? '⟳' : 'Re-run init'}
+      {busy ? '…' : compact ? <RetryIcon /> : 'Re-run init'}
     </button>
   );
 }

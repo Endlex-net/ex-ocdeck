@@ -1,0 +1,1481 @@
+/* 旧组件样式（tasks 8.5 迁移自 styles.css，token 化）。
+ *
+  * 保留组件（TaskWorkbenchPage / GitPanel / EnvEditor / StatusBadge /
+  * TaskActions / DeleteTaskModal / LifecycleLogModal / TermAppearanceEditor 等）仍使用旧类名。
+ * 本文件提供这些类的定义，颜色全部走 design-system token（CSS 变量），
+ * 不含 hex 字面量（token 定义层除外：diff2html 语义色派生自 --success/--danger）。
+ *
+ * legacy 变量别名（映射到 design-system token，兼容旧类定义内的 var() 引用）：
+ *   --text → --fg  /  --text-dim → --muted  /  --bg-panel → --surface
+ *   --bg-raised → color-mix(surface 80%, bg)  /  --bg-hover → --surface-hover
+ *   --green → --success  /  --red → --danger  /  --yellow → --warn  /  --gray → --muted
+ *   --accent-dim → color-mix(accent 50%, border)  /  --mono → --font-mono
+ */
+
+:root {
+  --text: var(--fg);
+  --text-dim: var(--muted);
+  --bg-panel: var(--surface);
+  --bg-raised: color-mix(in oklch, var(--surface) 80%, var(--bg));
+  --bg-hover: var(--surface-hover);
+  --green: var(--success);
+  --red: var(--danger);
+  --yellow: var(--warn);
+  --gray: var(--muted);
+  --accent-dim: color-mix(in oklch, var(--accent) 50%, var(--border));
+  --mono: var(--font-mono);
+}
+
+.mono {
+  font-family: var(--mono);
+}
+
+/* ---------- 基础控件 ---------- */
+
+.btn {
+  background: var(--surface);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 5px 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+  border-color: var(--accent-dim);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn-small {
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-ink);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.btn-danger {
+  background: var(--danger-soft);
+  border-color: color-mix(in oklch, var(--danger) 45%, var(--border-strong));
+  color: var(--danger);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+}
+
+.btn-ghost {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--muted);
+}
+
+.btn-ghost:hover:not(:disabled) {
+  color: var(--fg);
+}
+
+.input {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 6px 10px;
+  outline: none;
+  min-width: 180px;
+}
+
+.input:focus {
+  border-color: var(--accent);
+}
+
+.input-grow {
+  flex: 1;
+}
+
+select.input {
+  cursor: pointer;
+}
+
+/* 触控主控件 ≥44px + 环境变量窄屏防溢出（web-ui-shell / tasks 8.6 ①）。
+ * 必须在基础 .input { min-width:180px } 之后，否则同特异性媒体块会被源序覆盖。 */
+@media (max-width: 767px) {
+  /* 按钮触控档 35px（用户实测决策，覆盖 44px）：垂直 padding 4px 不叠加，border-box 精确 35px */
+  .btn {
+    min-height: 35px;
+    padding: 4px 14px;
+  }
+  .btn-small {
+    min-height: 35px;
+    padding: 4px 12px;
+  }
+  .input {
+    min-width: 0;
+    width: 100%;
+    min-height: 35px; /* 输入控件 35px 档（用户实测决策，覆盖 44px） */
+    padding-top: 4px;
+    padding-bottom: 4px;
+    box-sizing: border-box;
+  }
+  /* 环境变量模式切换按钮（GlobalEnvEditor）：35px 按钮触控档（用户实测决策） */
+  .env-mode-opt {
+    min-height: 35px;
+  }
+  /* 新增/编辑行：纵向堆叠，避免 min-width 叠加横向溢出 */
+  .env-add,
+  .env-row {
+    flex-wrap: wrap;
+    align-items: stretch;
+  }
+  .env-add .input,
+  .env-row .input {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+  .env-key {
+    max-width: 100%;
+  }
+}
+
+.spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+.spinner-inline {
+  width: 9px;
+  height: 9px;
+  border-width: 1.5px;
+  margin-right: 5px;
+  vertical-align: -1px;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.error-line {
+  color: var(--danger);
+  font-size: 12px;
+  padding: 6px 0;
+}
+
+.empty {
+  color: var(--muted);
+  padding: 48px 0;
+  text-align: center;
+}
+
+/* ---------- 页头（工作台用，主页面由 od-page-head 承担） ---------- */
+
+.page-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+
+.workbench .page-header {
+  padding: 8px 12px;
+  margin-bottom: 0;
+  background: var(--surface);
+}
+
+/* 工作台页头操作按钮：紧凑档（对齐设计稿 task-workbench.html wb-actions 的 od-btn-sm/od-btn-icon）。
+   全局 ≤767px .btn/.btn-small 触控规则（44px + 10px 12px padding）会把页头图标按钮撑成
+   大块（图标仍 1em≈11px），此处按页头语义显式定形：32px 紧凑档、细边框、图标居中；
+   ≤767px 触控档由下方 workbench 媒体块单独放大（图标同步放大，不留大块小图标）。
+   选择器限定直接子级，避免误伤 task-actions 内 dirty 确认弹窗（.modal）的按钮。 */
+.workbench .page-header > .btn,
+.workbench .page-header .task-actions > .btn,
+.workbench .page-header .header-overflow > .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  min-height: 32px;
+  min-width: 32px;
+  padding: 4px 8px;
+  font-size: 12px;
+  background: var(--bg);
+  border-color: var(--border);
+  color: var(--fg);
+}
+.workbench .page-header > .btn:hover:not(:disabled),
+.workbench .page-header .task-actions > .btn:hover:not(:disabled),
+.workbench .page-header .header-overflow > .btn:hover:not(:disabled) {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+  color: var(--fg);
+}
+
+.page-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.header-meta {
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.header-spacer {
+  flex: 1;
+}
+
+.header-error {
+  color: var(--danger);
+  font-size: 11px;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- 任务操作行内组 ---------- */
+
+.task-actions {
+  display: inline-flex;
+  gap: 6px;
+}
+
+/* ---------- 状态徽标 ---------- */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.badge-active {
+  color: var(--success);
+  background: var(--success-soft);
+  border-color: color-mix(in oklch, var(--success) 40%, var(--border));
+}
+
+.badge-suspended {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-color: color-mix(in oklch, var(--warn) 40%, var(--border));
+}
+
+.badge-archived {
+  color: var(--muted);
+  background: var(--surface);
+  border-color: var(--border-strong);
+}
+
+.badge-pending {
+  color: var(--info);
+  background: var(--info-soft);
+  border-color: color-mix(in oklch, var(--info) 40%, var(--border));
+}
+
+.badge-failed {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: color-mix(in oklch, var(--danger) 45%, var(--border));
+}
+
+/* agent 状态徽标（工作台内联） */
+.agent-idle {
+  color: var(--muted);
+  background: var(--surface);
+  border-color: var(--border-strong);
+}
+
+.agent-busy {
+  color: var(--success);
+  background: var(--success-soft);
+  border-color: color-mix(in oklch, var(--success) 40%, var(--border));
+}
+
+.agent-retry {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-color: color-mix(in oklch, var(--warn) 40%, var(--border));
+}
+
+.agent-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  margin-right: 5px;
+}
+
+.agent-busy .agent-dot,
+.agent-retry .agent-dot {
+  animation: agent-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes agent-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+
+/* ---------- 告警条 ---------- */
+
+.server-banners {
+  flex-shrink: 0;
+}
+
+.alert-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px 12px;
+  font-size: 11px;
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.alert-bar span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.alert-error {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.alert-notice {
+  color: var(--warn);
+  background: var(--warn-soft);
+}
+
+/* ---------- 工作台布局 ---------- */
+
+.workbench {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* 工作台 404：fullbleed 路由下自持边距（替代已删 .page） */
+.wb-not-found {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 28px 32px 64px;
+}
+
+.tabstrip {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 4px 8px 0;
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 4px 4px 0 0;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 0;
+  cursor: pointer;
+}
+
+.tab-label {
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+  padding: 5px 4px 5px 12px;
+  cursor: pointer;
+}
+
+.tab > .tab-label:only-child,
+.tab:not(:has(.tab-label)) {
+  padding: 5px 12px;
+}
+
+.tab-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font: inherit;
+  padding: 5px 10px 5px 4px;
+  cursor: pointer;
+}
+
+.tab-close:hover {
+  color: var(--danger);
+}
+
+.tab:hover {
+  color: var(--fg);
+}
+
+.tab-active {
+  background: var(--bg);
+  border-color: var(--border);
+  color: var(--accent);
+}
+
+.tab-add {
+  padding: 5px 10px;
+  font-size: 13px;
+}
+
+.tab-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 6px 6px 4px;
+  background: var(--border-strong);
+}
+
+.pane-area {
+  flex: 1;
+  position: relative;
+  min-height: 0;
+}
+
+.pane {
+  position: absolute;
+  inset: 0;
+}
+
+.pane-hidden {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.pane-scroll {
+  overflow: auto;
+}
+
+/* ---------- 终端基础布局（从 styles.css 恢复；颜色走 --term-*） ----------
+ *  TerminalView / session ResizeObserver 依赖宿主填满 pane（absolute inset:0 + .xterm height:100%）。 */
+
+.terminal-wrap {
+  position: absolute;
+  inset: 0;
+  background: var(--term-bg);
+}
+
+.terminal-host {
+  position: absolute;
+  inset: 0;
+  padding: 4px 0 0 8px;
+}
+
+.terminal-host .xterm {
+  height: 100%;
+}
+
+/* ---------- 终端 overlay ---------- */
+
+.terminal-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in oklch, var(--term-bg) 82%, transparent);
+  z-index: 5;
+}
+
+.terminal-overlay-box {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--term-muted);
+  font-size: 12px;
+  background: var(--term-bg);
+  border: 1px solid var(--term-border);
+  border-radius: 6px;
+  padding: 12px 18px;
+}
+
+.terminal-overlay-reason {
+  color: var(--term-red);
+}
+
+.terminal-overlay-actions {
+  display: inline-flex;
+  gap: 8px;
+}
+
+/* ---------- 模态框 ---------- */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in oklch, var(--ink) 70%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+
+.modal {
+  width: 440px;
+  max-width: calc(100vw - 48px);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+
+.modal-wide {
+  width: 720px;
+}
+
+.modal-title {
+  font-weight: 700;
+  font-size: 14px;
+  margin-bottom: 10px;
+  color: var(--fg);
+}
+
+.modal-body {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.modal-body strong {
+  color: var(--fg);
+}
+
+.modal-body code {
+  color: var(--accent);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.check-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 10px;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.warn-box {
+  border: 1px solid color-mix(in oklch, var(--warn) 40%, var(--border));
+  background: var(--warn-soft);
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin-top: 10px;
+  color: var(--warn);
+}
+
+.warn-box p {
+  margin: 0;
+}
+
+/* ---------- 设置面板 ---------- */
+
+.settings-pane {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 16px 24px 48px;
+}
+
+.settings-section {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 12px 14px;
+}
+
+.settings-title {
+  font-weight: 600;
+  font-size: 12px;
+  margin-bottom: 10px;
+  color: var(--fg);
+}
+
+/* ---------- 终端外观 ---------- */
+
+.term-appearance {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.term-appearance-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.term-appearance-label {
+  width: 56px;
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.term-appearance-size {
+  min-width: 80px;
+  max-width: 120px;
+}
+
+.term-appearance-hint {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.term-appearance-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.term-appearance-saved {
+  color: var(--success);
+  font-size: 12px;
+}
+
+/* ---------- 生命周期配置编辑器 ---------- */
+
+.lc-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.lc-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.lc-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.lc-note {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.lc-note-warn {
+  color: var(--danger);
+}
+
+.lc-textarea {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 8px 10px;
+  resize: vertical;
+  outline: none;
+  tab-size: 2;
+  box-sizing: border-box;
+}
+
+.lc-textarea:focus {
+  border-color: var(--accent);
+}
+
+.lc-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.lc-log-entries {
+  display: flex;
+  gap: 8px;
+}
+
+.lc-log {
+  margin: 0;
+  max-height: 60vh;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 12px;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--fg);
+}
+
+/* ---------- 环境变量编辑器 ---------- */
+
+.env-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.env-warning {
+  margin-top: 0;
+  font-size: 11px;
+}
+
+.env-hint {
+  color: var(--accent);
+  font-size: 11px;
+}
+
+.env-empty {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 8px 0;
+}
+
+.env-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.env-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.env-row:last-child {
+  border-bottom: none;
+}
+
+.env-key {
+  color: var(--accent);
+  font-size: 12px;
+  flex-shrink: 0;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.env-value {
+  flex: 1;
+  min-width: 0;
+  color: var(--fg);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.env-value-unset {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.env-add {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.env-mode-toggle {
+  display: inline-flex;
+  flex-shrink: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+/* GlobalEnvEditor 模式切换（从 styles.css 恢复并 token 化） */
+.env-mode-opt {
+  background: var(--surface);
+  border: none;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 4px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.env-mode-opt:hover:not(:disabled) {
+  color: var(--fg);
+}
+
+.env-mode-opt-active,
+.env-mode-opt-active:hover:not(:disabled) {
+  background: var(--bg-raised);
+  color: var(--accent);
+}
+
+.env-mode-opt:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* ---------- Git 面板 ---------- */
+
+.git-panel {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+}
+
+.git-side {
+  width: 340px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.git-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.git-branch {
+  color: var(--accent);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-side .error-line,
+.git-side .git-result,
+.git-side .git-error {
+  margin: 6px 10px 0;
+}
+
+.git-result {
+  color: var(--success);
+  font-size: 12px;
+}
+
+/* git stderr 原样透传：保留换行、等宽、可滚动 */
+.git-error {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border: 1px solid color-mix(in oklch, var(--danger) 45%, var(--border));
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 200px;
+  overflow: auto;
+  margin-top: 6px;
+}
+
+.git-files {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 0;
+}
+
+.git-clean {
+  color: var(--muted);
+  padding: 24px 12px;
+  text-align: center;
+}
+
+.git-group-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px 4px;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.git-group-count {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 0 6px;
+  font-size: 10px;
+}
+
+.git-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 12px;
+  cursor: default;
+}
+
+.git-file:hover {
+  background: var(--surface-hover);
+}
+
+.git-file-active {
+  background: var(--surface);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.git-file input[type='checkbox'] {
+  accent-color: var(--accent);
+  margin: 0;
+  flex-shrink: 0;
+}
+
+.git-file-path {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+  cursor: pointer;
+}
+
+.git-stat {
+  display: inline-flex;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.stat-add {
+  color: var(--success);
+}
+
+.stat-del {
+  color: var(--danger);
+}
+
+.git-commit-box {
+  border-top: 1px solid var(--border);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.git-commit-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.git-commit-meta span {
+  flex: 1;
+}
+
+.git-commit-msg {
+  resize: vertical;
+  width: 100%;
+  min-height: 54px;
+}
+
+.git-diff {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  /* 纵向滚动保留、横向关闭：横向滚动 owner 唯一为 .d2h-wrapper（design D3 不变量 3） */
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.git-diff-header {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.git-diff .empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.git-diff .git-error {
+  margin: 10px 14px;
+}
+
+.diff-view {
+  padding: 10px 14px 24px;
+  font-size: 12px;
+}
+
+/* ---------- diff2html 适配（语义色派生自 --success/--danger） ---------- */
+
+.diff-view .d2h-wrapper {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  /* 唯一横向滚动 owner（design D3 不变量 3）：gutter 与代码同容器同向滚动；
+     overflow-y:hidden 保持圆角裁剪，纵向滚动仍由 .git-diff 承担 */
+  overflow-x: auto;
+  overflow-y: hidden;
+  background: var(--bg);
+}
+
+.diff-view .d2h-file-diff {
+  overflow: visible;
+}
+
+.diff-view .d2h-file-wrapper,
+.diff-view .d2h-file-diff,
+.diff-view .d2h-code-wrapper {
+  width: max-content;
+  min-width: 100%;
+}
+
+.diff-view .d2h-code-wrapper {
+  position: relative;
+}
+
+.diff-view .d2h-file-header {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  color: var(--fg);
+}
+
+.diff-view .d2h-file-name-wrapper,
+.diff-view .d2h-file-name {
+  color: var(--fg);
+}
+
+.diff-view .d2h-file-stats {
+  color: var(--muted);
+}
+
+.diff-view .d2h-lines-added {
+  border-color: color-mix(in oklch, var(--success) 40%, transparent);
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.diff-view .d2h-lines-deleted {
+  border-color: color-mix(in oklch, var(--danger) 40%, transparent);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.diff-view .d2h-tag {
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+  color: var(--muted);
+}
+
+.diff-view .d2h-diff-table {
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  width: max-content;
+  min-width: 100%;
+}
+
+.diff-view .d2h-diff-table td {
+  padding: 0;
+}
+
+.diff-view .d2h-code-linenumber,
+.diff-view .d2h-code-side-linenumber {
+  background: var(--surface);
+  color: var(--muted);
+  border-color: var(--border);
+  line-height: 18px;
+}
+
+.diff-view .d2h-code-line,
+.diff-view .d2h-code-side-line {
+  color: var(--fg);
+  background: var(--bg);
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.diff-view .d2h-code-line-prefix {
+  color: var(--muted);
+}
+
+.diff-view .d2h-info {
+  background: var(--surface);
+  color: var(--accent);
+}
+
+.diff-view .d2h-ins {
+  background: color-mix(in oklch, var(--success) 14%, var(--bg));
+  border-color: color-mix(in oklch, var(--success) 14%, transparent);
+}
+
+.diff-view .d2h-del {
+  background: color-mix(in oklch, var(--danger) 14%, var(--bg));
+  border-color: color-mix(in oklch, var(--danger) 14%, transparent);
+}
+
+.diff-view .d2h-code-line ins,
+.diff-view .d2h-code-side-line ins {
+  background: color-mix(in oklch, var(--success) 30%, transparent);
+  color: color-mix(in oklch, var(--success) 80%, var(--fg));
+}
+
+.diff-view .d2h-code-line del,
+.diff-view .d2h-code-side-line del {
+  background: color-mix(in oklch, var(--danger) 30%, transparent);
+  color: color-mix(in oklch, var(--danger) 75%, var(--fg));
+}
+
+.diff-view .d2h-code-linenumber.d2h-ins,
+.diff-view .d2h-code-side-linenumber.d2h-ins {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.diff-view .d2h-code-linenumber.d2h-del,
+.diff-view .d2h-code-side-linenumber.d2h-del {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.diff-view .d2h-emptyplaceholder {
+  background: var(--surface);
+  border-color: var(--border);
+}
+
+.diff-view .d2h-file-diff .d2h-del.d2h-change,
+.diff-view .d2h-file-diff .d2h-ins.d2h-change {
+  background: inherit;
+}
+
+/* ---------- 工作台页头「⋯」溢出菜单（design task-workbench.html wb-overflow） ----------
+   桌面与窄屏同一入口，故不放在窄屏 media query 内。限定 .workbench 作用域。 */
+.workbench .header-overflow {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.workbench .overflow-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+
+.workbench .overflow-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 41;
+  min-width: 148px;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 4px;
+  box-shadow: var(--shadow-pop);
+}
+
+.workbench .overflow-item {
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: var(--fg);
+  font-size: 12px;
+  text-align: left;
+  padding: 9px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.workbench .overflow-item:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.workbench .overflow-item:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+.workbench .overflow-item-danger {
+  color: var(--danger);
+}
+
+/* ---------- 工作台窄屏布局（≤1024px，design D3） ----------
+   限定 .workbench 作用域，桌面端零回归。 */
+
+@media (max-width: 1024px) {
+  .workbench .input {
+    min-width: 0;
+  }
+
+  .workbench .modal-wide {
+    width: auto;
+    max-width: calc(100vw - 32px);
+  }
+
+  .workbench .git-side {
+    width: 100%;
+    flex-shrink: 1;
+  }
+
+  .workbench .page-header {
+    gap: 6px;
+    padding: 6px 8px;
+  }
+
+  .workbench .page-title {
+    min-width: 0;
+    flex-shrink: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .workbench .page-header .header-meta {
+    display: none;
+  }
+
+  .workbench .page-header .badge {
+    font-size: 9px;
+    padding: 1px 5px;
+  }
+
+  .workbench .tabstrip {
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .workbench .tabstrip::-webkit-scrollbar {
+    display: none;
+  }
+
+  .workbench .tabstrip .tab,
+  .workbench .tabstrip .tab-sep {
+    flex-shrink: 0;
+  }
+
+  .workbench .git-panel {
+    flex-direction: column;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+
+  .workbench .git-side {
+    flex-shrink: 0;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .workbench .git-files {
+    flex: none;
+    max-height: 40vh;
+    overflow-y: auto;
+  }
+
+  .workbench .git-diff {
+    flex: none;
+    overflow: visible;
+  }
+
+  .workbench .settings-pane {
+    padding: 12px 12px 48px;
+  }
+
+  .workbench .env-add {
+    flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 767px) {
+  .workbench .page-header {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+
+  /* 页头操作按钮触控档：35px（用户实测决策，覆盖 44px），图标同步 14px、水平 padding 不变；
+     min-width 44px 保留 x 轴触控宽度（仅降 y 轴） */
+  .workbench .page-header > .btn,
+  .workbench .page-header .task-actions > .btn,
+  .workbench .page-header .header-overflow > .btn {
+    min-height: 35px;
+    min-width: 44px;
+    padding: 6px 10px;
+    font-size: 14px;
+  }
+
+  .workbench .page-header .header-spacer {
+    display: none;
+  }
+
+  .workbench .page-title {
+    flex: 1 1 auto;
+  }
+
+  .workbench .page-header .task-actions {
+    margin-left: auto;
+  }
+
+  /* 页头任务切换器（≤767px 侧栏任务组隐藏时任务直达，design D12 裁决 3） */
+  .workbench .wb-switcher {
+    position: relative;
+    flex: 1 1 0;
+    min-width: 0;
+  }
+
+  .workbench .wb-switcher-btn {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+    min-height: 35px; /* 按钮触控档 35px（用户实测决策，覆盖 44px） */
+    background: none;
+    border: none;
+    color: var(--fg);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 8px 4px;
+    text-align: left;
+  }
+
+  .workbench .wb-switcher-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .workbench .wb-switcher-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    z-index: 41;
+    max-height: 320px;
+    overflow-y: auto;
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    padding: 4px;
+    box-shadow: var(--shadow-pop);
+  }
+
+  .workbench .wb-sw-group {
+    padding: 6px 10px 2px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .workbench .wb-sw-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    border: none;
+    background: none;
+    border-radius: 4px;
+    padding: 7px 10px;
+    color: var(--fg);
+    font: inherit;
+    font-size: 12.5px;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .workbench .wb-sw-item:hover,
+  .workbench .wb-sw-item.current {
+    background: var(--surface-hover);
+  }
+
+  .workbench .wb-sw-name {
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .workbench .wb-sw-all {
+    display: block;
+    padding: 8px 10px;
+    color: var(--accent);
+    font-size: 12px;
+    text-decoration: none;
+    border-top: 1px solid var(--border);
+    margin-top: 4px;
+  }
+}
