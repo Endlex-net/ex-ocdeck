@@ -49,12 +49,12 @@
 
 ### Requirement: 活跃会话列表 API
 
-系统 SHALL 提供 `GET /api/v1/sessions/active` 端点，鉴权方式与其他 `/api/v1/*` 管理 API 一致（Bearer token）。响应 MUST 为 JSON 数组，元素字段为 `task_id`、`project_id`、`project_name`、`name`、`branch`、`worktree_path`、`last_active_at`（Unix 秒）、`agentStatus`（`idle` | `busy` | `retry`，不可用时省略）。端点 MUST 对每个返回任务实时水合 `agentStatus`；水合 MUST 并发执行（每请求并发上限 8）并受水合预算约束（数据库查询完成后起 3 秒）；单个任务水合失败或超时 MUST 降级为该字段缺省，MUST NOT 导致整个请求失败。数据库查询失败 MUST 返回标准错误信封 500 且 MUST NOT 开始水合。无 active 任务时 MUST 返回 200 与空数组（JSON `[]`，MUST NOT 为 `null`）。响应为查询时刻快照：查询完成后任务状态变化的 MUST NOT 触发请求内重做。
+系统 SHALL 提供 `GET /api/v1/sessions/active` 端点，鉴权方式与其他 `/api/v1/*` 管理 API 一致（Bearer token）。响应 MUST 为 JSON 数组，元素字段为 `task_id`、`project_id`、`project_name`、`name`、`branch`、`worktree_path`、`last_active_at`（Unix 秒）、`agentStatus`（`idle` | `busy` | `retry`，不可用时省略）、`attention`（注意力摘要，结构见 agent-attention spec：`{permissions[], questions[]}`，无 pending 时两数组为空）。端点 MUST 对每个返回任务实时水合 `agentStatus`；水合 MUST 并发执行（每请求并发上限 8）并受水合预算约束（数据库查询完成后起 3 秒）；单个任务水合失败或超时 MUST 降级为该字段缺省，MUST NOT 导致整个请求失败。`attention` 数据 MUST 来自任务内存态 pending 集合，MUST NOT 引入新的 opencode 调用。数据库查询失败 MUST 返回标准错误信封 500 且 MUST NOT 开始水合。无 active 任务时 MUST 返回 200 与空数组（JSON `[]`，MUST NOT 为 `null`）。响应为查询时刻快照：查询完成后任务状态变化的 MUST NOT 触发请求内重做。
 
 #### Scenario: 正常返回活跃列表
 
 - **WHEN** 存在若干 active 任务，且其凭据、端口、归属 session 与 serve 状态接口均可用
-- **THEN** 返回 200，数组元素包含全部字段，`agentStatus` 为 `idle`/`busy`/`retry` 之一，数组按 `last_active_at` 倒序
+- **THEN** 返回 200，数组元素包含全部字段，`agentStatus` 为 `idle`/`busy`/`retry` 之一，`attention` 字段存在，数组按 `last_active_at` 倒序
 
 #### Scenario: 单个任务水合失败降级
 
@@ -102,12 +102,12 @@
 
 ### Requirement: 前端活跃会话页面
 
-系统 SHALL 提供独立前端页面（路由 `#/active`）展示跨项目活跃任务列表：每行展示项目名称、任务名、分支、最近活跃时间、agent 状态徽标；页面 MUST 以固定 5 秒间隔轮询刷新，且 MUST single-flight（上一请求未返回时跳过本次轮询，禁止请求重叠）；点击行 MUST 跳转对应任务工作台 `#/task/:id`。页面 MUST 区分三种状态：初次加载（loading）、请求失败（错误提示并保留上次成功数据）、真正空态（请求成功且无活跃任务，展示引导文案）。项目列表页（`#/`）MUST 提供进入该页面的入口。
+跨项目活跃任务列表 MUST 并入指挥中心首页（`#/active` 重定向至 `#/`，见 web-ui-shell spec 路由收敛要求），MUST NOT 保留独立页面。指挥中心 MUST 以固定 5 秒间隔 single-flight 轮询活跃任务数据（上一请求未返回时跳过本次轮询，禁止请求重叠），活跃任务行 MUST 展示项目名称、任务名、分支、最近活跃时间、agent 状态徽标与注意力标记；点击行 MUST 跳转对应任务工作台 `#/task/:id`。页面 MUST 区分三种状态：初次加载（loading）、请求失败（错误提示并保留上次成功数据）、真正空态（请求成功且无任务，展示引导文案）。侧栏 MUST 提供进入指挥中心的顶层导航项。
 
 #### Scenario: 浏览活跃任务并跳转
 
-- **WHEN** 用户打开 `#/active` 且存在活跃任务
-- **THEN** 列表按最近活跃时间倒序展示各行；点击某行后进入该任务的工作台页面
+- **WHEN** 用户打开指挥中心且存在活跃任务
+- **THEN** 「其余活跃任务」分区按最近活跃时间倒序展示（「需要关注」分区的排序规则见 command-center spec，不受本要求约束）；点击某行后进入该任务的工作台页面
 
 #### Scenario: 轮询不重叠
 
@@ -121,10 +121,10 @@
 
 #### Scenario: 空态展示
 
-- **WHEN** 用户打开 `#/active` 且请求成功返回空数组
+- **WHEN** 用户打开指挥中心且请求成功返回空数据
 - **THEN** 页面展示空态引导文案，而非报错或空白
 
-#### Scenario: 从项目列表进入
+#### Scenario: 旧路由重定向
 
-- **WHEN** 用户在项目列表页点击活跃会话入口
-- **THEN** 导航至 `#/active`
+- **WHEN** 用户打开 `#/active`
+- **THEN** 应用重定向至 `#/` 指挥中心

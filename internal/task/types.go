@@ -82,6 +82,11 @@ type OCClient interface {
 	DeleteSession(ctx context.Context, dir, id string) error
 	SessionStatus(ctx context.Context, dir string) (map[string]opencode.SessionStatus, error)
 	SubscribeEvents(ctx context.Context, dir string, onEvent func(opencode.Event), onReconnect func()) error
+	// ListPermissions GET /permission → pending 权限请求快照（design.md D6 注意力信号）。
+	// 404 → opencode.ErrCapabilityUnsupported（能力状态机迁移 unsupported）。
+	ListPermissions(ctx context.Context, dir string) ([]opencode.PermissionRequest, error)
+	// ListQuestions GET /question → pending 问题请求快照（design.md D6）。
+	ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error)
 }
 
 // OCClientFactory 构造指向某 serve（port+password）的 OCClient。

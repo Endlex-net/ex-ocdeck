@@ -123,7 +123,7 @@ type overflowOC struct{}
 func (c *overflowOC) Health(ctx context.Context) (opencode.HealthResponse, error) {
 	return opencode.HealthResponse{Healthy: true}, nil
 }
-func (c *overflowOC) Probe(ctx context.Context) (string, error)                 { return "1", nil }
+func (c *overflowOC) Probe(ctx context.Context) (string, error) { return "1", nil }
 func (c *overflowOC) ListSessions(ctx context.Context, dir string, limit int) ([]opencode.Session, error) {
 	return nil, opencode.ErrSessionOverflow
 }
@@ -140,6 +140,13 @@ func (c *overflowOC) SessionStatus(ctx context.Context, dir string) (map[string]
 func (c *overflowOC) SubscribeEvents(ctx context.Context, dir string, onEvent func(opencode.Event), onReconnect func()) error {
 	<-ctx.Done()
 	return ctx.Err()
+}
+
+func (c *overflowOC) ListPermissions(ctx context.Context, dir string) ([]opencode.PermissionRequest, error) {
+	return nil, opencode.ErrCapabilityUnsupported
+}
+func (c *overflowOC) ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error) {
+	return nil, opencode.ErrCapabilityUnsupported
 }
 
 // TestAllocatePort_RotationCursor 验证端口轮转游标（B5）：连续分配不每次从头扫。

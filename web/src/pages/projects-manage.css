@@ -1,0 +1,412 @@
+/* 项目管理单页 master-detail 样式（tasks.md 6.1-6.6，设计稿 docs/design/screens/projects.html）
+   布局/状态/交互规格对齐设计稿；mock 数据非契约。
+   本文件为 lane 6 独占页面级样式，只新增不交叉修改共享设计系统样式表。 */
+
+.pjm-split {
+  display: flex;
+  gap: 20px;
+  align-items: flex-start;
+}
+
+/* ============ 左栏：项目轨道 ============ */
+.pjm-rail-col {
+  flex: 0 0 232px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  position: sticky;
+  top: 24px;
+}
+.pjm-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.pjm-rail-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  border: 1px solid transparent;
+  background: none;
+  text-align: left;
+  font-family: var(--font-ui);
+  color: var(--fg);
+}
+.pjm-rail-item[aria-selected='true'] {
+  background: var(--surface);
+  border-color: var(--border);
+}
+.pjm-rail-item:hover {
+  background: var(--surface);
+}
+.pjm-rail-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13.5px;
+  font-weight: 500;
+}
+.pjm-rail-name svg {
+  color: var(--muted);
+  flex: none;
+}
+.pjm-rail-sub {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* 轨道检索框 */
+.pjm-search {
+  position: relative;
+}
+.pjm-search svg {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--muted);
+  pointer-events: none;
+}
+.pjm-search .od-input {
+  width: 100%;
+  padding-left: 30px;
+  font-size: 13px;
+}
+.pjm-search-count {
+  font-size: 11.5px;
+  color: var(--muted);
+  padding: 0 2px;
+}
+.pjm-rail-empty {
+  padding: 18px 12px;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--muted);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+}
+
+/* ============ 右栏：详情面板 ============ */
+.pjm-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.pjm-detail-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.pjm-detail-title {
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 1.35;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.pjm-detail-sub {
+  font-size: 12.5px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+.pjm-detail-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.pjm-detail-blockhint {
+  flex-basis: 100%;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* 删除项目两步确认 */
+.pjm-del {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  background: var(--danger-soft);
+  border: 1px solid color-mix(in oklch, var(--danger) 30%, var(--border));
+  border-radius: var(--radius);
+  font-size: 12.5px;
+  color: color-mix(in oklch, var(--danger) 70%, var(--mix-dark));
+}
+.pjm-del.show {
+  display: flex;
+}
+
+/* ============ 子标签 ============ */
+.pjm-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  margin: 14px 0 18px;
+  overflow-x: auto;
+}
+.pjm-tab {
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--muted);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  font-family: var(--font-ui);
+  margin-bottom: -1px;
+  white-space: nowrap;
+}
+.pjm-tab:hover {
+  color: var(--fg);
+}
+.pjm-tab[aria-selected='true'] {
+  color: var(--fg);
+  border-bottom-color: var(--fg);
+  font-weight: 500;
+}
+
+/* ============ 健康摘要条 ============ */
+.pjm-health {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.pjm-health-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.pjm-health-item strong {
+  color: var(--fg);
+  font-weight: 500;
+}
+
+/* 健康摘要计数 chip：可点击过滤（活跃绿/挂起黄/归档灰语义色，token/color-mix 派生）。
+   选中态 aria-pressed=true：语义色描边 + soft 底；hover 提表面。 */
+.pjm-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 2px 10px;
+  font: inherit;
+  font-size: 12.5px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  color: var(--fg);
+  white-space: nowrap;
+}
+.pjm-chip:hover {
+  background: var(--surface-hover);
+}
+.pjm-chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.pjm-chip-active {
+  color: color-mix(in oklch, var(--success) 62%, var(--mix-dark));
+}
+.pjm-chip-active[aria-pressed='true'] {
+  border-color: color-mix(in oklch, var(--success) 50%, var(--border));
+  background: var(--success-soft);
+}
+.pjm-chip-suspended {
+  color: color-mix(in oklch, var(--warn) 55%, var(--mix-dark));
+}
+.pjm-chip-suspended[aria-pressed='true'] {
+  border-color: color-mix(in oklch, var(--warn) 50%, var(--border));
+  background: var(--warn-soft);
+}
+.pjm-chip-archived {
+  color: var(--muted);
+}
+.pjm-chip-archived[aria-pressed='true'] {
+  border-color: var(--border-strong);
+  background: var(--surface);
+  color: var(--fg);
+}
+
+/* 过滤条件指示条（过滤激活时显示于列表上方） */
+.pjm-filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: -4px 0 10px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.pjm-health-fail {
+  color: var(--danger);
+}
+.pjm-health-meta {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 前往指挥中心新建任务提示链接 */
+.pjm-cc-link {
+  color: var(--fg);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.pjm-cc-link:hover {
+  text-decoration-thickness: 2px;
+}
+
+/* 任务行复用设计系统 .od-rows / .od-row；分支/状态徽章用现有组件。
+   行内操作按钮沿用 .od-btn / .od-btn-sm。 */
+.pjm-task-row-side {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* 行内操作按钮视觉归一（与指挥中心同一套规则）：TaskActions/RerunInitButton 为共享
+   legacy 组件（.btn.btn-small：mono 字体 + surface 底 + border-strong 粗边框），
+   与同行的 od-btn-sm 混排时风格/尺寸不一致。限定项目管理详情作用域归一为 od-btn-sm 视觉；
+   选择器限定直接子级，避免误伤 dirty 确认弹窗按钮。 */
+.pjm-detail .task-actions > .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 26px;
+  padding: 2px 10px;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--fg);
+}
+.pjm-detail .task-actions > .btn:hover:not(:disabled) {
+  background: var(--surface);
+  border-color: var(--border-strong);
+}
+
+/* ============ ≤1024px：列表 ⇄ 详情 钻取式导航 ============ */
+.pjm-back {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 14px;
+  padding: 6px 12px; /* 垂直 padding 压到 6px：与 35px 触控档不叠加（用户实测决策，覆盖 44px） */
+  min-height: 35px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  color: var(--fg);
+  cursor: pointer;
+}
+.pjm-back svg {
+  flex: none;
+  color: var(--muted);
+}
+.pjm-back:hover {
+  background: var(--surface);
+}
+
+@media (max-width: 1024px) {
+  .pjm-split {
+    flex-direction: column;
+    gap: 0;
+  }
+  .pjm-rail-col {
+    flex: none;
+    position: static;
+    width: 100%;
+  }
+  .pjm-rail {
+    gap: 8px;
+  }
+  .pjm-rail-item {
+    min-height: 56px;
+    padding: 12px 36px 12px 14px;
+    position: relative;
+    border: 1px solid var(--border);
+    background: var(--bg);
+  }
+  .pjm-rail-item[aria-selected='true'] {
+    background: var(--bg);
+    border-color: var(--border);
+  }
+  .pjm-rail-item::after {
+    content: '';
+    position: absolute;
+    right: 16px;
+    top: 50%;
+    width: 8px;
+    height: 8px;
+    margin-top: -5px;
+    border-top: 1.6px solid var(--muted);
+    border-right: 1.6px solid var(--muted);
+    transform: rotate(45deg);
+  }
+  /* 列表态隐藏详情；详情态隐藏列表（由 JS 切 m-detail） */
+  .pjm-split:not(.m-detail) .pjm-detail {
+    display: none;
+  }
+  .pjm-split.m-detail .pjm-rail-col {
+    display: none;
+  }
+  .pjm-split.m-detail .pjm-back {
+    display: inline-flex;
+  }
+  .pjm-detail {
+    width: 100%;
+  }
+  .pjm-detail-actions {
+    margin-left: 0;
+    width: 100%;
+  }
+  .pjm-health-meta {
+    margin-left: 0;
+    flex-basis: 100%;
+  }
+}
+
+@media (max-width: 767px) {
+  .pjm-health {
+    gap: 8px 14px;
+  }
+  /* 按钮触控档 35px（用户实测决策，覆盖 44px）；水平 padding 不变 */
+  .pjm-detail .task-actions > .btn {
+    min-height: 35px;
+  }
+  /* 健康摘要 chip 同档 35px */
+  .pjm-chip {
+    min-height: 35px;
+    padding: 6px 14px;
+  }
+}

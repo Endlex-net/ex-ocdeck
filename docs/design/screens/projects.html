@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<!-- VENDORED 设计源 · 固化于 2026-08-08（OpenSpec change: web-ui-redesign）
+     来源：Open Design 项目 2396c3bb-e795-41fb-9536-723f69c71734/screens/projects.html（未改动）
+     效力：布局/状态/交互规格；mock 数据与文案不具契约效力，行为以 openspec spec 为准。 -->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>项目 · ocdeck</title>
+<script src="../assets/ocdeck-theme.js"></script>
+<link rel="stylesheet" href="../assets/ocdeck-ui.css">
+<style>
+  .type-hint { display: none; }
+  .type-hint.show { display: flex; }
+  .create-card { display: none; }
+  .create-card.open { display: block; }
+
+  /* ===== 单页工作区：master-detail ===== */
+  .ws-split { display: flex; gap: 20px; align-items: flex-start; }
+
+  /* 轨道列：检索框 + 项目列表（sticky 在列上，保证 tablist 语义纯净） */
+  .ws-rail-col {
+    flex: 0 0 232px; display: flex; flex-direction: column; gap: 10px;
+    position: sticky; top: 24px;
+  }
+  .ws-rail { display: flex; flex-direction: column; gap: 4px; }
+  .ws-rail-item {
+    display: flex; flex-direction: column; gap: 4px; width: 100%;
+    padding: 10px 12px; border-radius: var(--radius); cursor: pointer;
+    border: 1px solid transparent; background: none; text-align: left;
+    font-family: var(--font-ui); color: var(--fg);
+  }
+  .ws-rail-item[hidden] { display: none; }
+  .ws-rail-item:hover { background: var(--surface); }
+  .ws-rail-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .ws-rail-item[aria-selected="true"] { background: var(--surface); border-color: var(--border); }
+  .ws-rail-name { display: flex; align-items: center; gap: 6px; font-size: 13.5px; font-weight: 500; }
+  .ws-rail-name svg { color: var(--muted); flex: none; }
+  .ws-rail-sub { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+
+  /* 轨道检索框 */
+  .ws-search { position: relative; }
+  .ws-search svg {
+    position: absolute; left: 10px; top: 50%; transform: translateY(-50%);
+    color: var(--muted); pointer-events: none;
+  }
+  .ws-search .od-input { width: 100%; padding-left: 30px; font-size: 13px; }
+  .ws-search-count { font-size: 11.5px; color: var(--muted); padding: 0 2px; }
+  .ws-rail-empty {
+    padding: 18px 12px; text-align: center;
+    font-size: 12.5px; color: var(--muted);
+    border: 1px dashed var(--border); border-radius: var(--radius);
+  }
+  .ws-rail-empty[hidden] { display: none; }
+
+  .ws-detail { flex: 1 1 auto; min-width: 0; }
+  .ws-detail[hidden] { display: none; }
+
+  .ws-detail-head { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; margin-bottom: 4px; }
+  .ws-detail-title { font-size: 19px; font-weight: 600; line-height: 1.35; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ws-detail-sub { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
+  .ws-detail-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ws-detail-blockhint { flex-basis: 100%; font-size: 12px; color: var(--muted); }
+
+  .pj-del {
+    display: none; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin: 10px 0 0; padding: 10px 12px;
+    background: var(--danger-soft); border: 1px solid color-mix(in oklch, var(--danger) 30%, var(--border));
+    border-radius: var(--radius); font-size: 12.5px;
+    color: color-mix(in oklch, var(--danger) 70%, black);
+  }
+  .pj-del.show { display: flex; }
+
+  /* 子标签：与设置页同一语言（fg 下划线，不占 accent） */
+  .ws-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin: 14px 0 18px; overflow-x: auto; }
+  .ws-tab {
+    padding: 8px 12px; font-size: 13px; color: var(--muted); background: none;
+    border: none; border-bottom: 2px solid transparent; cursor: pointer;
+    font-family: var(--font-ui); margin-bottom: -1px; white-space: nowrap;
+  }
+  .ws-tab:hover { color: var(--fg); }
+  .ws-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .ws-tab[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--fg); font-weight: 500; }
+
+  /* 健康摘要条 */
+  .ws-health {
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+    padding: 10px 14px; margin-bottom: 14px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    font-size: 12.5px; color: var(--muted);
+  }
+  .ws-health-item { display: inline-flex; align-items: center; gap: 6px; }
+  .ws-health-item strong { color: var(--fg); font-weight: 500; }
+
+  .ws-cc-link { color: var(--fg); text-decoration: underline; text-underline-offset: 2px; }
+  .ws-cc-link:hover { text-decoration-thickness: 2px; }
+
+  /* 健康摘要条尾项（worktree 占用）：桌面右推，窄屏独占一行左对齐 */
+  .ws-health-meta { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+  @media (max-width: 767px) {
+    .ws-health { gap: 8px 14px; }
+    .ws-health-meta { margin-left: 0; flex-basis: 100%; }
+  }
+
+  .task-actions { display: inline-flex; gap: 6px; }
+  .branch-ic { display: inline-flex; align-items: center; gap: 4px; }
+  .plan-badge { margin-left: 6px; }
+
+  /* 返回列表按钮：仅钻取模式（≤1024px）可见，由 JS 注入每个详情面板 */
+  .ws-back {
+    display: none; align-items: center; gap: 6px;
+    margin: 0 0 14px; padding: 8px 12px; min-height: 44px;
+    background: none; border: 1px solid var(--border); border-radius: var(--radius);
+    font-family: var(--font-ui); font-size: 13px; color: var(--fg); cursor: pointer;
+  }
+  .ws-back svg { flex: none; color: var(--muted); }
+  .ws-back:hover { background: var(--surface); }
+
+  /* ===== ≤1024px：列表 ⇄ 详情 钻取式导航（平板与手机同一模式） ===== */
+  @media (max-width: 1024px) {
+    .ws-split { flex-direction: column; gap: 0; }
+    /* 列表态：整宽卡片列，右端 chevron 暗示可进入 */
+    .ws-rail-col { flex: none; position: static; width: 100%; }
+    .ws-rail { gap: 8px; }
+    .ws-rail-item {
+      min-height: 56px; padding: 12px 36px 12px 14px; position: relative;
+      border: 1px solid var(--border); background: var(--bg);
+    }
+    .ws-rail-item[aria-selected="true"] { background: var(--bg); border-color: var(--border); }
+    .ws-rail-item::after {
+      content: ''; position: absolute; right: 16px; top: 50%;
+      width: 8px; height: 8px; margin-top: -5px;
+      border-top: 1.6px solid var(--muted); border-right: 1.6px solid var(--muted);
+      transform: rotate(45deg);
+    }
+    /* 列表态隐藏全部详情；详情态隐藏列表（.m-detail 由 JS 切换） */
+    .ws-split:not(.m-detail) .ws-detail { display: none; }
+    .ws-split.m-detail .ws-rail-col { display: none; }
+    .ws-split.m-detail .ws-back { display: inline-flex; }
+    .ws-detail { width: 100%; }
+    /* 详情头部：操作按钮整行，触屏目标 */
+    .ws-detail-actions { margin-left: 0; width: 100%; }
+  }
+</style>
+</head>
+<body>
+<div class="od-shell">
+  <aside class="od-sidebar" data-od-id="sidebar">
+    <div class="od-brand">
+      <span class="od-brand-mark">oc</span>
+      <div>
+        <div class="od-brand-name">ocdeck</div>
+        <div class="od-brand-sub">opencode 编排台</div>
+      </div>
+    </div>
+    <nav class="od-nav" data-od-id="global-nav">
+      <a class="od-nav-item" href="./command-center.html">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 12 8 12 11 5 14 19 17 12 21 12"/></svg>
+        指挥中心
+      </a>
+
+      <div class="od-nav-group">任务</div>
+      <div class="od-nav-proj">ocdeck</div>
+      <a class="od-nav-task" href="./task-workbench.html" data-od-id="nav-task-ime">
+        <span class="od-agent od-agent-busy"><span class="od-agent-dot"></span></span>
+        <span class="od-nav-task-name">重构终端 IME 补偿</span>
+      </a>
+      <a class="od-nav-task" href="./task-workbench.html" data-od-id="nav-task-diff">
+        <span class="od-agent od-agent-idle"><span class="od-agent-dot"></span></span>
+        <span class="od-nav-task-name">升级 diff 渲染</span>
+      </a>
+      <div class="od-nav-proj">blog-next</div>
+      <a class="od-nav-task" href="./task-workbench.html" data-od-id="nav-task-config">
+        <span class="od-agent od-agent-retry"><span class="od-agent-dot"></span></span>
+        <span class="od-nav-task-name">重写配置加载</span>
+      </a>
+      <a class="od-nav-task" href="./task-workbench.html" data-od-id="nav-task-ci">
+        <span class="od-agent od-agent-busy"><span class="od-agent-dot"></span></span>
+        <span class="od-nav-task-name">修复 CI 缓存</span>
+      </a>
+
+      <div class="od-nav-group">管理</div>
+      <a class="od-nav-item" href="./projects.html" aria-current="page">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
+        项目管理
+      </a>
+      <a class="od-nav-item" href="./configs.html">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><line x1="4" y1="7" x2="20" y2="7"/><circle cx="9" cy="7" r="2.2"/><line x1="4" y1="17" x2="20" y2="17"/><circle cx="15" cy="17" r="2.2"/></svg>
+        设置
+      </a>
+    </nav>
+    <div class="od-sidebar-foot mono"><button class="od-sidebar-cmdk" type="button" onclick="window.odPalette&&window.odPalette.open()"><span>命令面板</span><span class="od-palette-kbd">⌘K</span></button><span title="本地服务 · 单用户模式">127.0.0.1:56445</span><button class="od-theme-btn" type="button" data-od-theme-toggle aria-label="切换主题"><svg class="od-theme-icon-light" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="od-theme-icon-dark" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button></div>
+  </aside>
+
+  <div class="od-main">
+    <div class="od-content">
+      <header class="od-page-head" data-od-id="page-head">
+        <div class="od-page-title">
+          <h1>项目</h1>
+          <p class="muted" style="font-size:13px">注册一次工作区，之后每个新任务自动准备好</p>
+        </div>
+        <div class="od-page-actions">
+          <button class="od-btn od-btn-primary" id="toggleCreate" data-od-id="register-project-cta" aria-expanded="false" aria-controls="createCard">注册项目</button>
+        </div>
+      </header>
+
+      <section class="od-card create-card" id="createCard" data-od-id="project-create">
+        <div class="od-card-head">
+          <h2>注册项目</h2>
+        </div>
+        <div class="od-field">
+          <span class="od-label">项目类型</span>
+          <div class="od-radio-cards" role="radiogroup" id="typeGroup">
+            <div class="od-radio-card" role="radio" aria-checked="true" tabindex="0" data-type="repo" data-od-id="type-repo">
+              <div class="od-radio-title">git 仓库</div>
+              <div class="od-radio-desc">任务获得独立分支与 worktree 隔离，含完整 Git 面板</div>
+            </div>
+            <div class="od-radio-card" role="radio" aria-checked="false" tabindex="0" data-type="dir" data-od-id="type-dir">
+              <div class="od-radio-title">纯目录</div>
+              <div class="od-radio-desc">填写任意普通目录路径，不要求 git 仓库；该目录下的多个任务将共享同一目录。</div>
+            </div>
+          </div>
+        </div>
+        <div class="od-alert od-alert-info type-hint" id="dirHint">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="10.5" x2="12" y2="16"/><circle cx="12" cy="7.6" r="0.4" fill="currentColor"/></svg>
+          <div class="od-alert-body">多个活跃任务共享同一目录、无文件隔离，并行改动可能相互影响。</div>
+        </div>
+        <div class="od-field">
+          <label class="od-label" for="projName">项目名称</label>
+          <input class="od-input" id="projName" placeholder="my-repo">
+          <div class="od-hint" id="nameError" style="display:none;color:var(--danger)">创建失败：名称不能为空</div>
+        </div>
+        <div class="od-field">
+          <label class="od-label" for="projPath">绝对路径</label>
+          <input class="od-input mono" id="projPath" placeholder="/Users/you/code/my-repo">
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button class="od-btn" id="cancelCreate">取消</button>
+          <button class="od-btn od-btn-primary" id="submitCreate" data-od-id="register-project-submit">注册项目</button>
+        </div>
+      </section>
+
+      <div class="ws-split" data-od-id="workspace-split">
+        <!-- ============ 左栏：项目检索 + 列表 ============ -->
+        <div class="ws-rail-col" data-od-id="project-rail-col">
+          <div class="ws-search" data-od-id="project-search">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+            <input class="od-input" id="railSearch" type="search" autocomplete="off" placeholder="搜索项目（/）" aria-label="搜索项目，按名称、路径或类型过滤">
+          </div>
+          <div class="ws-search-count" id="railSearchCount" hidden aria-live="polite"></div>
+          <div class="ws-rail" role="tablist" aria-label="项目列表" data-od-id="project-rail" orientation="vertical">
+          <button class="ws-rail-item" role="tab" data-project="ocdeck" data-search="ocdeck /Users/mendlex/code/ocdeck 仓库 repo git" id="railtab-ocdeck" aria-controls="panel-ocdeck" aria-selected="true" data-od-id="rail-ocdeck">
+            <span class="ws-rail-name">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
+              ocdeck
+            </span>
+            <span class="ws-rail-sub"><span class="od-agent od-agent-busy"><span class="od-agent-dot"></span></span>活跃 1 · 共 6 个任务</span>
+          </button>
+          <button class="ws-rail-item" role="tab" data-project="blog" data-search="blog-next /Users/mendlex/code/blog-next 仓库 repo git" id="railtab-blog" aria-controls="panel-blog" aria-selected="false" data-od-id="rail-blog">
+            <span class="ws-rail-name">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
+              blog-next
+            </span>
+            <span class="ws-rail-sub"><span class="od-agent od-agent-busy"><span class="od-agent-dot"></span></span>活跃 1 · 共 2 个任务</span>
+          </button>
+          <button class="ws-rail-item" role="tab" data-project="scratch" data-search="scratch-notes /Users/mendlex/notes/scratch 纯目录 dir" id="railtab-scratch" aria-controls="panel-scratch" aria-selected="false" data-od-id="rail-scratch">
+            <span class="ws-rail-name">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
+              scratch-notes
+            </span>
+            <span class="ws-rail-sub">纯目录 · 0 个任务</span>
+          </button>
+          </div>
+          <div class="ws-rail-empty" id="railEmpty" hidden data-od-id="rail-empty">没有匹配的项目</div>
+        </div>
+
+        <!-- ============ 详情：ocdeck ============ -->
+        <section class="ws-detail" data-project="ocdeck" id="panel-ocdeck" role="tabpanel" aria-labelledby="railtab-ocdeck" data-od-id="detail-ocdeck">
+          <header class="ws-detail-head">
+            <div>
+              <h2 class="ws-detail-title">ocdeck
+                <span class="od-badge od-badge-type"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>仓库</span>
+              </h2>
+              <p class="ws-detail-sub mono">/Users/mendlex/code/ocdeck · 默认分支 ⎇ main</p>
+            </div>
+            <div class="ws-detail-actions">
+              <button class="od-btn od-btn-sm" data-plan="在终端打开">在终端打开<span class="od-badge od-badge-neutral plan-badge">规划中</span></button>
+              <button class="od-btn od-btn-sm od-btn-danger" disabled>删除项目</button>
+            </div>
+            <p class="ws-detail-blockhint">仍有 6 个任务，清空任务后才能删除项目</p>
+          </header>
+
+          <div class="ws-tabs" role="tablist" data-od-id="tabs-ocdeck">
+            <button class="ws-tab" role="tab" data-tab="overview" aria-selected="true">概览</button>
+            <button class="ws-tab" role="tab" data-tab="automation" aria-selected="false">自动化</button>
+            <button class="ws-tab" role="tab" data-tab="env" aria-selected="false">环境变量</button>
+          </div>
+
+          <div class="ws-pane" data-pane="overview">
+            <div class="ws-health" data-od-id="health-ocdeck">
+              <span class="ws-health-item"><span class="od-agent od-agent-busy"><span class="od-agent-dot"></span></span><strong>活跃 1</strong></span>
+              <span class="ws-health-item">挂起 2</span>
+              <span class="ws-health-item" style="color:var(--danger)">失败 1</span>
+              <span class="ws-health-item">init 最近成功 · 2 小时前</span>
+              <span class="ws-health-meta">worktree 占用 —<span class="od-badge od-badge-neutral plan-badge">规划中</span></span>
+            </div>
+
+            <div class="od-rows" data-task-rows data-od-id="task-rows-ocdeck">
+              <div class="od-row od-row-clickable" data-href="./task-workbench.html" data-od-id="task-row-ime">
+                <div class="od-row-main">
+                  <div class="od-row-title">重构终端 IME 补偿</div>
+                  <div class="od-row-sub"><span class="mono branch-ic">⎇ fix/terminal-ime</span></div>
+                </div>
+                <div class="od-row-side">
+                  <span class="od-agent od-agent-busy"><span class="od-agent-dot"></span>工作中</span>
+                  <span class="od-badge od-badge-active"><span class="od-badge-dot"></span>活跃</span>
+                  <span class="task-actions"><button class="od-btn od-btn-sm" data-act="suspend">挂起</button></span>
+                </div>
+              </div>
+
+              <div class="od-row od-row-clickable" data-href="./task-workbench.html" data-od-id="task-row-mobile-scroll">
+                <div class="od-row-main">
+                  <div class="od-row-title">修复移动端滚动</div>
+                  <div class="od-row-sub"><span class="mono branch-ic">⎇ fix/mobile-scroll</span></div>
+                </div>
+                <div class="od-row-side">
+                  <span class="od-agent od-agent-idle"><span class="od-agent-dot"></span>空闲</span>
+                  <span class="od-badge od-badge-suspend">挂起</span>
+                  <span class="task-actions">
+                    <button class="od-btn od-btn-sm" data-act="activate">激活</button>
+                    <button class="od-btn od-btn-sm od-btn-ghost" data-act="archive">归档</button>
+                    <button class="od-btn od-btn-sm od-btn-danger" data-act="delete">删除</button>
+                  </span>
+                </div>
+              </div>
+
+              <div class="od-row" data-od-id="task-row-diff-render">
+                <div class="od-row-main">
+                  <div class="od-row-title">升级 diff 渲染</div>
+                  <div class="od-row-sub"><span class="mono branch-ic">⎇ feature/diff2html</span></div>
+                </div>
+                <div class="od-row-side">
+                  <span class="od-badge od-badge-transit"><span class="od-spinner"></span>激活中</span>
+                  <span class="task-actions"><button class="od-btn od-btn-sm" disabled>挂起</button></span>
+                </div>
+              </div>
+
+              <div class="od-row" data-od-id="task-row-push">
+                <div class="od-row-main">
+                  <div class="od-row-title">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--danger)" stroke-width="1.8" stroke-linecap="round"><path d="M12 4 2.5 20h19L12 4z"/><line x1="12" y1="10" x2="12" y2="14.5"/><circle cx="12" cy="17.2" r="0.4" fill="var(--danger)"/></svg>
+                    接入推送通知
+                  </div>
+                  <div class="od-row-sub"><span class="mono branch-ic">⎇ feature/push</span><span style="color:var(--danger)">分支已被占用</span></div>
+                </div>
+                <div class="od-row-side">
+                  <span class="od-badge od-badge-fail">创建失败</span>
+                  <span class="task-actions">
+                    <button class="od-btn od-btn-sm" data-act="retry">重试</button>
+                    <button class="od-btn od-btn-sm od-btn-danger" data-act="force-delete">强制删除</button>
+                  </span>
+                </div>
+              </div>
+
+              <div class="od-row" data-od-id="task-row-config-load">
+                <div class="od-row-main">
+                  <div class="od-row-title">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--warn)" stroke-width="1.8" stroke-linecap="round"><path d="M12 4 2.5 20h19L12 4z"/><line x1="12" y1="10" x2="12" y2="14.5"/><circle cx="12" cy="17.2" r="0.4" fill="var(--warn)"/></svg>
+                    重写配置加载
+                  </div>
+                  <div class="od-row-sub">
+                    <span class="mono branch-ic">⎇ refactor/config</span>
+                    <span style="color:color-mix(in oklch, var(--warn) 55%, black)">init 失败：exit code 1</span>
+                  </div>
+                </div>
+                <div class="od-row-side">
+                  <span class="od-badge od-badge-warn">init 失败</span>
+                  <span class="od-badge od-badge-suspend">挂起</span>
+                  <span class="task-actions">
+                    <button class="od-btn od-btn-sm od-btn-ghost" data-act="logs">日志</button>
+                    <button class="od-btn od-btn-sm" data-act="rerun-init">重跑初始化</button>
+                    <button class="od-btn od-btn-sm od-btn-danger" data-act="delete">删除</button>
+                  </span>
+                </div>
+              </div>
+
+              <div class="od-row" data-od-id="task-row-old-experiment">
+                <div class="od-row-main">
+                  <div class="od-row-title">旧实验分支</div>
+                  <div class="od-row-sub"><span class="mono branch-ic">⎇ experiment/old</span></div>
+                </div>
+                <div class="od-row-side">
+                  <span class="od-badge od-badge-archive">归档</span>
+                  <span class="task-actions">
+                    <button class="od-btn od-btn-sm" data-act="restore">恢复</button>
+                    <button class="od-btn od-btn-sm od-btn-danger" data-act="delete">删除</button>
+                  </span>
+                </div>
+              </div>
+            </div>
+            <p class="od-hint" style="margin-top:10px">新建任务已移至<a class="ws-cc-link" href="./command-center.html">指挥中心</a>，此处聚焦任务状态与项目配置。</p>
+          </div>
+
+          <div class="ws-pane" data-pane="automation" hidden>
+            <p class="od-hint" style="margin-bottom:16px">这里定义「新任务如何自动准备好」：创建后跑什么脚本、从主仓库继承哪些文件、删除前如何清理。仅对之后创建的任务生效。</p>
+            <div class="od-field">
+              <label class="od-label">init 脚本</label>
+              <textarea class="od-textarea" rows="2">pnpm install</textarea>
+              <div class="od-hint">任务创建后自动执行；脚本可能重复/并行执行，需幂等。</div>
+            </div>
+            <div class="od-field">
+              <label class="od-label">文件继承</label>
+              <textarea class="od-textarea" rows="2">.env.local</textarea>
+              <div class="od-hint">每行一个 glob，仅复制 gitignored/untracked 文件到新 worktree。</div>
+            </div>
+            <div class="od-field">
+              <label class="od-label">pre-delete 脚本</label>
+              <textarea class="od-textarea" rows="2" placeholder="删除任务前执行的清理脚本"></textarea>
+              <div class="od-hint">脚本输出会落盘，勿打印敏感凭据。</div>
+            </div>
+            <div style="display:flex;justify-content:flex-end;margin-bottom:20px">
+              <button class="od-btn" data-save="automation">保存</button>
+            </div>
+            <div class="od-card-plain" data-od-id="template-ocdeck">
+              <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                <div style="flex:1;min-width:220px">
+                  <div style="font-size:13.5px;font-weight:500">配置模板</div>
+                  <div class="od-hint" style="margin-top:4px">将当前自动化配置存为模板，注册新项目时一键套用。</div>
+                </div>
+                <button class="od-btn od-btn-sm" data-plan="配置模板">存为模板<span class="od-badge od-badge-neutral plan-badge">规划中</span></button>
+              </div>
+            </div>
+          </div>
+
+          <div class="ws-pane" data-pane="env" hidden>
+            <div class="od-alert od-alert-warn" data-restart-hint style="display:none;margin-bottom:14px">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 4 2.5 20h19L12 4z"/><line x1="12" y1="10" x2="12" y2="14.5"/><circle cx="12" cy="17.2" r="0.4" fill="currentColor"/></svg>
+              <div class="od-alert-body">已保存。改动不是热生效——1 个活跃任务需挂起再激活后才会应用。</div>
+            </div>
+            <div class="od-kv-row">
+              <input class="od-input mono" value="NODE_ENV" aria-label="变量名">
+              <input class="od-input mono" value="development" aria-label="变量值">
+              <button class="od-btn od-btn-sm od-btn-ghost">删除</button>
+            </div>
+            <div class="od-kv-row">
+              <input class="od-input mono" value="EDITOR" aria-label="变量名">
+              <input class="od-input mono" value="code" aria-label="变量值">
+              <button class="od-btn od-btn-sm od-btn-ghost">删除</button>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:4px">
+              <button class="od-btn od-btn-sm">添加</button>
+              <button class="od-btn od-btn-sm" data-save="env">保存</button>
+            </div>
+            <p class="od-hint" style="margin-top:10px">明文存储（0600），请勿存放高敏凭据。项目层覆盖全局层、被任务层覆盖。</p>
+          </div>
+        </section>
+
+        <!-- ============ 详情：blog-next ============ -->
+        <section class="ws-detail" data-project="blog" id="panel-blog" role="tabpanel" aria-labelledby="railtab-blog" hidden data-od-id="detail-blog">
+          <header class="ws-detail-head">
+            <div>
+              <h2 class="ws-detail-title">blog-next
+                <span class="od-badge od-badge-type"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>仓库</span>
+              </h2>
+              <p class="ws-detail-sub mono">/Users/mendlex/code/blog-next · 默认分支 ⎇ main</p>
+            </div>
+            <div class="ws-detail-actions">
+              <button class="od-btn od-btn-sm" data-plan="在终端打开">在终端打开<span class="od-badge od-badge-neutral plan-badge">规划中</span></button>
+              <button class="od-btn od-btn-sm od-btn-danger" disabled>删除项目</button>
+            </div>
+            <p class="ws-detail-blockhint">仍有 2 个任务，清空任务后才能删除项目</p>
+          </header>
+
+          <div class="ws-tabs" role="tablist" data-od-id="tabs-blog">
+            <button class="ws-tab" role="tab" data-tab="overview" aria-selected="true">概览</button>
+            <button class="ws-tab" role="tab" data-tab="automation" aria-selected="false">自动化</button>
+            <button class="ws-tab" role="tab" data-tab="env" aria-selected="false">环境变量</button>
+          </div>
+
+          <div class="ws-pane" data-pane="overview">
+            <div class="ws-health">
+              <span class="ws-health-item"><span class="od-agent od-agent-busy"><span class="od-agent-dot"></span></span><strong>活跃 1</strong></span>
+              <span class="ws-health-item">挂起 1</span>
+              <span class="ws-health-item">init 尚未配置</span>
+              <span class="ws-health-meta">worktree 占用 —<span class="od-badge od-badge-neutral plan-badge">规划中</span></span>
+            </div>
+            <div class="od-rows" data-task-rows>
+              <div class="od-row od-row-clickable" data-href="./task-workbench.html" data-od-id="task-row-ci-cache">
+                <div class="od-row-main">
+                  <div class="od-row-title">修复 CI 缓存</div>
+                  <div class="od-row-sub"><span class="mono branch-ic">⎇ fix/ci-cache</span></div>
+                </div>
+                <div class="od-row-side">
+                  <span class="od-agent od-agent-busy"><span class="od-agent-dot"></span>工作中</span>
+                  <span class="od-badge od-badge-active"><span class="od-badge-dot"></span>活跃</span>
+                  <span class="task-actions"><button class="od-btn od-btn-sm" data-act="suspend">挂起</button></span>
+                </div>
+              </div>
+              <div class="od-row od-row-clickable" data-href="./task-workbench.html" data-od-id="task-row-comments">
+                <div class="od-row-main">
+                  <div class="od-row-title">接入评论系统</div>
+                  <div class="od-row-sub"><span class="mono branch-ic">⎇ feature/comments</span></div>
+                </div>
+                <div class="od-row-side">
+                  <span class="od-badge od-badge-suspend">挂起</span>
+                  <span class="task-actions">
+                    <button class="od-btn od-btn-sm" data-act="activate">激活</button>
+                    <button class="od-btn od-btn-sm od-btn-ghost" data-act="archive">归档</button>
+                    <button class="od-btn od-btn-sm od-btn-danger" data-act="delete">删除</button>
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="ws-pane" data-pane="automation" hidden>
+            <p class="od-hint" style="margin-bottom:16px">尚未配置自动化。配置 init 脚本后，每个新任务创建即自动装好依赖。</p>
+            <div class="od-field">
+              <label class="od-label">init 脚本</label>
+              <textarea class="od-textarea" rows="2" placeholder="例如：pnpm install"></textarea>
+            </div>
+            <div class="od-field">
+              <label class="od-label">文件继承</label>
+              <textarea class="od-textarea" rows="2" placeholder="例如：.env.local"></textarea>
+              <div class="od-hint">每行一个 glob，仅复制 gitignored/untracked 文件到新 worktree。</div>
+            </div>
+            <div class="od-field">
+              <label class="od-label">pre-delete 脚本</label>
+              <textarea class="od-textarea" rows="2" placeholder="删除任务前执行的清理脚本"></textarea>
+            </div>
+            <div style="display:flex;justify-content:flex-end;margin-bottom:20px">
+              <button class="od-btn" data-save="automation">保存</button>
+            </div>
+            <div class="od-card-plain">
+              <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                <div style="flex:1;min-width:220px">
+                  <div style="font-size:13.5px;font-weight:500">从模板套用</div>
+                  <div class="od-hint" style="margin-top:4px">把其他项目的自动化配置一键套用到本项目。</div>
+                </div>
+                <button class="od-btn od-btn-sm" data-plan="配置模板">选择模板<span class="od-badge od-badge-neutral plan-badge">规划中</span></button>
+              </div>
+            </div>
+          </div>
+
+          <div class="ws-pane" data-pane="env" hidden>
+            <div class="od-alert od-alert-warn" data-restart-hint style="display:none;margin-bottom:14px">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 4 2.5 20h19L12 4z"/><line x1="12" y1="10" x2="12" y2="14.5"/><circle cx="12" cy="17.2" r="0.4" fill="currentColor"/></svg>
+              <div class="od-alert-body">已保存。改动不是热生效——1 个活跃任务需挂起再激活后才会应用。</div>
+            </div>
+            <p class="od-hint" style="margin-bottom:12px">尚未设置项目级环境变量。项目层覆盖全局层、被任务层覆盖；明文存储（0600）。</p>
+            <div style="display:flex;gap:8px">
+              <button class="od-btn od-btn-sm">添加</button>
+              <button class="od-btn od-btn-sm" data-save="env">保存</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============ 详情：scratch-notes（纯目录） ============ -->
+        <section class="ws-detail" data-project="scratch" id="panel-scratch" role="tabpanel" aria-labelledby="railtab-scratch" hidden data-od-id="detail-scratch">
+          <header class="ws-detail-head">
+            <div>
+              <h2 class="ws-detail-title">scratch-notes
+                <span class="od-badge od-badge-type"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>纯目录</span>
+              </h2>
+              <p class="ws-detail-sub mono">/Users/mendlex/notes/scratch</p>
+            </div>
+            <div class="ws-detail-actions">
+              <button class="od-btn od-btn-sm" data-plan="在终端打开">在终端打开<span class="od-badge od-badge-neutral plan-badge">规划中</span></button>
+              <button class="od-btn od-btn-sm od-btn-danger" data-del-project>删除项目</button>
+            </div>
+          </header>
+          <div class="pj-del" data-del-project-confirm>
+            <span>确认删除项目「scratch-notes」？只删除任务记录与会话数据，<strong>绝不触碰该目录</strong>。</span>
+            <button class="od-btn od-btn-sm od-btn-danger" data-del-project-yes>确认删除</button>
+            <button class="od-btn od-btn-sm" data-del-project-no>取消</button>
+          </div>
+
+          <div class="ws-tabs" role="tablist" data-od-id="tabs-scratch">
+            <button class="ws-tab" role="tab" data-tab="overview" aria-selected="true">概览</button>
+            <button class="ws-tab" role="tab" data-tab="automation" aria-selected="false">自动化</button>
+            <button class="ws-tab" role="tab" data-tab="env" aria-selected="false">环境变量</button>
+          </div>
+
+          <div class="ws-pane" data-pane="overview">
+            <div class="od-alert od-alert-warn" style="margin-bottom:14px">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 4 2.5 20h19L12 4z"/><line x1="12" y1="10" x2="12" y2="14.5"/><circle cx="12" cy="17.2" r="0.4" fill="currentColor"/></svg>
+              <div class="od-alert-body">纯目录项目：无分支与 worktree 隔离，多个活跃任务共享同一目录，并行改动可能相互影响。</div>
+            </div>
+            <div class="od-empty" data-od-id="scratch-empty">
+              还没有任务。到<a class="ws-cc-link" href="./command-center.html">指挥中心</a>新建任务，或先在「自动化」里配置 init 脚本，让新任务开箱即用。
+            </div>
+          </div>
+
+          <div class="ws-pane" data-pane="automation" hidden>
+            <p class="od-hint" style="margin-bottom:16px">纯目录项目同样支持 init / pre-delete 脚本；文件继承依赖 git，仅对仓库项目可用。</p>
+            <div class="od-field">
+              <label class="od-label">init 脚本</label>
+              <textarea class="od-textarea" rows="2" placeholder="例如：pnpm install"></textarea>
+            </div>
+            <div class="od-field">
+              <label class="od-label">文件继承</label>
+              <textarea class="od-textarea" rows="2" disabled placeholder="仅对 git 仓库项目可用"></textarea>
+              <div class="od-hint">文件继承依赖 git 的 ignored/untracked 判定，纯目录项目不可用。</div>
+            </div>
+            <div class="od-field">
+              <label class="od-label">pre-delete 脚本</label>
+              <textarea class="od-textarea" rows="2" placeholder="删除任务前执行的清理脚本"></textarea>
+            </div>
+            <div style="display:flex;justify-content:flex-end">
+              <button class="od-btn" data-save="automation">保存</button>
+            </div>
+          </div>
+
+          <div class="ws-pane" data-pane="env" hidden>
+            <p class="od-hint" style="margin-bottom:12px">尚未设置项目级环境变量。项目层覆盖全局层、被任务层覆盖；明文存储（0600）。</p>
+            <div style="display:flex;gap:8px">
+              <button class="od-btn od-btn-sm">添加</button>
+              <button class="od-btn od-btn-sm" data-save="env">保存</button>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="od-modal-mask" id="deleteModal" style="display:none" data-od-id="task-delete-modal">
+  <div class="od-modal" role="dialog" aria-modal="true" aria-labelledby="delTitle">
+    <h2 id="delTitle">确认删除任务</h2>
+    <div class="od-modal-body">
+      <p id="delBody">该操作会删除对应 worktree，不可恢复。</p>
+      <label class="od-check" id="dirtyCheck">
+        <input type="checkbox" id="dirtyBox">
+        <span>worktree 有未提交改动，确认仍要删除</span>
+      </label>
+    </div>
+    <div class="od-modal-actions">
+      <button class="od-btn" id="delCancel">取消</button>
+      <button class="od-btn od-btn-danger" id="delConfirm" disabled>确认删除</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  function toast(msg) {
+    var t = document.createElement('div');
+    t.className = 'od-toast';
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(function () { t.remove(); }, 2400);
+  }
+
+  /* ---------- 注册项目卡 ---------- */
+  var toggle = document.getElementById('toggleCreate');
+  var card = document.getElementById('createCard');
+  var nameInput = document.getElementById('projName');
+  var nameError = document.getElementById('nameError');
+  var submit = document.getElementById('submitCreate');
+
+  function setCreateOpen(open) {
+    card.classList.toggle('open', open);
+    toggle.textContent = open ? '收起注册' : '注册项目';
+    /* CTA 纪律：卡片展开时页头按钮降级为次级，同屏只留卡内一个实心主按钮 */
+    toggle.classList.toggle('od-btn-primary', !open);
+    toggle.setAttribute('aria-expanded', String(open));
+    if (open) nameInput.focus();
+  }
+  toggle.addEventListener('click', function () { setCreateOpen(!card.classList.contains('open')); });
+  document.getElementById('cancelCreate').addEventListener('click', function () { setCreateOpen(false); });
+
+  var typeCards = document.querySelectorAll('#typeGroup .od-radio-card');
+  var dirHint = document.getElementById('dirHint');
+  typeCards.forEach(function (c) {
+    function pick() {
+      typeCards.forEach(function (x) { x.setAttribute('aria-checked', 'false'); });
+      c.setAttribute('aria-checked', 'true');
+      dirHint.classList.toggle('show', c.dataset.type === 'dir');
+    }
+    c.addEventListener('click', pick);
+    c.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+  });
+
+  submit.addEventListener('click', function () {
+    if (!nameInput.value.trim()) { nameError.style.display = 'block'; nameInput.focus(); return; }
+    nameError.style.display = 'none';
+    submit.disabled = true;
+    submit.textContent = '注册中…';
+    setTimeout(function () {
+      submit.disabled = false;
+      submit.textContent = '注册项目';
+      setCreateOpen(false);
+      toast('项目已注册');
+    }, 900);
+  });
+
+  /* ---------- master-detail：项目切换 ---------- */
+  var railItems = Array.prototype.slice.call(document.querySelectorAll('.ws-rail-item'));
+  var panels = Array.prototype.slice.call(document.querySelectorAll('.ws-detail'));
+  var split = document.querySelector('.ws-split');
+  var mqDrill = window.matchMedia('(max-width: 1024px)');
+  function selectProject(key) {
+    railItems.forEach(function (r) { r.setAttribute('aria-selected', String(r.dataset.project === key)); });
+    panels.forEach(function (p) { p.hidden = p.dataset.project !== key; });
+    try { history.replaceState(null, '', '#' + key); } catch (_) {}
+  }
+  /* ≤1024px 钻取模式：点项目进入详情，返回键回列表 */
+  function enterDetail() { if (mqDrill.matches) split.classList.add('m-detail'); }
+  function exitDetail() {
+    split.classList.remove('m-detail');
+    try { history.replaceState(null, '', location.pathname); } catch (_) {}
+  }
+  panels.forEach(function (p) {
+    var back = document.createElement('button');
+    back.type = 'button';
+    back.className = 'ws-back';
+    back.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>全部项目';
+    back.addEventListener('click', exitDetail);
+    p.insertBefore(back, p.firstChild);
+  });
+  railItems.forEach(function (r) {
+    r.addEventListener('click', function () { selectProject(r.dataset.project); enterDetail(); });
+  });
+  /* tabs 键盘契约：方向键在可见轨道项间移动并选中（过滤后跳过隐藏项） */
+  split.querySelector('.ws-rail').addEventListener('keydown', function (e) {
+    var visible = railItems.filter(function (r) { return !r.hidden; });
+    var idx = visible.indexOf(document.activeElement);
+    if (idx < 0) return;
+    var next = -1;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowRight') next = (idx + 1) % visible.length;
+    else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') next = (idx - 1 + visible.length) % visible.length;
+    if (next >= 0) { e.preventDefault(); visible[next].focus(); visible[next].click(); }
+  });
+
+  /* ---------- 项目检索：按名称 / 路径 / 类型即时过滤 ---------- */
+  var railSearch = document.getElementById('railSearch');
+  var railEmpty = document.getElementById('railEmpty');
+  var railSearchCount = document.getElementById('railSearchCount');
+  function filterRail() {
+    var q = railSearch.value.trim().toLowerCase();
+    var shown = 0;
+    railItems.forEach(function (r) {
+      var hit = !q || (r.dataset.search || '').toLowerCase().indexOf(q) !== -1;
+      r.hidden = !hit;
+      if (hit) shown++;
+    });
+    railEmpty.hidden = shown > 0;
+    railSearchCount.hidden = !q;
+    if (q) railSearchCount.textContent = '匹配 ' + shown + ' / ' + railItems.length + ' 个项目';
+  }
+  railSearch.addEventListener('input', filterRail);
+  railSearch.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') { railSearch.value = ''; filterRail(); }
+    else if (e.key === 'Enter') {
+      var first = railItems.filter(function (r) { return !r.hidden; })[0];
+      if (first) { selectProject(first.dataset.project); enterDetail(); }
+    }
+  });
+  /* 键盘优先：非输入态按 / 聚焦检索框 */
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+    var t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    e.preventDefault();
+    railSearch.focus();
+  });
+  var hash = location.hash.replace('#', '');
+  if (hash && panels.some(function (p) { return p.dataset.project === hash; })) {
+    selectProject(hash);
+    enterDetail();
+  }
+
+  /* ---------- 详情内子标签 ---------- */
+  panels.forEach(function (panel) {
+    var tabs = Array.prototype.slice.call(panel.querySelectorAll('.ws-tab'));
+    var panes = Array.prototype.slice.call(panel.querySelectorAll('.ws-pane'));
+    tabs.forEach(function (tab) {
+      tab.addEventListener('click', function () {
+        tabs.forEach(function (t) { t.setAttribute('aria-selected', String(t === tab)); });
+        panes.forEach(function (p) { p.hidden = p.dataset.pane !== tab.dataset.tab; });
+      });
+    });
+    /* 子标签方向键导航 */
+    panel.querySelector('.ws-tabs').addEventListener('keydown', function (e) {
+      var idx = tabs.indexOf(document.activeElement);
+      if (idx < 0) return;
+      var next = -1;
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') next = (idx + 1) % tabs.length;
+      else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') next = (idx - 1 + tabs.length) % tabs.length;
+      if (next >= 0) { e.preventDefault(); tabs[next].focus(); tabs[next].click(); }
+    });
+  });
+
+  /* ---------- 规划中能力 ---------- */
+  document.querySelectorAll('[data-plan]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      toast('「' + btn.dataset.plan + '」规划中，将在后续版本提供');
+    });
+  });
+
+  /* ---------- 保存动作（自动化 / 环境变量） ---------- */
+  document.querySelectorAll('[data-save]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      if (btn.dataset.save === 'env') {
+        var panel = btn.closest('.ws-pane');
+        var hint = panel && panel.querySelector('[data-restart-hint]');
+        if (hint) { hint.style.display = 'flex'; return; }
+      }
+      toast('已保存');
+    });
+  });
+
+  /* ---------- 删除项目（两步确认） ---------- */
+  document.querySelectorAll('[data-del-project]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var box = btn.closest('.ws-detail').querySelector('[data-del-project-confirm]');
+      if (box) box.classList.add('show');
+    });
+  });
+  document.querySelectorAll('[data-del-project-no]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      btn.closest('[data-del-project-confirm]').classList.remove('show');
+    });
+  });
+  document.querySelectorAll('[data-del-project-yes]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var detail = btn.closest('.ws-detail');
+      var key = detail.dataset.project;
+      var rail = document.querySelector('.ws-rail-item[data-project="' + key + '"]');
+      detail.remove();
+      if (rail) rail.remove();
+      toast('项目已删除');
+      var first = document.querySelector('.ws-rail-item');
+      if (first) selectProject(first.dataset.project);
+      else exitDetail();
+    });
+  });
+
+  /* ---------- 任务删除对话框 ---------- */
+  var modal = document.getElementById('deleteModal');
+  var delBody = document.getElementById('delBody');
+  var dirtyCheck = document.getElementById('dirtyCheck');
+  var dirtyBox = document.getElementById('dirtyBox');
+  var delConfirm = document.getElementById('delConfirm');
+  var pendingRow = null;
+
+  function openDelete(row, force) {
+    pendingRow = row;
+    if (force) {
+      delBody.textContent = '跳过 opencode 会话清理，同时跳过 pre-delete 脚本。该操作会删除对应 worktree，不可恢复。';
+      dirtyCheck.style.display = 'none';
+      delConfirm.disabled = false;
+    } else {
+      delBody.textContent = '该操作会删除对应 worktree，不可恢复。';
+      dirtyCheck.style.display = '';
+      dirtyBox.checked = false;
+      delConfirm.disabled = true;
+    }
+    modal.style.display = 'grid';
+    delConfirm.focus();
+  }
+  dirtyBox.addEventListener('change', function () { delConfirm.disabled = !dirtyBox.checked; });
+  document.getElementById('delCancel').addEventListener('click', function () { modal.style.display = 'none'; });
+  modal.addEventListener('click', function (e) { if (e.target === modal) modal.style.display = 'none'; });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') modal.style.display = 'none'; });
+  delConfirm.addEventListener('click', function () {
+    delConfirm.disabled = true;
+    delConfirm.textContent = '删除中…';
+    setTimeout(function () {
+      modal.style.display = 'none';
+      delConfirm.textContent = '确认删除';
+      if (pendingRow) pendingRow.remove();
+      toast('任务已删除');
+    }, 900);
+  });
+
+  /* ---------- 状态机驱动的任务操作 ---------- */
+  document.querySelectorAll('[data-task-rows] .od-row').forEach(function (row) {
+    row.querySelectorAll('[data-act]').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        var act = btn.dataset.act;
+        if (act === 'delete') { openDelete(row, false); return; }
+        if (act === 'force-delete') { openDelete(row, true); return; }
+        if (act === 'logs') { toast('init 日志 · refactor/config'); return; }
+        if (act === 'rerun-init') {
+          btn.disabled = true;
+          btn.innerHTML = '<span class="od-spinner"></span> 重跑中';
+          setTimeout(function () {
+            btn.disabled = false;
+            btn.textContent = '重跑初始化';
+            toast('init 已重新执行：exit code 0');
+          }, 1400);
+          return;
+        }
+        var badge = row.querySelector('.od-badge-active, .od-badge-suspend, .od-badge-archive, .od-badge-fail');
+        var actions = row.querySelector('.task-actions');
+        var labels = { suspend: ['挂起中', '挂起', '已挂起'], activate: ['激活中', '活跃', '已激活'], archive: ['归档中', '归档', '已归档'], restore: ['恢复中', '挂起', '已恢复为挂起'], retry: ['创建中', '活跃', '创建成功'] };
+        var conf = labels[act];
+        if (!conf || !badge) return;
+        actions.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+        badge.className = 'od-badge od-badge-transit';
+        badge.innerHTML = '<span class="od-spinner"></span>' + conf[0];
+        setTimeout(function () {
+          var cls = conf[1] === '活跃' ? 'od-badge-active' : (conf[1] === '挂起' ? 'od-badge-suspend' : 'od-badge-archive');
+          badge.className = 'od-badge ' + cls;
+          badge.innerHTML = (cls === 'od-badge-active' ? '<span class="od-badge-dot"></span>' : '') + conf[1];
+          if (conf[1] === '活跃') actions.innerHTML = '<button class="od-btn od-btn-sm">挂起</button>';
+          else if (conf[1] === '挂起') actions.innerHTML = '<button class="od-btn od-btn-sm">激活</button><button class="od-btn od-btn-sm od-btn-ghost">归档</button><button class="od-btn od-btn-sm od-btn-danger">删除</button>';
+          else actions.innerHTML = '<button class="od-btn od-btn-sm">恢复</button><button class="od-btn od-btn-sm od-btn-danger">删除</button>';
+          toast(conf[2]);
+        }, 1200);
+      });
+    });
+    if (row.dataset.href) {
+      row.addEventListener('click', function () { location.href = row.dataset.href; });
+    }
+  });
+})();
+</script>
+<script src="../assets/ocdeck-palette.js"></script>
+<script src="../assets/ocdeck-sidebar.js"></script>
+</body>
+</html>

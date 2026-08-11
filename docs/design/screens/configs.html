@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<!-- VENDORED 设计源 · 固化于 2026-08-08（OpenSpec change: web-ui-redesign）
+     来源：Open Design 项目 2396c3bb-e795-41fb-9536-723f69c71734/screens/configs.html（未改动）
+     效力：布局/状态/交互规格；mock 数据与文案不具契约效力，行为以 openspec spec 为准。 -->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>设置 · ocdeck</title>
+<script src="../assets/ocdeck-theme.js"></script>
+<link rel="stylesheet" href="../assets/ocdeck-ui.css">
+<style>
+  .seg { display: inline-flex; align-self: flex-start; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; flex: none; }
+  .seg button {
+    border: none; background: var(--bg); padding: 5px 10px; font: inherit; font-size: 12px;
+    color: var(--muted); cursor: pointer; min-height: 30px;
+  }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button.on { background: var(--ink); color: var(--on-ink); }
+  .cfg-files { display: flex; flex-direction: column; gap: 2px; flex: 0 0 200px; border-right: 1px solid var(--border); padding: 10px 8px; }
+  .cfg-file {
+    border: none; background: none; text-align: left; padding: 8px 10px; border-radius: var(--radius);
+    font: inherit; font-size: 12.5px; cursor: pointer; color: var(--fg);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .cfg-file:hover { background: var(--surface); }
+  /* 选中态与全站轨道模式一致（surface 底 + inset 描边），不占用 accent 预算 */
+  .cfg-file.on { background: var(--surface); box-shadow: inset 0 0 0 1px var(--border); font-weight: 500; }
+  .cfg-editor { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; padding: 14px 16px; }
+  .field-error { font-size: 12px; color: var(--danger); display: none; }
+  /* 设置子标签：选中态用前景色下划线，不占用 accent 预算 */
+  .set-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin-bottom: 18px; overflow-x: auto; }
+  .set-tab {
+    border: none; background: none; padding: 9px 14px; font: inherit; font-size: 13px; font-weight: 500;
+    color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px;
+    min-height: 36px; white-space: nowrap;
+  }
+  .set-tab:hover { color: var(--fg); }
+  .set-tab[aria-selected="true"] {
+    color: var(--fg); border-bottom-color: var(--fg); font-weight: 600;
+    background: var(--surface); border-radius: var(--radius) var(--radius) 0 0;
+  }
+  .set-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  /* AI 配置（并入） */
+  .strength-group { display: flex; gap: 10px; }
+  .strength {
+    flex: 1; max-width: 140px; border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 6px 12px; min-height: 34px; font-size: 13.5px; cursor: pointer;
+    background: var(--bg); text-align: center;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .strength:hover { border-color: var(--border-strong); }
+  .strength[aria-checked="true"] { border-color: var(--fg); background: var(--surface); font-weight: 500; }
+  .key-state { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .repair-error { font-size: 12px; color: var(--danger); margin-top: 8px; display: none; }
+  @media (max-width: 767px) {
+    .cfg-split { flex-direction: column; }
+    .cfg-files { flex: none; flex-direction: row; overflow-x: auto; border-right: none; border-bottom: 1px solid var(--border); }
+    .strength-group { flex-direction: column; }
+    .strength { max-width: none; }
+  }
+</style>
+</head>
+<body>
+<div class="od-shell">
+  <aside class="od-sidebar" data-od-id="sidebar">
+    <div class="od-brand">
+      <span class="od-brand-mark">oc</span>
+      <div>
+        <div class="od-brand-name">ocdeck</div>
+        <div class="od-brand-sub">opencode 编排台</div>
+      </div>
+    </div>
+    <nav class="od-nav" data-od-id="global-nav">
+      <a class="od-nav-item" href="./command-center.html">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 12 8 12 11 5 14 19 17 12 21 12"/></svg>
+        指挥中心
+      </a>
+
+      <div class="od-nav-group">任务</div>
+      <div class="od-nav-proj">ocdeck</div>
+      <a class="od-nav-task" href="./task-workbench.html" data-od-id="nav-task-ime">
+        <span class="od-agent od-agent-busy"><span class="od-agent-dot"></span></span>
+        <span class="od-nav-task-name">重构终端 IME 补偿</span>
+      </a>
+      <a class="od-nav-task" href="./task-workbench.html" data-od-id="nav-task-diff">
+        <span class="od-agent od-agent-idle"><span class="od-agent-dot"></span></span>
+        <span class="od-nav-task-name">升级 diff 渲染</span>
+      </a>
+      <div class="od-nav-proj">blog-next</div>
+      <a class="od-nav-task" href="./task-workbench.html" data-od-id="nav-task-config">
+        <span class="od-agent od-agent-retry"><span class="od-agent-dot"></span></span>
+        <span class="od-nav-task-name">重写配置加载</span>
+      </a>
+      <a class="od-nav-task" href="./task-workbench.html" data-od-id="nav-task-ci">
+        <span class="od-agent od-agent-busy"><span class="od-agent-dot"></span></span>
+        <span class="od-nav-task-name">修复 CI 缓存</span>
+      </a>
+
+      <div class="od-nav-group">管理</div>
+      <a class="od-nav-item" href="./projects.html">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
+        项目管理
+      </a>
+      <a class="od-nav-item" href="./configs.html" aria-current="page">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><line x1="4" y1="7" x2="20" y2="7"/><circle cx="9" cy="7" r="2.2"/><line x1="4" y1="17" x2="20" y2="17"/><circle cx="15" cy="17" r="2.2"/></svg>
+        设置
+      </a>
+    </nav>
+    <div class="od-sidebar-foot mono"><button class="od-sidebar-cmdk" type="button" onclick="window.odPalette&&window.odPalette.open()"><span>命令面板</span><span class="od-palette-kbd">⌘K</span></button><span title="本地服务 · 单用户模式">127.0.0.1:56445</span><button class="od-theme-btn" type="button" data-od-theme-toggle aria-label="切换主题"><svg class="od-theme-icon-light" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="od-theme-icon-dark" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button></div>
+  </aside>
+
+  <div class="od-main">
+    <div class="od-content">
+      <header class="od-page-head" data-od-id="page-head">
+        <div class="od-page-title">
+          <h1>设置</h1>
+          <p class="muted" style="font-size:13px">终端外观 · 全局环境变量 · opencode 配置 · AI provider</p>
+        </div>
+      </header>
+
+      <div class="set-tabs" role="tablist" data-od-id="settings-tabs">
+        <button class="set-tab" role="tab" id="tab-appearance" aria-controls="panel-appearance" aria-selected="true" data-tab="appearance">终端外观</button>
+        <button class="set-tab" role="tab" id="tab-env" aria-controls="panel-env" aria-selected="false" data-tab="env">环境变量</button>
+        <button class="set-tab" role="tab" id="tab-opencode" aria-controls="panel-opencode" aria-selected="false" data-tab="opencode">opencode 配置</button>
+        <button class="set-tab" role="tab" id="tab-ai" aria-controls="panel-ai" aria-selected="false" data-tab="ai">AI 配置</button>
+      </div>
+
+      <!-- 终端外观 -->
+      <div role="tabpanel" id="panel-appearance" aria-labelledby="tab-appearance">
+        <section class="od-card" data-od-id="term-appearance">
+          <div class="od-card-head"><h2>终端外观</h2></div>
+          <div class="od-field">
+            <span class="od-label" id="themeSegLabel">界面主题</span>
+            <div class="seg" data-od-theme-seg role="group" aria-labelledby="themeSegLabel" data-od-id="theme-seg">
+              <button type="button" data-mode="system">跟随系统</button>
+              <button type="button" data-mode="light">浅色</button>
+              <button type="button" data-mode="dark">深色</button>
+            </div>
+            <div class="od-hint">默认跟随系统；终端面板始终保持深色，不随主题翻转</div>
+          </div>
+          <div class="od-field">
+            <label class="od-label" for="fontStack">字体栈</label>
+            <input class="od-input mono" id="fontStack" value='ui-monospace, "SF Mono", Menlo, monospace'>
+          </div>
+          <div class="od-field">
+            <label class="od-label" for="fontSize">字号</label>
+            <input class="od-input" id="fontSize" type="number" value="13" min="8" max="32" style="max-width:120px">
+            <div class="field-error" id="sizeError">字号必须为 8–32 之间的整数</div>
+            <div class="od-hint">浏览器端偏好，存 localStorage，对本机所有任务终端生效</div>
+          </div>
+          <div class="od-term od-term-inset" id="termPreview" style="padding:12px 14px;font-size:13px" data-od-id="term-preview">
+            <div style="font-family:inherit">$ ocdeck serve</div>
+            <div style="font-family:inherit;color:var(--term-green)">✓ 服务已就绪 127.0.0.1:56445</div>
+            <div style="font-family:inherit;color:var(--term-muted)">3 个项目 · 4 个活跃任务</div>
+          </div>
+        </section>
+      </div>
+
+      <!-- 环境变量 -->
+      <div role="tabpanel" id="panel-env" aria-labelledby="tab-env" hidden>
+        <section class="od-card" data-od-id="global-env">
+          <div class="od-card-head"><h2>全局环境变量</h2></div>
+          <div class="od-alert od-alert-warn">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 4 2.5 20h19L12 4z"/><line x1="12" y1="10" x2="12" y2="14.5"/><circle cx="12" cy="17.2" r="0.4" fill="currentColor"/></svg>
+            <div class="od-alert-body">环境变量明文存储（0600），请勿存放高敏凭据。</div>
+          </div>
+          <div id="envRows">
+            <div class="od-kv-row" data-od-id="env-row-path">
+              <input class="od-input mono" value="PATH" aria-label="变量名" style="flex:0 0 140px">
+              <span class="seg">
+                <button class="on" data-mode="follow">跟随宿主</button>
+                <button data-mode="manual">手动</button>
+              </span>
+              <input class="od-input mono env-val" value="/usr/local/bin:/usr/bin:/bin" disabled>
+              <button class="od-btn od-btn-sm od-btn-ghost env-del">删除</button>
+            </div>
+            <div class="od-kv-row" data-od-id="env-row-proxy">
+              <input class="od-input mono" value="HTTP_PROXY" aria-label="变量名" style="flex:0 0 140px">
+              <span class="seg">
+                <button data-mode="follow">跟随宿主</button>
+                <button class="on" data-mode="manual">手动</button>
+              </span>
+              <input class="od-input mono env-val" value="http://127.0.0.1:7890">
+              <button class="od-btn od-btn-sm od-btn-ghost env-del">删除</button>
+            </div>
+            <div class="od-kv-row" data-od-id="env-row-goproxy">
+              <input class="od-input mono" value="GOPROXY" aria-label="变量名" style="flex:0 0 140px">
+              <span class="seg">
+                <button class="on" data-mode="follow">跟随宿主</button>
+                <button data-mode="manual">手动</button>
+              </span>
+              <input class="od-input mono env-val" placeholder="宿主环境未设置该变量" disabled>
+              <button class="od-btn od-btn-sm od-btn-ghost env-del">删除</button>
+            </div>
+          </div>
+          <p class="od-hint" style="margin:4px 0 10px">跟随宿主：展示服务端当前解析值，宿主未设置时置灰提示。跨项目生效，低于项目级 / 任务级。改动需重启任务（挂起后激活）生效。</p>
+          <div style="display:flex;gap:8px">
+            <button class="od-btn od-btn-sm" id="addEnv">添加</button>
+            <button class="od-btn od-btn-primary" id="saveEnv" data-od-id="env-save" style="margin-left:auto">保存</button>
+          </div>
+        </section>
+      </div>
+
+      <!-- opencode 配置 -->
+      <div role="tabpanel" id="panel-opencode" aria-labelledby="tab-opencode" hidden>
+        <section class="od-card" data-od-id="opencode-config" style="padding:0;overflow:hidden">
+          <div class="od-card-head" style="padding:18px 20px 0">
+            <h2>opencode 配置文件</h2>
+            <div class="od-card-extra">
+              <button class="od-btn od-btn-primary od-btn-sm" id="saveCfg" data-od-id="config-save">保存</button>
+            </div>
+          </div>
+          <div class="cfg-split" style="display:flex;min-height:340px;margin-top:12px;border-top:1px solid var(--border)">
+            <div class="cfg-files" role="listbox" aria-label="配置文件列表">
+              <button class="cfg-file on" role="option" aria-selected="true" data-file="opencode.json">opencode.json</button>
+              <button class="cfg-file" role="option" aria-selected="false" data-file="agents.md">agents.md</button>
+              <button class="cfg-file" role="option" aria-selected="false" data-file="config.jsonc">.opencode/config.jsonc</button>
+            </div>
+            <div class="cfg-editor">
+              <textarea class="od-textarea" id="cfgEditor" rows="14" spellcheck="false"></textarea>
+              <p class="od-hint" style="margin-top:8px">保存（PUT 整体替换），乐观锁冲突时需确认覆盖或重载。改动需重启任务（挂起后激活）生效。</p>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- AI 配置（原 ai-config.html 并入） -->
+      <div role="tabpanel" id="panel-ai" aria-labelledby="tab-ai" hidden>
+        <div class="od-alert od-alert-info" id="degradedNotice" data-od-id="ai-degraded-notice">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="10.5" x2="12" y2="16"/><circle cx="12" cy="7.6" r="0.4" fill="currentColor"/></svg>
+          <div class="od-alert-body">尚未配置，AI 功能（如英文分支命名）当前处于降级状态。</div>
+        </div>
+
+        <section class="od-card" data-od-id="ai-config-form">
+          <div class="od-card-head"><h2>AI provider</h2><span class="muted" style="font-size:12.5px">保存即时生效</span></div>
+          <div class="od-field">
+            <label class="od-label" for="provider">provider</label>
+            <select class="od-select" id="provider" style="max-width:280px">
+              <option value="openai">openai</option>
+              <option value="anthropic">anthropic</option>
+            </select>
+          </div>
+          <div class="od-field">
+            <label class="od-label" for="apiKey">API Key</label>
+            <input class="od-input mono" id="apiKey" type="password" placeholder="留空保持不变" style="max-width:420px">
+            <div class="key-state mono">当前已配置 sk-••••••••4f2c</div>
+            <div class="od-hint">仅保存用户新输入，绝不回显明文；留空保持不变（服务端语义）</div>
+          </div>
+          <div class="od-field">
+            <label class="od-label" for="baseUrl">base URL</label>
+            <input class="od-input mono" id="baseUrl" placeholder="留空使用默认端点" style="max-width:420px">
+          </div>
+          <div class="od-field">
+            <label class="od-label" for="model">模型</label>
+            <input class="od-input mono" id="model" placeholder="如 gpt-4o-mini / claude-haiku-4-5" style="max-width:420px">
+            <div class="field-error" id="modelError">模型不能为空</div>
+          </div>
+          <div class="od-field">
+            <span class="od-label">思考强度</span>
+            <div class="strength-group" role="radiogroup" id="strengthGroup" data-od-id="strength-group">
+              <div class="strength" role="radio" aria-checked="false" tabindex="0" data-v="低">低</div>
+              <div class="strength" role="radio" aria-checked="true" tabindex="0" data-v="默认">默认</div>
+              <div class="strength" role="radio" aria-checked="false" tabindex="0" data-v="高">高</div>
+            </div>
+            <div class="od-hint">强度越高响应越慢，「高」强度下分支命名可能超时并回退为自动生成。</div>
+          </div>
+          <div style="display:flex;justify-content:flex-end;margin-top:6px">
+            <button class="od-btn od-btn-primary" id="saveBtn" data-od-id="ai-config-save">保存</button>
+          </div>
+        </section>
+
+        <details class="od-collapse" data-od-id="ai-config-repair">
+          <summary>
+            <svg class="od-collapse-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="9 5 16 12 9 19"/></svg>
+            配置文件损坏或不可读？
+          </summary>
+          <div class="od-collapse-body">
+            <p style="font-size:13.5px">配置文件损坏或不可读：在上方重新填写并保存合法配置即可修复。</p>
+            <div style="margin-top:12px">
+              <button class="od-btn od-btn-sm" id="retryLoad">重试加载</button>
+              <div class="repair-error" id="repairError">重新加载失败：unexpected token at line 3</div>
+            </div>
+          </div>
+        </details>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="od-modal-mask" id="conflictModal" style="display:none" data-od-id="config-conflict-modal">
+  <div class="od-modal" role="dialog" aria-modal="true">
+    <h2>保存冲突</h2>
+    <div class="od-modal-body">配置文件已被外部修改。覆盖保存将以服务端最新版本为基线写入你的编辑；放弃则丢弃本地编辑并重新加载。</div>
+    <div class="od-modal-actions">
+      <button class="od-btn" id="conflictDiscard">放弃并重新加载</button>
+      <button class="od-btn od-btn-danger" id="conflictOverwrite">覆盖保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  function toast(msg) {
+    var t = document.createElement('div');
+    t.className = 'od-toast';
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(function () { t.remove(); }, 2600);
+  }
+
+  /* ---------- 设置子标签（hash 深链：#appearance/#env/#opencode/#ai） ---------- */
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('.set-tab'));
+  function selectTab(key, push) {
+    tabs.forEach(function (tb) {
+      var on = tb.dataset.tab === key;
+      tb.setAttribute('aria-selected', on ? 'true' : 'false');
+      document.getElementById(tb.getAttribute('aria-controls')).hidden = !on;
+    });
+    if (push) { try { history.replaceState(null, '', '#' + key); } catch (e) {} }
+  }
+  tabs.forEach(function (tb) {
+    tb.addEventListener('click', function () { selectTab(tb.dataset.tab, true); });
+  });
+  /* 方向键导航：←/→ 循环移动焦点并选中 */
+  document.querySelector('.set-tabs').addEventListener('keydown', function (e) {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    var i = tabs.indexOf(document.activeElement);
+    if (i < 0) return;
+    e.preventDefault();
+    var next = tabs[(i + (e.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length];
+    next.focus();
+    selectTab(next.dataset.tab, true);
+  });
+  var initial = (location.hash || '').replace('#', '');
+  if (['appearance', 'env', 'opencode', 'ai'].indexOf(initial) >= 0) selectTab(initial, false);
+
+  /* ---------- 终端外观实时预览 ---------- */
+  var fontStack = document.getElementById('fontStack');
+  var fontSize = document.getElementById('fontSize');
+  var sizeError = document.getElementById('sizeError');
+  var preview = document.getElementById('termPreview');
+  function apply() {
+    preview.style.fontFamily = fontStack.value || 'ui-monospace, Menlo, monospace';
+    var n = parseInt(fontSize.value, 10);
+    if (!Number.isInteger(n) || n < 8 || n > 32) {
+      sizeError.style.display = 'block';
+      return;
+    }
+    sizeError.style.display = 'none';
+    preview.style.fontSize = n + 'px';
+    try {
+      localStorage.setItem('ocdeck-term-font', fontStack.value);
+      localStorage.setItem('ocdeck-term-size', String(n));
+    } catch (e) {}
+  }
+  try {
+    var sf = localStorage.getItem('ocdeck-term-font');
+    var ss = localStorage.getItem('ocdeck-term-size');
+    if (sf) fontStack.value = sf;
+    if (ss) fontSize.value = ss;
+  } catch (e) {}
+  fontStack.addEventListener('input', apply);
+  fontSize.addEventListener('input', apply);
+  apply();
+
+  /* ---------- 全局环境变量 ---------- */
+  document.querySelectorAll('#envRows .od-kv-row').forEach(bindRow);
+  function bindRow(row) {
+    var segBtns = row.querySelectorAll('.seg button');
+    var val = row.querySelector('.env-val');
+    segBtns.forEach(function (b) {
+      b.addEventListener('click', function () {
+        segBtns.forEach(function (x) { x.classList.remove('on'); });
+        b.classList.add('on');
+        var follow = b.dataset.mode === 'follow';
+        val.disabled = follow;
+        if (follow && !val.value) val.placeholder = '宿主环境未设置该变量';
+        if (!follow) val.placeholder = '';
+      });
+    });
+    row.querySelector('.env-del').addEventListener('click', function () { row.remove(); });
+  }
+  document.getElementById('addEnv').addEventListener('click', function () {
+    var row = document.createElement('div');
+    row.className = 'od-kv-row';
+    row.innerHTML = '<input class="od-input mono" placeholder="KEY" style="flex:0 0 140px">' +
+      '<span class="seg"><button data-mode="follow">跟随宿主</button><button class="on" data-mode="manual">手动</button></span>' +
+      '<input class="od-input mono env-val" placeholder="VALUE">' +
+      '<button class="od-btn od-btn-sm od-btn-ghost env-del">删除</button>';
+    document.getElementById('envRows').appendChild(row);
+    bindRow(row);
+  });
+  document.getElementById('saveEnv').addEventListener('click', function () {
+    toast('已保存。2 个活跃任务受影响，需重启任务（挂起后激活）生效。');
+  });
+
+  /* ---------- opencode 配置文件 + 乐观锁 ---------- */
+  var contents = {
+    'opencode.json': '{\n  "model": "anthropic/claude-sonnet-4-5",\n  "small_model": "openai/gpt-4o-mini",\n  "theme": "ocdeck-dark",\n  "autoshare": false,\n  "keybinds": {\n    "interrupt": "esc",\n    "complete": "tab"\n  }\n}',
+    'agents.md': '# AGENTS\n\n## 全局约束\n- 修改源码优先使用专用编辑工具\n- 提交前运行测试\n',
+    'config.jsonc': '{\n  // 项目级覆盖\n  "model": "anthropic/claude-haiku-4-5",\n  "timeout_ms": 30000\n}'
+  };
+  var saveCount = {};
+  var editor = document.getElementById('cfgEditor');
+  var current = 'opencode.json';
+  editor.value = contents[current];
+  document.querySelectorAll('.cfg-file').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      document.querySelectorAll('.cfg-file').forEach(function (x) {
+        x.classList.remove('on');
+        x.setAttribute('aria-selected', 'false');
+      });
+      btn.classList.add('on');
+      btn.setAttribute('aria-selected', 'true');
+      current = btn.dataset.file;
+      editor.value = contents[current];
+    });
+  });
+  var conflictModal = document.getElementById('conflictModal');
+  document.getElementById('saveCfg').addEventListener('click', function () {
+    saveCount[current] = (saveCount[current] || 0) + 1;
+    if (saveCount[current] === 1) {
+      contents[current] = editor.value;
+      toast('已保存。当前没有活跃任务使用该配置。');
+    } else {
+      conflictModal.style.display = 'grid';
+    }
+  });
+  document.getElementById('conflictDiscard').addEventListener('click', function () {
+    conflictModal.style.display = 'none';
+    editor.value = contents[current];
+    saveCount[current] = 0;
+    toast('已重新加载服务端最新内容。');
+  });
+  document.getElementById('conflictOverwrite').addEventListener('click', function () {
+    conflictModal.style.display = 'none';
+    contents[current] = editor.value;
+    saveCount[current] = 0;
+    toast('已保存。3 个活跃任务受影响，需重启任务（挂起后激活）生效。');
+  });
+  conflictModal.addEventListener('click', function (e) { if (e.target === conflictModal) conflictModal.style.display = 'none'; });
+
+  /* ---------- AI 配置 ---------- */
+  var cards = document.querySelectorAll('#strengthGroup .strength');
+  cards.forEach(function (c) {
+    function pick() {
+      cards.forEach(function (x) { x.setAttribute('aria-checked', 'false'); });
+      c.setAttribute('aria-checked', 'true');
+    }
+    c.addEventListener('click', pick);
+    c.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+  });
+
+  var saveBtn = document.getElementById('saveBtn');
+  var model = document.getElementById('model');
+  var modelError = document.getElementById('modelError');
+  saveBtn.addEventListener('click', function () {
+    if (!model.value.trim()) {
+      modelError.style.display = 'block';
+      model.focus();
+      return;
+    }
+    modelError.style.display = 'none';
+    saveBtn.disabled = true;
+    saveBtn.textContent = '保存中…';
+    setTimeout(function () {
+      saveBtn.disabled = false;
+      saveBtn.textContent = '保存';
+      document.getElementById('degradedNotice').style.display = 'none';
+      toast('已保存并即时生效');
+    }, 800);
+  });
+
+  var retryBtn = document.getElementById('retryLoad');
+  var repairError = document.getElementById('repairError');
+  retryBtn.addEventListener('click', function () {
+    repairError.style.display = 'none';
+    retryBtn.disabled = true;
+    retryBtn.innerHTML = '<span class="od-spinner"></span> 重试中…';
+    setTimeout(function () {
+      retryBtn.disabled = false;
+      retryBtn.textContent = '重试加载';
+      repairError.style.display = 'block';
+    }, 900);
+  });
+})();
+</script>
+<script src="../assets/ocdeck-palette.js"></script>
+<script src="../assets/ocdeck-sidebar.js"></script>
+</body>
+</html>

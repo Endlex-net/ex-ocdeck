@@ -41,6 +41,12 @@ type TaskBackend interface {
 	//（cross-project-active-sessions：GET /api/v1/sessions/active 读模型来源）。
 	// 返回不含 agentStatus 的投影行；agentStatus 由 handler 并发 hydration 填充。
 	ListActiveTaskOverview(ctx context.Context) ([]task.ActiveTaskOverviewRow, error)
+	// Attention 返回任务注意力信号快照（design.md D6）。非 active/无 runtime 返回空快照。
+	// 纯读聚合，不影响任务状态机。API 层据此透出 attention 字段（空数组非 null）。
+	Attention(taskID string) (task.Attention, bool)
+	// ListProjectTaskSummaries 聚合全部任务摘要（design.md D4 GET /projects tasks 摘要）。
+	// 纯读聚合；store 失败返回错误（API 层 500 不水合）。agentStatus hydration 在 API 层。
+	ListProjectTaskSummaries(ctx context.Context) ([]task.ProjectTaskSummary, error)
 
 	// Git 状态/diff/commit/push 经 TaskManager GitOps（design.md §9/§21）。
 	// 持任务锁与 Suspend/Delete 等生命周期操作互斥，避免 api 绕过 TaskManager 致
@@ -233,6 +239,9 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 	dto.Sessions = toSessionDTOs(sessions)
 	// 2.8：active 时经该任务 serve 实时查询 agentStatus；非 active/查询失败降级为空串。
 	dto.AgentStatus = s.tasks.AgentStatus(r.Context(), taskID)
+	// D6 注意力信号快照透出（空数组非 null）。
+	att, _ := s.tasks.Attention(taskID)
+	dto.Attention = toAttentionDTO(att)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(dto)
 }
@@ -405,6 +414,7 @@ type taskRowDTO struct {
 	ProjectKind  string          `json:"project_kind"`
 	Sessions     []sessionRowDTO `json:"sessions,omitempty"`
 	AgentStatus  string          `json:"agentStatus,omitempty"`
+	Attention    attentionDTO    `json:"attention"`
 }
 
 type sessionRowDTO struct {
@@ -412,18 +422,65 @@ type sessionRowDTO struct {
 	LastSeenAt int64  `json:"last_seen_at"`
 }
 
+// attentionDTO 注意力信号透出 DTO（design.md D6）。空数组非 null；unsupported 透出空数组。
+type attentionDTO struct {
+	Permissions []permissionDTO `json:"permissions"`
+	Questions   []questionDTO   `json:"questions"`
+}
+
+type permissionDTO struct {
+	ID         string   `json:"id"`
+	Permission string   `json:"permission"`
+	Patterns   []string `json:"patterns"`
+	Since      int64    `json:"since"`
+}
+
+type questionDTO struct {
+	ID        string            `json:"id"`
+	Questions []questionItemDTO `json:"questions"`
+	Since     int64             `json:"since"`
+}
+
+type questionItemDTO struct {
+	Header   string `json:"header"`
+	Question string `json:"question"`
+}
+
+// toAttentionDTO 将 task.Attention 快照转为 DTO（空集合为非 nil 空数组，spec）。
+func toAttentionDTO(att task.Attention) attentionDTO {
+	perms := make([]permissionDTO, 0, len(att.Permissions))
+	for _, p := range att.Permissions {
+		perms = append(perms, permissionDTO{
+			ID: p.ID, Permission: p.Permission, Patterns: p.Patterns, Since: p.Since,
+		})
+	}
+	quests := make([]questionDTO, 0, len(att.Questions))
+	for _, q := range att.Questions {
+		items := make([]questionItemDTO, 0, len(q.Questions))
+		for _, qi := range q.Questions {
+			items = append(items, questionItemDTO{Header: qi.Header, Question: qi.Question})
+		}
+		quests = append(quests, questionDTO{
+			ID: q.ID, Questions: items, Since: q.Since,
+		})
+	}
+	return attentionDTO{Permissions: perms, Questions: quests}
+}
+
 // activeSessionDTO 跨项目 active 任务概览 DTO（cross-project-active-sessions D3/D4）。
 // 读模型（task.ActiveTaskOverviewRow）不含 agentStatus；handler hydration worker 并发填充。
 // AgentStatus 失败/超时为空串，经 omitempty 省略（idle/busy/retry 三态）。
+// Attention 纯读快照（design.md D6），空数组非 null。
 type activeSessionDTO struct {
-	TaskID       string `json:"task_id"`
-	ProjectID    string `json:"project_id"`
-	ProjectName  string `json:"project_name"`
-	Name         string `json:"name"`
-	Branch       string `json:"branch"`
-	WorktreePath string `json:"worktree_path"`
-	LastActiveAt int64  `json:"last_active_at"`
-	AgentStatus  string `json:"agentStatus,omitempty"`
+	TaskID       string       `json:"task_id"`
+	ProjectID    string       `json:"project_id"`
+	ProjectName  string       `json:"project_name"`
+	Name         string       `json:"name"`
+	Branch       string       `json:"branch"`
+	WorktreePath string       `json:"worktree_path"`
+	LastActiveAt int64        `json:"last_active_at"`
+	AgentStatus  string       `json:"agentStatus,omitempty"`
+	Attention    attentionDTO `json:"attention"`
 }
 
 func toTaskDTO(t task.TaskRow, projectKind string) taskRowDTO {
@@ -471,11 +528,15 @@ func (s *Server) handleListActiveSessions(w http.ResponseWriter, r *http.Request
 	}
 	out := make([]activeSessionDTO, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, activeSessionDTO{
+		dto := activeSessionDTO{
 			TaskID: row.ID, ProjectID: row.ProjectID, ProjectName: row.ProjectName,
 			Name: row.Name, Branch: row.Branch, WorktreePath: row.WorktreePath,
 			LastActiveAt: row.LastActiveAt,
-		})
+		}
+		// D6 注意力信号快照透出（空数组非 null）。
+		att, _ := s.tasks.Attention(row.ID)
+		dto.Attention = toAttentionDTO(att)
+		out = append(out, dto)
 	}
 	// Hydration worker（D4）：per-request 信号量 cap 8、3s budget；每 goroutine 仅写自己的 out[i]。
 	hctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)

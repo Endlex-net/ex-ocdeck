@@ -1,0 +1,893 @@
+<!DOCTYPE html>
+<!-- VENDORED 设计源 · 固化于 2026-08-08（OpenSpec change: web-ui-redesign）
+     来源：Open Design 项目 2396c3bb-e795-41fb-9536-723f69c71734/screens/task-workbench.html（未改动）
+     效力：布局/状态/交互规格；mock 数据与文案不具契约效力，行为以 openspec spec 为准。 -->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>重构终端 IME 补偿 · 任务工作台 · ocdeck</title>
+<script src="../assets/ocdeck-theme.js"></script>
+<link rel="stylesheet" href="../assets/ocdeck-ui.css">
+<style>
+  html, body { height: 100%; overflow: hidden; }
+  /* 工作台并入标准壳层：主侧栏任务组即任务切换器，零滚动契约不变 */
+  .wb-shell { height: 100vh; }
+  .wb-main { height: 100vh; }
+  @media (max-width: 767px) {
+    .wb-main { height: auto; flex: 1 1 auto; min-height: 0; }
+  }
+
+  /* 页头切换器：≤767px（侧栏收成顶栏、任务组隐藏）时的切换入口；
+     ≥768px 切换由侧栏任务组承担，标题退化为纯文本 */
+  @media (min-width: 768px) {
+    .wb-switcher-btn { pointer-events: none; cursor: default; margin-left: 0; padding-left: 0; }
+    .wb-switcher-btn:hover { background: none; }
+    .wb-switcher-btn > svg { display: none; }
+  }
+
+  /* 页头 */
+  .wb-header {
+    flex: none; display: flex; align-items: center; gap: 12px;
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+    background: var(--bg); flex-wrap: wrap;
+  }
+  .wb-title { font-size: 15px; font-weight: 600; white-space: nowrap; }
+  .wb-branch { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .wb-branch > svg { flex: none; }
+
+  /* 任务切换器：并行任务零跳转切换 */
+  .wb-switcher { position: relative; min-width: 0; flex: none; max-width: 44%; }
+  .wb-switcher-btn {
+    display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+    border: 1px solid transparent; background: none; border-radius: var(--radius);
+    padding: 4px 8px; margin: -4px 0 -4px -8px; font: inherit; cursor: pointer; text-align: left;
+  }
+  .wb-switcher-btn:hover { background: var(--surface); }
+  .wb-switcher-btn .wb-title { overflow: hidden; text-overflow: ellipsis; }
+  .wb-switcher-btn > svg { flex: none; color: var(--muted); }
+  .wb-switcher-menu {
+    position: absolute; left: -8px; top: calc(100% + 8px); z-index: 60;
+    min-width: 300px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow-pop); padding: 4px; display: none;
+  }
+  .wb-switcher-menu.open { display: block; }
+  .wb-sw-group { margin: 8px 10px 2px; font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
+  .wb-sw-item {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    padding: 7px 10px; border: none; background: none; border-radius: var(--radius);
+    font: inherit; font-size: 13px; cursor: pointer; text-align: left;
+  }
+  .wb-sw-item:hover { background: var(--surface); }
+  .wb-sw-item.current { background: var(--surface); font-weight: 500; }
+  .wb-sw-item .od-agent-dot { width: 7px; height: 7px; flex: 0 0 7px; }
+  .wb-sw-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wb-sw-item .mono { margin-left: auto; font-size: 11px; color: var(--muted); flex: none; }
+  .wb-sw-all {
+    display: flex; width: 100%; padding: 7px 10px; border: none; background: none;
+    border-top: 1px solid var(--border); border-radius: 0 0 var(--radius) var(--radius);
+    font: inherit; font-size: 12px; color: var(--muted); cursor: pointer; text-align: left;
+  }
+  .wb-sw-all:hover { color: var(--fg); }
+  .wb-badges { display: flex; align-items: center; gap: 8px; }
+  .wb-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+  .wb-overflow { position: relative; }
+  .wb-menu {
+    position: absolute; right: 0; top: calc(100% + 6px); z-index: 60;
+    min-width: 160px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow-pop); padding: 4px; display: none;
+  }
+  .wb-menu.open { display: block; }
+  .wb-menu button {
+    display: flex; width: 100%; padding: 8px 12px; border: none; background: none;
+    font: inherit; font-size: 13px; border-radius: var(--radius); cursor: pointer; text-align: left;
+  }
+  .wb-menu button:hover { background: var(--surface); }
+  .wb-menu .danger { color: var(--danger); }
+  .wb-label-full { display: inline; }
+  .wb-label-icon { display: none; }
+
+  /* 告警条区 */
+  .wb-alerts { flex: none; padding: 10px 16px 0; }
+  .wb-alerts .od-alert { margin-bottom: 8px; }
+  .wb-alert-close {
+    border: none; background: none; color: inherit; cursor: pointer;
+    font-size: 15px; line-height: 1; padding: 2px 4px; border-radius: var(--radius); opacity: 0.7;
+  }
+  .wb-alert-close:hover { opacity: 1; background: color-mix(in oklch, currentColor 10%, transparent); }
+
+  /* 面板区 */
+  .wb-panels { flex: 1 1 auto; min-height: 0; position: relative; }
+  .wb-panel { position: absolute; inset: 0; display: flex; flex-direction: column; }
+  .wb-panel[hidden] { display: none; }
+
+  /* TUI 终端 */
+  .tui-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 16px 18px; }
+  .tui-line { white-space: pre-wrap; word-break: break-word; }
+  .tui-dim { color: var(--term-muted); }
+  .tui-green { color: var(--term-green); }
+  .tui-red { color: var(--term-red); }
+  .tui-cursor {
+    display: inline-block; width: 8px; height: 16px; vertical-align: -2px;
+    background: var(--term-fg); animation: blink 1.1s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .tui-status {
+    flex: none; display: flex; gap: 14px; align-items: center;
+    padding: 7px 18px; border-top: 1px solid var(--term-border);
+    font-family: var(--font-mono); font-size: 11px; color: var(--term-muted);
+    white-space: nowrap; overflow: hidden;
+  }
+  .term-lock-layer { position: absolute; inset: 0; z-index: 10; display: none; }
+  .term-lock-layer.on { display: block; }
+  @media (pointer: fine) { .od-term-lock-btn { display: none; } }
+
+  /* Git 面板 */
+  .git-wrap { flex: 1 1 auto; min-height: 0; display: flex; }
+  .git-left {
+    flex: 0 0 320px; border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; min-height: 0; background: var(--bg);
+  }
+  .git-left-scroll { flex: 1 1 auto; overflow: auto; padding: 12px 14px; }
+  .git-group-title { font-size: 11.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin: 14px 0 6px; }
+  .git-group-title:first-child { margin-top: 0; }
+  .git-file {
+    display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+    border-radius: var(--radius); cursor: pointer; font-size: 12.5px;
+  }
+  .git-file:hover { background: var(--surface); }
+  /* 选中态与全站轨道同语言（surface + inset border），不占用 accent 预算 */
+  .git-file.sel { background: var(--surface); box-shadow: inset 0 0 0 1px var(--border); }
+  .git-file input { accent-color: var(--accent); width: 14px; height: 14px; flex: none; }
+  .git-file .mono { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+  .git-status-letter { flex: none; font-family: var(--font-mono); font-size: 11px; width: 18px; text-align: center; }
+  .git-foot { flex: none; border-top: 1px solid var(--border); padding: 12px 14px; }
+  .git-right { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; min-height: 0; background: var(--surface); }
+  .git-diff-head {
+    flex: none; padding: 10px 16px; border-bottom: 1px solid var(--border);
+    font-size: 12.5px; background: var(--bg); display: flex; align-items: center; gap: 10px;
+  }
+  .git-diff-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 14px 16px; }
+  .git-empty { display: grid; place-items: center; height: 100%; color: var(--muted); font-size: 13px; }
+
+  /* 设置面板 */
+  .settings-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 20px 24px 48px; }
+  .settings-inner { max-width: 760px; }
+  .log-block { padding: 12px 14px; font-size: 12px; }
+
+  /* 响应式 */
+  @media (max-width: 1024px) {
+    .wb-label-full { display: none; }
+    .wb-label-icon { display: inline; }
+    .git-wrap { flex-direction: column; overflow: auto; }
+    .git-left { flex: none; border-right: none; border-bottom: 1px solid var(--border); }
+    .git-right { flex: none; min-height: 420px; }
+  }
+  @media (max-width: 767px) {
+    /* 两行紧凑页头：行1 = 标题切换器 + 操作组；行2 = 分支 + 状态徽章 */
+    .wb-header { row-gap: 6px; padding: 8px 12px; }
+    .wb-switcher { max-width: none; flex: 1 1 0; min-width: 0; }
+    .wb-actions { margin-left: auto; flex: none; }
+    .wb-branch { order: 3; flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+    .wb-badges { order: 4; flex: none; margin-left: auto; }
+  }
+</style>
+</head>
+<body>
+<div class="od-shell wb-shell">
+
+  <aside class="od-sidebar" data-od-id="sidebar">
+    <div class="od-brand">
+      <span class="od-brand-mark">oc</span>
+      <div>
+        <div class="od-brand-name">ocdeck</div>
+        <div class="od-brand-sub">opencode 编排台</div>
+      </div>
+    </div>
+    <nav class="od-nav" data-od-id="global-nav">
+      <a class="od-nav-item" href="./command-center.html">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 12 8 12 11 5 14 19 17 12 21 12"/></svg>
+        指挥中心
+      </a>
+
+      <div class="od-nav-group">任务</div>
+      <div class="od-nav-proj">ocdeck</div>
+      <a class="od-nav-task" href="./task-workbench.html" data-branch="fix/terminal-ime" aria-current="page" data-od-id="nav-task-ime">
+        <span class="od-agent od-agent-busy"><span class="od-agent-dot"></span></span>
+        <span class="od-nav-task-name">重构终端 IME 补偿</span>
+      </a>
+      <a class="od-nav-task" href="./task-workbench.html" data-branch="feature/diff2html" data-od-id="nav-task-diff">
+        <span class="od-agent od-agent-idle"><span class="od-agent-dot"></span></span>
+        <span class="od-nav-task-name">升级 diff 渲染</span>
+      </a>
+      <div class="od-nav-proj">blog-next</div>
+      <a class="od-nav-task" href="./task-workbench.html" data-branch="refactor/config" data-od-id="nav-task-config">
+        <span class="od-agent od-agent-retry"><span class="od-agent-dot"></span></span>
+        <span class="od-nav-task-name">重写配置加载</span>
+      </a>
+      <a class="od-nav-task" href="./task-workbench.html" data-branch="fix/ci-cache" data-od-id="nav-task-ci">
+        <span class="od-agent od-agent-busy"><span class="od-agent-dot"></span></span>
+        <span class="od-nav-task-name">修复 CI 缓存</span>
+      </a>
+
+      <div class="od-nav-group">管理</div>
+      <a class="od-nav-item" href="./projects.html">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>
+        项目管理
+      </a>
+      <a class="od-nav-item" href="./configs.html">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><line x1="4" y1="7" x2="20" y2="7"/><circle cx="9" cy="7" r="2.2"/><line x1="4" y1="17" x2="20" y2="17"/><circle cx="15" cy="17" r="2.2"/></svg>
+        设置
+      </a>
+    </nav>
+    <div class="od-sidebar-foot mono"><button class="od-sidebar-cmdk" type="button" onclick="window.odPalette&&window.odPalette.open()"><span>命令面板</span><span class="od-palette-kbd">⌘K</span></button><span title="本地服务 · 单用户模式">127.0.0.1:56445</span><button class="od-theme-btn" type="button" data-od-theme-toggle aria-label="切换主题"><svg class="od-theme-icon-light" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="od-theme-icon-dark" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button></div>
+  </aside>
+
+  <div class="od-main wb-main">
+
+  <header class="wb-header" data-od-id="workbench-header">
+    <div class="wb-switcher" data-od-id="task-switcher">
+      <button class="wb-switcher-btn" id="switcherBtn" aria-haspopup="true" aria-expanded="false" title="切换任务">
+        <span class="wb-title" id="switcherTitle">重构终端 IME 补偿</span>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="wb-switcher-menu" id="switcherMenu" role="menu">
+        <div class="wb-sw-group">ocdeck</div>
+        <button class="wb-sw-item current" data-branch="fix/terminal-ime">
+          <span class="od-agent od-agent-busy"><span class="od-agent-dot"></span></span>
+          <span class="wb-sw-name">重构终端 IME 补偿</span>
+          <span class="mono">fix/terminal-ime</span>
+        </button>
+        <button class="wb-sw-item" data-branch="feature/diff2html">
+          <span class="od-agent od-agent-idle"><span class="od-agent-dot"></span></span>
+          <span class="wb-sw-name">升级 diff 渲染</span>
+          <span class="mono">feature/diff2html</span>
+        </button>
+        <div class="wb-sw-group">blog-next</div>
+        <button class="wb-sw-item" data-branch="refactor/config">
+          <span class="od-agent od-agent-retry"><span class="od-agent-dot"></span></span>
+          <span class="wb-sw-name">重写配置加载</span>
+          <span class="mono">refactor/config</span>
+        </button>
+        <button class="wb-sw-item" data-branch="fix/ci-cache">
+          <span class="od-agent od-agent-busy"><span class="od-agent-dot"></span></span>
+          <span class="wb-sw-name">修复 CI 缓存</span>
+          <span class="mono">fix/ci-cache</span>
+        </button>
+        <a class="wb-sw-all" href="./command-center.html">查看全部任务 →</a>
+      </div>
+    </div>
+    <span class="wb-branch mono"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="8" r="2.4"/><path d="M6 8.4v7.2"/><path d="M18 10.4c0 4-4 4.6-8 5.4"/></svg><span id="switcherBranch">fix/terminal-ime</span></span>
+    <span class="wb-badges">
+      <span class="od-badge od-badge-active" id="taskBadge"><span class="od-badge-dot"></span>活跃</span>
+      <span class="od-agent od-agent-busy" id="agentBadge"><span class="od-agent-dot"></span>工作中</span>
+    </span>
+    <div class="wb-actions">
+      <button class="od-btn od-btn-sm" id="suspendBtn" data-od-id="action-suspend">
+        <span class="wb-label-full">挂起</span>
+        <span class="wb-label-icon" title="挂起">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><line x1="9" y1="5" x2="9" y2="19"/><line x1="15" y1="5" x2="15" y2="19"/></svg>
+        </span>
+      </button>
+      <button class="od-btn od-btn-sm od-btn-ghost" id="archiveBtn">
+        <span class="wb-label-full">归档</span>
+        <span class="wb-label-icon" title="归档">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9"/><line x1="10" y1="13" x2="14" y2="13"/></svg>
+        </span>
+      </button>
+      <div class="wb-overflow">
+        <button class="od-btn od-btn-sm od-btn-icon" id="overflowBtn" title="更多操作" aria-label="更多操作" aria-haspopup="true" aria-expanded="false" data-od-id="action-overflow"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg></button>
+        <div class="wb-menu" id="overflowMenu">
+          <button class="danger" id="menuDelete">删除任务</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <div class="wb-alerts" data-od-id="workbench-alerts">
+    <div class="od-alert od-alert-danger" role="alert" data-od-id="alert-last-error">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 4 2.5 20h19L12 4z"/><line x1="12" y1="10" x2="12" y2="14.5"/><circle cx="12" cy="17.2" r="0.4" fill="currentColor"/></svg>
+      <div class="od-alert-body">删除失败：worktree 存在未提交改动</div>
+      <div class="od-alert-actions">
+        <button class="od-btn od-btn-sm" id="predeleteLogBtn">查看 pre-delete 日志</button>
+        <button class="wb-alert-close" aria-label="关闭">×</button>
+      </div>
+    </div>
+    <div class="od-alert od-alert-info" data-od-id="alert-notice">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="10.5" x2="12" y2="16"/><circle cx="12" cy="7.6" r="0.4" fill="currentColor"/></svg>
+      <div class="od-alert-body">有残留进程待清理（2 个），下次激活时自动回收。</div>
+      <div class="od-alert-actions"><button class="wb-alert-close" aria-label="关闭">×</button></div>
+    </div>
+  </div>
+
+  <div class="od-tabbar" role="tablist" data-od-id="workbench-tabs" id="tabbar">
+    <button class="od-tab" role="tab" data-tab="tui" aria-selected="true" aria-controls="panel-tui" id="tab-tui">TUI</button>
+    <button class="od-tab" role="tab" data-tab="shell1" aria-selected="false" aria-controls="panel-shell1" id="tab-shell1">shell 1 <span class="od-tab-close" title="关闭终端">×</span></button>
+    <button class="od-tab" role="tab" data-tab="shell2" aria-selected="false" aria-controls="panel-shell2" id="tab-shell2">shell 2 <span class="od-tab-close" title="关闭终端">×</span></button>
+    <button class="od-tab-add" id="addShell" title="新建 shell 终端" aria-label="新建 shell 终端" data-od-id="tab-add-shell"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
+    <span class="od-tab-sep"></span>
+    <button class="od-tab" role="tab" data-tab="git" aria-selected="false" aria-controls="panel-git" id="tab-git">Git</button>
+    <button class="od-tab" role="tab" data-tab="settings" aria-selected="false" aria-controls="panel-settings" id="tab-settings">设置</button>
+  </div>
+
+  <div class="wb-panels">
+
+    <!-- TUI 面板 -->
+    <section class="wb-panel od-term" id="panel-tui" data-od-id="panel-tui" role="tabpanel" aria-labelledby="tab-tui">
+      <div class="tui-body" id="tuiBody">
+        <div class="tui-line tui-dim">opencode 0.9.1 · 会话已恢复（session 01J8XK…）</div>
+        <div class="tui-line">&nbsp;</div>
+        <div class="tui-line"><span class="tui-green">›</span> 修复移动端竖拖合成滚轮事件的灵敏度</div>
+        <div class="tui-line">&nbsp;</div>
+        <div class="tui-line">我先看一下触摸手势的合成逻辑。</div>
+        <div class="tui-line tui-dim">✻ Read   web/src/terminal/touch-gestures.ts</div>
+        <div class="tui-line tui-dim">✻ Read   web/src/terminal/lock.ts</div>
+        <div class="tui-line">&nbsp;</div>
+        <div class="tui-line">问题在 deltaY 阈值：锁定态下手势直接透传浏览器滚动，</div>
+        <div class="tui-line">缺少按行高换算的累积器。准备做如下修改：</div>
+        <div class="tui-line">&nbsp;</div>
+        <div class="tui-line tui-dim">✻ Edit    web/src/terminal/touch-gestures.ts (+12 −4)</div>
+        <div class="tui-line tui-red">−  const delta = e.deltaY;</div>
+        <div class="tui-line tui-green">+  acc += e.deltaY;</div>
+        <div class="tui-line tui-green">+  const rows = Math.trunc(acc / lineHeight);</div>
+        <div class="tui-line tui-green">+  if (rows !== 0) { emitScroll(rows); acc -= rows * lineHeight; }</div>
+        <div class="tui-line">&nbsp;</div>
+        <div class="tui-line tui-green">⏵ Allow edit to touch-gestures.ts? (y)es / (n)o / (a)lways</div>
+        <div class="tui-line">&nbsp;</div>
+        <div class="tui-line"><span class="tui-green">›</span> <span class="tui-cursor"></span></div>
+      </div>
+      <div class="tui-status">
+        <span>fix/terminal-ime</span><span>opencode 0.9.1</span><span>esc 中断</span><span>tab 补全</span>
+      </div>
+      <div class="term-lock-layer on" id="lockLayer"></div>
+      <button class="od-term-lock-btn" id="lockBtn" data-od-id="term-lock" title="解锁终端" aria-label="解锁终端">
+        <svg id="lockIconLocked" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+        <svg id="lockIconOpen" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" style="display:none"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 7.8-1.3"/></svg>
+      </button>
+      <div class="od-term-overlay" id="overlaySuspended" style="display:none" data-od-id="overlay-suspended">
+        <div class="od-term-overlay-title">任务已挂起</div>
+        <div class="od-term-overlay-sub">任务已挂起，激活后可接入 opencode TUI</div>
+        <button class="od-btn od-btn-primary" id="activateBtn">激活任务</button>
+      </div>
+      <div class="od-term-overlay" id="overlayReconnect" style="display:none" data-od-id="overlay-reconnect">
+        <span class="od-spinner od-spinner-lg"></span>
+        <div class="od-term-overlay-title">连接中断，正在重连（第 2 次）…</div>
+      </div>
+      <div class="od-term-overlay" id="overlayReplaced" style="display:none" data-od-id="overlay-replaced">
+        <div class="od-term-overlay-title">连接被另一个标签页接管</div>
+        <div class="od-term-overlay-sub">同一终端同时只允许一个交互客户端。</div>
+        <button class="od-btn od-btn-primary" id="takeoverBtn">接管</button>
+      </div>
+    </section>
+
+    <!-- shell 终端面板（mock） -->
+    <section class="wb-panel od-term" id="panel-shell1" data-od-id="panel-shell1" role="tabpanel" aria-labelledby="tab-shell1" hidden>
+      <div class="tui-body">
+        <div class="tui-line tui-dim">~/worktrees/fix-terminal-ime</div>
+        <div class="tui-line"><span class="tui-green">$</span> git status --short</div>
+        <div class="tui-line"> M web/src/terminal/touch-gestures.ts</div>
+        <div class="tui-line"> M web/src/styles.css</div>
+        <div class="tui-line">?? docs/mobile-terminal.md</div>
+        <div class="tui-line"><span class="tui-green">$</span> <span class="tui-cursor"></span></div>
+      </div>
+      <div class="tui-status"><span>shell 1</span><span>zsh</span><span>tmux ocdeck</span></div>
+    </section>
+    <section class="wb-panel od-term" id="panel-shell2" data-od-id="panel-shell2" role="tabpanel" aria-labelledby="tab-shell2" hidden>
+      <div class="tui-body">
+        <div class="tui-line"><span class="tui-green">$</span> pnpm test -- terminal</div>
+        <div class="tui-line tui-dim">running 6 suites…</div>
+        <div class="tui-line tui-green">✓ touch-gestures.test.ts (14 tests)</div>
+        <div class="tui-line tui-green">✓ ime-compensator.test.ts (9 tests)</div>
+        <div class="tui-line"><span class="tui-green">$</span> <span class="tui-cursor"></span></div>
+      </div>
+      <div class="tui-status"><span>shell 2</span><span>zsh</span><span>tmux ocdeck</span></div>
+    </section>
+
+    <!-- Git 面板 -->
+    <section class="wb-panel" id="panel-git" data-od-id="panel-git" role="tabpanel" aria-labelledby="tab-git" hidden>
+      <div class="git-wrap">
+        <div class="git-left">
+          <div class="git-left-scroll">
+            <div style="display:flex;align-items:center;gap:8px;font-size:12.5px">
+              <span class="muted">当前分支</span><span class="mono">fix/terminal-ime</span>
+              <label style="margin-left:auto;font-size:12px;color:var(--muted);display:flex;align-items:center;gap:5px">
+                <input type="checkbox" id="checkAll" checked style="accent-color:var(--accent)"> 全选
+              </label>
+            </div>
+            <div class="git-group-title">已暂存</div>
+            <div class="git-file sel" data-diff="gestures" role="button" tabindex="0">
+              <input type="checkbox" checked>
+              <span class="mono">web/src/terminal/touch-gestures.ts</span>
+              <span class="git-status-letter" style="color:var(--muted)">M</span>
+            </div>
+            <div class="git-group-title">未暂存</div>
+            <div class="git-file" data-diff="styles" role="button" tabindex="0">
+              <input type="checkbox" checked>
+              <span class="mono">web/src/styles.css</span>
+              <span class="git-status-letter" style="color:var(--muted)">M</span>
+            </div>
+            <div class="git-file" data-diff="ime" role="button" tabindex="0">
+              <input type="checkbox" checked>
+              <span class="mono">web/src/terminal/ime-compensator.ts</span>
+              <span class="git-status-letter" style="color:var(--muted)">M</span>
+            </div>
+            <div class="git-group-title">未跟踪</div>
+            <div class="git-file" data-diff="none" role="button" tabindex="0">
+              <input type="checkbox" checked>
+              <span class="mono">docs/mobile-terminal.md</span>
+              <span class="git-status-letter" style="color:var(--muted)">??</span>
+            </div>
+            <p class="od-hint" style="margin-top:14px">面板激活时加载一次；不做自动轮询，避免打断勾选与 diff 阅读。</p>
+          </div>
+          <div class="git-foot">
+            <div style="font-size:12px;color:var(--muted);margin-bottom:8px" id="selCount">已选 4 个文件</div>
+            <textarea class="od-textarea" rows="2" placeholder="提交信息" style="margin-bottom:8px"></textarea>
+            <div style="display:flex;gap:8px">
+              <button class="od-btn od-btn-primary" id="commitBtn" data-od-id="git-commit">提交</button>
+              <button class="od-btn" id="pushBtn" data-od-id="git-push">推送</button>
+            </div>
+          </div>
+        </div>
+        <div class="git-right">
+          <div class="git-diff-head">
+            <span class="mono" id="diffFileName">web/src/terminal/touch-gestures.ts</span>
+            <span class="muted" style="font-size:11.5px">+12 −4</span>
+          </div>
+          <div class="git-diff-body" id="diffBody" data-od-id="git-diff">
+            <div class="od-diff">
+              <div class="od-diff-line od-diff-hunk"><span class="od-diff-gutter"></span>@@ -42,7 +42,9 @@ export function attachTouchGestures(</div>
+              <div class="od-diff-line"><span class="od-diff-gutter">42</span>  const term = session.terminal;</div>
+              <div class="od-diff-line"><span class="od-diff-gutter">43</span>  let acc = 0;</div>
+              <div class="od-diff-line od-diff-del"><span class="od-diff-gutter">44</span>−  const delta = e.deltaY;</div>
+              <div class="od-diff-line od-diff-del"><span class="od-diff-gutter">45</span>−  emitScroll(delta &gt; 0 ? 1 : -1);</div>
+              <div class="od-diff-line od-diff-add"><span class="od-diff-gutter">44</span>+  acc += e.deltaY;</div>
+              <div class="od-diff-line od-diff-add"><span class="od-diff-gutter">45</span>+  const rows = Math.trunc(acc / lineHeight);</div>
+              <div class="od-diff-line od-diff-add"><span class="od-diff-gutter">46</span>+  if (rows === 0) return;</div>
+              <div class="od-diff-line od-diff-add"><span class="od-diff-gutter">47</span>+  emitScroll(rows);</div>
+              <div class="od-diff-line od-diff-add"><span class="od-diff-gutter">48</span>+  acc -= rows * lineHeight;</div>
+              <div class="od-diff-line"><span class="od-diff-gutter">49</span>  }</div>
+              <div class="od-diff-line"><span class="od-diff-gutter">50</span>  el.addEventListener('touchmove', onMove, { passive: true });</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 设置面板 -->
+    <section class="wb-panel" id="panel-settings" data-od-id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+      <div class="settings-scroll">
+        <div class="settings-inner">
+          <h2 style="margin-bottom:14px">任务级环境变量</h2>
+          <div class="od-alert od-alert-warn">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 4 2.5 20h19L12 4z"/><line x1="12" y1="10" x2="12" y2="14.5"/><circle cx="12" cy="17.2" r="0.4" fill="currentColor"/></svg>
+            <div class="od-alert-body">环境变量明文存储（0600），请勿存放高敏凭据。</div>
+          </div>
+          <div class="od-kv-row">
+            <input class="od-input mono" value="TERM" aria-label="变量名">
+            <input class="od-input mono" value="xterm-256color" aria-label="变量值">
+            <button class="od-btn od-btn-sm od-btn-ghost">删除</button>
+          </div>
+          <div class="od-kv-row">
+            <input class="od-input mono" value="OC_DEBUG" aria-label="变量名">
+            <input class="od-input mono" value="1" aria-label="变量值">
+            <button class="od-btn od-btn-sm od-btn-ghost">删除</button>
+          </div>
+          <div style="display:flex;gap:8px;margin:10px 0 6px">
+            <button class="od-btn od-btn-sm">添加</button>
+            <button class="od-btn od-btn-primary" id="saveEnvBtn" data-od-id="env-save">保存</button>
+          </div>
+          <p class="od-hint">改动需挂起再激活后生效。</p>
+
+          <h2 style="margin:28px 0 12px">生命周期日志</h2>
+          <details class="od-collapse" open>
+            <summary>
+              <svg class="od-collapse-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="9 5 16 12 9 19"/></svg>
+              init 日志
+            </summary>
+            <div class="od-collapse-body" style="padding:12px">
+              <div class="od-term od-term-inset log-block">
+                <div class="tui-line tui-dim">$ pnpm install</div>
+                <div class="tui-line tui-dim">Packages: +214</div>
+                <div class="tui-line tui-dim">Done in 4.2s</div>
+                <div class="tui-line tui-green">exit code 0</div>
+              </div>
+            </div>
+          </details>
+          <details class="od-collapse">
+            <summary>
+              <svg class="od-collapse-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="9 5 16 12 9 19"/></svg>
+              pre-delete 日志
+            </summary>
+            <div class="od-collapse-body">
+              <p class="muted" style="font-size:13px">暂无日志。</p>
+            </div>
+          </details>
+          <details class="od-collapse">
+            <summary>
+              <svg class="od-collapse-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="9 5 16 12 9 19"/></svg>
+              init 失败示例
+            </summary>
+            <div class="od-collapse-body" style="padding:12px">
+              <div class="od-term od-term-inset log-block">
+                <div class="tui-line tui-dim">$ pnpm install</div>
+                <div class="tui-line tui-red">ERR_PNPM_FETCH_404  GET https://registry.npmjs.org/left-pad: Not Found</div>
+                <div class="tui-line tui-red">exit code 1</div>
+              </div>
+              <div style="margin-top:10px">
+                <button class="od-btn od-btn-sm" id="rerunInitBtn">重跑初始化</button>
+              </div>
+            </div>
+          </details>
+        </div>
+      </div>
+    </section>
+
+  </div>
+  </div>
+</div>
+
+<div class="od-modal-mask" id="deleteModal" style="display:none">
+  <div class="od-modal" role="dialog" aria-modal="true" aria-labelledby="deleteModalTitle">
+    <h2 id="deleteModalTitle">删除任务</h2>
+    <div class="od-modal-body">删除需先挂起任务。</div>
+    <div class="od-modal-actions"><button class="od-btn" id="deleteOk">知道了</button></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  function toast(msg) {
+    var t = document.createElement('div');
+    t.className = 'od-toast';
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(function () { t.remove(); }, 2400);
+  }
+
+  /* ---------- 标签切换：面板常驻仅隐藏 ---------- */
+  var tabbar = document.getElementById('tabbar');
+  var panels = {
+    tui: document.getElementById('panel-tui'),
+    shell1: document.getElementById('panel-shell1'),
+    shell2: document.getElementById('panel-shell2'),
+    git: document.getElementById('panel-git'),
+    settings: document.getElementById('panel-settings')
+  };
+  function activate(key) {
+    tabbar.querySelectorAll('.od-tab').forEach(function (t) {
+      t.setAttribute('aria-selected', t.dataset.tab === key ? 'true' : 'false');
+    });
+    Object.keys(panels).forEach(function (k) {
+      if (panels[k]) panels[k].hidden = k !== key;
+    });
+    try { localStorage.setItem('ocdeck-wb-tab', key); } catch (e) {}
+  }
+  tabbar.addEventListener('click', function (e) {
+    var close = e.target.closest('.od-tab-close');
+    if (close) {
+      e.stopPropagation();
+      var tab = close.parentElement;
+      if (close.dataset.confirm) {
+        var key = tab.dataset.tab;
+        if (panels[key]) { panels[key].remove(); delete panels[key]; }
+        tab.remove();
+        activate('tui');
+        toast('终端已关闭');
+      } else {
+        close.dataset.confirm = '1';
+        close.textContent = '确认?';
+        close.style.width = 'auto';
+        setTimeout(function () { if (close.isConnected) { delete close.dataset.confirm; close.textContent = '×'; } }, 2500);
+      }
+      return;
+    }
+    var tab = e.target.closest('.od-tab');
+    if (tab) activate(tab.dataset.tab);
+  });
+  /* tablist 方向键导航（左右移动焦点并选中）；Delete/Backspace 关闭 shell 标签 */
+  tabbar.addEventListener('keydown', function (e) {
+    var tabs = Array.prototype.slice.call(tabbar.querySelectorAll('.od-tab'));
+    var i = tabs.indexOf(document.activeElement);
+    if (i === -1) return;
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      e.preventDefault();
+      var next = tabs[(i + (e.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length];
+      next.focus();
+      activate(next.dataset.tab);
+      return;
+    }
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      var tab = tabs[i];
+      var close = tab.querySelector('.od-tab-close');
+      if (close) { e.preventDefault(); close.click(); }
+    }
+  });
+  var shellCount = 2;
+  document.getElementById('addShell').addEventListener('click', function () {
+    if (shellCount >= 4) { toast('最多 4 个 shell 终端'); return; }
+    shellCount += 1;
+    var key = 'shell' + shellCount;
+    var tab = document.createElement('button');
+    tab.className = 'od-tab';
+    tab.dataset.tab = key;
+    tab.setAttribute('role', 'tab');
+    tab.setAttribute('aria-selected', 'false');
+    tab.setAttribute('aria-controls', 'panel-' + key);
+    tab.id = 'tab-' + key;
+    tab.innerHTML = 'shell ' + shellCount + ' <span class="od-tab-close" title="关闭终端">×</span>';
+    document.getElementById('addShell').before(tab);
+    var panel = document.createElement('section');
+    panel.className = 'wb-panel od-term';
+    panel.id = 'panel-' + key;
+    panel.setAttribute('role', 'tabpanel');
+    panel.setAttribute('aria-labelledby', 'tab-' + key);
+    panel.hidden = true;
+    panel.innerHTML = '<div class="tui-body"><div class="tui-line"><span class="tui-green">$</span> <span class="tui-cursor"></span></div></div>' +
+      '<div class="tui-status"><span>shell ' + shellCount + '</span><span>zsh</span><span>tmux ocdeck</span></div>';
+    document.querySelector('.wb-panels').appendChild(panel);
+    panels[key] = panel;
+    activate(key);
+  });
+  var saved = null;
+  try { saved = localStorage.getItem('ocdeck-wb-tab'); } catch (e) {}
+  if (saved && panels[saved]) activate(saved);
+
+  /* ---------- 告警条关闭 ---------- */
+  document.querySelectorAll('.wb-alert-close').forEach(function (btn) {
+    btn.addEventListener('click', function () { btn.closest('.od-alert').remove(); });
+  });
+  document.getElementById('predeleteLogBtn').addEventListener('click', function () {
+    activate('settings');
+    toast('pre-delete 日志 · 暂无日志');
+  });
+
+  /* ---------- 溢出菜单 ---------- */
+  var overflowBtn = document.getElementById('overflowBtn');
+  var overflowMenu = document.getElementById('overflowMenu');
+  overflowBtn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    var open = overflowMenu.classList.toggle('open');
+    overflowBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+  document.addEventListener('click', function () {
+    overflowMenu.classList.remove('open');
+    overflowBtn.setAttribute('aria-expanded', 'false');
+  });
+  var deleteModal = document.getElementById('deleteModal');
+  var modalLastFocus = null;
+  function openModal() {
+    modalLastFocus = document.activeElement;
+    deleteModal.style.display = 'grid';
+    document.getElementById('deleteOk').focus();
+  }
+  function closeModal() {
+    deleteModal.style.display = 'none';
+    if (modalLastFocus && modalLastFocus.focus) modalLastFocus.focus();
+  }
+  document.getElementById('menuDelete').addEventListener('click', function () {
+    overflowMenu.classList.remove('open');
+    overflowBtn.setAttribute('aria-expanded', 'false');
+    openModal();
+  });
+  document.getElementById('deleteOk').addEventListener('click', closeModal);
+  deleteModal.addEventListener('click', function (e) { if (e.target === deleteModal) closeModal(); });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && deleteModal.style.display !== 'none') closeModal();
+  });
+
+  /* ---------- 任务切换器 ---------- */
+  var switcherBtn = document.getElementById('switcherBtn');
+  var switcherMenu = document.getElementById('switcherMenu');
+  var switcherTitle = document.getElementById('switcherTitle');
+  var switcherBranch = document.getElementById('switcherBranch');
+  switcherBtn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    var open = switcherMenu.classList.toggle('open');
+    switcherBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+  document.addEventListener('click', function (e) {
+    if (!e.target.closest('.wb-switcher')) {
+      switcherMenu.classList.remove('open');
+      switcherBtn.setAttribute('aria-expanded', 'false');
+    }
+  });
+  function selectTask(branch, name) {
+    switcherMenu.querySelectorAll('.wb-sw-item').forEach(function (x) {
+      x.classList.toggle('current', x.dataset.branch === branch);
+    });
+    document.querySelectorAll('.od-sidebar .od-nav-task').forEach(function (x) {
+      if (x.dataset.branch === branch) x.setAttribute('aria-current', 'page');
+      else x.removeAttribute('aria-current');
+    });
+    switcherTitle.textContent = name;
+    switcherBranch.textContent = branch;
+    switcherMenu.classList.remove('open');
+    switcherBtn.setAttribute('aria-expanded', 'false');
+    document.title = name + ' · 任务工作台 · ocdeck';
+    toast('已切换到「' + name + '」，会话原样接回');
+  }
+  switcherMenu.querySelectorAll('.wb-sw-item').forEach(function (item) {
+    item.addEventListener('click', function () {
+      if (item.classList.contains('current')) { switcherMenu.classList.remove('open'); return; }
+      selectTask(item.dataset.branch, item.querySelector('.wb-sw-name').textContent);
+    });
+  });
+  /* 主侧栏任务组 = 宽屏任务切换器：拦截跳转，就地切换 */
+  document.querySelectorAll('.od-sidebar .od-nav-task').forEach(function (item) {
+    item.addEventListener('click', function (e) {
+      e.preventDefault();
+      if (item.getAttribute('aria-current') === 'page') return;
+      selectTask(item.dataset.branch, item.querySelector('.od-nav-task-name').textContent);
+    });
+  });
+
+  /* ---------- 挂起 / 激活（真实状态行为） ---------- */
+  var taskBadge = document.getElementById('taskBadge');
+  var agentBadge = document.getElementById('agentBadge');
+  var suspendBtn = document.getElementById('suspendBtn');
+  var overlaySuspended = document.getElementById('overlaySuspended');
+  var overlayReconnect = document.getElementById('overlayReconnect');
+  var suspended = false;
+
+  suspendBtn.addEventListener('click', function () {
+    if (suspended) return;
+    taskBadge.className = 'od-badge od-badge-transit';
+    taskBadge.innerHTML = '<span class="od-spinner"></span>挂起中';
+    setTimeout(function () {
+      suspended = true;
+      taskBadge.className = 'od-badge od-badge-suspend';
+      taskBadge.textContent = '挂起';
+      agentBadge.style.display = 'none';
+      overlaySuspended.style.display = 'flex';
+      suspendBtn.disabled = true;
+      activate('tui');
+    }, 900);
+  });
+  document.getElementById('activateBtn').addEventListener('click', function () {
+    overlaySuspended.style.display = 'none';
+    overlayReconnect.style.display = 'flex';
+    taskBadge.className = 'od-badge od-badge-transit';
+    taskBadge.innerHTML = '<span class="od-spinner"></span>激活中';
+    setTimeout(function () {
+      suspended = false;
+      overlayReconnect.style.display = 'none';
+      taskBadge.className = 'od-badge od-badge-active';
+      taskBadge.innerHTML = '<span class="od-badge-dot"></span>活跃';
+      agentBadge.style.display = '';
+      suspendBtn.disabled = false;
+      toast('已激活，会话已恢复');
+    }, 1500);
+  });
+  document.getElementById('archiveBtn').addEventListener('click', function () {
+    toast('归档需先挂起任务');
+  });
+  document.getElementById('takeoverBtn').addEventListener('click', function () {
+    document.getElementById('overlayReplaced').style.display = 'none';
+    toast('已接管终端');
+  });
+
+  /* ---------- 移动端锁 ---------- */
+  var lockBtn = document.getElementById('lockBtn');
+  var lockLayer = document.getElementById('lockLayer');
+  var locked = true;
+  lockBtn.addEventListener('click', function () {
+    locked = !locked;
+    lockLayer.classList.toggle('on', locked);
+    document.getElementById('lockIconLocked').style.display = locked ? '' : 'none';
+    document.getElementById('lockIconOpen').style.display = locked ? 'none' : '';
+    lockBtn.title = locked ? '解锁终端' : '锁定终端';
+  });
+  // 触屏设备默认上锁；桌面端按钮被 CSS 隐藏，层同步移除
+  if (window.matchMedia('(pointer: fine)').matches) {
+    locked = false;
+    lockLayer.classList.remove('on');
+  }
+
+  /* ---------- Git 面板 ---------- */
+  var diffBody = document.getElementById('diffBody');
+  var diffName = document.getElementById('diffFileName');
+  var diffs = {
+    gestures: null, // 默认已在 DOM 中
+    styles: '<div class="od-diff">' +
+      '<div class="od-diff-line od-diff-hunk"><span class="od-diff-gutter"></span>@@ -88,6 +88,8 @@</div>' +
+      '<div class="od-diff-line od-diff-del"><span class="od-diff-gutter">88</span>−  .term-lock { z-index: 5; }</div>' +
+      '<div class="od-diff-line od-diff-add"><span class="od-diff-gutter">88</span>+  .term-lock { z-index: 20; }</div>' +
+      '<div class="od-diff-line od-diff-add"><span class="od-diff-gutter">89</span>+  .term-overlay { z-index: 30; }</div>' +
+      '<div class="od-diff-line"><span class="od-diff-gutter">90</span>  }</div></div>',
+    ime: '<div class="od-diff">' +
+      '<div class="od-diff-line od-diff-hunk"><span class="od-diff-gutter"></span>@@ -12,5 +12,7 @@</div>' +
+      '<div class="od-diff-line od-diff-del"><span class="od-diff-gutter">12</span>−  send(text);</div>' +
+      '<div class="od-diff-line od-diff-add"><span class="od-diff-gutter">12</span>+  if (composing) return; // 候选未确认，宁可少发</div>' +
+      '<div class="od-diff-line od-diff-add"><span class="od-diff-gutter">13</span>+  send(text);</div>' +
+      '<div class="od-diff-line"><span class="od-diff-gutter">14</span>  }</div></div>',
+    none: null
+  };
+  var currentDiff = 'gestures';
+  function showDiff(f) {
+    document.querySelectorAll('.git-file').forEach(function (x) { x.classList.remove('sel'); });
+    f.classList.add('sel');
+    var key = f.dataset.diff;
+    currentDiff = key;
+    if (key === 'none') {
+      diffName.textContent = 'docs/mobile-terminal.md';
+      diffBody.innerHTML = '<div class="git-empty">该文件暂无可展示的 diff。</div>';
+    } else if (key === 'gestures') {
+      diffName.textContent = 'web/src/terminal/touch-gestures.ts';
+      diffBody.innerHTML = initialDiff;
+    } else {
+      diffName.textContent = key === 'styles' ? 'web/src/styles.css' : 'web/src/terminal/ime-compensator.ts';
+      diffBody.innerHTML = diffs[key];
+    }
+  }
+  document.querySelectorAll('.git-file').forEach(function (f) {
+    f.addEventListener('click', function (e) {
+      if (e.target.tagName === 'INPUT') return;
+      showDiff(f);
+    });
+    /* 键盘等价：Enter/Space 选中并查看 diff（勾选仍走内部 checkbox） */
+    f.addEventListener('keydown', function (e) {
+      if (e.target.tagName === 'INPUT') return;
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        showDiff(f);
+      }
+    });
+  });
+  var initialDiff = diffBody.innerHTML;
+
+  var selCount = document.getElementById('selCount');
+  var fileBoxes = document.querySelectorAll('.git-file input[type=checkbox]');
+  var checkAll = document.getElementById('checkAll');
+  function refreshCount() {
+    var n = 0;
+    fileBoxes.forEach(function (b) { if (b.checked) n++; });
+    selCount.textContent = '已选 ' + n + ' 个文件';
+    checkAll.checked = n === fileBoxes.length;
+  }
+  fileBoxes.forEach(function (b) { b.addEventListener('change', refreshCount); });
+  checkAll.addEventListener('change', function () {
+    fileBoxes.forEach(function (b) { b.checked = checkAll.checked; });
+    refreshCount();
+  });
+
+  document.getElementById('commitBtn').addEventListener('click', function () {
+    var btn = this;
+    btn.disabled = true;
+    btn.textContent = '提交中…';
+    setTimeout(function () {
+      btn.disabled = false;
+      btn.textContent = '提交';
+      toast('提交完成');
+    }, 900);
+  });
+  document.getElementById('pushBtn').addEventListener('click', function () {
+    var btn = this;
+    btn.disabled = true;
+    btn.textContent = '推送中…';
+    setTimeout(function () {
+      btn.disabled = false;
+      btn.textContent = '推送';
+      toast('推送完成');
+    }, 900);
+  });
+
+  /* ---------- 设置面板 ---------- */
+  document.getElementById('saveEnvBtn').addEventListener('click', function () {
+    toast('已保存。需重启任务（挂起后激活）生效。');
+  });
+  document.getElementById('rerunInitBtn').addEventListener('click', function () {
+    var btn = this;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="od-spinner"></span> 重试中…';
+    setTimeout(function () {
+      btn.disabled = false;
+      btn.textContent = '重跑初始化';
+      toast('init 已重新执行：exit code 0');
+    }, 1400);
+  });
+})();
+</script>
+<script src="../assets/ocdeck-sidebar.js"></script>
+<script src="../assets/ocdeck-palette.js"></script>
+</body>
+</html>

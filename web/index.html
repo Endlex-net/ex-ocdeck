@@ -3,8 +3,38 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="light dark" />
     <title>ocdeck</title>
+    <!-- 首帧防闪烁：在 CSS 与首帧绘制前同步应用 data-theme（tasks 2.4，语义参考 docs/design/assets/ocdeck-theme.js）
+         localStorage['od-theme'] ∈ system|light|dark，缺省 system。 -->
+    <script>
+      (function () {
+        var STORE = 'od-theme';
+        var MODES = ['system', 'light', 'dark'];
+        var mq = window.matchMedia('(prefers-color-scheme: dark)');
+        var root = document.documentElement;
+        function stored() {
+          try {
+            var v = localStorage.getItem(STORE);
+            return MODES.indexOf(v) >= 0 ? v : 'system';
+          } catch (_) { return 'system'; }
+        }
+        function resolve(mode) {
+          return mode === 'system' ? (mq.matches ? 'dark' : 'light') : mode;
+        }
+        function paint() {
+          var mode = stored();
+          root.setAttribute('data-theme', resolve(mode));
+          root.setAttribute('data-theme-mode', mode);
+        }
+        // 系统主题变化时仅 system 模式下跟随
+        var onMq = function () { if (stored() === 'system') paint(); };
+        if (mq.addEventListener) mq.addEventListener('change', onMq);
+        else if (mq.addListener) mq.addListener(onMq);
+        // 首屏防闪烁：立即设置 data-theme
+        paint();
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

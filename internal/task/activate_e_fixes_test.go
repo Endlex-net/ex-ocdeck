@@ -100,12 +100,19 @@ func (c *portHealthOC) SubscribeEvents(ctx context.Context, dir string, onEvent 
 	return ctx.Err()
 }
 
+func (c *portHealthOC) ListPermissions(ctx context.Context, dir string) ([]opencode.PermissionRequest, error) {
+	return nil, opencode.ErrCapabilityUnsupported
+}
+func (c *portHealthOC) ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error) {
+	return nil, opencode.ErrCapabilityUnsupported
+}
+
 // newPortRetryManager 构造一个 Manager，其 ocFactory 在 failPort 上 Health 失败、其他端口成功。
 // 用于 E1 端口重试测试。probeErr 传入 Probe 返回错误（默认 nil=成功）。
 func newPortRetryManager(t *testing.T, store TaskStore, proc ProcessBackend, failPort int, probeErr error) *Manager {
 	t.Helper()
 	cfg := &config.Config{
-		DataDir:       t.TempDir(),
+		DataDir:        t.TempDir(),
 		ServePortRange: config.PortRange{Min: 50000, Max: 50999},
 		ShutdownPolicy: config.ShutdownPersist,
 	}
@@ -151,6 +158,12 @@ func (c *readyOCWrap) SubscribeEvents(ctx context.Context, dir string, onEvent f
 	}
 	return c.inner.SubscribeEvents(ctx, dir, onEvent, onReconnect)
 }
+func (c *readyOCWrap) ListPermissions(ctx context.Context, dir string) ([]opencode.PermissionRequest, error) {
+	return c.inner.ListPermissions(ctx, dir)
+}
+func (c *readyOCWrap) ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error) {
+	return c.inner.ListQuestions(ctx, dir)
+}
 
 // --- E1: 端口重写三处一致 ---
 
@@ -159,6 +172,7 @@ func (c *readyOCWrap) SubscribeEvents(ctx context.Context, dir string, onEvent f
 //   - 内存 env map（传给 startTUI）
 //   - 持久化 tasks.env_snapshot
 //   - 新建 serve 会话 env（serveEnv）
+//
 // 且旧 serve 会话 MUST 在新 serve 会话创建之前被 kill（不允许 serve 旧端口 / TUI 新端口）。
 func TestStartServeWithPortRetry_PortRewriteConsistency(t *testing.T) {
 	store := newMockStore()
@@ -235,7 +249,7 @@ func TestStartServeWithPortRetry_PortRewriteConsistency(t *testing.T) {
 }
 
 // TestStartServeWithPortRetry_TUIEnvUsesFinalPort 验证端口变更后 startTUI 用的是最终端口的 env
-//（E1 第 3 处：新建 TUI 会话 env）。端到端通过 Activate 触发。
+// （E1 第 3 处：新建 TUI 会话 env）。端到端通过 Activate 触发。
 func TestStartServeWithPortRetry_TUIEnvUsesFinalPort(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
@@ -370,7 +384,7 @@ func TestWaitServeReadyOrDead_AliveProcessWaitsForHealth(t *testing.T) {
 	seedSuspendedTask(store, "t1", "p1")
 	proc := newMockProc()
 	proc.sessions[serveSessionName("t1")] = true // 进程存活
-	oc := newMockOC(false)                        // health 永不就绪
+	oc := newMockOC(false)                       // health 永不就绪
 	m := newTestManager(t, store, proc, newMockWorktree(), oc)
 
 	err := m.waitServeReadyOrDead(context.Background(), oc, serveSessionName("t1"))
