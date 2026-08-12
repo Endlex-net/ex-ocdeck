@@ -259,6 +259,17 @@ const (
 	defaultHeartbeatTimeout = 60 * time.Second
 )
 
+// loopbackTransport 是进程内所有 opencode serve Client 共享的 Transport。
+// 从 DefaultTransport clone 继承 MaxIdleConns / IdleConnTimeout / DialContext 等有界
+// 回收配置，再显式 Proxy=nil：occlient 只访问 loopback，禁止任何代理劫持。
+// （Go ≥1.16 的 ProxyFromEnvironment 已豁免 loopback；Proxy: nil 仍作为显式不变量，
+// 防止版本/环境语义漂移。）
+var loopbackTransport = func() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = nil
+	return t
+}()
+
 // NewClient 构造 Client。port 为 serve 端口，password 为每 serve 随机密码。
 func NewClient(port int, password string, opts Options) *Client {
 	if opts.HealthTimeout <= 0 {
@@ -277,10 +288,8 @@ func NewClient(port int, password string, opts Options) *Client {
 		opts.HeartbeatTimeout = 0
 	}
 	baseURL := "http://127.0.0.1:" + strconv.Itoa(port)
-	// occlient 只访问 127.0.0.1 的 serve 实例：MUST 禁用代理。Go 的 ProxyFromEnvironment
-	// 不豁免 127.0.0.1（仅豁免 localhost 主机名），宿主环境 HTTP(S)_PROXY 会把 loopback
-	// 请求（含 SSE 长连接）劫持到本地代理导致挂起（冒烟实证）。
-	loopbackTransport := &http.Transport{Proxy: nil}
+	// httpClient / sseClient 各有独立 http.Client（超时语义不同），共享包级
+	// loopbackTransport 以跨实例复用 loopback 连接池，消除短连接 churn。
 	return &Client{
 		baseURL:           baseURL,
 		username:          "opencode",

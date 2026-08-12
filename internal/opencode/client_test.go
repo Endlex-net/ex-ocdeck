@@ -6,9 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"os"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1130,4 +1131,114 @@ func readFixture(t *testing.T, name string) []byte {
 		t.Fatalf("read fixture %s: %v", name, err)
 	}
 	return data
+}
+
+// ---- 共享 loopback Transport（fix-serve-connection-churn）----
+
+// connCountingServer 起真实 TCP listener，用 ConnState 统计 New 连接数。
+func connCountingServer(t *testing.T, handler http.Handler) (srv *http.Server, baseURL string, newConns *atomic.Int64) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	var n atomic.Int64
+	srv = &http.Server{Handler: handler}
+	srv.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			n.Add(1)
+		}
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+	})
+	return srv, "http://" + ln.Addr().String(), &n
+}
+
+func TestSharedLoopbackTransport_Invariants(t *testing.T) {
+	if loopbackTransport.Proxy != nil {
+		// Proxy 是 func，nil 表示禁用；非 nil 即未满足显式不变量。
+		t.Fatal("loopbackTransport.Proxy must be nil")
+	}
+	if loopbackTransport.MaxIdleConns <= 0 {
+		t.Fatalf("MaxIdleConns=%d want > 0 (bounded pool from DefaultTransport clone)", loopbackTransport.MaxIdleConns)
+	}
+	if loopbackTransport.IdleConnTimeout <= 0 {
+		t.Fatalf("IdleConnTimeout=%v want > 0 (idle reclaim from DefaultTransport clone)", loopbackTransport.IdleConnTimeout)
+	}
+
+	c := NewClient(1, "pw", Options{})
+	if c.httpClient.Transport != loopbackTransport {
+		t.Fatal("httpClient must bind package-level loopbackTransport")
+	}
+	if c.sseClient.Transport != loopbackTransport {
+		t.Fatal("sseClient must bind package-level loopbackTransport")
+	}
+	if c.httpClient.Transport != c.sseClient.Transport {
+		t.Fatal("httpClient and sseClient must share the same transport")
+	}
+	// 独立 http.Client 实例，超时语义分离。
+	if c.httpClient == c.sseClient {
+		t.Fatal("httpClient and sseClient must be distinct *http.Client instances")
+	}
+}
+
+func TestSharedLoopbackTransport_ReusesTCPAcrossClients(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, fmt.Sprintf(`{"healthy":true,"version":"%s"}`, ContractBaseline))
+	})
+	_, baseURL, newConns := connCountingServer(t, handler)
+
+	// 两个独立 NewClient，各发一次 Health；共享 transport 应只建 1 条 TCP。
+	c1 := NewClient(0, "pw", Options{HealthTimeout: 2 * time.Second, OpTimeout: 2 * time.Second})
+	c1.baseURL = baseURL
+	c2 := NewClient(0, "pw", Options{HealthTimeout: 2 * time.Second, OpTimeout: 2 * time.Second})
+	c2.baseURL = baseURL
+
+	if _, err := c1.Health(context.Background()); err != nil {
+		t.Fatalf("c1.Health: %v", err)
+	}
+	if _, err := c2.Health(context.Background()); err != nil {
+		t.Fatalf("c2.Health: %v", err)
+	}
+
+	if got := newConns.Load(); got != 1 {
+		t.Fatalf("TCP connections established: got %d want 1 (cross-client pool reuse)", got)
+	}
+}
+
+func TestSharedLoopbackTransport_OneConnPerHost(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, fmt.Sprintf(`{"healthy":true,"version":"%s"}`, ContractBaseline))
+	})
+
+	type host struct {
+		baseURL  string
+		newConns *atomic.Int64
+	}
+	hosts := make([]host, 2)
+	for i := range hosts {
+		_, baseURL, n := connCountingServer(t, handler)
+		hosts[i] = host{baseURL: baseURL, newConns: n}
+	}
+
+	// 每 host 两轮访问：第二轮必须复用 idle 连接。
+	for round := 0; round < 2; round++ {
+		for _, h := range hosts {
+			c := NewClient(0, "pw", Options{HealthTimeout: 2 * time.Second, OpTimeout: 2 * time.Second})
+			c.baseURL = h.baseURL
+			if _, err := c.Health(context.Background()); err != nil {
+				t.Fatalf("round %d host %s Health: %v", round, h.baseURL, err)
+			}
+		}
+	}
+
+	for i, h := range hosts {
+		if got := h.newConns.Load(); got != 1 {
+			t.Fatalf("host[%d] %s TCP connections: got %d want 1", i, h.baseURL, got)
+		}
+	}
 }
