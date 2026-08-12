@@ -496,7 +496,7 @@ func (m *Manager) deleteOCSessions(ctx context.Context, row TaskRow) error {
 
 // startTempServe 起一次性 serve 会话用于删除 oc session 数据（design.md §12）。
 func (m *Manager) startTempServe(ctx context.Context, row TaskRow) (int, string, error) {
-	port, err := m.allocatePort(row.LastPort)
+	port, err := m.allocatePort(row.LastPort, 0)
 	if err != nil {
 		return 0, "", err
 	}

@@ -189,6 +189,11 @@ type Manager struct {
 	// nil 防御回退默认值（直接 &Manager{} 构造的测试）。
 	probeColdStartBackoffFn func() []time.Duration
 
+	// serveReadyTimeout / serveReadyPollInterval 控制 waitServeReady* 健康轮询墙钟预算。
+	// 生产默认 10s / 500ms（零值回退）；测试可注入更短值，不得改变生产默认。
+	serveReadyTimeout      time.Duration
+	serveReadyPollInterval time.Duration
+
 	// keyedMu 提供每任务互斥锁（design.md §1：每任务 keyed mutex，冲突返回 409）。
 	keyedMu sync.Map // taskID -> *keyedLock
 

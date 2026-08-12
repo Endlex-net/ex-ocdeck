@@ -155,13 +155,13 @@ func TestAllocatePort_RotationCursor(t *testing.T) {
 	m := newTestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
 	m.cfg.ServePortRange = config.PortRange{Min: 50000, Max: 50005}
 	// 第一次分配（无 last_port）。
-	p1, err := m.allocatePort(sql.NullInt64{})
+	p1, err := m.allocatePort(sql.NullInt64{}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// 占用 p1，再分配应轮转到下一个。
 	// 由于 isPortFree 探测真实端口，测试环境端口可能都空闲；改为验证游标推进。
-	p2, err := m.allocatePort(sql.NullInt64{Int64: int64(p1), Valid: true})
+	p2, err := m.allocatePort(sql.NullInt64{Int64: int64(p1), Valid: true}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

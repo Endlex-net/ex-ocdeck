@@ -173,14 +173,15 @@ func (m *Manager) loadEnvSnapshot(row TaskRow) (map[string]string, error) {
 }
 
 // allocatePort 分配 serve 端口（design.md §3：先试 last_port，被占则范围内轮转）。
+// exclude：必须跳过的端口（0 = 不排除）；lastPort 快路径与轮转扫描均跳过。
 // 返回可用端口；范围耗尽返回错误。轮转游标避免每次从头扫（B5）。
 // portCursor 记录上次分配位置，下次从此处后轮转，降低并行 Activate 选同端口概率。
-func (m *Manager) allocatePort(lastPort sql.NullInt64) (int, error) {
+func (m *Manager) allocatePort(lastPort sql.NullInt64, exclude int) (int, error) {
 	pr := m.cfg.ServePortRange
-	// 先试 last_port。
+	// 先试 last_port（跳过 exclude）。
 	if lastPort.Valid {
 		p := int(lastPort.Int64)
-		if p >= pr.Min && p <= pr.Max && isPortFree(p) {
+		if p != exclude && p >= pr.Min && p <= pr.Max && isPortFree(p) {
 			return p, nil
 		}
 	}
@@ -196,6 +197,9 @@ func (m *Manager) allocatePort(lastPort sql.NullInt64) (int, error) {
 		p := start + off
 		if p > pr.Max {
 			p -= (pr.Max - pr.Min + 1)
+		}
+		if p == exclude {
+			continue
 		}
 		if isPortFree(p) {
 			m.portCursorMu.Lock()
@@ -319,25 +323,35 @@ const activateCompensationTimeout = 30 * time.Second
 const activateCompensationFinalizeTimeout = 10 * time.Second
 
 // runActivateFailureCompensation 执行 Activate 失败的统一补偿（design.md §19 补偿）：
-// kill 已建会话 → 清 env 快照 → 状态回退 activating→suspended + last_error。
+// kill 已建会话 → pending cleanup 回放 → 清 env 快照 → 状态回退 activating→suspended + last_error。
 //
 // 补偿用脱离调用方取消的 compCtx（WithoutCancel + activateCompensationTimeout），
 // 避免调用方 ctx 已取消时真实 store 的 ExecContext 失败导致任务卡 activating。
-// 预算拆分：cleanup 用 compCtx；最终 DB 收敛（清快照 + 状态回退 + last_error）在 cleanup 结束后
-// 另起新 bounded context（activateCompensationFinalizeTimeout），保证无论 cleanup 耗时/成败，
-// 状态回退总有全新预算。
+// 预算拆分：cleanup 用 compCtx；回放用新 detached 有界 ctx（activateCompensationFinalizeTimeout）；
+// 最终 DB 收敛另起新 bounded context，保证无论 cleanup 耗时/成败，状态回退总有全新预算。
 // 各步错误 MUST 记录日志但不跳过后续补偿步骤（不静默吞错，但保证补偿尽量收敛）。
-// last_error 聚合原始错误与 cleanup notice 错误（design.md §8：notice 持久化失败不静默）。
+// last_error 聚合原始错误与 cleanup/回放 notice 错误（design.md §8）；MUST NOT 改变 Activate 返回错误。
 func (m *Manager) runActivateFailureCompensation(reqCtx context.Context, taskID string, cause error) {
 	compCtx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), activateCompensationTimeout)
 	defer cancel()
 
-	cleanupErr := m.cleanupActivationRuntime(compCtx, taskID)
+	cleanupErr, observations := m.cleanupActivationRuntimeCollect(compCtx, taskID)
 	if cleanupErr != nil {
 		log.Printf("activate: cleanup runtime for task %s: %v", taskID, cleanupErr)
 	}
 
-	// 最终 DB 收敛：另起全新 bounded context，不受 cleanup 耗时影响。
+	// 回放：cleanup 结束后、最终 DB 收敛前；单个新 detached 有界 ctx（非逐 pending、不复用 compCtx）。
+	var replayErr error
+	if pendings := foldPendingCleanups(cause, observations); len(pendings) > 0 {
+		replayCtx, replayCancel := context.WithTimeout(context.WithoutCancel(reqCtx), activateCompensationFinalizeTimeout)
+		replayErr = m.replayPendingCleanups(replayCtx, taskID, pendings)
+		replayCancel()
+		if replayErr != nil {
+			log.Printf("activate: replay pending cleanup for task %s: %v", taskID, replayErr)
+		}
+	}
+
+	// 最终 DB 收敛：另起全新 bounded context，不受 cleanup/回放耗时影响。
 	finalCtx, finalCancel := context.WithTimeout(context.WithoutCancel(reqCtx), activateCompensationFinalizeTimeout)
 	defer finalCancel()
 
@@ -345,8 +359,15 @@ func (m *Manager) runActivateFailureCompensation(reqCtx context.Context, taskID 
 		log.Printf("activate: clear env snapshot for task %s: %v", taskID, err)
 	}
 	le := sql.NullString{String: cause.Error(), Valid: true}
+	agg := cause
 	if cleanupErr != nil {
-		le = sql.NullString{String: fmt.Errorf("%w; cleanup notice: %v", cause, cleanupErr).Error(), Valid: true}
+		agg = fmt.Errorf("%w; cleanup notice: %v", agg, cleanupErr)
+	}
+	if replayErr != nil {
+		agg = fmt.Errorf("%w; replay notice: %v", agg, replayErr)
+	}
+	if agg != cause {
+		le = sql.NullString{String: agg.Error(), Valid: true}
 	}
 	updated, err := m.store.UpdateTaskStatusConditional(finalCtx, taskID, StatusActivating, StatusSuspended, le)
 	if err != nil {
@@ -359,6 +380,72 @@ func (m *Manager) runActivateFailureCompensation(reqCtx context.Context, taskID 
 	}
 }
 
+// foldPendingCleanups 将 cause 路径 pending + cleanup observations 按发生顺序 fold：
+// 同会话 reason/retryable 取最新 observation；tickets = 全部 persisted=false 的 union；
+// 仅当同会话存在 persisted=false 时产生回放项；顺序 = 各会话首次出现顺序。
+func foldPendingCleanups(cause error, observations []cleanupObservation) []pendingCleanup {
+	type foldState struct {
+		sessionName    string
+		reason         string
+		retryable      bool
+		tickets        []string
+		hasUnpersisted bool
+	}
+	byName := map[string]*foldState{}
+	var order []string
+
+	apply := func(name, reason string, retryable bool, tickets []string, persisted bool) {
+		st, ok := byName[name]
+		if !ok {
+			st = &foldState{sessionName: name}
+			byName[name] = st
+			order = append(order, name)
+		}
+		// reason/retryable 始终取最新 observation（含已落库的更新终态）。
+		st.reason = reason
+		st.retryable = retryable
+		if !persisted {
+			st.hasUnpersisted = true
+			st.tickets = unionTickets(st.tickets, tickets)
+		}
+	}
+
+	// cause 路径 pending：按 errors.As 检出（发生在 cleanup observations 之前）。
+	var pce *pendingCleanupError
+	if errors.As(cause, &pce) && pce != nil {
+		apply(pce.pending.sessionName, pce.pending.reason, pce.pending.retryable, pce.pending.cleanupTickets, false)
+	}
+	for _, obs := range observations {
+		apply(obs.sessionName, obs.reason, obs.retryable, obs.cleanupTickets, obs.persisted)
+	}
+
+	var out []pendingCleanup
+	for _, name := range order {
+		st := byName[name]
+		if !st.hasUnpersisted {
+			continue
+		}
+		out = append(out, pendingCleanup{
+			sessionName:    st.sessionName,
+			cleanupTickets: st.tickets,
+			reason:         st.reason,
+			retryable:      st.retryable,
+		})
+	}
+	return out
+}
+
+// replayPendingCleanups 对归并后的 pending 每项恰好一次 recordResidualNotice。
+func (m *Manager) replayPendingCleanups(ctx context.Context, taskID string, pendings []pendingCleanup) error {
+	var errs []error
+	for _, p := range pendings {
+		if err := m.recordResidualNotice(ctx, taskID, p.sessionName, p.cleanupTickets, p.reason, p.retryable); err != nil {
+			errs = append(errs, fmt.Errorf("replay notice %s: %w", p.sessionName, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // activateRun 执行激活的外部副作用序列（serve → probe → SSE → tui）。
 // mode 由 Activate 早期 kind 门禁解析后传入（add-plain-dir-project D8）。
 func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode) error {
@@ -368,7 +455,7 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 	}
 
 	// ② 分配端口、合并 env 快照并持久化。
-	port, err := m.allocatePort(row.LastPort)
+	port, err := m.allocatePort(row.LastPort, 0)
 	if err != nil {
 		return newOpErr(codeConflict, err)
 	}
@@ -422,10 +509,35 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 	return nil
 }
 
+// 生产默认健康轮询预算（design.md：500ms 间隔、10s deadline）。
+const (
+	defaultServeReadyTimeout      = 10 * time.Second
+	defaultServeReadyPollInterval = 500 * time.Millisecond
+)
+
+func (m *Manager) serveReadyWaitTimeout() time.Duration {
+	if m != nil && m.serveReadyTimeout > 0 {
+		return m.serveReadyTimeout
+	}
+	return defaultServeReadyTimeout
+}
+
+func (m *Manager) serveReadyWaitPollInterval() time.Duration {
+	if m != nil && m.serveReadyPollInterval > 0 {
+		return m.serveReadyPollInterval
+	}
+	return defaultServeReadyPollInterval
+}
+
 // waitServeReady 轮询 health 直到就绪或超时。
 func (m *Manager) waitServeReady(ctx context.Context, oc OCClient) error {
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(m.serveReadyWaitTimeout())
+	poll := m.serveReadyWaitPollInterval()
 	for time.Now().Before(deadline) {
+		// 每轮先尊重取消：避免 Health 已因 ctx 失败后仍继续轮询到墙钟超时。
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		h, err := oc.Health(ctx)
 		if err == nil && h.Healthy {
 			return nil
@@ -433,22 +545,38 @@ func (m *Manager) waitServeReady(ctx context.Context, oc OCClient) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(poll):
 		}
+	}
+	// 墙钟耗尽时若 ctx 已取消，优先返回取消（与 startServeWithPortRetry 短路语义一致）。
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return fmt.Errorf("health check timeout")
 }
 
+// errServeSessionDied 标记健康轮询期间 serve 会话进程已不存在（与健康超时结构化区分）。
+// 调用方用 errors.Is 判定：进程死亡 = 已确认终止，无需 KillSession。
+var errServeSessionDied = errors.New("serve session died before ready")
+
 // waitServeReadyOrDead 在 waitServeReady 基础上每轮先判定 serve 会话进程是否已死
 // （design.md §3/§19 E3：serve 崩溃后不得等满超时）。仅用于 Activate 重试路径
 // （delete.go 的临时 serve 仍用 waitServeReady，保持其调用不变）。
+// 进程死亡分支包装 errServeSessionDied，调用方用 errors.Is 区分死亡与健康超时。
 func (m *Manager) waitServeReadyOrDead(ctx context.Context, oc OCClient, serveName string) error {
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(m.serveReadyWaitTimeout())
+	poll := m.serveReadyWaitPollInterval()
 	for time.Now().Before(deadline) {
+		// 每轮先尊重取消：MUST 先于死亡/健康判定，避免取消窗口误走 kill/allocate。
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		// 先判进程死亡：已死则立即终止轮询（不等满超时）。
+		// ErrNoTmuxServer 全仓惯例视为 absent（无 server = 会话不存在），
+		// 其他 infra 错误不得伪装死亡（走墙钟超时 → kill 门禁，避免误判逃逸进程）。
 		alive, derr := m.proc.HasSession(serveName)
-		if derr == nil && !alive {
-			return fmt.Errorf("serve session died before ready: %s", serveName)
+		if derr == nil && !alive || errors.Is(derr, process.ErrNoTmuxServer) {
+			return fmt.Errorf("%w: %s", errServeSessionDied, serveName)
 		}
 		h, err := oc.Health(ctx)
 		if err == nil && h.Healthy {
@@ -457,8 +585,12 @@ func (m *Manager) waitServeReadyOrDead(ctx context.Context, oc OCClient, serveNa
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(poll):
 		}
+	}
+	// 墙钟耗尽时若 ctx 已取消，优先返回取消（调用方以 ctx.Err()/errors.Is 短路，零本地副作用）。
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return fmt.Errorf("health check timeout")
 }
@@ -483,8 +615,12 @@ func probeErrToOpCode(err error) (string, error) {
 	}
 }
 
-// servePortRetries EADDRINUSE 换端口重试上限（design.md §3，B5）。
+// servePortRetries 为总尝试次数（含首次），健康检查失败后换端口重试（design.md D2）。
 const servePortRetries = 3
+
+// residualNoticeWriteTimeout 是轮换路径本地 residual notice 写的有界预算
+// （design.md D2：WithoutCancel + 10s；单个有界 CAS 收敛流程，不为热路径引入 30s 级延迟）。
+const residualNoticeWriteTimeout = 10 * time.Second
 
 // probeColdStartAttempts 是 capability probe 冷启动重试总次数（design.md D8）：
 // 首次 + 2 次重试 = 3 次尝试。全新 worktree 是 opencode 冷项目，首次 /session/status
@@ -551,16 +687,150 @@ func runProbeColdStartRetry(ctx context.Context, oc OCClient, backoff []time.Dur
 	return fmt.Errorf("after %d attempts: %w", probeColdStartAttempts, lastErr)
 }
 
-// startServeWithPortRetry 创建 serve 会话并健康检查；EADDRINUSE 自动换端口重试（design.md §3，B5）。
-// 端口被占时 serve 进程启动但健康检查不就绪 → 换新端口重新合并 env + 重建 serve 会话。
-// 端口变更时 MUST 同步三处 OCDECK_SERVE_PORT（design.md §3 E1，§2 line 68）：
+// pendingCleanup 是轮换路径 notice 本地写失败时移交外层补偿的持久化载荷
+// （design.md D2：sessionName + tickets + reason + retryable）。
+type pendingCleanup struct {
+	sessionName    string
+	cleanupTickets []string
+	reason         string
+	retryable      bool
+}
+
+// pendingCleanupError 包裹轮换路径终态 cause，并携带待回放的 pending cleanup。
+// Unwrap 返回 cause；errors.As 可检出后由 runActivateFailureCompensation 回放。
+type pendingCleanupError struct {
+	pending   pendingCleanup
+	noticeErr error
+	cause     error
+}
+
+func (e *pendingCleanupError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.noticeErr != nil {
+		return fmt.Sprintf("%v; pending cleanup notice: %v", e.cause, e.noticeErr)
+	}
+	return e.cause.Error()
+}
+
+func (e *pendingCleanupError) Unwrap() error { return e.cause }
+
+// cleanupObservation 记录 cleanup 路径一次 notice intent 的观察结果（design.md D2）。
+// clean 不形成 observation；写成功 persisted=true 仍参与归并（最新 reason/retryable）。
+type cleanupObservation struct {
+	sessionName    string
+	reason         string
+	retryable      bool
+	cleanupTickets []string
+	persisted      bool
+}
+
+// killNoticeClass 是 KillResult 共享 fail-closed 分类结果（轮换 switch 与 cleanup collect 共用）。
+// action:
+//   - "none"：clean，无 notice
+//   - "terminal"：记 notice 后终态（retryable debt 或未知矛盾）
+//   - "continue"：记 notice 后可继续轮换（snapshot_missing_degraded）
+type killNoticeClass struct {
+	action    string // none | terminal | continue
+	reason    string
+	retryable bool
+}
+
+// classifyKillResult 将 KillResult 收敛为共享 fail-closed 分类。
+// 未知 disposition 或 disposition 与 SessionKilled 矛盾 → kill_failed / retryable / terminal。
+// MUST NOT 经 dispositionToNotice 静默忽略未知值。
+func classifyKillResult(res process.KillResult) killNoticeClass {
+	// 已知 disposition 的 SessionKilled 一致性（与 process.KillSession 语义对齐）。
+	switch res.Disposition {
+	case process.DispositionClean:
+		if !res.SessionKilled {
+			return killNoticeClass{action: "terminal", reason: noticeReasonKillFailed, retryable: true}
+		}
+		return killNoticeClass{action: "none"}
+	case process.DispositionReapFailed:
+		if !res.SessionKilled {
+			return killNoticeClass{action: "terminal", reason: noticeReasonKillFailed, retryable: true}
+		}
+		return killNoticeClass{action: "terminal", reason: noticeReasonReapFailed, retryable: true}
+	case process.DispositionSnapshotFailed:
+		if res.SessionKilled {
+			return killNoticeClass{action: "terminal", reason: noticeReasonKillFailed, retryable: true}
+		}
+		return killNoticeClass{action: "terminal", reason: noticeReasonSnapshotFailed, retryable: true}
+	case process.DispositionKillFailed:
+		if res.SessionKilled {
+			return killNoticeClass{action: "terminal", reason: noticeReasonKillFailed, retryable: true}
+		}
+		return killNoticeClass{action: "terminal", reason: noticeReasonKillFailed, retryable: true}
+	case process.DispositionSnapshotMissingDegraded:
+		if res.SessionKilled {
+			return killNoticeClass{action: "terminal", reason: noticeReasonKillFailed, retryable: true}
+		}
+		return killNoticeClass{action: "continue", reason: noticeReasonSnapshotMissing, retryable: false}
+	default:
+		return killNoticeClass{action: "terminal", reason: noticeReasonKillFailed, retryable: true}
+	}
+}
+
+// withResidualNoticeCtx 返回脱离请求取消、有界 10s 的 notice 写 ctx。
+func withResidualNoticeCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), residualNoticeWriteTimeout)
+}
+
+// recordNoticeOrPending 写 residual notice；成功返回 nil；失败返回包裹 pendingCleanupError 的终态错误。
+func recordNoticeOrPending(sessionName string, tickets []string, reason string, retryable bool, noticeErr, cause error) error {
+	if noticeErr == nil {
+		return cause
+	}
+	return &pendingCleanupError{
+		pending: pendingCleanup{
+			sessionName:    sessionName,
+			cleanupTickets: append([]string(nil), tickets...),
+			reason:         reason,
+			retryable:      retryable,
+		},
+		noticeErr: noticeErr,
+		cause:     cause,
+	}
+}
+
+// aggregateServeWaitErr 聚合轮换路径终态错误（wait + kill/disposition + notice 文本上下文）。
+// 仅用于需要文本诊断、不要求保留底层 error chain 的路径（终态 disposition/末次预算等）。
+// 需要保留 aerr/perr 可 errors.Is 的路径请用 wrapServeWaitCause。
+func aggregateServeWaitErr(waitErr error, parts ...string) error {
+	msg := fmt.Sprintf("serve not ready: %v", waitErr)
+	for _, p := range parts {
+		if p != "" {
+			msg += "; " + p
+		}
+	}
+	return errors.New(msg)
+}
+
+// wrapServeWaitCause 在保留 wait/disposition 文本上下文的同时，以 %w 包装 finalErr，
+// 使 errors.Is/As 仍可达分配/持久化等底层错误（design/spec：分配失败 MUST 包装 aerr）。
+func wrapServeWaitCause(waitErr error, finalErr error, parts ...string) error {
+	msg := fmt.Sprintf("serve not ready: %v", waitErr)
+	for _, p := range parts {
+		if p != "" {
+			msg += "; " + p
+		}
+	}
+	if finalErr == nil {
+		return errors.New(msg)
+	}
+	return fmt.Errorf("%s: %w", msg, finalErr)
+}
+
+// startServeWithPortRetry 创建 serve 会话并健康检查；未就绪时按 D2 门禁换端口重试。
+// 端口变更时 MUST 同步三处 OCDECK_SERVE_PORT（design.md §3 E1）：
 //   - 内存 env map（传给后续 startTUI）
 //   - 持久化 tasks.env_snapshot（UpdateTaskEnvSnapshot）
 //   - 新建 serve 会话环境（serveEnv）
 //
-// 重建 serve 会话前 MUST 先 kill 旧会话（不允许 "serve 旧端口 / TUI 新端口"）。
-// Probe 错误按 §11 分类（probeErrToOpCode），非全部 oc_incompatible。
-// 返回最终可用端口。
+// Probe 失败 MUST NOT 本地 kill / 换端口；kill+notice 委托外层 compensation。
+// 返回最终可用端口；轮换路径终态错误可携带 pendingCleanupError。
 func (m *Manager) startServeWithPortRetry(ctx context.Context, row TaskRow, serveName string, port int, password string, env map[string]string) (int, error) {
 	for attempt := 0; attempt < servePortRetries; attempt++ {
 		serveEnv := copyMap(env)
@@ -578,34 +848,88 @@ func (m *Manager) startServeWithPortRetry(ctx context.Context, row TaskRow, serv
 			HealthTimeout: 2 * time.Second,
 			OpTimeout:     10 * time.Second,
 		})
-		// E3：健康轮询前判进程死亡，serve 崩溃立即失败（不等满超时）。
 		if err := m.waitServeReadyOrDead(ctx, oc, serveName); err != nil {
-			// E1：先 kill 旧 serve 会话（不允许 serve 旧端口 / TUI 新端口），再换端口。
-			_, _ = m.proc.KillSession(serveName)
-			newPort, aerr := m.allocatePort(sql.NullInt64{Int64: int64(port), Valid: true})
-			if aerr != nil {
-				return port, newOpErr(codeConflict, fmt.Errorf("serve not ready and no free port: %w", err))
+			// (a) ctx 取消：零副作用短路（MUST NOT kill/allocate/persist）。
+			// 同时认 wait 返回的取消错误与调用方 ctx（墙钟竞态下 wait 可能先返回 timeout）。
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				if ctx.Err() != nil {
+					return port, ctx.Err()
+				}
+				return port, err
 			}
-			if newPort == port {
-				// 无新端口可换 → 真正的就绪失败。
-				return port, newOpErr(codeProcessError, fmt.Errorf("serve not ready: %w", err))
+			// (b) 进程已死亡：无 KillSession / disposition / notice → 直接预算检查。
+			canRotate := errors.Is(err, errServeSessionDied)
+			// 本轮可带入终态上下文的额外片段（disposition 等）。
+			var rotateParts []string
+			if !canRotate {
+				// (c) 健康超时：KillSession 门禁 + notice 写（WithoutCancel + 10s）。
+				res, kerr := m.proc.KillSession(serveName)
+				nctx, ncancel := withResidualNoticeCtx(ctx)
+				if kerr != nil {
+					nerr := m.recordResidualNotice(nctx, row.ID, serveName, res.CleanupTickets, noticeReasonKillFailed, true)
+					ncancel()
+					cause := newOpErr(codeProcessError, aggregateServeWaitErr(err, fmt.Sprintf("kill: %v", kerr)))
+					if nerr != nil {
+						return port, recordNoticeOrPending(serveName, res.CleanupTickets, noticeReasonKillFailed, true, nerr, cause)
+					}
+					return port, cause
+				}
+				cls := classifyKillResult(res)
+				switch cls.action {
+				case "none":
+					ncancel()
+					canRotate = true
+				case "continue":
+					nerr := m.recordResidualNotice(nctx, row.ID, serveName, res.CleanupTickets, cls.reason, cls.retryable)
+					ncancel()
+					if nerr != nil {
+						cause := newOpErr(codeProcessError, aggregateServeWaitErr(err,
+							fmt.Sprintf("disposition: %s", res.Disposition),
+							fmt.Sprintf("notice: %v", nerr)))
+						return port, recordNoticeOrPending(serveName, res.CleanupTickets, cls.reason, cls.retryable, nerr, cause)
+					}
+					// snapshot_missing_degraded 记 notice 后可继续；保留 disposition 供末次终态聚合。
+					canRotate = true
+					rotateParts = append(rotateParts, fmt.Sprintf("disposition: %s", res.Disposition))
+				default: // terminal
+					nerr := m.recordResidualNotice(nctx, row.ID, serveName, res.CleanupTickets, cls.reason, cls.retryable)
+					ncancel()
+					parts := []string{fmt.Sprintf("disposition: %s", res.Disposition)}
+					if nerr != nil {
+						parts = append(parts, fmt.Sprintf("notice: %v", nerr))
+					}
+					cause := newOpErr(codeProcessError, aggregateServeWaitErr(err, parts...))
+					if nerr != nil {
+						return port, recordNoticeOrPending(serveName, res.CleanupTickets, cls.reason, cls.retryable, nerr, cause)
+					}
+					return port, cause
+				}
+			}
+			// (d) 末次预算：MUST NOT allocate/persist。终态聚合 wait + 本轮可得 disposition。
+			if attempt == servePortRetries-1 {
+				return port, newOpErr(codeProcessError, aggregateServeWaitErr(err, rotateParts...))
+			}
+			// (e) 排除刚失败端口后分配；失败 MUST 包装 aerr（%w）并保留 wait 上下文。
+			newPort, aerr := m.allocatePort(sql.NullInt64{Int64: int64(port), Valid: true}, port)
+			if aerr != nil {
+				return port, newOpErr(codeConflict, wrapServeWaitCause(err, aerr, rotateParts...))
 			}
 			port = newPort
-			// E1：同步三处 OCDECK_SERVE_PORT（内存 env + 持久化快照，design.md §2 line 68）。
+			// (f) persist 失败 → 终态，MUST NOT NewSession。保留 wait + disposition 上下文，%w 包装 perr。
+			// env 可能为 nil（调用方/测试注入）；写入前初始化，语义仍是更新后 persist。
+			if env == nil {
+				env = make(map[string]string)
+			}
 			env["OCDECK_SERVE_PORT"] = strconv.Itoa(port)
 			if perr := m.persistEnvSnapshot(ctx, row.ID, env); perr != nil {
-				return port, newOpErr(codeInternal, fmt.Errorf("persist env snapshot on port change: %w", perr))
+				return port, newOpErr(codeInternal, wrapServeWaitCause(err, perr, rotateParts...))
 			}
 			continue
 		}
 		// 健康就绪 → 能力探测。
-		// D8：全新 worktree 是 opencode 冷项目，serve 启动后首次 /session/status 可超 10s
-		//（实测 7.3s+，负载下超时）→ Probe 归类 ErrServeNotReady。此时 serve 进程仍健康，
-		// 仅能力端点未就绪，故不 kill 会话，短退避重试（首次 + 2 次，退避 2s/4s）。
-		// 首次超时后服务端初始化已完成，二次命中热路径。其他错误（mismatch/unauthorized/未知）
-		// 立即按 probeErrToOpCode 失败并 kill 会话。
+		// D8：冷启动 ErrServeNotReady 短退避重试；任何 Probe 失败 MUST NOT 本地 kill / 换端口
+		// （kill+notice 委托外层 runActivateFailureCompensation）。
 		if err := m.probeWithColdStartRetry(ctx, oc); err != nil {
-			_, _ = m.proc.KillSession(serveName)
 			code, ferr := probeErrToOpCode(err)
 			return port, newOpErr(code, ferr)
 		}
@@ -1196,12 +1520,17 @@ func (m *Manager) handleInfraError(taskID, sessionName string, infraErr error) {
 }
 
 // cleanupActivationRuntime 清理激活过程中已建的会话（失败补偿）。
-// kill serve/tui/shell（best-effort，记录残留 notice），停 SSE 与退出监视。
-// 返回聚合 error：notice 持久化失败（CAS 不收敛/store 不可达）MUST 传播/聚合，
-// 不静默吞错（design.md §8）。调用方（Activate 失败路径）将其纳入 last_error。
-// P4 复评阻塞 5：HasSession/KillSession infra 错误 MUST fail-closed 收集为 retryable notice
-// （不得 _ = 吞错——残留进程下次 Activate 被门禁永久阻塞，design.md §5/§8）。
+// 既有签名保留：返回聚合 error；其余三调用点（锁超时/主动收敛/reconcile）行为不变。
+// Activate 失败路径用 cleanupActivationRuntimeCollect 收集 observations 供 pending 回放。
 func (m *Manager) cleanupActivationRuntime(ctx context.Context, taskID string) error {
+	err, _ := m.cleanupActivationRuntimeCollect(ctx, taskID)
+	return err
+}
+
+// cleanupActivationRuntimeCollect 同 cleanupActivationRuntime，并返回每条 cleanup notice intent
+// 的 observation（design.md D2）。clean 不形成 observation；未知/矛盾 disposition 经共享
+// classifyKillResult fail-closed 记 kill_failed（MUST NOT 经 dispositionToNotice 静默忽略）。
+func (m *Manager) cleanupActivationRuntimeCollect(ctx context.Context, taskID string) (error, []cleanupObservation) {
 	rt := m.getRuntime(taskID)
 	if rt != nil {
 		rt.stopAll()
@@ -1211,16 +1540,28 @@ func (m *Manager) cleanupActivationRuntime(ctx context.Context, taskID string) e
 	shellNames, err := m.listShellSessions(taskID)
 	if err != nil {
 		m.clearRuntime(taskID)
-		return fmt.Errorf("enumerate shells for cleanup activation runtime: %w", err)
+		return fmt.Errorf("enumerate shells for cleanup activation runtime: %w", err), nil
 	}
 	names := append([]string{serveSessionName(taskID), tuiSessionName(taskID)}, shellNames...)
 	var noticeErrs []error
+	var observations []cleanupObservation
+	recordObs := func(name, reason string, retryable bool, tickets []string, nerr error) {
+		observations = append(observations, cleanupObservation{
+			sessionName:    name,
+			reason:         reason,
+			retryable:      retryable,
+			cleanupTickets: append([]string(nil), tickets...),
+			persisted:      nerr == nil,
+		})
+	}
 	for _, name := range names {
 		// P4 复评阻塞 5：HasSession infra 错误 fail-closed——记 retryable notice（kill_failed），
 		// 不得 _ = 吞错当 absent 跳过（残留会话下次 Activate 被门禁阻塞）。
 		exists, herr := m.proc.HasSession(name)
 		if herr != nil && !errors.Is(herr, process.ErrNoTmuxServer) {
-			if nerr := m.recordResidualNotice(ctx, taskID, name, nil, noticeReasonKillFailed, true); nerr != nil {
+			nerr := m.recordResidualNotice(ctx, taskID, name, nil, noticeReasonKillFailed, true)
+			recordObs(name, noticeReasonKillFailed, true, nil, nerr)
+			if nerr != nil {
 				noticeErrs = append(noticeErrs, fmt.Errorf("has session %s: %w; record notice: %v", name, herr, nerr))
 			} else {
 				noticeErrs = append(noticeErrs, fmt.Errorf("has session %s: %w", name, herr))
@@ -1233,19 +1574,28 @@ func (m *Manager) cleanupActivationRuntime(ctx context.Context, taskID string) e
 		// KillSession infra 错误同样 fail-closed 记 retryable notice。
 		res, kerr := m.proc.KillSession(name)
 		if kerr != nil {
-			if nerr := m.recordResidualNotice(ctx, taskID, name, res.CleanupTickets, noticeReasonKillFailed, true); nerr != nil {
+			nerr := m.recordResidualNotice(ctx, taskID, name, res.CleanupTickets, noticeReasonKillFailed, true)
+			recordObs(name, noticeReasonKillFailed, true, res.CleanupTickets, nerr)
+			if nerr != nil {
 				noticeErrs = append(noticeErrs, fmt.Errorf("kill session %s: %w; record notice: %v", name, kerr, nerr))
 			} else {
 				noticeErrs = append(noticeErrs, fmt.Errorf("kill session %s: %w", name, kerr))
 			}
 			continue
 		}
-		if err := m.recordResidualNoticeFromDisposition(ctx, taskID, name, res); err != nil {
-			noticeErrs = append(noticeErrs, err)
+		cls := classifyKillResult(res)
+		if cls.action == "none" {
+			// clean：无 notice intent，不形成 observation、不取消既有 pending。
+			continue
+		}
+		nerr := m.recordResidualNotice(ctx, taskID, name, res.CleanupTickets, cls.reason, cls.retryable)
+		recordObs(name, cls.reason, cls.retryable, res.CleanupTickets, nerr)
+		if nerr != nil {
+			noticeErrs = append(noticeErrs, nerr)
 		}
 	}
 	m.clearRuntime(taskID)
-	return errors.Join(noticeErrs...)
+	return errors.Join(noticeErrs...), observations
 }
 
 // checkNoResidualSessions 检查 tmux ls 中是否仍有该任务会话（design.md §19 Activate 前置）。
