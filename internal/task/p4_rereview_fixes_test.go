@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/config"
 	"ocdeck/internal/opencode"
 	"ocdeck/internal/process"
@@ -100,8 +101,8 @@ type noticeCASFailStore struct {
 	TaskStore
 }
 
-func (w *noticeCASFailStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (bool, error) {
-	return false, nil
+func (w *noticeCASFailStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error) {
+	return application.MutationResult{}, nil
 }
 
 // --- Fix 3: orphan ticket 持久化闭环 ---

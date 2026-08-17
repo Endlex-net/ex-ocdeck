@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	ocdecktask "ocdeck/internal/domain/task"
 )
 
 func openTestDB(t *testing.T) *DB {
@@ -30,6 +32,22 @@ func seedProjectTask(t *testing.T, db *DB, taskID string) {
 	}
 	if err := db.CreateTask(ctx, TaskRow{
 		ID: taskID, ProjectID: "p1", Name: "task", Branch: "b", Status: "suspended", WorktreePath: "/tmp/wt",
+	}); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+}
+
+// seedCreatingTaskForCommit 创建一个 status=creating 的任务，供 CommitCreated 成功路径 seed
+// （F-05：不得用 suspended 测 CommitCreated 成功路径）。返回后 CommitCreated(.., "creating", init)
+// 把 status 迁到 suspended 并写入 init_status。
+func seedCreatingTaskForCommit(t *testing.T, db *DB, taskID string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo"); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if err := db.CreateTask(ctx, TaskRow{
+		ID: taskID, ProjectID: "p1", Name: "task", Branch: "b", Status: "creating", WorktreePath: "/tmp/wt",
 	}); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
@@ -103,7 +121,7 @@ func TestTaskEnvVars_CascadeOnDelete(t *testing.T) {
 		ID: "t1", ProjectID: "p1", Name: "task", Branch: "b", Status: "suspended", WorktreePath: "/tmp/wt",
 	})
 	_ = db.SetTaskEnvVar(ctx, "t1", "FOO", "bar")
-	if err := db.DeleteTask(ctx, "t1"); err != nil {
+	if _, err := db.DeleteTask(ctx, "t1"); err != nil {
 		t.Fatalf("delete task: %v", err)
 	}
 	var n int
@@ -166,7 +184,8 @@ func TestWithTx_Commit(t *testing.T) {
 	ctx := context.Background()
 	seedProjectTask(t, db, "t1")
 	err := db.WithTx(ctx, func(q *Queries) error {
-		return q.UpdateTaskStatus(ctx, "t1", "active", sql.NullString{})
+		_, err := q.UpdateTaskStatus(ctx, "t1", "active", nsToPtr(sql.NullString{}))
+		return err
 	})
 	if err != nil {
 		t.Fatalf("WithTx: %v", err)
@@ -186,7 +205,7 @@ func TestWithTx_RollbackOnError(t *testing.T) {
 	seedProjectTask(t, db, "t1")
 	sentinel := errors.New("boom")
 	err := db.WithTx(ctx, func(q *Queries) error {
-		if err := q.UpdateTaskStatus(ctx, "t1", "activating", sql.NullString{}); err != nil {
+		if _, err := q.UpdateTaskStatus(ctx, "t1", "activating", nsToPtr(sql.NullString{})); err != nil {
 			return err
 		}
 		return sentinel
@@ -208,16 +227,16 @@ func TestUpdateTaskNoticeCAS_ConflictNotReplaced(t *testing.T) {
 	ctx := context.Background()
 	seedProjectTask(t, db, "t1")
 	// 期望当前为 NULL，写入 A。
-	replaced, err := db.UpdateTaskNoticeCAS(ctx, "t1", sql.NullString{}, sql.NullString{String: "A", Valid: true})
-	if err != nil || !replaced {
+	replaced, err := db.UpdateTaskNoticeCAS(ctx, "t1", nsToPtr(sql.NullString{}), nsToPtr(sql.NullString{String: "A", Valid: true}))
+	if err != nil || !replaced.Matched {
 		t.Fatalf("first CAS: replaced=%v err=%v", replaced, err)
 	}
 	// 并发：仍期望 NULL，应冲突不替换。
-	replaced2, err := db.UpdateTaskNoticeCAS(ctx, "t1", sql.NullString{}, sql.NullString{String: "B", Valid: true})
+	replaced2, err := db.UpdateTaskNoticeCAS(ctx, "t1", nsToPtr(sql.NullString{}), nsToPtr(sql.NullString{String: "B", Valid: true}))
 	if err != nil {
 		t.Fatalf("second CAS err: %v", err)
 	}
-	if replaced2 {
+	if replaced2.Matched {
 		t.Error("CAS replaced despite notice != expected (lost update)")
 	}
 	task, _ := db.GetTask(ctx, "t1")
@@ -225,8 +244,8 @@ func TestUpdateTaskNoticeCAS_ConflictNotReplaced(t *testing.T) {
 		t.Errorf("notice = %q, want A (unaffected by conflicting CAS)", task.Notice.String)
 	}
 	// 期望当前为 A，写入 C，应替换。
-	replaced3, err := db.UpdateTaskNoticeCAS(ctx, "t1", sql.NullString{String: "A", Valid: true}, sql.NullString{String: "C", Valid: true})
-	if err != nil || !replaced3 {
+	replaced3, err := db.UpdateTaskNoticeCAS(ctx, "t1", nsToPtr(sql.NullString{String: "A", Valid: true}), nsToPtr(sql.NullString{String: "C", Valid: true}))
+	if err != nil || !replaced3.Matched {
 		t.Fatalf("third CAS: replaced=%v err=%v", replaced3, err)
 	}
 }
@@ -236,16 +255,16 @@ func TestUpdateTaskStatusConditional(t *testing.T) {
 	ctx := context.Background()
 	seedProjectTask(t, db, "t1")
 	// from suspended → activating 成功。
-	updated, err := db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "activating", sql.NullString{})
-	if err != nil || !updated {
+	updated, err := db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "activating", nsToPtr(sql.NullString{}))
+	if err != nil || !updated.Matched {
 		t.Fatalf("first conditional: updated=%v err=%v", updated, err)
 	}
 	// 再次 from suspended → active，应不更新（当前已是 activating）。
-	updated2, err := db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "active", sql.NullString{})
+	updated2, err := db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "active", nsToPtr(sql.NullString{}))
 	if err != nil {
 		t.Fatalf("second conditional err: %v", err)
 	}
-	if updated2 {
+	if updated2.Matched {
 		t.Error("conditional updated despite status mismatch")
 	}
 	task, _ := db.GetTask(ctx, "t1")
@@ -354,7 +373,7 @@ func TestListActiveTaskOverview_NoSessionFallbackToUpdatedAt(t *testing.T) {
 	ctx := context.Background()
 	seedProjectTask(t, db, "t1")
 	// seedProjectTask 默认 suspended；切到 active 以纳入概览。
-	if _, err := db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "active", sql.NullString{}); err != nil {
+	if _, err := db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "active", nsToPtr(sql.NullString{})); err != nil {
 		t.Fatalf("activate t1: %v", err)
 	}
 	task, _ := db.GetTask(ctx, "t1")
@@ -581,8 +600,8 @@ func TestBeginDeleteIntent_Atomic(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 	seedProjectTask(t, db, "t1")
-	updated, err := db.BeginDeleteIntent(ctx, "t1", "normal", []string{"suspended", "archived", "creation_failed"})
-	if err != nil || !updated {
+	updated, err := db.BeginDeleteIntent(ctx, "t1", "normal", []ocdecktask.Status{"suspended", "archived", "creation_failed"})
+	if err != nil || !updated.Matched {
 		t.Fatalf("begin delete intent: updated=%v err=%v", updated, err)
 	}
 	task, _ := db.GetTask(ctx, "t1")
@@ -595,12 +614,12 @@ func TestBeginDeleteIntent_Atomic(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create t2: %v", err)
 	}
-	_, _ = db.UpdateTaskStatusConditional(ctx, "t2", "suspended", "active", sql.NullString{})
-	updated2, err := db.BeginDeleteIntent(ctx, "t2", "force", []string{"suspended", "archived"})
+	_, _ = db.UpdateTaskStatusConditional(ctx, "t2", "suspended", "active", nsToPtr(sql.NullString{}))
+	updated2, err := db.BeginDeleteIntent(ctx, "t2", "force", []ocdecktask.Status{"suspended", "archived"})
 	if err != nil {
 		t.Fatalf("second intent err: %v", err)
 	}
-	if updated2 {
+	if updated2.Matched {
 		t.Error("intent updated from non-allowed status (active)")
 	}
 	task2, _ := db.GetTask(ctx, "t2")
@@ -728,7 +747,7 @@ func TestTaskSessions_CascadeOnDelete(t *testing.T) {
 	ctx := context.Background()
 	seedProjectTask(t, db, "t1")
 	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "t1", SessionID: "s1", SessionCreatedAt: 1, FirstSeenAt: 1, LastSeenAt: 1})
-	if err := db.DeleteTask(ctx, "t1"); err != nil {
+	if _, err := db.DeleteTask(ctx, "t1"); err != nil {
 		t.Fatalf("delete task: %v", err)
 	}
 	var n int

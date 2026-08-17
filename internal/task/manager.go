@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/config"
 	"ocdeck/internal/lifecycle"
 	"ocdeck/internal/opencode"
@@ -26,25 +27,25 @@ type TaskStore interface {
 	GetTask(ctx context.Context, id string) (TaskRow, error)
 	ListTasksByProject(ctx context.Context, projectID string) ([]TaskRow, error)
 	ListAllTasks(ctx context.Context) ([]TaskRow, error)
-	UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) error
-	UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (bool, error)
-	UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) error
-	UpdateTaskLastPort(ctx context.Context, id string, port int) error
-	UpdateTaskNotice(ctx context.Context, id string, notice sql.NullString) error
-	UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (bool, error)
-	SetTaskDeleteMode(ctx context.Context, id, mode string) error
-	BeginDeleteIntent(ctx context.Context, id, mode string, fromStatuses []string) (bool, error)
-	ArchiveTask(ctx context.Context, id string) error
-	RestoreTask(ctx context.Context, id string) error
-	DeleteTask(ctx context.Context, id string) error
+	UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) (application.TransitionResult, error)
+	UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (application.TransitionResult, error)
+	UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) (application.MutationResult, error)
+	UpdateTaskLastPort(ctx context.Context, id string, port int) (application.MutationResult, error)
+	UpdateTaskNotice(ctx context.Context, id string, notice sql.NullString) (application.MutationResult, error)
+	UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error)
+	SetTaskDeleteMode(ctx context.Context, id, mode string) (application.MutationResult, error)
+	BeginDeleteIntent(ctx context.Context, id, mode string, fromStatuses []string) (application.TransitionResult, error)
+	ArchiveTask(ctx context.Context, id string) (application.TransitionResult, error)
+	RestoreTask(ctx context.Context, id string) (application.TransitionResult, error)
+	DeleteTask(ctx context.Context, id string) (application.DeleteResult, error)
 	// 生命周期配置（design.md §2.1）
 	GetLifecycleConfig(ctx context.Context, projectID string) (LifecycleConfigRow, error)
 	UpsertLifecycleConfig(ctx context.Context, projectID, inheritPatterns, initScript, preDeleteScript string) error
 	// init_status CAS（design.md §2.1/§3）
-	CommitCreated(ctx context.Context, taskID, expectedStatus, initStatus string) (bool, error)
-	ClaimInitRun(ctx context.Context, taskID string) (bool, error)
-	ClaimInitRerun(ctx context.Context, taskID string) (bool, error)
-	FinishInitRun(ctx context.Context, taskID, status string, initError sql.NullString) (bool, error)
+	CommitCreated(ctx context.Context, taskID, expectedStatus, initStatus string) (application.TransitionResult, error)
+	ClaimInitRun(ctx context.Context, taskID string) (application.MutationResult, error)
+	ClaimInitRerun(ctx context.Context, taskID string) (application.MutationResult, error)
+	FinishInitRun(ctx context.Context, taskID, status string, initError sql.NullString) (application.MutationResult, error)
 	ConvergeInterruptedInitRuns(ctx context.Context) (int64, error)
 	// env
 	ListGlobalEnvVars(ctx context.Context) ([]GlobalEnvVarRow, error)

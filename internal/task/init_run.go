@@ -52,7 +52,7 @@ func (m *Manager) runInitAttempt(taskID string) {
 		log.Printf("init runner: claim task %s: %v", taskID, err)
 		return
 	}
-	if !claimed {
+	if !claimed.Matched {
 		// 并发下另一执行者已 claim 或状态已变，不重复执行。
 		return
 	}
@@ -77,7 +77,7 @@ func (m *Manager) runInitAttempt(taskID string) {
 		log.Printf("init runner: finish task %s: %v", taskID, ferr)
 		return
 	}
-	if !updated {
+	if !updated.Matched {
 		// rows=0：任务已被外部收敛（如服务重启），不激活（§4）。
 		log.Printf("init runner: task %s init_status no longer running (externally converged)", taskID)
 		return
@@ -167,7 +167,7 @@ func (m *Manager) runRerunInitAttempt(taskID string, wgRelease func()) {
 		log.Printf("rerun init: finish task %s: %v", taskID, ferr)
 		return
 	}
-	if !updated {
+	if !updated.Matched {
 		log.Printf("rerun init: task %s init_status no longer running (externally converged)", taskID)
 		return
 	}

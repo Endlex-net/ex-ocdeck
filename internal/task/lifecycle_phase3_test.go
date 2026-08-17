@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/config"
 	"ocdeck/internal/git"
 	"ocdeck/internal/lifecycle"
@@ -616,12 +617,12 @@ type errFinishInitStore struct {
 	finishCalled chan struct{}
 }
 
-func (s *errFinishInitStore) FinishInitRun(ctx context.Context, taskID, status string, initError sql.NullString) (bool, error) {
+func (s *errFinishInitStore) FinishInitRun(ctx context.Context, taskID, status string, initError sql.NullString) (application.MutationResult, error) {
 	select {
 	case s.finishCalled <- struct{}{}:
 	default:
 	}
-	return false, fmt.Errorf("db finish error")
+	return application.MutationResult{}, fmt.Errorf("db finish error")
 }
 func (s *errFinishInitStore) seedProject(p ProjectRow) {
 	if ms, ok := s.TaskStore.(*mockStore); ok {
@@ -662,7 +663,7 @@ type rowsZeroFinishStore struct {
 	mu           sync.Mutex
 }
 
-func (s *rowsZeroFinishStore) FinishInitRun(ctx context.Context, taskID, status string, initError sql.NullString) (bool, error) {
+func (s *rowsZeroFinishStore) FinishInitRun(ctx context.Context, taskID, status string, initError sql.NullString) (application.MutationResult, error) {
 	s.mu.Lock()
 	s.finishCalls++
 	s.mu.Unlock()
@@ -671,19 +672,19 @@ func (s *rowsZeroFinishStore) FinishInitRun(ctx context.Context, taskID, status 
 	default:
 	}
 	// 返回 rows=0（外部收敛）。
-	return false, nil
+	return application.MutationResult{}, nil
 }
 func (s *rowsZeroFinishStore) seedProject(p ProjectRow) {
 	if ms, ok := s.TaskStore.(*mockStore); ok {
 		ms.seedProject(p)
 	}
 }
-func (s *rowsZeroFinishStore) ClaimInitRun(ctx context.Context, taskID string) (bool, error) {
+func (s *rowsZeroFinishStore) ClaimInitRun(ctx context.Context, taskID string) (application.MutationResult, error) {
 	// 让 claim 成功，使流程进入脚本执行。
 	if ms, ok := s.TaskStore.(*mockStore); ok {
 		return ms.ClaimInitRun(ctx, taskID)
 	}
-	return true, nil
+	return application.MutationResult{Matched: true, Changed: true}, nil
 }
 
 // TestInheritLog_WrittenAndTruncated：inherit.log 写入 + 1MB 截断。

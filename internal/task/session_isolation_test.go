@@ -163,7 +163,7 @@ func TestAlign_CompleteDeletesOwnedAbsentAndClearsOverflowNotice(t *testing.T) {
 	}
 	// 预置 session_overflow notice。
 	overflowNotice := encodeNotices([]noticeEntry{{Code: noticeCodeSessionOverflow, Message: "overflow"}})
-	if err := db.UpdateTaskNotice(ctx, "t1", overflowNotice); err != nil {
+	if _, err := db.UpdateTaskNotice(ctx, "t1", nullStringToPtr(overflowNotice)); err != nil {
 		t.Fatal(err)
 	}
 	// complete 对齐：listed = [sess-a]（sess-stale 缺席 → 应删；notice 清除 overflow）。
@@ -222,7 +222,7 @@ func TestAlign_OverflowKeepsAbsentAndNoticePreserved(t *testing.T) {
 	}
 	// 预置 overflow notice（模拟 application 层事务外 CAS 已写入）。
 	overflowNotice := encodeNotices([]noticeEntry{{Code: noticeCodeSessionOverflow, Message: "overflow"}})
-	if err := db.UpdateTaskNotice(ctx, "t1", overflowNotice); err != nil {
+	if _, err := db.UpdateTaskNotice(ctx, "t1", nullStringToPtr(overflowNotice)); err != nil {
 		t.Fatal(err)
 	}
 	// overflow 对齐：listed=[sess-a]（sess-stale 缺席但 complete=false 不删；noticeFn 为 nil 不动 notice）。

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/config"
 	"ocdeck/internal/opencode"
 	"ocdeck/internal/process"
@@ -24,9 +25,9 @@ type failingUpdateStatusStore struct {
 	updateStatusErr error
 }
 
-func (s *failingUpdateStatusStore) UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) error {
+func (s *failingUpdateStatusStore) UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) (application.TransitionResult, error) {
 	if s.updateStatusErr != nil && status == StatusSuspended {
-		return s.updateStatusErr
+		return application.TransitionResult{}, s.updateStatusErr
 	}
 	return s.mockStore.UpdateTaskStatus(ctx, id, status, lastError)
 }

@@ -86,7 +86,7 @@ func (m *Manager) ReopenAttach(ctx context.Context, taskID string) (TerminalID, 
 		//（TUI 重开失败可重试），MUST NOT attach 不属本任务的 session。
 		// UpdateTaskStatus 写 last_error 同时保持 status=active（不收敛状态）。
 		le := sql.NullString{String: fmt.Sprintf("reopen attach: %v", aerr), Valid: true}
-		if uerr := m.store.UpdateTaskStatus(ctx, taskID, StatusActive, le); uerr != nil {
+		if _, uerr := m.store.UpdateTaskStatus(ctx, taskID, StatusActive, le); uerr != nil {
 			log.Printf("reopen attach: record last_error for task %s: %v", taskID, uerr)
 		}
 		return "", newOpErr(codeProcessError, fmt.Errorf("reopen attach: %w", aerr))

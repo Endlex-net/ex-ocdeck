@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 
+	"ocdeck/internal/application"
+	ocdecktask "ocdeck/internal/domain/task"
 	"ocdeck/internal/git"
 	"ocdeck/internal/process"
 	"ocdeck/internal/pty"
@@ -81,37 +83,41 @@ func (a *StoreAdapter) ListActiveTaskOverview(ctx context.Context) ([]ActiveTask
 	return out, nil
 }
 
-func (a *StoreAdapter) UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) error {
-	return a.db.UpdateTaskStatus(ctx, id, status, lastError)
+func (a *StoreAdapter) UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) (application.TransitionResult, error) {
+	return a.db.UpdateTaskStatus(ctx, id, ocdecktask.Status(status), nullStringToPtr(lastError))
 }
-func (a *StoreAdapter) UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (bool, error) {
-	return a.db.UpdateTaskStatusConditional(ctx, id, fromStatus, toStatus, lastError)
+func (a *StoreAdapter) UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (application.TransitionResult, error) {
+	return a.db.UpdateTaskStatusConditional(ctx, id, ocdecktask.Status(fromStatus), ocdecktask.Status(toStatus), nullStringToPtr(lastError))
 }
-func (a *StoreAdapter) UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) error {
-	return a.db.UpdateTaskEnvSnapshot(ctx, id, envSnapshot)
+func (a *StoreAdapter) UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) (application.MutationResult, error) {
+	return a.db.UpdateTaskEnvSnapshot(ctx, id, nullStringToPtr(envSnapshot))
 }
-func (a *StoreAdapter) UpdateTaskLastPort(ctx context.Context, id string, port int) error {
+func (a *StoreAdapter) UpdateTaskLastPort(ctx context.Context, id string, port int) (application.MutationResult, error) {
 	return a.db.UpdateTaskLastPort(ctx, id, port)
 }
-func (a *StoreAdapter) UpdateTaskNotice(ctx context.Context, id string, notice sql.NullString) error {
-	return a.db.UpdateTaskNotice(ctx, id, notice)
+func (a *StoreAdapter) UpdateTaskNotice(ctx context.Context, id string, notice sql.NullString) (application.MutationResult, error) {
+	return a.db.UpdateTaskNotice(ctx, id, nullStringToPtr(notice))
 }
-func (a *StoreAdapter) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (bool, error) {
-	return a.db.UpdateTaskNoticeCAS(ctx, id, expected, newNotice)
+func (a *StoreAdapter) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error) {
+	return a.db.UpdateTaskNoticeCAS(ctx, id, nullStringToPtr(expected), nullStringToPtr(newNotice))
 }
-func (a *StoreAdapter) SetTaskDeleteMode(ctx context.Context, id, mode string) error {
-	return a.db.SetTaskDeleteMode(ctx, id, mode)
+func (a *StoreAdapter) SetTaskDeleteMode(ctx context.Context, id, mode string) (application.MutationResult, error) {
+	return a.db.SetTaskDeleteMode(ctx, id, ocdecktask.DeleteMode(mode))
 }
-func (a *StoreAdapter) BeginDeleteIntent(ctx context.Context, id, mode string, fromStatuses []string) (bool, error) {
-	return a.db.BeginDeleteIntent(ctx, id, mode, fromStatuses)
+func (a *StoreAdapter) BeginDeleteIntent(ctx context.Context, id, mode string, fromStatuses []string) (application.TransitionResult, error) {
+	fs := make([]ocdecktask.Status, len(fromStatuses))
+	for i, s := range fromStatuses {
+		fs[i] = ocdecktask.Status(s)
+	}
+	return a.db.BeginDeleteIntent(ctx, id, ocdecktask.DeleteMode(mode), fs)
 }
-func (a *StoreAdapter) ArchiveTask(ctx context.Context, id string) error {
+func (a *StoreAdapter) ArchiveTask(ctx context.Context, id string) (application.TransitionResult, error) {
 	return a.db.ArchiveTask(ctx, id)
 }
-func (a *StoreAdapter) RestoreTask(ctx context.Context, id string) error {
+func (a *StoreAdapter) RestoreTask(ctx context.Context, id string) (application.TransitionResult, error) {
 	return a.db.RestoreTask(ctx, id)
 }
-func (a *StoreAdapter) DeleteTask(ctx context.Context, id string) error {
+func (a *StoreAdapter) DeleteTask(ctx context.Context, id string) (application.DeleteResult, error) {
 	return a.db.DeleteTask(ctx, id)
 }
 
@@ -134,20 +140,20 @@ func (a *StoreAdapter) UpsertLifecycleConfig(ctx context.Context, projectID, inh
 
 // --- init_status CAS（design.md §2.1/§3） ---
 
-func (a *StoreAdapter) CommitCreated(ctx context.Context, taskID, expectedStatus, initStatus string) (bool, error) {
-	return a.db.CommitCreated(ctx, taskID, expectedStatus, initStatus)
+func (a *StoreAdapter) CommitCreated(ctx context.Context, taskID, expectedStatus, initStatus string) (application.TransitionResult, error) {
+	return a.db.CommitCreated(ctx, taskID, ocdecktask.Status(expectedStatus), ocdecktask.InitStatus(initStatus))
 }
 
-func (a *StoreAdapter) ClaimInitRun(ctx context.Context, taskID string) (bool, error) {
+func (a *StoreAdapter) ClaimInitRun(ctx context.Context, taskID string) (application.MutationResult, error) {
 	return a.db.ClaimInitRun(ctx, taskID)
 }
 
-func (a *StoreAdapter) ClaimInitRerun(ctx context.Context, taskID string) (bool, error) {
+func (a *StoreAdapter) ClaimInitRerun(ctx context.Context, taskID string) (application.MutationResult, error) {
 	return a.db.ClaimInitRerun(ctx, taskID)
 }
 
-func (a *StoreAdapter) FinishInitRun(ctx context.Context, taskID, status string, initError sql.NullString) (bool, error) {
-	return a.db.FinishInitRun(ctx, taskID, status, initError)
+func (a *StoreAdapter) FinishInitRun(ctx context.Context, taskID, status string, initError sql.NullString) (application.MutationResult, error) {
+	return a.db.FinishInitRun(ctx, taskID, ocdecktask.InitStatus(status), nullStringToPtr(initError))
 }
 
 func (a *StoreAdapter) ConvergeInterruptedInitRuns(ctx context.Context) (int64, error) {
@@ -296,6 +302,16 @@ func (a *StoreAdapter) ListCleanupDebts(ctx context.Context) ([]CleanupDebtRow, 
 		out = append(out, CleanupDebtRow{SessionName: r.SessionName, Tickets: r.Tickets, CreatedAt: r.CreatedAt})
 	}
 	return out, nil
+}
+
+// nullStringToPtr 把 sql.NullString 映射为 *string：Invalid → nil。
+// 供 StoreAdapter 把 legacy TaskStore 的 sql.NullString 参数转换为 store 层 *string。
+func nullStringToPtr(ns sql.NullString) *string {
+	if !ns.Valid {
+		return nil
+	}
+	s := ns.String
+	return &s
 }
 
 func toTaskRow(t store.TaskRow) TaskRow {

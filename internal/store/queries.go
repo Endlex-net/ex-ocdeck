@@ -10,6 +10,9 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	"ocdeck/internal/application"
+	ocdecktask "ocdeck/internal/domain/task"
 )
 
 // DBTX 是 *sql.DB 与 *sql.Tx 共同满足的查询接口，使同一组 Queries 方法
@@ -106,8 +109,20 @@ type SessionRow struct {
 	ParentID string
 }
 
-// nowUnix 返回当前 Unix 时间戳。
-func nowUnix() int64 { return time.Now().Unix() }
+// nowUnix 返回当前 Unix 时间戳（秒精度）。包级 var，测试可临时覆盖以验证跨秒行为
+// （task P1.2 validation：跨秒用可注入时间或 mock nowUnix）。
+var nowUnix = func() int64 { return time.Now().Unix() }
+
+// beforeConditionalUpdateHook 供 F-01 真交错测试在 updateTaskStatus 的内部 SELECT 完成后、
+// UPDATE 执行前暂停调用方 goroutine（生产为 nil 不调用，零开销）。测试注入 channel 同步：
+// A 调用方法 → SELECT 读旧值 → 触发 hook 阻塞 → 测试经独立连接完成 B 写入 → 放行 hook →
+// A 的 UPDATE WHERE 在 B 写后的当前行上重新求值，断言不覆盖 B。
+var beforeConditionalUpdateHook func(taskID string)
+
+// afterConditionalUpdateReadHook 供 F-01 真交错测试在 updateTaskStatus 的内部 SELECT 完成
+// 后立即通知测试「A 已读到旧值，可放行 B 写入」。配合 beforeConditionalUpdateHook 使用：
+// 测试等此信号 → B 写入 → 关闭 beforeConditionalUpdateHook 的阻塞 → A 继续 UPDATE。
+var afterConditionalUpdateReadHook func(taskID string)
 
 // CreateProject 插入项目行。kind ∈ repo | dir（migration 0008）。
 func (q *Queries) CreateProject(ctx context.Context, id, name, path, defaultBranch, kind string) error {
@@ -419,62 +434,449 @@ func (q *Queries) ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOverv
 	return out, rows.Err()
 }
 
-// UpdateTaskStatus 更新任务状态与 last_error，刷新 updated_at。
-func (q *Queries) UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) error {
-	_, err := q.db.ExecContext(ctx,
-		`UPDATE tasks SET status = ?, last_error = ?, updated_at = ? WHERE id = ?`,
-		status, lastError, nowUnix(), id)
-	return err
+// UpdateTaskStatus 更新任务状态与 last_error，返回结构化结果（design.md D0/§8）。
+//
+// 同值口径覆盖 status+last_error（spec.md Scenario：status-same-last_error-different
+// 仍提交）。同值排除下推到 UPDATE WHERE（NULL-safe IS/IS NOT），RowsAffected 区分
+// 同值（0 行，行存在）与不匹配（0 行，行不存在）；updated_at 仅真实变更且跨秒推进。
+func (q *Queries) UpdateTaskStatus(ctx context.Context, id string, status ocdecktask.Status, lastError *string) (application.TransitionResult, error) {
+	return q.updateTaskStatus(ctx, id, status, lastError, false, "")
 }
 
-// UpdateTaskEnvSnapshot 更新 env_snapshot（design.md §2，激活时持久化）。
-func (q *Queries) UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) error {
-	_, err := q.db.ExecContext(ctx,
-		`UPDATE tasks SET env_snapshot = ?, updated_at = ? WHERE id = ?`,
-		envSnapshot, nowUnix(), id)
-	return err
+// UpdateTaskStatusConditional 条件更新任务状态：仅当当前 status==fromStatus 时才更新。
+//
+// 返回 TransitionResult：Matched=当前 status==fromStatus；同值口径 status+last_error
+// （status-same-last_error-different 仍提交）。StatusChanged 仅 status 真实迁移时为 true。
+// 设计依据 design.md §5/§19：状态转移前置检查 → 意图落库；并发操作通过状态条件避免覆盖。
+func (q *Queries) UpdateTaskStatusConditional(ctx context.Context, id string, fromStatus, toStatus ocdecktask.Status, lastError *string) (application.TransitionResult, error) {
+	return q.updateTaskStatus(ctx, id, toStatus, lastError, true, string(fromStatus))
+}
+
+// updateTaskStatus 是 UpdateTaskStatus 与 UpdateTaskStatusConditional 的共享实现。
+//
+// conditional=true 时施加 fromStatus CAS：UPDATE 的 WHERE 携带 `status IS fromStatus`
+// （expected 谓词，NULL-safe，F-01 下推）+ status/last_error 的同值排除（任一列不同才匹配）。
+// conditional=false 时无 expected 谓词，仅 id 命中 + 同值排除。
+//
+// RowsAffected=0 分类（同一事务内补 SELECT）：行存在且（conditional 时 status==fromStatus）
+// 且全部业务列==新值 → Matched+!Changed（同值幂等）；行存在但 conditional status!=fromStatus
+// 或行不存在 → !Matched（CAS 失败）。StatusChanged/From/To 由事务内读到的实际 old/new 计算（F-05）。
+// updated_at 仅跨秒推进（同秒实变 SET updated_at=updated_at）。
+//
+// beforeConditionalUpdateHook/afterConditionalUpdateReadHook 供 F-01 真交错测试在内部 SELECT
+// 与 UPDATE 之间暂停调用方（生产 nil 不调用）。
+func (q *Queries) updateTaskStatus(ctx context.Context, id string, status ocdecktask.Status, lastError *string,
+	conditional bool, fromStatus string,
+) (application.TransitionResult, error) {
+	newLE := nullableString(lastError)
+	// F-01 真交错测试钩子路径：当 hooks 注入时，SELECT 与 UPDATE 之间会暂停让 B 写入。
+	// SQLite WAL 下事务内 SELECT 持快照锁，B 写入后 A 的 UPDATE 会 SQLITE_LOCKED（快照过期）。
+	// 测试路径改用非事务 SELECT+独立原子 UPDATE，让 B 写入不阻塞、A 的 UPDATE WHERE 在 B 写后
+	// 当前行上重新求值。生产无 hooks 时仍走 runTx 事务路径（原子性保证）。
+	if beforeConditionalUpdateHook != nil || afterConditionalUpdateReadHook != nil {
+		return q.updateTaskStatusInterleaved(ctx, id, status, newLE, conditional, fromStatus)
+	}
+	return runTx(ctx, q, func(qx *Queries) (application.TransitionResult, error) {
+		// 读旧值（status/last_error/updated_at）用于 CAS 判定与 From/To 计算。
+		row := qx.db.QueryRowContext(ctx,
+			`SELECT status, last_error, updated_at FROM tasks WHERE id = ?`, id)
+		var curStatus string
+		var curLastError sql.NullString
+		var curUpdatedAt int64
+		if err := row.Scan(&curStatus, &curLastError, &curUpdatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				return application.TransitionResult{}, nil
+			}
+			return application.TransitionResult{}, err
+		}
+		// 构造 UPDATE：WHERE 携带 id + （conditional 时 status IS fromStatus expected）+ 同值排除（任一列不同才匹配，F-01 原子）。
+		diffPred, diffArgs := anyColDiffersPredicate(
+			[]string{"status", "last_error"},
+			[]sql.NullString{{String: string(status), Valid: true}, newLE})
+		now := nowUnix()
+		updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+		var expFrag string
+		var expArgs []any
+		if conditional {
+			expFrag = " AND status IS ?"
+			expArgs = []any{fromStatus}
+		}
+		qry := "UPDATE tasks SET status = ?, last_error = ?, " + updClause +
+			" WHERE id = ?" + expFrag + " AND (" + diffPred + ")"
+		args := []any{string(status), newLE}
+		args = append(args, updArgs...)
+		args = append(args, id)
+		args = append(args, expArgs...)
+		args = append(args, diffArgs...)
+		res, err := qx.db.ExecContext(ctx, qry, args...)
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		if n == 0 {
+			// RowsAffected=0 分类：在同一事务内补 SELECT 区分 expected 失配/行不存在/同值幂等。
+			return qx.classifyZeroRowsStatus(ctx, id, conditional, fromStatus, status, newLE)
+		}
+		statusChanged := curStatus != string(status)
+		out := application.TransitionResult{
+			MutationResult: application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt},
+			StatusChanged:  statusChanged,
+		}
+		if statusChanged {
+			out.From = ocdecktask.Status(curStatus)
+			out.To = status
+		}
+		return out, nil
+	})
+}
+
+// updateTaskStatusInterleaved 是 F-01 真交错测试专用路径（hooks 注入时）：
+// SELECT 读旧值后触发 hooks 暂停，独立连接 B 可写入（WAL 下读不阻塞写），放行后 A 执行
+// 独立原子 UPDATE（非事务，避免 WAL 快照过期 SQLITE_LOCKED）。UPDATE WHERE 携带 expected
+// + 同值排除，在 B 写后行上重新求值；RowsAffected=0 用 classifyZeroRowsStatus 分类。
+func (q *Queries) updateTaskStatusInterleaved(ctx context.Context, id string, status ocdecktask.Status, newLE sql.NullString,
+	conditional bool, fromStatus string,
+) (application.TransitionResult, error) {
+	// 读旧值（非事务，不持快照锁）。
+	row := q.db.QueryRowContext(ctx,
+		`SELECT status, last_error, updated_at FROM tasks WHERE id = ?`, id)
+	var curStatus string
+	var curLastError sql.NullString
+	var curUpdatedAt int64
+	if err := row.Scan(&curStatus, &curLastError, &curUpdatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return application.TransitionResult{}, nil
+		}
+		return application.TransitionResult{}, err
+	}
+	// 触发 hooks：afterRead 通知测试「A 已读旧值」，beforeHook 阻塞等 B 写完。
+	if afterConditionalUpdateReadHook != nil {
+		afterConditionalUpdateReadHook(id)
+	}
+	if beforeConditionalUpdateHook != nil {
+		beforeConditionalUpdateHook(id)
+	}
+	// 独立原子 UPDATE（非事务）：WHERE 携带 expected + 同值排除。
+	diffPred, diffArgs := anyColDiffersPredicate(
+		[]string{"status", "last_error"},
+		[]sql.NullString{{String: string(status), Valid: true}, newLE})
+	now := nowUnix()
+	updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+	var expFrag string
+	var expArgs []any
+	if conditional {
+		expFrag = " AND status IS ?"
+		expArgs = []any{fromStatus}
+	}
+	qry := "UPDATE tasks SET status = ?, last_error = ?, " + updClause +
+		" WHERE id = ?" + expFrag + " AND (" + diffPred + ")"
+	args := []any{string(status), newLE}
+	args = append(args, updArgs...)
+	args = append(args, id)
+	args = append(args, expArgs...)
+	args = append(args, diffArgs...)
+	res, err := q.db.ExecContext(ctx, qry, args...)
+	if err != nil {
+		return application.TransitionResult{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return application.TransitionResult{}, err
+	}
+	if n == 0 {
+		// RowsAffected=0 分类（非事务补 SELECT）。
+		return q.classifyZeroRowsStatus(ctx, id, conditional, fromStatus, status, newLE)
+	}
+	statusChanged := curStatus != string(status)
+	out := application.TransitionResult{
+		MutationResult: application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt},
+		StatusChanged:  statusChanged,
+	}
+	if statusChanged {
+		out.From = ocdecktask.Status(curStatus)
+		out.To = status
+	}
+	return out, nil
+}
+
+// classifyZeroRowsStatus 在 UPDATE RowsAffected=0 后于同一事务内补 SELECT，区分：
+//   - 行不存在 → !Matched（TransitionResult{}）
+//   - conditional 且 status!=fromStatus → !Matched（CAS expected 失配）
+//   - status==（conditional?fromStatus:当前）且 status+last_error 全等于新值 → Matched+!Changed（同值幂等）
+//   - 其他（行存在、expected 匹配、但并发下业务列已被他写为非同值且 WHERE 未命中）→ !Matched
+//
+// 读到的 status/last_error 为 UPDATE 不命中后的当前行实际值（B 写后），据此判定。
+func (q *Queries) classifyZeroRowsStatus(ctx context.Context, id string, conditional bool, fromStatus string,
+	newStatus ocdecktask.Status, newLE sql.NullString,
+) (application.TransitionResult, error) {
+	row := q.db.QueryRowContext(ctx,
+		`SELECT status, last_error FROM tasks WHERE id = ?`, id)
+	var curStatus string
+	var curLastError sql.NullString
+	if err := row.Scan(&curStatus, &curLastError); err != nil {
+		if err == sql.ErrNoRows {
+			// 行不存在 → !Matched。
+			return application.TransitionResult{}, nil
+		}
+		return application.TransitionResult{}, err
+	}
+	if conditional && curStatus != fromStatus {
+		// expected 失配（status 已被并发改为非 fromStatus）→ !Matched。
+		return application.TransitionResult{}, nil
+	}
+	// 行存在且 expected 匹配：判定是否同值幂等（status+last_error 全等于新值）。
+	statusSame := curStatus == string(newStatus)
+	leSame := nullStringEqual(curLastError, newLE)
+	if statusSame && leSame {
+		return application.TransitionResult{MutationResult: application.MutationResult{Matched: true}}, nil
+	}
+	// 行存在、expected 匹配，但业务列非全同值且 UPDATE 未命中（罕见：并发写入使 WHERE 谓词在
+	// SELECT 与 UPDATE 间失配）→ 按 !Matched 上报，调用方重读决策。
+	return application.TransitionResult{}, nil
+}
+
+// UpdateTaskEnvSnapshot 更新 env_snapshot（design.md §2，激活时持久化），返回结构化结果。
+func (q *Queries) UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot *string) (application.MutationResult, error) {
+	return q.updateSingleNullableCol(ctx, id, "env_snapshot", envSnapshot)
 }
 
 // UpdateTaskLastPort 更新 last_port（仅记录上次成功端口，非事实来源，design.md §3）。
-func (q *Queries) UpdateTaskLastPort(ctx context.Context, id string, port int) error {
-	_, err := q.db.ExecContext(ctx,
-		`UPDATE tasks SET last_port = ?, updated_at = ? WHERE id = ?`, port, nowUnix(), id)
-	return err
+//
+// 同值排除下推到 UPDATE WHERE（last_port IS NOT ?，F-01 原子）；事务内读 updated_at 旧值。
+func (q *Queries) UpdateTaskLastPort(ctx context.Context, id string, port int) (application.MutationResult, error) {
+	return runTx(ctx, q, func(qx *Queries) (application.MutationResult, error) {
+		row := qx.db.QueryRowContext(ctx, `SELECT last_port, updated_at FROM tasks WHERE id = ?`, id)
+		var curPort sql.NullInt64
+		var curUpdatedAt int64
+		if err := row.Scan(&curPort, &curUpdatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				return application.MutationResult{}, nil
+			}
+			return application.MutationResult{}, err
+		}
+		if nullInt64Equal(curPort, sql.NullInt64{Int64: int64(port), Valid: true}) {
+			return application.MutationResult{Matched: true}, nil
+		}
+		now := nowUnix()
+		updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+		// last_port 非 NULL 列但用 IS NOT 统一（新值非 NULL 时 `last_port IS NOT ?`）。
+		qry := "UPDATE tasks SET last_port = ?, " + updClause + " WHERE id = ? AND last_port IS NOT ?"
+		args := []any{port}
+		args = append(args, updArgs...)
+		args = append(args, id, port)
+		res, err := qx.db.ExecContext(ctx, qry, args...)
+		if err != nil {
+			return application.MutationResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return application.MutationResult{}, err
+		}
+		if n == 0 {
+			return application.MutationResult{Matched: true}, nil
+		}
+		return application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt}, nil
+	})
 }
 
-// UpdateTaskNotice 更新 notice JSON 数组（design.md §8）。
-func (q *Queries) UpdateTaskNotice(ctx context.Context, id string, notice sql.NullString) error {
-	_, err := q.db.ExecContext(ctx,
-		`UPDATE tasks SET notice = ?, updated_at = ? WHERE id = ?`, notice, nowUnix(), id)
-	return err
+// UpdateTaskNotice 更新 notice JSON 数组（design.md §8），返回结构化结果。
+func (q *Queries) UpdateTaskNotice(ctx context.Context, id string, notice *string) (application.MutationResult, error) {
+	return q.updateSingleNullableCol(ctx, id, "notice", notice)
 }
 
-// SetTaskDeleteMode 持久化 delete_mode（design.md §8/§19）。
-func (q *Queries) SetTaskDeleteMode(ctx context.Context, id, mode string) error {
-	_, err := q.db.ExecContext(ctx,
-		`UPDATE tasks SET delete_mode = ?, updated_at = ? WHERE id = ?`, mode, nowUnix(), id)
-	return err
+// SetTaskDeleteMode 持久化 delete_mode（design.md §8/§19），返回结构化结果。
+//
+// 同值排除下推到 UPDATE WHERE（delete_mode IS NOT ?，F-01 原子）；事务内读 updated_at 旧值。
+func (q *Queries) SetTaskDeleteMode(ctx context.Context, id string, mode ocdecktask.DeleteMode) (application.MutationResult, error) {
+	return runTx(ctx, q, func(qx *Queries) (application.MutationResult, error) {
+		row := qx.db.QueryRowContext(ctx, `SELECT delete_mode, updated_at FROM tasks WHERE id = ?`, id)
+		var curMode sql.NullString
+		var curUpdatedAt int64
+		if err := row.Scan(&curMode, &curUpdatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				return application.MutationResult{}, nil
+			}
+			return application.MutationResult{}, err
+		}
+		newMode := sql.NullString{String: string(mode), Valid: true}
+		if nullStringEqual(curMode, newMode) {
+			return application.MutationResult{Matched: true}, nil
+		}
+		modePred, modeArg := colNotEqualPredicate("delete_mode", newMode)
+		now := nowUnix()
+		updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+		qry := "UPDATE tasks SET delete_mode = ?, " + updClause + " WHERE id = ? AND " + modePred
+		args := []any{newMode}
+		args = append(args, updArgs...)
+		args = append(args, id)
+		if modeArg != nil {
+			args = append(args, modeArg)
+		}
+		res, err := qx.db.ExecContext(ctx, qry, args...)
+		if err != nil {
+			return application.MutationResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return application.MutationResult{}, err
+		}
+		if n == 0 {
+			return application.MutationResult{Matched: true}, nil
+		}
+		return application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt}, nil
+	})
 }
 
-// ArchiveTask 置 archived 状态并记录 archived_at。
-func (q *Queries) ArchiveTask(ctx context.Context, id string) error {
-	_, err := q.db.ExecContext(ctx,
-		`UPDATE tasks SET status = 'archived', archived_at = ?, updated_at = ? WHERE id = ?`,
-		nowUnix(), nowUnix(), id)
-	return err
+// ArchiveTask 置 archived 状态并记录 archived_at，返回结构化结果。
+//
+// 同值排除下推到 UPDATE WHERE（status IS NOT 'archived'，F-01 原子）；StatusChanged/From/To
+// 由事务内读到的实际 old/new 计算（F-05），不得硬编码。updated_at 仅跨秒推进。
+func (q *Queries) ArchiveTask(ctx context.Context, id string) (application.TransitionResult, error) {
+	return runTx(ctx, q, func(qx *Queries) (application.TransitionResult, error) {
+		row := qx.db.QueryRowContext(ctx, `SELECT status, updated_at FROM tasks WHERE id = ?`, id)
+		var curStatus string
+		var curUpdatedAt int64
+		if err := row.Scan(&curStatus, &curUpdatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				return application.TransitionResult{}, nil
+			}
+			return application.TransitionResult{}, err
+		}
+		if curStatus == string(ocdecktask.StatusArchived) {
+			// 已 archived：同值，不写，updated_at 不动。
+			return application.TransitionResult{MutationResult: application.MutationResult{Matched: true}}, nil
+		}
+		now := nowUnix()
+		updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+		qry := "UPDATE tasks SET status = 'archived', archived_at = ?, " + updClause +
+			" WHERE id = ? AND status IS NOT 'archived'"
+		args := []any{now}
+		args = append(args, updArgs...)
+		args = append(args, id)
+		res, err := qx.db.ExecContext(ctx, qry, args...)
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		if n == 0 {
+			return application.TransitionResult{MutationResult: application.MutationResult{Matched: true}}, nil
+		}
+		return application.TransitionResult{
+			MutationResult: application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt},
+			StatusChanged:  true,
+			From:           ocdecktask.Status(curStatus),
+			To:             ocdecktask.StatusArchived,
+		}, nil
+	})
 }
 
-// RestoreTask 从 archived 恢复到 suspended。
-func (q *Queries) RestoreTask(ctx context.Context, id string) error {
-	_, err := q.db.ExecContext(ctx,
-		`UPDATE tasks SET status = 'suspended', updated_at = ? WHERE id = ?`, nowUnix(), id)
-	return err
+// RestoreTask 从 archived 恢复到 suspended，返回结构化结果。
+//
+// 同值排除下推到 UPDATE WHERE（status IS NOT 'suspended'，F-01 原子）；StatusChanged/From/To
+// 由事务内读到的实际 old/new 计算（F-05）。updated_at 仅跨秒推进。
+func (q *Queries) RestoreTask(ctx context.Context, id string) (application.TransitionResult, error) {
+	return runTx(ctx, q, func(qx *Queries) (application.TransitionResult, error) {
+		row := qx.db.QueryRowContext(ctx, `SELECT status, updated_at FROM tasks WHERE id = ?`, id)
+		var curStatus string
+		var curUpdatedAt int64
+		if err := row.Scan(&curStatus, &curUpdatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				return application.TransitionResult{}, nil
+			}
+			return application.TransitionResult{}, err
+		}
+		if curStatus == string(ocdecktask.StatusSuspended) {
+			return application.TransitionResult{MutationResult: application.MutationResult{Matched: true}}, nil
+		}
+		now := nowUnix()
+		updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+		qry := "UPDATE tasks SET status = 'suspended', " + updClause +
+			" WHERE id = ? AND status IS NOT 'suspended'"
+		args := []any{}
+		args = append(args, updArgs...)
+		args = append(args, id)
+		res, err := qx.db.ExecContext(ctx, qry, args...)
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		if n == 0 {
+			return application.TransitionResult{MutationResult: application.MutationResult{Matched: true}}, nil
+		}
+		return application.TransitionResult{
+			MutationResult: application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt},
+			StatusChanged:  true,
+			From:           ocdecktask.Status(curStatus),
+			To:             ocdecktask.StatusSuspended,
+		}, nil
+	})
 }
 
-// DeleteTask 按 ID 删除任务（CASCADE 删除其 sessions/env_vars）。
-func (q *Queries) DeleteTask(ctx context.Context, id string) error {
-	_, err := q.db.ExecContext(ctx, `DELETE FROM tasks WHERE id = ?`, id)
-	return err
+// DeleteTask 按 ID 删除任务（CASCADE 删除其 sessions/env_vars），返回结构化结果。
+//
+// 同事务先捕获剩余 session ID 与任务前态再删除（design D2:337）。
+func (q *Queries) DeleteTask(ctx context.Context, id string) (application.DeleteResult, error) {
+	if _, isTx := q.db.(*sql.Tx); isTx {
+		return q.deleteTaskInTx(ctx, id)
+	}
+	var r application.DeleteResult
+	txErr := withTxQueries(ctx, q.db, func(qtx *Queries) error {
+		var cerr error
+		r, cerr = qtx.deleteTaskInTx(ctx, id)
+		return cerr
+	})
+	return r, txErr
+}
+
+func (q *Queries) deleteTaskInTx(ctx context.Context, id string) (application.DeleteResult, error) {
+	row := q.db.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id = ?`, id)
+	var fromStatus string
+	if err := row.Scan(&fromStatus); err != nil {
+		if err == sql.ErrNoRows {
+			return application.DeleteResult{}, nil
+		}
+		return application.DeleteResult{}, err
+	}
+	srows, err := q.db.QueryContext(ctx, `SELECT session_id FROM task_sessions WHERE task_id = ?`, id)
+	if err != nil {
+		return application.DeleteResult{}, err
+	}
+	var cascaded []string
+	for srows.Next() {
+		var sid string
+		if err := srows.Scan(&sid); err != nil {
+			srows.Close()
+			return application.DeleteResult{}, err
+		}
+		cascaded = append(cascaded, sid)
+	}
+	if err := srows.Err(); err != nil {
+		srows.Close()
+		return application.DeleteResult{}, err
+	}
+	srows.Close()
+	res, err := q.db.ExecContext(ctx, `DELETE FROM tasks WHERE id = ?`, id)
+	if err != nil {
+		return application.DeleteResult{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return application.DeleteResult{}, err
+	}
+	return application.DeleteResult{
+		Affected:           int(n),
+		From:               ocdecktask.Status(fromStatus),
+		CascadedSessionIDs: cascaded,
+	}, nil
 }
 
 // SetTaskEnvVar 插入或更新任务级 env 变量。
@@ -579,81 +981,149 @@ func (q *Queries) DeleteTaskSession(ctx context.Context, taskID, sessionID strin
 	return err
 }
 
-// UpdateTaskNoticeCAS 乐观更新 notice（CAS）：仅当当前 notice 等于 expected 时
-// 才写入 newNotice，返回是否替换成功（RowsAffected=1）。
-// expected 为 sql.NullString：NULL 表示"当前为空"的期望，sql.NullString{Valid:false}。
+// UpdateTaskNoticeCAS 乐观更新 notice（CAS）：仅当当前 notice 等于 expected 时才考虑写入。
+//
+// 返回 MutationResult：Matched=当前 notice==expected；Changed=newNotice!=expected
+// （同值幂等成功 Matched+!Changed，不得误判为失败重试）；UpdatedAtAdvanced=真实变更且跨秒。
+// expected/newNotice 为 *string：nil 表示 NULL 期望/新值。
 // 设计依据 design.md §5/§8：notice 更新 MUST 为 CAS/事务，避免 Delete/Suspend/SSE 与
 // 后台重试的 notice 写互相覆盖。
-func (q *Queries) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (replaced bool, err error) {
-	// NULL 与常量在 SQL 中不能用 = 比较（NULL = NULL → NULL），需用 IS 分支。
-	var (
-		res sql.Result
-		qry string
-	)
-	if expected.Valid {
-		qry = `UPDATE tasks SET notice = ?, updated_at = ?
-		       WHERE id = ? AND notice = ?`
-		res, err = q.db.ExecContext(ctx, qry, newNotice, nowUnix(), id, expected)
-	} else {
-		qry = `UPDATE tasks SET notice = ?, updated_at = ?
-		       WHERE id = ? AND notice IS NULL`
-		res, err = q.db.ExecContext(ctx, qry, newNotice, nowUnix(), id)
-	}
-	if err != nil {
-		return false, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return n == 1, nil
-}
-
-// UpdateTaskStatusConditional 条件更新任务状态：仅当当前 status == fromStatus 时
-// 才更新为 toStatus（携带 lastError），返回是否更新成功（RowsAffected=1）。
-// 设计依据 design.md §5/§19：状态转移前置检查 → 意图落库；并发操作通过状态条件避免覆盖。
-func (q *Queries) UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (updated bool, err error) {
-	res, err := q.db.ExecContext(ctx,
-		`UPDATE tasks SET status = ?, last_error = ?, updated_at = ?
-		 WHERE id = ? AND status = ?`,
-		toStatus, lastError, nowUnix(), id, fromStatus)
-	if err != nil {
-		return false, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return n == 1, nil
+//
+// F-01 原子性：expected 与同值排除都下推到 UPDATE 的 WHERE（notice IS <expected> AND
+// notice IS NOT <new>），RowsAffected 区分异值（1 行）与不匹配/同值（0 行）；事务内读
+// updated_at 旧值以判定 UpdatedAtAdvanced。
+func (q *Queries) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice *string) (application.MutationResult, error) {
+	expNS := nullableString(expected)
+	newNS := nullableString(newNotice)
+	return runTx(ctx, q, func(qx *Queries) (application.MutationResult, error) {
+		row := qx.db.QueryRowContext(ctx, `SELECT notice, updated_at FROM tasks WHERE id = ?`, id)
+		var curNotice sql.NullString
+		var curUpdatedAt int64
+		if err := row.Scan(&curNotice, &curUpdatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				return application.MutationResult{}, nil
+			}
+			return application.MutationResult{}, err
+		}
+		if !nullStringEqual(curNotice, expNS) {
+			// expected 不匹配：CAS 失败，调用方重试。
+			return application.MutationResult{}, nil
+		}
+		if nullStringEqual(curNotice, newNS) {
+			// 同值幂等成功：Matched+!Changed，不写。
+			return application.MutationResult{Matched: true}, nil
+		}
+		// UPDATE WHERE 携带 expected（notice IS <expected>）与同值排除（notice IS NOT <new>）。
+		now := nowUnix()
+		updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+		expPred, expArg := expectedPredicate("notice", expNS)
+		newPred, newArg := colNotEqualPredicate("notice", newNS)
+		qry := "UPDATE tasks SET notice = ?, " + updClause +
+			" WHERE id = ? AND " + expPred + " AND " + newPred
+		args := []any{newNS}
+		args = append(args, updArgs...)
+		args = append(args, id)
+		if expArg != nil {
+			args = append(args, expArg)
+		}
+		if newArg != nil {
+			args = append(args, newArg)
+		}
+		res, err := qx.db.ExecContext(ctx, qry, args...)
+		if err != nil {
+			return application.MutationResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return application.MutationResult{}, err
+		}
+		if n == 0 {
+			// 并发下 expected 已失配：CAS 失败，调用方重试（不误判为同值成功）。
+			return application.MutationResult{}, nil
+		}
+		return application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt}, nil
+	})
 }
 
 // BeginDeleteIntent 原子持久化删除意图：单语句把 delete_mode 与 status=deleting 一起更新，
-// 仅当当前 status 处于 fromStatus 之一时生效，返回是否更新成功。
-// 设计依据 design.md §12/§19/§8：持久化 delete_mode + 置 deleting 必须原子落库，
-// 按持久化 delete_mode 幂等重入 deleting。
-func (q *Queries) BeginDeleteIntent(ctx context.Context, id, mode string, fromStatuses []string) (updated bool, err error) {
+// 仅当当前 status 处于 fromStatus 之一时生效。
+//
+// 返回 TransitionResult：Matched=当前 status ∈ fromStatuses；status 迁移到 deleting。
+// StatusChanged/From/To 由事务内读到的实际 old/new 计算（F-05，不得硬编码：若调用方
+// 误传含 deleting 的 fromStatuses，当前已 deleting 则同值 Matched+!Changed）。delete_mode
+// 同值不影响 Changed（status 已变时）。设计依据 design.md §12/§19/§8。F-01：expected（status
+// ∈ fromStatuses）与同值排除（status IS NOT 'deleting'）下推到 UPDATE WHERE。
+func (q *Queries) BeginDeleteIntent(ctx context.Context, id string, mode ocdecktask.DeleteMode, fromStatuses []ocdecktask.Status) (application.TransitionResult, error) {
 	if len(fromStatuses) == 0 {
-		return false, nil
+		return application.TransitionResult{}, nil
 	}
-	// 单语句避免 delete_mode 与 status 之间的部分提交窗口。
-	placeholders := make([]string, len(fromStatuses))
-	args := make([]any, 0, len(fromStatuses)+4)
-	args = append(args, mode, nowUnix(), id)
+	// 预构 WHERE 的 status IN(...) 与参数（expected 条件）。
+	phs := make([]string, len(fromStatuses))
+	expArgs := make([]any, 0, len(fromStatuses))
 	for i, s := range fromStatuses {
-		placeholders[i] = "?"
-		args = append(args, s)
+		phs[i] = "?"
+		expArgs = append(expArgs, string(s))
 	}
-	qry := `UPDATE tasks SET delete_mode = ?, status = 'deleting', updated_at = ?
-	        WHERE id = ? AND status IN (` + joinPlaceholders(placeholders) + `)`
-	res, err := q.db.ExecContext(ctx, qry, args...)
-	if err != nil {
-		return false, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return n == 1, nil
+	statusIn := "status IN (" + joinPlaceholders(phs) + ")"
+	return runTx(ctx, q, func(qx *Queries) (application.TransitionResult, error) {
+		row := qx.db.QueryRowContext(ctx, `SELECT status, delete_mode, updated_at FROM tasks WHERE id = ?`, id)
+		var curStatus string
+		var curMode sql.NullString
+		var curUpdatedAt int64
+		if err := row.Scan(&curStatus, &curMode, &curUpdatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				return application.TransitionResult{}, nil
+			}
+			return application.TransitionResult{}, err
+		}
+		matched := false
+		for _, s := range fromStatuses {
+			if curStatus == string(s) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return application.TransitionResult{}, nil
+		}
+		newMode := sql.NullString{String: string(mode), Valid: true}
+		now := nowUnix()
+		updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+		// 同值排除（任一列不同才匹配，F-01）：status 目标 'deleting' + delete_mode 目标 mode。
+		diffPred, diffArgs := anyColDiffersPredicate(
+			[]string{"status", "delete_mode"},
+			[]sql.NullString{{String: string(ocdecktask.StatusDeleting), Valid: true}, newMode})
+		// WHERE: id + status IN fromStatuses（expected）+ 同值排除。
+		qry := "UPDATE tasks SET delete_mode = ?, status = 'deleting', " + updClause +
+			" WHERE id = ? AND " + statusIn + " AND (" + diffPred + ")"
+		args := []any{newMode}
+		args = append(args, updArgs...)
+		args = append(args, id)
+		args = append(args, expArgs...)
+		args = append(args, diffArgs...)
+		res, err := qx.db.ExecContext(ctx, qry, args...)
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		if n == 0 {
+			// 并发下 status 已迁出 fromStatuses 或已 deleting：CAS 失败。
+			return application.TransitionResult{}, nil
+		}
+		statusChanged := curStatus != string(ocdecktask.StatusDeleting)
+		out := application.TransitionResult{
+			MutationResult: application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt},
+			StatusChanged:  statusChanged,
+		}
+		if statusChanged {
+			out.From = ocdecktask.Status(curStatus)
+			out.To = ocdecktask.StatusDeleting
+		}
+		return out, nil
+	})
 }
 
 func joinPlaceholders(p []string) string {
@@ -667,88 +1137,233 @@ func joinPlaceholders(p []string) string {
 
 // --- 项目生命周期配置 CAS（design.md §2.1，migration 0007） ---
 //
-// 以下方法全部 CAS / 原子：条件不满足时返回 rows=0（updated=false），而非 error。
-// 统一约定（与 UpdateTaskStatus 语义一致）：均刷新 updated_at。
+// 以下方法全部 CAS / 原子：条件不满足时返回 Matched=false（非 error）。
+// 同值口径：init 系列 = init_status+init_error；CommitCreated 含 status 迁移。
+// updated_at 仅真实变更且跨秒推进。
 
-// CommitCreated 原子提交 Create/retryCreate 的最终状态：单条 UPDATE 把 status 从
-// expectedStatus 置为 suspended 并写入 initStatus（design.md §2.1/§3）。
-// 后置条件 MUST 含 last_error=NULL（清空旧 creation_failed 错误）与 updated_at=now。
+// CommitCreated 原子提交 Create/retryCreate 的最终状态：把 status 从 expectedStatus
+// 置为 suspended 并写入 initStatus，清空 last_error（design.md §2.1/§3）。
 // expectedStatus ∈ {creating, creation_failed}；initStatus ∈ {pending, none}。
-// rows=0（updated=false）表示提交失败（状态已被并发改变）。
-func (q *Queries) CommitCreated(ctx context.Context, taskID, expectedStatus, initStatus string) (updated bool, err error) {
-	res, err := q.db.ExecContext(ctx,
-		`UPDATE tasks SET status = 'suspended', last_error = NULL, init_status = ?, updated_at = ?
-		 WHERE id = ? AND status = ?`,
-		initStatus, nowUnix(), taskID, expectedStatus)
-	if err != nil {
-		return false, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return n == 1, nil
+//
+// 返回 TransitionResult：Matched=当前 status==expectedStatus；同值口径 status+last_error+init_status
+// （全部写列）。StatusChanged/From/To 由事务内读到的实际 old/new 计算（F-05，不得硬编码：
+// 若调用方误传 suspended 作 expectedStatus，当前已 suspended 则同值 Matched+!Changed）。
+// F-01：expected（status IS expectedStatus）与同值排除（status IS NOT 'suspended' 等）下推到 UPDATE WHERE。
+func (q *Queries) CommitCreated(ctx context.Context, taskID string, expectedStatus ocdecktask.Status, initStatus ocdecktask.InitStatus) (application.TransitionResult, error) {
+	expStatusNS := sql.NullString{String: string(expectedStatus), Valid: true}
+	newInitNS := sql.NullString{String: string(initStatus), Valid: true}
+	return runTx(ctx, q, func(qx *Queries) (application.TransitionResult, error) {
+		row := qx.db.QueryRowContext(ctx,
+			`SELECT status, init_status, last_error, updated_at FROM tasks WHERE id = ?`, taskID)
+		var curStatus, curInitStatus string
+		var curLastError sql.NullString
+		var curUpdatedAt int64
+		if err := row.Scan(&curStatus, &curInitStatus, &curLastError, &curUpdatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				return application.TransitionResult{}, nil
+			}
+			return application.TransitionResult{}, err
+		}
+		if curStatus != string(expectedStatus) {
+			// expected 不匹配：CAS 失败。
+			return application.TransitionResult{}, nil
+		}
+		statusChanged := curStatus != string(ocdecktask.StatusSuspended)
+		leChanged := curLastError.Valid // 新值 NULL，旧值非 NULL 即变更
+		initChanged := curInitStatus != string(initStatus)
+		changed := statusChanged || leChanged || initChanged
+		if !changed {
+			// 全列同值：不写。
+			return application.TransitionResult{MutationResult: application.MutationResult{Matched: true}}, nil
+		}
+		now := nowUnix()
+		updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+		// WHERE: id + status IS expectedStatus（expected）+ 同值排除（任一列不同才匹配，F-01）。
+		// 同值口径 status+last_error+init_status：全部等于新值才视为同值行排除。
+		diffPred, diffArgs := anyColDiffersPredicate(
+			[]string{"status", "last_error", "init_status"},
+			[]sql.NullString{
+				{String: string(ocdecktask.StatusSuspended), Valid: true},
+				{}, // 新值 NULL
+				newInitNS,
+			})
+		qry := "UPDATE tasks SET status = 'suspended', last_error = NULL, init_status = ?, " + updClause +
+			" WHERE id = ? AND status IS ? AND (" + diffPred + ")"
+		args := []any{initStatus}
+		args = append(args, updArgs...)
+		args = append(args, taskID, expStatusNS)
+		args = append(args, diffArgs...)
+		res, err := qx.db.ExecContext(ctx, qry, args...)
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		if n == 0 {
+			// 并发下 expected 已失配：CAS 失败。
+			return application.TransitionResult{}, nil
+		}
+		out := application.TransitionResult{
+			MutationResult: application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt},
+			StatusChanged:  statusChanged,
+		}
+		if statusChanged {
+			out.From = ocdecktask.Status(curStatus)
+			out.To = ocdecktask.StatusSuspended
+		}
+		return out, nil
+	})
 }
 
 // ClaimInitRun 置 init_status=running，要求 status=suspended 且 init_status=pending
-// （design.md §2.1/§3：InitRunner 初次执行 claim）。rows=0 表示未获得（并发下另一执行者已 claim）。
-func (q *Queries) ClaimInitRun(ctx context.Context, taskID string) (updated bool, err error) {
-	res, err := q.db.ExecContext(ctx,
-		`UPDATE tasks SET init_status = 'running', updated_at = ?
-		 WHERE id = ? AND status = 'suspended' AND init_status = 'pending'`,
-		nowUnix(), taskID)
-	if err != nil {
-		return false, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return n == 1, nil
+// （design.md §2.1/§3：InitRunner 初次执行 claim）。
+// 返回 MutationResult：Matched=满足 CAS；init_status pending→running 为真实变更。
+// F-01：expected（status='suspended' AND init_status='pending'）与同值排除
+// （init_status IS NOT 'running'）下推到 UPDATE WHERE；事务内读 updated_at 旧值。
+func (q *Queries) ClaimInitRun(ctx context.Context, taskID string) (application.MutationResult, error) {
+	return runTx(ctx, q, func(qx *Queries) (application.MutationResult, error) {
+		row := qx.db.QueryRowContext(ctx,
+			`SELECT init_status, updated_at FROM tasks WHERE id = ? AND status = 'suspended' AND init_status = 'pending'`,
+			taskID)
+		var curInit string
+		var curUpdatedAt int64
+		if err := row.Scan(&curInit, &curUpdatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				return application.MutationResult{}, nil
+			}
+			return application.MutationResult{}, err
+		}
+		now := nowUnix()
+		updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+		qry := "UPDATE tasks SET init_status = 'running', " + updClause +
+			" WHERE id = ? AND status = 'suspended' AND init_status = 'pending' AND init_status IS NOT 'running'"
+		args := []any{}
+		args = append(args, updArgs...)
+		args = append(args, taskID)
+		res, err := qx.db.ExecContext(ctx, qry, args...)
+		if err != nil {
+			return application.MutationResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return application.MutationResult{}, err
+		}
+		if n == 0 {
+			// 并发下 CAS 已失配。
+			return application.MutationResult{}, nil
+		}
+		return application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt}, nil
+	})
 }
 
 // ClaimInitRerun 置 init_status=running 并清空旧 init_error，要求 status=suspended 且
 // init_status ∈ {failed, succeeded}（design.md §2.1/§3：RerunInit claim）。
-func (q *Queries) ClaimInitRerun(ctx context.Context, taskID string) (updated bool, err error) {
-	res, err := q.db.ExecContext(ctx,
-		`UPDATE tasks SET init_status = 'running', init_error = NULL, updated_at = ?
-		 WHERE id = ? AND status = 'suspended' AND init_status IN ('failed', 'succeeded')`,
-		nowUnix(), taskID)
-	if err != nil {
-		return false, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return n == 1, nil
+// 返回 MutationResult：Matched=满足 CAS；init_status 迁移到 running（非 failed/succeeded）为真实变更。
+// F-01：expected（status='suspended' AND init_status IN {failed,succeeded}）与同值排除
+// （init_status IS NOT 'running'）下推到 UPDATE WHERE；事务内读 updated_at 旧值。
+func (q *Queries) ClaimInitRerun(ctx context.Context, taskID string) (application.MutationResult, error) {
+	return runTx(ctx, q, func(qx *Queries) (application.MutationResult, error) {
+		row := qx.db.QueryRowContext(ctx,
+			`SELECT init_status, init_error, updated_at FROM tasks
+			 WHERE id = ? AND status = 'suspended' AND init_status IN ('failed', 'succeeded')`,
+			taskID)
+		var curInit string
+		var curInitError sql.NullString
+		var curUpdatedAt int64
+		if err := row.Scan(&curInit, &curInitError, &curUpdatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				return application.MutationResult{}, nil
+			}
+			return application.MutationResult{}, err
+		}
+		now := nowUnix()
+		updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+		qry := "UPDATE tasks SET init_status = 'running', init_error = NULL, " + updClause +
+			" WHERE id = ? AND status = 'suspended' AND init_status IN ('failed', 'succeeded') AND init_status IS NOT 'running'"
+		args := []any{}
+		args = append(args, updArgs...)
+		args = append(args, taskID)
+		res, err := qx.db.ExecContext(ctx, qry, args...)
+		if err != nil {
+			return application.MutationResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return application.MutationResult{}, err
+		}
+		if n == 0 {
+			return application.MutationResult{}, nil
+		}
+		return application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt}, nil
+	})
 }
 
 // FinishInitRun 落账 InitRunner 执行结果，要求 init_status=running（design.md §2.1/§3）。
-// status 为 'succeeded' 或 'failed'：成功时 initError 应为空（清空），失败时写 initError。
-// rows=0 表示任务已被外部收敛（如服务重启），调用方记录警告。
-func (q *Queries) FinishInitRun(ctx context.Context, taskID, status string, initError sql.NullString) (updated bool, err error) {
-	res, err := q.db.ExecContext(ctx,
-		`UPDATE tasks SET init_status = ?, init_error = ?, updated_at = ?
-		 WHERE id = ? AND init_status = 'running'`,
-		status, initError, nowUnix(), taskID)
-	if err != nil {
-		return false, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return n == 1, nil
+// status 为 'succeeded' 或 'failed'。返回 MutationResult：Matched=当前 init_status=running；
+// 同值口径 init_status+init_error：若新 status==running 且 initError 同值则 Matched+!Changed
+// （罕见，调用方按 Matched 判定）。
+// F-01：expected（init_status='running'）与同值排除（init_status IS NOT ? AND init_error IS NOT ?）
+// 下推到 UPDATE WHERE；事务内读 updated_at 旧值。
+func (q *Queries) FinishInitRun(ctx context.Context, taskID string, status ocdecktask.InitStatus, initError *string) (application.MutationResult, error) {
+	newIE := nullableString(initError)
+	newInitNS := sql.NullString{String: string(status), Valid: true}
+	return runTx(ctx, q, func(qx *Queries) (application.MutationResult, error) {
+		row := qx.db.QueryRowContext(ctx,
+			`SELECT init_status, init_error, updated_at FROM tasks WHERE id = ? AND init_status = 'running'`,
+			taskID)
+		var curInit string
+		var curInitError sql.NullString
+		var curUpdatedAt int64
+		if err := row.Scan(&curInit, &curInitError, &curUpdatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				return application.MutationResult{}, nil
+			}
+			return application.MutationResult{}, err
+		}
+		if curInit == string(status) && nullStringEqual(curInitError, newIE) {
+			// 全列同值：不写。
+			return application.MutationResult{Matched: true}, nil
+		}
+		now := nowUnix()
+		updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+		// 同值排除（任一列不同才匹配，F-01）：init_status + init_error 全部等于新值才视为同值。
+		diffPred, diffArgs := anyColDiffersPredicate(
+			[]string{"init_status", "init_error"},
+			[]sql.NullString{newInitNS, newIE})
+		qry := "UPDATE tasks SET init_status = ?, init_error = ?, " + updClause +
+			" WHERE id = ? AND init_status = 'running' AND (" + diffPred + ")"
+		args := []any{string(status), newIE}
+		args = append(args, updArgs...)
+		args = append(args, taskID)
+		args = append(args, diffArgs...)
+		res, err := qx.db.ExecContext(ctx, qry, args...)
+		if err != nil {
+			return application.MutationResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return application.MutationResult{}, err
+		}
+		if n == 0 {
+			// 并发下 CAS 已失配或同值。
+			return application.MutationResult{Matched: true}, nil
+		}
+		return application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt}, nil
+	})
 }
 
 // ConvergeInterruptedInitRuns 启动收敛：把 init_status ∈ {pending, running} 的任务
 // 置为 failed 并写 init_error='interrupted by server restart'（design.md §2.1/§3）。
-// 返回受影响行数。用于 Reconcile 启动时收敛上次进程未完成的 init 执行。
+// 返回受影响行数。所有命中行 init_status 均 ≠ failed → 均为真实变更，updated_at 推进 now。
+// 用于 Reconcile 启动时收敛上次进程未完成的 init 执行。
+// F-01：WHERE 的 init_status IN('pending','running') 已原子排除同值行（failed+interrupted
+// 不在集合内），单语句原子；NOT(...) 冗余保留无害。
 func (q *Queries) ConvergeInterruptedInitRuns(ctx context.Context) (int64, error) {
 	res, err := q.db.ExecContext(ctx,
 		`UPDATE tasks SET init_status = 'failed', init_error = 'interrupted by server restart', updated_at = ?
-		 WHERE init_status IN ('pending', 'running')`,
+		 WHERE init_status IN ('pending', 'running') AND NOT (init_status = 'failed' AND init_error = 'interrupted by server restart')`,
 		nowUnix())
 	if err != nil {
 		return 0, err
@@ -809,17 +1424,40 @@ func (q *Queries) alignSessionsInTx(ctx context.Context, taskID string, sessions
 		}
 	}
 	if noticeFn != nil {
-		row := q.db.QueryRowContext(ctx, `SELECT notice FROM tasks WHERE id = ?`, taskID)
-		var current sql.NullString
-		if err := row.Scan(&current); err != nil {
+		if err := q.applyNoticeInTx(ctx, taskID, noticeFn); err != nil {
 			return err
 		}
-		next := noticeFn(current)
-		// notice 在对齐事务内整体覆盖（非 CAS：对齐是单写者事务，外部并发由 keyed mutex 串行）。
-		if _, err := q.db.ExecContext(ctx,
-			`UPDATE tasks SET notice = ?, updated_at = ? WHERE id = ?`, next, nowUnix(), taskID); err != nil {
-			return err
-		}
+	}
+	return nil
+}
+
+// applyNoticeInTx 在事务内写入对齐后的 notice（同值原子 no-op，F-01）。
+// 读取当前 notice → noticeFn 计算新值 → 同值不写；异值才 UPDATE 且 WHERE 携带同值排除
+// 谓词（notice IS NOT <next>），仅跨秒推进 updated_at。返回（非导出供 align 函数忽略结果使用）。
+func (q *Queries) applyNoticeInTx(ctx context.Context, taskID string, noticeFn func(sql.NullString) sql.NullString) error {
+	row := q.db.QueryRowContext(ctx, `SELECT notice, updated_at FROM tasks WHERE id = ?`, taskID)
+	var current sql.NullString
+	var curUpdatedAt int64
+	if err := row.Scan(&current, &curUpdatedAt); err != nil {
+		return err
+	}
+	next := noticeFn(current)
+	if nullStringEqual(current, next) {
+		// notice 同值：不推进 updated_at。
+		return nil
+	}
+	now := nowUnix()
+	updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+	noticePred, noticeArg := colNotEqualPredicate("notice", next)
+	qry := "UPDATE tasks SET notice = ?, " + updClause + " WHERE id = ? AND " + noticePred
+	args := []any{next}
+	args = append(args, updArgs...)
+	args = append(args, taskID)
+	if noticeArg != nil {
+		args = append(args, noticeArg)
+	}
+	if _, err := q.db.ExecContext(ctx, qry, args...); err != nil {
+		return err
 	}
 	return nil
 }
@@ -850,6 +1488,25 @@ func withTxQueries(ctx context.Context, db DBTX, fn func(qtx *Queries) error) er
 	}
 	committed = true
 	return nil
+}
+
+// runTx 在事务内执行 fn 并返回其结果。若 q 已绑定 *sql.Tx（事务内调用）则直接复用；
+// 否则经 withTxQueries 自动开事务。供同值原子写方法在事务内读旧值 + 原子 UPDATE。
+func runTx[T any](ctx context.Context, q *Queries, fn func(qtx *Queries) (T, error)) (T, error) {
+	var zero T
+	if _, isTx := q.db.(*sql.Tx); isTx {
+		return fn(q)
+	}
+	var r T
+	txErr := withTxQueries(ctx, q.db, func(qtx *Queries) error {
+		var cerr error
+		r, cerr = fn(qtx)
+		return cerr
+	})
+	if txErr != nil {
+		return zero, txErr
+	}
+	return r, nil
 }
 
 type rowScanner interface {
@@ -1041,14 +1698,7 @@ func (q *Queries) alignTaskSessionsInTx(ctx context.Context, taskID string, mode
 		}
 	}
 	if noticeFn != nil {
-		row := q.db.QueryRowContext(ctx, `SELECT notice FROM tasks WHERE id = ?`, taskID)
-		var current sql.NullString
-		if err := row.Scan(&current); err != nil {
-			return nil, err
-		}
-		next := noticeFn(current)
-		if _, err := q.db.ExecContext(ctx,
-			`UPDATE tasks SET notice = ?, updated_at = ? WHERE id = ?`, next, nowUnix(), taskID); err != nil {
+		if err := q.applyNoticeInTx(ctx, taskID, noticeFn); err != nil {
 			return nil, err
 		}
 	}

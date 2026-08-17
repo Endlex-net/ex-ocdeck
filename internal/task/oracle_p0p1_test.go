@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/config"
 	"ocdeck/internal/opencode"
 	"ocdeck/internal/process"
@@ -874,8 +875,8 @@ type casErrStore struct {
 	err error
 }
 
-func (s *casErrStore) UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (bool, error) {
-	return false, s.err
+func (s *casErrStore) UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (application.TransitionResult, error) {
+	return application.TransitionResult{}, s.err
 }
 
 // --- B3：SSE directory fail-closed + status/diff sessionIDProp 归属 ---

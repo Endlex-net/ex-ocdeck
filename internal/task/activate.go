@@ -285,7 +285,7 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 	if err != nil {
 		return newOpErr(codeInternal, err)
 	}
-	if !updated {
+	if !updated.Matched {
 		return newOpErr(codeConflict, fmt.Errorf("task %s state changed before activate commit", taskID))
 	}
 
@@ -299,7 +299,7 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 		return err
 	}
 	// 提交点：active。提交失败补偿（杀已建会话回 suspended，B5）。
-	if err := m.store.UpdateTaskStatus(ctx, taskID, StatusActive, sql.NullString{}); err != nil {
+	if _, err := m.store.UpdateTaskStatus(ctx, taskID, StatusActive, sql.NullString{}); err != nil {
 		commitErr := fmt.Errorf("commit active: %w", err)
 		m.runActivateFailureCompensation(ctx, taskID, commitErr)
 		return newOpErr(codeInternal, err)
@@ -355,7 +355,7 @@ func (m *Manager) runActivateFailureCompensation(reqCtx context.Context, taskID 
 	finalCtx, finalCancel := context.WithTimeout(context.WithoutCancel(reqCtx), activateCompensationFinalizeTimeout)
 	defer finalCancel()
 
-	if err := m.store.UpdateTaskEnvSnapshot(finalCtx, taskID, sql.NullString{}); err != nil {
+	if _, err := m.store.UpdateTaskEnvSnapshot(finalCtx, taskID, sql.NullString{}); err != nil {
 		log.Printf("activate: clear env snapshot for task %s: %v", taskID, err)
 	}
 	le := sql.NullString{String: cause.Error(), Valid: true}
@@ -374,7 +374,7 @@ func (m *Manager) runActivateFailureCompensation(reqCtx context.Context, taskID 
 		log.Printf("activate: rollback activating→suspended for task %s: %v", taskID, err)
 		return
 	}
-	if !updated {
+	if !updated.Matched {
 		// 无 error 但 updated=false：状态已被并发改动（非 activating），便于诊断卡 activating 场景。
 		log.Printf("activate: rollback activating→suspended for task %s: status changed concurrently (not activating)", taskID)
 	}
@@ -474,7 +474,7 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 		return err
 	}
 	// 端口写回 DB（仅记录，非事实来源，design.md §3）。B7b：写入错误不得忽略。
-	if err := m.store.UpdateTaskLastPort(ctx, taskID, port); err != nil {
+	if _, err := m.store.UpdateTaskLastPort(ctx, taskID, port); err != nil {
 		// 端口写回失败非致命（last_port 仅交叉校验），但不得静默吞错。
 		// serve 已起在 port，继续后续流程；记录日志供运维感知。
 		log.Printf("activate: update last port for task %s: %v (serve running on %d)", taskID, err, port)
@@ -946,7 +946,7 @@ func (m *Manager) persistEnvSnapshot(ctx context.Context, taskID string, merged 
 	if err != nil {
 		return fmt.Errorf("marshal env snapshot: %w", err)
 	}
-	if err := m.store.UpdateTaskEnvSnapshot(ctx, taskID, sql.NullString{String: string(b), Valid: true}); err != nil {
+	if _, err := m.store.UpdateTaskEnvSnapshot(ctx, taskID, sql.NullString{String: string(b), Valid: true}); err != nil {
 		return fmt.Errorf("persist env snapshot: %w", err)
 	}
 	return nil
@@ -1461,7 +1461,7 @@ func (m *Manager) convergeToSuspendedChecked(taskID, reason string, gen int, ins
 		// gen 校验在无锁路径无法可靠执行（runtime 可能已被清理/替换），降级为 best-effort 收敛。
 		ctx := context.Background()
 		_ = m.cleanupActivationRuntime(ctx, taskID)
-		_ = m.store.UpdateTaskEnvSnapshot(ctx, taskID, sql.NullString{})
+		_, _ = m.store.UpdateTaskEnvSnapshot(ctx, taskID, sql.NullString{})
 		le := sql.NullString{String: fmt.Sprintf("%s; converge lock wait timed out: %v", reason, err), Valid: true}
 		_, _ = m.store.UpdateTaskStatusConditional(ctx, taskID, StatusActive, StatusSuspended, le)
 		return
@@ -1488,7 +1488,7 @@ func (m *Manager) convergeToSuspendedChecked(taskID, reason string, gen int, ins
 	cleanupErr := m.cleanupActivationRuntime(ctx, taskID)
 	// 清除 env 快照（design.md §2：运行时不可恢复时清快照）。
 	// P4 复评阻塞 5：env 快照写回错误聚合进 last_error，不静默吞错。
-	envErr := m.store.UpdateTaskEnvSnapshot(ctx, taskID, sql.NullString{})
+	_, envErr := m.store.UpdateTaskEnvSnapshot(ctx, taskID, sql.NullString{})
 	le := sql.NullString{String: reason, Valid: true}
 	if cleanupErr != nil {
 		le = sql.NullString{String: fmt.Sprintf("%s; cleanup notice: %v", reason, cleanupErr), Valid: true}
@@ -1503,7 +1503,7 @@ func (m *Manager) convergeToSuspendedChecked(taskID, reason string, gen int, ins
 	if statusErr != nil {
 		log.Printf("convergeToSuspended: commit suspended failed (task %s): %v; last_error=%s", taskID, statusErr, le.String)
 	}
-	if !committed && statusErr == nil {
+	if !committed.Matched && statusErr == nil {
 		// 状态已非 active（并发 Suspend/Delete 等），无需再落 suspended。
 		log.Printf("convergeToSuspended: task %s no longer active (concurrent transition)", taskID)
 	}

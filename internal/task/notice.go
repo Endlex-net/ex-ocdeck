@@ -193,8 +193,8 @@ func (m *Manager) recordResidualNotice(ctx context.Context, taskID, sessionName 
 			entries = append(entries, entry)
 		}
 		newRaw := encodeNotices(entries)
-		replaced, _ := m.store.UpdateTaskNoticeCAS(ctx, taskID, row.Notice, newRaw)
-		if !replaced {
+		r, _ := m.store.UpdateTaskNoticeCAS(ctx, taskID, row.Notice, newRaw)
+		if !r.Matched {
 			continue
 		}
 		// 读回校验收敛：确认本条 entry 已落库。
@@ -237,8 +237,8 @@ func (m *Manager) recordSessionOverflowNotice(ctx context.Context, taskID string
 			entries = append(entries, entry)
 		}
 		newRaw := encodeNotices(entries)
-		replaced, _ := m.store.UpdateTaskNoticeCAS(ctx, taskID, row.Notice, newRaw)
-		if !replaced {
+		r, _ := m.store.UpdateTaskNoticeCAS(ctx, taskID, row.Notice, newRaw)
+		if !r.Matched {
 			continue
 		}
 		// 读回校验收敛：确认 overflow 项已落库（或原本就存在）。
@@ -275,8 +275,8 @@ func (m *Manager) casWriteNotices(ctx context.Context, taskID string, remaining 
 		if _, perr := parseNotices(cur.Notice); perr != nil {
 			return fmt.Errorf("cas write notices: notice json corrupted (task %s): %w", taskID, perr)
 		}
-		replaced, _ := m.store.UpdateTaskNoticeCAS(ctx, taskID, cur.Notice, newRaw)
-		if replaced {
+		r, _ := m.store.UpdateTaskNoticeCAS(ctx, taskID, cur.Notice, newRaw)
+		if r.Matched {
 			return nil
 		}
 	}
@@ -466,8 +466,8 @@ func (m *Manager) retryTaskNotices(ctx context.Context, t TaskRow, entries []not
 		curEntries, _ := parseNotices(cur.Notice)
 		merged := mergeNoticesExcluding(curEntries, remaining, clearedKeys)
 		newRaw := encodeNotices(merged)
-		replaced, _ := m.store.UpdateTaskNoticeCAS(ctx, t.ID, cur.Notice, newRaw)
-		if replaced {
+		r, _ := m.store.UpdateTaskNoticeCAS(ctx, t.ID, cur.Notice, newRaw)
+		if r.Matched {
 			return errors.Join(errs...)
 		}
 		// CAS 失败：下一轮基于最新 cur.Notice 重新合并（remaining 不变，已清除项继续排除）。

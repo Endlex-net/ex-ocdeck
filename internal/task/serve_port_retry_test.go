@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/config"
 	"ocdeck/internal/opencode"
 	"ocdeck/internal/process"
@@ -136,13 +137,13 @@ type noticeFailNStore struct {
 	calls int
 }
 
-func (s *noticeFailNStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (bool, error) {
+func (s *noticeFailNStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error) {
 	s.mu.Lock()
 	s.calls++
 	n := s.calls
 	s.mu.Unlock()
 	if n <= s.failN {
-		return false, nil
+		return application.MutationResult{}, nil
 	}
 	return s.mockStore.UpdateTaskNoticeCAS(ctx, id, expected, newNotice)
 }
@@ -152,8 +153,8 @@ type noticeAlwaysFailStore struct {
 	*mockStore
 }
 
-func (s *noticeAlwaysFailStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (bool, error) {
-	return false, nil
+func (s *noticeAlwaysFailStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error) {
+	return application.MutationResult{}, nil
 }
 
 // killSeqProc：按调用序号返回 KillResult / error 序列；耗尽后 clean。
@@ -669,9 +670,9 @@ type envSnapshotFailStore struct {
 	*mockStore
 }
 
-func (s *envSnapshotFailStore) UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) error {
+func (s *envSnapshotFailStore) UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) (application.MutationResult, error) {
 	if envSnapshot.Valid {
-		return errors.New("db write failed")
+		return application.MutationResult{}, errors.New("db write failed")
 	}
 	return s.mockStore.UpdateTaskEnvSnapshot(ctx, id, envSnapshot)
 }
@@ -732,7 +733,7 @@ type countingEnvStore struct {
 	lastPort string
 }
 
-func (s *countingEnvStore) UpdateTaskEnvSnapshot(ctx context.Context, id string, snapSQL sql.NullString) error {
+func (s *countingEnvStore) UpdateTaskEnvSnapshot(ctx context.Context, id string, snapSQL sql.NullString) (application.MutationResult, error) {
 	if snapSQL.Valid {
 		s.mu.Lock()
 		s.writes++
@@ -1496,9 +1497,9 @@ type envSnapshotSentinelFailStore struct {
 	*mockStore
 }
 
-func (s *envSnapshotSentinelFailStore) UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) error {
+func (s *envSnapshotSentinelFailStore) UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) (application.MutationResult, error) {
 	if envSnapshot.Valid {
-		return errPersistSentinel
+		return application.MutationResult{}, errPersistSentinel
 	}
 	return s.mockStore.UpdateTaskEnvSnapshot(ctx, id, envSnapshot)
 }

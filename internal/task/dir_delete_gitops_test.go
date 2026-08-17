@@ -188,7 +188,7 @@ func TestDelete_DirDeletionFailed_ForceReentry(t *testing.T) {
 	before := snapshotDir(t, projDir)
 	seedDirTaskWithDir(store, "t1", "p1", projDir)
 	// 模拟前次删除失败落账：状态 deletion_failed + 持久化 delete_mode=force。
-	_ = store.SetTaskDeleteMode(context.Background(), "t1", string(DeleteForce))
+	_, _ = store.SetTaskDeleteMode(context.Background(), "t1", string(DeleteForce))
 	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusDeletionFailed })
 	proc := newMockProc()
 	wt := wrapPanicWorktree(newMockWorktree())
@@ -470,7 +470,7 @@ func TestRetry_DirDeletionFailed_Succeeds_NoDirtyFilesCall(t *testing.T) {
 	before := snapshotDir(t, projDir)
 	seedDirTaskWithDir(store, "t1", "p1", projDir)
 	// 模拟前次删除失败落账：deletion_failed + delete_mode=normal。
-	_ = store.SetTaskDeleteMode(context.Background(), "t1", string(DeleteNormal))
+	_, _ = store.SetTaskDeleteMode(context.Background(), "t1", string(DeleteNormal))
 	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusDeletionFailed })
 	// panicDirtyWorktree 确保 DirtyFiles 不被调用；其余 WorktreeBackend 方法经 mockWorktree 默认。
 	wt := wrapPanicDirtyWorktree(wrapPanicWorktree(newMockWorktree()))
@@ -493,7 +493,7 @@ func TestRetry_DirDeleting_Succeeds(t *testing.T) {
 	before := snapshotDir(t, projDir)
 	seedDirTaskWithDir(store, "t1", "p1", projDir)
 	// 模拟删除进行中卡住：deleting + delete_mode=normal。
-	_ = store.SetTaskDeleteMode(context.Background(), "t1", string(DeleteNormal))
+	_, _ = store.SetTaskDeleteMode(context.Background(), "t1", string(DeleteNormal))
 	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusDeleting })
 	wt := wrapPanicDirtyWorktree(wrapPanicWorktree(newMockWorktree()))
 	m := newTestManager(t, store, newMockProc(), wt, newMockOC(true))
@@ -514,7 +514,7 @@ func TestRetry_DirConfirmDirtyAcceptedButIgnored(t *testing.T) {
 	projDir := t.TempDir()
 	writeFileTree(t, projDir)
 	seedDirTaskWithDir(store, "t1", "p1", projDir)
-	_ = store.SetTaskDeleteMode(context.Background(), "t1", string(DeleteNormal))
+	_, _ = store.SetTaskDeleteMode(context.Background(), "t1", string(DeleteNormal))
 	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusDeletionFailed })
 	wt := wrapPanicDirtyWorktree(wrapPanicWorktree(newMockWorktree()))
 	m := newTestManager(t, store, newMockProc(), wt, newMockOC(true))

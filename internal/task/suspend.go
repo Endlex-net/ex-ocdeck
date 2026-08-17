@@ -43,7 +43,7 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 	if err != nil {
 		return newOpErr(codeInternal, err)
 	}
-	if !updated {
+	if !updated.Matched {
 		return newOpErr(codeConflict, fmt.Errorf("task %s state changed before suspend", taskID))
 	}
 	return m.suspendRun(ctx, taskID, mode)
@@ -194,7 +194,7 @@ func (m *Manager) finishSuspend(ctx context.Context, taskID string, results []ki
 		}
 	}
 	// 清除 env 快照（design.md §2：Suspend 成功清快照）。
-	if err := m.store.UpdateTaskEnvSnapshot(ctx, taskID, sql.NullString{}); err != nil {
+	if _, err := m.store.UpdateTaskEnvSnapshot(ctx, taskID, sql.NullString{}); err != nil {
 		if firstErr == nil {
 			firstErr = fmt.Errorf("clear env snapshot: %w", err)
 		}
@@ -203,7 +203,7 @@ func (m *Manager) finishSuspend(ctx context.Context, taskID string, results []ki
 	if firstErr != nil {
 		le = sql.NullString{String: firstErr.Error(), Valid: true}
 	}
-	if err := m.store.UpdateTaskStatus(ctx, taskID, StatusSuspended, le); err != nil {
+	if _, err := m.store.UpdateTaskStatus(ctx, taskID, StatusSuspended, le); err != nil {
 		if firstErr == nil {
 			firstErr = fmt.Errorf("commit suspended: %w", err)
 		}

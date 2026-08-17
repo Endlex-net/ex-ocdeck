@@ -9,7 +9,9 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/config"
+	ocdecktask "ocdeck/internal/domain/task"
 	"ocdeck/internal/opencode"
 	"ocdeck/internal/process"
 	"ocdeck/internal/pty"
@@ -184,151 +186,152 @@ func (s *mockStore) ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOve
 	return out, nil
 }
 
-func (s *mockStore) UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) error {
+func (s *mockStore) UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) (application.TransitionResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.tasks[id]
 	if !ok {
-		return fmt.Errorf("not found")
+		return application.TransitionResult{}, fmt.Errorf("not found")
 	}
 	t.Status = status
 	t.LastError = lastError
 	t.UpdatedAt = 2
 	s.tasks[id] = t
-	return nil
+	return application.TransitionResult{MutationResult: application.MutationResult{Matched: true, Changed: true}}, nil
 }
 
-func (s *mockStore) UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (bool, error) {
+func (s *mockStore) UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (application.TransitionResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.tasks[id]
 	if !ok {
-		return false, fmt.Errorf("not found")
+		return application.TransitionResult{}, fmt.Errorf("not found")
 	}
 	if t.Status != fromStatus {
 		s.statusCalls = append(s.statusCalls, statusCall{id, fromStatus, toStatus, false})
-		return false, nil
+		return application.TransitionResult{}, nil
 	}
 	t.Status = toStatus
 	t.LastError = lastError
 	t.UpdatedAt = 3
 	s.tasks[id] = t
 	s.statusCalls = append(s.statusCalls, statusCall{id, fromStatus, toStatus, true})
-	return true, nil
+	return application.TransitionResult{MutationResult: application.MutationResult{Matched: true, Changed: true}}, nil
 }
 
-func (s *mockStore) UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) error {
+func (s *mockStore) UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) (application.MutationResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.tasks[id]
 	if !ok {
-		return fmt.Errorf("not found")
+		return application.MutationResult{}, fmt.Errorf("not found")
 	}
 	t.EnvSnapshot = envSnapshot
 	s.tasks[id] = t
-	return nil
+	return application.MutationResult{Matched: true, Changed: true}, nil
 }
 
-func (s *mockStore) UpdateTaskLastPort(ctx context.Context, id string, port int) error {
+func (s *mockStore) UpdateTaskLastPort(ctx context.Context, id string, port int) (application.MutationResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.tasks[id]
 	if !ok {
-		return fmt.Errorf("not found")
+		return application.MutationResult{}, fmt.Errorf("not found")
 	}
 	t.LastPort = sql.NullInt64{Int64: int64(port), Valid: true}
 	s.tasks[id] = t
-	return nil
+	return application.MutationResult{Matched: true, Changed: true}, nil
 }
 
-func (s *mockStore) UpdateTaskNotice(ctx context.Context, id string, notice sql.NullString) error {
+func (s *mockStore) UpdateTaskNotice(ctx context.Context, id string, notice sql.NullString) (application.MutationResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.tasks[id]
 	if !ok {
-		return fmt.Errorf("not found")
+		return application.MutationResult{}, fmt.Errorf("not found")
 	}
 	t.Notice = notice
 	s.tasks[id] = t
-	return nil
+	return application.MutationResult{Matched: true, Changed: true}, nil
 }
 
-func (s *mockStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (bool, error) {
+func (s *mockStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.tasks[id]
 	if !ok {
-		return false, fmt.Errorf("not found")
+		return application.MutationResult{}, fmt.Errorf("not found")
 	}
 	if t.Notice != expected {
-		return false, nil
+		return application.MutationResult{}, nil
 	}
 	t.Notice = newNotice
 	s.tasks[id] = t
-	return true, nil
+	return application.MutationResult{Matched: true, Changed: true}, nil
 }
 
-func (s *mockStore) SetTaskDeleteMode(ctx context.Context, id, mode string) error {
+func (s *mockStore) SetTaskDeleteMode(ctx context.Context, id, mode string) (application.MutationResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.tasks[id]
 	if !ok {
-		return fmt.Errorf("not found")
+		return application.MutationResult{}, fmt.Errorf("not found")
 	}
 	t.DeleteMode = sql.NullString{String: mode, Valid: true}
 	s.tasks[id] = t
-	return nil
+	return application.MutationResult{Matched: true, Changed: true}, nil
 }
 
-func (s *mockStore) BeginDeleteIntent(ctx context.Context, id, mode string, fromStatuses []string) (bool, error) {
+func (s *mockStore) BeginDeleteIntent(ctx context.Context, id, mode string, fromStatuses []string) (application.TransitionResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.tasks[id]
 	if !ok {
-		return false, fmt.Errorf("not found")
+		return application.TransitionResult{}, fmt.Errorf("not found")
 	}
 	for _, st := range fromStatuses {
 		if t.Status == st {
 			t.Status = StatusDeleting
 			t.DeleteMode = sql.NullString{String: mode, Valid: true}
 			s.tasks[id] = t
-			return true, nil
+			return application.TransitionResult{MutationResult: application.MutationResult{Matched: true, Changed: true}}, nil
 		}
 	}
-	return false, nil
+	return application.TransitionResult{}, nil
 }
 
-func (s *mockStore) ArchiveTask(ctx context.Context, id string) error {
+func (s *mockStore) ArchiveTask(ctx context.Context, id string) (application.TransitionResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.tasks[id]
 	if !ok {
-		return fmt.Errorf("not found")
+		return application.TransitionResult{}, fmt.Errorf("not found")
 	}
 	t.Status = StatusArchived
 	s.tasks[id] = t
-	return nil
+	return application.TransitionResult{MutationResult: application.MutationResult{Matched: true, Changed: true}}, nil
 }
 
-func (s *mockStore) RestoreTask(ctx context.Context, id string) error {
+func (s *mockStore) RestoreTask(ctx context.Context, id string) (application.TransitionResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.tasks[id]
 	if !ok {
-		return fmt.Errorf("not found")
+		return application.TransitionResult{}, fmt.Errorf("not found")
 	}
 	t.Status = StatusSuspended
 	s.tasks[id] = t
-	return nil
+	return application.TransitionResult{MutationResult: application.MutationResult{Matched: true, Changed: true}}, nil
 }
 
-func (s *mockStore) DeleteTask(ctx context.Context, id string) error {
+func (s *mockStore) DeleteTask(ctx context.Context, id string) (application.DeleteResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.deleteTaskCount++
+	from := s.tasks[id].Status
 	delete(s.tasks, id)
 	delete(s.sessions, id)
-	return nil
+	return application.DeleteResult{Affected: 1, From: ocdecktask.Status(from)}, nil
 }
 
 // deleteTaskCountVal 返回 DeleteTask 调用次数（测试经 accessor 读取，避免直接读字段与并发写竞态）。

@@ -263,9 +263,9 @@ func TestCommitCreated_FromCreating(t *testing.T) {
 	ctx := context.Background()
 	seedProjectTask(t, db, "t1")
 	// 先把任务置为 creating 并带 last_error，模拟创建中状态。
-	_, _ = db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "creating", sql.NullString{String: "old err", Valid: true})
+	_, _ = db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "creating", nsToPtr(sql.NullString{String: "old err", Valid: true}))
 	updated, err := db.CommitCreated(ctx, "t1", "creating", "pending")
-	if err != nil || !updated {
+	if !updated.Matched {
 		t.Fatalf("CommitCreated from creating: updated=%v err=%v", updated, err)
 	}
 	task, _ := db.GetTask(ctx, "t1")
@@ -285,9 +285,9 @@ func TestCommitCreated_FromCreationFailed(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 	seedProjectTask(t, db, "t1")
-	_, _ = db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "creation_failed", sql.NullString{String: "create err", Valid: true})
+	_, _ = db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "creation_failed", nsToPtr(sql.NullString{String: "create err", Valid: true}))
 	updated, err := db.CommitCreated(ctx, "t1", "creation_failed", "none")
-	if err != nil || !updated {
+	if err != nil || !updated.Matched {
 		t.Fatalf("CommitCreated from creation_failed: updated=%v err=%v", updated, err)
 	}
 	task, _ := db.GetTask(ctx, "t1")
@@ -309,7 +309,7 @@ func TestCommitCreated_StatusMismatchNoUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CommitCreated mismatch err: %v", err)
 	}
-	if updated {
+	if updated.Matched {
 		t.Error("CommitCreated updated despite status mismatch (expected creating, was suspended)")
 	}
 	task, _ := db.GetTask(ctx, "t1")
@@ -325,7 +325,7 @@ func TestClaimInitRun_PendingToRunning(t *testing.T) {
 	seedProjectTask(t, db, "t1")
 	_, _ = db.CommitCreated(ctx, "t1", "suspended", "pending")
 	updated, err := db.ClaimInitRun(ctx, "t1")
-	if err != nil || !updated {
+	if err != nil || !updated.Matched {
 		t.Fatalf("ClaimInitRun: updated=%v err=%v", updated, err)
 	}
 	task, _ := db.GetTask(ctx, "t1")
@@ -344,7 +344,7 @@ func TestClaimInitRun_ConditionNotMetRowsZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClaimInitRun err: %v", err)
 	}
-	if updated {
+	if updated.Matched {
 		t.Error("ClaimInitRun updated despite init_status != pending")
 	}
 }
@@ -357,9 +357,9 @@ func TestClaimInitRerun_FailedOrSucceededToRunning(t *testing.T) {
 	// failed → running。
 	_, _ = db.CommitCreated(ctx, "t1", "suspended", "pending")
 	_, _ = db.ClaimInitRun(ctx, "t1")
-	_, _ = db.FinishInitRun(ctx, "t1", "failed", sql.NullString{String: "boom", Valid: true})
+	_, _ = db.FinishInitRun(ctx, "t1", "failed", nsToPtr(sql.NullString{String: "boom", Valid: true}))
 	updated, err := db.ClaimInitRerun(ctx, "t1")
-	if err != nil || !updated {
+	if err != nil || !updated.Matched {
 		t.Fatalf("ClaimInitRerun from failed: updated=%v err=%v", updated, err)
 	}
 	task, _ := db.GetTask(ctx, "t1")
@@ -370,9 +370,9 @@ func TestClaimInitRerun_FailedOrSucceededToRunning(t *testing.T) {
 		t.Errorf("init_error = %v, want NULL (cleared on rerun claim)", task.InitError)
 	}
 	// succeeded → running。
-	_, _ = db.FinishInitRun(ctx, "t1", "succeeded", sql.NullString{})
+	_, _ = db.FinishInitRun(ctx, "t1", "succeeded", nsToPtr(sql.NullString{}))
 	updated2, err := db.ClaimInitRerun(ctx, "t1")
-	if err != nil || !updated2 {
+	if err != nil || !updated2.Matched {
 		t.Fatalf("ClaimInitRerun from succeeded: updated=%v err=%v", updated2, err)
 	}
 	task2, _ := db.GetTask(ctx, "t1")
@@ -391,7 +391,7 @@ func TestClaimInitRerun_ConditionNotMetRowsZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClaimInitRerun err: %v", err)
 	}
-	if updated {
+	if updated.Matched {
 		t.Error("ClaimInitRerun updated despite init_status not in {failed,succeeded}")
 	}
 }
@@ -404,8 +404,8 @@ func TestFinishInitRun_RunningToSucceededOrFailed(t *testing.T) {
 	_, _ = db.CommitCreated(ctx, "t1", "suspended", "pending")
 	_, _ = db.ClaimInitRun(ctx, "t1")
 	// 成功：init_error 清空。
-	updated, err := db.FinishInitRun(ctx, "t1", "succeeded", sql.NullString{})
-	if err != nil || !updated {
+	updated, err := db.FinishInitRun(ctx, "t1", "succeeded", nsToPtr(sql.NullString{}))
+	if err != nil || !updated.Matched {
 		t.Fatalf("FinishInitRun succeeded: updated=%v err=%v", updated, err)
 	}
 	task, _ := db.GetTask(ctx, "t1")
@@ -414,8 +414,8 @@ func TestFinishInitRun_RunningToSucceededOrFailed(t *testing.T) {
 	}
 	// 再次 claim → failed：写 init_error。
 	_, _ = db.ClaimInitRerun(ctx, "t1")
-	updated2, err := db.FinishInitRun(ctx, "t1", "failed", sql.NullString{String: "init failed", Valid: true})
-	if err != nil || !updated2 {
+	updated2, err := db.FinishInitRun(ctx, "t1", "failed", nsToPtr(sql.NullString{String: "init failed", Valid: true}))
+	if err != nil || !updated2.Matched {
 		t.Fatalf("FinishInitRun failed: updated=%v err=%v", updated2, err)
 	}
 	task2, _ := db.GetTask(ctx, "t1")
@@ -430,11 +430,11 @@ func TestFinishInitRun_ConditionNotMetRowsZero(t *testing.T) {
 	ctx := context.Background()
 	seedProjectTask(t, db, "t1")
 	// init_status=none（非 running），finish 应不更新。
-	updated, err := db.FinishInitRun(ctx, "t1", "succeeded", sql.NullString{})
+	updated, err := db.FinishInitRun(ctx, "t1", "succeeded", nsToPtr(sql.NullString{}))
 	if err != nil {
 		t.Fatalf("FinishInitRun err: %v", err)
 	}
-	if updated {
+	if updated.Matched {
 		t.Error("FinishInitRun updated despite init_status != running")
 	}
 }
@@ -447,12 +447,12 @@ func TestClaimInitRun_StatusNotSuspendedRowsZero(t *testing.T) {
 	seedProjectTask(t, db, "t1")
 	// 置为 suspended+pending，再切到 active（保留 init_status=pending）。
 	_, _ = db.CommitCreated(ctx, "t1", "suspended", "pending")
-	_, _ = db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "active", sql.NullString{})
+	_, _ = db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "active", nsToPtr(sql.NullString{}))
 	updated, err := db.ClaimInitRun(ctx, "t1")
 	if err != nil {
 		t.Fatalf("ClaimInitRun err: %v", err)
 	}
-	if updated {
+	if updated.Matched {
 		t.Error("ClaimInitRun updated despite status=active (WHERE status='suspended' not satisfied)")
 	}
 	task, _ := db.GetTask(ctx, "t1")
@@ -470,13 +470,13 @@ func TestClaimInitRerun_StatusNotSuspendedRowsZero(t *testing.T) {
 	// 走完整流程到 failed，再切到 archived（保留 init_status=failed）。
 	_, _ = db.CommitCreated(ctx, "t1", "suspended", "pending")
 	_, _ = db.ClaimInitRun(ctx, "t1")
-	_, _ = db.FinishInitRun(ctx, "t1", "failed", sql.NullString{String: "boom", Valid: true})
-	_, _ = db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "archived", sql.NullString{})
+	_, _ = db.FinishInitRun(ctx, "t1", "failed", nsToPtr(sql.NullString{String: "boom", Valid: true}))
+	_, _ = db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "archived", nsToPtr(sql.NullString{}))
 	updated, err := db.ClaimInitRerun(ctx, "t1")
 	if err != nil {
 		t.Fatalf("ClaimInitRerun err: %v", err)
 	}
-	if updated {
+	if updated.Matched {
 		t.Error("ClaimInitRerun updated despite status=archived (WHERE status='suspended' not satisfied)")
 	}
 	task, _ := db.GetTask(ctx, "t1")
@@ -493,7 +493,7 @@ func TestCAS_UpdatedAtRefreshed(t *testing.T) {
 	seedProjectTask(t, db, "t1")
 
 	// CommitCreated：creating → suspended。
-	_, _ = db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "creating", sql.NullString{})
+	_, _ = db.UpdateTaskStatusConditional(ctx, "t1", "suspended", "creating", nsToPtr(sql.NullString{}))
 	old := taskUpdatedAt(t, db, "t1")
 	waitNextSecond(t, old)
 	_, _ = db.CommitCreated(ctx, "t1", "creating", "pending")
@@ -514,7 +514,7 @@ func TestCAS_UpdatedAtRefreshed(t *testing.T) {
 	// FinishInitRun：running → failed。
 	old = new
 	waitNextSecond(t, old)
-	_, _ = db.FinishInitRun(ctx, "t1", "failed", sql.NullString{String: "boom", Valid: true})
+	_, _ = db.FinishInitRun(ctx, "t1", "failed", nsToPtr(sql.NullString{String: "boom", Valid: true}))
 	new = taskUpdatedAt(t, db, "t1")
 	if new <= old {
 		t.Errorf("FinishInitRun updated_at = %d, want > %d (refreshed)", new, old)

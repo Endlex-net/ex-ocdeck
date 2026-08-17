@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/config"
 	"ocdeck/internal/opencode"
 	"ocdeck/internal/process"
@@ -376,9 +377,9 @@ func wrapStatusErr(inner TaskStore, condErr error) *statusErrStore {
 	return &statusErrStore{TaskStore: inner, condErr: condErr}
 }
 
-func (w *statusErrStore) UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (bool, error) {
+func (w *statusErrStore) UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (application.TransitionResult, error) {
 	if w.condErr != nil && fromStatus == StatusActive && toStatus == StatusSuspended {
-		return false, w.condErr
+		return application.TransitionResult{}, w.condErr
 	}
 	return w.TaskStore.UpdateTaskStatusConditional(ctx, id, fromStatus, toStatus, lastError)
 }

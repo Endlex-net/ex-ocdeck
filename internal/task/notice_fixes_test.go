@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/process"
 )
 
@@ -67,11 +68,11 @@ type casFailingStore struct {
 	mu       sync.Mutex
 }
 
-func (s *casFailingStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (bool, error) {
+func (s *casFailingStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error) {
 	s.mu.Lock()
 	s.casCalls++
 	s.mu.Unlock()
-	return false, nil
+	return application.MutationResult{}, nil
 }
 
 // TestRetryTaskNotices_CASExhaustionAggregatesError 验证 CAS 循环耗尽时 retryTaskNotices
