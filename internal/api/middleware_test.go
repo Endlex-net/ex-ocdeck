@@ -267,7 +267,7 @@ func TestAuthenticatedWrongMethod_JSON404(t *testing.T) {
 func TestServerStatus_VersionVerifiedReal(t *testing.T) {
 	cfg := testConfig()
 	cfg.OpenCodeVersion = opencode.ContractBaseline
-	cfg.VersionVerified = config.VersionMatches(cfg.OpenCodeVersion, config.ContractBaseline)
+	cfg.VersionVerified = config.VersionSupported(cfg.OpenCodeVersion)
 	srv := New(cfg, nil)
 	ts := httptest.NewServer(srv.mux)
 	defer ts.Close()
@@ -284,7 +284,10 @@ func TestServerStatus_VersionVerifiedReal(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 	if vv, _ := status["versionVerified"].(bool); !vv {
-		t.Errorf("versionVerified = %v, want true for matching baseline", status["versionVerified"])
+		t.Errorf("versionVerified = %v, want true for inside verified range", status["versionVerified"])
+	}
+	if cm, _ := status["contractMinVersion"].(string); cm != config.ContractMinVersion {
+		t.Errorf("contractMinVersion = %q, want %s", cm, config.ContractMinVersion)
 	}
 	if cb, _ := status["contractBaseline"].(string); cb != config.ContractBaseline {
 		t.Errorf("contractBaseline = %q, want %s", cb, config.ContractBaseline)

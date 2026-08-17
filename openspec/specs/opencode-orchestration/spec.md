@@ -79,7 +79,7 @@ serve 会话进程在健康轮询期间已死亡时 MUST 直接换端口重试�
 - **THEN** 系统创建 TUI tmux 会话，TUI 作用于本任务 worktree
 
 ### Requirement: serve 就绪等待与能力探测
-系统 SHALL 在 serve 启动后轮询 `GET /global/health`，就绪后 MUST 做能力探测（`/session/status` 响应结构与 session 列表字段形状校验；**DELETE 响应形状 MUST NOT 做 live 探测**——不能为探测制造删除副作用，首次真实删除时校验，不符报 deletion_failed）；探测通过才启动 TUI 会话。单端口尝试的健康检查超时或 serve 进程死亡 MUST 先按「端口分配策略」处置（旧会话清理、cleanup notice、换端口判定），仅当该策略判定允许换端口时才以不同端口重试；全部尝试耗尽后 MUST 判定激活失败，清理会话并回滚任务状态为挂起 + 记录 last_error。**任何能力探测失败**（含冷启动重试耗尽后的 serve 未就绪、认证失败、能力不兼容、未知错误）MUST 直接判定激活失败，MUST NOT 触发换端口重试，错误分类保持既有映射，清理会话并回滚任务状态为挂起 + 记录 last_error。opencode 版本号 MUST NOT 作为激活门禁：版本与契约基准不一致时仅告警（日志 + UI 提示），不阻止激活。
+系统 SHALL 在 serve 启动后轮询 `GET /global/health`，就绪后 MUST 做能力探测（`/session/status` 响应结构与 session 列表字段形状校验；**DELETE 响应形状 MUST NOT 做 live 探测**——不能为探测制造删除副作用，首次真实删除时校验，不符报 deletion_failed）；探测通过才启动 TUI 会话。单端口尝试的健康检查超时或 serve 进程死亡 MUST 先按「端口分配策略」处置（旧会话清理、cleanup notice、换端口判定），仅当该策略判定允许换端口时才以不同端口重试；全部尝试耗尽后 MUST 判定激活失败，清理会话并回滚任务状态为挂起 + 记录 last_error。**任何能力探测失败**（含冷启动重试耗尽后的 serve 未就绪、认证失败、能力不兼容、未知错误）MUST 直接判定激活失败，MUST NOT 触发换端口重试，错误分类保持既有映射，清理会话并回滚任务状态为挂起 + 记录 last_error。opencode 版本号 MUST NOT 作为激活门禁：版本超出已验证契约区间 [ContractMinVersion, ContractBaseline] 时仅告警（日志 + UI 提示），不阻止激活。
 
 #### Scenario: serve 启动全部尝试耗尽
 - **WHEN** 所有端口尝试均未通过健康检查（或重试预算耗尽）
@@ -134,7 +134,7 @@ serve 会话进程在健康轮询期间已死亡时 MUST 直接换端口重试�
 - **THEN** active/activating/suspending 任务显示为挂起（archived/creation_failed/deletion_failed 保持原状），无进程残留，用户可手动激活恢复
 
 ### Requirement: session 归属捕获
-系统 SHALL 订阅每个活跃 serve 的 SSE 事件流（`GET /event`）：`session.created` 事件的 sessionID 位于 `properties.info.id`（OpenCode 1.18.9 契约）；同时监听 `session.updated` 刷新 `last_seen_at`。激活后 MUST 全量对齐一次该 directory 的 session 列表。SSE 断流时 MUST 指数退避重连，重连成功后 MUST 再次全量对齐。
+系统 SHALL 订阅每个活跃 serve 的 SSE 事件流（`GET /event`）：`session.created` 事件的 sessionID 位于 `properties.info.id`（已验证契约区间 [ContractMinVersion, ContractBaseline]）；同时监听 `session.updated` 刷新 `last_seen_at`。激活后 MUST 全量对齐一次该 directory 的 session 列表。SSE 断流时 MUST 指数退避重连，重连成功后 MUST 再次全量对齐。
 
 **session 所有权规则**：一个 opencode session 至多归属一个 ocdeck 任务（该约束适用于经本变更后合法写入口产生的新归属；历史遗留的重复归属行不做启动修复，随任务删除自然清理）；任务 MUST 仅对本任务拥有的 session（`task_sessions` 中本任务的行）执行删除、attach 与对齐写回。归属写入 MUST 统一经 store 层原子 claim（单事务内"仅当 sessionID 未被其他任务拥有时插入/更新本任务行"），MUST NOT 以"先查询后 upsert"的非原子方式写归属。claim 冲突语义：SSE/对齐路径冲突 MUST 忽略该 session 并记服务端诊断日志（不阻断）；锚定创建路径冲突 MUST 使激活失败并记录 last_error，MUST NOT attach 不属本任务的 session。
 
@@ -142,7 +142,7 @@ serve 会话进程在健康轮询期间已死亡时 MUST 直接换端口重试�
 
 kind 传播 MUST 覆盖全部四个会建立 SSE/对齐/锚定的运行时入口：Activate、persist 重启恢复（resumeActive）、挂起失败的运行时修复（tryRepairRuntime）、TUI 重开（ReopenAttach）；四者在任何状态修改或运行时副作用前 MUST 解析并校验项目 kind，未知 kind MUST 报错且零副作用。ReopenAttach 的锚定 claim 冲突 MUST 返回错误并记录 last_error，任务保持 active 不收敛，MUST NOT attach 不属本任务的 session。
 
-同目录双 serve 不串流是该 SSE 归属方案的前提，已经 OpenCode 源码验证（设计阶段完成）：`/event` 订阅的是进程内 listener（`server/routes/instance/httpapi/handlers/event.ts`），事件 publish 仅 notify 本进程 PubSub（`core/event.ts`），跨进程仅可经 `sync/history` 显式拉取；该架构自 v1.16.0 起连续稳定（v1.18.9 ↔ 最新 dev 字节级一致）。若未来 OpenCode 升级引入存储级事件分发，dir 任务归属 MUST 重新评审。
+同目录双 serve 不串流是该 SSE 归属方案的前提，已经 OpenCode 源码验证（设计阶段完成）：`/event` 订阅的是进程内 listener（`server/routes/instance/httpapi/handlers/event.ts`），事件 publish 仅 notify 本进程 PubSub（`core/event.ts`），跨进程仅可经 `sync/history` 显式拉取；该架构自 v1.16.0 起连续稳定（v1.18.14 ↔ v1.18.18 锚点字节级一致；扩展区间须相邻对核验）。若未来 OpenCode 升级引入存储级事件分发，dir 任务归属 MUST 重新评审。
 
 #### Scenario: TUI 新建会话被记录
 - **WHEN** 用户在 TUI 中新建会话

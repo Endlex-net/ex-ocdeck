@@ -307,24 +307,38 @@ func emptyEnv() EnvLookup {
 	return func(string) (string, bool) { return "", false }
 }
 
-func TestCompareOCVersion(t *testing.T) {
+func TestVersionSupported(t *testing.T) {
 	cases := []struct {
 		detected string
-		baseline string
 		want     bool
 	}{
-		{"1.18.14", "1.18.14", true},
-		{"opencode 1.18.14", "1.18.14", true},
-		{"1.19.0", "1.18.14", false},
-		{"1.18.8", "1.18.14", false},
-		{"v1.18.14", "1.18.14", true},
-		{"test-1.0.0", "1.18.14", false},
+		{"1.18.14", true},
+		{"1.18.16", true},
+		{"1.18.18", true},
+		{"opencode 1.18.18", true},
+		{"v1.18.14", true},
+		{"1.18.13", false},
+		{"1.18.19", false},
+		{"1.19.0", false},
+		{"test-1.0.0", false},
+		{"1.18", false},
+		{"1x.18.14", false},
+		{"1.18x.14", false},
+		{"1.18.14-rc.1", false},
+		{"opencode 1.18.18 garbage", false},
+		{"01.18.14", false},
 	}
 	for _, c := range cases {
-		got := VersionMatches(c.detected, c.baseline)
+		got := VersionSupported(c.detected)
 		if got != c.want {
-			t.Errorf("VersionMatches(%q,%q) = %v, want %v", c.detected, c.baseline, got, c.want)
+			t.Errorf("VersionSupported(%q) = %v, want %v", c.detected, got, c.want)
 		}
+	}
+	if !VersionSupported(ContractMinVersion) {
+		t.Errorf("VersionSupported(ContractMinVersion=%q) = false, want true", ContractMinVersion)
+	}
+	if !VersionSupported(ContractBaseline) {
+		t.Errorf("VersionSupported(ContractBaseline=%q) = false, want true", ContractBaseline)
 	}
 }
 

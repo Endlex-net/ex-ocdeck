@@ -13,7 +13,7 @@ import (
 // 透出空数组（design.md D6 能力状态机）。
 var ErrCapabilityUnsupported = errors.New("opencode: capability unsupported (endpoint not available)")
 
-// PermissionRequest 是 GET /permission 返回的单条 pending 权限请求（opencode 1.18.14 契约）。
+// PermissionRequest 是 GET /permission 返回的单条 pending 权限请求（opencode 1.18.18 契约）。
 // 字段取自 permission.asked SSE 事件 payload 的可持久子集：id/sessionID/permission/patterns。
 // metadata/always/tool 等展示字段由前端经 SSE 透传，本层只保留 pending 集合所需的最小稳定字段。
 type PermissionRequest struct {
@@ -31,7 +31,7 @@ type QuestionItem struct {
 	Question string `json:"question"`
 }
 
-// QuestionRequest 是 GET /question 返回的单条 pending 问题请求（opencode 1.18.14 契约）。
+// QuestionRequest 是 GET /question 返回的单条 pending 问题请求（opencode 1.18.18 契约）。
 type QuestionRequest struct {
 	ID        string         `json:"id"`
 	SessionID string         `json:"sessionID"`
@@ -283,7 +283,7 @@ func optionalStringSliceField(props map[string]interface{}, key string) ([]strin
 	return out, true
 }
 
-// ListPermissions GET /permission?directory=<wt>（opencode 1.18.14 契约）→
+// ListPermissions GET /permission?directory=<wt>（opencode 1.18.18 契约）→
 // pending 权限请求快照。404 → ErrCapabilityUnsupported（能力状态机迁移 unsupported）。
 // 响应 200 但 null/非数组/坏元素 → 整体失败（design.md D6：whole-type degraded）。
 func (c *Client) ListPermissions(ctx context.Context, dir string) ([]PermissionRequest, error) {
@@ -311,7 +311,7 @@ func (c *Client) ListPermissions(ctx context.Context, dir string) ([]PermissionR
 	return out, nil
 }
 
-// ListQuestions GET /question?directory=<wt>（opencode 1.18.14 契约）→
+// ListQuestions GET /question?directory=<wt>（opencode 1.18.18 契约）→
 // pending 问题请求快照。404 → ErrCapabilityUnsupported。
 // 响应 200 但 null/非数组/坏元素 → 整体失败。
 func (c *Client) ListQuestions(ctx context.Context, dir string) ([]QuestionRequest, error) {

@@ -3,7 +3,7 @@
 //
 // 漂移防护策略（§11）：版本号仅告警，激活门禁是能力探测（health + /session/status
 // 结构 + session 列表字段形状；DELETE 形状不做 live 探测，首次真实删除时校验）。
-// 全部端点契约以 OpenCode 1.18.14 源码核验为基线（contract fixture 固化，见 §20），
+// 全部端点契约以 OpenCode 1.18.18 源码核验为基线（contract fixture 固化，见 §20），
 // 漂移只改本包一处。
 //
 // 仅使用标准库（net/http + bufio 手写 SSE 解析）：go.mod 由独立 lane 维护。
@@ -22,12 +22,15 @@ import (
 	"time"
 )
 
-// ContractBaseline 契约基准版本（design.md §11/§20）；仅作告警，非门禁。
-const ContractBaseline = "1.18.14"
+// ContractBaseline 已验证契约区间上限；仅作告警，非门禁；区间检查见 internal/opencode/CONTRACT.md。
+const ContractBaseline = "1.18.18"
+
+// ContractMinVersion 已验证契约区间下限；仅作告警，非门禁。
+const ContractMinVersion = "1.18.14"
 
 // Session 表示 opencode 的 session 对象。顶层字段 id、time.updated（§20，
 // session.ts:191-209，非嵌套 info.id）。额外字段以 Raw 保留原文供上层按需取用。
-// ParentID 非空表示 background subagent 子会话（1.18.14 契约：Session 有 parentID 字段，
+// ParentID 非空表示 background subagent 子会话（1.18.18 契约：Session 有 parentID 字段，
 // 子 session 非空，与主会话同 directory）；空为顶层会话（用户主会话）。
 type Session struct {
 	ID       string                 `json:"id"`
@@ -138,7 +141,7 @@ func (e Event) TimeUpdated() (float64, bool) {
 	return floatNumber(t["updated"])
 }
 
-// ParentID 从 Event 提取 properties.info.parentID（1.18.14 契约：Session 有 parentID 字段，
+// ParentID 从 Event 提取 properties.info.parentID（1.18.18 契约：Session 有 parentID 字段，
 // 子 session 非空）。用于 SSE 捕获与全量对齐时持久化 parent_id，锚定候选据此仅取顶层会话。
 // 无 parentID 字段或非 string 返回 ""（顶层会话）。
 func (e Event) ParentID() string {
