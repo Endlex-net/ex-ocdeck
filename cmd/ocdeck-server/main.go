@@ -17,9 +17,11 @@ import (
 
 	"ocdeck/internal/ai"
 	"ocdeck/internal/api"
+	apptask "ocdeck/internal/application/task"
 	"ocdeck/internal/config"
 	"ocdeck/internal/lifecycle"
 	"ocdeck/internal/process"
+	sqlite "ocdeck/internal/infrastructure/sqlite"
 	"ocdeck/internal/store"
 	"ocdeck/internal/task"
 	"ocdeck/internal/worktree"
@@ -105,6 +107,17 @@ func run() error {
 
 	// TaskManager 构造（design.md §18）。
 	adapter := task.NewStoreAdapter(db)
+	// P1.4.4/P1.4.5 wiring：sqlite adapter 实现 application ports（TaskRepository +
+	// TaskReadRepository + SessionRepository），经 application/task LifecycleService 编排
+	// Get/List/Archive/Restore 与 session claim/touch/delete/align/attention 提交位，
+	// 注入 Manager facade。NoopPublisher 阶段：不发布任何事件，事件生产挂接在 Phase C/P1.6。
+	appAdapter := sqlite.New(db)
+	lifecycleSvc := apptask.New(apptask.Options{
+		Tasks:    appAdapter,
+		Read:     appAdapter,
+		Sessions: appAdapter,
+		Publish:  apptask.NoopPublisher{},
+	})
 	tm := task.New(task.Options{
 		Cfg:             cfg,
 		Store:           adapter,
@@ -114,6 +127,7 @@ func run() error {
 		LifecycleRunner: lifecycle.New(), // design.md §7.1：init/pre-delete 脚本与 inherit
 		LogDir:          cfg.DataDir + "/logs",
 		Namer:           namer, // ai-worktree-naming：Create 经 LLM 提炼分支 slug，未配置时内部回退 Slugify
+		Lifecycle:       lifecycleSvc, // P1.4.4：Get/List/Archive/Restore 委托
 	})
 	// 注入 Manager 生命周期 context（design.md §4：SSE/退出监视挂进程 ctx，非 HTTP request ctx）。
 	tm.SetLifecycleCtx(ctx)

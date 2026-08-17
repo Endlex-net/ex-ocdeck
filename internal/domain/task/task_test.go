@@ -743,3 +743,82 @@ func TestTransitionErrorFormatting(t *testing.T) {
 		t.Fatal("Error() should not be empty")
 	}
 }
+
+// TestRehydrateGuardEquivalent 断言 Rehydrate 构造的 guard 视图与 taskAt（直接构造）
+// 在全部 guard 上决策一致：Rehydrate 不走 New 不变量，按行值直接构造，供 guard 判定。
+func TestRehydrateGuardEquivalent(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     Status
+		initStatus InitStatus
+		mode       DeleteMode
+		notices    []Notice
+	}{
+		{"suspended/none", StatusSuspended, InitStatusNone, DeleteModeNormal, nil},
+		{"suspended/pending", StatusSuspended, InitStatusPending, DeleteModeNormal, nil},
+		{"suspended/running", StatusSuspended, InitStatusRunning, DeleteModeNormal, nil},
+		{"suspended/failed", StatusSuspended, InitStatusFailed, DeleteModeNormal, nil},
+		{"succeeded", StatusSuspended, InitStatusSucceeded, DeleteModeNormal, nil},
+		{"unknown init", StatusSuspended, "bogus", DeleteModeNormal, nil},
+		{"active", StatusActive, InitStatusNone, DeleteModeNormal, nil},
+		{"archived", StatusArchived, InitStatusNone, DeleteModeNormal, nil},
+		{"creation_failed/normal", StatusCreationFailed, InitStatusNone, DeleteModeNormal, nil},
+		{"creation_failed/force", StatusCreationFailed, InitStatusNone, DeleteModeForce, nil},
+		{"deletion_failed/normal", StatusDeletionFailed, InitStatusNone, DeleteModeNormal, nil},
+		{"deletion_failed/force", StatusDeletionFailed, InitStatusNone, DeleteModeForce, nil},
+		{"deletion_failed/force/init-running", StatusDeletionFailed, InitStatusRunning, DeleteModeForce, nil},
+		{"with retryable residual notice", StatusSuspended, InitStatusNone, DeleteModeNormal,
+			[]Notice{{Code: NoticeCodeResidualProcesses, Data: NoticeData{Retryable: true}}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			direct := taskAt(c.status, c.initStatus, c.notices)
+			rh := Rehydrate(GuardView{Status: c.status, InitStatus: c.initStatus, Notices: c.notices})
+
+			if direct.CanActivate() != rh.CanActivate() {
+				t.Fatalf("CanActivate: direct=%v rehydrate=%v", direct.CanActivate(), rh.CanActivate())
+			}
+			if direct.CanSuspend() != rh.CanSuspend() {
+				t.Fatalf("CanSuspend: direct=%v rehydrate=%v", direct.CanSuspend(), rh.CanSuspend())
+			}
+			if direct.CanArchive() != rh.CanArchive() {
+				t.Fatalf("CanArchive: direct=%v rehydrate=%v", direct.CanArchive(), rh.CanArchive())
+			}
+			if direct.CanRestore() != rh.CanRestore() {
+				t.Fatalf("CanRestore: direct=%v rehydrate=%v", direct.CanRestore(), rh.CanRestore())
+			}
+			if direct.CanDelete(c.mode) != rh.CanDelete(c.mode) {
+				t.Fatalf("CanDelete(%s): direct=%v rehydrate=%v", c.mode, direct.CanDelete(c.mode), rh.CanDelete(c.mode))
+			}
+		})
+	}
+}
+
+// TestRehydrateNoticesDefensiveCopy 断言 Rehydrate 对 notices 做防御性拷贝，
+// 外部修改不污染内部集合（与 SetNotices 一致）。
+func TestRehydrateNoticesDefensiveCopy(t *testing.T) {
+	notices := []Notice{{Code: NoticeCodeSessionOverflow}}
+	rh := Rehydrate(GuardView{Status: StatusSuspended, InitStatus: InitStatusNone, Notices: notices})
+	if !rh.HasSessionOverflow() {
+		t.Fatal("Rehydrate must populate notices")
+	}
+	// 修改外部 slice 不影响内部副本（防御性拷贝）。
+	notices[0] = Notice{Code: NoticeCodeResidualProcesses}
+	if !rh.HasSessionOverflow() {
+		t.Fatal("external mutation leaked into Rehydrate view: internal copy was affected")
+	}
+}
+
+// TestRehydrateNilNotices 断言 Rehydrate 接受 nil notices 且 guard 行为与空集合一致。
+func TestRehydrateNilNotices(t *testing.T) {
+	rh := Rehydrate(GuardView{Status: StatusSuspended, InitStatus: InitStatusNone})
+	if rh.HasRetryableResidual() {
+		t.Fatal("nil notices must not report retryable residual")
+	}
+	if rh.HasSessionOverflow() {
+		t.Fatal("nil notices must not report session overflow")
+	}
+	if !rh.CanActivate() {
+		t.Fatal("suspended/none/nil-notices must CanActivate")
+	}
+}

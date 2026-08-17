@@ -202,7 +202,7 @@ func TestP4_SSEFirstAlignInProgressReconnectSerializes(t *testing.T) {
 	}
 
 	// Activate 返回仅意味着首次 align + drainAndRelease 完成；reconnect align 在 SSE goroutine 内异步执行，
-	// 需等其 AlignSessions 落库（listCalls==2 且 inflight==0）后再断言最终状态。
+	// 需等其 AlignTaskSessions 落库（listCalls==2 且 inflight==0）后再断言最终状态。
 	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if base.listCalls.Load() == 2 && base.inflight.Load() == 0 {

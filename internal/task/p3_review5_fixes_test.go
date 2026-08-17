@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"ocdeck/internal/application/runtime"
 	"ocdeck/internal/config"
 	"ocdeck/internal/opencode"
 	"ocdeck/internal/process"
@@ -42,12 +43,18 @@ func TestConvergeToSuspended_LockBusyWaitsThenConverges(t *testing.T) {
 	if lerr != nil {
 		t.Fatalf("prereq tryLockTask: %v", lerr)
 	}
+	// P1.4.7：触发令牌 = Activate 后当前 runtime 令牌（watcher 注册时捕获的同一身份）。
+	rt := m.getRuntime("t1")
+	if rt == nil {
+		t.Fatal("prereq runtime missing after Activate")
+	}
+	tok := runtime.RuntimeToken{InstanceID: rt.instanceID, Generation: rt.generation}
 
 	// 触发 serve 退出事件（fatal runtime event）：convergeToSuspended 应阻塞等锁，不立即返回。
 	var converged atomic.Bool
 	go func() {
 		// convergeToSuspended 阻塞等锁；释放锁后收敛。
-		m.handleServeExit("t1")
+		m.handleServeExit("t1", tok)
 		converged.Store(true)
 	}()
 

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"ocdeck/internal/application"
+	"ocdeck/internal/application/runtime"
 	"ocdeck/internal/config"
 	"ocdeck/internal/opencode"
 	"ocdeck/internal/process"
@@ -402,7 +403,11 @@ func TestP4Rereview_ConvergeToSuspended_CleanupInfraError_FormsRetryableDebt(t *
 	proc.hasSessionErr = errors.New("tmux infra: has session failed")
 	m := newR7TestManager(t, s, proc, newMockWorktree(), newMockOC(true))
 
-	m.convergeToSuspended("t1", "test converge fail-closed")
+	// P1.4.7：converge 统一携带触发令牌（design.md D0:150）——构造 runtime 并以其令牌触发。
+	rt := m.newRuntime("t1")
+	m.setRuntime("t1", rt)
+	m.convergeToSuspended("t1", "test converge fail-closed",
+		runtime.RuntimeToken{InstanceID: rt.instanceID, Generation: rt.generation})
 	// MUST 收敛到 suspended。
 	assertStatus(t, s, "t1", StatusSuspended)
 	// MUST 记 retryable notice（cleanup infra 错误形成可重试 debt）。
@@ -442,7 +447,11 @@ func TestP4Rereview_ConvergeToSuspended_StatusCommitFailure_LogsAndDoesNotSilent
 	errStore := wrapStatusErr(s, errors.New("db: status commit failed"))
 	m := newR7TestManager(t, errStore, proc, newMockWorktree(), newMockOC(true))
 
-	m.convergeToSuspended("t1", "test status commit failure")
+	// P1.4.7：converge 统一携带触发令牌——构造 runtime 并以其令牌触发。
+	rt := m.newRuntime("t1")
+	m.setRuntime("t1", rt)
+	m.convergeToSuspended("t1", "test status commit failure",
+		runtime.RuntimeToken{InstanceID: rt.instanceID, Generation: rt.generation})
 	// 状态提交失败 → DB 仍 active（未落 suspended）。
 	assertStatus(t, s, "t1", StatusActive)
 	// 既有 notice MUST NOT 被移除。

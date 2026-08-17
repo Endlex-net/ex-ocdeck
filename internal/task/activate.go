@@ -13,6 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"ocdeck/internal/application/runtime"
+	apptask "ocdeck/internal/application/task"
+	ocdecksess "ocdeck/internal/domain/session"
 	"ocdeck/internal/opencode"
 	"ocdeck/internal/process"
 )
@@ -264,24 +267,30 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 	// init_status 门禁（design.md §5，tasks 3.5）：none|succeeded → 放行；
 	// pending|running → invalid_state "init in progress"；failed → invalid_state 含 init_error；
 	// 未知/空值 → invalid_state fail-closed。
-	switch row.InitStatus {
-	case InitStatusNone, InitStatusSucceeded:
-		// 放行。
-	case InitStatusPending, InitStatusRunning:
-		return newOpErr(codeInvalidState, fmt.Errorf("task %s init in progress (init_status=%s)", taskID, row.InitStatus))
-	case InitStatusFailed:
-		msg := fmt.Sprintf("init failed: %s", row.InitError.String)
-		if !row.InitError.Valid || row.InitError.String == "" {
-			msg = "init failed"
+	//
+	// guard 委托 domain/task.CanActivate（design D0 P1.4.2 strangler 第二步）：本处仅委托
+	// init_status 五分支决策——status 已在上游校验为 suspended、notice 已在 hasRetryableNotice
+	// 校验为无阻断，故 rehydrateGuardView(row) 构造的 domain 视图 notices 为空，
+	// CanActivate 仅由 init_status 决定（fail-closed on 未知值）。
+	// 委托前后行为 byte-equivalent：guard 拒绝时按现状分支模板生成错误消息。
+	if !rehydrateGuardView(row).CanActivate() {
+		switch row.InitStatus {
+		case InitStatusPending, InitStatusRunning:
+			return newOpErr(codeInvalidState, fmt.Errorf("task %s init in progress (init_status=%s)", taskID, row.InitStatus))
+		case InitStatusFailed:
+			msg := fmt.Sprintf("init failed: %s", row.InitError.String)
+			if !row.InitError.Valid || row.InitError.String == "" {
+				msg = "init failed"
+			}
+			msg += "；修复脚本后 Re-run"
+			return newOpErr(codeInvalidState, errors.New(msg))
+		default:
+			return newOpErr(codeInvalidState, fmt.Errorf("task %s unknown init_status %q", taskID, row.InitStatus))
 		}
-		msg += "；修复脚本后 Re-run"
-		return newOpErr(codeInvalidState, errors.New(msg))
-	default:
-		return newOpErr(codeInvalidState, fmt.Errorf("task %s unknown init_status %q", taskID, row.InitStatus))
 	}
 
 	// ① 置 activating。
-	updated, err := m.store.UpdateTaskStatusConditional(ctx, taskID, StatusSuspended, StatusActivating, sql.NullString{})
+	updated, err := m.writeStatusConditional(ctx, taskID, StatusSuspended, StatusActivating, sql.NullString{})
 	if err != nil {
 		return newOpErr(codeInternal, err)
 	}
@@ -299,7 +308,7 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 		return err
 	}
 	// 提交点：active。提交失败补偿（杀已建会话回 suspended，B5）。
-	if _, err := m.store.UpdateTaskStatus(ctx, taskID, StatusActive, sql.NullString{}); err != nil {
+	if _, err := m.writeStatus(ctx, taskID, StatusActive, sql.NullString{}); err != nil {
 		commitErr := fmt.Errorf("commit active: %w", err)
 		m.runActivateFailureCompensation(ctx, taskID, commitErr)
 		return newOpErr(codeInternal, err)
@@ -355,7 +364,7 @@ func (m *Manager) runActivateFailureCompensation(reqCtx context.Context, taskID 
 	finalCtx, finalCancel := context.WithTimeout(context.WithoutCancel(reqCtx), activateCompensationFinalizeTimeout)
 	defer finalCancel()
 
-	if _, err := m.store.UpdateTaskEnvSnapshot(finalCtx, taskID, sql.NullString{}); err != nil {
+	if _, err := m.writeEnvSnapshot(finalCtx, taskID, sql.NullString{}); err != nil {
 		log.Printf("activate: clear env snapshot for task %s: %v", taskID, err)
 	}
 	le := sql.NullString{String: cause.Error(), Valid: true}
@@ -369,7 +378,7 @@ func (m *Manager) runActivateFailureCompensation(reqCtx context.Context, taskID 
 	if agg != cause {
 		le = sql.NullString{String: agg.Error(), Valid: true}
 	}
-	updated, err := m.store.UpdateTaskStatusConditional(finalCtx, taskID, StatusActivating, StatusSuspended, le)
+	updated, err := m.writeStatusConditional(finalCtx, taskID, StatusActivating, StatusSuspended, le)
 	if err != nil {
 		log.Printf("activate: rollback activating→suspended for task %s: %v", taskID, err)
 		return
@@ -474,7 +483,7 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 		return err
 	}
 	// 端口写回 DB（仅记录，非事实来源，design.md §3）。B7b：写入错误不得忽略。
-	if _, err := m.store.UpdateTaskLastPort(ctx, taskID, port); err != nil {
+	if _, err := m.writeLastPort(ctx, taskID, port); err != nil {
 		// 端口写回失败非致命（last_port 仅交叉校验），但不得静默吞错。
 		// serve 已起在 port，继续后续流程；记录日志供运维感知。
 		log.Printf("activate: update last port for task %s: %v (serve running on %d)", taskID, err, port)
@@ -946,7 +955,7 @@ func (m *Manager) persistEnvSnapshot(ctx context.Context, taskID string, merged 
 	if err != nil {
 		return fmt.Errorf("marshal env snapshot: %w", err)
 	}
-	if _, err := m.store.UpdateTaskEnvSnapshot(ctx, taskID, sql.NullString{String: string(b), Valid: true}); err != nil {
+	if _, err := m.writeEnvSnapshot(ctx, taskID, sql.NullString{String: string(b), Valid: true}); err != nil {
 		return fmt.Errorf("persist env snapshot: %w", err)
 	}
 	return nil
@@ -991,7 +1000,7 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 	// align 串行化屏障（design.md §4）：任一时刻最多一个 align 在执行（首次 align + reconnect align 互斥）。
 	// 首次 align 进行中若断流，onReconnect MUST 排队等待（合并为一次重对齐），MUST NOT 并发清空 buffered
 	// 造成事件丢失/乱序。等待期间 buffering 保持 true，事件继续缓冲；待 align 释放后 reconnect 重新全量对齐
-	//（丢弃半成品状态安全，AlignSessions 幂等 upsert）。
+	//（丢弃半成品状态安全，AlignTaskSessions 幂等 upsert）。
 	var alignMu sync.Mutex
 
 	// drainAndRelease 排空全部缓冲事件再置 buffering=false 放行实时事件（design.md §4：
@@ -1135,16 +1144,26 @@ func (m *Manager) handleSSEEvent(ctx context.Context, taskID, wtPath string, ev 
 		}
 		if ev.Type == "session.updated" {
 			// D8：session.updated 仅刷新本任务已归属行的 last_seen_at，绝不创建归属。
-			// 未归属 session 的 updated 一律忽略（updated=false 正常路径，记 debug 不报错）。
+			// 未归属 session 的 updated 一律忽略（!Matched 正常路径，记 debug 不报错）。
 			updatedTS, hasTS := ev.TimeUpdated()
 			if !hasTS {
 				return nil
 			}
-			updated, uerr := m.store.TouchOwnedTaskSession(ctx, taskID, sid, int64(updatedTS))
+			if m.lifecycle != nil {
+				res, uerr := m.lifecycle.TouchOwnedSession(ctx, taskID, ocdecksess.ID(sid), int64(updatedTS))
+				if uerr != nil {
+					return fmt.Errorf("touch owned session %s: %w", sid, uerr)
+				}
+				if !res.Matched {
+					log.Printf("task %s: session.updated for unowned session %s; ignoring", taskID, sid)
+				}
+				return nil
+			}
+			res, uerr := m.store.TouchOwnedTaskSession(ctx, taskID, sid, int64(updatedTS))
 			if uerr != nil {
 				return fmt.Errorf("touch owned session %s: %w", sid, uerr)
 			}
-			if !updated {
+			if !res.Matched {
 				log.Printf("task %s: session.updated for unowned session %s; ignoring", taskID, sid)
 			}
 			return nil
@@ -1155,13 +1174,28 @@ func (m *Manager) handleSSEEvent(ctx context.Context, taskID, wtPath string, ev 
 			createdAt = int64(updated)
 			lastSeen = int64(updated)
 		}
-		claimed, owner, cerr := m.store.ClaimTaskSession(ctx, taskID, sid, createdAt, nowUnixI(), lastSeen, ev.ParentID())
+		if m.lifecycle != nil {
+			obs := ocdecksess.Observation{
+				ID: ocdecksess.ID(sid), ParentID: ev.ParentID(),
+				CreatedAt: createdAt, UpdatedAt: lastSeen, FirstSeenAt: nowUnixI(),
+			}
+			cres, cerr := m.lifecycle.ClaimSession(ctx, taskID, obs)
+			if cerr != nil {
+				return fmt.Errorf("claim session %s: %w", sid, cerr)
+			}
+			if !cres.Claimed {
+				log.Printf("task %s: sse session.created for session %s conflict (owned by task %s); skipping",
+					taskID, sid, cres.OwnerTaskID)
+			}
+			return nil
+		}
+		cres, cerr := m.store.ClaimTaskSession(ctx, taskID, sid, createdAt, nowUnixI(), lastSeen, ev.ParentID())
 		if cerr != nil {
 			return fmt.Errorf("claim session %s: %w", sid, cerr)
 		}
-		if !claimed {
+		if !cres.Claimed {
 			log.Printf("task %s: sse session.created for session %s conflict (owned by task %s); skipping",
-				taskID, sid, owner)
+				taskID, sid, cres.OwnerTaskID)
 		}
 	case "session.deleted":
 		sid := ev.SessionID()
@@ -1175,31 +1209,52 @@ func (m *Manager) handleSSEEvent(ctx context.Context, taskID, wtPath string, ev 
 				taskID, ev.Type, sid, dir, ok, wtPath)
 			return nil
 		}
-		if err := m.store.DeleteTaskSession(ctx, taskID, sid); err != nil {
+		if m.lifecycle != nil {
+			if _, err := m.lifecycle.DeleteOwnedSession(ctx, taskID, ocdecksess.ID(sid)); err != nil {
+				return fmt.Errorf("delete session %s: %w", sid, err)
+			}
+			return nil
+		}
+		if _, err := m.store.DeleteTaskSession(ctx, taskID, sid); err != nil {
 			return fmt.Errorf("delete session %s: %w", sid, err)
 		}
 	default:
 		// D6 注意力事件：permission/question v1+v2 家族。ParseAttentionEvent 命中则应用，
 		// 未知/缺字段静默忽略。注意力事件处理永不返回错误（不影响任务状态机）。
+		// P1.4.5：apply 返回 changed，经 commit helper 发布 serve_runtime.attention_changed
+		//（NoopPublisher 阶段调用位就绪无实际发布）。
 		if aev, ok := opencode.ParseAttentionEvent(ev); ok {
 			if rt := m.getRuntime(taskID); rt != nil {
-				rt.applyAttentionEvent(aev)
+				if rt.applyAttentionEvent(aev) {
+					m.commitAttentionChanged(taskID, rt, true)
+				}
 			}
 			return nil
 		}
 		// B3b：status/diff 等无 properties.info 的事件，sessionID 取 properties.sessionID
 		//（VERIFICATION.md 实测，回退 properties.info.id），反查 task_sessions 归属，
 		// 命中本任务才处理（design.md §4 补注）。未命中本任务的 session 不动本任务数据。
+		// 历史重复归属 fail-closed：OwnerOf 返回 typed ambiguity error（design D0）。
 		sid := ev.SessionIDProp()
 		if sid == "" {
 			return nil
 		}
-		owns, err := m.sessionBelongsToTask(ctx, taskID, sid)
-		if err != nil {
-			return fmt.Errorf("check session ownership %s: %w", sid, err)
-		}
-		if !owns {
-			return nil
+		if m.lifecycle != nil {
+			owner, found, err := m.lifecycle.OwnerOf(ctx, ocdecksess.ID(sid))
+			if err != nil {
+				return fmt.Errorf("check session ownership %s: %w", sid, err)
+			}
+			if !found || owner != taskID {
+				return nil
+			}
+		} else {
+			owns, err := m.sessionBelongsToTask(ctx, taskID, sid)
+			if err != nil {
+				return fmt.Errorf("check session ownership %s: %w", sid, err)
+			}
+			if !owns {
+				return nil
+			}
 		}
 	}
 	return nil
@@ -1223,12 +1278,16 @@ func (m *Manager) sessionBelongsToTask(ctx context.Context, taskID, sid string) 
 // alignSessions 全量对齐（design.md §4 + add-plain-dir-project D8）：
 // GET /session?directory=<wt>&limit=1000。count<limit → complete=true（删 owned 缺席行）；
 // count==limit → overflow，complete=false，先经事务外 CAS 写 session_overflow notice 再调对齐
-// （对齐失败 notice 保留，B5）。
+//（对齐失败 notice 保留，B5）。
 //
 // mode=AlignModeRepo：listed 逐个原子 claim（单任务场景 guard 不命中，行为与既有 upsert 一致），
-// 冲突 ID 经 store 层上报（此处仅传播 error，冲突 session 在 store 内被跳过）。
-// mode=AlignModeOwnedOnly（dir）：仅对 listed∩owned 刷新 last_seen_at（store 层处理），绝不 claim。
+// 冲突 ID 经 align 编排上报日志（冲突 session 在事务内被跳过）。
+// mode=AlignModeOwnedOnly（dir）：仅对 listed∩owned 刷新 last_seen_at，绝不 claim。
 // complete/overflow 判定 MUST 基于原始目录列表（过滤之前，D8 算法第 1 步）。
+//
+// P1.4.5：注入 LifecycleService 时委托（overflow 前置 CAS + complete notice 决策随事务 +
+// AlignConflict 有界重试统一在 application/task.RunAlign）；未注入时经 storeAlignPortsAdapter
+// 共用同一编排（TaskStore 支撑的窄端口）。
 //
 // 返回 error（不吞，B5）：非 overflow 错误传播；AlignTaskSessions store 错误传播。
 func (m *Manager) alignSessions(ctx context.Context, taskID, wtPath string, oc OCClient, mode AlignMode) error {
@@ -1238,50 +1297,25 @@ func (m *Manager) alignSessions(ctx context.Context, taskID, wtPath string, oc O
 		// 溢出（count==limit）仅刷新不删缺席行，写 session_overflow notice（B5）。
 		if isOverflow(err) {
 			complete = false
-			if oerr := m.recordSessionOverflowNotice(ctx, taskID); oerr != nil {
-				// notice 写入错误 MUST 处理（聚合，不静默，design.md §8）。
-				return fmt.Errorf("session overflow notice: %w", oerr)
-			}
 		} else {
 			return fmt.Errorf("list sessions: %w", err)
 		}
 	}
-	obs := make([]SessionObservation, 0, len(sessions))
+	obs := make([]ocdecksess.Observation, 0, len(sessions))
 	for _, s := range sessions {
-		obs = append(obs, SessionObservation{
-			SessionID: s.ID,
+		obs = append(obs, ocdecksess.Observation{
+			ID:        ocdecksess.ID(s.ID),
+			ParentID:  s.ParentID,
 			CreatedAt: int64(s.Time.Created),
 			UpdatedAt: int64(s.Time.Updated),
-			ParentID:  s.ParentID,
 		})
 	}
-	// 完整对齐时清除 session_overflow notice（design.md §4）。
-	var noticeFn func(sql.NullString) sql.NullString
-	if complete {
-		noticeFn = func(cur sql.NullString) sql.NullString {
-			entries, perr := parseNotices(cur)
-			if perr != nil {
-				return cur // 损坏不动
-			}
-			out := entries[:0]
-			for _, e := range entries {
-				if e.Code != noticeCodeSessionOverflow {
-					out = append(out, e)
-				}
-			}
-			return encodeNotices(out)
-		}
-	}
-	conflicts, aerr := m.store.AlignTaskSessions(ctx, taskID, mode, obs, complete, noticeFn)
-	if aerr != nil {
+	if m.lifecycle != nil {
+		_, aerr := m.lifecycle.AlignSessions(ctx, taskID, toDomainAlignMode(mode), obs, complete)
 		return aerr
 	}
-	// repo/dir 对齐路径冲突 → 忽略 + 记诊断日志（不阻断，D8）。dir 模式无 claim 故无冲突；
-	// repo 单任务场景 guard 不命中，conflicts 为空。
-	for _, sid := range conflicts {
-		log.Printf("task %s: align session %s conflict (owned by other task); skipping", taskID, sid)
-	}
-	return nil
+	_, aerr := apptask.RunAlign(ctx, storeAlignPortsAdapter{store: m.store}, taskID, toDomainAlignMode(mode), obs, complete)
+	return aerr
 }
 
 // startTUI 锚定确定 session 并创建 TUI 会话（design.md §4 恢复与锚定）。
@@ -1351,14 +1385,30 @@ func (m *Manager) resolveAnchorSession(ctx context.Context, oc OCClient, row Tas
 	}
 	// D8：原子 claim 归属（锚定创建路径冲突 → 激活失败，MUST NOT attach 不属本任务的 session）。
 	// 新建 session 理论上必不冲突，但 claim 冲突（边界）时返回错误以避免归属不一致。
-	claimed, owner, perr := m.store.ClaimTaskSession(ctx, row.ID, created.ID,
+	if m.lifecycle != nil {
+		obs := ocdecksess.Observation{
+			ID: ocdecksess.ID(created.ID), ParentID: "",
+			CreatedAt: int64(created.Time.Created), UpdatedAt: int64(created.Time.Updated),
+			FirstSeenAt: int64(created.Time.Updated),
+		}
+		cres, perr := m.lifecycle.ClaimSession(ctx, row.ID, obs)
+		if perr != nil {
+			// store 错误：已建 session 可经后续全量对齐补记，但当前激活 MUST 失败以避免归属不一致。
+			return "", fmt.Errorf("persist anchor session %s: %w", created.ID, perr)
+		}
+		if !cres.Claimed {
+			return "", fmt.Errorf("anchor session %s conflict (owned by task %s); MUST NOT attach", created.ID, cres.OwnerTaskID)
+		}
+		return created.ID, nil
+	}
+	cres, perr := m.store.ClaimTaskSession(ctx, row.ID, created.ID,
 		int64(created.Time.Created), int64(created.Time.Updated), int64(created.Time.Updated), "")
 	if perr != nil {
 		// store 错误：已建 session 可经后续全量对齐补记，但当前激活 MUST 失败以避免归属不一致。
 		return "", fmt.Errorf("persist anchor session %s: %w", created.ID, perr)
 	}
-	if !claimed {
-		return "", fmt.Errorf("anchor session %s conflict (owned by task %s); MUST NOT attach", created.ID, owner)
+	if !cres.Claimed {
+		return "", fmt.Errorf("anchor session %s conflict (owned by task %s); MUST NOT attach", created.ID, cres.OwnerTaskID)
 	}
 	return created.ID, nil
 }
@@ -1371,6 +1421,9 @@ func (m *Manager) resolveAnchorSession(ctx context.Context, oc OCClient, row Tas
 //   - WatchEventSessionExit → handleServeExit（serve_exit 语义）；
 //   - WatchEventInfraError（tmux 持续故障）→ handleInfraError（记录 last_error + notice + 收敛运行时，
 //     不得静默）。
+//
+// P1.4.7（design.md D0:150）：注册时捕获触发 RuntimeToken 并贯穿传递给 converge——
+// 触发令牌是注册/回调校验时刻的身份，不得在等锁后重读 runtime 顶替。
 func (m *Manager) watchServeExit(taskID, serveName string) {
 	gen := 0
 	inst := ""
@@ -1378,6 +1431,7 @@ func (m *Manager) watchServeExit(taskID, serveName string) {
 		gen = rt.generation
 		inst = rt.instanceID
 	}
+	tok := runtime.RuntimeToken{InstanceID: inst, Generation: gen}
 	cancel, done := m.proc.WatchExit(serveName, func(ev process.WatchEvent) {
 		// 校验当前 runtime 注册表（非注册时捕获的 rt）。
 		cur := m.getRuntime(taskID)
@@ -1386,9 +1440,9 @@ func (m *Manager) watchServeExit(taskID, serveName string) {
 		}
 		switch ev.Type {
 		case process.WatchEventSessionExit:
-			m.handleServeExit(taskID)
+			m.handleServeExit(taskID, tok)
 		case process.WatchEventInfraError:
-			m.handleInfraError(taskID, serveName, ev.Err)
+			m.handleInfraError(taskID, serveName, ev.Err, tok)
 		}
 	})
 	if cur := m.getRuntime(taskID); cur != nil {
@@ -1411,6 +1465,7 @@ func (m *Manager) watchTUIExit(taskID, tuiName string) {
 		gen = rt.generation
 		inst = rt.instanceID
 	}
+	tok := runtime.RuntimeToken{InstanceID: inst, Generation: gen}
 	cancel, done := m.proc.WatchExit(tuiName, func(ev process.WatchEvent) {
 		cur := m.getRuntime(taskID)
 		if cur == nil || !cur.matchesRegistry(gen, tuiName, inst) {
@@ -1422,7 +1477,7 @@ func (m *Manager) watchTUIExit(taskID, tuiName string) {
 			// 从注册表移除 TUI group；ReopenAttach 由 WS/REST 触发重建。
 			cur.removeGroup(tuiName)
 		case process.WatchEventInfraError:
-			m.handleInfraError(taskID, tuiName, ev.Err)
+			m.handleInfraError(taskID, tuiName, ev.Err, tok)
 		}
 	})
 	if cur := m.getRuntime(taskID); cur != nil {
@@ -1435,78 +1490,50 @@ func (m *Manager) watchTUIExit(taskID, tuiName string) {
 
 // handleServeExit serve 异常消失（非挂起路径）→ 完整清理运行时 → suspended + last_error。
 // 清除 env snapshot 与 shell（design.md §2/§4：serve 异常退出清快照）。
-func (m *Manager) handleServeExit(taskID string) {
-	m.convergeToSuspended(taskID, "serve session exited unexpectedly")
+// P1.4.7：tok 为 watcher 注册时捕获的触发令牌（design.md D0:150 令牌贯穿）。
+func (m *Manager) handleServeExit(taskID string, tok runtime.RuntimeToken) {
+	m.convergeToSuspended(taskID, "serve session exited unexpectedly", tok)
 }
 
 // convergeToSuspended 收敛活跃任务到 suspended（design.md §4：不得留 active 但无 SSE 托管的运行时）。
-// 非 SSE 路径（serve_exit watcher、handleInfraError）—— gen 校验已由调用方 matchesRegistry 完成，
-// 此处不做 gen 隔离校验。
-func (m *Manager) convergeToSuspended(taskID, reason string) {
-	m.convergeToSuspendedChecked(taskID, reason, 0, "", false)
+// 非 SSE 路径（serve_exit watcher、handleInfraError）——令牌校验在 convergeToSuspendedChecked
+// 内统一完成（拿锁后按触发令牌比对当前 runtime，含 watcher 路径）。
+func (m *Manager) convergeToSuspended(taskID, reason string, tok runtime.RuntimeToken) {
+	m.convergeToSuspendedChecked(taskID, reason, tok)
 }
 
-// convergeToSuspendedForGen 同 convergeToSuspended，但携带触发事件的 (generation, instanceID)
-// 并做 gen 隔离校验（SSE 路径专用）。拿锁后 MUST 校验与当前 runtime 注册表匹配：旧代延迟错误
-// （SSE goroutine 排队等锁期间任务被 Suspend→重新 Activate 换代）MUST NOT 清理新代 runtime
-// （design.md §2 三元组隔离）。校验不通过时记录日志并返回（新代 runtime 不受旧代延迟错误影响）。
+// convergeToSuspendedForGen 同 convergeToSuspended，SSE 路径专用：以触发事件的
+// (generation, instanceID) 构造 RuntimeToken 进入统一收敛入口。
 func (m *Manager) convergeToSuspendedForGen(taskID, reason string, gen int, instID string) {
-	m.convergeToSuspendedChecked(taskID, reason, gen, instID, true)
+	m.convergeToSuspendedChecked(taskID, reason, runtime.RuntimeToken{InstanceID: instID, Generation: gen})
 }
 
-func (m *Manager) convergeToSuspendedChecked(taskID, reason string, gen int, instID string, checkGen bool) {
+// convergeToSuspendedChecked 统一收敛入口（watcher/SSE 路径一致携带触发令牌，
+// design.md D0:150）。拿锁后校验当前 runtime 令牌仍等于触发令牌——旧代延迟回调
+//（等锁期间任务被 Suspend→重新 Activate 换代）MUST NOT 清理新代 runtime（design.md §2
+// 三元组隔离）。锁等待超时不再无锁清理/CAS（design.md D0:151 替换行为）：仅按触发令牌
+// 登记两阶段债务，由 backgroundLoop worker 持锁消化（converge_debt.go）。
+func (m *Manager) convergeToSuspendedChecked(taskID, reason string, tok runtime.RuntimeToken) {
 	unlock, err := m.lockTaskForConverge(taskID)
 	if err != nil {
-		// 锁等待超时：尽力 best-effort 清理（不持锁，仍清残留 + 落 last_error），不静默。
-		// gen 校验在无锁路径无法可靠执行（runtime 可能已被清理/替换），降级为 best-effort 收敛。
-		ctx := context.Background()
-		_ = m.cleanupActivationRuntime(ctx, taskID)
-		_, _ = m.store.UpdateTaskEnvSnapshot(ctx, taskID, sql.NullString{})
-		le := sql.NullString{String: fmt.Sprintf("%s; converge lock wait timed out: %v", reason, err), Valid: true}
-		_, _ = m.store.UpdateTaskStatusConditional(ctx, taskID, StatusActive, StatusSuspended, le)
+		m.onConvergeLockTimeout(taskID, reason, tok)
 		return
 	}
 	defer unlock()
-	// P4 复评阻塞 4：SSE 路径（checkGen=true）校验当前 runtime 仍为触发代（三元组隔离）。
-	// 旧代延迟回调（等锁期间 Suspend→重新 Activate）MUST NOT 清理新代 runtime。
-	// gen=0 是首代合法值，需与当前 runtime 的 gen 匹配；instID 为本代唯一标识，不匹配即旧代。
-	if checkGen {
-		rt := m.getRuntime(taskID)
-		curGen, curInst := -1, "<nil>"
-		if rt != nil {
-			curGen, curInst = rt.generation, rt.instanceID
-		}
-		if rt == nil || curGen != gen || curInst != instID {
-			log.Printf("convergeToSuspended: stale gen callback (task %s gen=%d inst=%s) skipped; current gen=%d inst=%s",
-				taskID, gen, instID, curGen, curInst)
-			return
-		}
+	// 触发令牌隔离（统一原 SSE checkGen 路径与 watcher 路径）：当前 runtime 为 nil 或令牌
+	// 不匹配 → 旧代延迟回调，跳过收敛（不清理新代/已清 runtime）。
+	if rt := m.getRuntime(taskID); rt == nil || rt.instanceID != tok.InstanceID || rt.generation != tok.Generation {
+		log.Printf("convergeToSuspended: stale token callback (task %s gen=%d inst=%s) skipped",
+			taskID, tok.Generation, tok.InstanceID)
+		return
 	}
 	ctx := context.Background()
 	// 停 SSE + kill tui/shell 会话。notice 持久化失败聚合进 last_error（不静默，design.md §8）。
 	// cleanupActivationRuntime 内部 fail-closed 记 retryable notice（P4 复评阻塞 5）。
 	cleanupErr := m.cleanupActivationRuntime(ctx, taskID)
-	// 清除 env 快照（design.md §2：运行时不可恢复时清快照）。
-	// P4 复评阻塞 5：env 快照写回错误聚合进 last_error，不静默吞错。
-	_, envErr := m.store.UpdateTaskEnvSnapshot(ctx, taskID, sql.NullString{})
-	le := sql.NullString{String: reason, Valid: true}
-	if cleanupErr != nil {
-		le = sql.NullString{String: fmt.Sprintf("%s; cleanup notice: %v", reason, cleanupErr), Valid: true}
-	}
-	if envErr != nil {
-		le = sql.NullString{String: fmt.Sprintf("%s; clear env snapshot: %v", le.String, envErr), Valid: true}
-	}
-	// P4 复评阻塞 5：状态提交失败 MUST NOT 静默——runtime 注册表已由 cleanupActivationRuntime
-	// 清除（停 SSE/watcher），但状态未变意味着 DB 仍 active 但无 runtime。记 last_error 让用户/
-	// 后台感知；DB 故障下保持 active+last_error（下次 reconcile/converge 再试），不得移除既有 notice。
-	committed, statusErr := m.store.UpdateTaskStatusConditional(ctx, taskID, StatusActive, StatusSuspended, le)
-	if statusErr != nil {
-		log.Printf("convergeToSuspended: commit suspended failed (task %s): %v; last_error=%s", taskID, statusErr, le.String)
-	}
-	if !committed.Matched && statusErr == nil {
-		// 状态已非 active（并发 Suspend/Delete 等），无需再落 suspended。
-		log.Printf("convergeToSuspended: task %s no longer active (concurrent transition)", taskID)
-	}
+	// 清除 env 快照 + active→suspended CAS + D2 嵌套决策表（converge_debt.go）。
+	// env 快照写回错误聚合进 last_error，不静默吞错（P4 复评阻塞 5）。
+	m.convergeCommitCAS(ctx, taskID, reason, tok, cleanupErr)
 }
 
 // handleInfraError 处理 tmux 持续基础设施故障（C1：infra_error 明确处理路径，不得静默）。
@@ -1514,9 +1541,10 @@ func (m *Manager) convergeToSuspendedChecked(taskID, reason string, gen int, ins
 // 处理：取得任务锁 → 完整清理运行时（停 SSE/watcher + kill 残余会话，记 residual notice）
 // → 记 last_error（含底层 infra 错误）→ 落 suspended。
 // 不静默：last_error 与 notice 均落库，供用户与后台周期感知。
-func (m *Manager) handleInfraError(taskID, sessionName string, infraErr error) {
+// P1.4.7：tok 为 watcher 注册时捕获的触发令牌（design.md D0:150 令牌贯穿）。
+func (m *Manager) handleInfraError(taskID, sessionName string, infraErr error, tok runtime.RuntimeToken) {
 	reason := fmt.Sprintf("tmux infra error watching %s: %v", sessionName, infraErr)
-	m.convergeToSuspended(taskID, reason)
+	m.convergeToSuspended(taskID, reason, tok)
 }
 
 // cleanupActivationRuntime 清理激活过程中已建的会话（失败补偿）。

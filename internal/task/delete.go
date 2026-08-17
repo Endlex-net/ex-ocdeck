@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"time"
 
+	ocdecksess "ocdeck/internal/domain/session"
+	ocdecktask "ocdeck/internal/domain/task"
 	"ocdeck/internal/opencode"
 	"ocdeck/internal/process"
 )
@@ -35,16 +37,18 @@ func (m *Manager) Delete(ctx context.Context, taskID string, mode DeleteMode, co
 	if err != nil {
 		return newOpErr(codeNotFound, fmt.Errorf("task not found: %w", err))
 	}
-	// 前置检查：状态须允许删除。
+	// guard 委托 domain/task.CanDelete(mode)（design D0 P1.4.2 strangler 第二步）。
 	// gating MUST 与持久化 delete_mode 一致（design.md §19）：
 	//   - Normal：状态 ∈ {suspended, archived, creation_failed}（deletion_failed 不得直接重入 Normal 流程，
 	//     必须经 Retry 按 persisted force mode 强制删除，避免 Normal 跳过已失败步骤的资源清理）。
 	//   - Force：状态 ∈ {suspended, archived, creation_failed, deletion_failed}（强制删除 MUST 接受 deletion_failed）。
-	if !deleteAllowedStatus(row.Status, mode) {
-		return newOpErr(codeInvalidState, fmt.Errorf("delete not allowed from %s with mode %s", row.Status, mode))
-	}
-	// init_status 门禁（design.md tasks 3.7）：init 进行中拒绝删除。
-	if row.InitStatus == InitStatusPending || row.InitStatus == InitStatusRunning {
+	//   - init 进行中两者均拒绝；未知 mode/未知 status fail-closed 拒绝。
+	// 委托前后行为 byte-equivalent：guard 拒绝时按现状维度顺序生成错误（status/mode 优先，init 次之）。
+	if !rehydrateGuardView(row).CanDelete(ocdecktask.DeleteMode(mode)) {
+		if !deleteAllowedStatus(row.Status, mode) {
+			return newOpErr(codeInvalidState, fmt.Errorf("delete not allowed from %s with mode %s", row.Status, mode))
+		}
+		// init_status 门禁（design.md tasks 3.7）：init 进行中拒绝删除。
 		return newOpErr(codeInvalidState, fmt.Errorf("task %s init in progress (init_status=%s)", taskID, row.InitStatus))
 	}
 
@@ -90,7 +94,7 @@ func (m *Manager) Delete(ctx context.Context, taskID string, mode DeleteMode, co
 	}
 
 	// ① 持久化 delete_mode + 置 deleting（原子）。
-	updated, err := m.store.BeginDeleteIntent(ctx, taskID, string(mode), []string{
+	updated, err := m.writeBeginDeleteIntent(ctx, taskID, string(mode), []string{
 		StatusSuspended, StatusArchived, StatusCreationFailed, StatusDeletionFailed,
 	})
 	if err != nil {
@@ -126,7 +130,7 @@ func (m *Manager) deleteResume(ctx context.Context, row TaskRow, mode DeleteMode
 	proj, err := m.store.GetProject(ctx, row.ProjectID)
 	if err != nil {
 		le := sql.NullString{String: fmt.Errorf("get project for delete resume: %w", err).Error(), Valid: true}
-		_, _ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, le)
+		_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, le)
 		return newOpErr(codeNotFound, fmt.Errorf("project not found for delete resume: %w", err))
 	}
 	switch proj.Kind {
@@ -137,7 +141,7 @@ func (m *Manager) deleteResume(ctx context.Context, row TaskRow, mode DeleteMode
 	default:
 		// 未知持久化 kind（DB 损坏值）→ internal（D1）。落 deletion_failed 保留行供排查。
 		le := sql.NullString{String: fmt.Sprintf("unknown project kind %q", proj.Kind), Valid: true}
-		_, _ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, le)
+		_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, le)
 		return newOpErr(codeInternal, fmt.Errorf("task %s unknown project kind %q", taskID, proj.Kind))
 	}
 }
@@ -148,7 +152,7 @@ func (m *Manager) deleteResume(ctx context.Context, row TaskRow, mode DeleteMode
 func (m *Manager) finalizeDeletionFailed(taskID, lastError string) {
 	finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), finishDeletionCtxTimeout)
 	le := sql.NullString{String: lastError, Valid: true}
-	_, _ = m.store.UpdateTaskStatus(finalizeCtx, taskID, StatusDeletionFailed, le)
+	_, _ = m.writeStatus(finalizeCtx, taskID, StatusDeletionFailed, le)
 	finalizeCancel()
 }
 
@@ -159,7 +163,7 @@ func (m *Manager) finalizeDeletionFailed(taskID, lastError string) {
 func (m *Manager) retryDebtGate(ctx context.Context, taskID string, notice sql.NullString) error {
 	entries, perr := parseNotices(notice)
 	if perr != nil {
-		_, _ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, sql.NullString{String: "notice json corrupted", Valid: true})
+		_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, sql.NullString{String: "notice json corrupted", Valid: true})
 		return newOpErr(codeConflict, fmt.Errorf("task %s notice corrupted: %w", taskID, perr))
 	}
 	if !hasDebtTickets(entries) {
@@ -174,7 +178,7 @@ func (m *Manager) retryDebtGate(ctx context.Context, taskID string, notice sql.N
 		if cerr := m.casWriteNotices(ctx, taskID, remaining); cerr != nil {
 			le = fmt.Sprintf("%s; cas write notices: %v", le, cerr)
 		}
-		_, _ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, sql.NullString{String: le, Valid: true})
+		_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, sql.NullString{String: le, Valid: true})
 		return newOpErr(codeProcessError, derr)
 	}
 	// retryable 已清但仍有 degraded/overflow 时 MUST NOT 阻止 Delete（仅 retryable 阻止，
@@ -186,7 +190,7 @@ func (m *Manager) retryDebtGate(ctx context.Context, taskID string, notice sql.N
 		if cerr := m.casWriteNotices(ctx, taskID, remaining); cerr != nil {
 			le = fmt.Sprintf("cleanup debt not converged; cas write notices: %v", cerr)
 		}
-		_, _ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, sql.NullString{String: le, Valid: true})
+		_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, sql.NullString{String: le, Valid: true})
 		return newOpErr(codeConflict, fmt.Errorf("task %s has uncleaned cleanup debt", taskID))
 	}
 	return nil
@@ -207,7 +211,7 @@ func (m *Manager) deleteResumeRepo(ctx context.Context, row TaskRow, mode Delete
 	if mode != DeleteForce {
 		if err := m.deleteOCSessions(ctx, row); err != nil {
 			le := sql.NullString{String: fmt.Errorf("delete oc sessions: %w", err).Error(), Valid: true}
-			_, _ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, le)
+			_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, le)
 			return newOpErr(codeProcessError, err)
 		}
 	}
@@ -215,7 +219,7 @@ func (m *Manager) deleteResumeRepo(ctx context.Context, row TaskRow, mode Delete
 	// ④ KillSession 残余会话（若有）。
 	if err := m.killResidualSessions(ctx, taskID); err != nil {
 		le := sql.NullString{String: err.Error(), Valid: true}
-		_, _ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, le)
+		_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, le)
 		return newOpErr(codeProcessError, err)
 	}
 
@@ -225,7 +229,7 @@ func (m *Manager) deleteResumeRepo(ctx context.Context, row TaskRow, mode Delete
 	proj, err := m.store.GetProject(ctx, row.ProjectID)
 	if err != nil {
 		le := sql.NullString{String: fmt.Errorf("get project for worktree removal: %w", err).Error(), Valid: true}
-		_, _ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, le)
+		_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, le)
 		return newOpErr(codeNotFound, fmt.Errorf("project not found for worktree removal: %w", err))
 	}
 	// B7c：二次 dirty 门禁——preflight 通过后，oc session/kill 残余会话期间若新产生 dirty
@@ -235,13 +239,13 @@ func (m *Manager) deleteResumeRepo(ctx context.Context, row TaskRow, mode Delete
 		currentDirty, derr := m.wt.DirtyFiles(ctx, row.WorktreePath)
 		if derr != nil {
 			le := sql.NullString{String: fmt.Errorf("second dirty gate: %w", derr).Error(), Valid: true}
-			_, _ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, le)
+			_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, le)
 			return newOpErr(codeGitError, fmt.Errorf("second dirty gate: %w", derr))
 		}
 		for f := range currentDirty {
 			if _, ok := preflightDirty[f]; !ok {
 				le := sql.NullString{String: "new dirty files after preflight; confirm deletion again", Valid: true}
-				_, _ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, le)
+				_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, le)
 				return newOpErr(codeConflict, errors.New("worktree: new dirty files after preflight; confirm deletion again with confirmDirty=true"))
 			}
 		}
@@ -286,7 +290,7 @@ func (m *Manager) deleteResumeRepo(ctx context.Context, row TaskRow, mode Delete
 	}
 
 	// ⑨ 删 DB 行（提交点）。
-	if _, err := m.store.DeleteTask(ctx, taskID); err != nil {
+	if _, err := m.writeDeleteTask(ctx, taskID); err != nil {
 		finalizeOnFail(fmt.Errorf("delete db row: %w", err).Error())
 		return newOpErr(codeInternal, err)
 	}
@@ -323,7 +327,7 @@ func (m *Manager) deleteResumeDir(ctx context.Context, row TaskRow, mode DeleteM
 	if mode != DeleteForce {
 		if err := m.deleteOCSessions(ctx, row); err != nil {
 			le := sql.NullString{String: fmt.Errorf("delete oc sessions: %w", err).Error(), Valid: true}
-			_, _ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, le)
+			_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, le)
 			return newOpErr(codeProcessError, err)
 		}
 	}
@@ -331,7 +335,7 @@ func (m *Manager) deleteResumeDir(ctx context.Context, row TaskRow, mode DeleteM
 	// ④ KillSession 残余会话（若有）。
 	if err := m.killResidualSessions(ctx, taskID); err != nil {
 		le := sql.NullString{String: err.Error(), Valid: true}
-		_, _ = m.store.UpdateTaskStatus(ctx, taskID, StatusDeletionFailed, le)
+		_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, le)
 		return newOpErr(codeProcessError, err)
 	}
 
@@ -363,7 +367,7 @@ func (m *Manager) deleteResumeDir(ctx context.Context, row TaskRow, mode DeleteM
 	}
 
 	// ⑨ 删 DB 行（提交点）。dir 不 wt.Remove——用户目录零写删（pre-delete 脚本为唯一例外）。
-	if _, err := m.store.DeleteTask(ctx, taskID); err != nil {
+	if _, err := m.writeDeleteTask(ctx, taskID); err != nil {
 		finalizeOnFail(fmt.Errorf("delete db row: %w", err).Error())
 		return newOpErr(codeInternal, err)
 	}
@@ -466,8 +470,16 @@ func (m *Manager) deleteOCSessions(ctx context.Context, row TaskRow) error {
 			continue
 		}
 		// oc 删除成功（含 404 幂等）→ 落账删除 DB session 行。DB 失败也聚合，不阻断后续项。
-		if err := m.store.DeleteTaskSession(ctx, row.ID, s.SessionID); err != nil {
-			errs = append(errs, fmt.Errorf("delete session row %s: %w", s.SessionID, err))
+		// P1.4.5：注入 LifecycleService 时经 SessionRepository.DeleteOwned（commit helper
+		// 调用位就绪，NoopPublisher 阶段）；未注入走 legacy 直连 store 路径。
+		if m.lifecycle != nil {
+			if _, derr := m.lifecycle.DeleteOwnedSession(ctx, row.ID, ocdecksess.ID(s.SessionID)); derr != nil {
+				errs = append(errs, fmt.Errorf("delete session row %s: %w", s.SessionID, derr))
+			}
+			continue
+		}
+		if _, derr := m.store.DeleteTaskSession(ctx, row.ID, s.SessionID); derr != nil {
+			errs = append(errs, fmt.Errorf("delete session row %s: %w", s.SessionID, derr))
 		}
 	}
 	// 一次性 serve 清理（显式步骤，非 defer）：KillSession 结果与 notice 写入错误
@@ -651,6 +663,11 @@ func appendRemaining(already, unprocessed []noticeEntry) []noticeEntry {
 // deleteAllowedStatus 判断状态是否允许删除（gating 与 delete_mode 一致，design.md §19）。
 // Normal：deletion_failed 不得直接重入 Normal 流程（必须经 Retry 按持久化 force mode 强删）。
 // Force：接受 deletion_failed（兑现"删除失败后可强制删除"）。
+//
+// P1.4.2 strangler 第二步后，Delete guard 的决策权威迁至 domain/task.CanDelete(mode)
+// （见 Delete 入口）。本函数仅保留用于 guard 拒绝时的错误消息维度选择——status/mode
+// 维度先于 init 维度报错（byte-equivalent），因此拒绝路径仍需判定是否 status/mode
+// 维度失败以生成对应消息。逻辑与 domain CanDelete 的 status/mode 子判定等价。
 func deleteAllowedStatus(status string, mode DeleteMode) bool {
 	switch status {
 	case StatusSuspended, StatusArchived, StatusCreationFailed:

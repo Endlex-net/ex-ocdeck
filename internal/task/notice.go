@@ -34,10 +34,10 @@ const (
 // notice reason 枚举（§8：residual_processes.data.reason）。
 // 注意：这是 reason 枚举原值，非 disposition 名。
 const (
-	noticeReasonSnapshotFailed      = "snapshot_failed"
-	noticeReasonKillFailed           = "kill_failed"
-	noticeReasonReapFailed           = "reap_failed"
-	noticeReasonSnapshotMissing      = "snapshot_missing_degraded"
+	noticeReasonSnapshotFailed  = "snapshot_failed"
+	noticeReasonKillFailed      = "kill_failed"
+	noticeReasonReapFailed      = "reap_failed"
+	noticeReasonSnapshotMissing = "snapshot_missing_degraded"
 )
 
 // dispositionToNotice 将 process.Disposition 唯一映射为 (reason, retryable)（B6）。
@@ -59,24 +59,21 @@ func dispositionToNotice(d process.CleanupDisposition) (reason string, retryable
 
 // newRuntime 构造任务运行时索引，generation 单调递增（不得运行时清除后归零，B4）。
 // instanceID 为本代唯一标识，供回调三元组校验（B4）。
+//
+// P1.4.3：generation/tombstone 责任已迁移至 application/runtime.Registry（单一锁域）。
+// Manager 不再持有 genMu/lastGen，全部经 Registry.NewRuntimeToken 分配，tombstone 语义
+// 保持不变（清理后从 lastGen+1 续递增，design.md D0:204-208 先例）。
 func (m *Manager) newRuntime(taskID string) *taskRuntime {
 	prev := m.getRuntime(taskID)
-	gen := 0
+	prevGen := 0
 	if prev != nil {
-		gen = prev.generation + 1
+		prevGen = prev.generation
 	}
-	// B4：即便 prev==nil（runtime 已被 clearRuntime 移除），generation 也不得回 0。
-	// 从 Manager 侧 lastGen 续递增，保证回调三元组校验的 generation 在进程生命周期内不回卷。
-	m.genMu.Lock()
-	if last, ok := m.lastGen[taskID]; ok && last >= gen {
-		gen = last + 1
-	}
-	m.lastGen[taskID] = gen
-	m.genMu.Unlock()
+	token := m.runtimeRegistry.NewRuntimeToken(taskID, prevGen, newTaskID())
 	return &taskRuntime{
 		taskID:       taskID,
-		generation:   gen,
-		instanceID:   newTaskID(),
+		generation:   token.Generation,
+		instanceID:   token.InstanceID,
 		groups:       map[string]*runtimeGroup{},
 		watchCancels: map[string]func(){},
 		watchDones:   map[string]<-chan struct{}{},
@@ -156,9 +153,9 @@ func (m *Manager) recordResidualNotice(ctx context.Context, taskID, sessionName 
 		TS:      nowUnixI(),
 		Data: map[string]interface{}{
 			"sessionName":    sessionName,
-			"cleanupTickets":  tickets,
-			"reason":          reason,
-			"retryable":        retryable,
+			"cleanupTickets": tickets,
+			"reason":         reason,
+			"retryable":      retryable,
 		},
 	}
 	// CAS 循环：读当前 notice → 按会话替换/追加 → CAS 写；失败重读重试，不得覆盖丢并发 notice（B6）。
@@ -193,7 +190,7 @@ func (m *Manager) recordResidualNotice(ctx context.Context, taskID, sessionName 
 			entries = append(entries, entry)
 		}
 		newRaw := encodeNotices(entries)
-		r, _ := m.store.UpdateTaskNoticeCAS(ctx, taskID, row.Notice, newRaw)
+		r, _ := m.writeNoticeCAS(ctx, taskID, row.Notice, newRaw)
 		if !r.Matched {
 			continue
 		}
@@ -204,50 +201,6 @@ func (m *Manager) recordResidualNotice(ctx context.Context, taskID, sessionName 
 		// 未收敛：被并发覆盖，继续重试。
 	}
 	return fmt.Errorf("record residual notice: CAS did not converge (task %s, session %s)", taskID, sessionName)
-}
-
-// recordSessionOverflowNotice 记录 session_overflow notice（design.md §4）。
-// CAS 写回成功后读回校验收敛。返回 error：store 不可达 / JSON 损坏 / CAS 不收敛时返回，
-// 供调用方（alignSessions）聚合，不静默吞错（design.md §8）。
-func (m *Manager) recordSessionOverflowNotice(ctx context.Context, taskID string) error {
-	entry := noticeEntry{
-		Code:    noticeCodeSessionOverflow,
-		Message: "session alignment reached limit; absent rows not pruned",
-		TS:      nowUnixI(),
-	}
-	for attempt := 0; attempt < 8; attempt++ {
-		row, err := m.store.GetTask(ctx, taskID)
-		if err != nil {
-			return fmt.Errorf("record session overflow notice: get task: %w", err)
-		}
-		entries, perr := parseNotices(row.Notice)
-		if perr != nil {
-			// JSON 损坏 MUST fail-closed，不得当空数组覆盖（record 路径，design.md §8）。
-			return fmt.Errorf("record session overflow notice: notice json corrupted (task %s): %w", taskID, perr)
-		}
-		// 幂等：已有 overflow 项则不重复追加。
-		already := false
-		for _, e := range entries {
-			if e.Code == noticeCodeSessionOverflow {
-				already = true
-				break
-			}
-		}
-		if !already {
-			entries = append(entries, entry)
-		}
-		newRaw := encodeNotices(entries)
-		r, _ := m.store.UpdateTaskNoticeCAS(ctx, taskID, row.Notice, newRaw)
-		if !r.Matched {
-			continue
-		}
-		// 读回校验收敛：确认 overflow 项已落库（或原本就存在）。
-		if m.noticeReadbackHasCode(ctx, taskID, noticeCodeSessionOverflow) {
-			return nil
-		}
-		// 未收敛：继续重试。
-	}
-	return fmt.Errorf("record session overflow notice: CAS did not converge (task %s)", taskID)
 }
 
 // recordResidualNoticeFromDisposition 唯一映射 disposition → notice（B6）。
@@ -275,7 +228,7 @@ func (m *Manager) casWriteNotices(ctx context.Context, taskID string, remaining 
 		if _, perr := parseNotices(cur.Notice); perr != nil {
 			return fmt.Errorf("cas write notices: notice json corrupted (task %s): %w", taskID, perr)
 		}
-		r, _ := m.store.UpdateTaskNoticeCAS(ctx, taskID, cur.Notice, newRaw)
+		r, _ := m.writeNoticeCAS(ctx, taskID, cur.Notice, newRaw)
 		if r.Matched {
 			return nil
 		}
@@ -296,24 +249,6 @@ func (m *Manager) noticeReadbackContains(ctx context.Context, taskID string, ent
 	want := noticeKey(entry)
 	for _, e := range entries {
 		if noticeKey(e) == want {
-			return true
-		}
-	}
-	return false
-}
-
-// noticeReadbackHasCode 读回 notice 并判断是否存在指定 code 的项。
-func (m *Manager) noticeReadbackHasCode(ctx context.Context, taskID, code string) bool {
-	row, err := m.store.GetTask(ctx, taskID)
-	if err != nil {
-		return false
-	}
-	entries, perr := parseNotices(row.Notice)
-	if perr != nil {
-		return false
-	}
-	for _, e := range entries {
-		if e.Code == code {
 			return true
 		}
 	}
@@ -466,7 +401,7 @@ func (m *Manager) retryTaskNotices(ctx context.Context, t TaskRow, entries []not
 		curEntries, _ := parseNotices(cur.Notice)
 		merged := mergeNoticesExcluding(curEntries, remaining, clearedKeys)
 		newRaw := encodeNotices(merged)
-		r, _ := m.store.UpdateTaskNoticeCAS(ctx, t.ID, cur.Notice, newRaw)
+		r, _ := m.writeNoticeCAS(ctx, t.ID, cur.Notice, newRaw)
 		if r.Matched {
 			return errors.Join(errs...)
 		}
@@ -485,7 +420,7 @@ func (m *Manager) sessionOwnedByRuntime(rt *taskRuntime, sessionName string) boo
 }
 
 // mergeNoticesExcluding 合并最新读回的 src 与本轮处理后的 processed，并排除本轮已清除项
-//（clearedKeys）。src 中命中 clearedKeys 的项不得复活（本轮已成功清除，即便并发写回也
+// （clearedKeys）。src 中命中 clearedKeys 的项不得复活（本轮已成功清除，即便并发写回也
 // 不得恢复）。src 中不在 processed 且不在 clearedKeys 的项视为并发新增，保留（不丢）。
 func mergeNoticesExcluding(src, processed []noticeEntry, clearedKeys map[string]bool) []noticeEntry {
 	out := make([]noticeEntry, 0, len(src)+len(processed))

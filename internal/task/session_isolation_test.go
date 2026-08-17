@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"testing"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/opencode"
 	"ocdeck/internal/store"
 )
@@ -32,19 +33,19 @@ func TestClaimTaskSession_ConflictIgnoredDiagnosed(t *testing.T) {
 	store.seedProject(ProjectRow{ID: "p1", Name: "p1", Path: "/p1", Kind: ProjectKindRepo})
 	store.seedProject(ProjectRow{ID: "p2", Name: "p2", Path: "/p2", Kind: ProjectKindRepo})
 	// t1 先 claim sess-x。
-	if claimed, _, err := store.ClaimTaskSession(ctx, "t1", "sess-x", 1, 1, 1, ""); err != nil || !claimed {
-		t.Fatalf("t1 claim: claimed=%v err=%v", claimed, err)
+	if res, err := store.ClaimTaskSession(ctx, "t1", "sess-x", 1, 1, 1, ""); err != nil || !res.Claimed {
+		t.Fatalf("t1 claim: claimed=%v err=%v", res.Claimed, err)
 	}
 	// t2 claim 同一 session → 冲突。
-	claimed, owner, err := store.ClaimTaskSession(ctx, "t2", "sess-x", 2, 2, 2, "")
+	res, err := store.ClaimTaskSession(ctx, "t2", "sess-x", 2, 2, 2, "")
 	if err != nil {
 		t.Fatalf("t2 claim err: %v", err)
 	}
-	if claimed {
+	if res.Claimed {
 		t.Errorf("t2 claim should fail (conflict), got claimed=true")
 	}
-	if owner != "t1" {
-		t.Errorf("owner = %q, want t1", owner)
+	if res.OwnerTaskID != "t1" {
+		t.Errorf("owner = %q, want t1", res.OwnerTaskID)
 	}
 	// t2 不应有 sess-x 行。
 	t2Sessions, _ := store.ListTaskSessions(ctx, "t2")
@@ -74,12 +75,12 @@ func TestDirTasks_AlignDontClaimOthersSessions(t *testing.T) {
 		{SessionID: "sess-foreign", UpdatedAt: 20},
 	}
 	// tA 按 ownedOnly 对齐。
-	conflicts, err := store.AlignTaskSessions(ctx, "tA", AlignModeOwnedOnly, listed, true, nil)
+	ares, err := store.AlignTaskSessions(ctx, "tA", AlignModeOwnedOnly, listed, true, application.NoticeMutation{})
 	if err != nil {
 		t.Fatalf("tA align: %v", err)
 	}
-	if len(conflicts) != 0 {
-		t.Errorf("tA ownedOnly should not report conflicts, got %v", conflicts)
+	if len(ares.Conflicts) != 0 {
+		t.Errorf("tA ownedOnly should not report conflicts, got %v", ares.Conflicts)
 	}
 	// tA 仅刷新 sess-a（owned），不认领 sess-b/foreign。
 	tASessions, _ := store.ListTaskSessions(ctx, "tA")
@@ -101,7 +102,7 @@ func TestDirTasks_AlignDontClaimOthersSessions(t *testing.T) {
 		t.Errorf("tA after complete align = %+v, want only sess-a", tASessions)
 	}
 	// tB 同理：对齐后仍只拥有 sess-b，不认领 sess-a/foreign。
-	_, err = store.AlignTaskSessions(ctx, "tB", AlignModeOwnedOnly, listed, true, nil)
+	_, err = store.AlignTaskSessions(ctx, "tB", AlignModeOwnedOnly, listed, true, application.NoticeMutation{})
 	if err != nil {
 		t.Fatalf("tB align: %v", err)
 	}
@@ -123,7 +124,7 @@ func TestDirTasks_DeleteIsolation(t *testing.T) {
 	store.sessions["tA"] = []SessionRow{{TaskID: "tA", SessionID: "sess-a", LastSeenAt: 10}}
 	store.sessions["tB"] = []SessionRow{{TaskID: "tB", SessionID: "sess-b", LastSeenAt: 10}}
 	// 删除 tA 的 session。
-	if err := store.DeleteTaskSession(ctx, "tA", "sess-a"); err != nil {
+	if _, err := store.DeleteTaskSession(ctx, "tA", "sess-a"); err != nil {
 		t.Fatalf("delete tA sess-a: %v", err)
 	}
 	tA, _ := store.ListTaskSessions(ctx, "tA")
@@ -167,18 +168,12 @@ func TestAlign_CompleteDeletesOwnedAbsentAndClearsOverflowNotice(t *testing.T) {
 		t.Fatal(err)
 	}
 	// complete 对齐：listed = [sess-a]（sess-stale 缺席 → 应删；notice 清除 overflow）。
+	// P1.4.5：notice 决策以 NoticeMutation 表达——Expected=预置的 overflow notice，
+	// New=清除 session_overflow 后（空集合 → nil，对应 NULL）。
 	listed := []store.SessionObservation{{SessionID: "sess-a", UpdatedAt: 20}}
-	noticeFn := func(cur sql.NullString) sql.NullString {
-		entries, _ := parseNotices(cur)
-		out := entries[:0]
-		for _, e := range entries {
-			if e.Code != noticeCodeSessionOverflow {
-				out = append(out, e)
-			}
-		}
-		return encodeNotices(out)
-	}
-	if _, err := db.AlignTaskSessions(ctx, "t1", store.AlignModeRepo, listed, true, noticeFn); err != nil {
+	expected := overflowNotice.String
+	if _, err := db.AlignTaskSessions(ctx, "t1", store.AlignModeRepo, listed, true,
+		application.NoticeMutation{Expected: &expected, New: nil}); err != nil {
 		t.Fatalf("AlignTaskSessions: %v", err)
 	}
 	sessions, _ := db.ListTaskSessions(ctx, "t1")
@@ -225,9 +220,9 @@ func TestAlign_OverflowKeepsAbsentAndNoticePreserved(t *testing.T) {
 	if _, err := db.UpdateTaskNotice(ctx, "t1", nullStringToPtr(overflowNotice)); err != nil {
 		t.Fatal(err)
 	}
-	// overflow 对齐：listed=[sess-a]（sess-stale 缺席但 complete=false 不删；noticeFn 为 nil 不动 notice）。
+	// overflow 对齐：listed=[sess-a]（sess-stale 缺席但 complete=false 不删；notice 分支跳过不动 notice）。
 	listed := []store.SessionObservation{{SessionID: "sess-a", UpdatedAt: 20}}
-	if _, err := db.AlignTaskSessions(ctx, "t1", store.AlignModeRepo, listed, false, nil); err != nil {
+	if _, err := db.AlignTaskSessions(ctx, "t1", store.AlignModeRepo, listed, false, application.NoticeMutation{}); err != nil {
 		t.Fatalf("AlignTaskSessions overflow: %v", err)
 	}
 	sessions, _ := db.ListTaskSessions(ctx, "t1")
@@ -259,13 +254,13 @@ func TestTouchOwnedTaskSession_DoesNotCreateOwnership(t *testing.T) {
 	store := newMockStore()
 	ctx := context.Background()
 	store.sessions["t1"] = []SessionRow{{TaskID: "t1", SessionID: "sess-owned", LastSeenAt: 10}}
-	// 未归属 session：updated=false，不插入。
-	updated, err := store.TouchOwnedTaskSession(ctx, "t1", "sess-unowned", 99)
+	// 未归属 session：!Matched，不插入。
+	tres, err := store.TouchOwnedTaskSession(ctx, "t1", "sess-unowned", 99)
 	if err != nil {
 		t.Fatalf("touch unowned: %v", err)
 	}
-	if updated {
-		t.Errorf("touch unowned should return updated=false, got true")
+	if tres.Matched || tres.Changed {
+		t.Errorf("touch unowned should return !Matched, got %+v", tres)
 	}
 	t1, _ := store.ListTaskSessions(ctx, "t1")
 	for _, s := range t1 {
@@ -273,10 +268,10 @@ func TestTouchOwnedTaskSession_DoesNotCreateOwnership(t *testing.T) {
 			t.Errorf("TouchOwnedTaskSession MUST NOT create ownership row for sess-unowned")
 		}
 	}
-	// 已归属 session：updated=true，刷新 last_seen_at。
-	updated, err = store.TouchOwnedTaskSession(ctx, "t1", "sess-owned", 99)
-	if err != nil || !updated {
-		t.Fatalf("touch owned: updated=%v err=%v", updated, err)
+	// 已归属 session：Matched+Changed，刷新 last_seen_at。
+	tres, err = store.TouchOwnedTaskSession(ctx, "t1", "sess-owned", 99)
+	if err != nil || !tres.Matched || !tres.Changed {
+		t.Fatalf("touch owned: res=%+v err=%v", tres, err)
 	}
 	t1, _ = store.ListTaskSessions(ctx, "t1")
 	for _, s := range t1 {
@@ -437,8 +432,8 @@ type conflictClaimStore struct {
 	*mockStore
 }
 
-func (c *conflictClaimStore) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (bool, string, error) {
-	return false, "other-task", nil
+func (c *conflictClaimStore) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
+	return application.ClaimResult{Claimed: false, OwnerTaskID: "other-task"}, nil
 }
 
 // TestUnknownAlignMode_FailClosed 验证 AlignTaskSessions 对未知 mode 在任何写入前返回错误（fail-closed）。
@@ -446,7 +441,7 @@ func TestUnknownAlignMode_FailClosed(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
 	_, err := store.AlignTaskSessions(context.Background(), "t1", AlignMode(99),
-		[]SessionObservation{{SessionID: "x"}}, true, nil)
+		[]SessionObservation{{SessionID: "x"}}, true, application.NoticeMutation{})
 	if err == nil {
 		t.Fatal("AlignTaskSessions with unknown mode should fail (fail-closed)")
 	}
@@ -459,6 +454,9 @@ func TestForeignSessionNotClaimed(t *testing.T) {
 	ctx := context.Background()
 	store.seedProject(ProjectRow{ID: "p1", Name: "p1", Path: "/p1", Kind: ProjectKindRepo})
 	store.seedProject(ProjectRow{ID: "p2", Name: "p2", Path: "/p2", Kind: ProjectKindRepo})
+	// complete=true 时 align 走 notice 分支（任务行必须存在，镜像生产 fail-closed）。
+	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/p1"}
+	store.tasks["t2"] = TaskRow{ID: "t2", ProjectID: "p2", Status: StatusSuspended, WorktreePath: "/p2"}
 	// t2 拥有 sess-shared。
 	store.sessions["t2"] = []SessionRow{{TaskID: "t2", SessionID: "sess-shared", LastSeenAt: 10}}
 	// t1 repo 对齐 listed=[sess-shared, sess-own]：sess-shared 被他任务拥有 → 冲突跳过；sess-own claim 成功。
@@ -466,18 +464,18 @@ func TestForeignSessionNotClaimed(t *testing.T) {
 		{SessionID: "sess-shared", UpdatedAt: 20},
 		{SessionID: "sess-own", UpdatedAt: 20},
 	}
-	conflicts, err := store.AlignTaskSessions(ctx, "t1", AlignModeRepo, listed, true, nil)
+	ares, err := store.AlignTaskSessions(ctx, "t1", AlignModeRepo, listed, true, application.NoticeMutation{})
 	if err != nil {
 		t.Fatalf("align: %v", err)
 	}
 	found := false
-	for _, sid := range conflicts {
-		if sid == "sess-shared" {
+	for _, sid := range ares.Conflicts {
+		if string(sid) == "sess-shared" {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("conflicts = %v, want sess-shared reported (owned by other task)", conflicts)
+		t.Errorf("conflicts = %v, want sess-shared reported (owned by other task)", ares.Conflicts)
 	}
 	t1, _ := store.ListTaskSessions(ctx, "t1")
 	ownsShared := false

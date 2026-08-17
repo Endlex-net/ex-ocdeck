@@ -27,7 +27,9 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 	if err != nil {
 		return newOpErr(codeNotFound, fmt.Errorf("task not found: %w", err))
 	}
-	if row.Status != StatusActive {
+	// guard 委托 domain/task.CanSuspend（design D0 P1.4.2 strangler 第二步）。
+	// 委托前后行为 byte-equivalent：guard 拒绝时仍按现状错误模板生成 invalid_state。
+	if !rehydrateGuardView(row).CanSuspend() {
 		return newOpErr(codeInvalidState, fmt.Errorf("suspend requires active, got %s", row.Status))
 	}
 	// D8：状态转换前解析项目 kind（任何副作用前 fail-closed）。未知持久化 kind → internal（D1）。
@@ -39,7 +41,8 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 	if kerr != nil {
 		return newOpErr(codeInternal, kerr)
 	}
-	updated, err := m.store.UpdateTaskStatusConditional(ctx, taskID, StatusActive, StatusSuspending, sql.NullString{})
+	// P1.4.7：DB 写入经 write* helper 路由（注入 LifecycleService 时走 persist+commit 封装）。
+	updated, err := m.writeStatusConditional(ctx, taskID, StatusActive, StatusSuspending, sql.NullString{})
 	if err != nil {
 		return newOpErr(codeInternal, err)
 	}
@@ -112,7 +115,7 @@ func (m *Manager) suspendRun(ctx context.Context, taskID string, mode AlignMode)
 	if ferr == nil && fixed {
 		// 修复成功 → 回 active + last_error（design.md §5）。
 		le := sql.NullString{String: "suspend partially failed, runtime repaired", Valid: true}
-		_, _ = m.store.UpdateTaskStatusConditional(ctx, taskID, StatusSuspending, StatusActive, le)
+		_, _ = m.writeStatusConditional(ctx, taskID, StatusSuspending, StatusActive, le)
 		return nil
 	}
 	// 修复失败或期间 serve 死亡 → 转分支 a：强制 kill 残余 → suspended。
@@ -194,7 +197,7 @@ func (m *Manager) finishSuspend(ctx context.Context, taskID string, results []ki
 		}
 	}
 	// 清除 env 快照（design.md §2：Suspend 成功清快照）。
-	if _, err := m.store.UpdateTaskEnvSnapshot(ctx, taskID, sql.NullString{}); err != nil {
+	if _, err := m.writeEnvSnapshot(ctx, taskID, sql.NullString{}); err != nil {
 		if firstErr == nil {
 			firstErr = fmt.Errorf("clear env snapshot: %w", err)
 		}
@@ -203,10 +206,13 @@ func (m *Manager) finishSuspend(ctx context.Context, taskID string, results []ki
 	if firstErr != nil {
 		le = sql.NullString{String: firstErr.Error(), Valid: true}
 	}
-	if _, err := m.store.UpdateTaskStatus(ctx, taskID, StatusSuspended, le); err != nil {
+	if _, err := m.writeStatus(ctx, taskID, StatusSuspended, le); err != nil {
 		if firstErr == nil {
 			firstErr = fmt.Errorf("commit suspended: %w", err)
 		}
+	} else {
+		// 任务离开 active：撤销收敛债务登记（best-effort compare-and-delete，design.md D2）。
+		m.deleteConvergeDebt(taskID)
 	}
 	return firstErr
 }

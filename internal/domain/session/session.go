@@ -211,6 +211,18 @@ func NewAmbiguousOwnerError(id ID, owners []string) *AmbiguousOwnerError {
 	return &AmbiguousOwnerError{SessionID: id, Owners: owners}
 }
 
+// AlignMode 表达对齐路径的 claim 策略（add-plain-dir-project D8，Session 归属规则）：
+// repo 目录私有可能认领新归属；dir 目录可共享，绝不 claim（owned-only 刷新）。
+// 零值非法（fail-closed 由 repository 拒绝）。
+type AlignMode int
+
+const (
+	// AlignModeRepo 目录私有：listed 逐个原子 claim（未被他任务拥有才插入/更新）。
+	AlignModeRepo AlignMode = iota + 1
+	// AlignModeOwnedOnly 目录可共享（dir）：仅对 listed∩owned 刷新 last_seen_at，绝不 claim。
+	AlignModeOwnedOnly
+)
+
 // --- 辅助：构造观测用的 Session（application 从 opencode DTO 转换） ---
 
 // Observation 为持久化中立的会话观测（application 从 opencode DTO 转换后传入 domain）。
@@ -220,6 +232,9 @@ type Observation struct {
 	ParentID   string
 	CreatedAt  int64
 	UpdatedAt  int64
+	// FirstSeenAt ocdeck 首次观测时间（Unix 秒）。claim 路径由调用点决定：
+	// SSE 事件为本地到达时刻，锚定/对齐为观测 UpdatedAt。
+	FirstSeenAt int64
 }
 
 // FromObservation 在 align 路径从观测构造归属明确的新 Session（待 Claim 事务写入）。

@@ -12,6 +12,7 @@ import (
 	"ocdeck/internal/application"
 	"ocdeck/internal/config"
 	ocdecktask "ocdeck/internal/domain/task"
+	ocdecksess "ocdeck/internal/domain/session"
 	"ocdeck/internal/opencode"
 	"ocdeck/internal/process"
 	"ocdeck/internal/pty"
@@ -371,7 +372,7 @@ func (s *mockStore) UpsertTaskSession(ctx context.Context, sess SessionRow) erro
 func (s *mockStore) ListTaskSessions(ctx context.Context, taskID string) ([]SessionRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// 返回拷贝，避免调用方在锁外迭代期间被 UpsertTaskSession/AlignSessions 原地改写
+	// 返回拷贝，避免调用方在锁外迭代期间被 UpsertTaskSession/AlignTaskSessions 原地改写
 	// 底层数组造成 data race（-race 下会报错）。
 	list := s.sessions[taskID]
 	out := make([]SessionRow, len(list))
@@ -412,31 +413,29 @@ func sortSessionRows(rows []SessionRow) {
 	}
 }
 
-func (s *mockStore) DeleteTaskSession(ctx context.Context, taskID, sessionID string) error {
+// DeleteTaskSession 镜像 store.DeleteTaskSession：删除归属行并返回受影响行数。
+func (s *mockStore) DeleteTaskSession(ctx context.Context, taskID, sessionID string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	list := s.sessions[taskID]
-	out := list[:0]
+	kept := list[:0]
+	removed := 0
 	for _, e := range list {
-		if e.SessionID != sessionID {
-			out = append(out, e)
+		if e.SessionID == sessionID {
+			removed++
+			continue
 		}
+		kept = append(kept, e)
 	}
-	s.sessions[taskID] = out
-	return nil
+	s.sessions[taskID] = kept
+	return removed, nil
 }
 
-func (s *mockStore) AlignSessions(ctx context.Context, taskID string, sessions []SessionRow, complete bool, noticeFn func(sql.NullString) sql.NullString) error {
-	s.mu.Lock()
-	s.sessions[taskID] = append([]SessionRow(nil), sessions...)
-	s.mu.Unlock()
-	return nil
-}
+// --- session 归属隔离 mock（add-plain-dir-project D8，P1.4.5 结构化签名） ---
 
-// --- session 归属隔离 mock（add-plain-dir-project D8） ---
-
-// ClaimTaskSession 镜像 store.ClaimTaskSession：仅当 sessionID 未被他任务拥有时插入/更新本任务行。
-func (s *mockStore) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (bool, string, error) {
+// ClaimTaskSession 镜像 store.ClaimTaskSession：仅当 sessionID 未被他任务拥有时插入/更新
+// 本任务行；ClaimResult.Changed=新插入或 last_seen_at/parent_id 实际推进。
+func (s *mockStore) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// 查是否被他任务拥有。
@@ -446,31 +445,33 @@ func (s *mockStore) ClaimTaskSession(ctx context.Context, taskID, sessionID stri
 		}
 		for _, e := range list {
 			if e.SessionID == sessionID {
-				return false, other, nil
+				return application.ClaimResult{Claimed: false, OwnerTaskID: other}, nil
 			}
 		}
 	}
-	// 无冲突：upsert 本任务行。
+	// 无冲突：upsert 本任务行（Changed=新插入或 last_seen/parent 实际推进）。
 	list := s.sessions[taskID]
 	for i, e := range list {
 		if e.SessionID == sessionID {
+			changed := lastSeen > e.LastSeenAt || parentID != e.ParentID
 			if lastSeen > e.LastSeenAt {
 				list[i].LastSeenAt = lastSeen
 			}
 			list[i].ParentID = parentID
 			s.sessions[taskID] = list
-			return true, "", nil
+			return application.ClaimResult{Claimed: true, Changed: changed}, nil
 		}
 	}
 	s.sessions[taskID] = append(list, SessionRow{
 		TaskID: taskID, SessionID: sessionID, SessionCreatedAt: createdAt,
 		FirstSeenAt: firstSeen, LastSeenAt: lastSeen, ParentID: parentID,
 	})
-	return true, "", nil
+	return application.ClaimResult{Claimed: true, Changed: true}, nil
 }
 
-// TouchOwnedTaskSession 镜像 store.TouchOwnedTaskSession：条件 UPDATE 本任务已归属行。
-func (s *mockStore) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (bool, error) {
+// TouchOwnedTaskSession 镜像 store.TouchOwnedTaskSession：Matched=命中本任务归属行，
+// Changed=last_seen_at 真实推进（值变化条件），绝不插入。
+func (s *mockStore) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (application.MutationResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	list := s.sessions[taskID]
@@ -478,29 +479,34 @@ func (s *mockStore) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID
 		if e.SessionID == sessionID {
 			if lastSeenAt > e.LastSeenAt {
 				list[i].LastSeenAt = lastSeenAt
+				s.sessions[taskID] = list
+				return application.MutationResult{Matched: true, Changed: true}, nil
 			}
-			return true, nil
+			return application.MutationResult{Matched: true}, nil
 		}
 	}
-	return false, nil
+	return application.MutationResult{}, nil
 }
 
-// AlignTaskSessions 镜像 store.AlignTaskSessions：按 mode 对齐，repo 逐个 claim（冲突上报），
-// ownedOnly 仅刷新 listed∩owned；complete 删 owned 缺席行；noticeFn 事务内读写 notice（mock 不维护 notice，noop）。
-func (s *mockStore) AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, noticeFn func(sql.NullString) sql.NullString) ([]string, error) {
+// AlignTaskSessions 镜像 store.AlignTaskSessions：按 mode 对齐（repo 逐个 claim、冲突上报、
+// ownedOnly 仅刷新 listed∩owned），complete 删 owned 缺席行并对 tasks.notice 做 CAS 镜像
+//（expected 失配返回 application.AlignConflict；同值 no-op），返回结构化 AlignResult。
+func (s *mockStore) AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, notice application.NoticeMutation) (application.AlignResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var res application.AlignResult
 	if mode != AlignModeRepo && mode != AlignModeOwnedOnly {
-		return nil, fmt.Errorf("mock: unknown AlignMode %d", mode)
+		return res, fmt.Errorf("mock: unknown AlignMode %d", mode)
 	}
 	// owned 集合 O。
 	ownedSet := map[string]bool{}
 	for _, e := range s.sessions[taskID] {
 		ownedSet[e.SessionID] = true
 	}
-	var conflicts []string
+	var affected []ocdecksess.ID
 	switch mode {
 	case AlignModeRepo:
+		var conflicts []ocdecksess.ID
 		for _, ob := range listed {
 			// 查是否被他任务拥有。
 			var owner string
@@ -519,14 +525,16 @@ func (s *mockStore) AlignTaskSessions(ctx context.Context, taskID string, mode A
 				}
 			}
 			if owner != "" {
-				conflicts = append(conflicts, ob.SessionID)
+				conflicts = append(conflicts, ocdecksess.ID(ob.SessionID))
 				continue
 			}
-			// upsert 本任务行。
+			// upsert 本任务行（Changed 判定镜像生产 claim）。
 			list := s.sessions[taskID]
 			found := false
+			changed := false
 			for i, e := range list {
 				if e.SessionID == ob.SessionID {
+					changed = ob.UpdatedAt > e.LastSeenAt || ob.ParentID != e.ParentID
 					if ob.UpdatedAt > e.LastSeenAt {
 						list[i].LastSeenAt = ob.UpdatedAt
 					}
@@ -540,8 +548,18 @@ func (s *mockStore) AlignTaskSessions(ctx context.Context, taskID string, mode A
 					TaskID: taskID, SessionID: ob.SessionID, SessionCreatedAt: ob.CreatedAt,
 					FirstSeenAt: nowUnixI(), LastSeenAt: ob.UpdatedAt, ParentID: ob.ParentID,
 				})
+				changed = true
+			}
+			if changed {
+				if ownedSet[ob.SessionID] {
+					res.Touched++
+				} else {
+					res.Inserted++
+				}
+				affected = append(affected, ocdecksess.ID(ob.SessionID))
 			}
 		}
+		res.Conflicts = conflicts
 	case AlignModeOwnedOnly:
 		for _, ob := range listed {
 			if !ownedSet[ob.SessionID] {
@@ -552,6 +570,9 @@ func (s *mockStore) AlignTaskSessions(ctx context.Context, taskID string, mode A
 				if e.SessionID == ob.SessionID {
 					if ob.UpdatedAt > e.LastSeenAt {
 						list[i].LastSeenAt = ob.UpdatedAt
+						s.sessions[taskID] = list
+						res.Touched++
+						affected = append(affected, ocdecksess.ID(ob.SessionID))
 					}
 					break
 				}
@@ -568,12 +589,42 @@ func (s *mockStore) AlignTaskSessions(ctx context.Context, taskID string, mode A
 		for _, e := range list {
 			if keep[e.SessionID] {
 				out = append(out, e)
+			} else {
+				res.Deleted++
+				affected = append(affected, ocdecksess.ID(e.SessionID))
 			}
 		}
 		s.sessions[taskID] = out
+		tm, nerr := s.alignNoticeLocked(taskID, notice)
+		if nerr != nil {
+			return res, nerr
+		}
+		res.TaskMutation = tm
 	}
-	// noticeFn 在 mock 下不维护 notice 列，noop（测试需断言 notice 经专门路径覆盖）。
-	return conflicts, nil
+	for _, e := range s.sessions[taskID] {
+		res.OwnedSessionIDs = append(res.OwnedSessionIDs, ocdecksess.ID(e.SessionID))
+	}
+	res.AffectedSessionIDs = affected
+	return res, nil
+}
+
+// alignNoticeLocked 镜像 store.alignNoticeInTx 的 CAS 语义（调用方持 s.mu）。
+func (s *mockStore) alignNoticeLocked(taskID string, mut application.NoticeMutation) (application.MutationResult, error) {
+	t, ok := s.tasks[taskID]
+	if !ok {
+		return application.MutationResult{}, fmt.Errorf("not found")
+	}
+	if t.Notice != ptrToNullString(mut.Expected) {
+		cur := t.Notice
+		return application.MutationResult{}, &application.AlignConflict{TaskID: taskID, Expected: mut.Expected, Actual: nullStringToPtr(cur)}
+	}
+	next := ptrToNullString(mut.New)
+	if t.Notice == next {
+		return application.MutationResult{Matched: true}, nil
+	}
+	t.Notice = next
+	s.tasks[taskID] = t
+	return application.MutationResult{Matched: true, Changed: true}, nil
 }
 
 // --- mock process backend ---

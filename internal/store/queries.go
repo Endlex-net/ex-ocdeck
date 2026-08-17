@@ -13,6 +13,7 @@ import (
 
 	"ocdeck/internal/application"
 	ocdecktask "ocdeck/internal/domain/task"
+	ocdecksess "ocdeck/internal/domain/session"
 )
 
 // DBTX 是 *sql.DB 与 *sql.Tx 共同满足的查询接口，使同一组 Queries 方法
@@ -974,11 +975,18 @@ func (q *Queries) ListTopLevelTaskSessions(ctx context.Context, taskID string) (
 	return out, rows.Err()
 }
 
-// DeleteTaskSession 删除会话归属行。
-func (q *Queries) DeleteTaskSession(ctx context.Context, taskID, sessionID string) error {
-	_, err := q.db.ExecContext(ctx,
+// DeleteTaskSession 删除会话归属行，返回受影响行数（0=行不存在，幂等成功）。
+func (q *Queries) DeleteTaskSession(ctx context.Context, taskID, sessionID string) (int, error) {
+	res, err := q.db.ExecContext(ctx,
 		`DELETE FROM task_sessions WHERE task_id = ? AND session_id = ?`, taskID, sessionID)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
 }
 
 // UpdateTaskNoticeCAS 乐观更新 notice（CAS）：仅当当前 notice 等于 expected 时才考虑写入。
@@ -1371,13 +1379,44 @@ func (q *Queries) ConvergeInterruptedInitRuns(ctx context.Context) (int64, error
 	return res.RowsAffected()
 }
 
-// DeleteAbsentSessions 删除任务中不在 keepSet 内的会话归属行。
-// 设计依据 design.md §4：仅完整对齐结果（count < limit）可删缺席行。
-func (q *Queries) DeleteAbsentSessions(ctx context.Context, taskID string, keepSet []string) error {
+// DeleteAbsentSessions 删除任务中不在 keepSet 内的会话归属行，返回被删除的 session ID
+//（对齐计数用，design.md §4 / D2 align 行）。设计依据 design.md §4：仅完整对齐结果
+//（count < limit）可删缺席行。
+func (q *Queries) DeleteAbsentSessions(ctx context.Context, taskID string, keepSet []string) ([]string, error) {
+	selectQry, selectArgs := absentSessionsQuery(taskID, keepSet)
+	rows, err := q.db.QueryContext(ctx, selectQry, selectArgs...)
+	if err != nil {
+		return nil, err
+	}
+	var deleted []string
+	for rows.Next() {
+		var sid string
+		if err := rows.Scan(&sid); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		deleted = append(deleted, sid)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	if len(deleted) == 0 {
+		return nil, nil
+	}
+	deleteQry, deleteArgs := absentSessionsQuery(taskID, keepSet)
+	if _, err := q.db.ExecContext(ctx, "DELETE FROM task_sessions WHERE session_id IN (SELECT session_id FROM ("+deleteQry+"))", deleteArgs...); err != nil {
+		return nil, err
+	}
+	return deleted, nil
+}
+
+// absentSessionsQuery 构造缺席行（task 下不在 keepSet 内）的查询与参数，
+// SELECT 与 DELETE 共用同一谓词保证删除范围与读取一致。
+func absentSessionsQuery(taskID string, keepSet []string) (string, []any) {
 	if len(keepSet) == 0 {
-		_, err := q.db.ExecContext(ctx,
-			`DELETE FROM task_sessions WHERE task_id = ?`, taskID)
-		return err
+		return `SELECT session_id FROM task_sessions WHERE task_id = ?`, []any{taskID}
 	}
 	placeholders := make([]string, len(keepSet))
 	args := make([]any, 0, len(keepSet)+1)
@@ -1386,84 +1425,11 @@ func (q *Queries) DeleteAbsentSessions(ctx context.Context, taskID string, keepS
 		placeholders[i] = "?"
 		args = append(args, s)
 	}
-	qry := `DELETE FROM task_sessions WHERE task_id = ? AND session_id NOT IN (` + joinPlaceholders(placeholders) + `)`
-	_, err := q.db.ExecContext(ctx, qry, args...)
-	return err
-}
-
-// AlignSessions 全量对齐任务会话归属（design.md §4）：在单事务内 upsert 全部返回项、
-// 删除缺席行、更新 notice。仅当 complete=true（count < limit，结果完整）时删除缺席行；
-// complete=false（可能截断）时 MUST NOT 删除（仅 upsert + notice），由调用方写入
-// session_overflow notice，complete 恢复时由调用方清除该 notice。
-// noticeFn 在事务内对最新 notice 做最终写入（读取当前行后计算），保证对齐与 notice 原子提交。
-//
-// 若 q 已绑定 *sql.Tx（在 WithTx 回调内调用），直接复用该事务；否则自动开启事务。
-func (q *Queries) AlignSessions(ctx context.Context, taskID string, sessions []SessionRow, complete bool, noticeFn func(current sql.NullString) sql.NullString) error {
-	if _, isTx := q.db.(*sql.Tx); isTx {
-		return q.alignSessionsInTx(ctx, taskID, sessions, complete, noticeFn)
-	}
-	return withTxQueries(ctx, q.db, func(qtx *Queries) error {
-		return qtx.alignSessionsInTx(ctx, taskID, sessions, complete, noticeFn)
-	})
-}
-
-// alignSessionsInTx 在已绑定的事务内执行对齐逻辑，供 AlignSessions 的事务与非事务两条路径复用。
-func (q *Queries) alignSessionsInTx(ctx context.Context, taskID string, sessions []SessionRow, complete bool, noticeFn func(sql.NullString) sql.NullString) error {
-	for _, s := range sessions {
-		if err := q.UpsertTaskSession(ctx, s); err != nil {
-			return err
-		}
-	}
-	if complete {
-		keep := make([]string, len(sessions))
-		for i, s := range sessions {
-			keep[i] = s.SessionID
-		}
-		if err := q.DeleteAbsentSessions(ctx, taskID, keep); err != nil {
-			return err
-		}
-	}
-	if noticeFn != nil {
-		if err := q.applyNoticeInTx(ctx, taskID, noticeFn); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// applyNoticeInTx 在事务内写入对齐后的 notice（同值原子 no-op，F-01）。
-// 读取当前 notice → noticeFn 计算新值 → 同值不写；异值才 UPDATE 且 WHERE 携带同值排除
-// 谓词（notice IS NOT <next>），仅跨秒推进 updated_at。返回（非导出供 align 函数忽略结果使用）。
-func (q *Queries) applyNoticeInTx(ctx context.Context, taskID string, noticeFn func(sql.NullString) sql.NullString) error {
-	row := q.db.QueryRowContext(ctx, `SELECT notice, updated_at FROM tasks WHERE id = ?`, taskID)
-	var current sql.NullString
-	var curUpdatedAt int64
-	if err := row.Scan(&current, &curUpdatedAt); err != nil {
-		return err
-	}
-	next := noticeFn(current)
-	if nullStringEqual(current, next) {
-		// notice 同值：不推进 updated_at。
-		return nil
-	}
-	now := nowUnix()
-	updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
-	noticePred, noticeArg := colNotEqualPredicate("notice", next)
-	qry := "UPDATE tasks SET notice = ?, " + updClause + " WHERE id = ? AND " + noticePred
-	args := []any{next}
-	args = append(args, updArgs...)
-	args = append(args, taskID)
-	if noticeArg != nil {
-		args = append(args, noticeArg)
-	}
-	if _, err := q.db.ExecContext(ctx, qry, args...); err != nil {
-		return err
-	}
-	return nil
+	return `SELECT session_id FROM task_sessions WHERE task_id = ? AND session_id NOT IN (` + joinPlaceholders(placeholders) + `)`, args
 }
 
 // withTxQueries 使用 db（*sql.DB）开启事务并在回调中提供绑定该事务的 Queries。
-// 供未持有 DB 句柄的方法（如 AlignSessions 在 *sql.DB 绑定时）自动落事务。
+// 供未持有 DB 句柄的方法（如 AlignTaskSessions 在 *sql.DB 绑定时）自动落事务。
 func withTxQueries(ctx context.Context, db DBTX, fn func(qtx *Queries) error) error {
 	sqlDB, ok := db.(*sql.DB)
 	if !ok {
@@ -1559,30 +1525,32 @@ type SessionObservation struct {
 
 // ClaimTaskSession 原子 claim 一个 session 至本任务（add-plain-dir-project D8）。
 // 单事务内"仅当该 sessionID 未被其他任务拥有时插入/更新本任务行；已被他任务拥有则
-// claimed=false + ownerTaskID"。不加跨任务唯一索引（避免对存量数据做迁移）。
+// Claimed=false + OwnerTaskID"。不加跨任务唯一索引（避免对存量数据做迁移）。
 // SQLite 单写者语义下事务无竞态。
 //
-// 冲突判定：存在 task_id != 本任务 且 session_id == sessionID 的行即冲突（ownerTaskID 为他任务）。
-// 本任务已拥有（task_id == 本任务）→ claimed=true，刷新 last_seen_at/parent_id（幂等 upsert）。
+// 返回 application.ClaimResult：Changed=新插入或 last_seen_at/parent_id 实际推进
+//（design.md D0:77，同值幂等 upsert 为 Claimed+!Changed）。
+//
+// 冲突判定：存在 task_id != 本任务 且 session_id == sessionID 的行即冲突（OwnerTaskID 为他任务）。
+// 本任务已拥有（task_id == 本任务）→ Claimed=true，刷新 last_seen_at/parent_id（幂等 upsert）。
 // 无任何归属 → 插入本任务行。
 //
 // created/firstSeen/lastSeen 与既有 UpsertTaskSession 语义一致。
-func (q *Queries) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (claimed bool, ownerTaskID string, err error) {
+func (q *Queries) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
 	if _, isTx := q.db.(*sql.Tx); isTx {
 		return q.claimTaskSessionInTx(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
 	}
-	var c bool
-	var owner string
+	var res application.ClaimResult
 	txErr := withTxQueries(ctx, q.db, func(qtx *Queries) error {
 		var cerr error
-		c, owner, cerr = qtx.claimTaskSessionInTx(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+		res, cerr = qtx.claimTaskSessionInTx(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
 		return cerr
 	})
-	return c, owner, txErr
+	return res, txErr
 }
 
 // claimTaskSessionInTx 在已绑定事务内执行 claim 逻辑，供事务与非事务路径复用。
-func (q *Queries) claimTaskSessionInTx(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (bool, string, error) {
+func (q *Queries) claimTaskSessionInTx(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
 	// 先查是否被他任务拥有。
 	row := q.db.QueryRowContext(ctx,
 		`SELECT task_id FROM task_sessions WHERE session_id = ? AND task_id != ?`, sessionID, taskID)
@@ -1590,12 +1558,25 @@ func (q *Queries) claimTaskSessionInTx(ctx context.Context, taskID, sessionID st
 	err := row.Scan(&owner)
 	if err == nil {
 		// 被他任务拥有 → 冲突，不写入。
-		return false, owner, nil
+		return application.ClaimResult{Claimed: false, OwnerTaskID: owner}, nil
 	}
 	if err != sql.ErrNoRows {
-		return false, "", err
+		return application.ClaimResult{}, err
 	}
-	// 无冲突：upsert 本任务行（与 UpsertTaskSession 一致语义）。
+	// 无冲突：读本任务既有行，判定 changed（新插入或 last_seen_at/parent_id 实际推进）。
+	orow := q.db.QueryRowContext(ctx,
+		`SELECT last_seen_at, parent_id FROM task_sessions WHERE task_id = ? AND session_id = ?`, taskID, sessionID)
+	var curLast int64
+	var curParent sql.NullString
+	changed := true
+	if oerr := orow.Scan(&curLast, &curParent); oerr == sql.ErrNoRows {
+		changed = true // 新插入。
+	} else if oerr != nil {
+		return application.ClaimResult{}, oerr
+	} else {
+		changed = lastSeen > curLast || parentID != nullStringValue(curParent)
+	}
+	// upsert 本任务行（与 UpsertTaskSession 一致语义）。
 	_, err = q.db.ExecContext(ctx,
 		`INSERT INTO task_sessions (task_id, session_id, session_created_at, first_seen_at, last_seen_at, parent_id)
 		 VALUES (?, ?, ?, ?, ?, ?)
@@ -1604,86 +1585,119 @@ func (q *Queries) claimTaskSessionInTx(ctx context.Context, taskID, sessionID st
 		   parent_id = excluded.parent_id`,
 		taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
 	if err != nil {
-		return false, "", err
+		return application.ClaimResult{}, err
 	}
-	return true, "", nil
+	return application.ClaimResult{Claimed: true, Changed: changed}, nil
 }
 
 // TouchOwnedTaskSession 条件 UPDATE 仅本任务已归属行的 last_seen_at（add-plain-dir-project D8）。
-// 绝不插入；updated=false（未归属行）为正常路径，调用方记 debug 不报错。
-func (q *Queries) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (updated bool, err error) {
+// 绝不插入；返回 MutationResult：Matched=命中本任务归属行，Changed=值真实推进
+//（WHERE last_seen_at < ? 值变化条件，design.md D2 session touch 行；同值为 Matched+!Changed）。
+// 未命中归属行（!Matched）为正常路径，调用方记 debug 不报错。
+func (q *Queries) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (application.MutationResult, error) {
 	res, err := q.db.ExecContext(ctx,
-		`UPDATE task_sessions SET last_seen_at = MAX(?, last_seen_at)
-		 WHERE task_id = ? AND session_id = ?`,
-		lastSeenAt, taskID, sessionID)
+		`UPDATE task_sessions SET last_seen_at = ?
+		 WHERE task_id = ? AND session_id = ? AND last_seen_at < ?`,
+		lastSeenAt, taskID, sessionID, lastSeenAt)
 	if err != nil {
-		return false, err
+		return application.MutationResult{}, err
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return false, err
+		return application.MutationResult{}, err
 	}
-	return n == 1, nil
+	if n == 1 {
+		return application.MutationResult{Matched: true, Changed: true}, nil
+	}
+	// 0 行分类：同值已归属（Matched+!Changed）或未命中归属（!Matched）。
+	var one int
+	row := q.db.QueryRowContext(ctx,
+		`SELECT 1 FROM task_sessions WHERE task_id = ? AND session_id = ?`, taskID, sessionID)
+	if rerr := row.Scan(&one); rerr == nil {
+		return application.MutationResult{Matched: true}, nil
+	} else if rerr != sql.ErrNoRows {
+		return application.MutationResult{}, rerr
+	}
+	return application.MutationResult{}, nil
 }
 
-// AlignTaskSessions 单事务原子对齐（add-plain-dir-project D8）：
+// AlignTaskSessions 单事务原子对齐（add-plain-dir-project D8 + design.md D0:80/86）：
 //   - 读 owned 集合 O（本任务已有归属行）；
 //   - mode=repo：对 listed 逐个原子 claim（冲突 ID 经返回值上报）；
 //   - mode=ownedOnly：仅对 listed∩O 刷新 last_seen_at（绝不 claim）；
-//   - complete=true：仅删 O 中缺席行（不在 listed 内的 owned 行）；complete=false 不删；
-//   - noticeFn 事务内读写 notice（complete 时调用方用于清除 session_overflow notice）。
+//   - complete=true：仅删 O 中缺席行（不在 listed 内的 owned 行）并同事务提交 notice 变更
+//     （application.NoticeMutation：expected 失配整事务回滚返回 application.AlignConflict；
+//     同值原子 no-op 不推进 updated_at）；complete=false 不删缺席行、不触碰 notice；
+//   - 返回 application.AlignResult：Inserted/Touched/Deleted 计数、AffectedSessionIDs
+//     （受影响集合）、OwnedSessionIDs（对齐后全量 owned）、TaskMutation（notice 分支结构化结果）。
 //
-// 沿用 AlignSessions 的事务/noticeFn 模式。owned 快照与刷新/删除/notice 同事务，
-// 杜绝"事务外 O 快照期间新 claim 行被 complete 误删"。
-func (q *Queries) AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, noticeFn func(current sql.NullString) sql.NullString) (conflicts []string, err error) {
+// owned 快照与刷新/删除/notice 同事务，杜绝"事务外 O 快照期间新 claim 行被 complete 误删"。
+func (q *Queries) AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, notice application.NoticeMutation) (application.AlignResult, error) {
 	if _, isTx := q.db.(*sql.Tx); isTx {
-		return q.alignTaskSessionsInTx(ctx, taskID, mode, listed, complete, noticeFn)
+		return q.alignTaskSessionsInTx(ctx, taskID, mode, listed, complete, notice)
 	}
-	var c []string
+	var res application.AlignResult
 	txErr := withTxQueries(ctx, q.db, func(qtx *Queries) error {
 		var cerr error
-		c, cerr = qtx.alignTaskSessionsInTx(ctx, taskID, mode, listed, complete, noticeFn)
+		res, cerr = qtx.alignTaskSessionsInTx(ctx, taskID, mode, listed, complete, notice)
 		return cerr
 	})
-	return c, txErr
+	return res, txErr
 }
 
 // alignTaskSessionsInTx 在已绑定事务内执行对齐逻辑，供事务与非事务路径复用。
-func (q *Queries) alignTaskSessionsInTx(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, noticeFn func(sql.NullString) sql.NullString) ([]string, error) {
+func (q *Queries) alignTaskSessionsInTx(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, notice application.NoticeMutation) (application.AlignResult, error) {
+	var res application.AlignResult
 	if mode != AlignModeRepo && mode != AlignModeOwnedOnly {
 		// fail-closed：未知 mode MUST 在任何写入前返回错误（D8）。
-		return nil, fmt.Errorf("store: unknown AlignMode %d", mode)
+		return res, fmt.Errorf("store: unknown AlignMode %d", mode)
 	}
 	// 读 owned 集合 O（本任务已有归属行）。
-	owned, err := q.listOwnedSessions(ctx, taskID)
+	owned, err := q.ListOwnedSessionIDs(ctx, taskID)
 	if err != nil {
-		return nil, err
+		return res, err
 	}
 	ownedSet := make(map[string]bool, len(owned))
 	for _, sid := range owned {
 		ownedSet[sid] = true
 	}
-	var conflicts []string
+	var affected []ocdecksess.ID
 	switch mode {
 	case AlignModeRepo:
 		// listed 逐个原子 claim（冲突 ID 上报，不写入）。
+		var conflicts []ocdecksess.ID
 		for _, s := range listed {
-			claimed, _, cerr := q.claimTaskSessionInTx(ctx, taskID, s.SessionID, s.CreatedAt, nowUnix(), s.UpdatedAt, s.ParentID)
+			cres, cerr := q.claimTaskSessionInTx(ctx, taskID, s.SessionID, s.CreatedAt, nowUnix(), s.UpdatedAt, s.ParentID)
 			if cerr != nil {
-				return nil, cerr
+				return res, cerr
 			}
-			if !claimed {
-				conflicts = append(conflicts, s.SessionID)
+			if !cres.Claimed {
+				conflicts = append(conflicts, ocdecksess.ID(s.SessionID))
+				continue
+			}
+			if cres.Changed {
+				if ownedSet[s.SessionID] {
+					res.Touched++
+				} else {
+					res.Inserted++
+				}
+				affected = append(affected, ocdecksess.ID(s.SessionID))
 			}
 		}
+		res.Conflicts = conflicts
 	case AlignModeOwnedOnly:
 		// 仅对 listed∩O 刷新 last_seen_at，绝不 claim。
 		for _, s := range listed {
 			if !ownedSet[s.SessionID] {
 				continue
 			}
-			if _, uerr := q.TouchOwnedTaskSession(ctx, taskID, s.SessionID, s.UpdatedAt); uerr != nil {
-				return nil, uerr
+			tres, terr := q.TouchOwnedTaskSession(ctx, taskID, s.SessionID, s.UpdatedAt)
+			if terr != nil {
+				return res, terr
+			}
+			if tres.Changed {
+				res.Touched++
+				affected = append(affected, ocdecksess.ID(s.SessionID))
 			}
 		}
 	}
@@ -1693,20 +1707,96 @@ func (q *Queries) alignTaskSessionsInTx(ctx context.Context, taskID string, mode
 		for _, s := range listed {
 			keep = append(keep, s.SessionID)
 		}
-		if err := q.DeleteAbsentSessions(ctx, taskID, keep); err != nil {
-			return nil, err
+		deleted, derr := q.DeleteAbsentSessions(ctx, taskID, keep)
+		if derr != nil {
+			return res, derr
 		}
-	}
-	if noticeFn != nil {
-		if err := q.applyNoticeInTx(ctx, taskID, noticeFn); err != nil {
-			return nil, err
+		res.Deleted = len(deleted)
+		for _, sid := range deleted {
+			affected = append(affected, ocdecksess.ID(sid))
 		}
+		tm, nerr := q.alignNoticeInTx(ctx, taskID, notice)
+		if nerr != nil {
+			return res, nerr
+		}
+		res.TaskMutation = tm
 	}
-	return conflicts, nil
+	ownedAfter, err := q.ListOwnedSessionIDs(ctx, taskID)
+	if err != nil {
+		return res, err
+	}
+	ids := make([]ocdecksess.ID, 0, len(ownedAfter))
+	for _, sid := range ownedAfter {
+		ids = append(ids, ocdecksess.ID(sid))
+	}
+	res.OwnedSessionIDs = ids
+	res.AffectedSessionIDs = affected
+	return res, nil
 }
 
-// listOwnedSessions 返回本任务已拥有的 session_id 列表（O 集合）。
-func (q *Queries) listOwnedSessions(ctx context.Context, taskID string) ([]string, error) {
+// alignNoticeInTx 在对齐事务内提交 notice 变更（design.md D0:80/86，仅 complete 路径调用）。
+//
+// expected 与事务内最新 notice 不匹配 → 返回 application.AlignConflict（调用方事务回滚，
+// 不提交任何 session 行变更）；匹配且 New 不同 → UPDATE 携带 expected 与同值排除谓词
+//（仅跨秒推进 updated_at）；匹配且同值 → Matched+!Changed 原子 no-op。
+func (q *Queries) alignNoticeInTx(ctx context.Context, taskID string, mut application.NoticeMutation) (application.MutationResult, error) {
+	expNS := nullableString(mut.Expected)
+	newNS := nullableString(mut.New)
+	row := q.db.QueryRowContext(ctx, `SELECT notice, updated_at FROM tasks WHERE id = ?`, taskID)
+	var current sql.NullString
+	var curUpdatedAt int64
+	if err := row.Scan(&current, &curUpdatedAt); err != nil {
+		return application.MutationResult{}, err
+	}
+	if !nullStringEqual(current, expNS) {
+		// expected 失配：整事务回滚，application 重读重决策后有界重试。
+		return application.MutationResult{}, &application.AlignConflict{
+			TaskID:   taskID,
+			Expected: mut.Expected,
+			Actual:   nullStringToPtr(current),
+		}
+	}
+	if nullStringEqual(current, newNS) {
+		// notice 同值：不推进 updated_at。
+		return application.MutationResult{Matched: true}, nil
+	}
+	now := nowUnix()
+	updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+	expPred, expArg := expectedPredicate("notice", expNS)
+	newPred, newArg := colNotEqualPredicate("notice", newNS)
+	qry := "UPDATE tasks SET notice = ?, " + updClause +
+		" WHERE id = ? AND " + expPred + " AND " + newPred
+	args := []any{newNS}
+	args = append(args, updArgs...)
+	args = append(args, taskID)
+	if expArg != nil {
+		args = append(args, expArg)
+	}
+	if newArg != nil {
+		args = append(args, newArg)
+	}
+	qres, err := q.db.ExecContext(ctx, qry, args...)
+	if err != nil {
+		return application.MutationResult{}, err
+	}
+	n, err := qres.RowsAffected()
+	if err != nil {
+		return application.MutationResult{}, err
+	}
+	if n == 0 {
+		// 事务内单写者下不可达（刚读过 expected 匹配且 New 不同）；防御性按冲突回滚。
+		return application.MutationResult{}, &application.AlignConflict{
+			TaskID:   taskID,
+			Expected: mut.Expected,
+			Actual:   nullStringToPtr(current),
+		}
+	}
+	return application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt}, nil
+}
+
+// ListOwnedSessionIDs 返回本任务已拥有的 session_id 列表（O 集合，align 事务内与
+// SessionRepository.OwnedSessions 共用）。
+func (q *Queries) ListOwnedSessionIDs(ctx context.Context, taskID string) ([]string, error) {
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT session_id FROM task_sessions WHERE task_id = ?`, taskID)
 	if err != nil {
@@ -1722,6 +1812,24 @@ func (q *Queries) listOwnedSessions(ctx context.Context, taskID string) ([]strin
 		out = append(out, sid)
 	}
 	return out, rows.Err()
+}
+
+// nullStringToPtr 把 sql.NullString 映射为 *string：Invalid → nil。
+func nullStringToPtr(n sql.NullString) *string {
+	if !n.Valid {
+		return nil
+	}
+	s := n.String
+	return &s
+}
+
+// nullStringValue 返回 sql.NullString 的 String 值，Invalid 时空串（NULL 与 '' 语义等价的
+// 归一比较用）。
+func nullStringValue(ns sql.NullString) string {
+	if !ns.Valid {
+		return ""
+	}
+	return ns.String
 }
 
 // --- cleanup_debts（orphan ticket 持久化，design.md §10） ---

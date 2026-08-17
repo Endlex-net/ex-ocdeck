@@ -7,16 +7,36 @@ package application
 
 import (
 	"context"
+	"errors"
 
+	ocdeckevent "ocdeck/internal/domain/event"
 	ocdecktask "ocdeck/internal/domain/task"
 	ocdecksess "ocdeck/internal/domain/session"
 )
+
+// ErrTaskNotFound 为读侧端口返回任务未命中的 sentinel error（design.md D0 consumer-owned）。
+//
+// sqlite adapter 把底层 sql.ErrNoRows 归一化为本 sentinel，application 经
+// LifecycleService 透传，Manager facade 映射为 task.OpError{codeNotFound}
+// （保持 api.TaskBackend 契约与 OpError 映射逐字不变）。
+var ErrTaskNotFound = errors.New("task not found")
+
+// Publisher 为 application commit helper 发布事件的窄接口（design.md D0:133）。
+//
+// P1.4.4 阶段注入 NoopPublisher（不发布任何事件）；真实事件生产挂接在 Phase C/P1.6。
+// Publish 非阻塞：订阅方缓冲满时丢弃该事件并置位溢出信号，MUST NOT 回滚业务提交。
+type Publisher interface {
+	Publish(ev ocdeckevent.Event)
+}
 
 // TaskRepository 表达任务聚合的持久化端口（design.md D0）。
 //
 // 状态写入返回 TransitionResult（区分 status 是否真实迁移）；其余单列写入返回
 // MutationResult。DeleteTask 返回 DeleteResult（含被删行原状态与级联 session ID）。
 type TaskRepository interface {
+	// CreateTask 插入任务行（status 由调用方提供，creating 意图落库）。
+	// 仅消费 ID/ProjectID/Name/Branch/Status/WorktreePath/BaseRef；MUST NOT 再校验 status。
+	CreateTask(ctx context.Context, row TaskSnapshot) error
 	UpdateTaskStatus(ctx context.Context, id string, status ocdecktask.Status, lastError *string) (TransitionResult, error)
 	UpdateTaskStatusConditional(ctx context.Context, id string, fromStatus, toStatus ocdecktask.Status, lastError *string) (TransitionResult, error)
 	UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot *string) (MutationResult, error)
@@ -40,16 +60,63 @@ type TaskRepository interface {
 	GetTask(ctx context.Context, id string) (*ocdecktask.Task, error)
 }
 
+// TaskReadRepository 为任务读侧端口（design.md D0:71 consumer-owned）。
+//
+// Get/List 用例需要全行快照（含创建期可变信息与持久化元数据），而 TaskRepository.GetTask
+// 仅返回 guard 视图（status/init_status/delete_mode/notices）。本端口闭合为 Get/List 读侧，
+// 返回 application 层 TaskSnapshot（普通 Go 类型，MUST NOT 泄漏 sql.NullString），
+// 供 LifecycleService 编排与 Manager facade 转换为 task.TaskRow（迁移期 api.TaskBackend 契约冻结）。
+type TaskReadRepository interface {
+	GetTaskRow(ctx context.Context, id string) (TaskSnapshot, error)
+	ListTasksByProject(ctx context.Context, projectID string) ([]TaskSnapshot, error)
+}
+
+// TaskSnapshot 为 application 层读出的任务全行快照（design.md D0:71 consumer-owned）。
+//
+// 字段与 store.TaskRow / task.TaskRow 一一对应，但用普通 Go 类型表达 nullable
+// （*string / *int64），MUST NOT 泄漏 sql.NullString。Manager facade 转换为 task.TaskRow
+// 时还原 sql.NullString（迁移期 api.TaskBackend 契约返回 task.TaskRow，逐字不变）。
+type TaskSnapshot struct {
+	ID           string
+	ProjectID    string
+	Name         string
+	Branch       string
+	Status       string
+	WorktreePath string
+	LastPort     *int64
+	LastError    *string
+	Notice       *string
+	DeleteMode   *string
+	EnvSnapshot  *string
+	CreatedAt    int64
+	UpdatedAt    int64
+	ArchivedAt   *int64
+	InitStatus   string
+	InitError    *string
+	BaseRef      string
+}
+
 // SessionRepository 表达会话归属隔离的持久化端口（design.md D0:78-86）。
 //
 // 方法闭合为 Claim/TouchOwned/DeleteOwned/Align/OwnedSessions/OwnerOf，MUST NOT 暴露
 // 通用 Save/Upsert。OwnerOf 读到历史重复归属时 fail-closed 返回
 // session.AmbiguousOwnerError。
 type SessionRepository interface {
+	// Claim 原子认领归属：单事务先查他主再 upsert；changed=新插入或 last_seen_at/parent_id
+	// 实际推进（design.md D0:77）。obs.FirstSeenAt 为 ocdeck 首次观测时间。
 	Claim(ctx context.Context, taskID string, obs ocdecksess.Observation) (ClaimResult, error)
+	// TouchOwned 条件推进本任务已归属行的 last_seen_at（绝不插入）；Matched=命中归属行，
+	// Changed=值真实推进（值不变为 Matched+!Changed 同值幂等）。
 	TouchOwned(ctx context.Context, taskID string, sessionID ocdecksess.ID, lastSeenAt int64) (MutationResult, error)
+	// DeleteOwned 删除归属行，返回受影响行数（0=行不存在，同值幂等成功）。
 	DeleteOwned(ctx context.Context, taskID string, sessionID ocdecksess.ID) (int, error)
-	Align(ctx context.Context, taskID string, observed []ocdecksess.Session, notice NoticeMutation) (AlignResult, error)
+	// Align 单事务批处理一致性对齐（design.md D0:80/86）：按 mode 处理 observed（repo 逐个
+	// 原子 claim / ownedOnly 仅刷新 listed∩owned），complete=true 时删 owned 缺席行并同事务
+	// 提交 notice 变更（expected 失配整事务回滚返回 AlignConflict）；complete=false 不删缺席行、
+	// 不触碰 notice（overflow 的 session_overflow 由 application 在 Align 之前经事务外 CAS 写入，
+	// Align 失败 MUST NOT 回滚该 notice）。
+	Align(ctx context.Context, taskID string, mode ocdecksess.AlignMode, observed []ocdecksess.Observation, complete bool, notice NoticeMutation) (AlignResult, error)
+	// OwnedSessions 返回本任务拥有的全部 session ID（对账交集用）。
 	OwnedSessions(ctx context.Context, taskID string) ([]ocdecksess.ID, error)
 	// OwnerOf 反查 session_id 的归属 task。读到历史重复归属时 fail-closed 返回
 	// session.AmbiguousOwnerError（typed ambiguity）；found=false 表示无归属行。

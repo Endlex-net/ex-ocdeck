@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
+	"ocdeck/internal/application/runtime"
+	apptask "ocdeck/internal/application/task"
 	"ocdeck/internal/config"
 	"ocdeck/internal/lifecycle"
 	"ocdeck/internal/opencode"
@@ -57,18 +59,23 @@ type TaskStore interface {
 	// ListTopLevelTaskSessions 列出顶层会话（parent_id 为空），供锚定候选取最近顶层 session
 	//（design.md §4 锚定隔离 background subagent 子会话）。
 	ListTopLevelTaskSessions(ctx context.Context, taskID string) ([]SessionRow, error)
-	DeleteTaskSession(ctx context.Context, taskID, sessionID string) error
-	AlignSessions(ctx context.Context, taskID string, sessions []SessionRow, complete bool, noticeFn func(sql.NullString) sql.NullString) error
+	// DeleteTaskSession 删除会话归属行，返回受影响行数（0=行不存在，幂等成功，P1.4.5 结构化）。
+	DeleteTaskSession(ctx context.Context, taskID, sessionID string) (int, error)
 	// ClaimTaskSession 原子 claim 一个 session 至本任务（add-plain-dir-project D8）。
-	// 单事务"仅当 sessionID 未被他任务拥有时插入/更新本任务行；已被他任务拥有则 claimed=false + ownerTaskID"。
-	// 不加跨任务唯一索引；冲突语义由调用方按入口处理（SSE/对齐忽略+诊断，锚定失败+last_error）。
-	ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (claimed bool, ownerTaskID string, err error)
+	// 单事务"仅当 sessionID 未被他任务拥有时插入/更新本任务行；已被他任务拥有则
+	// Claimed=false + OwnerTaskID"。ClaimResult.Changed=新插入或 last_seen_at/parent_id
+	// 实际推进（P1.4.5 结构化）。不加跨任务唯一索引；冲突语义由调用方按入口处理
+	//（SSE/对齐忽略+诊断，锚定失败+last_error）。
+	ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error)
 	// TouchOwnedTaskSession 条件 UPDATE 仅本任务已归属行的 last_seen_at（D8）。
-	// 绝不插入；updated=false（未归属行）为正常路径。供 session.updated 事件使用（MUST NOT 创建归属）。
-	TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (updated bool, err error)
-	// AlignTaskSessions 单事务原子对齐（D8）：读 owned → 按 mode（repo claim/ownedOnly 刷新）→
-	// complete 删 owned 缺席行 → noticeFn 事务内读写 notice。conflicts 为 repo 模式下被他任务拥有的 sessionID。
-	AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, noticeFn func(sql.NullString) sql.NullString) (conflicts []string, err error)
+	// 绝不插入；MutationResult.Matched=命中归属行（同值为 Matched+!Changed），!Matched
+	//（未归属行）为正常路径。供 session.updated 事件使用（MUST NOT 创建归属）。
+	TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (application.MutationResult, error)
+	// AlignTaskSessions 单事务原子对齐（D8 + design.md D0:80/86）：读 owned → 按 mode
+	//（repo claim/ownedOnly 刷新）→ complete 删 owned 缺席行 + notice CAS 同事务提交
+	//（expected 失配整事务回滚返回 application.AlignConflict）。返回结构化 AlignResult
+	//（计数/AffectedSessionIDs/OwnedSessionIDs/TaskMutation/Conflicts）。
+	AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, notice application.NoticeMutation) (application.AlignResult, error)
 	// ListActiveTaskOverview 聚合全部 active 任务的跨项目概览
 	//（cross-project-active-sessions D2：JOIN projects + LEFT JOIN task_sessions）。
 	ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOverviewRow, error)
@@ -172,6 +179,16 @@ type ActiveTaskOverviewRow struct {
 // --- Manager ---
 
 // Manager 是任务状态转换/进程/worktree 操作的唯一入口（design.md §1/§18）。
+//
+// legacy facade 角色（OpenSpec change sse-active-sessions P1.4.1）：
+// 本类型当前是单体编排器，层间无端口与领域模型——状态机决策、外部副作用编排与
+// 持久化写入全部内联于此。在 sse-active-sessions 的 strangler 迁移中它作为
+// legacy facade，按 design D0 八步顺序逐步把职责迁移到 application 层单一
+// LifecycleService + domain guard + consumer-owned Repository ports
+// （ServeRuntimeRegistry 独立承接 generation/instanceID/groups/tombstone/clear）。
+// 迁移期间 MUST 保持单一写路径（不与新 application/service 双写）、锁定 D0 不变量清单，
+// 直至 P1.4.8 调用方收缩至零后删除或仅留别名转发层。P1.4.1 仅冻结现状 trace 与
+// 「决策先于副作用」约定，不改动本类型的任何行为。
 type Manager struct {
 	cfg       *config.Config
 	store     TaskStore
@@ -202,11 +219,13 @@ type Manager struct {
 	rtMu     sync.Mutex
 	runtimes map[string]*taskRuntime // taskID -> runtime
 
-	// lastGen 记录每任务最后使用的 generation（B4：runtime 清除后 generation 不得回 0，
-	// Manager 侧单调递增持久持有）。即便 runtime 被 clearRuntime 移除，下次 newRuntime 也
-	// 从 lastGen+1 续递增，保证回调三元组校验的 generation 在进程生命周期内不回卷。
-	genMu   sync.Mutex
-	lastGen map[string]int // taskID -> last used generation
+	// runtimeRegistry 是 ServeRuntime 代际/tombstone 管理权威（design.md D0 step 3，
+	// P1.4.3 一次性迁移）。承载 generation/instanceID 分配与 lastGen tombstone 语义，
+	// 单一锁域（Registry.genMu），MUST NOT 与 Manager 旧字段双写——切换后 Manager 侧
+	// genMu/lastGen 已删除，全部经 Registry.NewRuntimeToken 分配。
+	// B4：即便 runtime 被 clearRuntime 移除，下次 newRuntime 经 Registry tombstone 续递增，
+	// 保证回调三元组校验的 generation 在进程生命周期内不回卷（沿用 lastGen 持久代先例）。
+	runtimeRegistry *runtime.Registry
 
 	// lifeCtx 是 Manager 生命周期 context（design.md §4：SSE/退出监视挂 Manager 生命周期，
 	// 非 HTTP request context）。由 SetLifecycleCtx 注入；nil 时回退 context.Background()。
@@ -242,6 +261,16 @@ type Manager struct {
 	lifecycleRunner lifecycle.LifecycleRunner
 	// logDir 为生命周期脚本日志根目录（design.md §7.4：<dataDir>/logs）。
 	logDir string
+
+	// taskRepo 为 application.TaskRepository port 注入位（design D0 P1.4.2 接线）。
+	// strangler 第二步：guard 委托经 domain Rehydrate 完成（不经 port），本字段为后续步骤
+	// （P1.4.4+ 迁移 Get/List/Archive/Restore）预置的能力通道。当前 nil 不影响调用路径。
+	taskRepo application.TaskRepository
+
+	// lifecycle 为 application/task LifecycleService（design D0 P1.4.4 迁移第 4 步）。
+	// P1.4.4 起 Get/List/Archive/Restore 委托本 service；nil 时回退 legacy 直连 store 路径
+	// （保持测试不注入 service 时行为不变）。后续步骤（P1.4.5+）追加更多用例委托。
+	lifecycle *apptask.LifecycleService
 
 	// runnerCtx 是 InitRunner/pre-delete 脚本执行所用的独立 context（design.md §6.1）：
 	// 不复用 SetLifecycleCtx 的 signal ctx，仅 Shutdown 关 gate 后取消。
@@ -321,6 +350,15 @@ type Options struct {
 	LifecycleRunner lifecycle.LifecycleRunner
 	// LogDir 生命周期脚本日志根目录（design.md §7.4）。为空时回退 <cfg.DataDir>/logs。
 	LogDir string
+	// TaskRepo 可选：application.TaskRepository port 注入（design D0 P1.4.2 接线）。
+	// strangler 第二步：guard 委托经 domain Rehydrate 完成（纯领域，不经 port），
+	// 本字段为后续步骤（P1.4.4+ 迁移 Get/List/Archive/Restore）预置的 application ports
+	// 能力通道。当前未使用，保留 nil 不影响任何调用路径（调用路径与行为逐字不变）。
+	TaskRepo application.TaskRepository
+	// Lifecycle 可选：application/task LifecycleService 注入（design D0 P1.4.4 迁移第 4 步）。
+	// 注入后 Get/List/Archive/Restore 委托本 service；nil 时回退 legacy 直连 store 路径，
+	// 保持测试不注入 service 时行为不变。
+	Lifecycle *apptask.LifecycleService
 }
 
 // New 构造 Manager。OCFactory 为 nil 时用默认 opencode.Client 工厂。
@@ -335,8 +373,10 @@ func New(opts Options) *Manager {
 		debtStore:               opts.DebtStore,
 		lifecycleRunner:         opts.LifecycleRunner,
 		logDir:                  opts.LogDir,
+		taskRepo:                opts.TaskRepo,
+		lifecycle:               opts.Lifecycle,
 		runtimes:                make(map[string]*taskRuntime),
-		lastGen:                 make(map[string]int),
+		runtimeRegistry:         runtime.New(),
 		rand4Fn:                 rand4,
 		probeColdStartBackoffFn: defaultProbeColdStartBackoff,
 	}
@@ -620,6 +660,9 @@ func (m *Manager) backgroundLoop(ctx context.Context) {
 			}
 			// D6：degraded 注意力能力状态周期重试（复用 backgroundLoop，不新增 goroutine/定时器）。
 			m.retryAttentionDegraded(ctx)
+			// P1.4.7：收敛债务 tick 分支（design.md D2 债务两阶段：锁超时登记的
+			// preCleanup/postCleanup 由 worker 持锁消化；锁忙任务跳过本轮不阻塞周期）。
+			m.processConvergeDebts(ctx)
 		}
 	}
 }

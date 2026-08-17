@@ -6,6 +6,7 @@ import (
 
 	"ocdeck/internal/application"
 	ocdecktask "ocdeck/internal/domain/task"
+	ocdecksess "ocdeck/internal/domain/session"
 	"ocdeck/internal/git"
 	"ocdeck/internal/process"
 	"ocdeck/internal/pty"
@@ -228,18 +229,8 @@ func (a *StoreAdapter) ListTopLevelTaskSessions(ctx context.Context, taskID stri
 	}
 	return out, nil
 }
-func (a *StoreAdapter) DeleteTaskSession(ctx context.Context, taskID, sessionID string) error {
+func (a *StoreAdapter) DeleteTaskSession(ctx context.Context, taskID, sessionID string) (int, error) {
 	return a.db.DeleteTaskSession(ctx, taskID, sessionID)
-}
-func (a *StoreAdapter) AlignSessions(ctx context.Context, taskID string, sessions []SessionRow, complete bool, noticeFn func(sql.NullString) sql.NullString) error {
-	ss := make([]store.SessionRow, 0, len(sessions))
-	for _, s := range sessions {
-		ss = append(ss, store.SessionRow{
-			TaskID: s.TaskID, SessionID: s.SessionID, SessionCreatedAt: s.SessionCreatedAt,
-			FirstSeenAt: s.FirstSeenAt, LastSeenAt: s.LastSeenAt, ParentID: s.ParentID,
-		})
-	}
-	return a.db.AlignSessions(ctx, taskID, ss, complete, noticeFn)
 }
 
 // --- session 归属隔离（add-plain-dir-project D8：原子 claim / 对齐 / 条件刷新） ---
@@ -259,24 +250,117 @@ func toStoreAlignMode(mode AlignMode) store.AlignMode {
 }
 
 // ClaimTaskSession 原子 claim（D8）：单事务仅当 sessionID 未被他任务拥有时插入/更新本任务行。
-func (a *StoreAdapter) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (bool, string, error) {
+// 返回结构化 ClaimResult（P1.4.5：Claimed/Changed/OwnerTaskID）。
+func (a *StoreAdapter) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
 	return a.db.ClaimTaskSession(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
 }
 
 // TouchOwnedTaskSession 条件 UPDATE 仅本任务已归属行的 last_seen_at（D8）。
-func (a *StoreAdapter) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (bool, error) {
+// 返回结构化 MutationResult（P1.4.5：Matched=命中归属行，Changed=值真实推进）。
+func (a *StoreAdapter) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (application.MutationResult, error) {
 	return a.db.TouchOwnedTaskSession(ctx, taskID, sessionID, lastSeenAt)
 }
 
-// AlignTaskSessions 单事务原子对齐（D8）：task 层 AlignMode/SessionObservation 映射到 store 层类型。
-func (a *StoreAdapter) AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, noticeFn func(sql.NullString) sql.NullString) ([]string, error) {
+// AlignTaskSessions 单事务原子对齐（D8 + design.md D0:80/86）：task 层 AlignMode/
+// SessionObservation 映射到 store 层类型；notice 以 NoticeMutation 事务内 CAS 提交。
+func (a *StoreAdapter) AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, notice application.NoticeMutation) (application.AlignResult, error) {
 	obs := make([]store.SessionObservation, 0, len(listed))
 	for _, s := range listed {
 		obs = append(obs, store.SessionObservation{
 			SessionID: s.SessionID, CreatedAt: s.CreatedAt, UpdatedAt: s.UpdatedAt, ParentID: s.ParentID,
 		})
 	}
-	return a.db.AlignTaskSessions(ctx, taskID, toStoreAlignMode(mode), obs, complete, noticeFn)
+	return a.db.AlignTaskSessions(ctx, taskID, toStoreAlignMode(mode), obs, complete, notice)
+}
+
+// storeAlignPortsAdapter 把 legacy TaskStore 适配为 apptask.AlignPorts（P1.4.5 迁移期
+// legacy 直连路径共用 RunAlign 编排，避免 align 决策/事务边界逻辑双写）。
+type storeAlignPortsAdapter struct {
+	store TaskStore
+}
+
+// GetTaskRow 读全行快照：TaskStore.GetTask → application.TaskSnapshot（nullable 转指针）。
+func (a storeAlignPortsAdapter) GetTaskRow(ctx context.Context, id string) (application.TaskSnapshot, error) {
+	row, err := a.store.GetTask(ctx, id)
+	if err != nil {
+		return application.TaskSnapshot{}, err
+	}
+	return taskRowToSnapshot(row), nil
+}
+
+// UpdateTaskNoticeCAS 乐观更新 notice（sql.NullString ↔ *string 转换）。
+func (a storeAlignPortsAdapter) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice *string) (application.MutationResult, error) {
+	return a.store.UpdateTaskNoticeCAS(ctx, id, ptrToNullString(expected), ptrToNullString(newNotice))
+}
+
+// Align 委托 TaskStore.AlignTaskSessions（Observation/AlignMode 映射）。
+func (a storeAlignPortsAdapter) Align(ctx context.Context, taskID string, mode ocdecksess.AlignMode, observed []ocdecksess.Observation, complete bool, notice application.NoticeMutation) (application.AlignResult, error) {
+	listed := make([]SessionObservation, 0, len(observed))
+	for _, o := range observed {
+		listed = append(listed, SessionObservation{
+			SessionID: string(o.ID), CreatedAt: o.CreatedAt, UpdatedAt: o.UpdatedAt, ParentID: o.ParentID,
+		})
+	}
+	return a.store.AlignTaskSessions(ctx, taskID, fromDomainAlignMode(mode), listed, complete, notice)
+}
+
+// taskRowToSnapshot 把 task.TaskRow 映射为 application.TaskSnapshot（P1.4.5 供 legacy
+// align 端口适配读取 notice 原文；与 taskSnapshotToTaskRow 互逆）。
+func taskRowToSnapshot(r TaskRow) application.TaskSnapshot {
+	return application.TaskSnapshot{
+		ID:           r.ID,
+		ProjectID:    r.ProjectID,
+		Name:         r.Name,
+		Branch:       r.Branch,
+		Status:       r.Status,
+		WorktreePath: r.WorktreePath,
+		LastPort:     ptrToNullInt64ToPtr(r.LastPort),
+		LastError:    nullStringToPtr(r.LastError),
+		Notice:       nullStringToPtr(r.Notice),
+		DeleteMode:   nullStringToPtr(r.DeleteMode),
+		EnvSnapshot:  nullStringToPtr(r.EnvSnapshot),
+		CreatedAt:    r.CreatedAt,
+		UpdatedAt:    r.UpdatedAt,
+		ArchivedAt:   ptrToNullInt64ToPtr(r.ArchivedAt),
+		InitStatus:   r.InitStatus,
+		InitError:    nullStringToPtr(r.InitError),
+		BaseRef:      r.BaseRef,
+	}
+}
+
+// ptrToNullInt64ToPtr 把 sql.NullInt64 映射为 *int64（Invalid → nil）。
+func ptrToNullInt64ToPtr(n sql.NullInt64) *int64 {
+	if !n.Valid {
+		return nil
+	}
+	v := n.Int64
+	return &v
+}
+
+// fromDomainAlignMode 映射 domain/session.AlignMode → task 层 AlignMode。
+// 未知值映射为零值，由 store 层 AlignTaskSessions fail-closed 拒绝。
+func fromDomainAlignMode(mode ocdecksess.AlignMode) AlignMode {
+	switch mode {
+	case ocdecksess.AlignModeRepo:
+		return AlignModeRepo
+	case ocdecksess.AlignModeOwnedOnly:
+		return AlignModeOwnedOnly
+	default:
+		return 0
+	}
+}
+
+// toDomainAlignMode 映射 task 层 AlignMode → domain/session.AlignMode。
+// 未知值映射为零值，由 store 层 fail-closed 拒绝。
+func toDomainAlignMode(mode AlignMode) ocdecksess.AlignMode {
+	switch mode {
+	case AlignModeRepo:
+		return ocdecksess.AlignModeRepo
+	case AlignModeOwnedOnly:
+		return ocdecksess.AlignModeOwnedOnly
+	default:
+		return 0
+	}
 }
 
 // --- CleanupDebtStore 适配（design.md §10：orphan tickets 跨重启持久化） ---
@@ -314,6 +398,24 @@ func nullStringToPtr(ns sql.NullString) *string {
 	return &s
 }
 
+// rehydrateGuardView 把 legacy TaskRow 重建为 domain Task guard 视图（design D0 P1.4.2）。
+//
+// strangler 第二步：现状 guard 判断（Archive/Restore/Delete/Activate init_status/Suspend）
+// 委托 domain/task 的 CanArchive/CanRestore/CanDelete/CanActivate/CanSuspend。本 helper
+// 从 legacy TaskRow 行值构造 domain guard 所需的最小字段子集（status/init_status），
+// notices 不填（notice 维度的判断仍由 legacy hasRetryableNotice 完成，保证 notice JSON
+// 损坏 fail-closed 语义与错误码映射 byte-equivalent）。
+//
+// 调用方在拿到 TaskRow（GetTask 已将 init_status 归一化为 none）后调用本 helper，
+// 再调用 domain Can* guard；guard 拒绝时调用方按现状维度顺序与错误模板生成 OpError，
+// 保持委托前后行为字节级等价。
+func rehydrateGuardView(row TaskRow) *ocdecktask.Task {
+	return ocdecktask.Rehydrate(ocdecktask.GuardView{
+		Status:     ocdecktask.Status(row.Status),
+		InitStatus: ocdecktask.InitStatus(row.InitStatus),
+	})
+}
+
 func toTaskRow(t store.TaskRow) TaskRow {
 	return TaskRow{
 		ID: t.ID, ProjectID: t.ProjectID, Name: t.Name, Branch: t.Branch, Status: t.Status,
@@ -321,6 +423,49 @@ func toTaskRow(t store.TaskRow) TaskRow {
 		DeleteMode: t.DeleteMode, EnvSnapshot: t.EnvSnapshot, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
 		ArchivedAt: t.ArchivedAt, InitStatus: t.InitStatus, InitError: t.InitError, BaseRef: t.BaseRef,
 	}
+}
+
+// taskSnapshotToTaskRow 把 application.TaskSnapshot 还原为 task.TaskRow（design D0 P1.4.4）。
+//
+// 迁移期 api.TaskBackend 契约返回 task.TaskRow（冻结不变量），LifecycleService.Get/List
+// 返回 application.TaskSnapshot，经本 helper 还原为 task.TaskRow，保持逐字段等价。
+// *string/*int64 还原为 sql.NullString/sql.NullInt64（nil → Invalid）。
+func taskSnapshotToTaskRow(s application.TaskSnapshot) TaskRow {
+	return TaskRow{
+		ID:           s.ID,
+		ProjectID:    s.ProjectID,
+		Name:         s.Name,
+		Branch:       s.Branch,
+		Status:       s.Status,
+		WorktreePath: s.WorktreePath,
+		LastPort:     ptrToNullInt64(s.LastPort),
+		LastError:    ptrToNullString(s.LastError),
+		Notice:       ptrToNullString(s.Notice),
+		DeleteMode:   ptrToNullString(s.DeleteMode),
+		EnvSnapshot:  ptrToNullString(s.EnvSnapshot),
+		CreatedAt:    s.CreatedAt,
+		UpdatedAt:    s.UpdatedAt,
+		ArchivedAt:   ptrToNullInt64(s.ArchivedAt),
+		InitStatus:   s.InitStatus,
+		InitError:    ptrToNullString(s.InitError),
+		BaseRef:      s.BaseRef,
+	}
+}
+
+// ptrToNullString 把 *string 还原为 sql.NullString（nil → Invalid）。
+func ptrToNullString(s *string) sql.NullString {
+	if s == nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: *s, Valid: true}
+}
+
+// ptrToNullInt64 把 *int64 还原为 sql.NullInt64（nil → Invalid）。
+func ptrToNullInt64(n *int64) sql.NullInt64 {
+	if n == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: *n, Valid: true}
 }
 
 // WorktreeAdapter 包装 *worktree.Manager 实现 WorktreeBackend。

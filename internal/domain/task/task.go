@@ -152,7 +152,7 @@ func New(in NewInput) (*Task, error) {
 	if in.WorktreePath == "" {
 		return nil, errors.New("task.New: WorktreePath must not be empty")
 	}
-	return &Task{
+		return &Task{
 		id:           in.ID,
 		projectID:    in.ProjectID,
 		name:         in.Name,
@@ -164,6 +164,42 @@ func New(in NewInput) (*Task, error) {
 		createdAt:    in.CreatedAt,
 		updatedAt:    in.CreatedAt,
 	}, nil
+}
+
+// GuardView 为持久化行重建 guard 视图所需的最小字段子集（design D0 P1.4.2）。
+// 仅包含 status/init_status/delete_mode/notices——guard 判断输入；其余创建期可变信息
+// （name/branch/worktreePath/baseRef）与持久化元数据（lastError/initError/timestamps）
+// 不参与 guard 决策，故不在重建输入中。调用方按需填充：notice 维度已在上游判断完成时
+// 传 nil；delete_mode 仅在 guard 需要读持久化 mode 时填充（CanDelete 的 mode 由参数传入，
+// 不读此字段）。
+type GuardView struct {
+	Status     Status
+	InitStatus InitStatus
+	DeleteMode DeleteMode
+	Notices    []Notice
+}
+
+// Rehydrate 从持久化行值构造 Task 的 guard 视图（design D0 P1.4.2）。
+//
+// 这是持久化重建的合法形态：直接按行值构造，不走 New 的创建不变量（New 仅用于首次创建，
+// 固定 status=creating）。Rehydrate 供 application/legacy facade 调用 domain guard
+// （CanArchive/CanRestore/CanDelete/CanActivate/CanSuspend）使用，纯 stdlib、无 IO、
+// 不校验业务不变量。
+//
+// 与 New 的区别：New 校验创建期必填字段并固定 status=creating；Rehydrate 接受任意
+// 持久化值（含 creation_failed/deletion_failed 等终态），仅用于读取 guard 判定，
+// 不用于写入或状态迁移。
+func Rehydrate(v GuardView) *Task {
+	t := &Task{
+		status:     v.Status,
+		initStatus: v.InitStatus,
+		deleteMode: v.DeleteMode,
+	}
+	if v.Notices != nil {
+		t.notices = make([]Notice, len(v.Notices))
+		copy(t.notices, v.Notices)
+	}
+	return t
 }
 
 // --- 只读访问器 ---

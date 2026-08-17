@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"ocdeck/internal/application"
 	ocdecktask "ocdeck/internal/domain/task"
 )
 
@@ -628,17 +629,16 @@ func TestBeginDeleteIntent_Atomic(t *testing.T) {
 	}
 }
 
-func TestAlignSessions_CompleteDeletesAbsent(t *testing.T) {
+func TestAlignTaskSessions_CompleteDeletesAbsent(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 	seedProjectTask(t, db, "t1")
 	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "t1", SessionID: "s1", SessionCreatedAt: 1, FirstSeenAt: 10, LastSeenAt: 100})
 	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "t1", SessionID: "s2", SessionCreatedAt: 1, FirstSeenAt: 10, LastSeenAt: 90})
-	// 全量对齐返回 [s1]，complete=true → 删除缺席的 s2。
-	aligned := []SessionRow{
-		{TaskID: "t1", SessionID: "s1", SessionCreatedAt: 1, FirstSeenAt: 10, LastSeenAt: 100},
-	}
-	if err := db.AlignSessions(ctx, "t1", aligned, true, nil); err != nil {
+	// 全量对齐返回 [s1]，complete=true → 删除缺席的 s2；结构化结果携带删除计数与 owned 快照。
+	listed := []SessionObservation{{SessionID: "s1", CreatedAt: 1, UpdatedAt: 100}}
+	res, err := db.AlignTaskSessions(ctx, "t1", AlignModeRepo, listed, true, application.NoticeMutation{})
+	if err != nil {
 		t.Fatalf("align: %v", err)
 	}
 	rows, err := db.ListTaskSessions(ctx, "t1")
@@ -648,19 +648,23 @@ func TestAlignSessions_CompleteDeletesAbsent(t *testing.T) {
 	if len(rows) != 1 || rows[0].SessionID != "s1" {
 		t.Errorf("sessions = %+v, want only s1", rows)
 	}
+	if res.Deleted != 1 || res.Inserted != 0 {
+		t.Errorf("result = %+v, want Deleted=1 Inserted=0", res)
+	}
+	if len(res.OwnedSessionIDs) != 1 || string(res.OwnedSessionIDs[0]) != "s1" {
+		t.Errorf("OwnedSessionIDs = %v, want [s1]", res.OwnedSessionIDs)
+	}
 }
 
-func TestAlignSessions_TruncatedKeepsAbsent(t *testing.T) {
+func TestAlignTaskSessions_TruncatedKeepsAbsent(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 	seedProjectTask(t, db, "t1")
 	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "t1", SessionID: "s1", SessionCreatedAt: 1, FirstSeenAt: 10, LastSeenAt: 100})
 	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "t1", SessionID: "s2", SessionCreatedAt: 1, FirstSeenAt: 10, LastSeenAt: 90})
-	// 截断（complete=false）：仅 upsert s1，MUST NOT 删除 s2。
-	aligned := []SessionRow{
-		{TaskID: "t1", SessionID: "s1", SessionCreatedAt: 1, FirstSeenAt: 10, LastSeenAt: 100},
-	}
-	if err := db.AlignSessions(ctx, "t1", aligned, false, nil); err != nil {
+	// 截断（complete=false）：仅 upsert s1，MUST NOT 删除 s2，也不触碰 notice。
+	listed := []SessionObservation{{SessionID: "s1", CreatedAt: 1, UpdatedAt: 100}}
+	if _, err := db.AlignTaskSessions(ctx, "t1", AlignModeRepo, listed, false, application.NoticeMutation{}); err != nil {
 		t.Fatalf("align: %v", err)
 	}
 	rows, err := db.ListTaskSessions(ctx, "t1")
@@ -672,17 +676,17 @@ func TestAlignSessions_TruncatedKeepsAbsent(t *testing.T) {
 	}
 }
 
-func TestAlignSessions_RollbackOnPartialFailure(t *testing.T) {
+func TestAlignTaskSessions_RollbackOnPartialFailure(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 	seedProjectTask(t, db, "t1")
 	_ = db.UpsertTaskSession(ctx, SessionRow{TaskID: "t1", SessionID: "s1", SessionCreatedAt: 1, FirstSeenAt: 10, LastSeenAt: 100})
-	// noticeFn 读取不存在的任务行 → 返回 sql.ErrNoRows → 事务回滚，upsert 不提交。
-	aligned := []SessionRow{
-		{TaskID: "t1", SessionID: "s2", SessionCreatedAt: 1, FirstSeenAt: 10, LastSeenAt: 200},
-	}
-	noticeFn := func(sql.NullString) sql.NullString { return sql.NullString{String: "x", Valid: true} }
-	err := db.AlignSessions(ctx, "nonexistent-task", aligned, true, noticeFn)
+	// notice 分支读取不存在的任务行 → 返回 sql.ErrNoRows → 事务回滚，upsert 不提交。
+	listed := []SessionObservation{{SessionID: "s2", CreatedAt: 1, UpdatedAt: 200}}
+	expected := "x"
+	newNotice := "y"
+	_, err := db.AlignTaskSessions(ctx, "nonexistent-task", AlignModeRepo, listed, true,
+		application.NoticeMutation{Expected: &expected, New: &newNotice})
 	if err == nil {
 		t.Fatal("expected error for nonexistent task, got nil")
 	}
@@ -904,12 +908,15 @@ func TestClaimTaskSession_NoConflictInserts(t *testing.T) {
 		Status: "suspended", WorktreePath: "/wt"}); err != nil {
 		t.Fatal(err)
 	}
-	claimed, owner, err := db.ClaimTaskSession(ctx, "t1", "sess-1", 10, 11, 12, "parent-x")
+	res, err := db.ClaimTaskSession(ctx, "t1", "sess-1", 10, 11, 12, "parent-x")
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if !claimed || owner != "" {
-		t.Fatalf("claimed=%v owner=%q, want true/empty", claimed, owner)
+	if !res.Claimed || res.OwnerTaskID != "" {
+		t.Fatalf("claimed=%v owner=%q, want true/empty", res.Claimed, res.OwnerTaskID)
+	}
+	if !res.Changed {
+		t.Errorf("new insert claim should report Changed=true")
 	}
 	sessions, _ := db.ListTaskSessions(ctx, "t1")
 	if len(sessions) != 1 || sessions[0].SessionID != "sess-1" {
@@ -936,19 +943,19 @@ func TestClaimTaskSession_ConflictReturnsOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	// t1 claim sess-shared。
-	if claimed, _, err := db.ClaimTaskSession(ctx, "t1", "sess-shared", 1, 1, 1, ""); err != nil || !claimed {
-		t.Fatalf("t1 claim: %v %v", claimed, err)
+	if res, err := db.ClaimTaskSession(ctx, "t1", "sess-shared", 1, 1, 1, ""); err != nil || !res.Claimed {
+		t.Fatalf("t1 claim: %v %v", res.Claimed, err)
 	}
 	// t2 claim 同一 session → 冲突。
-	claimed, owner, err := db.ClaimTaskSession(ctx, "t2", "sess-shared", 2, 2, 2, "")
+	res, err := db.ClaimTaskSession(ctx, "t2", "sess-shared", 2, 2, 2, "")
 	if err != nil {
 		t.Fatalf("t2 claim: %v", err)
 	}
-	if claimed {
+	if res.Claimed {
 		t.Errorf("t2 claim should fail (conflict)")
 	}
-	if owner != "t1" {
-		t.Errorf("owner = %q, want t1", owner)
+	if res.OwnerTaskID != "t1" {
+		t.Errorf("owner = %q, want t1", res.OwnerTaskID)
 	}
 	// t2 不应有该行。
 	t2Sessions, _ := db.ListTaskSessions(ctx, "t2")
@@ -970,12 +977,16 @@ func TestClaimTaskSession_IdempotentOwnTask(t *testing.T) {
 		Status: "suspended", WorktreePath: "/wt"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := db.ClaimTaskSession(ctx, "t1", "sess-1", 1, 1, 1, "p1"); err != nil {
+	if _, err := db.ClaimTaskSession(ctx, "t1", "sess-1", 1, 1, 1, "p1"); err != nil {
 		t.Fatal(err)
 	}
 	// 再次 claim 同任务同 session，last_seen 更新、parent 更新。
-	if claimed, _, err := db.ClaimTaskSession(ctx, "t1", "sess-1", 5, 5, 99, "p2"); err != nil || !claimed {
-		t.Fatalf("idempotent claim: %v %v", claimed, err)
+	res, err := db.ClaimTaskSession(ctx, "t1", "sess-1", 5, 5, 99, "p2")
+	if err != nil || !res.Claimed {
+		t.Fatalf("idempotent claim: %v %v", res.Claimed, err)
+	}
+	if !res.Changed {
+		t.Errorf("claim with advanced last_seen/parent should report Changed=true")
 	}
 	sessions, _ := db.ListTaskSessions(ctx, "t1")
 	if len(sessions) != 1 || sessions[0].LastSeenAt != 99 || sessions[0].ParentID != "p2" {
@@ -994,25 +1005,35 @@ func TestTouchOwnedTaskSession_NoInsert(t *testing.T) {
 		Status: "suspended", WorktreePath: "/wt"}); err != nil {
 		t.Fatal(err)
 	}
-	// 未归属 → updated=false，不插入。
-	updated, err := db.TouchOwnedTaskSession(ctx, "t1", "sess-unowned", 99)
+	// 未归属 → !Matched，不插入。
+	tres, err := db.TouchOwnedTaskSession(ctx, "t1", "sess-unowned", 99)
 	if err != nil {
 		t.Fatalf("touch unowned: %v", err)
 	}
-	if updated {
-		t.Errorf("touch unowned should return false")
+	if tres.Matched || tres.Changed {
+		t.Errorf("touch unowned should return !Matched, got %+v", tres)
 	}
 	sessions, _ := db.ListTaskSessions(ctx, "t1")
 	if len(sessions) != 0 {
 		t.Errorf("unowned touch MUST NOT insert, got %+v", sessions)
 	}
-	// 预置归属后再 touch → updated=true，刷新 last_seen。
-	if _, _, err := db.ClaimTaskSession(ctx, "t1", "sess-1", 1, 1, 10, ""); err != nil {
+	// 预置归属后再 touch → Matched+Changed，刷新 last_seen。
+	if _, err := db.ClaimTaskSession(ctx, "t1", "sess-1", 1, 1, 10, ""); err != nil {
 		t.Fatal(err)
 	}
-	updated, err = db.TouchOwnedTaskSession(ctx, "t1", "sess-1", 99)
-	if err != nil || !updated {
-		t.Fatalf("touch owned: updated=%v err=%v", updated, err)
+	tres, err = db.TouchOwnedTaskSession(ctx, "t1", "sess-1", 99)
+	if err != nil || !tres.Matched || !tres.Changed {
+		t.Fatalf("touch owned: res=%+v err=%v", tres, err)
+	}
+	// 同值再 touch → Matched+!Changed（同值幂等）。
+	tres, err = db.TouchOwnedTaskSession(ctx, "t1", "sess-1", 99)
+	if err != nil || !tres.Matched || tres.Changed {
+		t.Fatalf("touch same value: res=%+v err=%v, want Matched+!Changed", tres, err)
+	}
+	// 旧值再 touch → 同样不推进（last_seen_at < ? 条件排除）。
+	tres, err = db.TouchOwnedTaskSession(ctx, "t1", "sess-1", 50)
+	if err != nil || !tres.Matched || tres.Changed {
+		t.Fatalf("touch older value: res=%+v err=%v, want Matched+!Changed", tres, err)
 	}
 	sessions, _ = db.ListTaskSessions(ctx, "t1")
 	if sessions[0].LastSeenAt != 99 {
@@ -1036,7 +1057,7 @@ func TestAlignTaskSessions_RepoClaimConflicts(t *testing.T) {
 		t.Fatal(err)
 	}
 	// t2 拥有 sess-shared。
-	if _, _, err := db.ClaimTaskSession(ctx, "t2", "sess-shared", 1, 1, 1, ""); err != nil {
+	if _, err := db.ClaimTaskSession(ctx, "t2", "sess-shared", 1, 1, 1, ""); err != nil {
 		t.Fatal(err)
 	}
 	// t1 repo 对齐：listed=[sess-shared, sess-own]。
@@ -1044,12 +1065,12 @@ func TestAlignTaskSessions_RepoClaimConflicts(t *testing.T) {
 		{SessionID: "sess-shared", UpdatedAt: 20},
 		{SessionID: "sess-own", UpdatedAt: 20},
 	}
-	conflicts, err := db.AlignTaskSessions(ctx, "t1", AlignModeRepo, listed, true, nil)
+	ares, err := db.AlignTaskSessions(ctx, "t1", AlignModeRepo, listed, true, application.NoticeMutation{})
 	if err != nil {
 		t.Fatalf("align: %v", err)
 	}
-	if len(conflicts) != 1 || conflicts[0] != "sess-shared" {
-		t.Errorf("conflicts = %v, want [sess-shared]", conflicts)
+	if len(ares.Conflicts) != 1 || string(ares.Conflicts[0]) != "sess-shared" {
+		t.Errorf("conflicts = %v, want [sess-shared]", ares.Conflicts)
 	}
 	t1, _ := db.ListTaskSessions(ctx, "t1")
 	ids := map[string]bool{}
@@ -1076,7 +1097,7 @@ func TestAlignTaskSessions_OwnedOnlyNoClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	// t1 预置 owned: sess-a。
-	if _, _, err := db.ClaimTaskSession(ctx, "t1", "sess-a", 1, 1, 10, ""); err != nil {
+	if _, err := db.ClaimTaskSession(ctx, "t1", "sess-a", 1, 1, 10, ""); err != nil {
 		t.Fatal(err)
 	}
 	// listed=[sess-a, sess-b, sess-foreign]；ownedOnly 仅刷新 sess-a，不 claim b/foreign。
@@ -1085,12 +1106,12 @@ func TestAlignTaskSessions_OwnedOnlyNoClaim(t *testing.T) {
 		{SessionID: "sess-b", UpdatedAt: 20},
 		{SessionID: "sess-foreign", UpdatedAt: 20},
 	}
-	conflicts, err := db.AlignTaskSessions(ctx, "t1", AlignModeOwnedOnly, listed, true, nil)
+	ares, err := db.AlignTaskSessions(ctx, "t1", AlignModeOwnedOnly, listed, true, application.NoticeMutation{})
 	if err != nil {
 		t.Fatalf("align: %v", err)
 	}
-	if len(conflicts) != 0 {
-		t.Errorf("ownedOnly should not report conflicts, got %v", conflicts)
+	if len(ares.Conflicts) != 0 {
+		t.Errorf("ownedOnly should not report conflicts, got %v", ares.Conflicts)
 	}
 	t1, _ := db.ListTaskSessions(ctx, "t1")
 	ids := map[string]bool{}
@@ -1122,11 +1143,11 @@ func TestAlignTaskSessions_UnknownModeFailClosed(t *testing.T) {
 		Status: "suspended", WorktreePath: "/wt"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := db.ClaimTaskSession(ctx, "t1", "sess-a", 1, 1, 1, ""); err != nil {
+	if _, err := db.ClaimTaskSession(ctx, "t1", "sess-a", 1, 1, 1, ""); err != nil {
 		t.Fatal(err)
 	}
 	_, err := db.AlignTaskSessions(ctx, "t1", AlignMode(99),
-		[]SessionObservation{{SessionID: "x"}}, true, nil)
+		[]SessionObservation{{SessionID: "x"}}, true, application.NoticeMutation{})
 	if err == nil {
 		t.Fatal("unknown mode should fail (fail-closed)")
 	}
@@ -1163,15 +1184,15 @@ func TestClaimTaskSession_ConcurrentUniqueOwnership_RealSQLite(t *testing.T) {
 		wg.Add(1)
 		go func(idx int, tid string) {
 			defer wg.Done()
-			claimed, owner, err := db.ClaimTaskSession(ctx, tid, sharedSess, 1, 1, 1, "")
+			res, err := db.ClaimTaskSession(ctx, tid, sharedSess, 1, 1, 1, "")
 			if err != nil {
 				t.Errorf("claim %s: %v", tid, err)
 				return
 			}
-			if claimed {
+			if res.Claimed {
 				atomic.AddInt32(&successCount, 1)
 				claimOwner.Store(tid)
-			} else if owner != "" {
+			} else if res.OwnerTaskID != "" {
 				// 失败方应得到 owner（另一个任务 ID）。
 				_ = idx
 			}
@@ -1193,12 +1214,12 @@ func TestClaimTaskSession_ConcurrentUniqueOwnership_RealSQLite(t *testing.T) {
 		loser = "ta"
 	}
 	// 再次 claim（失败方重试）应返回 owner=成功方、claimed=false。
-	claimed2, owner2, err := db.ClaimTaskSession(ctx, loser, sharedSess, 1, 1, 1, "")
+	res2, err := db.ClaimTaskSession(ctx, loser, sharedSess, 1, 1, 1, "")
 	if err != nil {
 		t.Fatalf("retry claim loser: %v", err)
 	}
-	if claimed2 || owner2 != owner {
-		t.Errorf("loser re-claim: claimed=%v owner=%q, want false/%q", claimed2, owner2, owner)
+	if res2.Claimed || res2.OwnerTaskID != owner {
+		t.Errorf("loser re-claim: claimed=%v owner=%q, want false/%q", res2.Claimed, res2.OwnerTaskID, owner)
 	}
 	// 最终该 session 仅归属一个任务。
 	sessA, _ := db.ListTaskSessions(ctx, "ta")
