@@ -12,6 +12,7 @@ package task
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -31,6 +32,8 @@ type fakeSessionRepo struct {
 	delErr      error
 	alignRes    application.AlignResult
 	alignErr    error
+	// alignCallCount 记录 Align 调用次数（断言 CAS 失败 MUST NOT 执行 Align）。
+	alignCallCount int
 }
 
 func (r *fakeSessionRepo) Claim(ctx context.Context, taskID string, obs ocdecksess.Observation) (application.ClaimResult, error) {
@@ -43,6 +46,7 @@ func (r *fakeSessionRepo) DeleteOwned(ctx context.Context, taskID string, sessio
 	return r.delAffected, r.delErr
 }
 func (r *fakeSessionRepo) Align(ctx context.Context, taskID string, mode ocdecksess.AlignMode, observed []ocdecksess.Observation, complete bool, notice application.NoticeMutation) (application.AlignResult, error) {
+	r.alignCallCount++
 	if r.alignErr != nil {
 		return application.AlignResult{}, r.alignErr
 	}
@@ -161,6 +165,62 @@ var errTestAlignStore = &testError{"align store error"}
 type testError struct{ msg string }
 
 func (e *testError) Error() string { return e.msg }
+
+// TestP162_OverflowCASRealChange_PublishesActivityChangedEvenIfAlignFails 验证 P1.6.2
+// overflow 分支（LifecycleService 路径）：notice CAS 命中且真实变更（Changed &&
+// UpdatedAtAdvanced）时发布 task.activity_changed；发布先于 Align 提交，
+// 随后 Align 失败 MUST NOT 回滚已发布事件（事务外独立提交，design.md D0:86）。
+func TestP162_OverflowCASRealChange_PublishesActivityChangedEvenIfAlignFails(t *testing.T) {
+	repo := &fakeTaskRepo{mutationRes: application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: true}}
+	sessions := &fakeSessionRepo{alignErr: errTestAlignStore}
+	pub := &recordingPublisher{}
+	svc := New(Options{Tasks: repo, Read: &fakeReadRepo{}, Sessions: sessions, Publish: pub})
+
+	_, err := svc.AlignSessions(context.Background(), "t1", ocdecksess.AlignModeRepo, nil, false)
+	if err == nil || !strings.Contains(err.Error(), "align store error") {
+		t.Fatalf("err = %v, want align error propagated", err)
+	}
+	if len(pub.events) != 1 || pub.events[0] != string(ocdeckevent.TypeTaskActivityChanged) {
+		t.Fatalf("events = %v, want [task.activity_changed] published and not rolled back", pub.events)
+	}
+}
+
+// TestP162_OverflowCASFail_NoAlignNoPublish 验证 overflow notice CAS 未收敛
+// （!Matched 重试耗尽 / GetTaskRow 错误）：返回错误且 MUST NOT 执行 Align、不发布任何事件。
+func TestP162_OverflowCASFail_NoAlignNoPublish(t *testing.T) {
+	newSvc := func(repo *fakeTaskRepo, read *fakeReadRepo) (*LifecycleService, *fakeSessionRepo, *recordingPublisher) {
+		sessions := &fakeSessionRepo{}
+		pub := &recordingPublisher{}
+		return New(Options{Tasks: repo, Read: read, Sessions: sessions, Publish: pub}), sessions, pub
+	}
+
+	t.Run("CAS mismatch exhausts", func(t *testing.T) {
+		svc, sessions, pub := newSvc(&fakeTaskRepo{mutationRes: application.MutationResult{}}, &fakeReadRepo{})
+		_, err := svc.AlignSessions(context.Background(), "t1", ocdecksess.AlignModeRepo, nil, false)
+		if err == nil || !strings.Contains(err.Error(), "did not converge") {
+			t.Fatalf("err = %v, want CAS convergence error", err)
+		}
+		if sessions.alignCallCount != 0 {
+			t.Fatalf("Align calls = %d, want 0", sessions.alignCallCount)
+		}
+		if len(pub.events) != 0 {
+			t.Fatalf("events = %v, want none", pub.events)
+		}
+	})
+	t.Run("get task error", func(t *testing.T) {
+		svc, sessions, pub := newSvc(&fakeTaskRepo{}, &fakeReadRepo{getErr: errors.New("db down")})
+		_, err := svc.AlignSessions(context.Background(), "t1", ocdecksess.AlignModeRepo, nil, false)
+		if err == nil || !strings.Contains(err.Error(), "get task") {
+			t.Fatalf("err = %v, want get task error", err)
+		}
+		if sessions.alignCallCount != 0 {
+			t.Fatalf("Align calls = %d, want 0", sessions.alignCallCount)
+		}
+		if len(pub.events) != 0 {
+			t.Fatalf("events = %v, want none", pub.events)
+		}
+	})
+}
 
 // TestP145_RunAlign_CompleteConflictRetries 验证 complete 路径 notice expected 失配：
 // Align 返回 AlignConflict → 重读 Task、重新经 domain 决策后有界重试成功；

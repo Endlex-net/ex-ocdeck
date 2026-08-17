@@ -19,9 +19,10 @@ import (
 	"ocdeck/internal/api"
 	apptask "ocdeck/internal/application/task"
 	"ocdeck/internal/config"
+	"ocdeck/internal/infrastructure/eventbus"
+	sqlite "ocdeck/internal/infrastructure/sqlite"
 	"ocdeck/internal/lifecycle"
 	"ocdeck/internal/process"
-	sqlite "ocdeck/internal/infrastructure/sqlite"
 	"ocdeck/internal/store"
 	"ocdeck/internal/task"
 	"ocdeck/internal/worktree"
@@ -110,13 +111,16 @@ func run() error {
 	// P1.4.4/P1.4.5 wiring：sqlite adapter 实现 application ports（TaskRepository +
 	// TaskReadRepository + SessionRepository），经 application/task LifecycleService 编排
 	// Get/List/Archive/Restore 与 session claim/touch/delete/align/attention 提交位，
-	// 注入 Manager facade。NoopPublisher 阶段：不发布任何事件，事件生产挂接在 Phase C/P1.6。
+	// 注入 Manager facade。P1.6.5：单例 bus 经窄 Publisher 接口注入（commit helper
+	// 真实发布领域事件；*eventbus.Bus 结构性满足 application.Publisher），
+	// 同一 bus 供 Phase 2 SSE 消费侧订阅。
+	bus := eventbus.New()
 	appAdapter := sqlite.New(db)
 	lifecycleSvc := apptask.New(apptask.Options{
 		Tasks:    appAdapter,
 		Read:     appAdapter,
 		Sessions: appAdapter,
-		Publish:  apptask.NoopPublisher{},
+		Publish:  bus,
 	})
 	tm := task.New(task.Options{
 		Cfg:             cfg,
@@ -143,6 +147,9 @@ func run() error {
 
 	srv := api.New(cfg, db)
 	srv.SetTaskBackend(tm)
+	// P1.6.5：消费侧注入同一 bus（经 eventSubscriberAdapter 适配 api.EventSubscriber；
+	// SSE 端点消费在 Phase 2 建立），须在 RebuildRoutes 前生效。
+	srv.SetEventSubscriber(eventSubscriberAdapter{bus})
 	// AI 配置 Store 注入 API 层（design.md D7 wiring）：单实例同时供给命名链。
 	// 沿用 SetTaskBackend 位置模式，须在 RebuildRoutes 前生效。
 	srv.SetAIConfigStore(aiStore)

@@ -46,8 +46,11 @@ func (p svcAlignPorts) Align(ctx context.Context, taskID string, mode ocdecksess
 	return p.s.sessions.Align(ctx, taskID, mode, observed, complete, notice)
 }
 
+// UpdateTaskNoticeCAS 经 LifecycleService.UpdateNoticeCAS 提交：overflow notice CAS
+// 真实变更（Changed && UpdatedAtAdvanced）发布 task.activity_changed（P1.6.2）。
+// 事务外 CAS 先于 Align 提交与发布，Align 失败不回滚（design.md D0:86）。
 func (p svcAlignPorts) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice *string) (application.MutationResult, error) {
-	return p.s.tasks.UpdateTaskNoticeCAS(ctx, id, expected, newNotice)
+	return p.s.UpdateNoticeCAS(ctx, id, expected, newNotice)
 }
 
 func (p svcAlignPorts) GetTaskRow(ctx context.Context, id string) (application.TaskSnapshot, error) {

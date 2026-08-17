@@ -19,17 +19,18 @@ import (
 
 // Server 持有 HTTP 服务与依赖。本任务提供骨架与占位路由。
 type Server struct {
-	cfg           *config.Config
-	mux           *http.ServeMux
-	auth          *TokenAuthenticator
-	store         StoreRO
-	projs         ProjectStore
-	tasks         TaskBackend
-	envs          EnvStore
-	lifecycleCfgs LifecycleConfigStore
-	ocCfgs        OCConfigService
-	aiConfig      *ai.Store
-	httpSrv       *http.Server
+	cfg             *config.Config
+	mux             *http.ServeMux
+	auth            *TokenAuthenticator
+	store           StoreRO
+	projs           ProjectStore
+	tasks           TaskBackend
+	envs            EnvStore
+	lifecycleCfgs   LifecycleConfigStore
+	ocCfgs          OCConfigService
+	aiConfig        *ai.Store
+	eventSubscriber EventSubscriber
+	httpSrv         *http.Server
 
 	// watchdogStateProvider 返回 watchdog 运行态字符串（off/running/degraded），
 	// 供 /server/status 接线（design.md §21）。nil 时回退 "off"。
