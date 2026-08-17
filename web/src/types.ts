@@ -210,6 +210,7 @@ export interface ServerStatus {
   tmuxVersion: string;
   shutdownPolicy: string;
   watchdogState: 'off' | 'running' | 'degraded';
+  contractMinVersion: string;
   contractBaseline: string;
   versionVerified: boolean;
 }

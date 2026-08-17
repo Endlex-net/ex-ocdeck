@@ -31,10 +31,13 @@ const (
 	ShutdownKillImmediate ShutdownPolicy = "kill_immediate"
 )
 
-// ContractBaseline 是 opencode 契约基准版本（design.md §11/§20）。
-// 版本号仅作告警非门禁；激活门禁是能力探测。
+// ContractBaseline / ContractMinVersion 是已验证契约区间的上/下限（design.md §11/§20）。
+// 版本号仅作告警非门禁；激活门禁是能力探测。区间检查见 internal/opencode/CONTRACT.md。
 // 唯一真值定义在 internal/opencode（契约归属方），这里通过常量别名引用，避免跨包重复字面量。
-const ContractBaseline = opencode.ContractBaseline
+const (
+	ContractBaseline   = opencode.ContractBaseline
+	ContractMinVersion = opencode.ContractMinVersion
+)
 
 // PortRange serve 端口分配范围（design.md §3）。
 type PortRange struct {
@@ -63,7 +66,7 @@ type Config struct {
 	AllowedOrigins []string
 	// OpenCodeVersion 启动时 `opencode --version` 记录（design.md §11），仅告警非门禁。
 	OpenCodeVersion string
-	// VersionVerified OpenCodeVersion == ContractBaseline 的比较结果（design.md §11）。
+	// VersionVerified OpenCodeVersion 落在 [ContractMinVersion, ContractBaseline] 的比较结果（design.md §11）。
 	// 仅作告警/UI 提示，不作为激活门禁（门禁是能力探测）。
 	VersionVerified bool
 	// TmuxVersion 启动时 `tmux -V` 记录（design.md §2），MUST >= 3.2。
@@ -217,11 +220,11 @@ func Load(opts Options) (*Config, func(), error) {
 		ShutdownPolicy:  policy,
 		AllowedOrigins:  allowedOrigins,
 		OpenCodeVersion: ocVersion,
-		VersionVerified: compareOCVersion(ocVersion, ContractBaseline),
+		VersionVerified: VersionSupported(ocVersion),
 		TmuxVersion:     tmuxVersion,
 	}
 	if !cfg.VersionVerified {
-		log.Printf("warning: opencode version %s != contract baseline %s; ocdeck may behave unexpectedly (activation is gated by capability probe, not version)", ocVersion, ContractBaseline)
+		log.Printf("warning: opencode version %s outside verified contract range [%s, %s]; ocdeck may behave unexpectedly (activation is gated by capability probe, not version)", ocVersion, opencode.ContractMinVersion, ContractBaseline)
 	}
 	return cfg, release, nil
 }
@@ -351,29 +354,70 @@ func stripVersionSuffix(s string) string {
 	return s
 }
 
-// compareOCVersion 比较探测到的 opencode 版本与契约基准（design.md §11）。
-// 形如 "opencode 1.18.14" 或 "1.18.14"；按 semver major.minor.patch 比较。
-// 返回 true 表示相等（versionVerified），false 触发告警。
-func compareOCVersion(detected, baseline string) bool {
-	return normalizeOCVersion(detected) == normalizeOCVersion(baseline)
+// VersionSupported 判断探测到的 opencode 版本是否落在已验证契约区间
+// [ContractMinVersion, ContractBaseline]（design.md §11）。
+// 形如 "opencode 1.18.18" 或 "1.18.18"；按 semver major.minor.patch 比较。
+// 无法解析或不含三段数字时返回 false（触发告警）。
+func VersionSupported(detected string) bool {
+	maj, min, pat, ok := parseOCSemver(detected)
+	if !ok {
+		return false
+	}
+	loMaj, loMin, loPat, loOk := parseOCSemver(ContractMinVersion)
+	hiMaj, hiMin, hiPat, hiOk := parseOCSemver(ContractBaseline)
+	if !loOk || !hiOk {
+		return false
+	}
+	return versionAtLeast(maj, min, pat, loMaj, loMin, loPat) &&
+		versionAtLeast(hiMaj, hiMin, hiPat, maj, min, pat)
 }
 
-// VersionMatches 是 compareOCVersion 的导出封装，供调用方（含测试）复用同一比较逻辑。
-func VersionMatches(detected, baseline string) bool {
-	return compareOCVersion(detected, baseline)
+// parseOCSemver 严格解析 opencode 版本：取最后一个空白分隔 token，去掉可选前缀 `v`，
+// 要求恰好 major.minor.patch 三段，每段为无前导零的非负整数（"0" 本身允许），
+// 不含任何其它字符。不使用 stripVersionSuffix（该 helper 仅服务于 tmux）。
+func parseOCSemver(s string) (major, minor, patch int, ok bool) {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return 0, 0, 0, false
+	}
+	ver := strings.TrimPrefix(fields[len(fields)-1], "v")
+	parts := strings.Split(ver, ".")
+	if len(parts) != 3 {
+		return 0, 0, 0, false
+	}
+	for _, p := range parts {
+		if !isStrictNumericPart(p) {
+			return 0, 0, 0, false
+		}
+	}
+	major, _ = strconv.Atoi(parts[0])
+	minor, _ = strconv.Atoi(parts[1])
+	patch, _ = strconv.Atoi(parts[2])
+	return major, minor, patch, true
 }
 
-// normalizeOCVersion 从版本字符串中提取 major.minor.patch，返回规整化结果。
-func normalizeOCVersion(s string) string {
-	ver := s
-	if i := strings.IndexByte(ver, ' '); i >= 0 {
-		// 形如 "opencode 1.18.14" → 取最后一段。
-		ver = strings.TrimSpace(ver[i+1:])
+// isStrictNumericPart 判断是否为合法的数字段：非空、纯数字、无前导零（"0" 除外）。
+func isStrictNumericPart(s string) bool {
+	if s == "" {
+		return false
 	}
-	ver = strings.TrimPrefix(ver, "v")
-	parts := strings.SplitN(ver, ".", 3)
-	if len(parts) < 3 {
-		return ver
+	if len(s) > 1 && s[0] == '0' {
+		return false
 	}
-	return stripVersionSuffix(parts[0]) + "." + stripVersionSuffix(parts[1]) + "." + stripVersionSuffix(parts[2])
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func versionAtLeast(maj, min, pat, loMaj, loMin, loPat int) bool {
+	if maj != loMaj {
+		return maj > loMaj
+	}
+	if min != loMin {
+		return min > loMin
+	}
+	return pat >= loPat
 }

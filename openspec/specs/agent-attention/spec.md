@@ -130,7 +130,7 @@
 
 ### Requirement: 注意力信号 API 透出
 
-系统 SHALL 在 `GET /api/v1/tasks/{id}` 响应中附加 `attention` 字段：`{ "permissions": [{ "id", "permission", "patterns", "since" }], "questions": [{ "id", "questions": [{ "header", "question" }], "since" }] }`。`since` MUST 为 Unix 秒的**本地首次观察时间**：pending 条目首次进入 ocdeck 集合的时刻（SSE `asked` 到达或对账快照中作为新 ID 出现）；对账替换时，新旧集合中都存在的 ID 保留原 `since`。**注意**：`since` 是 ocdeck 本地观察时间而非 opencode 权威时间——opencode 1.18.14 允许调用方自定义请求 ID，不保证 ID 单调或不复用；极端情况下（复用 ID 且错过 replied 事件）`since` 可能偏旧，UI 仅用于相对时间展示，可接受。无 pending 请求时两个数组为空（MUST NOT 省略字段或返回 null）；能力状态为 `unsupported` 时对应类型透出空数组，`degraded` 时透出最后成功集合叠加其后 SSE 增量。`GET /api/v1/sessions/active` 的每个元素 MUST 附加相同结构的 `attention` 摘要。`GET /api/v1/projects` 的任务摘要 MUST 附加 `attention_count`（pending 权限 + 问题总数）。注意力透出 MUST 为只读：MUST NOT 提供权限回复或问题回答的代理端点。注意力查询 MUST NOT 引入新的 opencode 调用（数据来自内存集合的快照拷贝）。
+系统 SHALL 在 `GET /api/v1/tasks/{id}` 响应中附加 `attention` 字段：`{ "permissions": [{ "id", "permission", "patterns", "since" }], "questions": [{ "id", "questions": [{ "header", "question" }], "since" }] }`。`since` MUST 为 Unix 秒的**本地首次观察时间**：pending 条目首次进入 ocdeck 集合的时刻（SSE `asked` 到达或对账快照中作为新 ID 出现）；对账替换时，新旧集合中都存在的 ID 保留原 `since`。**注意**：`since` 是 ocdeck 本地观察时间而非 opencode 权威时间——opencode 1.18.18 允许调用方自定义请求 ID，不保证 ID 单调或不复用；极端情况下（复用 ID 且错过 replied 事件）`since` 可能偏旧，UI 仅用于相对时间展示，可接受。无 pending 请求时两个数组为空（MUST NOT 省略字段或返回 null）；能力状态为 `unsupported` 时对应类型透出空数组，`degraded` 时透出最后成功集合叠加其后 SSE 增量。`GET /api/v1/sessions/active` 的每个元素 MUST 附加相同结构的 `attention` 摘要。`GET /api/v1/projects` 的任务摘要 MUST 附加 `attention_count`（pending 权限 + 问题总数）。注意力透出 MUST 为只读：MUST NOT 提供权限回复或问题回答的代理端点。注意力查询 MUST NOT 引入新的 opencode 调用（数据来自内存集合的快照拷贝）。
 
 #### Scenario: 任务详情携带注意力
 

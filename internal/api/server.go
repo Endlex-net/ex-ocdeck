@@ -254,12 +254,13 @@ func (s *Server) handleServerStatus(w http.ResponseWriter, r *http.Request) {
 		watchdogState = s.watchdogStateProvider()
 	}
 	status := map[string]any{
-		"opencodeVersion":  s.cfg.OpenCodeVersion,
-		"tmuxVersion":      s.cfg.TmuxVersion,
-		"shutdownPolicy":   string(s.cfg.ShutdownPolicy),
-		"watchdogState":    watchdogState,
-		"contractBaseline": config.ContractBaseline,
-		"versionVerified":  s.cfg.VersionVerified,
+		"opencodeVersion":    s.cfg.OpenCodeVersion,
+		"tmuxVersion":        s.cfg.TmuxVersion,
+		"shutdownPolicy":     string(s.cfg.ShutdownPolicy),
+		"watchdogState":      watchdogState,
+		"contractBaseline":   config.ContractBaseline,
+		"contractMinVersion": config.ContractMinVersion,
+		"versionVerified":    s.cfg.VersionVerified,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)
