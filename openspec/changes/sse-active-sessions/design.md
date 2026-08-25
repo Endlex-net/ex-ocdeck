@@ -56,17 +56,101 @@ cmd/ocdeck-server/        composition root
 
 **领域模型（实体与聚合边界，已与领域所有者确认）**：
 
-| 对象 | 身份（主键） | 职责 | 不包含 |
-|---|---|---|---|
-| `Task`（聚合根） | `tasks.id` | 完整 status/init_status 状态机（domain guard 表达合法流转，application 负责 CAS 提交）、delete intent、typed notice 集合、创建期不可变信息 | `[]Session`、ServeRuntime、tmux/opencode handle、env 合并算法 |
-| `Session`（独立聚合） | 领域 ID = `session_id` | OwnerTaskID、created/first_seen/last_seen、parentID、claim/touch/delete 规则 | opencode session 内容、run status、Task 指针 |
-| `ServeRuntime`（内存实体） | `instanceID + generation` | RuntimeToken、runtime groups、run_status、attention | 持久化 Task 副本、Repository、跨重启恢复 |
-| `AttentionState`（ServeRuntime 组件，非独立实体） | —（随 ServeRuntime） | permission/question 集合、capability 状态、owner/reconcile epoch、buffer | 独立 repository、独立生命周期 |
+Domain model 仅 Task 与 Session（持久化 + Repository + 领域 guard）；ServeRuntime 是 **application 层内存实体**（runtime projection），不是 domain model；AttentionState 是 ServeRuntime 的组件。
+
+| 对象 | 层 | 身份（主键） | 职责 | 不包含 |
+|---|---|---|---|---|
+| `Task`（domain 聚合根） | domain | `tasks.id` | 完整 status/init_status 状态机（domain guard 表达合法流转，application 负责 CAS 提交）、delete intent、typed notice 集合、创建期不可变信息 | `[]Session`、ServeRuntime、tmux/opencode handle、env 合并算法 |
+| `Session`（domain 独立聚合） | domain | 领域 ID = `session_id` | OwnerTaskID、created/first_seen/last_seen、parentID、claim/touch/delete 规则 | opencode session 内容、run status、Task 指针 |
+| `ServeRuntime`（application 内存实体，**非 domain model**） | application | `taskID + instVersion` | instVersion 令牌、runtime groups、run_status、attention | 持久化 Task 副本、Repository、跨重启恢复 |
+| `AttentionState`（ServeRuntime 组件，非独立实体） | application | —（随 ServeRuntime） | permission/question 集合、capability 状态、owner/reconcile epoch、buffer | 独立 repository、独立生命周期 |
 
 - **Session 为什么是独立聚合**：一次 align 可处理千级行、由 opencode SSE 独立驱动，且现有对齐要求 owned 快照/claim/touch/delete/notice 在同一事务内完成（`queries.go:972`）——这是 application 级批处理事务，不表示 Session 是 Task 内部实体。
-- **ServeRuntime 由 application 持有**：`ServeRuntimeRegistry` 按 taskID 索引，实体身份为 `instanceID+generation`，不持有 `*Task`；与持久状态的协作始终通过「重读 Task/CAS → 外部副作用 → Runtime apply」完成。无 Repository。
+- **ServeRuntime 由 application 持有**：`ServeRuntimeRegistry` 按 taskID 索引，实体身份为 `taskID + instVersion`，不持有 `*Task`；与持久状态的协作始终通过「重读 Task/CAS → 外部副作用 → Runtime apply」完成。无 Repository。
+- **instVersion 定义（2026-08-18 决策，替代原 `RuntimeToken{instanceID, generation}` 双字段）**：fencing 只需等值判定（tombstone 为权威，MUST NOT 数值比大小），双字段冗余。instVersion = **毫秒时间戳 + 随机后缀**（ULID 结构，如 `01724000000123-a3f9c2`，用既有 crypto/rand 手拼，不引第三方依赖）：随机后缀保证同毫秒双分配不撞（构造上唯一），时间戳前缀保证日志可读顺序。纯毫秒时间戳被否（同 ms 撞车会破坏 fencing）；纯随机串被否（丢可读顺序）。跨进程重启不防撞也无需防——旧进程回调随进程死亡，比对只发生在单进程生命周期内。P1.4.3/P1.4.7 已按双字段实现，单字段化重构为独立任务（tasks P1.4.9）。
 - **AttentionState 不是值对象**（可变、有 epoch/owner 并发仲裁），作为 ServeRuntime 的组件；permission/question 快照项是值对象。现有 owner/buffer/atomic epoch 模型（`attention.go:55` 起）保持不简化。
 - **session_id 唯一性口径（已核实物理现状）**：领域层声明 `session_id` 全局唯一；物理层 `task_sessions` 主键为 `(task_id, session_id)` 复合主键（`internal/store/migrations/0001_init.sql:62`），无全局唯一索引——跨 task 唯一由 `ClaimTaskSession` 事务内先查其他 owner 再 upsert 保证（`queries.go:903`）。本变更不加唯一索引；读到历史重复归属时 fail-closed。`SessionRepository` MUST NOT 暴露通用 Save/Upsert，方法闭合为 Claim/TouchOwned/DeleteOwned/Align/OwnedSessions/OwnerOf（见下）。
+
+**ER 图（持久层 + 内存层）**：
+
+```
+┌──────────────────────── Persistence (SQLite) ────────────────────────┐
+│                                                                      │
+│  ┌──────────────┐        ┌──────────────────────────┐                │
+│  │   projects   │ 1    * │          tasks           │                │
+│  │──────────────│────────│──────────────────────────│                │
+│  │ id (PK)      │        │ id (PK)                  │                │
+│  │ name/path    │        │ project_id (FK)          │                │
+│  │ kind         │        │ status / init_status     │ ← Task 聚合根   │
+│  │ default_br   │        │ last_error / delete_mode │   (domain)      │
+│  └──────────────┘        │ notice (typed JSON)      │                │
+│                          │ worktree_path / base_ref │                │
+│                          │ env_snapshot             │                │
+│                          │ created_at / updated_at  │ ← 同值 no-op    │
+│                          └───────────┬──────────────┘   不推进         │
+│                                      │ 1                             │
+│                                      │ *                             │
+│                          ┌───────────┴──────────────┐                │
+│                          │     task_sessions        │                │
+│                          │──────────────────────────│                │
+│                          │ task_id    (PK, FK)      │                │
+│                          │ session_id (PK)          │ ← Session 聚合  │
+│                          │ session_created_at       │   领域 ID       │
+│                          │ first_seen_at            │   = session_id  │
+│                          │ last_seen_at / parent_id │   (domain)      │
+│                          └──────────────────────────┘                │
+│                                                                      │
+│  ┌──────────────────────┐                                            │
+│  │   cleanup_debts      │ ← 孤儿 ticket 持久化（跨重启恢复；           │
+│  │──────────────────────│   与内存 ConvergeDebt 不同机制）            │
+│  │ session_name (PK)    │                                            │
+│  │ tickets (JSON)       │                                            │
+│  └──────────────────────┘                                            │
+└──────────────────────────────────────────────────────────────────────┘
+
+                          ▲ 启动时 Reconcile 按「DB 事实 + tmux/
+                          │ opencode 实际会话」重建；无 Repository
+                          │
+┌──────────────────── In-Memory (application/runtime) ─────────────────┐
+│                                                                      │
+│  ┌─────────────────────────────┐                                     │
+│  │   ServeRuntimeRegistry      │                                     │
+│  │─────────────────────────────│                                     │
+│  │ genMu（单一锁域）           │                                     │
+│  │ lastToken[taskID]           │ ← tombstone（instVersion）           │
+│  │ debts[taskID]               │ ← ConvergeDebt（pre/postCleanup）    │
+│  └──────────┬──────────────────┘                                     │
+│             │ 1                                                      │
+│             │ 0..1（仅 active 任务存在）                              │
+│             ▼                                                        │
+│  ┌─────────────────────────────┐     ┌─────────────────────────────┐ │
+│  │  ServeRuntime               │ 1   1│  AttentionState             │ │
+│  │  （application 内存实体，    │──────│  （组件，非独立实体）        │ │
+│  │   非 domain model）         │     │─────────────────────────────│ │
+│  │─────────────────────────────│     │ permissions[] / questions[] │ │
+│  │ instVersion                 │     │ owner / reconcileEpoch      │ │
+│  │  {ms时间戳+随机后缀}        │     │ buffer / capability state   │ │
+│  │ groups: serve/tui/shell     │     └─────────────────────────────┘ │
+│  │ run_status（P1.8 内存态）   │                ▲                     │
+│  │ taskID（仅 ID，不持 *Task） │                │ 唯一 apply 路径       │
+│  └─────────────────────────────┘                │ (changed → typed    │
+│             ▲                                   │  delta → publish)   │
+│             │ watcher/SSE 回调必须带完整 token   │                     │
+│  ┌──────────┴───────────────────────────────────┴──────────┐         │
+│  │  Event{Topic, Type, RID, Payload}                       │         │
+│  │  Topic: task|session|serve_runtime|control              │         │
+│  │  RID = 主体主键；发布前提：已落账/已 apply                │         │
+│  └─────────────────────────────────────────────────────────┘         │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+关键边界：
+
+- `task_sessions` 复合主键 `(task_id, session_id)`：领域声明 `session_id` 全局唯一，物理无唯一索引；唯一性靠 Claim 事务保证，读到重复归属 fail-closed。
+- `ServeRuntime` 不持久化：装的是 tmux 句柄、SSE 连接、attention 缓冲——进程死即消，持久化它等于记录假真相。跨重启要恢复的是「该清没清的资源」，走 `cleanup_debts` 表，不是 ServeRuntime。
+- instVersion 单字段令牌：watcher 回调必须带完整 `taskID + instVersion`，Registry 只认当前版本；tombstone 记最近一次分配的 instVersion（等值比对即 fencing，无 int 回卷问题）。
+- `ConvergeDebt`（P1.4.7）在 Registry genMu 锁域内，管「本进程内锁超时没清成」的两阶段债务；与 `cleanup_debts` 表（孤儿 ticket，跨重启）是不同机制，不得混淆。
+- 持久层记「应该是什么」，内存层记「此刻谁在占用资源」，Reconcile 在启动时把「此刻」对齐回「应该」。
 
 **Repository ports（consumer-owned，定义在 application 侧，非 domain）**：`TaskRepository`、`SessionRepository`、`ProjectReader`、`EnvReader`、`CleanupDebtRepository`，加外部端口 `ProcessPort`（tmux）、`OpenCodePort`、`WorktreePort`。MUST NOT 复制现有同时含项目/任务/env/session/读模型的超宽 `TaskStore`（它目前泄漏 `sql.NullString`，`manager.go:21`）。`internal/task/adapters.go` 当前由 task 侧主动 import store/process/worktree（`adapters.go:7`）——最终这些 adapter 移到 infrastructure；物理搬目录不是 Phase 1 门禁，消除反向依赖才是。
 
@@ -136,7 +220,7 @@ type AlignResult struct {
 
 1. 冻结 HTTP/WS DTO、错误码、SQL 行为与关键副作用 trace；建立旧 Manager facade。
 2. 引入 domain 类型、Repository ports 与结构化结果；调用路径不变。
-3. 抽 `ServeRuntimeRegistry`，一次性迁移 generation/instanceID/groups/tombstone/clear 责任；MUST NOT 旧 Manager 与新 Registry 双写。
+3. 抽 `ServeRuntimeRegistry`，一次性迁移 instVersion/groups/tombstone/clear 责任；MUST NOT 旧 Manager 与新 Registry 双写。
 4. 迁移低风险 `Get/List/Archive/Restore`，验证状态 guard、CAS 与事件 commit helper。
 5. 迁移 Session claim/touch/delete/align 与 Attention apply；align 保持单事务，不拆成循环调用（RunStatus 内存态为新增能力，整体在 P1.8 建立，本步不涉及）。
 6. 迁移 Create/Retry，然后 Activate；保持创建的「前置检查 → creating → 副作用 → CommitCreated → 锁外调度」顺序（`crud.go:91`）。
@@ -147,7 +231,7 @@ type AlignResult struct {
 
 - `api.TaskBackend` 契约、DTO 字段与 `task.OpError` 映射不变（`tasks.go:15`）。
 - 全系统只有一个 task keyed-lock owner；状态写尽量全部改为 expected-state CAS。
-- watcher/SSE callback 始终携带 generation+sessionName+instanceID；MUST NOT 像现状 watcher 预校验后丢掉 token 再进入无 token converge（`activate.go:1366`）。
+- watcher/SSE callback 始终携带 taskID+sessionName+instVersion；MUST NOT 像现状 watcher 预校验后丢掉令牌再进入无令牌 converge（`activate.go:1366`）。
 - 现状锁超时做无锁 cleanup + CAS（`activate.go:1457`）是**必须被替换的行为**，Phase 1 换成令牌校验后的两阶段债务（见 D2 矩阵），不得当作需保持的现状。
 - Attention 的 owner/reconcile epoch、锁外 REST、buffer 重放语义保持。
 - Session claim 唯一归属、dir owned-only、overflow 基于原始列表、align 单事务保持。
@@ -167,7 +251,7 @@ type AlignResult struct {
 type Event struct {
     Topic  string      // 领域 topic："task" | "session" | "serve_runtime" | "control"
     Type   string      // 具名领域事件，见「事件类型目录」
-    RID    string      // 主体实体自己的主键 ID：task 事件=task 主键；session 单条事件=session 主键（session 是独立实体）；serve_runtime 事件=ServeRuntime 主键 instanceID（Payload 携带 task_id）；sessions.aligned=task 主键（主体为任务的会话集合，持久侧无独立对象）；仅 resync.requested 无主体允许空
+    RID    string      // 主体实体自己的主键 ID：task 事件=task 主键；session 单条事件=session 主键（session 是独立实体）；serve_runtime 事件=ServeRuntime 主键 instVersion（Payload 携带 task_id）；sessions.aligned=task 主键（主体为任务的会话集合，持久侧无独立对象）；仅 resync.requested 无主体允许空
     Payload any        // 按 Type 的小载荷，见目录；MUST NOT 塞整表/整实体快照；RID 承载主体主键不重复入 Payload；Payload 只带关联实体 ID（session 单条与 serve_runtime 事件含 owning task_id；sessions.aligned 含受影响 session_ids）
 }
 // resync.requested 为控制事件：不表达任何域事实，仅要求订阅方重新拉取其场景全量；
@@ -215,11 +299,11 @@ type Event struct {
 | `session.touched` | `session` | session 主键 | owned 会话的最近活跃时间被推进 | `{task_id}` | `TouchOwnedTaskSession` 真实推进 `last_seen_at` | 值不变、未命中归属 |
 | `session.deleted` | `session` | session 主键 | 一条 owned 会话归属被移除 | `{task_id}` | `DeleteTaskSession` affected>0；或 Force 删除时 `DeleteTask` 事务内级联移除（逐个发布，先于 `task.deleted`） | 删除不存在行；本操作内已逐项发布过的 session MUST NOT 重复发布 |
 | `sessions.aligned` | `session` | task 主键（主体为任务的会话集合，task 的衍生产物） | 全量对账使会话归属行或活动水位发生真实变化 | `{inserted, touched, deleted int; session_ids []string}`（受影响会话 ID，由对账事务统计得出） | `alignSessions` 的 session 行计数（inserted+touched+deleted）总和 >0；对账事务内 notice/`updated_at` 的真实推进 MUST NOT 计入本事件，另发 `task.activity_changed`（见 D2 align 事务内写入行） | 全量无变化 |
-| `serve_runtime.attention_changed` | `serve_runtime` | ServeRuntime 主键 instanceID（主体是 ServeRuntime 的注意力组件） | 外部可见的注意力快照（permissions/questions）发生变化 | `{task_id}` | 增量 apply / 接管归并 / REST 写回相对基线再变化 | canceled/epoch 失配仅为 REST 写回；无变化 |
-| `serve_runtime.run_status_changed` | `serve_runtime` | ServeRuntime 主键 instanceID | 该 serve 实例的运行状态（opencode session 三态聚合，即对外 `agentStatus` 字段）或其可用性发生变化 | `{task_id, from, to, available}`：`from`/`to` 为聚合三态 `idle`/`busy`/`retry` 或 `""`（不可用，见 `internal/opencode/client.go:50-52`）；`available` 为变化后外部是否可用 | 唯一 apply 返回 changed（含 0↔1 owned、断流 available→unavailable） | 同值、原本不可用再断流、孤儿 status 事件 |
+| `serve_runtime.attention_changed` | `serve_runtime` | ServeRuntime 主键 instVersion（主体是 ServeRuntime 的注意力组件） | 外部可见的注意力快照（permissions/questions）发生变化 | `{task_id}` | 增量 apply / 接管归并 / REST 写回相对基线再变化 | canceled/epoch 失配仅为 REST 写回；无变化 |
+| `serve_runtime.run_status_changed` | `serve_runtime` | ServeRuntime 主键 instVersion | 该 serve 实例的运行状态（opencode session 三态聚合，即对外 `agentStatus` 字段）或其可用性发生变化 | `{task_id, from, to, available}`：`from`/`to` 为聚合三态 `idle`/`busy`/`retry` 或 `""`（不可用，见 `internal/opencode/client.go:50-52`）；`available` 为变化后外部是否可用 | 唯一 apply 返回 changed（含 0↔1 owned、断流 available→unavailable） | 同值、原本不可用再断流、孤儿 status 事件 |
 | `resync.requested` | `control` | 空（无主体） | 控制事件：要求订阅方重拉其场景全量；不表达任何域事实 | `{}` | 仅 D2 三处闭合例外：(a) 不确定提交 (b) worker 撤销登记前 (c) 锁等待超时且触发令牌仍有效的债务登记（含 tombstone 匹配直登 postCleanup）；每条例外路径至多一次 | 确定的成功/失败域路径；不得用它表达 session/attention/agent 事实 |
 
-`RID` 一律为**主体实体自己的主键 ID**：task 事件（`task.created`/`task.status_changed`/`task.deleted`/`task.activity_changed`）为 task 主键；`session.claimed`/`session.touched`/`session.deleted` 为 session 主键（session 是独立聚合，owning task 转入 Payload `task_id`）；`serve_runtime.attention_changed`/`serve_runtime.run_status_changed` 为 ServeRuntime 主键 instanceID（owning task 转入 Payload `task_id`）；`sessions.aligned` 的主体是任务的会话集合（持久侧无独立对象），RID 为 task 主键；`resync.requested` 无主体允许空。Payload 只携带关联实体 ID 与已落账事实（`from`/`to`/`available`），不含 ActiveSessionItem 整行、不含 Attention 明细、不含 overview 数组。总线 MUST NOT 再引入无 Type 的粗 `Kind`。
+`RID` 一律为**主体实体自己的主键 ID**：task 事件（`task.created`/`task.status_changed`/`task.deleted`/`task.activity_changed`）为 task 主键；`session.claimed`/`session.touched`/`session.deleted` 为 session 主键（session 是独立聚合，owning task 转入 Payload `task_id`）；`serve_runtime.attention_changed`/`serve_runtime.run_status_changed` 为 ServeRuntime 主键 instVersion（owning task 转入 Payload `task_id`）；`sessions.aligned` 的主体是任务的会话集合（持久侧无独立对象），RID 为 task 主键；`resync.requested` 无主体允许空。Payload 只携带关联实体 ID 与已落账事实（`from`/`to`/`available`），不含 ActiveSessionItem 整行、不含 Attention 明细、不含 overview 数组。总线 MUST NOT 再引入无 Type 的粗 `Kind`。
 
 **SSE 场景适配器消费过滤**（仅本变更接入的订阅者；其它场景以后另写）：
 
@@ -338,8 +422,8 @@ task 提交点 ──Publish──► Event{Topic 领域, Type, RID, Payload}
 | updated_at 推进类写入 | Manager 编排层中调用 `UpdateTaskEnvSnapshot`/`UpdateTaskLastPort`/`UpdateTaskNotice*`/`SetTaskDeleteMode` 的成功点（均推进 `tasks.updated_at`，`queries.go:430-456`），及 `ReopenAttach` 的 active→active `UpdateTaskStatus`（`attach_shell.go:87-90`，若 status 未变则只走本行） | **同值写矛盾的唯一解**：当前这些 SQL 无论字段值是否变化都无条件推进 `updated_at`（SQLite RowsAffected 按 WHERE 匹配计数而非值变化），跨秒同值写会真实改变 overview 排序字段——本变更 MUST 将这些 store 更新统一改为**字段同值时原子 no-op**（SQL `WHERE` 排除同值，SQLite `IS NOT` 做 NULL 安全比较），并返回结构化结果 `MutationResult{Matched, Changed, UpdatedAtAdvanced}`：`Matched` 供 CAS 调用方收敛判定（现有 `UpdateTaskNoticeCAS` 的单一 bool 被 `notice.go:196-205,228-250` 当作竞争失败重试，同值幂等成功不得被误判为不匹配）；领域发布条件 = `Changed && UpdatedAtAdvanced`。同值、同秒、任务不存在 MUST NOT 发布。**排他规则：同一提交若已产生 `task.status_changed`（status 真实迁移，含 `last_error` 随迁移同写），MUST NOT 另发 `task.activity_changed`——迁移的 `updated_at` 推进由 `task.status_changed` 承载；本事件仅用于未伴随状态迁移的真实字段变更**（如 env/notice/last_port/delete_mode 写入、`active→active` 同状态但 `last_error` 不同的提交）。指挥中心 SSE 对所有 `task.activity_changed` 标脏（无 session 时 `last_active_at` 回退该字段；有 session 时重建是多余但正确） | `task.activity_changed` |
 | align 事务内 notice/updated_at 写入 | `AlignTaskSessions` 事务内 noticeFn 分支直接 `UPDATE tasks SET notice, updated_at`（`queries.go:1043-1053`） | 与上行同一 no-op 规则：notice 相同时 MUST 原子跳过（不推进 `updated_at`）；本变更须让 `AlignTaskSessions` 返回结构化提交结果（session 插入/时间推进/删除计数 + notice 是否变化 + `updated_at` 是否真实推进）。session 行计数 >0 → `sessions.aligned`；notice/`updated_at` 真实推进另发 `task.activity_changed` | `sessions.aligned` 和/或 `task.activity_changed` |
 | 异常收敛迁移（持锁主路径） | `convergeToSuspended` 持锁主路径（`activate.go:1502`） | 仅 `committed=true`（并发已转走/未命中不发布）；Payload=`{from:"active", to:"suspended"}` | `task.status_changed` |
-| 异常收敛的清理先于提交（持锁主路径） | `convergeToSuspended` 先 `cleanupActivationRuntime`（`activate.go:1488`，经 `clearRuntime` 清 attention 并停 SSE/runtime，`manager.go:511-522`）后 CAS（`activate.go:1502-1508`） | **结构化结果矩阵（嵌套决策表，叶节点唯一）**：清理前捕获债务令牌与外部可见状态（当前 agentStatus/attention 快照）。第一层按 CAS 结果分叉：①`committed=true` → 发布 `task.status_changed{from:active,to:suspended}`，不登记；②CAS error → 保守发布实际已发生的可见失效（`serve_runtime.run_status_changed`/`serve_runtime.attention_changed`），然后按状态重读结果分叉：②a 重读仍 active → 发布一次 `resync.requested` 并登记 **`postCleanup` 债务**；②b 重读为非 active/不存在 → 仅发布一次 `resync.requested`，不登记；②c 重读 error → 发布一次 `resync.requested` 并登记 **`postCleanup` 债务**；③`committed=false` → 按重读结果分叉：③a 仍 active → 发布可见失效并登记 **`postCleanup` 债务**；③b 非 active/不存在 → 不发布不登记（该并发转换由其对应提交点发布）；③c 重读 error → 同 ②c 处理（保守登记 `postCleanup` + resync.requested）。worker 语义见下行「债务两阶段」。重试注册表语义：**注册项携带触发时的 runtime `generation`/`instanceID` 作债务令牌，并携带阶段 `preCleanup` \| `postCleanup`**；Manager 侧维护**最新 runtime 令牌 tombstone**（创建 runtime 时更新、清理后保留；`lastGen` 已有持久代先例，`manager.go:204-208`/`notice.go:68-75`）；注册表由明确 mutex 保护；登记按 taskID 去重（新代登记原子替换旧注册项）；执行入口接入既有 `backgroundLoop`（`manager.go:603-622`）新增 tick 分支；任务离开 active 时同步撤销登记；移除 MUST 为 compare-and-delete（防旧 worker 误删新代登记） | `serve_runtime.run_status_changed` / `serve_runtime.attention_changed` / `task.status_changed` / `resync.requested` |
-| 锁等待超时（禁止无锁破坏性清理） | 当前 `lockTaskForConverge` 失败后无锁 `cleanupActivationRuntime` + best-effort CAS（`activate.go:1458-1467`）；serve_exit watcher 回调预校验后丢弃触发令牌（`activate.go:1375-1391` → `handleServeExit:1438-1440` 无令牌入口） | **令牌贯穿**：所有异常收敛入口（serve_exit watcher、`handleInfraError`、SSE `convergeToSuspendedForGen`）MUST 统一携带触发 `RuntimeToken{generation, instanceID}`，watcher 路径不得再经无令牌入口（消除等锁期间换代后误清新代）。**本变更 MUST 取消无锁破坏性清理**：锁等待超时 MUST NOT 再调用 `cleanupActivationRuntime` 或无锁 CAS。超时路径仅允许：(1) 以**触发令牌**做登记前过期判定——当前 runtime 令牌等于触发令牌 → 捕获外部可见快照并继续 (2)-(4)；当前 runtime 为 nil 且 tombstone 等于触发令牌 → cleanup 已发生，跳过 (2) 直接登记 **`postCleanup`** 并发布一次 `resync.requested`；两者均不匹配 → 视为旧代 stale callback，记录日志并退出，MUST NOT 登记/清理。超时路径 MUST NOT 读取等锁结束时刻的当前 runtime 令牌代替触发令牌；(2) 若快照当前可用则经唯一 apply 发布一次可见失效（`serve_runtime.run_status_changed`/`serve_runtime.attention_changed`，无可见字段则不发领域事件）；(3) 发布一次 `resync.requested`；(4) 登记 **`preCleanup` 债务**（令牌 = 触发令牌，与持锁矩阵同一注册表/tombstone）。**原子登记**：过期判定、可见失效决策与登记 MUST 在与 runtime 安装/tombstone 更新同一互斥锁域内序列化完成（`registerDebtIfCurrent` 语义）——锁域内按精确触发令牌重新校验，校验通过才执行失效发布与登记；旧令牌 MUST NOT 覆盖较新令牌的既有登记；可见失效 apply 同样在该锁域内按触发令牌再校验（防止把新代快照标记失效）。**债务两阶段（消除 runtime=nil 与「超时后才清 runtime」的冲突）**：worker 取得任务锁后先按阶段分叉前置校验——`preCleanup`：①注册表令牌等于快照；②任务仍 active；③当前 runtime 令牌等于债务令牌（runtime 允许非空）；④tombstone 等于债务令牌。通过后持锁执行 cleanup，将同一登记原子推进为 `postCleanup`（令牌不变），再走持锁 CAS 矩阵。`postCleanup`：①注册表令牌等于快照；②任务仍 active；③当前 runtime 为空；④tombstone 等于债务令牌。通过后只重试 CAS。任一阶段 tombstone/令牌不匹配 → compare-and-delete 撤销旧债务，不 cleanup。**注册表阶段并发**：同令牌重复登记 MUST 单调合并取更高阶段（`preCleanup`→`postCleanup`），MUST NOT 出现 `postCleanup→preCleanup` 回退；阶段推进 MUST 为精确 CAS（匹配 taskID+令牌+当前阶段 `preCleanup` 才置 `postCleanup`）；推进 CAS 失败 MUST 重读：同令牌已为 `postCleanup` → 视为推进成功继续 CAS；令牌已更新（新代）→ 直接退出且 MUST NOT 删除注册项；记录缺失但任务仍 active 且 runtime 已空 → 重新登记 `postCleanup` 债务。worker 自身重试 CAS 的结果 MUST 再套同一叶节点，且每个叶节点写明注册表动作：W① `committed=true` → 先发布 `task.status_changed{from:active,to:suspended}` 再 compare-and-delete；W②a CAS error+重读 active → 保留 `postCleanup` 登记（已在本轮发布过 `resync.requested` 则本叶不再重复）；W②b CAS error+重读非 active/不存在 → 先 `resync.requested` 再 compare-and-delete；W②c CAS error+重读 error → 保留 `postCleanup` 登记；W③a `committed=false`+重读 active → 保留 `postCleanup` 登记；W③b `committed=false`+重读非 active/不存在 → compare-and-delete、不发布；W③c `committed=false`+重读 error → 同 W②c。worker 不得在未持任务锁时清理 runtime | `serve_runtime.run_status_changed` / `serve_runtime.attention_changed` / `task.status_changed` / `resync.requested` |
+| 异常收敛的清理先于提交（持锁主路径） | `convergeToSuspended` 先 `cleanupActivationRuntime`（`activate.go:1488`，经 `clearRuntime` 清 attention 并停 SSE/runtime，`manager.go:511-522`）后 CAS（`activate.go:1502-1508`） | **结构化结果矩阵（嵌套决策表，叶节点唯一）**：清理前捕获债务令牌与外部可见状态（当前 agentStatus/attention 快照）。第一层按 CAS 结果分叉：①`committed=true` → 发布 `task.status_changed{from:active,to:suspended}`，不登记；②CAS error → 保守发布实际已发生的可见失效（`serve_runtime.run_status_changed`/`serve_runtime.attention_changed`），然后按状态重读结果分叉：②a 重读仍 active → 发布一次 `resync.requested` 并登记 **`postCleanup` 债务**；②b 重读为非 active/不存在 → 仅发布一次 `resync.requested`，不登记；②c 重读 error → 发布一次 `resync.requested` 并登记 **`postCleanup` 债务**；③`committed=false` → 按重读结果分叉：③a 仍 active → 发布可见失效并登记 **`postCleanup` 债务**；③b 非 active/不存在 → 不发布不登记（该并发转换由其对应提交点发布）；③c 重读 error → 同 ②c 处理（保守登记 `postCleanup` + resync.requested）。worker 语义见下行「债务两阶段」。重试注册表语义：**注册项携带触发时的 runtime instVersion 作债务令牌，并携带阶段 `preCleanup` \| `postCleanup`**；Manager 侧维护**最新 runtime 令牌 tombstone**（创建 runtime 时更新、清理后保留；`lastGen` 已有持久代先例，`manager.go:204-208`/`notice.go:68-75`）；注册表由明确 mutex 保护；登记按 taskID 去重（新代登记原子替换旧注册项）；执行入口接入既有 `backgroundLoop`（`manager.go:603-622`）新增 tick 分支；任务离开 active 时同步撤销登记；移除 MUST 为 compare-and-delete（防旧 worker 误删新代登记） | `serve_runtime.run_status_changed` / `serve_runtime.attention_changed` / `task.status_changed` / `resync.requested` |
+| 锁等待超时（禁止无锁破坏性清理） | 当前 `lockTaskForConverge` 失败后无锁 `cleanupActivationRuntime` + best-effort CAS（`activate.go:1458-1467`）；serve_exit watcher 回调预校验后丢弃触发令牌（`activate.go:1375-1391` → `handleServeExit:1438-1440` 无令牌入口） | **令牌贯穿**：所有异常收敛入口（serve_exit watcher、`handleInfraError`、SSE `convergeToSuspendedForGen`）MUST 统一携带触发令牌 `taskID + instVersion`，watcher 路径不得再经无令牌入口（消除等锁期间换代后误清新代）。**本变更 MUST 取消无锁破坏性清理**：锁等待超时 MUST NOT 再调用 `cleanupActivationRuntime` 或无锁 CAS。超时路径仅允许：(1) 以**触发令牌**做登记前过期判定——当前 runtime 令牌等于触发令牌 → 捕获外部可见快照并继续 (2)-(4)；当前 runtime 为 nil 且 tombstone 等于触发令牌 → cleanup 已发生，跳过 (2) 直接登记 **`postCleanup`** 并发布一次 `resync.requested`；两者均不匹配 → 视为旧代 stale callback，记录日志并退出，MUST NOT 登记/清理。超时路径 MUST NOT 读取等锁结束时刻的当前 runtime 令牌代替触发令牌；(2) 若快照当前可用则经唯一 apply 发布一次可见失效（`serve_runtime.run_status_changed`/`serve_runtime.attention_changed`，无可见字段则不发领域事件）；(3) 发布一次 `resync.requested`；(4) 登记 **`preCleanup` 债务**（令牌 = 触发令牌，与持锁矩阵同一注册表/tombstone）。**原子登记**：过期判定、可见失效决策与登记 MUST 在与 runtime 安装/tombstone 更新同一互斥锁域内序列化完成（`registerDebtIfCurrent` 语义）——锁域内按精确触发令牌重新校验，校验通过才执行失效发布与登记；旧令牌 MUST NOT 覆盖较新令牌的既有登记；可见失效 apply 同样在该锁域内按触发令牌再校验（防止把新代快照标记失效）。**债务两阶段（消除 runtime=nil 与「超时后才清 runtime」的冲突）**：worker 取得任务锁后先按阶段分叉前置校验——`preCleanup`：①注册表令牌等于快照；②任务仍 active；③当前 runtime 令牌等于债务令牌（runtime 允许非空）；④tombstone 等于债务令牌。通过后持锁执行 cleanup，将同一登记原子推进为 `postCleanup`（令牌不变），再走持锁 CAS 矩阵。`postCleanup`：①注册表令牌等于快照；②任务仍 active；③当前 runtime 为空；④tombstone 等于债务令牌。通过后只重试 CAS。任一阶段 tombstone/令牌不匹配 → compare-and-delete 撤销旧债务，不 cleanup。**注册表阶段并发**：同令牌重复登记 MUST 单调合并取更高阶段（`preCleanup`→`postCleanup`），MUST NOT 出现 `postCleanup→preCleanup` 回退；阶段推进 MUST 为精确 CAS（匹配 taskID+令牌+当前阶段 `preCleanup` 才置 `postCleanup`）；推进 CAS 失败 MUST 重读：同令牌已为 `postCleanup` → 视为推进成功继续 CAS；令牌已更新（新代）→ 直接退出且 MUST NOT 删除注册项；记录缺失但任务仍 active 且 runtime 已空 → 重新登记 `postCleanup` 债务。worker 自身重试 CAS 的结果 MUST 再套同一叶节点，且每个叶节点写明注册表动作：W① `committed=true` → 先发布 `task.status_changed{from:active,to:suspended}` 再 compare-and-delete；W②a CAS error+重读 active → 保留 `postCleanup` 登记（已在本轮发布过 `resync.requested` 则本叶不再重复）；W②b CAS error+重读非 active/不存在 → 先 `resync.requested` 再 compare-and-delete；W②c CAS error+重读 error → 保留 `postCleanup` 登记；W③a `committed=false`+重读 active → 保留 `postCleanup` 登记；W③b `committed=false`+重读非 active/不存在 → compare-and-delete、不发布；W③c `committed=false`+重读 error → 同 W②c。worker 不得在未持任务锁时清理 runtime | `serve_runtime.run_status_changed` / `serve_runtime.attention_changed` / `task.status_changed` / `resync.requested` |
 | Suspend 修复回迁 | `suspend.go:115` | 仅 `committed=true`；Payload=`{from,to}`（通常 `suspending→active`） | `task.status_changed` |
 
 `UpdateTaskStatus`/`UpdateTaskStatusConditional` 等 store 层调用不感知总线——发布统一在 application 层 LifecycleService 的集中 commit helper（D0）提交点之后，store/sqlite adapter 保持纯持久化职责。领域事件按上表全量挂接；指挥中心 SSE 再用消费过滤表投影。`ClaimInitRun`/`ClaimInitRerun`/`FinishInitRun`/`ConvergeInterruptedInitRuns` 只改 `init_status`、不改 `tasks.status`，本变更 **MUST NOT** 为它们发明领域事件（含不触发 `task.activity_changed`——init 写入即使推进 `updated_at` 也不发任何领域事件，后续 projects 场景若需要再扩展）。启动期 `Reconcile` 在 HTTP 开放前执行（`main.go` 顺序），其发布按设计发往零订阅者，正确性依赖开放后首帧全量快照与不变的 projects 轮询。实现时以该路径清单逐项核对。**总线不提供跨 topic 顺序保证**（如 Force 删除的级联 `session.deleted` 与 `task.deleted` 分属不同 topic，订阅方 fan-in 的到达顺序不得作为事实依据）；指挥中心 SSE 适配器仅据事件标脏后重组装全量快照，不依赖事件顺序。
@@ -448,7 +532,7 @@ main.go
 
 - [状态事件契约不完全确定（确切 type 字符串与字段路径待实测）] → tasks 设 Phase 0 实测门禁：捕获 idle/busy/retry 三类真实 fixture 并固化解析契约测试；未命中 fail-closed 忽略；门禁失败启用 D4 fallback（低频探测缓存）。
 - [DDD 重构中漏事件或状态语义漂移（写点众多）] → 以全部 store 写调用点形成 D2 提交矩阵；每迁移一个用例做正向/CAS 未命中/store error/同值 no-op 测试；旧 facade 只允许单写路径。
-- [ServeRuntime 换代、回调等锁、teardown 与债务 worker 竞态] → 单一 Registry 锁域 + typed RuntimeToken + tombstone + compare-and-delete + preCleanup→postCleanup 单调状态机；`go test -race` 加可控 barrier 测试。
+- [ServeRuntime 换代、回调等锁、teardown 与债务 worker 竞态] → 单一 Registry 锁域 + instVersion 令牌 + tombstone + compare-and-delete + preCleanup→postCleanup 单调状态机；`go test -race` 加可控 barrier 测试。
 - [DB、Runtime、Publish 三者无原子事务；session 物理键弱于领域模型] → publish-after-commit；不确定结果发 resync；Overflow+全量快照兜底；SessionRepository 方法闭合为 Claim/TouchOwned/DeleteOwned/Align/OwnedSessions/OwnerOf（禁通用 Save/Upsert）；历史重复归属读到时 fail-closed。
 - [事件丢失（缓冲溢出/进程内 at-most-once）] → D1 `Overflow()` 可观察溢出 + D3 全量快照语义与溢出即重推 + 心跳写探测，正确性不依赖单事件送达。
 - [合并窗口引入最长 ~500ms 额外延迟] → 窗口值本变更固定 500ms（后续调整须另走规格变更）；相较 5s 轮询仍是一个数量级改善。

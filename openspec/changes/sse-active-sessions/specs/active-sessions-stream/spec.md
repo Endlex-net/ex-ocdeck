@@ -33,7 +33,7 @@
 
 本变更支持的事件分为两层，各自闭合，内容不同。MUST NOT 把领域事件 Type/Payload 当作 SSE 帧，也 MUST NOT 把 SSE 裸数组回写成总线事件。
 
-**内部领域事件**结构固定为 `{Topic, Type, RID, Payload}`。`Topic` MUST 为 `task` / `session` / `serve_runtime` / `control`。`Type` MUST 为下列闭合枚举之一；**各 Type 的 Payload 字段以 design 事件类型目录为唯一定义**（本 requirement 不重复列举），Payload 仅含该 Type 规定的小字段，MUST NOT 携带 `ActiveSessionItem` 整表或 Attention 明细。`RID` MUST 为主体实体自己的主键 ID：task 事件（`task.created`/`task.status_changed`/`task.deleted`/`task.activity_changed`）为 task 主键；`session.claimed` / `session.touched` / `session.deleted` 为 session 主键（session 是独立聚合，owning task 由 Payload `task_id` 携带）；`serve_runtime.attention_changed` / `serve_runtime.run_status_changed` 为 ServeRuntime 主键 instanceID（owning task 由 Payload `task_id` 携带）；`sessions.aligned` 的主体为任务的会话集合（持久侧无独立对象），RID 为 task 主键；`resync.requested` 无主体，RID 允许空：
+**内部领域事件**结构固定为 `{Topic, Type, RID, Payload}`。`Topic` MUST 为 `task` / `session` / `serve_runtime` / `control`。`Type` MUST 为下列闭合枚举之一；**各 Type 的 Payload 字段以 design 事件类型目录为唯一定义**（本 requirement 不重复列举），Payload 仅含该 Type 规定的小字段，MUST NOT 携带 `ActiveSessionItem` 整表或 Attention 明细。`RID` MUST 为主体实体自己的主键 ID：task 事件（`task.created`/`task.status_changed`/`task.deleted`/`task.activity_changed`）为 task 主键；`session.claimed` / `session.touched` / `session.deleted` 为 session 主键（session 是独立聚合，owning task 由 Payload `task_id` 携带）；`serve_runtime.attention_changed` / `serve_runtime.run_status_changed` 为 ServeRuntime 主键 instVersion（owning task 由 Payload `task_id` 携带）；`sessions.aligned` 的主体为任务的会话集合（持久侧无独立对象），RID 为 task 主键；`resync.requested` 无主体，RID 允许空：
 
 - `task.created`（topic `task`，RID=task 主键）
 - `task.status_changed`（topic `task`，RID=task 主键）
@@ -41,8 +41,8 @@
 - `task.activity_changed`（topic `task`，RID=task 主键；仅当提交未伴随 `task.status_changed` 时发布——真实状态迁移只发 `task.status_changed`，其 `updated_at` 推进由它承载；`init_status`/`init_error` 写入即使推进 `updated_at` 也 MUST NOT 触发本事件）
 - `session.claimed` / `session.touched` / `session.deleted`（topic `session`，RID=session 主键）
 - `sessions.aligned`（topic `session`，RID=task 主键）
-- `serve_runtime.attention_changed`（topic `serve_runtime`，RID=ServeRuntime 主键 instanceID）
-- `serve_runtime.run_status_changed`（topic `serve_runtime`，RID=ServeRuntime 主键 instanceID）
+- `serve_runtime.attention_changed`（topic `serve_runtime`，RID=ServeRuntime 主键 instVersion）
+- `serve_runtime.run_status_changed`（topic `serve_runtime`，RID=ServeRuntime 主键 instVersion）
 - `resync.requested`（topic `control`，RID 允许空）
 
 未知 `Type` MUST 仍投递给订阅者，MUST NOT 使发布失败。指挥中心 SSE 适配器 MUST 按 design 消费过滤表标脏：`task.created` 与两端都非 `active` 的 `task.status_changed`、以及 `from!=active` 的 `task.deleted` MUST NOT 标脏；其余本变更 Type 与未知 Type、以及溢出信号 MUST 标脏。适配器 MUST NOT 按 Payload 做增量合并。
@@ -54,7 +54,7 @@
 #### Scenario: 内部领域事件闭合且仅小载荷
 
 - **WHEN** 任务域在任一提交点发布总线事件
-- **THEN** 事件含 `Topic`/`Type`/`RID`/`Payload`，`Type` 为本 requirement 闭合枚举之一；`RID` 为主体实体主键（task 事件与 sessions.aligned 为 task 主键，session 单条事件为 session 主键，serve_runtime 事件为 instanceID，resync.requested 允许空）；`task.status_changed` 带 `{from,to}`，`task.deleted` 带 `{from}`，`serve_runtime.run_status_changed` 带 `{task_id,from,to,available}`，`serve_runtime.attention_changed` 带 `{task_id}`，`session.claimed`/`session.touched`/`session.deleted` 带 `{task_id}`，`sessions.aligned` 带计数与受影响 `session_ids`；事件 MUST NOT 携带 `ActiveSessionItem` 或 Attention 明细
+- **THEN** 事件含 `Topic`/`Type`/`RID`/`Payload`，`Type` 为本 requirement 闭合枚举之一；`RID` 为主体实体主键（task 事件与 sessions.aligned 为 task 主键，session 单条事件为 session 主键，serve_runtime 事件为 instVersion，resync.requested 允许空）；`task.status_changed` 带 `{from,to}`，`task.deleted` 带 `{from}`，`serve_runtime.run_status_changed` 带 `{task_id,from,to,available}`，`serve_runtime.attention_changed` 带 `{task_id}`，`session.claimed`/`session.touched`/`session.deleted` 带 `{task_id}`，`sessions.aligned` 带计数与受影响 `session_ids`；事件 MUST NOT 携带 `ActiveSessionItem` 或 Attention 明细
 
 #### Scenario: 对外帧与领域事件解耦
 
