@@ -1018,7 +1018,7 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 			// R7 failpoint：session 落库错误 MUST 收敛运行时（design.md §4/§19）。
 			for _, ev := range replay {
 				if err := m.handleSSEEvent(sseCtx, taskID, wtPath, ev); err != nil {
-					go m.convergeToSuspendedForGen(taskID, "sse replay session store error: "+err.Error(), rt.generation, rt.instanceID)
+					go m.convergeToSuspendedForGen(taskID, "sse replay session store error: "+err.Error(), rt.instVersion)
 					return
 				}
 			}
@@ -1049,7 +1049,7 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 			// design.md §4/§19）。在独立 goroutine 收敛：cleanup 会 kill serve 结束本 ctx，
 			// 需避免在 SSE goroutine 内 join/cancel 造成死锁。
 			if err := m.handleSSEEvent(sseCtx, taskID, wtPath, ev); err != nil {
-				go m.convergeToSuspendedForGen(taskID, "sse session store error: "+err.Error(), rt.generation, rt.instanceID)
+				go m.convergeToSuspendedForGen(taskID, "sse session store error: "+err.Error(), rt.instVersion)
 				return
 			}
 		}
@@ -1070,7 +1070,7 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 				// 在新 goroutine 收敛：onReconnect 在 SSE goroutine 内，cleanup 会 kill serve（结束本 goroutine ctx），
 				// 需避免在自身 goroutine 内 join/cancel 造成死锁。
 				cancel()
-				go m.convergeToSuspendedForGen(taskID, "sse reconnect align failed: "+err.Error(), rt.generation, rt.instanceID)
+				go m.convergeToSuspendedForGen(taskID, "sse reconnect align failed: "+err.Error(), rt.instVersion)
 				return
 			}
 			// D6 注意力对账（align 路径）：session align 成功后、drainAndRelease 前。失败不影响任务状态机。
@@ -1083,13 +1083,13 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 		sseErr := ocWithReady.SubscribeEvents(sseCtx, wtPath, onEvent, onReconnect)
 		if sseErr != nil && sseErr != context.Canceled && !errors.Is(sseErr, context.Canceled) {
 			// SSE 流异常结束（非主动 cancel）：在新 goroutine 收敛（cleanup 会 kill serve 结束本 ctx）。
-			go m.convergeToSuspendedForGen(taskID, "sse stream ended: "+sseErr.Error(), rt.generation, rt.instanceID)
+			go m.convergeToSuspendedForGen(taskID, "sse stream ended: "+sseErr.Error(), rt.instVersion)
 			return
 		}
 		// 正常返回（流结束/ctx 取消）：若 ctx 未被主动 cancel（即非 Activate/Shutdown 主动停 SSE），
 		// serve 仍存活但 SSE 流终止 → 收敛。sseCtx 被 cancel 的情况由 Activate 返回路径/Shutdown 处理，不在此收敛。
 		if sseCtx.Err() == nil {
-			go m.convergeToSuspendedForGen(taskID, "sse stream ended (serve may still be alive)", rt.generation, rt.instanceID)
+			go m.convergeToSuspendedForGen(taskID, "sse stream ended (serve may still be alive)", rt.instVersion)
 		}
 	}()
 
@@ -1414,28 +1414,25 @@ func (m *Manager) resolveAnchorSession(ctx context.Context, oc OCClient, row Tas
 }
 
 // watchServeExit 监视 serve 会话消失 → 完整清理运行时 → suspended + last_error（design.md §4）。
-// 回调校验三元组 (generation, sessionName, InstanceID) 仍匹配 Manager 当前注册表，
-// 否则忽略（B4 回调隔离：旧代回调不清理新代）。校验针对 m.getRuntime 的当前 runtime，
-// 而非注册时捕获的 rt，保证旧代 runtime 被替换后回调即失效（C1：不捕获本地快照）。
+// 回调校验 (instVersion, sessionName) 仍匹配 Manager 当前注册表，否则忽略（B4 回调隔离：
+// 旧实例回调不清理新实例）。校验针对 m.getRuntime 的当前 runtime，而非注册时捕获的 rt，
+// 保证旧 runtime 被替换后回调即失效（C1：不捕获本地快照）。
 // 事件类型分发（C1 typed RuntimeEvent）：
 //   - WatchEventSessionExit → handleServeExit（serve_exit 语义）；
 //   - WatchEventInfraError（tmux 持续故障）→ handleInfraError（记录 last_error + notice + 收敛运行时，
 //     不得静默）。
 //
-// P1.4.7（design.md D0:150）：注册时捕获触发 RuntimeToken 并贯穿传递给 converge——
-// 触发令牌是注册/回调校验时刻的身份，不得在等锁后重读 runtime 顶替。
+// P1.4.7（design.md D0:150）：注册时捕获触发令牌并贯穿传递给 converge——触发令牌是
+// 注册/回调校验时刻的身份，不得在等锁后重读 runtime 顶替。
 func (m *Manager) watchServeExit(taskID, serveName string) {
-	gen := 0
-	inst := ""
+	tok := runtime.InstVersion("")
 	if rt := m.getRuntime(taskID); rt != nil {
-		gen = rt.generation
-		inst = rt.instanceID
+		tok = rt.instVersion
 	}
-	tok := runtime.RuntimeToken{InstanceID: inst, Generation: gen}
 	cancel, done := m.proc.WatchExit(serveName, func(ev process.WatchEvent) {
 		// 校验当前 runtime 注册表（非注册时捕获的 rt）。
 		cur := m.getRuntime(taskID)
-		if cur == nil || !cur.matchesRegistry(gen, serveName, inst) {
+		if cur == nil || !cur.matchesRegistry(tok, serveName) {
 			return
 		}
 		switch ev.Type {
@@ -1454,21 +1451,18 @@ func (m *Manager) watchServeExit(taskID, serveName string) {
 }
 
 // watchTUIExit 监视 TUI 会话消失 → 标记可重开（保持活跃，design.md §4）。
-// 回调校验三元组（B4 回调隔离，针对当前 runtime 注册表，C1：不捕获本地快照）。
+// 回调校验（B4 回调隔离，针对当前 runtime 注册表，C1：不捕获本地快照）。
 // 事件类型分发（C1 typed RuntimeEvent）：
 //   - WatchEventSessionExit → tui_exit 语义：标记可重开（保持活跃）；
 //   - WatchEventInfraError → handleInfraError（TUI 监视 infra 错误同样收敛运行时）。
 func (m *Manager) watchTUIExit(taskID, tuiName string) {
-	gen := 0
-	inst := ""
+	tok := runtime.InstVersion("")
 	if rt := m.getRuntime(taskID); rt != nil {
-		gen = rt.generation
-		inst = rt.instanceID
+		tok = rt.instVersion
 	}
-	tok := runtime.RuntimeToken{InstanceID: inst, Generation: gen}
 	cancel, done := m.proc.WatchExit(tuiName, func(ev process.WatchEvent) {
 		cur := m.getRuntime(taskID)
-		if cur == nil || !cur.matchesRegistry(gen, tuiName, inst) {
+		if cur == nil || !cur.matchesRegistry(tok, tuiName) {
 			return
 		}
 		switch ev.Type {
@@ -1491,29 +1485,29 @@ func (m *Manager) watchTUIExit(taskID, tuiName string) {
 // handleServeExit serve 异常消失（非挂起路径）→ 完整清理运行时 → suspended + last_error。
 // 清除 env snapshot 与 shell（design.md §2/§4：serve 异常退出清快照）。
 // P1.4.7：tok 为 watcher 注册时捕获的触发令牌（design.md D0:150 令牌贯穿）。
-func (m *Manager) handleServeExit(taskID string, tok runtime.RuntimeToken) {
+func (m *Manager) handleServeExit(taskID string, tok runtime.InstVersion) {
 	m.convergeToSuspended(taskID, "serve session exited unexpectedly", tok)
 }
 
 // convergeToSuspended 收敛活跃任务到 suspended（design.md §4：不得留 active 但无 SSE 托管的运行时）。
 // 非 SSE 路径（serve_exit watcher、handleInfraError）——令牌校验在 convergeToSuspendedChecked
 // 内统一完成（拿锁后按触发令牌比对当前 runtime，含 watcher 路径）。
-func (m *Manager) convergeToSuspended(taskID, reason string, tok runtime.RuntimeToken) {
+func (m *Manager) convergeToSuspended(taskID, reason string, tok runtime.InstVersion) {
 	m.convergeToSuspendedChecked(taskID, reason, tok)
 }
 
 // convergeToSuspendedForGen 同 convergeToSuspended，SSE 路径专用：以触发事件的
-// (generation, instanceID) 构造 RuntimeToken 进入统一收敛入口。
-func (m *Manager) convergeToSuspendedForGen(taskID, reason string, gen int, instID string) {
-	m.convergeToSuspendedChecked(taskID, reason, runtime.RuntimeToken{InstanceID: instID, Generation: gen})
+// instVersion 进入统一收敛入口（P1.4.9：原 (generation, instanceID) 双参数收敛）。
+func (m *Manager) convergeToSuspendedForGen(taskID, reason string, instVersion runtime.InstVersion) {
+	m.convergeToSuspendedChecked(taskID, reason, instVersion)
 }
 
 // convergeToSuspendedChecked 统一收敛入口（watcher/SSE 路径一致携带触发令牌，
-// design.md D0:150）。拿锁后校验当前 runtime 令牌仍等于触发令牌——旧代延迟回调
-//（等锁期间任务被 Suspend→重新 Activate 换代）MUST NOT 清理新代 runtime（design.md §2
-// 三元组隔离）。锁等待超时不再无锁清理/CAS（design.md D0:151 替换行为）：仅按触发令牌
+// design.md D0:150）。拿锁后校验当前 runtime 令牌仍等于触发令牌——旧实例延迟回调
+//（等锁期间任务被 Suspend→重新 Activate 换代）MUST NOT 清理新实例 runtime（design.md §2
+// 令牌隔离）。锁等待超时不再无锁清理/CAS（design.md D0:151 替换行为）：仅按触发令牌
 // 登记两阶段债务，由 backgroundLoop worker 持锁消化（converge_debt.go）。
-func (m *Manager) convergeToSuspendedChecked(taskID, reason string, tok runtime.RuntimeToken) {
+func (m *Manager) convergeToSuspendedChecked(taskID, reason string, tok runtime.InstVersion) {
 	unlock, err := m.lockTaskForConverge(taskID)
 	if err != nil {
 		m.onConvergeLockTimeout(taskID, reason, tok)
@@ -1521,10 +1515,9 @@ func (m *Manager) convergeToSuspendedChecked(taskID, reason string, tok runtime.
 	}
 	defer unlock()
 	// 触发令牌隔离（统一原 SSE checkGen 路径与 watcher 路径）：当前 runtime 为 nil 或令牌
-	// 不匹配 → 旧代延迟回调，跳过收敛（不清理新代/已清 runtime）。
-	if rt := m.getRuntime(taskID); rt == nil || rt.instanceID != tok.InstanceID || rt.generation != tok.Generation {
-		log.Printf("convergeToSuspended: stale token callback (task %s gen=%d inst=%s) skipped",
-			taskID, tok.Generation, tok.InstanceID)
+	// 不匹配 → 旧实例延迟回调，跳过收敛（不清理新实例/已清 runtime）。
+	if rt := m.getRuntime(taskID); rt == nil || rt.instVersion != tok {
+		log.Printf("convergeToSuspended: stale token callback (task %s instVersion=%s) skipped", taskID, tok)
 		return
 	}
 	ctx := context.Background()
@@ -1542,7 +1535,7 @@ func (m *Manager) convergeToSuspendedChecked(taskID, reason string, tok runtime.
 // → 记 last_error（含底层 infra 错误）→ 落 suspended。
 // 不静默：last_error 与 notice 均落库，供用户与后台周期感知。
 // P1.4.7：tok 为 watcher 注册时捕获的触发令牌（design.md D0:150 令牌贯穿）。
-func (m *Manager) handleInfraError(taskID, sessionName string, infraErr error, tok runtime.RuntimeToken) {
+func (m *Manager) handleInfraError(taskID, sessionName string, infraErr error, tok runtime.InstVersion) {
 	reason := fmt.Sprintf("tmux infra error watching %s: %v", sessionName, infraErr)
 	m.convergeToSuspended(taskID, reason, tok)
 }

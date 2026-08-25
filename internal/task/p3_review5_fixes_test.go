@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"ocdeck/internal/application/runtime"
 	"ocdeck/internal/config"
 	"ocdeck/internal/opencode"
 	"ocdeck/internal/process"
@@ -48,7 +47,7 @@ func TestConvergeToSuspended_LockBusyWaitsThenConverges(t *testing.T) {
 	if rt == nil {
 		t.Fatal("prereq runtime missing after Activate")
 	}
-	tok := runtime.RuntimeToken{InstanceID: rt.instanceID, Generation: rt.generation}
+	tok := rt.instVersion
 
 	// 触发 serve 退出事件（fatal runtime event）：convergeToSuspended 应阻塞等锁，不立即返回。
 	var converged atomic.Bool

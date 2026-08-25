@@ -1,11 +1,14 @@
-package runtime
-
 // debt.go 收敛债务（两阶段 preCleanup/postCleanup）登记表（design.md D0:45/D2）。
 //
 // 债务表达「异常收敛未能当场完成」的事实：锁等待超时路径 MUST NOT 无锁清理/无锁 CAS
 //（design.md D0:151 替换行为），仅按触发令牌登记债务，由 backgroundLoop worker 持锁消化。
-// 表挂在 Registry 上，与 runtime 安装（NewRuntimeToken）/tombstone 更新同一互斥锁域
+// 表挂在 Registry 上，与 runtime 安装（NewInstVersion）/tombstone 更新同一互斥锁域
 //（genMu，design.md D0:342），保证登记的过期判定、阶段推进与新代分配串行化。
+//
+// P1.4.9：令牌为单一 InstVersion 字符串（等值判定，MUST NOT 数值比大小），原
+// RuntimeToken{instanceID, generation} 双字段已收敛。
+
+package runtime
 
 // DebtPhase 表达收敛债务的两阶段（design.md D2 债务两阶段）。
 // 阶段只单调推进（preCleanup→postCleanup），MUST NOT 回退。
@@ -21,7 +24,7 @@ const (
 // DebtEntry 为单条收敛债务（design.md D2：注册项携带触发时的 runtime 令牌 + 阶段）。
 type DebtEntry struct {
 	TaskID string
-	Token  RuntimeToken
+	Token  InstVersion
 	Phase  DebtPhase
 }
 
@@ -29,7 +32,7 @@ type DebtEntry struct {
 // registerDebtIfCurrent 语义 + D2:341-342 登记去重规则）。
 //
 // 过期判定只看 TRIGGER 令牌（不得用「等锁结束时刻」的当前令牌顶替），且以 tombstone
-// 为代际权威（NewRuntimeToken 在同一 genMu 锁域内推进 tombstone）：
+// 为代际权威（NewInstVersion 在同一 genMu 锁域内推进 tombstone）：
 //   - tombstone 存在且 != trigger → 旧代 stale，一律拒绝（即使调用方 runtime 快照仍
 //     匹配——快照可能滞后于换代）；
 //   - 否则 currentRuntime 非 nil → 当前代当且仅当 *currentRuntime == trigger；
@@ -45,7 +48,7 @@ type DebtEntry struct {
 //
 // 返回 (registered, actualPhase)：registered=false 时 actualPhase 为既有登记的阶段
 //（无登记时为零值），供调用方诊断。
-func (r *Registry) RegisterIfCurrent(taskID string, trigger RuntimeToken, phase DebtPhase, currentRuntime *RuntimeToken) (registered bool, actualPhase DebtPhase) {
+func (r *Registry) RegisterIfCurrent(taskID string, trigger InstVersion, phase DebtPhase, currentRuntime *InstVersion) (registered bool, actualPhase DebtPhase) {
 	r.genMu.Lock()
 	defer r.genMu.Unlock()
 	existing, hasExisting := r.debts[taskID]
@@ -73,10 +76,10 @@ func (r *Registry) RegisterIfCurrent(taskID string, trigger RuntimeToken, phase 
 }
 
 // triggerCurrentLocked 判定触发令牌是否仍为当前代（调用方持 genMu）。
-// tombstone 是代际权威（NewRuntimeToken 在本锁域内推进）：tombstone 已推进到其他令牌
+// tombstone 是代际权威（NewInstVersion 在本锁域内推进）：tombstone 已推进到其他令牌
 // → 触发令牌为旧代，一律拒绝。runtime 快照（Manager.rtMu 域）仅作补充判定，不凌驾
 // tombstone——快照可能滞后于换代。
-func (r *Registry) triggerCurrentLocked(taskID string, trigger RuntimeToken, currentRuntime *RuntimeToken) bool {
+func (r *Registry) triggerCurrentLocked(taskID string, trigger InstVersion, currentRuntime *InstVersion) bool {
 	tomb, hasTomb := r.lastToken[taskID]
 	if hasTomb && tomb != trigger {
 		return false
@@ -92,7 +95,7 @@ func (r *Registry) triggerCurrentLocked(taskID string, trigger RuntimeToken, cur
 //   - 同令牌已是 postCleanup → ok=true（推进幂等）；
 //   - 令牌已换（新代登记）→ tokenMoved=true，MUST NOT 删除注册项（防旧 worker 误删新代）；
 //   - 记录缺失 → missing=true。
-func (r *Registry) AdvanceToPostCleanup(taskID string, token RuntimeToken) (ok bool, missing bool, tokenMoved bool) {
+func (r *Registry) AdvanceToPostCleanup(taskID string, token InstVersion) (ok bool, missing bool, tokenMoved bool) {
 	r.genMu.Lock()
 	defer r.genMu.Unlock()
 	entry, exists := r.debts[taskID]
@@ -112,7 +115,7 @@ func (r *Registry) AdvanceToPostCleanup(taskID string, token RuntimeToken) (ok b
 
 // CompareAndDelete 仅当 taskID+token 均匹配时删除登记（design.md D2：移除 MUST 为
 // compare-and-delete，防旧 worker 误删新代登记）。返回是否实际删除。
-func (r *Registry) CompareAndDelete(taskID string, token RuntimeToken) bool {
+func (r *Registry) CompareAndDelete(taskID string, token InstVersion) bool {
 	r.genMu.Lock()
 	defer r.genMu.Unlock()
 	entry, exists := r.debts[taskID]

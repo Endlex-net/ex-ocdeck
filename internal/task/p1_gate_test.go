@@ -274,25 +274,21 @@ func TestDispositionToNotice_FiveValues(t *testing.T) {
 	}
 }
 
-// TestNewRuntime_GenerationMonotonic 验证 generation 单调递增且 clearRuntime 后不回卷（B4）。
-func TestNewRuntime_GenerationMonotonic(t *testing.T) {
+// TestNewRuntime_InstVersionUnique 验证 instVersion 唯一性（B4 语义，P1.4.9 单字符串
+// 令牌取代原 generation 单调）：连续分配（含同毫秒）与 clearRuntime 后再分配均不重复。
+func TestNewRuntime_InstVersionUnique(t *testing.T) {
 	m := newTestManager(t, newMockStore(), newMockProc(), newMockWorktree(), newMockOC(true))
 
 	rt1 := m.newRuntime("t1")
-	gen1 := rt1.generation
 	rt2 := m.newRuntime("t1")
-	if rt2.generation <= gen1 {
-		t.Errorf("second generation = %d, want > %d (monotonic increase)", rt2.generation, gen1)
+	if rt1.instVersion == rt2.instVersion {
+		t.Errorf("consecutive allocations must differ, both %q", rt1.instVersion)
 	}
-	// clearRuntime 后再创建：generation 不得回卷到 0/旧值（B4）。
+	// clearRuntime 后再创建：令牌不得与既有令牌重复（B4 fencing 等值判定基础）。
 	m.clearRuntime("t1")
 	rt3 := m.newRuntime("t1")
-	if rt3.generation <= rt2.generation {
-		t.Errorf("post-clear generation = %d, want > %d (monotonic, no rollback after clear)", rt3.generation, rt2.generation)
-	}
-	// instanceID 唯一。
-	if rt3.instanceID == rt2.instanceID {
-		t.Error("instanceID must be unique per generation")
+	if rt3.instVersion == rt2.instVersion || rt3.instVersion == rt1.instVersion {
+		t.Errorf("post-clear instVersion %q must differ from prior tokens %q/%q", rt3.instVersion, rt1.instVersion, rt2.instVersion)
 	}
 }
 

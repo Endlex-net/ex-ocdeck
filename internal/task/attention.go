@@ -795,7 +795,7 @@ func (m *Manager) commitAttentionChanged(taskID string, rt *taskRuntime, changed
 	if !changed || m.lifecycle == nil {
 		return
 	}
-	m.lifecycle.CommitAttentionChange(taskID, rt.instanceID)
+	m.lifecycle.CommitAttentionChange(taskID, string(rt.instVersion))
 }
 
 // --- 后台 30s 周期重试（degraded） ---

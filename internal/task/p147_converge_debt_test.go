@@ -76,11 +76,11 @@ func TestP147_Suspend_GuardReject_ViaLifecycle(t *testing.T) {
 
 // p147RuntimeWithSessions 构造带存活 serve/tui 会话与已安装 runtime 的 active 任务，
 // 返回触发令牌（当前 runtime 令牌）。
-func p147RuntimeWithSessions(t *testing.T, m *Manager) runtime.RuntimeToken {
+func p147RuntimeWithSessions(t *testing.T, m *Manager) runtime.InstVersion {
 	t.Helper()
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	return runtime.RuntimeToken{InstanceID: rt.instanceID, Generation: rt.generation}
+	return rt.instVersion
 }
 
 // TestP147_LockTimeout_RegistersPreCleanup_NoUnlockCleanup 直接单测锁超时分支
@@ -124,10 +124,11 @@ func TestP147_LockTimeout_StaleToken_NoRegister(t *testing.T) {
 	proc := newMockProc()
 	proc.sessions[serveSessionName("t1")] = true
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
-	cur := p147RuntimeWithSessions(t, m)
+	// 安装当前 runtime（tombstone 随分配推进到当前令牌）。
+	p147RuntimeWithSessions(t, m)
 
-	// 不同于当前代的触发令牌。
-	stale := runtime.RuntimeToken{InstanceID: "stale-inst", Generation: cur.Generation + 5}
+	// 不同于当前令牌的触发令牌（tombstone 已推进到当前，此值为旧代）。
+	stale := runtime.InstVersion("01724000000123-stale0")
 	m.onConvergeLockTimeout("t1", "stale callback", stale)
 
 	if _, ok := m.runtimeRegistry.Get("t1"); ok {
@@ -277,7 +278,7 @@ func TestP147_LockTimeout_NewRuntimeReplacesOldDebt(t *testing.T) {
 	// 第一代锁超时 → 登记 tok1 preCleanup。
 	rt1 := m.newRuntime("t1")
 	m.setRuntime("t1", rt1)
-	tok1 := runtime.RuntimeToken{InstanceID: rt1.instanceID, Generation: rt1.generation}
+	tok1 := rt1.instVersion
 	m.onConvergeLockTimeout("t1", "gen1 lock timeout", tok1)
 	if entry, ok := m.runtimeRegistry.Get("t1"); !ok || entry.Token != tok1 {
 		t.Fatalf("prereq: tok1 debt missing: %+v (ok=%v)", entry, ok)
@@ -287,7 +288,7 @@ func TestP147_LockTimeout_NewRuntimeReplacesOldDebt(t *testing.T) {
 	m.clearRuntime("t1")
 	rt2 := m.newRuntime("t1")
 	m.setRuntime("t1", rt2)
-	tok2 := runtime.RuntimeToken{InstanceID: rt2.instanceID, Generation: rt2.generation}
+	tok2 := rt2.instVersion
 
 	// 第二代锁超时：新令牌登记必须替换旧债。
 	m.onConvergeLockTimeout("t1", "gen2 lock timeout", tok2)
@@ -344,11 +345,11 @@ func p147ManagerWithRecordingPublisher(t *testing.T, store TaskStore) (*Manager,
 
 // p147SeedPostCleanupDebt 构造 runtime 并登记其令牌的 postCleanup 债务
 //（runtime 已清、tombstone 保留令牌，与 worker postCleanup 前置一致）。
-func p147SeedPostCleanupDebt(t *testing.T, m *Manager) runtime.RuntimeToken {
+func p147SeedPostCleanupDebt(t *testing.T, m *Manager) runtime.InstVersion {
 	t.Helper()
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	tok := runtime.RuntimeToken{InstanceID: rt.instanceID, Generation: rt.generation}
+	tok := rt.instVersion
 	m.clearRuntime("t1")
 	registered, _ := m.runtimeRegistry.RegisterIfCurrent("t1", tok, runtime.DebtPhasePostCleanup, nil)
 	if !registered {

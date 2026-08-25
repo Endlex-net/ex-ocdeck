@@ -220,9 +220,9 @@ func noticeRawString(n *string) string {
 //
 // 两个独立 accepted apply（接管归并 / REST 写回）各自在 apply 前后快照 diff 判定 changed，
 // changed 时调用本方法发布 serve_runtime.attention_changed（本阶段 NoopPublisher，
-// 调用位就绪无实际发布）。RID 为 ServeRuntime 主键 instanceID，Payload 携带 task_id。
-func (s *LifecycleService) CommitAttentionChange(taskID, instanceID string) {
-	s.publish.Publish(ocdeckevent.NewServeRuntimeAttentionChanged(instanceID, taskID))
+// 调用位就绪无实际发布）。RID 为 ServeRuntime 主键 instVersion，Payload 携带 task_id。
+func (s *LifecycleService) CommitAttentionChange(taskID, instVersion string) {
+	s.publish.Publish(ocdeckevent.NewServeRuntimeAttentionChanged(instVersion, taskID))
 }
 
 // --- commit helper（design.md D0:133，NoopPublisher 阶段调用位就绪） ---

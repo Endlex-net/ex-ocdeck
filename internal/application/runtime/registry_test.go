@@ -5,90 +5,109 @@ import (
 	"testing"
 )
 
-// TestNewRuntimeToken_MonotonicAndTombstone 验证 generation 单调递增、
-// 清理后从 tombstone 续递增（B4：进程生命周期内不回卷）。
-func TestNewRuntimeToken_MonotonicAndTombstone(t *testing.T) {
+// TestNewInstVersion_Format 验证令牌格式 `<13 位 ms>-<hex 后缀>`（design.md:70）。
+func TestNewInstVersion_Format(t *testing.T) {
 	r := New()
-	// 首次分配：prevGen=0 → gen=1，instanceID="i1"。
-	tok1 := r.NewRuntimeToken("t1", 0, "i1")
-	if tok1.Generation != 1 || tok1.InstanceID != "i1" {
-		t.Fatalf("tok1 = %+v, want {gen=1 inst=i1}", tok1)
+	v := r.NewInstVersion("t1")
+	s := string(v)
+	if len(s) <= 14 || s[13] != '-' {
+		t.Fatalf("token %q MUST be <13-digit ms>-<hex suffix>", s)
 	}
-	// 续递增：prevGen=1 → gen=2。
-	tok2 := r.NewRuntimeToken("t1", 1, "i2")
-	if tok2.Generation != 2 || tok2.InstanceID != "i2" {
-		t.Fatalf("tok2 = %+v, want {gen=2 inst=i2}", tok2)
+	for i, c := range s[:13] {
+		if c < '0' || c > '9' {
+			t.Fatalf("token %q first 13 runes MUST be digits (pos %d = %q)", s, i, c)
+		}
 	}
-	// 模拟 clearRuntime（runtime 移除，prevGen 回到 0）。generation MUST 从 tombstone 续递增，
-	// 不得回卷到 1（B4）。
-	tok3 := r.NewRuntimeToken("t1", 0, "i3")
-	if tok3.Generation != 3 || tok3.InstanceID != "i3" {
-		t.Fatalf("tok3 = %+v, want {gen=3 inst=i3} (tombstone prevents rewind)", tok3)
+	for _, c := range s[14:] {
+		ok := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+		if !ok {
+			t.Fatalf("token %q suffix MUST be lowercase hex, got %q", s, c)
+		}
 	}
-	// Tombstone 反映最近一次分配的完整令牌（P1.4.7：generation+instanceID）。
+}
+
+// TestNewInstVersion_UniqueAcrossRapidSuccessiveAllocations 验证连续快速分配
+//（含同毫秒）不撞值：issued 集合使唯一性成为确定性保证（design.md:70 随机后缀 +
+// issued 复检，非概率保证），任意单次运行 MUST 通过。
+func TestNewInstVersion_UniqueAcrossRapidSuccessiveAllocations(t *testing.T) {
+	r := New()
+	const n = 1000
+	seen := make(map[InstVersion]bool, n)
+	for i := 0; i < n; i++ {
+		v := r.NewInstVersion("t1")
+		if seen[v] {
+			t.Fatalf("duplicate instVersion %q within %d rapid allocations", v, n)
+		}
+		seen[v] = true
+	}
+}
+
+// TestNewInstVersion_TombstoneRetainsLastTokenAfterClearSim 验证 clear-sim（无 prevGen
+// 参数，直接再分配）后 tombstone 仍为最近一次分配的令牌（B4：清理后保留）。
+func TestNewInstVersion_TombstoneRetainsLastTokenAfterClearSim(t *testing.T) {
+	r := New()
+	r.NewInstVersion("t1")
+	// 模拟 clearRuntime：runtime 移除。P1.4.9 后分配不依赖 prev 状态，直接再分配。
+	v2 := r.NewInstVersion("t1")
+	if v2 == "" {
+		t.Fatal("allocated token must be non-empty")
+	}
 	tomb, ok := r.Tombstone("t1")
-	if !ok || tomb != tok3 {
-		t.Errorf("Tombstone = %+v (ok=%v), want %+v", tomb, ok, tok3)
+	if !ok || tomb != v2 {
+		t.Fatalf("Tombstone = %q (ok=%v), want %q (last allocated)", tomb, ok, v2)
 	}
 }
 
-// TestNewRuntimeToken_IndependentTasks 验证不同 taskID 的代际独立。
-func TestNewRuntimeToken_IndependentTasks(t *testing.T) {
+// TestNewInstVersion_IndependentTasks 验证不同 taskID 的令牌互不影响（tombstone 按
+// taskID 独立）。
+func TestNewInstVersion_IndependentTasks(t *testing.T) {
 	r := New()
-	tokA1 := r.NewRuntimeToken("a", 0, "a1")
-	tokB1 := r.NewRuntimeToken("b", 0, "b1")
-	if tokA1.Generation != 1 || tokB1.Generation != 1 {
-		t.Fatalf("independent tasks should each start at gen=1, got a=%d b=%d", tokA1.Generation, tokB1.Generation)
+	vA := r.NewInstVersion("a")
+	vB := r.NewInstVersion("b")
+	if vA == vB {
+		t.Fatalf("independent tasks allocated identical tokens %q", vA)
 	}
-	// t1 推进不影响 b。
-	tokA2 := r.NewRuntimeToken("a", 1, "a2")
-	if tokA2.Generation != 2 {
-		t.Fatalf("a gen2 = %d, want 2", tokA2.Generation)
+	vA2 := r.NewInstVersion("a")
+	if vA2 == vA {
+		t.Fatalf("re-allocation for task a must differ, both %q", vA)
 	}
-	if tomb, ok := r.Tombstone("b"); !ok || tomb != tokB1 {
-		t.Errorf("b tombstone = %+v (ok=%v), want %+v (independent)", tomb, ok, tokB1)
+	if tomb, ok := r.Tombstone("b"); !ok || tomb != vB {
+		t.Errorf("b tombstone = %q (ok=%v), want %q (independent)", tomb, ok, vB)
 	}
 }
 
-// TestNewRuntimeToken_Concurrent 验证并发分配无 data race 且代际单调。
-func TestNewRuntimeToken_Concurrent(t *testing.T) {
+// TestNewInstVersion_ConcurrentAllUnique 验证并发分配全部唯一且 genMu 并发安全
+//（issued 集合确定性保证，非概率保证）。
+func TestNewInstVersion_ConcurrentAllUnique(t *testing.T) {
 	r := New()
-	const goroutines = 20
+	const goroutines = 50
+	const perG = 20
+	var mu sync.Mutex
+	seen := make(map[InstVersion]bool, goroutines*perG)
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
-	// 每个 goroutine 为独立 taskID 分配一次，验证 genMu 并发安全。
-	for i := 0; i < goroutines; i++ {
-		go func(i int) {
-			defer wg.Done()
-			taskID := "t" + itoa(i)
-			_ = r.NewRuntimeToken(taskID, 0, "inst")
-		}(i)
-	}
-	wg.Wait()
-	// 同一 taskID 并发分配（串行化后单调递增）。
-	wg.Add(goroutines)
-	var maxGen int
-	var mu sync.Mutex
 	for i := 0; i < goroutines; i++ {
 		go func() {
 			defer wg.Done()
-			// 每次用「上次的 gen」作为 prevGen 模拟续递增；并发下 genMu 串行化。
-			// 由于并发 prevGen 可能落后，Registry 仍保证单调（取 max(prev+1, last+1)）。
-			tok := r.NewRuntimeToken("shared", 0, "inst")
-			mu.Lock()
-			if tok.Generation > maxGen {
-				maxGen = tok.Generation
+			for j := 0; j < perG; j++ {
+				v := r.NewInstVersion("shared")
+				mu.Lock()
+				if seen[v] {
+					t.Errorf("duplicate instVersion %q in concurrent allocation", v)
+				}
+				seen[v] = true
+				mu.Unlock()
 			}
-			mu.Unlock()
 		}()
 	}
 	wg.Wait()
-	if maxGen < 1 {
-		t.Fatalf("concurrent allocation produced no tokens")
+	if len(seen) != goroutines*perG {
+		t.Fatalf("allocated %d unique tokens, want %d", len(seen), goroutines*perG)
 	}
-	// tombstone 令牌的 generation == 最大已分配 gen。
-	if tomb, ok := r.Tombstone("shared"); !ok || tomb.Generation != maxGen {
-		t.Errorf("shared tombstone = %+v (ok=%v), want gen %d (max allocated)", tomb, ok, maxGen)
+	// tombstone 为最后一次分配的令牌之一（等值域内任一即可：必在集合中）。
+	tomb, ok := r.Tombstone("shared")
+	if !ok || !seen[tomb] {
+		t.Fatalf("tombstone %q (ok=%v) must be one of allocated tokens", tomb, ok)
 	}
 }
 
@@ -100,15 +119,40 @@ func TestTombstone_NoTask(t *testing.T) {
 	}
 }
 
-// itoa 轻量整数转字符串（避免引入 strconv 使测试依赖最小）。
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
+// TestNewInstVersion_RejectsCandidateEqualToHistoricalToken 定向复现候选碰撞场景
+//（oracle BLOCKED 根因）：分配 A → 分配 B（tombstone 推进到 B）→ 第三次分配的候选
+// 先返回历史令牌 A。旧实现仅对照当前 tombstone 会误接受 A；issued 集合 MUST 拒绝 A
+// 并重生成取新值 C。经 genValueFn 接缝脚本化候选序列，断言 NewInstVersion 的对外
+// 行为（返回值与 tombstone），不测内部状态。
+func TestNewInstVersion_RejectsCandidateEqualToHistoricalToken(t *testing.T) {
+	r := New()
+	const (
+		tokA = InstVersion("01724000000123-aaaaaa")
+		tokB = InstVersion("01724000000123-bbbbbb")
+		tokC = InstVersion("01724000000123-cccccc")
+	)
+	// 扁平候选流：第 1 次分配取 A；第 2 次取 B；第 3 次先撞历史 A（须被拒绝）再取 C。
+	queue := []InstVersion{tokA, tokB, tokA, tokC}
+	r.genValueFn = func() InstVersion {
+		v := queue[0]
+		queue = queue[1:]
+		return v
 	}
-	var b []byte
-	for i > 0 {
-		b = append([]byte{byte('0' + i%10)}, b...)
-		i /= 10
+
+	if v := r.NewInstVersion("t1"); v != tokA {
+		t.Fatalf("first allocation = %q, want %q", v, tokA)
 	}
-	return string(b)
+	if v := r.NewInstVersion("t1"); v != tokB {
+		t.Fatalf("second allocation = %q, want %q (tombstone moved)", v, tokB)
+	}
+	v3 := r.NewInstVersion("t1")
+	if v3 != tokC {
+		t.Fatalf("third allocation = %q, want %q (candidate equal to historical token A MUST be rejected and regenerated)", v3, tokC)
+	}
+	if tomb, ok := r.Tombstone("t1"); !ok || tomb != tokC {
+		t.Fatalf("Tombstone = %q (ok=%v), want %q", tomb, ok, tokC)
+	}
+	if len(queue) != 0 {
+		t.Fatalf("scripted candidates not fully consumed, leftover %v (regen loop consumed an unexpected candidate)", queue)
+	}
 }

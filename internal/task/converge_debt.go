@@ -38,7 +38,7 @@ func (m *Manager) requestResync() {
 
 // onConvergeLockTimeout 是收敛等锁超时分支（convergeToSuspendedChecked 等锁失败时调用）。
 // design.md D0:151：本分支 MUST NOT cleanup / CAS，仅登记债务后返回。
-func (m *Manager) onConvergeLockTimeout(taskID, reason string, tok runtime.RuntimeToken) {
+func (m *Manager) onConvergeLockTimeout(taskID, reason string, tok runtime.InstVersion) {
 	m.registerDebtIfCurrent(taskID, tok, reason)
 }
 
@@ -52,11 +52,11 @@ func (m *Manager) onConvergeLockTimeout(taskID, reason string, tok runtime.Runti
 // runtime 快照指针，不得丢弃存活校验。登记成功才发布 resync.requested（避免
 // publish-then-reject；NoopPublisher 阶段调用位就绪无实际发布）。本方法不持任务锁
 //（等锁已失败）。
-func (m *Manager) registerDebtIfCurrent(taskID string, trigger runtime.RuntimeToken, reason string) {
-	var current *runtime.RuntimeToken
+func (m *Manager) registerDebtIfCurrent(taskID string, trigger runtime.InstVersion, reason string) {
+	var current *runtime.InstVersion
 	if rt := m.getRuntime(taskID); rt != nil {
-		t := runtime.RuntimeToken{InstanceID: rt.instanceID, Generation: rt.generation}
-		current = &t
+		cur := rt.instVersion
+		current = &cur
 	}
 	var phase runtime.DebtPhase
 	switch {
@@ -65,14 +65,14 @@ func (m *Manager) registerDebtIfCurrent(taskID string, trigger runtime.RuntimeTo
 	case current == nil && m.tombstoneIs(taskID, trigger):
 		phase = runtime.DebtPhasePostCleanup
 	default:
-		log.Printf("convergeToSuspended: lock wait timed out (task %s gen=%d inst=%s): stale trigger token, no debt registered; reason=%s",
-			taskID, trigger.Generation, trigger.InstanceID, reason)
+		log.Printf("convergeToSuspended: lock wait timed out (task %s instVersion=%s): stale trigger token, no debt registered; reason=%s",
+			taskID, trigger, reason)
 		return
 	}
 	registered, actual := m.runtimeRegistry.RegisterIfCurrent(taskID, trigger, phase, current)
 	if !registered {
-		log.Printf("converge debt: register skipped (task %s gen=%d inst=%s phase=%d): stale trigger; existing debt phase=%d",
-			taskID, trigger.Generation, trigger.InstanceID, phase, actual)
+		log.Printf("converge debt: register skipped (task %s instVersion=%s phase=%d): stale trigger; existing debt phase=%d",
+			taskID, trigger, phase, actual)
 		return
 	}
 	m.requestResync()
@@ -81,16 +81,16 @@ func (m *Manager) registerDebtIfCurrent(taskID string, trigger runtime.RuntimeTo
 // registerConvergeDebt 登记收敛债务（CAS 矩阵 ②a/②c/③a/③c 与推进缺失重登记路径）。
 // 调用时机均为 cleanup 之后：runtime 已清，currentRuntime=nil，过期判定由 tombstone
 // 匹配承载（design.md D2 postCleanup 语义）。
-func (m *Manager) registerConvergeDebt(taskID string, tok runtime.RuntimeToken, phase runtime.DebtPhase) {
+func (m *Manager) registerConvergeDebt(taskID string, tok runtime.InstVersion, phase runtime.DebtPhase) {
 	registered, actual := m.runtimeRegistry.RegisterIfCurrent(taskID, tok, phase, nil)
 	if !registered {
-		log.Printf("converge debt: register skipped (task %s gen=%d inst=%s phase=%d): stale trigger; existing debt phase=%d",
-			taskID, tok.Generation, tok.InstanceID, phase, actual)
+		log.Printf("converge debt: register skipped (task %s instVersion=%s phase=%d): stale trigger; existing debt phase=%d",
+			taskID, tok, phase, actual)
 	}
 }
 
 // tombstoneIs 判断任务 tombstone 是否等于给定令牌（无 tombstone 视为不等）。
-func (m *Manager) tombstoneIs(taskID string, tok runtime.RuntimeToken) bool {
+func (m *Manager) tombstoneIs(taskID string, tok runtime.InstVersion) bool {
 	tomb, ok := m.runtimeRegistry.Tombstone(taskID)
 	return ok && tomb == tok
 }
@@ -106,7 +106,7 @@ func (m *Manager) deleteConvergeDebt(taskID string) {
 // convergeCommitCAS 持锁收敛的提交段：清 env 快照 + last_error 聚合 + active→suspended CAS
 // + D2 嵌套决策表。converge 持锁主路径与债务 worker 共用；调用方持任务锁且清理已完成
 //（或 postCleanup 无需清理）。
-func (m *Manager) convergeCommitCAS(ctx context.Context, taskID, reason string, tok runtime.RuntimeToken, cleanupErr error) {
+func (m *Manager) convergeCommitCAS(ctx context.Context, taskID, reason string, tok runtime.InstVersion, cleanupErr error) {
 	_, envErr := m.writeEnvSnapshot(ctx, taskID, sql.NullString{})
 	le := sql.NullString{String: reason, Valid: true}
 	if cleanupErr != nil {
@@ -132,7 +132,7 @@ func (m *Manager) convergeCommitCAS(ctx context.Context, taskID, reason string, 
 //   ③ !Matched（并发已转走，无错误）→ 重读分叉：③a 仍 active → 登记 postCleanup；
 //      ③b 非 active/缺失 → 不发布，compare-and-delete；③c 读错误 → 同 ②c（登记
 //      postCleanup + resync）。
-func (m *Manager) applyConvergeCASMatrix(taskID string, tok runtime.RuntimeToken, committed bool, statusErr error) {
+func (m *Manager) applyConvergeCASMatrix(taskID string, tok runtime.InstVersion, committed bool, statusErr error) {
 	switch {
 	case statusErr == nil && committed:
 		// ① 任务已离开 active。
@@ -236,7 +236,7 @@ func (m *Manager) processConvergeDebtLocked(ctx context.Context, entry runtime.D
 	case runtime.DebtPhasePreCleanup:
 		if rt := m.getRuntime(entry.TaskID); rt != nil {
 			// ③ 当前 runtime 令牌 == 债务令牌（runtime 允许非空：worker 负责清理）。
-			if rt.instanceID != entry.Token.InstanceID || rt.generation != entry.Token.Generation {
+			if rt.instVersion != entry.Token {
 				m.runtimeRegistry.CompareAndDelete(entry.TaskID, entry.Token)
 				return
 			}
@@ -269,7 +269,7 @@ func (m *Manager) advanceDebtAndRunCAS(ctx context.Context, entry runtime.DebtEn
 	ok, _, tokenMoved := m.runtimeRegistry.AdvanceToPostCleanup(entry.TaskID, entry.Token)
 	if !ok {
 		if tokenMoved {
-			log.Printf("converge debt: advance skipped (task %s): token moved to newer generation", entry.TaskID)
+			log.Printf("converge debt: advance skipped (task %s): token moved to newer instance", entry.TaskID)
 			return
 		}
 		m.registerConvergeDebt(entry.TaskID, entry.Token, runtime.DebtPhasePostCleanup)

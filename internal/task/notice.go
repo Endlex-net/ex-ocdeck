@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 
+	"ocdeck/internal/application/runtime"
 	"ocdeck/internal/process"
 )
 
@@ -57,43 +58,36 @@ func dispositionToNotice(d process.CleanupDisposition) (reason string, retryable
 	}
 }
 
-// newRuntime 构造任务运行时索引，generation 单调递增（不得运行时清除后归零，B4）。
-// instanceID 为本代唯一标识，供回调三元组校验（B4）。
+// newRuntime 构造任务运行时索引，instVersion 为本实例唯一令牌（design.md:70，B4）。
 //
-// P1.4.3：generation/tombstone 责任已迁移至 application/runtime.Registry（单一锁域）。
-// Manager 不再持有 genMu/lastGen，全部经 Registry.NewRuntimeToken 分配，tombstone 语义
-// 保持不变（清理后从 lastGen+1 续递增，design.md D0:204-208 先例）。
+// P1.4.3 起令牌责任迁移至 application/runtime.Registry（单一锁域）；P1.4.9 收敛为单字符串
+// instVersion：Registry.NewInstVersion 生成（ms 时间戳 + 随机后缀，构造上同任务不撞），
+// tombstone 语义保持不变（分配即更新、清理后保留）。回调校验用等值比对，
+// MUST NOT 数值比大小。
 func (m *Manager) newRuntime(taskID string) *taskRuntime {
-	prev := m.getRuntime(taskID)
-	prevGen := 0
-	if prev != nil {
-		prevGen = prev.generation
-	}
-	token := m.runtimeRegistry.NewRuntimeToken(taskID, prevGen, newTaskID())
 	return &taskRuntime{
 		taskID:       taskID,
-		generation:   token.Generation,
-		instanceID:   token.InstanceID,
+		instVersion:  m.runtimeRegistry.NewInstVersion(taskID),
 		groups:       map[string]*runtimeGroup{},
 		watchCancels: map[string]func(){},
 		watchDones:   map[string]<-chan struct{}{},
 	}
 }
 
-// matchesRegistry 校验回调三元组 (generation, role/sessionName, InstanceID) 是否仍匹配
-// 当前运行时注册表的对应 group（design.md §2 回调隔离，B4）。
-// 不匹配即忽略回调（旧代回调不得清理新代）。
-func (rt *taskRuntime) matchesRegistry(gen int, key, instanceID string) bool {
+// matchesRegistry 校验回调身份 (instVersion, sessionName) 是否仍匹配当前运行时注册表的
+// 对应 group（design.md §2 回调隔离，B4；P1.4.9 双字段收敛为单令牌等值比对）。
+// 不匹配即忽略回调（旧实例回调不得清理新实例）。
+func (rt *taskRuntime) matchesRegistry(tok runtime.InstVersion, key string) bool {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	if rt.generation != gen {
+	if rt.instVersion != tok {
 		return false
 	}
 	g, ok := rt.groups[key]
 	if !ok || g == nil {
 		return false
 	}
-	return g.Generation == gen && g.InstanceID == instanceID
+	return g.InstVersion == tok
 }
 
 // parseNotices 解析 tasks.notice JSON 数组。

@@ -219,12 +219,12 @@ type Manager struct {
 	rtMu     sync.Mutex
 	runtimes map[string]*taskRuntime // taskID -> runtime
 
-	// runtimeRegistry 是 ServeRuntime 代际/tombstone 管理权威（design.md D0 step 3，
-	// P1.4.3 一次性迁移）。承载 generation/instanceID 分配与 lastGen tombstone 语义，
+	// runtimeRegistry 是 ServeRuntime instVersion/tombstone 管理权威（design.md D0 step 3，
+	// P1.4.3 一次性迁移；P1.4.9 单字符串令牌收敛）。承载 instVersion 分配与 tombstone 语义，
 	// 单一锁域（Registry.genMu），MUST NOT 与 Manager 旧字段双写——切换后 Manager 侧
-	// genMu/lastGen 已删除，全部经 Registry.NewRuntimeToken 分配。
-	// B4：即便 runtime 被 clearRuntime 移除，下次 newRuntime 经 Registry tombstone 续递增，
-	// 保证回调三元组校验的 generation 在进程生命周期内不回卷（沿用 lastGen 持久代先例）。
+	// genMu/lastGen 已删除，全部经 Registry.NewInstVersion 分配。
+	// B4：即便 runtime 被 clearRuntime 移除，tombstone 保留最近令牌，回调 fencing 按等值
+	// 判定（P1.4.9：唯一性取代原 generation 单调不回卷语义）。
 	runtimeRegistry *runtime.Registry
 
 	// lifeCtx 是 Manager 生命周期 context（design.md §4：SSE/退出监视挂 Manager 生命周期，
@@ -295,9 +295,10 @@ type keyedLock struct {
 
 // taskRuntime 维护单个活跃任务的运行时状态（design.md §2 RuntimeGroup）。
 type taskRuntime struct {
-	taskID       string
-	generation   int                        // 激活代，回调校验用
-	instanceID   string                     // 本代实例标识，回调三元组校验用（B4）
+	taskID string
+	// instVersion 为本实例令牌（design.md:70，P1.4.9 单字符串收敛原
+	// generation+instanceID 双字段），回调校验用（B4 fencing 等值判定）。
+	instVersion  runtime.InstVersion
 	groups       map[string]*runtimeGroup   // sessionName -> group
 	sseCancel    context.CancelFunc         // SSE 订阅取消（阻塞式：cancel 并 join SSE goroutine）
 	sseDone      chan struct{}              // SSE goroutine 退出信号（stopAll 时 join）
@@ -312,17 +313,15 @@ type taskRuntime struct {
 type runtimeGroup struct {
 	Role        string // serve / tui / shell
 	SessionName string
-	Generation  int
-	InstanceID  string
+	InstVersion runtime.InstVersion
 }
 
-// registerGroup 写入注册表（B4：groups 真实写入，回调三元组校验依据）。
+// registerGroup 写入注册表（B4：groups 真实写入，回调校验依据）。
 func (rt *taskRuntime) registerGroup(role, sessionName string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	rt.groups[sessionName] = &runtimeGroup{
-		Role: role, SessionName: sessionName,
-		Generation: rt.generation, InstanceID: rt.instanceID,
+		Role: role, SessionName: sessionName, InstVersion: rt.instVersion,
 	}
 }
 

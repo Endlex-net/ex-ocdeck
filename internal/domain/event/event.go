@@ -50,10 +50,10 @@ const (
 	// Payload={inserted, touched, deleted, session_ids}。
 	TypeSessionsAligned = "sessions.aligned"
 	// TypeServeRuntimeAttentionChanged 外部可见注意力快照发生变化。
-	// RID=ServeRuntime 主键 instanceID，Payload={task_id}。
+	// RID=ServeRuntime 主键 instVersion，Payload={task_id}。
 	TypeServeRuntimeAttentionChanged = "serve_runtime.attention_changed"
 	// TypeServeRuntimeRunStatusChanged ServeRuntime 运行状态或可用性发生变化。
-	// RID=ServeRuntime 主键 instanceID，Payload={task_id, from, to, available}。
+	// RID=ServeRuntime 主键 instVersion，Payload={task_id, from, to, available}。
 	TypeServeRuntimeRunStatusChanged = "serve_runtime.run_status_changed"
 	// TypeResyncRequested 控制事件：要求订阅方重拉其场景全量。RID 允许空，Payload={}。
 	TypeResyncRequested = "resync.requested"
@@ -197,21 +197,23 @@ func NewSessionsAligned(taskID string, inserted, touched, deleted int, sessionID
 }
 
 // NewServeRuntimeAttentionChanged 构造 serve_runtime.attention_changed 事件。
-func NewServeRuntimeAttentionChanged(instanceID, taskID string) Event {
+// RID 为 ServeRuntime 主键 instVersion（P1.4.9：单字符串实例令牌）。
+func NewServeRuntimeAttentionChanged(instVersion, taskID string) Event {
 	return Event{
 		Topic:   TopicServeRuntime,
 		Type:    TypeServeRuntimeAttentionChanged,
-		RID:     instanceID,
+		RID:     instVersion,
 		Payload: ServeRuntimeTaskPayload{TaskID: taskID},
 	}
 }
 
 // NewServeRuntimeRunStatusChanged 构造 serve_runtime.run_status_changed 事件。
-func NewServeRuntimeRunStatusChanged(instanceID, taskID, from, to string, available bool) Event {
+// RID 为 ServeRuntime 主键 instVersion（P1.4.9：单字符串实例令牌）。
+func NewServeRuntimeRunStatusChanged(instVersion, taskID, from, to string, available bool) Event {
 	return Event{
 		Topic: TopicServeRuntime,
 		Type:  TypeServeRuntimeRunStatusChanged,
-		RID:  instanceID,
+		RID:   instVersion,
 		Payload: ServeRuntimeRunStatusChangedPayload{
 			TaskID:    taskID,
 			From:      from,
