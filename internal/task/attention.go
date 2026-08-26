@@ -8,31 +8,25 @@ import (
 	"sync/atomic"
 	"time"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/opencode"
 )
 
-// --- 三层类型模型：task 层（含 Since，本地首次观察时间） ---
+// --- 三层类型模型（含 Since，本地首次观察时间） ---
+// Attention/PendingPermission/PendingQuestion 定义已迁至 internal/application（dto.go，
+// sse-active-sessions P1.9a）；此处保留别名，本包及既有引用零改动。
 
 // PendingPermission task 层 pending 权限请求。Since 为本地首次观察 Unix 秒
 // （SSE asked 到达时刻；REST 对账同 ID 保留原 since，新 ID 取对账时刻，design.md D6）。
-type PendingPermission struct {
-	opencode.PermissionRequest
-	Since int64
-}
+type PendingPermission = application.PendingPermission
 
 // PendingQuestion task 层 pending 问题请求。Since 同 PendingPermission。
-type PendingQuestion struct {
-	opencode.QuestionRequest
-	Since int64
-}
+type PendingQuestion = application.PendingQuestion
 
 // Attention 是任务注意力信号的只读快照（design.md D6 API 透出）。
 // 拷贝语义：attentionSnapshot 返回深拷贝，调用方可安全持有。
 // 无 pending 时为非 nil 空切片（空数组非 null，spec）。
-type Attention struct {
-	Permissions []PendingPermission
-	Questions   []PendingQuestion
-}
+type Attention = application.Attention
 
 // --- 能力状态机（per 任务 × per 类型，独立） ---
 
@@ -886,19 +880,8 @@ func (m *Manager) taskOcClient(ctx context.Context, taskID string) (OCClient, st
 // --- ProjectTaskSummary（GET /projects tasks 摘要，design.md D4 11 字段） ---
 
 // ProjectTaskSummary 项目任务摘要（design.md D4：10 存储字段 + attention_count）。
-type ProjectTaskSummary struct {
-	TaskID         string
-	Name           string
-	ProjectID      string
-	Status         string
-	InitStatus     string
-	Branch         string
-	WorktreePath   string
-	LastError      string
-	Notice         string
-	UpdatedAt      int64
-	AttentionCount int
-}
+// 定义已迁至 internal/application（dto.go）；此处保留别名。
+type ProjectTaskSummary = application.ProjectTaskSummary
 
 // ListProjectTaskSummaries 聚合全部任务摘要。纯读聚合；store 失败返回错误（API 层 500 不水合）。
 func (m *Manager) ListProjectTaskSummaries(ctx context.Context) ([]ProjectTaskSummary, error) {

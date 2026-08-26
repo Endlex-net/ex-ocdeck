@@ -8,27 +8,27 @@ import (
 	"sync"
 	"time"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/pty"
-	"ocdeck/internal/task"
 )
 
 // TaskBackend 是 api 层调用的 TaskManager 能力（design.md §18 task 行 + §21 路由）。
-// api handler 只做 DTO/HTTP 语义，不做编排。返回 task.TaskRow + error（api 做 DTO 转换）。
+// api handler 只做 DTO/HTTP 语义，不做编排。返回 application.TaskRow + error（api 做 DTO 转换）。
 type TaskBackend interface {
-	Create(ctx context.Context, projectID, taskName, baseRef string) (task.TaskRow, error)
+	Create(ctx context.Context, projectID, taskName, baseRef string) (application.TaskRow, error)
 	Activate(ctx context.Context, taskID string) error
 	Suspend(ctx context.Context, taskID string) error
 	Archive(ctx context.Context, taskID string) error
 	Restore(ctx context.Context, taskID string) error
-	Delete(ctx context.Context, taskID string, mode task.DeleteMode, confirmDirty bool) error
+	Delete(ctx context.Context, taskID string, mode application.DeleteMode, confirmDirty bool) error
 	Retry(ctx context.Context, taskID string, confirmDirty bool) error
-	ReopenAttach(ctx context.Context, taskID string) (task.TerminalID, error)
-	CreateShell(ctx context.Context, taskID string) (task.TerminalID, error)
-	CloseShell(ctx context.Context, terminalID task.TerminalID) error
-	Get(ctx context.Context, taskID string) (task.TaskRow, error)
-	List(ctx context.Context, projectID string) ([]task.TaskRow, error)
-	ListTaskSessions(ctx context.Context, taskID string) ([]task.SessionRow, error)
-	ListShells(taskID string) ([]task.TerminalID, error)
+	ReopenAttach(ctx context.Context, taskID string) (application.TerminalID, error)
+	CreateShell(ctx context.Context, taskID string) (application.TerminalID, error)
+	CloseShell(ctx context.Context, terminalID application.TerminalID) error
+	Get(ctx context.Context, taskID string) (application.TaskRow, error)
+	List(ctx context.Context, projectID string) ([]application.TaskRow, error)
+	ListTaskSessions(ctx context.Context, taskID string) ([]application.SessionRow, error)
+	ListShells(taskID string) ([]application.TerminalID, error)
 	ValidateShellTerminal(tid string) error
 	AttachPty(sessionName string, cols, rows int) (*pty.Pty, error)
 	// AgentStatus 返回任务 agent 运行态（idle/busy/retry/空串，design.md 2.8）。
@@ -44,28 +44,28 @@ type TaskBackend interface {
 	// ListActiveTaskOverview 聚合全部 active 任务的跨项目概览
 	//（cross-project-active-sessions：GET /api/v1/sessions/active 读模型来源）。
 	// 返回不含 agentStatus 的投影行；agentStatus 由 handler 并发 hydration 填充。
-	ListActiveTaskOverview(ctx context.Context) ([]task.ActiveTaskOverviewRow, error)
+	ListActiveTaskOverview(ctx context.Context) ([]application.ActiveTaskOverviewRow, error)
 	// Attention 返回任务注意力信号快照（design.md D6）。非 active/无 runtime 返回空快照。
 	// 纯读聚合，不影响任务状态机。API 层据此透出 attention 字段（空数组非 null）。
-	Attention(taskID string) (task.Attention, bool)
+	Attention(taskID string) (application.Attention, bool)
 	// ListProjectTaskSummaries 聚合全部任务摘要（design.md D4 GET /projects tasks 摘要）。
 	// 纯读聚合；store 失败返回错误（API 层 500 不水合）。agentStatus hydration 在 API 层。
-	ListProjectTaskSummaries(ctx context.Context) ([]task.ProjectTaskSummary, error)
+	ListProjectTaskSummaries(ctx context.Context) ([]application.ProjectTaskSummary, error)
 
 	// Git 状态/diff/commit/push 经 TaskManager GitOps（design.md §9/§21）。
 	// 持任务锁与 Suspend/Delete 等生命周期操作互斥，避免 api 绕过 TaskManager 致
-	// worktree 在 git 操作中被移除（P6 并发竞争修复）。DTO 直接复用 task 包类型，
-	// 前端 JSON 契约不变（task.GitStatusDTO/GitDiffDTO 字段与既有响应一致）。
-	// 错误语义经 *task.OpError 携带：not_found/conflict/invalid_input/git_error，
+	// worktree 在 git 操作中被移除（P6 并发竞争修复）。DTO 直接复用 application 包类型，
+	// 前端 JSON 契约不变（application.GitStatusDTO/GitDiffDTO 字段与既有响应一致）。
+	// 错误语义经 *application.OpError 携带：not_found/conflict/invalid_input/git_error，
 	// 由 mapTaskErr 统一映射 HTTP code/msg。
-	GitStatus(ctx context.Context, taskID string) (task.GitStatusDTO, error)
-	GitDiff(ctx context.Context, taskID, ref, path string, untracked bool) (task.GitDiffDTO, error)
+	GitStatus(ctx context.Context, taskID string) (application.GitStatusDTO, error)
+	GitDiff(ctx context.Context, taskID, ref, path string, untracked bool) (application.GitDiffDTO, error)
 	GitCommit(ctx context.Context, taskID, message string, paths []string) error
 	GitPush(ctx context.Context, taskID string) error
 	// RerunInit 手动重跑 init 脚本（design.md §8，tasks 3.6）。
 	// 返回 claim 后的任务行（init_status=running），供 API 层 200+DTO。
-	// task.OpError 映射：invalid_state → 422、conflict → 409。
-	RerunInit(ctx context.Context, taskID string) (task.TaskRow, error)
+	// application.OpError 映射：invalid_state → 422、conflict → 409。
+	RerunInit(ctx context.Context, taskID string) (application.TaskRow, error)
 	// ReadInitLog 读取 init 日志（design.md §7.4/§8）：inherit 警告节 + init.log 拼接，tail ≤64KB。
 	// 任务不存在 → not_found；无日志文件返回空串非错误。
 	ReadInitLog(ctx context.Context, taskID string) (string, error)
@@ -275,9 +275,9 @@ func (s *Server) handleReopenAttach(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
-	mode := task.DeleteNormal
+	mode := application.DeleteNormal
 	if m := r.URL.Query().Get("mode"); m == "force" {
-		mode = task.DeleteForce
+		mode = application.DeleteForce
 	} else if m != "" && m != "normal" {
 		writeApiError(w, NewError(CodeInvalidInput, "mode must be normal or force"))
 		return
@@ -307,7 +307,7 @@ func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
 
 // handleRerunInit POST /api/v1/tasks/{id}/rerun-init（design.md §8）。
 // 独立 handler（非 handleTaskAction——既有 helper 返回 204）；成功 200 + 任务 DTO。
-// task.OpError 映射走 mapTaskErr（invalid_state → 422、conflict → 409）。
+// application.OpError 映射走 mapTaskErr（invalid_state → 422、conflict → 409）。
 //
 // fail-closed（D6）：RerunInit 会在 claim/执行脚本产生副作用；project_kind MUST 在副作用前
 // 取得。预取（Get + requireProjectKind）失败 MUST NOT 调用 RerunInit，直接返回错误
@@ -389,7 +389,7 @@ func (s *Server) handleCreateTerminal(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCloseTerminal(w http.ResponseWriter, r *http.Request) {
-	tid := task.TerminalID(r.PathValue("tid"))
+	tid := application.TerminalID(r.PathValue("tid"))
 	if err := s.tasks.CloseShell(r.Context(), tid); err != nil {
 		writeApiError(w, mapTaskErr(err))
 		return
@@ -450,8 +450,8 @@ type questionItemDTO struct {
 	Question string `json:"question"`
 }
 
-// toAttentionDTO 将 task.Attention 快照转为 DTO（空集合为非 nil 空数组，spec）。
-func toAttentionDTO(att task.Attention) attentionDTO {
+// toAttentionDTO 将 application.Attention 快照转为 DTO（空集合为非 nil 空数组，spec）。
+func toAttentionDTO(att application.Attention) attentionDTO {
 	perms := make([]permissionDTO, 0, len(att.Permissions))
 	for _, p := range att.Permissions {
 		perms = append(perms, permissionDTO{
@@ -472,7 +472,7 @@ func toAttentionDTO(att task.Attention) attentionDTO {
 }
 
 // activeSessionDTO 跨项目 active 任务概览 DTO（cross-project-active-sessions D3/D4）。
-// 读模型（task.ActiveTaskOverviewRow）不含 agentStatus；handler hydration worker 并发填充。
+// 读模型（application.ActiveTaskOverviewRow）不含 agentStatus；handler hydration worker 并发填充。
 // AgentStatus 失败/超时为空串，经 omitempty 省略（idle/busy/retry 三态）。
 // Attention 纯读快照（design.md D6），空数组非 null。
 type activeSessionDTO struct {
@@ -487,7 +487,7 @@ type activeSessionDTO struct {
 	Attention    attentionDTO `json:"attention"`
 }
 
-func toTaskDTO(t task.TaskRow, projectKind string) taskRowDTO {
+func toTaskDTO(t application.TaskRow, projectKind string) taskRowDTO {
 	dto := taskRowDTO{
 		ID: t.ID, ProjectID: t.ProjectID, Name: t.Name, Branch: t.Branch, Status: t.Status,
 		WorktreePath: t.WorktreePath, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
@@ -513,7 +513,7 @@ func toTaskDTO(t task.TaskRow, projectKind string) taskRowDTO {
 	return dto
 }
 
-func toSessionDTOs(rows []task.SessionRow) []sessionRowDTO {
+func toSessionDTOs(rows []application.SessionRow) []sessionRowDTO {
 	out := make([]sessionRowDTO, 0, len(rows))
 	for _, s := range rows {
 		out = append(out, sessionRowDTO{SessionID: s.SessionID, LastSeenAt: s.LastSeenAt})
@@ -566,9 +566,9 @@ func (s *Server) handleListActiveSessions(w http.ResponseWriter, r *http.Request
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-// mapTaskErr 将 task.OpError 映射为 *ApiError（design.md §21）。
+// mapTaskErr 将 application.OpError 映射为 *ApiError（design.md §21）。
 func mapTaskErr(err error) *ApiError {
-	code := task.OpErrorCode(err)
+	code := application.OpErrorCode(err)
 	if code == "" {
 		return NewError(CodeInternal, "internal error")
 	}

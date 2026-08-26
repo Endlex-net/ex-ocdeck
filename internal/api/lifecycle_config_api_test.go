@@ -9,23 +9,23 @@ import (
 	"strings"
 	"testing"
 
-	"ocdeck/internal/task"
+	"ocdeck/internal/application"
 )
 
 // lifecycleTaskBackend 为 lifecycle-config / rerun-init / logs API 测试提供可控 TaskBackend。
 // 嵌入 fakeTaskBackend 复用其余 noop 方法，仅覆盖本任务相关方法。
 type lifecycleTaskBackend struct {
 	*fakeTaskBackend
-	tasks        map[string]task.TaskRow
-	rerunFn      func(ctx context.Context, taskID string) (task.TaskRow, error)
+	tasks        map[string]application.TaskRow
+	rerunFn      func(ctx context.Context, taskID string) (application.TaskRow, error)
 	readInitFn   func(ctx context.Context, taskID string) (string, error)
 	readPreDelFn func(ctx context.Context, taskID string) (string, error)
 }
 
-func newLifecycleTaskBackend(rows ...task.TaskRow) *lifecycleTaskBackend {
+func newLifecycleTaskBackend(rows ...application.TaskRow) *lifecycleTaskBackend {
 	b := &lifecycleTaskBackend{
 		fakeTaskBackend: &fakeTaskBackend{},
-		tasks:           map[string]task.TaskRow{},
+		tasks:           map[string]application.TaskRow{},
 	}
 	for _, r := range rows {
 		b.tasks[r.ID] = r
@@ -33,19 +33,19 @@ func newLifecycleTaskBackend(rows ...task.TaskRow) *lifecycleTaskBackend {
 	return b
 }
 
-func (b *lifecycleTaskBackend) Get(ctx context.Context, taskID string) (task.TaskRow, error) {
+func (b *lifecycleTaskBackend) Get(ctx context.Context, taskID string) (application.TaskRow, error) {
 	r, ok := b.tasks[taskID]
 	if !ok {
-		return task.TaskRow{}, &task.OpError{Code: "not_found", Err: errNotFound(taskID)}
+		return application.TaskRow{}, &application.OpError{Code: "not_found", Err: errNotFound(taskID)}
 	}
 	return r, nil
 }
 
-func (b *lifecycleTaskBackend) RerunInit(ctx context.Context, taskID string) (task.TaskRow, error) {
+func (b *lifecycleTaskBackend) RerunInit(ctx context.Context, taskID string) (application.TaskRow, error) {
 	if b.rerunFn != nil {
 		return b.rerunFn(ctx, taskID)
 	}
-	return task.TaskRow{}, nil
+	return application.TaskRow{}, nil
 }
 
 func (b *lifecycleTaskBackend) ReadInitLog(ctx context.Context, taskID string) (string, error) {
@@ -257,9 +257,9 @@ func TestLifecycleAPI_RerunInit_InvalidState_422(t *testing.T) {
 	projs.projects["p1"] = storeProjectRow{ID: "p1", Name: "p", Path: "/x", DefaultBranch: "main", Kind: "repo"}
 	lc := newFakeLifecycleConfigStore()
 	// Get 必须返回带 ProjectID 的行，供 RerunInit 副作用前预取 kind（D6 fail-closed）。
-	tb := newLifecycleTaskBackend(task.TaskRow{ID: "t1", ProjectID: "p1", Status: task.StatusSuspended})
-	tb.rerunFn = func(ctx context.Context, taskID string) (task.TaskRow, error) {
-		return task.TaskRow{}, &task.OpError{Code: "invalid_state", Err: errNotFound(taskID)}
+	tb := newLifecycleTaskBackend(application.TaskRow{ID: "t1", ProjectID: "p1", Status: application.StatusSuspended})
+	tb.rerunFn = func(ctx context.Context, taskID string) (application.TaskRow, error) {
+		return application.TaskRow{}, &application.OpError{Code: "invalid_state", Err: errNotFound(taskID)}
 	}
 	s := newLifecycleAPIServer(t, projs, lc, tb)
 	ts := httptest.NewServer(s.mux)
@@ -286,9 +286,9 @@ func TestLifecycleAPI_RerunInit_Conflict_409(t *testing.T) {
 	projs := newFakeProjectStore()
 	projs.projects["p1"] = storeProjectRow{ID: "p1", Name: "p", Path: "/x", DefaultBranch: "main", Kind: "repo"}
 	lc := newFakeLifecycleConfigStore()
-	tb := newLifecycleTaskBackend(task.TaskRow{ID: "t1", ProjectID: "p1", Status: task.StatusSuspended})
-	tb.rerunFn = func(ctx context.Context, taskID string) (task.TaskRow, error) {
-		return task.TaskRow{}, &task.OpError{Code: "conflict", Err: errNotFound(taskID)}
+	tb := newLifecycleTaskBackend(application.TaskRow{ID: "t1", ProjectID: "p1", Status: application.StatusSuspended})
+	tb.rerunFn = func(ctx context.Context, taskID string) (application.TaskRow, error) {
+		return application.TaskRow{}, &application.OpError{Code: "conflict", Err: errNotFound(taskID)}
 	}
 	s := newLifecycleAPIServer(t, projs, lc, tb)
 	ts := httptest.NewServer(s.mux)
@@ -315,9 +315,9 @@ func TestLifecycleAPI_RerunInit_Success_200WithTaskDTO(t *testing.T) {
 	projs := newFakeProjectStore()
 	projs.projects["p1"] = storeProjectRow{ID: "p1", Name: "p", Path: "/x", DefaultBranch: "main", Kind: "repo"}
 	lc := newFakeLifecycleConfigStore()
-	tb := newLifecycleTaskBackend(task.TaskRow{ID: "t1", ProjectID: "p1", Status: task.StatusSuspended})
-	tb.rerunFn = func(ctx context.Context, taskID string) (task.TaskRow, error) {
-		return task.TaskRow{ID: "t1", ProjectID: "p1", Status: task.StatusSuspended, InitStatus: task.InitStatusRunning}, nil
+	tb := newLifecycleTaskBackend(application.TaskRow{ID: "t1", ProjectID: "p1", Status: application.StatusSuspended})
+	tb.rerunFn = func(ctx context.Context, taskID string) (application.TaskRow, error) {
+		return application.TaskRow{ID: "t1", ProjectID: "p1", Status: application.StatusSuspended, InitStatus: application.InitStatusRunning}, nil
 	}
 	s := newLifecycleAPIServer(t, projs, lc, tb)
 	ts := httptest.NewServer(s.mux)
@@ -338,7 +338,7 @@ func TestLifecycleAPI_RerunInit_Success_200WithTaskDTO(t *testing.T) {
 	if dto.ID != "t1" {
 		t.Errorf("dto.ID = %q, want t1", dto.ID)
 	}
-	if dto.InitStatus != task.InitStatusRunning {
+	if dto.InitStatus != application.InitStatusRunning {
 		t.Errorf("dto.InitStatus = %q, want running", dto.InitStatus)
 	}
 }
@@ -346,7 +346,7 @@ func TestLifecycleAPI_RerunInit_Success_200WithTaskDTO(t *testing.T) {
 func TestLifecycleAPI_InitLog_EmptyBody_200(t *testing.T) {
 	projs := newFakeProjectStore()
 	lc := newFakeLifecycleConfigStore()
-	tb := newLifecycleTaskBackend(task.TaskRow{ID: "t1", ProjectID: "p1", Status: task.StatusSuspended})
+	tb := newLifecycleTaskBackend(application.TaskRow{ID: "t1", ProjectID: "p1", Status: application.StatusSuspended})
 	s := newLifecycleAPIServer(t, projs, lc, tb)
 	ts := httptest.NewServer(s.mux)
 	defer ts.Close()
@@ -374,7 +374,7 @@ func TestLifecycleAPI_InitLog_EmptyBody_200(t *testing.T) {
 func TestLifecycleAPI_PreDeleteLog_EmptyBody_200(t *testing.T) {
 	projs := newFakeProjectStore()
 	lc := newFakeLifecycleConfigStore()
-	tb := newLifecycleTaskBackend(task.TaskRow{ID: "t1", ProjectID: "p1", Status: task.StatusSuspended})
+	tb := newLifecycleTaskBackend(application.TaskRow{ID: "t1", ProjectID: "p1", Status: application.StatusSuspended})
 	s := newLifecycleAPIServer(t, projs, lc, tb)
 	ts := httptest.NewServer(s.mux)
 	defer ts.Close()
@@ -404,7 +404,7 @@ func TestLifecycleAPI_InitLog_TaskNotFound_404(t *testing.T) {
 	lc := newFakeLifecycleConfigStore()
 	tb := newLifecycleTaskBackend() // 无任务
 	tb.readInitFn = func(ctx context.Context, taskID string) (string, error) {
-		return "", &task.OpError{Code: "not_found", Err: errNotFound(taskID)}
+		return "", &application.OpError{Code: "not_found", Err: errNotFound(taskID)}
 	}
 	s := newLifecycleAPIServer(t, projs, lc, tb)
 	ts := httptest.NewServer(s.mux)
@@ -432,7 +432,7 @@ func TestLifecycleAPI_PreDeleteLog_TaskNotFound_404(t *testing.T) {
 	lc := newFakeLifecycleConfigStore()
 	tb := newLifecycleTaskBackend()
 	tb.readPreDelFn = func(ctx context.Context, taskID string) (string, error) {
-		return "", &task.OpError{Code: "not_found", Err: errNotFound(taskID)}
+		return "", &application.OpError{Code: "not_found", Err: errNotFound(taskID)}
 	}
 	s := newLifecycleAPIServer(t, projs, lc, tb)
 	ts := httptest.NewServer(s.mux)
@@ -526,17 +526,17 @@ type projectKindTaskBackend struct {
 	projectID string
 }
 
-func (b *projectKindTaskBackend) Create(ctx context.Context, projectID, taskName, baseRef string) (task.TaskRow, error) {
-	return task.TaskRow{ID: "t-new", ProjectID: projectID, Name: taskName, Status: task.StatusSuspended}, nil
+func (b *projectKindTaskBackend) Create(ctx context.Context, projectID, taskName, baseRef string) (application.TaskRow, error) {
+	return application.TaskRow{ID: "t-new", ProjectID: projectID, Name: taskName, Status: application.StatusSuspended}, nil
 }
-func (b *projectKindTaskBackend) Get(ctx context.Context, taskID string) (task.TaskRow, error) {
-	return task.TaskRow{ID: taskID, ProjectID: b.projectID, Status: task.StatusSuspended}, nil
+func (b *projectKindTaskBackend) Get(ctx context.Context, taskID string) (application.TaskRow, error) {
+	return application.TaskRow{ID: taskID, ProjectID: b.projectID, Status: application.StatusSuspended}, nil
 }
-func (b *projectKindTaskBackend) List(ctx context.Context, projectID string) ([]task.TaskRow, error) {
-	return []task.TaskRow{{ID: "t1", ProjectID: projectID, Status: task.StatusSuspended}}, nil
+func (b *projectKindTaskBackend) List(ctx context.Context, projectID string) ([]application.TaskRow, error) {
+	return []application.TaskRow{{ID: "t1", ProjectID: projectID, Status: application.StatusSuspended}}, nil
 }
-func (b *projectKindTaskBackend) RerunInit(ctx context.Context, taskID string) (task.TaskRow, error) {
-	return task.TaskRow{ID: taskID, ProjectID: b.projectID, Status: task.StatusSuspended, InitStatus: task.InitStatusRunning}, nil
+func (b *projectKindTaskBackend) RerunInit(ctx context.Context, taskID string) (application.TaskRow, error) {
+	return application.TaskRow{ID: taskID, ProjectID: b.projectID, Status: application.StatusSuspended, InitStatus: application.InitStatusRunning}, nil
 }
 
 // TestTaskDTO_ProjectKind_FilledAtListCreateGetRerunInit 验证 task DTO 的 project_kind 字段
@@ -644,7 +644,7 @@ func TestTaskDTO_ProjectKind_FilledAtListCreateGetRerunInit(t *testing.T) {
 func TestTaskDTO_FailClosed_ProjectNotFound(t *testing.T) {
 	projs := newFakeProjectStore() // 无项目
 	lc := newFakeLifecycleConfigStore()
-	tb := newLifecycleTaskBackend(task.TaskRow{ID: "t1", ProjectID: "missing", Status: task.StatusSuspended})
+	tb := newLifecycleTaskBackend(application.TaskRow{ID: "t1", ProjectID: "missing", Status: application.StatusSuspended})
 	doReq := func(t *testing.T, method, url string) *http.Response {
 		t.Helper()
 		resp, err := http.DefaultClient.Do(authedReq(method, url, ""))
@@ -690,10 +690,10 @@ func TestTaskDTO_FailClosed_ProjectNotFound(t *testing.T) {
 	t.Run("RerunInit_404_no_side_effect", func(t *testing.T) {
 		// 项目不存在 → MUST NOT 调用 RerunInit（零 claim/脚本副作用）。
 		called := false
-		tb2 := newLifecycleTaskBackend(task.TaskRow{ID: "t1", ProjectID: "missing", Status: task.StatusSuspended})
-		tb2.rerunFn = func(ctx context.Context, taskID string) (task.TaskRow, error) {
+		tb2 := newLifecycleTaskBackend(application.TaskRow{ID: "t1", ProjectID: "missing", Status: application.StatusSuspended})
+		tb2.rerunFn = func(ctx context.Context, taskID string) (application.TaskRow, error) {
 			called = true
-			return task.TaskRow{}, nil
+			return application.TaskRow{}, nil
 		}
 		s := newLifecycleAPIServer(t, projs, lc, tb2)
 		ts := httptest.NewServer(s.mux)
@@ -718,7 +718,7 @@ func TestTaskDTO_FailClosed_UnknownPersistedKind_500(t *testing.T) {
 	projs := newFakeProjectStore()
 	projs.projects["pbad"] = storeProjectRow{ID: "pbad", Name: "p", Path: "/x", Kind: "weird"}
 	lc := newFakeLifecycleConfigStore()
-	tb := newLifecycleTaskBackend(task.TaskRow{ID: "t1", ProjectID: "pbad", Status: task.StatusSuspended})
+	tb := newLifecycleTaskBackend(application.TaskRow{ID: "t1", ProjectID: "pbad", Status: application.StatusSuspended})
 
 	t.Run("List_500", func(t *testing.T) {
 		s := newLifecycleAPIServer(t, projs, lc, tb)
@@ -748,10 +748,10 @@ func TestTaskDTO_FailClosed_UnknownPersistedKind_500(t *testing.T) {
 	})
 	t.Run("RerunInit_500_no_side_effect", func(t *testing.T) {
 		called := false
-		tb2 := newLifecycleTaskBackend(task.TaskRow{ID: "t1", ProjectID: "pbad", Status: task.StatusSuspended})
-		tb2.rerunFn = func(ctx context.Context, taskID string) (task.TaskRow, error) {
+		tb2 := newLifecycleTaskBackend(application.TaskRow{ID: "t1", ProjectID: "pbad", Status: application.StatusSuspended})
+		tb2.rerunFn = func(ctx context.Context, taskID string) (application.TaskRow, error) {
 			called = true
-			return task.TaskRow{}, nil
+			return application.TaskRow{}, nil
 		}
 		s := newLifecycleAPIServer(t, projs, lc, tb2)
 		ts := httptest.NewServer(s.mux)

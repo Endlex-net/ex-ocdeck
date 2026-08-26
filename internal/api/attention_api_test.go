@@ -9,33 +9,33 @@ import (
 	"testing"
 	"time"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/opencode"
-	"ocdeck/internal/task"
 )
 
 // attentionTaskBackend 注入 Attention 返回值，供 API 透出字段测试。
 type attentionTaskBackend struct {
 	*fakeTaskBackend
-	attention   task.Attention
+	attention   application.Attention
 	attentionOk bool
 }
 
-func (b *attentionTaskBackend) Attention(taskID string) (task.Attention, bool) {
+func (b *attentionTaskBackend) Attention(taskID string) (application.Attention, bool) {
 	return b.attention, b.attentionOk
 }
 
-func (b *attentionTaskBackend) Get(ctx context.Context, taskID string) (task.TaskRow, error) {
-	return task.TaskRow{ID: taskID, ProjectID: "p1", Status: task.StatusActive}, nil
+func (b *attentionTaskBackend) Get(ctx context.Context, taskID string) (application.TaskRow, error) {
+	return application.TaskRow{ID: taskID, ProjectID: "p1", Status: application.StatusActive}, nil
 }
 
 func TestGetTask_AttentionFields(t *testing.T) {
-	perm := task.PendingPermission{
+	perm := application.PendingPermission{
 		PermissionRequest: opencode.PermissionRequest{
 			ID: "perm1", SessionID: "s1", Permission: "bash", Patterns: []string{"rm", "ls"},
 		},
 		Since: 1700000000,
 	}
-	quest := task.PendingQuestion{
+	quest := application.PendingQuestion{
 		QuestionRequest: opencode.QuestionRequest{
 			ID: "quest1", SessionID: "s1",
 			Questions: []opencode.QuestionItem{{Header: "h1", Question: "what?"}},
@@ -44,7 +44,7 @@ func TestGetTask_AttentionFields(t *testing.T) {
 	}
 	tb := &attentionTaskBackend{
 		fakeTaskBackend: &fakeTaskBackend{},
-		attention:       task.Attention{Permissions: []task.PendingPermission{perm}, Questions: []task.PendingQuestion{quest}},
+		attention:       application.Attention{Permissions: []application.PendingPermission{perm}, Questions: []application.PendingQuestion{quest}},
 		attentionOk:     true,
 	}
 	projs := newFakeProjectStore()
@@ -88,7 +88,7 @@ func TestGetTask_AttentionFields(t *testing.T) {
 func TestGetTask_AttentionEmptyArrayNotNull(t *testing.T) {
 	tb := &attentionTaskBackend{
 		fakeTaskBackend: &fakeTaskBackend{},
-		attention:       task.Attention{Permissions: []task.PendingPermission{}, Questions: []task.PendingQuestion{}},
+		attention:       application.Attention{Permissions: []application.PendingPermission{}, Questions: []application.PendingQuestion{}},
 		attentionOk:     false,
 	}
 	projs := newFakeProjectStore()
@@ -126,7 +126,7 @@ func TestGetTask_AttentionEmptyArrayNotNull(t *testing.T) {
 
 // TestListActiveSessions_AttentionEmptyArrayNotNull 验证 sessions/active 元素 attention 空数组非 null。
 func TestListActiveSessions_AttentionEmptyArrayNotNull(t *testing.T) {
-	rows := []task.ActiveTaskOverviewRow{
+	rows := []application.ActiveTaskOverviewRow{
 		activeRow("t1", "p1", "projA", "taskA", "bA", "/wtA", 300),
 	}
 	tb := newActiveSessionsBackend(rows...)
@@ -152,18 +152,18 @@ func TestListActiveSessions_AttentionEmptyArrayNotNull(t *testing.T) {
 func TestListProjects_TaskSummaries(t *testing.T) {
 	tb := &projectSummaryBackend{
 		fakeTaskBackend: &fakeTaskBackend{},
-		summaries: []task.ProjectTaskSummary{
-			{TaskID: "t1", Name: "taskA", ProjectID: "p1", Status: task.StatusActive,
-				InitStatus: task.InitStatusNone, Branch: "b1", WorktreePath: "/wt1",
+		summaries: []application.ProjectTaskSummary{
+			{TaskID: "t1", Name: "taskA", ProjectID: "p1", Status: application.StatusActive,
+				InitStatus: application.InitStatusNone, Branch: "b1", WorktreePath: "/wt1",
 				UpdatedAt: 100, AttentionCount: 2},
-			{TaskID: "t2", Name: "taskB", ProjectID: "p1", Status: task.StatusSuspended,
-				InitStatus: task.InitStatusSucceeded, Branch: "b2", WorktreePath: "/wt2",
+			{TaskID: "t2", Name: "taskB", ProjectID: "p1", Status: application.StatusSuspended,
+				InitStatus: application.InitStatusSucceeded, Branch: "b2", WorktreePath: "/wt2",
 				UpdatedAt: 200, AttentionCount: 0},
 		},
 	}
 	projs := newFakeProjectStore()
 	projs.projects["p1"] = storeProjectRow{ID: "p1", Name: "projA", Path: "/p", DefaultBranch: "main", Kind: "repo", CreatedAt: 50}
-	projs.counts["p1"] = storeTaskCounts{Total: 2, ByStatus: map[string]int{task.StatusActive: 1, task.StatusSuspended: 1}}
+	projs.counts["p1"] = storeTaskCounts{Total: 2, ByStatus: map[string]int{application.StatusActive: 1, application.StatusSuspended: 1}}
 
 	s := newAPITestServer(t, tb)
 	s.projs = projs
@@ -192,10 +192,21 @@ func TestListProjects_TaskSummaries(t *testing.T) {
 	if len(got[0].TaskSummaries) != 2 {
 		t.Fatalf("tasks summaries len = %d, want 2", len(got[0].TaskSummaries))
 	}
-	// attention_count 字段验证
+	// updated_at / attention_count 字段透传验证。updated_at 为 P1.9a 迁移回归锚点：
+	// seed 值（100/200）必须原样到达响应，映射丢失或零值即失败。
 	for _, ts := range got[0].TaskSummaries {
-		if ts.ID == "t1" && ts.AttentionCount != 2 {
-			t.Errorf("t1 attention_count = %d, want 2", ts.AttentionCount)
+		switch ts.ID {
+		case "t1":
+			if ts.UpdatedAt != 100 {
+				t.Errorf("t1 updated_at = %d, want 100", ts.UpdatedAt)
+			}
+			if ts.AttentionCount != 2 {
+				t.Errorf("t1 attention_count = %d, want 2", ts.AttentionCount)
+			}
+		case "t2":
+			if ts.UpdatedAt != 200 {
+				t.Errorf("t2 updated_at = %d, want 200", ts.UpdatedAt)
+			}
 		}
 	}
 }
@@ -203,11 +214,11 @@ func TestListProjects_TaskSummaries(t *testing.T) {
 // projectSummaryBackend 注入 ListProjectTaskSummaries 返回值。
 type projectSummaryBackend struct {
 	*fakeTaskBackend
-	summaries []task.ProjectTaskSummary
+	summaries []application.ProjectTaskSummary
 }
 
-func (b *projectSummaryBackend) ListProjectTaskSummaries(ctx context.Context) ([]task.ProjectTaskSummary, error) {
-	out := make([]task.ProjectTaskSummary, len(b.summaries))
+func (b *projectSummaryBackend) ListProjectTaskSummaries(ctx context.Context) ([]application.ProjectTaskSummary, error) {
+	out := make([]application.ProjectTaskSummary, len(b.summaries))
 	copy(out, b.summaries)
 	return out, nil
 }
@@ -233,16 +244,16 @@ func TestListProjects_HydrationDeadline(t *testing.T) {
 	tb := &slowAgentStatusBackend{
 		projectSummaryBackend: &projectSummaryBackend{
 			fakeTaskBackend: &fakeTaskBackend{},
-			summaries: []task.ProjectTaskSummary{
-				{TaskID: "t1", Name: "taskA", ProjectID: "p1", Status: task.StatusActive,
-					InitStatus: task.InitStatusNone, Branch: "b1", WorktreePath: "/wt1", UpdatedAt: 100},
+			summaries: []application.ProjectTaskSummary{
+				{TaskID: "t1", Name: "taskA", ProjectID: "p1", Status: application.StatusActive,
+					InitStatus: application.InitStatusNone, Branch: "b1", WorktreePath: "/wt1", UpdatedAt: 100},
 			},
 		},
 		delay: 10 * time.Second,
 	}
 	projs := newFakeProjectStore()
 	projs.projects["p1"] = storeProjectRow{ID: "p1", Name: "projA", Path: "/p", DefaultBranch: "main", Kind: "repo", CreatedAt: 50}
-	projs.counts["p1"] = storeTaskCounts{Total: 1, ByStatus: map[string]int{task.StatusActive: 1}}
+	projs.counts["p1"] = storeTaskCounts{Total: 1, ByStatus: map[string]int{application.StatusActive: 1}}
 
 	s := newAPITestServer(t, tb)
 	s.projs = projs

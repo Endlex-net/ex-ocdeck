@@ -14,14 +14,14 @@ import (
 	"testing"
 	"time"
 
-	"ocdeck/internal/task"
+	"ocdeck/internal/application"
 )
 
 // activeSessionsBackend 可注入 ListActiveTaskOverview 返回值与 AgentStatus 行为，
 // 供 GET /api/v1/sessions/active handler 测试（cross-project-active-sessions D3/D4）。
 type activeSessionsBackend struct {
 	*fakeTaskBackend
-	overviewRows []task.ActiveTaskOverviewRow
+	overviewRows []application.ActiveTaskOverviewRow
 	overviewErr  error
 	// agentStatusFn 注入每个 taskID 的 hydration 行为；nil 时返回空串（降级）。
 	agentStatusFn func(ctx context.Context, taskID string) string
@@ -30,14 +30,14 @@ type activeSessionsBackend struct {
 	agentStatusCalls []string
 }
 
-func newActiveSessionsBackend(rows ...task.ActiveTaskOverviewRow) *activeSessionsBackend {
+func newActiveSessionsBackend(rows ...application.ActiveTaskOverviewRow) *activeSessionsBackend {
 	return &activeSessionsBackend{
 		fakeTaskBackend: &fakeTaskBackend{},
 		overviewRows:    rows,
 	}
 }
 
-func (b *activeSessionsBackend) ListActiveTaskOverview(ctx context.Context) ([]task.ActiveTaskOverviewRow, error) {
+func (b *activeSessionsBackend) ListActiveTaskOverview(ctx context.Context) ([]application.ActiveTaskOverviewRow, error) {
 	if b.overviewErr != nil {
 		return nil, b.overviewErr
 	}
@@ -60,9 +60,9 @@ func (b *activeSessionsBackend) agentStatusCallCount() int {
 	return len(b.agentStatusCalls)
 }
 
-// activeRow 构造 task.ActiveTaskOverviewRow 测试行辅助。
-func activeRow(id, projectID, projectName, name, branch, wt string, lastActive int64) task.ActiveTaskOverviewRow {
-	return task.ActiveTaskOverviewRow{
+// activeRow 构造 application.ActiveTaskOverviewRow 测试行辅助。
+func activeRow(id, projectID, projectName, name, branch, wt string, lastActive int64) application.ActiveTaskOverviewRow {
+	return application.ActiveTaskOverviewRow{
 		ID: id, ProjectID: projectID, ProjectName: projectName, Name: name,
 		Branch: branch, WorktreePath: wt, LastActiveAt: lastActive,
 	}
@@ -93,7 +93,7 @@ func readAndDecode(t *testing.T, body io.Reader) (string, []activeSessionDTO) {
 }
 
 func TestListActiveSessions_HappyPath(t *testing.T) {
-	rows := []task.ActiveTaskOverviewRow{
+	rows := []application.ActiveTaskOverviewRow{
 		activeRow("t1", "p1", "projA", "taskA", "bA", "/wtA", 300),
 		activeRow("t2", "p2", "projB", "taskB", "bB", "/wtB", 200),
 	}
@@ -139,7 +139,7 @@ func TestListActiveSessions_HappyPath(t *testing.T) {
 // 部分 AgentStatus 失败/降级时，成功任务仍携带 agentStatus，仅失败任务省略字段
 // （cross-project-active-sessions D4：单点降级不阻塞其他）。
 func TestListActiveSessions_PartialDegradationKeepsSuccessfulAgentStatus(t *testing.T) {
-	rows := []task.ActiveTaskOverviewRow{
+	rows := []application.ActiveTaskOverviewRow{
 		activeRow("t-ok", "p1", "projA", "taskA", "bA", "/wtA", 200),
 		activeRow("t-fail", "p2", "projB", "taskB", "bB", "/wtB", 100),
 	}
@@ -268,7 +268,7 @@ func TestListActiveSessions_UnauthorizedWithoutToken(t *testing.T) {
 // 全程确定性 channel/barrier，不依赖 time.Sleep。峰值并发经 atomic CAS 跟踪，断言 ≤8。
 func TestListActiveSessions_HydrationCapSemaphore(t *testing.T) {
 	const n = 9
-	rows := make([]task.ActiveTaskOverviewRow, n)
+	rows := make([]application.ActiveTaskOverviewRow, n)
 	for i := range rows {
 		rows[i] = activeRow("t"+strconv.Itoa(i), "p1", "projA", "task", "b", "/wt", int64(100-i))
 	}
@@ -346,7 +346,7 @@ func TestListActiveSessions_HydrationCapSemaphore(t *testing.T) {
 // （cross-project-active-sessions D4：context.WithTimeout(ctx, 3*time.Second)）。
 // fake 检查接收到的 ctx deadline 在 [2.9s, 3.1s] 范围并立即返回，无 3s 墙钟等待。
 func TestListActiveSessions_HydrationBudgetDeadline(t *testing.T) {
-	rows := []task.ActiveTaskOverviewRow{activeRow("t1", "p1", "projA", "taskA", "b", "/wt", 100)}
+	rows := []application.ActiveTaskOverviewRow{activeRow("t1", "p1", "projA", "taskA", "b", "/wt", 100)}
 	tb := newActiveSessionsBackend(rows...)
 	tb.agentStatusFn = func(ctx context.Context, taskID string) string {
 		dl, ok := ctx.Deadline()
@@ -378,7 +378,7 @@ func TestListActiveSessions_HydrationBudgetDeadline(t *testing.T) {
 // TestListActiveSessions_ShortParentCtxCancellation 验证调用方（请求 ctx）更短
 // deadline 时 hctx 继承取消，hydration goroutine 在 ctx.Done 后立即退出、agentStatus 省略。
 func TestListActiveSessions_ShortParentCtxCancellation(t *testing.T) {
-	rows := []task.ActiveTaskOverviewRow{activeRow("t1", "p1", "projA", "taskA", "b", "/wt", 100)}
+	rows := []application.ActiveTaskOverviewRow{activeRow("t1", "p1", "projA", "taskA", "b", "/wt", 100)}
 	tb := newActiveSessionsBackend(rows...)
 	cancelled := make(chan struct{})
 	tb.agentStatusFn = func(ctx context.Context, taskID string) string {
@@ -419,7 +419,7 @@ func TestListActiveSessions_ShortParentCtxCancellation(t *testing.T) {
 // hydration 因 ctx.Done 退出且 AgentStatus 调用记录 < 任务数。
 func TestListActiveSessions_ClientRequestCancelMidHydration(t *testing.T) {
 	const n = 3
-	rows := make([]task.ActiveTaskOverviewRow, n)
+	rows := make([]application.ActiveTaskOverviewRow, n)
 	for i := range rows {
 		rows[i] = activeRow("t"+strconv.Itoa(i), "p1", "projA", "task", "b", "/wt", int64(100-i))
 	}
@@ -479,7 +479,7 @@ func TestListActiveSessions_ClientRequestCancelMidHydration(t *testing.T) {
 // TestListActiveSessions_ReadModelImmutability 验证 hydration worker 仅写自己的 out[i].AgentStatus，
 // 不修改读模型字段（task_id/last_active_at 等来自 store，MUST NOT 被 hydration 改写）。
 func TestListActiveSessions_ReadModelImmutability(t *testing.T) {
-	rows := []task.ActiveTaskOverviewRow{
+	rows := []application.ActiveTaskOverviewRow{
 		activeRow("t1", "p1", "projA", "taskA", "bA", "/wtA", 100),
 	}
 	tb := newActiveSessionsBackend(rows...)

@@ -98,9 +98,8 @@ type CleanupDebtRow struct {
 	CreatedAt   int64
 }
 
-// ProjectRow / TaskRow / EnvVarRow / SessionRow 解耦 store 包结构（design.md §18）。
-// ProjectRow.Kind ∈ repo | dir（add-plain-dir-project D1）；TaskRow.BaseRef 为 repo 任务的
-// 基线分支全引用，dir 项目任务为空串（D10）。
+// ProjectRow / EnvVarRow 解耦 store 包结构（design.md §18）。
+// ProjectRow.Kind ∈ repo | dir（add-plain-dir-project D1）。
 type ProjectRow struct {
 	ID            string
 	Name          string
@@ -110,30 +109,18 @@ type ProjectRow struct {
 	CreatedAt     int64
 }
 
-type TaskRow struct {
-	ID           string
-	ProjectID    string
-	Name         string
-	Branch       string
-	Status       string
-	WorktreePath string
-	LastPort     sql.NullInt64
-	LastError    sql.NullString
-	Notice       sql.NullString
-	DeleteMode   sql.NullString
-	EnvSnapshot  sql.NullString
-	CreatedAt    int64
-	UpdatedAt    int64
-	ArchivedAt   sql.NullInt64
-	InitStatus   string
-	InitError    sql.NullString
-	BaseRef      string
-}
-
 type EnvVarRow struct {
 	Key   string
 	Value string
 }
+
+// TaskRow / SessionRow / ActiveTaskOverviewRow 定义已迁至 internal/application
+// （dto.go，sse-active-sessions P1.9a）；此处保留别名，本包及既有引用零改动。
+type TaskRow = application.TaskRow
+
+type SessionRow = application.SessionRow
+
+type ActiveTaskOverviewRow = application.ActiveTaskOverviewRow
 
 // LifecycleConfigRow 项目生命周期配置行（design.md §2.1，解耦 store 包结构）。
 // 缺行读取时三脚本字段为空串（无配置 = 空配置语义）。
@@ -151,29 +138,6 @@ type GlobalEnvVarRow struct {
 	Key   string
 	Mode  string
 	Value string
-}
-
-type SessionRow struct {
-	TaskID           string
-	SessionID        string
-	SessionCreatedAt int64
-	FirstSeenAt      int64
-	LastSeenAt       int64
-	// ParentID 非空表示 background subagent 子会话；空为顶层会话（design.md §4 锚定隔离）。
-	ParentID string
-}
-
-// ActiveTaskOverviewRow 跨项目 active 任务概览投影行（cross-project-active-sessions D1/D2）。
-// 仅供 GET /api/v1/sessions/active 读模型：字段与 store.ActiveTaskOverviewRow 一一对应，
-// 不携带 agentStatus（由 API 层 hydration worker 并发填充到 DTO）。
-type ActiveTaskOverviewRow struct {
-	ID           string
-	ProjectID    string
-	ProjectName  string
-	Name         string
-	Branch       string
-	WorktreePath string
-	LastActiveAt int64
 }
 
 // --- Manager ---

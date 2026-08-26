@@ -20,8 +20,8 @@ import (
 	"sync"
 	"time"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/git"
-	"ocdeck/internal/task"
 )
 
 // registerProjectRoutes 注册 projects 相关路由（design.md §21）。
@@ -119,7 +119,7 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 先取全部任务摘要（store 失败 → 500 不水合，spec）。
-	var summaries []task.ProjectTaskSummary
+	var summaries []application.ProjectTaskSummary
 	if s.tasks != nil {
 		summaries, err = s.tasks.ListProjectTaskSummaries(r.Context())
 		if err != nil {
@@ -146,8 +146,8 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 }
 
 // groupSummariesByProject 按项目分组任务摘要。
-func groupSummariesByProject(summaries []task.ProjectTaskSummary) map[string][]task.ProjectTaskSummary {
-	out := make(map[string][]task.ProjectTaskSummary)
+func groupSummariesByProject(summaries []application.ProjectTaskSummary) map[string][]application.ProjectTaskSummary {
+	out := make(map[string][]application.ProjectTaskSummary)
 	for _, s := range summaries {
 		out[s.ProjectID] = append(out[s.ProjectID], s)
 	}
@@ -155,7 +155,7 @@ func groupSummariesByProject(summaries []task.ProjectTaskSummary) map[string][]t
 }
 
 // toProjectTaskSummaryDTOs 转换任务摘要为 DTO（不含 agentStatus，由水合填充）。
-func toProjectTaskSummaryDTOs(summaries []task.ProjectTaskSummary) []projectTaskSummaryDTO {
+func toProjectTaskSummaryDTOs(summaries []application.ProjectTaskSummary) []projectTaskSummaryDTO {
 	out := make([]projectTaskSummaryDTO, 0, len(summaries))
 	for _, s := range summaries {
 		dto := projectTaskSummaryDTO{
@@ -182,7 +182,7 @@ func hydrateProjectTaskAgentStatuses(ctx context.Context, s *Server, projects []
 	var targets []target
 	for i := range projects {
 		for j := range projects[i].TaskSummaries {
-			if projects[i].TaskSummaries[j].Status == task.StatusActive {
+			if projects[i].TaskSummaries[j].Status == application.StatusActive {
 				targets = append(targets, target{i, j, projects[i].TaskSummaries[j].ID})
 			}
 		}
@@ -201,7 +201,7 @@ func hydrateSingleProjectAgentStatuses(ctx context.Context, s *Server, p *projec
 	}
 	var targets []target
 	for j := range p.TaskSummaries {
-		if p.TaskSummaries[j].Status == task.StatusActive {
+		if p.TaskSummaries[j].Status == application.StatusActive {
 			targets = append(targets, target{j, p.TaskSummaries[j].ID})
 		}
 	}
