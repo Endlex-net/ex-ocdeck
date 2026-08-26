@@ -51,6 +51,6 @@
   - [x] P2.7.1 新增 fetch streaming SSE 客户端：Bearer 头、ReadableStream 分帧解析（`event:`/`data:`/注释行，处理跨 chunk 粘包；snapshot/update 同一解析路径裸数组）、401 → clearToken + UNAUTHORIZED_EVENT 且停止重连、指数退避重连（1s 起步 ×2、上限 30s、首个有效帧到达后重置）；`close()` 置永久 closed 标志 + 中断当前 fetch + 取消在途退避计时器
   - [x] P2.7.2 `CommandCenterPage` 移除 `usePoll(pollSessions, 5000)`，改为 mount 订阅/unmount close；帧驱动 `setSnap`；保留 initialized/attempted/error/lastSuccessAt 并**修改 `resolveSessionsBootstrap` 判定**：整页 loading 仅在 projects 自身未初始化时进入；sessions 未首帧一律为独立「连接中」（抑制全局与分区空态），消除现有 `projectsInit=true 且 projectsLen=0 且 sessions 未 attempted → loading` 分支（CommandCenterPage.tsx:109-110；既有测试 command-center.test.ts:510-513 同步改写）；首次连接错误走 error 且不与连接中并存；双快照 join 不变；**删除/改写页面"每 5 秒刷新"的用户可见文案（CommandCenterPage.tsx:257），改为连接状态中性表述**
   - [x] P2.7.3 前端测试：分帧解析（跨 chunk 粘包；注释行与未知 event 忽略；非法 JSON/非数组 data → onError + 保留旧数据 + 终止当前连接退避重连且不重置退避）、401 停止重连、断线退避重连且首个有效帧重置退避、**退避等待期间 close 后不再发起 fetch**、卸载 AbortController 清理关闭连接、订阅异常保留旧数据、**projects 已有数据 + sessions 首帧未到 → 渲染 projects-only 且展示连接中、不整页 loading、不真空态**、**projects 已成功初始化但为空 + sessions 首帧未到 → 展示连接中，不整页 loading、不真空态**、**projects 非空 + sessions 首帧为 `[]` → 继续渲染 projects-only 数据、不显示全局空态**、**两侧均成功初始化且 join 后三区均无任务 → 显示全局空态**、首次连接错误展示错误且不与连接中并存、页面不再对 `/api/v1/sessions/active` 发起定时轮询的断言、**不再出现固定 5 秒刷新提示文案**
-- [ ] P2.8 端到端验证（依赖全部 Phase 2 lane）：
-  - [ ] P2.8.1 手工/脚本联调：启动服务端，建立 SSE 连接收到首帧 snapshot；触发任务 session 活动后在 500ms 合并窗口到期后收到 update（允许明确的组装/flush 调度容差）；杀连接观察前端退避重连；关停服务观察连接及时释放
-  - [ ] P2.8.2 `go build ./... && go test ./... -race` 与前端 `tsc`/测试全绿
+- [x] P2.8 端到端验证（依赖全部 Phase 2 lane）：
+  - [x] P2.8.1 手工/脚本联调：启动服务端，建立 SSE 连接收到首帧 snapshot；触发任务 session 活动后在 500ms 合并窗口到期后收到 update（允许明确的组装/flush 调度容差）；杀连接观察前端退避重连；关停服务观察连接及时释放
+  - [x] P2.8.2 `go build ./... && go test ./... -race` 与前端 `tsc`/测试全绿
