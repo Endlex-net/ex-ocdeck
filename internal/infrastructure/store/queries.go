@@ -70,9 +70,10 @@ type TaskRow struct {
 	CreatedAt    int64
 	UpdatedAt    int64
 	ArchivedAt   sql.NullInt64
-	InitStatus   string
-	InitError    sql.NullString
-	BaseRef      string
+	InitStatus       string
+	InitError        sql.NullString
+	BaseRef          string
+	AnchorSessionID  sql.NullString
 }
 
 // LifecycleConfigRow project_lifecycle_configs 表行映射（design.md §2，migration 0007）。
@@ -351,7 +352,8 @@ func (q *Queries) CreateTask(ctx context.Context, t TaskRow) error {
 func (q *Queries) GetTask(ctx context.Context, id string) (TaskRow, error) {
 	row := q.db.QueryRowContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
-		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref
+		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
+		        anchor_session_id
 		 FROM tasks WHERE id = ?`, id)
 	return scanTaskRow(row)
 }
@@ -360,7 +362,8 @@ func (q *Queries) GetTask(ctx context.Context, id string) (TaskRow, error) {
 func (q *Queries) ListTasksByProject(ctx context.Context, projectID string) ([]TaskRow, error) {
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
-		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref
+		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
+		        anchor_session_id
 		 FROM tasks WHERE project_id = ? ORDER BY created_at ASC`, projectID)
 	if err != nil {
 		return nil, err
@@ -373,7 +376,8 @@ func (q *Queries) ListTasksByProject(ctx context.Context, projectID string) ([]T
 func (q *Queries) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
-		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref
+		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
+		        anchor_session_id
 		 FROM tasks ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
@@ -1483,7 +1487,8 @@ func scanTaskRow(row rowScanner) (TaskRow, error) {
 	var t TaskRow
 	err := row.Scan(&t.ID, &t.ProjectID, &t.Name, &t.Branch, &t.Status, &t.WorktreePath,
 		&t.LastPort, &t.LastError, &t.Notice, &t.DeleteMode, &t.EnvSnapshot,
-		&t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.InitStatus, &t.InitError, &t.BaseRef)
+		&t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.InitStatus, &t.InitError, &t.BaseRef,
+		&t.AnchorSessionID)
 	return t, err
 }
 
@@ -1588,6 +1593,114 @@ func (q *Queries) claimTaskSessionInTx(ctx context.Context, taskID, sessionID st
 		return application.ClaimResult{}, err
 	}
 	return application.ClaimResult{Claimed: true, Changed: changed}, nil
+}
+
+// ClaimTaskSessionAndSetAnchor 单事务 claim session 并写入 tasks.anchor_session_id（D5）。
+// claim 成功后 sessionID 立即成为权威锚定；冲突时归属与 anchor 均不修改。
+func (q *Queries) ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
+	return runTx(ctx, q, func(qtx *Queries) (application.ClaimResult, error) {
+		res, err := qtx.claimTaskSessionInTx(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+		if err != nil || !res.Claimed {
+			return res, err
+		}
+		if _, err := qtx.db.ExecContext(ctx,
+			`UPDATE tasks SET anchor_session_id = ? WHERE id = ?`, sessionID, taskID); err != nil {
+			return application.ClaimResult{}, err
+		}
+		return res, nil
+	})
+}
+
+// ClearTaskAnchorConditional 条件清空锚定（D5 CAS）：
+// `anchor_session_id=NULL WHERE id=? AND anchor_session_id=<old>`。
+// Matched=命中并清空；0 行 → !Matched（调用方复读后判定）。
+func (q *Queries) ClearTaskAnchorConditional(ctx context.Context, taskID, oldAnchor string) (application.MutationResult, error) {
+	res, err := q.db.ExecContext(ctx,
+		`UPDATE tasks SET anchor_session_id = NULL WHERE id = ? AND anchor_session_id = ?`,
+		taskID, oldAnchor)
+	if err != nil {
+		return application.MutationResult{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return application.MutationResult{}, err
+	}
+	if n == 0 {
+		return application.MutationResult{}, nil
+	}
+	return application.MutationResult{Matched: true, Changed: true}, nil
+}
+
+// recoveryPermitWindowSec / recoveryPermitMax 为 D3 固定预算：滚动 5 分钟最多 3 个 permit。
+const (
+	recoveryPermitWindowSec int64 = 5 * 60
+	recoveryPermitMax             = 3
+)
+
+// AcquirePermitResult 是 AcquireRecoveryPermit 的结构化结果。
+type AcquirePermitResult struct {
+	Acquired bool // false=窗口已满，未写入新记录
+	Ordinal  int  // 窗口内第几个（1-based）；未取得时为 0
+}
+
+// AcquireRecoveryPermit 原子写入一条 attempt 记录并返回窗口内 ordinal（D3）。
+// now 为调用方注入的 Unix 秒（确定性测试）；先惰性裁剪过期行，窗口已满则不写入。
+func (q *Queries) AcquireRecoveryPermit(ctx context.Context, taskID string, now int64) (AcquirePermitResult, error) {
+	return runTx(ctx, q, func(qtx *Queries) (AcquirePermitResult, error) {
+		windowStart := now - recoveryPermitWindowSec
+		if _, err := qtx.pruneRecoveryAttempts(ctx, taskID, windowStart); err != nil {
+			return AcquirePermitResult{}, err
+		}
+		n, err := qtx.countRecoveryAttemptsSince(ctx, taskID, windowStart)
+		if err != nil {
+			return AcquirePermitResult{}, err
+		}
+		if n >= recoveryPermitMax {
+			return AcquirePermitResult{}, nil
+		}
+		if _, err := qtx.db.ExecContext(ctx,
+			`INSERT INTO task_recovery_attempts (task_id, attempted_at) VALUES (?, ?)`,
+			taskID, now); err != nil {
+			return AcquirePermitResult{}, err
+		}
+		return AcquirePermitResult{Acquired: true, Ordinal: n + 1}, nil
+	})
+}
+
+// CountRecoveryAttemptsInWindow 返回滚动窗口内（now-5min..now）的 attempt 数。
+func (q *Queries) CountRecoveryAttemptsInWindow(ctx context.Context, taskID string, now int64) (int, error) {
+	return q.countRecoveryAttemptsSince(ctx, taskID, now-recoveryPermitWindowSec)
+}
+
+// PruneExpiredRecoveryAttempts 删除 attempted_at < before 的记录（惰性裁剪入口）。
+// taskID 非空则仅裁该任务；空则全表。
+func (q *Queries) PruneExpiredRecoveryAttempts(ctx context.Context, taskID string, before int64) (int64, error) {
+	return q.pruneRecoveryAttempts(ctx, taskID, before)
+}
+
+func (q *Queries) countRecoveryAttemptsSince(ctx context.Context, taskID string, since int64) (int, error) {
+	var n int
+	err := q.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM task_recovery_attempts WHERE task_id = ? AND attempted_at >= ?`,
+		taskID, since).Scan(&n)
+	return n, err
+}
+
+func (q *Queries) pruneRecoveryAttempts(ctx context.Context, taskID string, before int64) (int64, error) {
+	var (
+		res sql.Result
+		err error
+	)
+	if taskID == "" {
+		res, err = q.db.ExecContext(ctx, `DELETE FROM task_recovery_attempts WHERE attempted_at < ?`, before)
+	} else {
+		res, err = q.db.ExecContext(ctx,
+			`DELETE FROM task_recovery_attempts WHERE task_id = ? AND attempted_at < ?`, taskID, before)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // TouchOwnedTaskSession 条件 UPDATE 仅本任务已归属行的 last_seen_at（add-plain-dir-project D8）。

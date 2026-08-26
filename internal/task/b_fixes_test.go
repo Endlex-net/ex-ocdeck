@@ -75,13 +75,13 @@ func TestCallbackIsolation_OldGenIgnored(t *testing.T) {
 	// 旧代 runtime + serve group。
 	oldRT := m.newRuntime("t1")
 	m.setRuntime("t1", oldRT)
-	oldRT.registerGroup("serve", serveSessionName("t1"))
+	oldRT.registerGroup(roleLegacyServe, serveSessionName("t1"))
 	m.watchServeExit("t1", serveSessionName("t1"))
 
 	// 模拟新代 runtime：newRuntime 递增 generation，注册新 serve group。
 	newRT := m.newRuntime("t1")
 	m.setRuntime("t1", newRT)
-	newRT.registerGroup("serve", serveSessionName("t1"))
+	newRT.registerGroup(roleLegacyServe, serveSessionName("t1"))
 
 	// 触发旧代 watch 的退出事件（旧 cancel 仍指向 oldRT 闭包）。
 	proc.triggerExit(serveSessionName("t1"), process.WatchEvent{Type: process.WatchEventSessionExit})
@@ -455,9 +455,20 @@ func TestShellNameParsing(t *testing.T) {
 	}{
 		{"ocdeck-abc123-serve", "serve", "abc123"},
 		{"ocdeck-abc123-tui", "tui", "abc123"},
+		{"ocdeck-abc123-runtime", "runtime", "abc123"},
 		{"ocdeck-abc123-shell-1", "shell-1", "abc123"},
 		{"ocdeck-abc123-shell-12", "shell-12", "abc123"},
 		{"ocdeck-a1b2c3d4-shell-99", "shell-99", "a1b2c3d4"},
+		{"ocdeck-abc123-shell-0", "", ""},
+		{"ocdeck-abc123-shell-00", "", ""},
+		{"ocdeck-abc123-shell-", "", ""},
+		{"ocdeck-abc123-shell-abc", "", ""},
+		{"ocdeck-abc123-worker", "", ""},
+		{"not-ocdeck-abc123-runtime", "", ""},
+		{"ocdeck-", "", ""},
+	}
+	if got := runtimeSessionName("abc123"); got != "ocdeck-abc123-runtime" {
+		t.Errorf("runtimeSessionName = %q, want ocdeck-abc123-runtime", got)
 	}
 	for _, c := range cases {
 		if got := roleFromSessionName(c.name); got != c.role {

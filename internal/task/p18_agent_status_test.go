@@ -385,7 +385,7 @@ func TestP18_DisconnectSequenceAndTokenValidation(t *testing.T) {
 
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	rt.registerGroup("serve", serveSessionName("t1"))
+	rt.registerGroup(roleLegacyServe, serveSessionName("t1"))
 	if err := m.startSSE(context.Background(), rt, "t1", "/data/worktrees/p1/t1", 50001, "pw", AlignModeRepo); err != nil {
 		t.Fatalf("startSSE: %v", err)
 	}
@@ -419,7 +419,7 @@ func TestP18_DisconnectSequenceAndTokenValidation(t *testing.T) {
 	// 激活代身份校验：runtime 被替换后，旧闭包的断流回调 MUST 忽略（不发布、不触碰新实例）。
 	newRT := m.newRuntime("t1")
 	m.setRuntime("t1", newRT)
-	newRT.registerGroup("serve", serveSessionName("t1"))
+	newRT.registerGroup(roleLegacyServe, serveSessionName("t1"))
 	hook.onDisconnect()
 	if got := m.AgentStatusSnapshot("t1"); got != "" {
 		t.Fatalf("new runtime snapshot = %q, want empty (no state yet)", got)
@@ -831,7 +831,7 @@ func TestP18_DisconnectEpochFence(t *testing.T) {
 	seedActiveTask(store, "t1", "p1")
 	m, pub, _ := newP18Manager(t, store, newMockProc(), newMockOC(true))
 	rt, a := p18ReadyRuntime(m, "t1", "s1") // 连接代 1，valid idle
-	rt.registerGroup("serve", serveSessionName("t1"))
+	rt.registerGroup(roleLegacyServe, serveSessionName("t1"))
 
 	// 重连：分配新连接代 2 并重新 valid（等价 onReconnect 的 connect→align→reconcile 序列）。
 	a.apply(agentStatusOp{kind: agentOpConnect})

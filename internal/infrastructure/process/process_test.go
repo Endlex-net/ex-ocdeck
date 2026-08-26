@@ -57,8 +57,9 @@ func TestValidateSessionName(t *testing.T) {
 		name string
 		ok   bool
 	}{
-		{"ocdeck-task1-serve", true},
-		{"ocdeck-task-1-tui", true},
+		{"ocdeck-task1-runtime", true},
+		{"ocdeck-task1-serve", true}, // legacy：管理/清理路径仍接受
+		{"ocdeck-task-1-tui", true},  // legacy
 		{"ocdeck-my-task-shell-1", true},
 		{"ocdeck-task1-shell-99", true},
 		{"", false},
@@ -69,20 +70,126 @@ func TestValidateSessionName(t *testing.T) {
 		{"ocdeck-task;rm-serve", false},
 		{"foo-task-serve", false}, // 前缀错
 		{"OCDECK-task-serve", false},
-		// role 段收紧（design.md §2：role ∈ {serve, tui, shell-<n>}）
-		{"ocdeck-task1-serve1", false},     // serve 不带后缀
-		{"ocdeck-task1-tui-1", false},      // tui 不带后缀
-		{"ocdeck-task1-shell", false},      // shell MUST 带 -<n>
-		{"ocdeck-task1-shell-abc", false},  // shell-<n> 仅数字
-		{"ocdeck-task1-shell-01", true},   // 0 开头仍为合法数字（shell-<n>）
-		{"ocdeck-task1-worker", false},     // 非法 role
-		{"ocdeck-task1-Serve", false},      // 大写
+		{"ocdeck-task1-serve1", false},    // serve 不带后缀
+		{"ocdeck-task1-tui-1", false},     // tui 不带后缀
+		{"ocdeck-task1-shell", false},     // shell MUST 带 -<n>
+		{"ocdeck-task1-shell-abc", false}, // shell-<n> 仅数字
+		{"ocdeck-task1-shell-01", false},  // 前导零非法
+		{"ocdeck-task1-shell-0", false},   // n 必须 > 0
+		{"ocdeck-task1-worker", false},    // 非法 role
+		{"ocdeck-task1-Serve", false},     // 大写
+		{"ocdeck-task1-runtime-1", false}, // runtime 不带后缀
 	}
 	for _, c := range cases {
 		err := ValidateSessionName(c.name)
 		if (err == nil) != c.ok {
 			t.Errorf("ValidateSessionName(%q) ok=%v, want %v (err=%v)", c.name, err == nil, c.ok, err)
 		}
+	}
+}
+
+func TestValidateNewSessionName(t *testing.T) {
+	cases := []struct {
+		name string
+		ok   bool
+	}{
+		{"ocdeck-task1-runtime", true},
+		{"ocdeck-my-task-shell-1", true},
+		{"ocdeck-task1-shell-99", true},
+		{"ocdeck-task1-shell-01", false},
+		{"ocdeck-task1-shell-0", false},
+		{"ocdeck-task1-serve", false}, // legacy 不可新建
+		{"ocdeck-task-1-tui", false},  // legacy 不可新建
+		{"", false},
+		{"ocdeck-task", false},
+		{"ocdeck-task1-worker", false},
+		{"ocdeck-task1-runtime-1", false},
+		{"ocdeck-task1-shell", false},
+	}
+	for _, c := range cases {
+		err := ValidateNewSessionName(c.name)
+		if (err == nil) != c.ok {
+			t.Errorf("ValidateNewSessionName(%q) ok=%v, want %v (err=%v)", c.name, err == nil, c.ok, err)
+		}
+	}
+}
+
+func TestNewSession_AcceptsLegacySuffixUntilPhase2(t *testing.T) {
+	var saw []string
+	m := &Manager{
+		execTmuxFn: func(_ context.Context, args ...string) (string, string, error) {
+			saw = append(saw, args...)
+			return "", "", nil
+		},
+	}
+	for _, name := range []string{"ocdeck-task1-serve", "ocdeck-task1-tui"} {
+		err := m.NewSession(SessionSpec{
+			Name:    name,
+			Dir:     "/tmp",
+			CmdArgv: []string{"sleep", "1"},
+		})
+		if err != nil {
+			t.Errorf("NewSession(%q) err=%v, want accept legacy until Phase 2", name, err)
+		}
+	}
+	if len(saw) == 0 {
+		t.Fatal("execTmux was not called for legacy NewSession")
+	}
+}
+
+func TestParseSessionName(t *testing.T) {
+	cases := []struct {
+		name       string
+		taskID     string
+		suffix     string
+		ok         bool
+	}{
+		{"ocdeck-abc123-runtime", "abc123", "runtime", true},
+		{"ocdeck-abc123-serve", "abc123", "serve", true},
+		{"ocdeck-abc123-tui", "abc123", "tui", true},
+		{"ocdeck-abc123-shell-1", "abc123", "shell-1", true},
+		{"ocdeck-abc123-shell-12", "abc123", "shell-12", true},
+		{"ocdeck-abc123-shell-0", "", "", false},
+		{"ocdeck-abc123-shell-00", "", "", false},
+		{"ocdeck-abc123-shell-01", "", "", false},
+		{"ocdeck-abc123-shell-", "", "", false},
+		{"ocdeck-abc123-shell-abc", "", "", false},
+		{"ocdeck-abc123-shell-18446744073709551616", "", "", false}, // overflow
+		{"ocdeck-abc123-worker", "", "", false},
+		{"", "", "", false},
+	}
+	for _, c := range cases {
+		taskID, suffix, err := ParseSessionName(c.name)
+		if c.ok {
+			if err != nil || taskID != c.taskID || suffix != c.suffix {
+				t.Errorf("ParseSessionName(%q)=(%q,%q,%v) want (%q,%q,nil)", c.name, taskID, suffix, err, c.taskID, c.suffix)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("ParseSessionName(%q) ok, want error", c.name)
+		}
+	}
+}
+
+func TestHasSession_AcceptsLegacySuffix(t *testing.T) {
+	var sawName string
+	m := &Manager{
+		execTmuxFn: func(_ context.Context, args ...string) (string, string, error) {
+			for i, a := range args {
+				if a == "-t" && i+1 < len(args) {
+					sawName = args[i+1]
+				}
+			}
+			return "", "", nil
+		},
+	}
+	ok, err := m.HasSession("ocdeck-task1-serve")
+	if err != nil || !ok {
+		t.Fatalf("HasSession(legacy serve) ok=%v err=%v, want true/nil", ok, err)
+	}
+	if sawName != "=ocdeck-task1-serve" {
+		t.Errorf("HasSession target = %q, want =ocdeck-task1-serve", sawName)
 	}
 }
 

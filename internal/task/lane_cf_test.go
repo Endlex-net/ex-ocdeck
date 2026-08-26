@@ -28,8 +28,8 @@ func TestTypedRuntimeEvent_ServeInfraErrorSuspended(t *testing.T) {
 
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	rt.registerGroup("serve", serveSessionName("t1"))
-	rt.registerGroup("tui", tuiSessionName("t1"))
+	rt.registerGroup(roleLegacyServe, serveSessionName("t1"))
+	rt.registerGroup(roleLegacyTUI, tuiSessionName("t1"))
 	m.watchServeExit("t1", serveSessionName("t1"))
 
 	proc.triggerExit(serveSessionName("t1"), process.WatchEvent{
@@ -59,8 +59,8 @@ func TestTypedRuntimeEvent_TuiExitKeepsActive(t *testing.T) {
 
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	rt.registerGroup("serve", serveSessionName("t1"))
-	rt.registerGroup("tui", tuiSessionName("t1"))
+	rt.registerGroup(roleLegacyServe, serveSessionName("t1"))
+	rt.registerGroup(roleLegacyTUI, tuiSessionName("t1"))
 	m.watchTUIExit("t1", tuiSessionName("t1"))
 
 	proc.triggerExit(tuiSessionName("t1"), process.WatchEvent{Type: process.WatchEventSessionExit})
@@ -90,13 +90,13 @@ func TestTypedRuntimeEvent_OldGenIgnored_ViaCurrentRegistry(t *testing.T) {
 	// 旧代 runtime + serve group + watcher。
 	oldRT := m.newRuntime("t1")
 	m.setRuntime("t1", oldRT)
-	oldRT.registerGroup("serve", serveSessionName("t1"))
+	oldRT.registerGroup(roleLegacyServe, serveSessionName("t1"))
 	m.watchServeExit("t1", serveSessionName("t1"))
 
 	// 新代 runtime（generation 递增）。
 	newRT := m.newRuntime("t1")
 	m.setRuntime("t1", newRT)
-	newRT.registerGroup("serve", serveSessionName("t1"))
+	newRT.registerGroup(roleLegacyServe, serveSessionName("t1"))
 
 	// 旧代 watcher 触发 infra_error → 应不匹配新代注册表 → 忽略。
 	proc.triggerExit(serveSessionName("t1"), process.WatchEvent{

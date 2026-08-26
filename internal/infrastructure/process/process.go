@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,7 @@ import (
 // SessionSpec 描述一次 tmux 会话创建请求（design.md §18）。
 type SessionSpec struct {
 	// Name 会话名，MUST 经 ValidateSessionName 校验（ocdeck-<taskID>-<role>）。
+	// Phase 2 接线点：创建路径改为 ValidateNewSessionName（拒绝 legacy serve/tui）。
 	Name string
 	// Dir 会话工作目录（tmux new-session -c），MUST 为绝对路径。
 	Dir string
@@ -168,25 +170,134 @@ func EnsureTmpDir(dataDir string) (string, error) {
 	return p, nil
 }
 
-// sessionNameRe 校验 ocdeck-<taskID>-<role> 形态，taskID 字符集 [a-z0-9-]，
-// role 段 MUST ∈ serve | tui | shell-<n>（design.md §2 会话命名表）。
-var sessionNameRe = regexp.MustCompile(`^ocdeck-([a-z0-9]+(?:-[a-z0-9]+)*?)-(serve|tui|shell-[0-9]+)$`)
+const (
+	sessionNameMaxLen = 128
+	ocdeckPrefix      = "ocdeck-"
+	suffixRuntime     = "runtime"
+	suffixServe       = "serve"
+	suffixTUI         = "tui"
+	suffixShellPrefix = "shell-"
+)
 
-// ValidateSessionName 校验会话名格式（design.md §2：会话名 MUST 经格式校验后才用于命令）。
-// 拒绝空、超长（tmux 上限 256 但此处更保守）、非法字符、不匹配 ocdeck- 前缀、
-// role 段不在 {serve, tui, shell-<n>} 范围。
-func ValidateSessionName(name string) error {
+// ParseSessionName 是会话名的单一 canonical parser（design D2 / G1-3）。
+// 形态 ocdeck-<taskID>-<suffix>，taskID 字符集 [a-z0-9-]（段不以 - 起止）。
+// suffix ∈ runtime | serve | tui | shell-<n>，n 为无前导零的正整数（n > 0）。
+// 溢出或非法 suffix 一律失败。
+func ParseSessionName(name string) (taskID, suffix string, err error) {
 	if name == "" {
-		return fmt.Errorf("process: empty session name")
+		return "", "", fmt.Errorf("process: empty session name")
 	}
-	if len(name) > 128 {
-		return fmt.Errorf("process: session name too long (%d)", len(name))
+	if len(name) > sessionNameMaxLen {
+		return "", "", fmt.Errorf("process: session name too long (%d)", len(name))
 	}
-	m := sessionNameRe.FindStringSubmatch(name)
-	if m == nil {
-		return fmt.Errorf("process: invalid session name %q (want ocdeck-<taskID>-<role>, role ∈ {serve,tui,shell-<n>}, charset [a-z0-9-])", name)
+	if !strings.HasPrefix(name, ocdeckPrefix) || len(name) <= len(ocdeckPrefix) {
+		return "", "", fmt.Errorf("process: invalid session name %q (want ocdeck-<taskID>-<role>, charset [a-z0-9-])", name)
 	}
-	return nil
+	rest := name[len(ocdeckPrefix):]
+	taskID, suffix, ok := splitTaskIDAndSuffix(rest)
+	if !ok {
+		return "", "", fmt.Errorf("process: invalid session name %q (want ocdeck-<taskID>-<role>, charset [a-z0-9-])", name)
+	}
+	if !validTaskID(taskID) || !validSessionSuffix(suffix) {
+		return "", "", fmt.Errorf("process: invalid session name %q (want ocdeck-<taskID>-<role>, charset [a-z0-9-])", name)
+	}
+	return taskID, suffix, nil
+}
+
+func splitTaskIDAndSuffix(rest string) (taskID, suffix string, ok bool) {
+	switch {
+	case strings.HasSuffix(rest, "-"+suffixRuntime):
+		return rest[:len(rest)-len("-"+suffixRuntime)], suffixRuntime, true
+	case strings.HasSuffix(rest, "-"+suffixServe):
+		return rest[:len(rest)-len("-"+suffixServe)], suffixServe, true
+	case strings.HasSuffix(rest, "-"+suffixTUI):
+		return rest[:len(rest)-len("-"+suffixTUI)], suffixTUI, true
+	}
+	idx := strings.LastIndex(rest, "-"+suffixShellPrefix)
+	if idx < 0 {
+		return "", "", false
+	}
+	return rest[:idx], rest[idx+1:], true
+}
+
+func validTaskID(id string) bool {
+	if id == "" {
+		return false
+	}
+	prevDash := true
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if c == '-' {
+			if prevDash {
+				return false
+			}
+			prevDash = true
+			continue
+		}
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return false
+		}
+		prevDash = false
+	}
+	return !prevDash
+}
+
+func validSessionSuffix(suffix string) bool {
+	switch suffix {
+	case suffixRuntime, suffixServe, suffixTUI:
+		return true
+	}
+	n, ok := parseShellIndex(suffix)
+	return ok && n > 0
+}
+
+// parseShellIndex 解析 shell-<n>：n 必须是无前导零的正整数（溢出失败）。
+func parseShellIndex(suffix string) (int, bool) {
+	if !strings.HasPrefix(suffix, suffixShellPrefix) {
+		return 0, false
+	}
+	num := suffix[len(suffixShellPrefix):]
+	if num == "" || num[0] == '0' {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(num, 10, 31)
+	if err != nil || n == 0 {
+		return 0, false
+	}
+	return int(n), true
+}
+
+func validateParsedSessionName(name string, createOnly bool) error {
+	_, suffix, err := ParseSessionName(name)
+	if err != nil {
+		if createOnly {
+			return fmt.Errorf("process: invalid session name %q (want ocdeck-<taskID>-<role>, role ∈ {runtime,shell-<n>}, charset [a-z0-9-])", name)
+		}
+		return err
+	}
+	if !createOnly {
+		return nil
+	}
+	if suffix == suffixRuntime {
+		return nil
+	}
+	if _, ok := parseShellIndex(suffix); ok {
+		return nil
+	}
+	return fmt.Errorf("process: invalid session name %q (want ocdeck-<taskID>-<role>, role ∈ {runtime,shell-<n>}, charset [a-z0-9-])", name)
+}
+
+// ValidateSessionName 校验会话名格式（管理/清理路径：HasSession/KillSession/watch）。
+// 拒绝空、超长、非法字符、不匹配 ocdeck- 前缀；role 段 ∈ {runtime, shell-<n>, serve, tui}，n > 0。
+func ValidateSessionName(name string) error {
+	return validateParsedSessionName(name, false)
+}
+
+// ValidateNewSessionName 校验创建路径会话名（design D2）。
+// 仅接受 runtime | shell-<n>（n > 0），拒绝 legacy serve/tui。
+// Phase 2 接线点：NewSession 改为调用本函数。本阶段 NewSession 仍走 ValidateSessionName。
+func ValidateNewSessionName(name string) error {
+	return validateParsedSessionName(name, true)
 }
 
 // tmuxArgs 构造 tmux 命令的完整 argv（含 -L/-f/-- 前缀），sub 为子命令及参数。
@@ -355,6 +466,9 @@ const termGrace = 2 * time.Second
 // NewSession 创建 tmux 会话（design.md §18）。
 // 命令构造：从白名单 CmdArgv 逐元素单引号转义拼成单个 shell 字符串，
 // env 经 -e KEY=VALUE argv 传递，精确 target -t =<name>。
+//
+// Phase 2 接线点：将下方 ValidateSessionName 替换为 ValidateNewSessionName，
+// 与 Activate 切到 runtime 同批提交。本阶段仍接受 legacy serve/tui（Activate 仍创建双进程）。
 func (m *Manager) NewSession(spec SessionSpec) error {
 	if err := ValidateSessionName(spec.Name); err != nil {
 		return err

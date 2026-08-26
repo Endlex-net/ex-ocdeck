@@ -130,7 +130,7 @@ func TestListShells_ReturnsAliveShells(t *testing.T) {
 	// 构造 runtime（模拟已激活）。
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	rt.registerGroup("serve", serveSessionName("t1"))
+	rt.registerGroup(roleLegacyServe, serveSessionName("t1"))
 
 	// 创建 2 个 shell。
 	tid1, err := m.CreateShell(context.Background(), "t1")
@@ -188,8 +188,8 @@ func TestValidateShellTerminal_RejectsNonShell(t *testing.T) {
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	rt.registerGroup("serve", serveSessionName("t1"))
-	rt.registerGroup("shell", shellSessionName("t1", 1))
+	rt.registerGroup(roleLegacyServe, serveSessionName("t1"))
+	rt.registerGroup(roleShell, shellSessionName("t1", 1))
 
 	cases := []struct {
 		name string
@@ -227,7 +227,7 @@ func TestValidateShellTerminal_AcceptsValidShell(t *testing.T) {
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	rt.registerGroup("shell", shellName)
+	rt.registerGroup(roleShell, shellName)
 
 	if err := m.ValidateShellTerminal(shellName); err != nil {
 		t.Errorf("ValidateShellTerminal(valid shell) must pass, got: %v", err)

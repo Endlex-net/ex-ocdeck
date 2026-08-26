@@ -678,7 +678,7 @@ func TestReopenAttach_RecreatesMissingTUI(t *testing.T) {
 	// runtime 必须存在（ReopenAttach 注册 group + watchTUIExit 依赖 runtime）。
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	rt.registerGroup("serve", serveSessionName("t1"))
+	rt.registerGroup(roleLegacyServe, serveSessionName("t1"))
 
 	// TUI 不存在 → 重建。
 	tid, err := m.ReopenAttach(context.Background(), "t1")

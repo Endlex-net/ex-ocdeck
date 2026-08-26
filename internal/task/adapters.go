@@ -322,9 +322,10 @@ func taskRowToSnapshot(r TaskRow) application.TaskSnapshot {
 		CreatedAt:    r.CreatedAt,
 		UpdatedAt:    r.UpdatedAt,
 		ArchivedAt:   ptrToNullInt64ToPtr(r.ArchivedAt),
-		InitStatus:   r.InitStatus,
-		InitError:    nullStringToPtr(r.InitError),
-		BaseRef:      r.BaseRef,
+		InitStatus:      r.InitStatus,
+		InitError:       nullStringToPtr(r.InitError),
+		BaseRef:         r.BaseRef,
+		AnchorSessionID: nullStringToPtr(r.AnchorSessionID),
 	}
 }
 
@@ -422,6 +423,7 @@ func toTaskRow(t store.TaskRow) TaskRow {
 		WorktreePath: t.WorktreePath, LastPort: t.LastPort, LastError: t.LastError, Notice: t.Notice,
 		DeleteMode: t.DeleteMode, EnvSnapshot: t.EnvSnapshot, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
 		ArchivedAt: t.ArchivedAt, InitStatus: t.InitStatus, InitError: t.InitError, BaseRef: t.BaseRef,
+		AnchorSessionID: t.AnchorSessionID,
 	}
 }
 
@@ -446,9 +448,10 @@ func taskSnapshotToTaskRow(s application.TaskSnapshot) TaskRow {
 		CreatedAt:    s.CreatedAt,
 		UpdatedAt:    s.UpdatedAt,
 		ArchivedAt:   ptrToNullInt64(s.ArchivedAt),
-		InitStatus:   s.InitStatus,
-		InitError:    ptrToNullString(s.InitError),
-		BaseRef:      s.BaseRef,
+		InitStatus:      s.InitStatus,
+		InitError:       ptrToNullString(s.InitError),
+		BaseRef:         s.BaseRef,
+		AnchorSessionID: ptrToNullString(s.AnchorSessionID),
 	}
 }
 

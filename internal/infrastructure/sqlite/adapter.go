@@ -200,9 +200,10 @@ func toTaskSnapshot(r store.TaskRow) application.TaskSnapshot {
 		CreatedAt:    r.CreatedAt,
 		UpdatedAt:    r.UpdatedAt,
 		ArchivedAt:   nullInt64ToPtr(r.ArchivedAt),
-		InitStatus:   r.InitStatus,
-		InitError:    nullStringToPtrSnapshot(r.InitError),
-		BaseRef:      r.BaseRef,
+		InitStatus:      r.InitStatus,
+		InitError:       nullStringToPtrSnapshot(r.InitError),
+		BaseRef:         r.BaseRef,
+		AnchorSessionID: nullStringToPtrSnapshot(r.AnchorSessionID),
 	}
 }
 

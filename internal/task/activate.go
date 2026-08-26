@@ -499,7 +499,7 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 	rt := m.newRuntime(taskID)
 	m.setRuntime(taskID, rt)
 	// 注册 serve group（B4：groups 真实写入注册表）。
-	rt.registerGroup("serve", serveName)
+	rt.registerGroup(roleLegacyServe, serveName)
 	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode); err != nil {
 		return newOpErr(codeProcessError, fmt.Errorf("sse subscribe: %w", err))
 	}
@@ -509,7 +509,7 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 		return newOpErr(codeProcessError, fmt.Errorf("tui session: %w", err))
 	}
 	// 注册 tui group（B4）。
-	rt.registerGroup("tui", tuiSessionName(taskID))
+	rt.registerGroup(roleLegacyTUI, tuiSessionName(taskID))
 
 	// 退出监视：serve 异常消失 → 完整清理 → suspended（design.md §4）。
 	m.watchServeExit(taskID, serveName)

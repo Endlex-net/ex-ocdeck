@@ -256,7 +256,7 @@ func (m *Manager) tryRepairRuntime(ctx context.Context, taskID string, mode Alig
 	// 重建运行时 → SSE 订阅 + 全量对齐（B7：恢复完整运行时）。mode 由 Suspend 入口传入。
 	rt := m.newRuntime(taskID)
 	m.setRuntime(taskID, rt)
-	rt.registerGroup("serve", serveName)
+	rt.registerGroup(roleLegacyServe, serveName)
 	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode); err != nil {
 		m.clearRuntime(taskID)
 		return false, fmt.Errorf("sse resubscribe: %w", err)
@@ -282,7 +282,7 @@ func (m *Manager) tryRepairRuntime(ctx context.Context, taskID string, mode Alig
 			return false, fmt.Errorf("reopen tui: %w", err)
 		}
 	}
-	rt.registerGroup("tui", tuiName)
+	rt.registerGroup(roleLegacyTUI, tuiName)
 	// 退出监视（watchers 重建）。
 	m.watchServeExit(taskID, serveName)
 	m.watchTUIExit(taskID, tuiName)

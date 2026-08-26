@@ -275,15 +275,26 @@ type taskRuntime struct {
 	mu          sync.Mutex
 }
 
+// runtimeRole 是 RuntimeGroup.Role 的强类型（design D2）。
+type runtimeRole string
+
+const (
+	roleRuntime runtimeRole = "runtime"
+	roleShell   runtimeRole = "shell"
+	// roleLegacyServe / roleLegacyTUI 仅过渡期使用（Activate 仍建双进程），Phase 2 删除。
+	roleLegacyServe runtimeRole = "serve"
+	roleLegacyTUI   runtimeRole = "tui"
+)
+
 // runtimeGroup 对应 design.md §2 RuntimeGroup。
 type runtimeGroup struct {
-	Role        string // serve / tui / shell
+	Role        runtimeRole
 	SessionName string
 	InstVersion runtime.InstVersion
 }
 
 // registerGroup 写入注册表（B4：groups 真实写入，回调校验依据）。
-func (rt *taskRuntime) registerGroup(role, sessionName string) {
+func (rt *taskRuntime) registerGroup(role runtimeRole, sessionName string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	rt.groups[sessionName] = &runtimeGroup{

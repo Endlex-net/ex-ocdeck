@@ -95,7 +95,7 @@ func TestStopAndJoinAllRuntimes_NoLeak(t *testing.T) {
 	// 手动构造活跃 runtime + SSE + serve/tui watch（复用 activate 内部步骤）。
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	rt.registerGroup("serve", serveSessionName("t1"))
+	rt.registerGroup(roleLegacyServe, serveSessionName("t1"))
 	if err := m.startSSE(lifeCtx, rt, "t1", "/wt", 50001, "pw", AlignModeRepo); err != nil {
 		t.Fatalf("startSSE: %v", err)
 	}

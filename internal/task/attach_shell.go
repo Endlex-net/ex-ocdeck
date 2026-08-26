@@ -98,7 +98,7 @@ func (m *Manager) ReopenAttach(ctx context.Context, taskID string) (TerminalID, 
 	}
 	// 注册 tui group（B4：groups 真实写入注册表）。
 	if rt := m.getRuntime(taskID); rt != nil {
-		rt.registerGroup("tui", tuiName)
+		rt.registerGroup(roleLegacyTUI, tuiName)
 	}
 	m.watchTUIExit(taskID, tuiName)
 	return TerminalID(tuiName), nil
@@ -165,7 +165,7 @@ func (m *Manager) CreateShell(ctx context.Context, taskID string) (TerminalID, e
 	}
 	// 注册 shell group（B4：groups 真实写入注册表）。
 	if rt := m.getRuntime(taskID); rt != nil {
-		rt.registerGroup("shell", shellName)
+		rt.registerGroup(roleShell, shellName)
 	}
 	m.watchShellExit(taskID, shellName)
 	return TerminalID(shellName), nil
@@ -290,7 +290,7 @@ func (m *Manager) ListShells(taskID string) ([]TerminalID, error) {
 	rt.mu.Lock()
 	var names []string
 	for sessionName, g := range rt.groups {
-		if g.Role != "shell" {
+		if g.Role != roleShell {
 			continue
 		}
 		names = append(names, sessionName)
@@ -346,7 +346,7 @@ func (m *Manager) ValidateShellTerminal(tid string) error {
 	rt.mu.Lock()
 	g, ok := rt.groups[tid]
 	rt.mu.Unlock()
-	if !ok || g == nil || g.Role != "shell" {
+	if !ok || g == nil || g.Role != roleShell {
 		return newOpErr(codeNotFound, fmt.Errorf("shell terminal %s not found (not registered as shell)", tid))
 	}
 	return nil

@@ -156,3 +156,36 @@ func TestParseNoticeJSON(t *testing.T) {
 		}
 	})
 }
+
+func TestAdapter_GetTaskRow_AnchorSessionIDRoundTrip(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := db.CreateProject(ctx, "p1", "proj", "/repo", "main", "repo"); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	if err := db.CreateTask(ctx, store.TaskRow{
+		ID: "t1", ProjectID: "p1", Name: "task", Branch: "b", Status: "suspended", WorktreePath: "/wt",
+	}); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	adapter := New(db)
+
+	empty, err := adapter.GetTaskRow(ctx, "t1")
+	if err != nil {
+		t.Fatalf("GetTaskRow empty: %v", err)
+	}
+	if empty.AnchorSessionID != nil {
+		t.Errorf("empty AnchorSessionID = %v, want nil", empty.AnchorSessionID)
+	}
+
+	if _, err := db.ClaimTaskSessionAndSetAnchor(ctx, "t1", "sess-anchor", 1, 1, 1, ""); err != nil {
+		t.Fatalf("claim+anchor: %v", err)
+	}
+	got, err := adapter.GetTaskRow(ctx, "t1")
+	if err != nil {
+		t.Fatalf("GetTaskRow: %v", err)
+	}
+	if got.AnchorSessionID == nil || *got.AnchorSessionID != "sess-anchor" {
+		t.Errorf("AnchorSessionID = %v, want sess-anchor", got.AnchorSessionID)
+	}
+}
