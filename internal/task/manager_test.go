@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // seedProjectTask 在 mockStore 中创建项目与挂起任务。

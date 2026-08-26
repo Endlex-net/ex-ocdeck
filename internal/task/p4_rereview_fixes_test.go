@@ -7,10 +7,11 @@ import (
 	"strings"
 	"testing"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
-	"ocdeck/internal/store"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // 本文件覆盖 P4 门禁复评（ora-1）5 项阻塞的测试。
@@ -100,8 +101,8 @@ type noticeCASFailStore struct {
 	TaskStore
 }
 
-func (w *noticeCASFailStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (bool, error) {
-	return false, nil
+func (w *noticeCASFailStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error) {
+	return application.MutationResult{}, nil
 }
 
 // --- Fix 3: orphan ticket 持久化闭环 ---
@@ -314,10 +315,10 @@ func TestP4Rereview_RealStore_Reconcile_RestoreFromCleanupDebts(t *testing.T) {
 // --- Fix 4: SSE failpoint 收敛 runtime 身份隔离 ---
 
 // TestP4Rereview_SSEStaleGenError_DoesNotClearNewGenRuntime 验证 P4 复评阻塞 4：
-// 旧代 SSE 错误回调的 convergeToSuspendedForGen 携带 (generation, instanceID)，拿锁后校验
-// 与当前 runtime 注册表匹配，旧代延迟错误 MUST NOT 清理新代 runtime（design.md §2 三元组隔离）。
-// 构造：Activate gen1 → 换代为 gen2（模拟 Suspend→重新 Activate）→ 用 gen1 的 (gen,instID)
-// 调用 convergeToSuspendedForGen → 断言 gen2 runtime 不受影响 + 状态仍 active。
+// 旧实例 SSE 错误回调的 convergeToSuspendedForGen 携带触发 instVersion，拿锁后校验
+// 与当前 runtime 匹配，旧实例延迟错误 MUST NOT 清理新实例 runtime（design.md §2 令牌隔离）。
+// 构造：Activate 实例1 → 换代为实例2（模拟 Suspend→重新 Activate）→ 用实例1 令牌
+// 调用 convergeToSuspendedForGen → 断言实例2 runtime 不受影响 + 状态仍 active。
 func TestP4Rereview_SSEStaleGenError_DoesNotClearNewGenRuntime(t *testing.T) {
 	s := newMockStore()
 	seedSuspendedTask(s, "t1", "p1")
@@ -328,38 +329,37 @@ func TestP4Rereview_SSEStaleGenError_DoesNotClearNewGenRuntime(t *testing.T) {
 	m := newR7TestManager(t, s, proc, newMockWorktree(), newMockOC(true))
 	m.SetLifecycleCtx(context.Background())
 
-	// 第一次 Activate（旧代 gen=1）。
+	// 第一次 Activate（旧实例）。
 	if err := m.Activate(context.Background(), "t1"); err != nil {
-		t.Fatalf("Activate gen1: %v", err)
+		t.Fatalf("Activate inst1: %v", err)
 	}
-	oldGen := m.getRuntime("t1").generation
-	oldInst := m.getRuntime("t1").instanceID
+	oldTok := m.getRuntime("t1").instVersion
 
-	// Suspend → 重新 Activate（换代为 gen=2，不同 instanceID）。
+	// Suspend → 重新 Activate（新实例令牌）。
 	if err := m.Suspend(context.Background(), "t1"); err != nil {
-		t.Fatalf("Suspend gen1: %v", err)
+		t.Fatalf("Suspend inst1: %v", err)
 	}
 	assertStatus(t, s, "t1", StatusSuspended)
 	if err := m.Activate(context.Background(), "t1"); err != nil {
-		t.Fatalf("Activate gen2: %v", err)
+		t.Fatalf("Activate inst2: %v", err)
 	}
 	newRT := m.getRuntime("t1")
 	if newRT == nil {
-		t.Fatal("new gen runtime must exist after re-Activate")
+		t.Fatal("new runtime must exist after re-Activate")
 	}
-	if newRT.generation == oldGen {
-		t.Fatalf("new gen=%d must differ from old gen=%d", newRT.generation, oldGen)
+	if newRT.instVersion == oldTok {
+		t.Fatalf("new instVersion %q must differ from old %q", newRT.instVersion, oldTok)
 	}
 	assertStatus(t, s, "t1", StatusActive)
 
-	// 旧代延迟 SSE 错误回调到达：用 gen1 的 (generation, instanceID) 调用 convergeToSuspendedForGen。
-	// 拿锁后校验 gen != 当前 gen2 → 跳过收敛（不清理新代 runtime）。
-	m.convergeToSuspendedForGen("t1", "stale gen sse error callback", oldGen, oldInst)
+	// 旧实例延迟 SSE 错误回调到达：用实例1 令牌调用 convergeToSuspendedForGen。
+	// 拿锁后校验令牌 != 当前实例 → 跳过收敛（不清理新实例 runtime）。
+	m.convergeToSuspendedForGen("t1", "stale gen sse error callback", oldTok)
 
-	// 断言：新代 runtime 仍存在 + 状态仍 active（旧代延迟错误未清理新代）。
+	// 断言：新实例 runtime 仍存在 + 状态仍 active（旧实例延迟错误未清理新实例）。
 	cur := m.getRuntime("t1")
-	if cur == nil || cur.generation != newRT.generation {
-		t.Fatal("stale gen SSE error callback MUST NOT clear new gen runtime (identity isolation)")
+	if cur == nil || cur.instVersion != newRT.instVersion {
+		t.Fatal("stale SSE error callback MUST NOT clear new runtime (identity isolation)")
 	}
 	assertStatus(t, s, "t1", StatusActive)
 }
@@ -381,7 +381,7 @@ func TestP4Rereview_SSEStaleGenError_CurrentGenConverges(t *testing.T) {
 	}
 	rt := m.getRuntime("t1")
 	// 当前代的 SSE 错误回调 → gen 校验通过 → 正常收敛到 suspended。
-	m.convergeToSuspendedForGen("t1", "current gen sse error", rt.generation, rt.instanceID)
+	m.convergeToSuspendedForGen("t1", "current gen sse error", rt.instVersion)
 	assertStatus(t, s, "t1", StatusSuspended)
 }
 
@@ -401,7 +401,10 @@ func TestP4Rereview_ConvergeToSuspended_CleanupInfraError_FormsRetryableDebt(t *
 	proc.hasSessionErr = errors.New("tmux infra: has session failed")
 	m := newR7TestManager(t, s, proc, newMockWorktree(), newMockOC(true))
 
-	m.convergeToSuspended("t1", "test converge fail-closed")
+	// P1.4.7：converge 统一携带触发令牌（design.md D0:150）——构造 runtime 并以其令牌触发。
+	rt := m.newRuntime("t1")
+	m.setRuntime("t1", rt)
+	m.convergeToSuspended("t1", "test converge fail-closed", rt.instVersion)
 	// MUST 收敛到 suspended。
 	assertStatus(t, s, "t1", StatusSuspended)
 	// MUST 记 retryable notice（cleanup infra 错误形成可重试 debt）。
@@ -441,7 +444,10 @@ func TestP4Rereview_ConvergeToSuspended_StatusCommitFailure_LogsAndDoesNotSilent
 	errStore := wrapStatusErr(s, errors.New("db: status commit failed"))
 	m := newR7TestManager(t, errStore, proc, newMockWorktree(), newMockOC(true))
 
-	m.convergeToSuspended("t1", "test status commit failure")
+	// P1.4.7：converge 统一携带触发令牌——构造 runtime 并以其令牌触发。
+	rt := m.newRuntime("t1")
+	m.setRuntime("t1", rt)
+	m.convergeToSuspended("t1", "test status commit failure", rt.instVersion)
 	// 状态提交失败 → DB 仍 active（未落 suspended）。
 	assertStatus(t, s, "t1", StatusActive)
 	// 既有 notice MUST NOT 被移除。

@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // mockNamer 实现 BranchNamer，记录调用并返回预设 slug。

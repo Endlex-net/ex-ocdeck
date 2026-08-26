@@ -1,0 +1,157 @@
+// dto.go 定义 API 契约侧的任务/会话/注意力/Git DTO 与状态常量（design.md D5/§21）。
+//
+// sse-active-sessions P1.9a：定义自 internal/task 迁移至此，锁定 import 方向
+// api → application（design.md D0:55）；internal/task 保留同名类型/常量别名，
+// 既有引用零改动。字段、JSON tag、常量值与迁移前逐字一致（零 wire/DTO/行为变更）。
+package application
+
+import (
+	"database/sql"
+
+	"ocdeck/internal/infrastructure/opencode"
+)
+
+// DeleteMode 删除模式（design.md §19）。
+type DeleteMode string
+
+const (
+	DeleteNormal DeleteMode = "normal"
+	DeleteForce  DeleteMode = "force"
+)
+
+// TerminalID 标识一个 shell 终端（design.md §18 CreateShell/CloseShell）。
+type TerminalID string
+
+// Status 用户态 + 内部过渡态（design.md §5）。
+const (
+	StatusSuspended      = "suspended"
+	StatusActive         = "active"
+	StatusArchived       = "archived"
+	StatusCreating       = "creating"
+	StatusCreationFailed = "creation_failed"
+	StatusActivating     = "activating"
+	StatusSuspending     = "suspending"
+	StatusDeleting       = "deleting"
+	StatusDeletionFailed = "deletion_failed"
+)
+
+// InitStatus init_status 域（design.md §3：none | pending | running | succeeded | failed）。
+// Create 链按是否配置 init 脚本落 pending（待 InitRunner 执行）或 none（无脚本直接激活）。
+// 既有任务迁移为 none。Activate 门禁按 §5 五分支放行/拒绝。
+const (
+	InitStatusNone      = "none"
+	InitStatusPending   = "pending"
+	InitStatusRunning   = "running"
+	InitStatusSucceeded = "succeeded"
+	InitStatusFailed    = "failed"
+)
+
+// TaskRow tasks 表行映射（解耦 store 包结构，design.md §18）。
+// BaseRef 为 repo 任务的基线分支全引用，dir 项目任务为空串（add-plain-dir-project D10）。
+type TaskRow struct {
+	ID           string
+	ProjectID    string
+	Name         string
+	Branch       string
+	Status       string
+	WorktreePath string
+	LastPort     sql.NullInt64
+	LastError    sql.NullString
+	Notice       sql.NullString
+	DeleteMode   sql.NullString
+	EnvSnapshot  sql.NullString
+	CreatedAt    int64
+	UpdatedAt    int64
+	ArchivedAt   sql.NullInt64
+	InitStatus   string
+	InitError    sql.NullString
+	BaseRef      string
+}
+
+// SessionRow 会话归属行（解耦 store 包结构，design.md §18）。
+type SessionRow struct {
+	TaskID           string
+	SessionID        string
+	SessionCreatedAt int64
+	FirstSeenAt      int64
+	LastSeenAt       int64
+	// ParentID 非空表示 background subagent 子会话；空为顶层会话（design.md §4 锚定隔离）。
+	ParentID string
+}
+
+// ActiveTaskOverviewRow 跨项目 active 任务概览投影行（cross-project-active-sessions D1/D2）。
+// 仅供 GET /api/v1/tasks/active 读模型：字段与 store.ActiveTaskOverviewRow 一一对应，
+// 不携带 agentStatus（由 API 层组装读内存快照填充到 DTO，sse-active-sessions P2.2）。
+type ActiveTaskOverviewRow struct {
+	ID           string
+	ProjectID    string
+	ProjectName  string
+	Name         string
+	Branch       string
+	WorktreePath string
+	LastActiveAt int64
+}
+
+// --- 注意力信号三层类型模型（含 Since，本地首次观察时间） ---
+
+// PendingPermission task 层 pending 权限请求。Since 为本地首次观察 Unix 秒
+// （SSE asked 到达时刻；REST 对账同 ID 保留原 since，新 ID 取对账时刻，design.md D6）。
+type PendingPermission struct {
+	opencode.PermissionRequest
+	Since int64
+}
+
+// PendingQuestion task 层 pending 问题请求。Since 同 PendingPermission。
+type PendingQuestion struct {
+	opencode.QuestionRequest
+	Since int64
+}
+
+// Attention 是任务注意力信号的只读快照（design.md D6 API 透出）。
+// 拷贝语义：attentionSnapshot 返回深拷贝，调用方可安全持有。
+// 无 pending 时为非 nil 空切片（空数组非 null，spec）。
+type Attention struct {
+	Permissions []PendingPermission
+	Questions   []PendingQuestion
+}
+
+// ProjectTaskSummary 项目任务摘要（design.md D4：10 存储字段 + attention_count，
+// GET /projects tasks 摘要）。
+type ProjectTaskSummary struct {
+	TaskID         string
+	Name           string
+	ProjectID      string
+	Status         string
+	InitStatus     string
+	Branch         string
+	WorktreePath   string
+	LastError      string
+	Notice         string
+	UpdatedAt      int64
+	AttentionCount int
+}
+
+// GitFileDTO 单文件状态（design.md §21 git/status，与 internal/api/git.go gitFileDTO 字段一致）。
+type GitFileDTO struct {
+	Path      string `json:"path"`
+	X         string `json:"x"`
+	Y         string `json:"y"`
+	Staged    bool   `json:"staged"`
+	Unstaged  bool   `json:"unstaged"`
+	Untracked bool   `json:"untracked"`
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+	IsBinary  bool   `json:"isBinary"`
+}
+
+// GitStatusDTO status 响应（含当前分支，design.md §21 git/status）。
+type GitStatusDTO struct {
+	Branch string       `json:"branch"`
+	Files  []GitFileDTO `json:"files"`
+}
+
+// GitDiffDTO diff 响应（unified diff 文本 + 截断标记，design.md §21 git/diff）。
+type GitDiffDTO struct {
+	Diff      string `json:"diff"`
+	Truncated bool   `json:"truncated"`
+}

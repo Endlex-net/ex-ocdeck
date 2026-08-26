@@ -15,14 +15,17 @@ import (
 	"syscall"
 	"time"
 
-	"ocdeck/internal/ai"
 	"ocdeck/internal/api"
+	apptask "ocdeck/internal/application/task"
 	"ocdeck/internal/config"
-	"ocdeck/internal/lifecycle"
-	"ocdeck/internal/process"
-	"ocdeck/internal/store"
+	"ocdeck/internal/infrastructure/ai"
+	"ocdeck/internal/infrastructure/eventbus"
+	"ocdeck/internal/infrastructure/lifecycle"
+	"ocdeck/internal/infrastructure/process"
+	sqlite "ocdeck/internal/infrastructure/sqlite"
+	"ocdeck/internal/infrastructure/store"
+	"ocdeck/internal/infrastructure/worktree"
 	"ocdeck/internal/task"
-	"ocdeck/internal/worktree"
 )
 
 func main() {
@@ -105,6 +108,20 @@ func run() error {
 
 	// TaskManager 构造（design.md §18）。
 	adapter := task.NewStoreAdapter(db)
+	// P1.4.4/P1.4.5 wiring：sqlite adapter 实现 application ports（TaskRepository +
+	// TaskReadRepository + SessionRepository），经 application/task LifecycleService 编排
+	// Get/List/Archive/Restore 与 session claim/touch/delete/align/attention 提交位，
+	// 注入 Manager facade。P1.6.5：单例 bus 经窄 Publisher 接口注入（commit helper
+	// 真实发布领域事件；*eventbus.Bus 结构性满足 application.Publisher），
+	// 同一 bus 供 Phase 2 SSE 消费侧订阅。
+	bus := eventbus.New()
+	appAdapter := sqlite.New(db)
+	lifecycleSvc := apptask.New(apptask.Options{
+		Tasks:    appAdapter,
+		Read:     appAdapter,
+		Sessions: appAdapter,
+		Publish:  bus,
+	})
 	tm := task.New(task.Options{
 		Cfg:             cfg,
 		Store:           adapter,
@@ -114,6 +131,7 @@ func run() error {
 		LifecycleRunner: lifecycle.New(), // design.md §7.1：init/pre-delete 脚本与 inherit
 		LogDir:          cfg.DataDir + "/logs",
 		Namer:           namer, // ai-worktree-naming：Create 经 LLM 提炼分支 slug，未配置时内部回退 Slugify
+		Lifecycle:       lifecycleSvc, // P1.4.4：Get/List/Archive/Restore 委托
 	})
 	// 注入 Manager 生命周期 context（design.md §4：SSE/退出监视挂进程 ctx，非 HTTP request ctx）。
 	tm.SetLifecycleCtx(ctx)
@@ -129,6 +147,9 @@ func run() error {
 
 	srv := api.New(cfg, db)
 	srv.SetTaskBackend(tm)
+	// P1.6.5：消费侧注入同一 bus（经 eventSubscriberAdapter 适配 api.EventSubscriber；
+	// SSE 端点消费在 Phase 2 建立），须在 RebuildRoutes 前生效。
+	srv.SetEventSubscriber(eventSubscriberAdapter{bus})
 	// AI 配置 Store 注入 API 层（design.md D7 wiring）：单实例同时供给命名链。
 	// 沿用 SetTaskBackend 位置模式，须在 RebuildRoutes 前生效。
 	srv.SetAIConfigStore(aiStore)

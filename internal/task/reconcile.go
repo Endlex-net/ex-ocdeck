@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // Reconcile 启动 reconciliation（design.md §5 + §10 shutdownPolicy 三模式 + tasks 3.8）。
@@ -22,7 +22,7 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 	// tasks 3.8：ConvergeInterruptedInitRuns MUST 先于既有启动恢复步骤执行——
 	// 把 init_status∈{pending,running} 的任务收敛为 failed（interrupted by server restart）。
 	// 更新失败 MUST fail-closed 阻止 HTTP 开放。
-	if n, err := m.store.ConvergeInterruptedInitRuns(ctx); err != nil {
+	if n, err := m.writeConvergeInterruptedInitRuns(ctx); err != nil {
 		return fmt.Errorf("reconcile: converge interrupted init runs: %w", err)
 	} else if n > 0 {
 		log.Printf("reconcile: converged %d interrupted init runs", n)
@@ -113,11 +113,11 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 // 检查并返回（不得 _, _ 吞没）——committed=false 表示状态已被外部改动（CAS 不匹配），
 // 调用方据此聚合进 Reconcile 返回值，main 据此拒开 HTTP。返回 nil 仅当 CAS 成功提交。
 func (m *Manager) commitSuspendedReconcile(ctx context.Context, taskID, fromStatus, lastError string) error {
-	committed, err := m.store.UpdateTaskStatusConditional(ctx, taskID, fromStatus, StatusSuspended, sql.NullString{String: lastError, Valid: lastError != ""})
+	committed, err := m.writeStatusConditional(ctx, taskID, fromStatus, StatusSuspended, sql.NullString{String: lastError, Valid: lastError != ""})
 	if err != nil {
 		return fmt.Errorf("commit suspended (from %s): %w", fromStatus, err)
 	}
-	if !committed {
+	if !committed.Matched {
 		return fmt.Errorf("commit suspended (from %s): CAS not matched (state changed concurrently)", fromStatus)
 	}
 	return nil
@@ -190,7 +190,7 @@ func (m *Manager) reconcilePersist(ctx context.Context, tasks []TaskRow, session
 			if kerr := m.killTaskSessionsReconcile(ctx, t.ID, names); kerr != nil {
 				errs = append(errs, fmt.Errorf("task %s kill sessions: %w", t.ID, kerr))
 			}
-			if serr := m.store.UpdateTaskStatus(ctx, t.ID, StatusSuspended, sql.NullString{}); serr != nil {
+			if _, serr := m.writeStatus(ctx, t.ID, StatusSuspended, sql.NullString{}); serr != nil {
 				errs = append(errs, fmt.Errorf("task %s commit suspended: %w", t.ID, serr))
 			}
 		case StatusSuspended, StatusArchived:
@@ -205,7 +205,7 @@ func (m *Manager) reconcilePersist(ctx context.Context, tasks []TaskRow, session
 			if kerr := m.killTaskSessionsReconcile(ctx, t.ID, names); kerr != nil {
 				errs = append(errs, fmt.Errorf("task %s kill sessions: %w", t.ID, kerr))
 			}
-			if serr := m.store.UpdateTaskStatus(ctx, t.ID, StatusCreationFailed, sql.NullString{String: "reconcile: interrupted during creating", Valid: true}); serr != nil {
+			if _, serr := m.writeStatus(ctx, t.ID, StatusCreationFailed, sql.NullString{String: "reconcile: interrupted during creating", Valid: true}); serr != nil {
 				errs = append(errs, fmt.Errorf("task %s commit creation_failed: %w", t.ID, serr))
 			}
 		case StatusCreationFailed:
@@ -236,7 +236,7 @@ func (m *Manager) reconcileKill(ctx context.Context, tasks []TaskRow, sessions [
 	for _, t := range tasks {
 		switch t.Status {
 		case StatusActive, StatusActivating, StatusSuspending:
-			if serr := m.store.UpdateTaskStatus(ctx, t.ID, StatusSuspended, sql.NullString{String: "kill mode reconcile", Valid: true}); serr != nil {
+			if _, serr := m.writeStatus(ctx, t.ID, StatusSuspended, sql.NullString{String: "kill mode reconcile", Valid: true}); serr != nil {
 				errs = append(errs, fmt.Errorf("task %s commit suspended: %w", t.ID, serr))
 			}
 		}
@@ -318,7 +318,7 @@ func (m *Manager) resumeActive(ctx context.Context, t TaskRow) error {
 	}
 	// 标记 active（提交点；失败 MUST 返回错误，main 的 fail-closed 才能覆盖，B9）。
 	// 运行时已完整恢复（SSE + watchers + groups），此时提交 active 不会留假状态。
-	if err := m.store.UpdateTaskStatus(ctx, t.ID, StatusActive, sql.NullString{}); err != nil {
+	if _, err := m.writeStatus(ctx, t.ID, StatusActive, sql.NullString{}); err != nil {
 		m.clearRuntime(t.ID)
 		return fmt.Errorf("commit active on resume: %w", err)
 	}
@@ -430,7 +430,7 @@ func (m *Manager) cleanupTaskRuntimeReconcile(ctx context.Context, taskID string
 	// kill 残余会话（记 notice）。
 	kerr := m.killTaskSessionsReconcile(ctx, taskID, names)
 	// 清除 env 快照（design.md §2：kill 模式 reconcile 落 suspended 清快照）。
-	if serr := m.store.UpdateTaskEnvSnapshot(ctx, taskID, sql.NullString{}); serr != nil {
+	if _, serr := m.writeEnvSnapshot(ctx, taskID, sql.NullString{}); serr != nil {
 		return errors.Join(kerr, fmt.Errorf("clear env snapshot: %w", serr))
 	}
 	return kerr

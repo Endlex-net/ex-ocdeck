@@ -8,8 +8,8 @@ import (
 
 	"github.com/coder/websocket"
 
-	"ocdeck/internal/pty"
-	"ocdeck/internal/task"
+	"ocdeck/internal/application"
+	"ocdeck/internal/infrastructure/pty"
 )
 
 // handleWSTUI 处理 /ws/terminal/:taskID（TUI 终端，design.md §7/§21）。
@@ -43,7 +43,7 @@ func (s *Server) handleWSTUI(w http.ResponseWriter, r *http.Request) {
 	// → 1011 internal error，不得误判为 4010 掩盖 infra 故障（design.md §8/§21）。
 	tid, err := s.tasks.ReopenAttach(r.Context(), taskID)
 	if err != nil {
-		code := ErrorCode(task.OpErrorCode(err))
+		code := ErrorCode(application.OpErrorCode(err))
 		switch code {
 		case CodeInvalidState, CodeNotFound, CodeConflict:
 			wsClose(context.Background(), c, wsCloseTaskSuspended, "task not active")
@@ -103,7 +103,7 @@ func (s *Server) handleWSShell(w http.ResponseWriter, r *http.Request) {
 	//   - process_error/internal（tmux 基础设施故障等服务端错误）→ 1011（internal error），
 	//     走默认重连路径（临时故障可恢复），不得误发 4004 致前端永久停止。
 	if err := s.tasks.ValidateShellTerminal(tid); err != nil {
-		code := ErrorCode(task.OpErrorCode(err))
+		code := ErrorCode(application.OpErrorCode(err))
 		switch code {
 		case CodeNotFound, CodeInvalidInput, CodeConflict:
 			wsClose(context.Background(), c, wsCloseTerminalNotFound, "terminal not found")

@@ -6,36 +6,36 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sync"
 	"testing"
-	"time"
 
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/task"
+	"ocdeck/internal/application"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // attentionTaskBackend 注入 Attention 返回值，供 API 透出字段测试。
 type attentionTaskBackend struct {
 	*fakeTaskBackend
-	attention   task.Attention
+	attention   application.Attention
 	attentionOk bool
 }
 
-func (b *attentionTaskBackend) Attention(taskID string) (task.Attention, bool) {
+func (b *attentionTaskBackend) Attention(taskID string) (application.Attention, bool) {
 	return b.attention, b.attentionOk
 }
 
-func (b *attentionTaskBackend) Get(ctx context.Context, taskID string) (task.TaskRow, error) {
-	return task.TaskRow{ID: taskID, ProjectID: "p1", Status: task.StatusActive}, nil
+func (b *attentionTaskBackend) Get(ctx context.Context, taskID string) (application.TaskRow, error) {
+	return application.TaskRow{ID: taskID, ProjectID: "p1", Status: application.StatusActive}, nil
 }
 
 func TestGetTask_AttentionFields(t *testing.T) {
-	perm := task.PendingPermission{
+	perm := application.PendingPermission{
 		PermissionRequest: opencode.PermissionRequest{
 			ID: "perm1", SessionID: "s1", Permission: "bash", Patterns: []string{"rm", "ls"},
 		},
 		Since: 1700000000,
 	}
-	quest := task.PendingQuestion{
+	quest := application.PendingQuestion{
 		QuestionRequest: opencode.QuestionRequest{
 			ID: "quest1", SessionID: "s1",
 			Questions: []opencode.QuestionItem{{Header: "h1", Question: "what?"}},
@@ -44,7 +44,7 @@ func TestGetTask_AttentionFields(t *testing.T) {
 	}
 	tb := &attentionTaskBackend{
 		fakeTaskBackend: &fakeTaskBackend{},
-		attention:       task.Attention{Permissions: []task.PendingPermission{perm}, Questions: []task.PendingQuestion{quest}},
+		attention:       application.Attention{Permissions: []application.PendingPermission{perm}, Questions: []application.PendingQuestion{quest}},
 		attentionOk:     true,
 	}
 	projs := newFakeProjectStore()
@@ -88,7 +88,7 @@ func TestGetTask_AttentionFields(t *testing.T) {
 func TestGetTask_AttentionEmptyArrayNotNull(t *testing.T) {
 	tb := &attentionTaskBackend{
 		fakeTaskBackend: &fakeTaskBackend{},
-		attention:       task.Attention{Permissions: []task.PendingPermission{}, Questions: []task.PendingQuestion{}},
+		attention:       application.Attention{Permissions: []application.PendingPermission{}, Questions: []application.PendingQuestion{}},
 		attentionOk:     false,
 	}
 	projs := newFakeProjectStore()
@@ -124,9 +124,9 @@ func TestGetTask_AttentionEmptyArrayNotNull(t *testing.T) {
 	}
 }
 
-// TestListActiveSessions_AttentionEmptyArrayNotNull 验证 sessions/active 元素 attention 空数组非 null。
+// TestListActiveSessions_AttentionEmptyArrayNotNull 验证 tasks/active 元素 attention 空数组非 null。
 func TestListActiveSessions_AttentionEmptyArrayNotNull(t *testing.T) {
-	rows := []task.ActiveTaskOverviewRow{
+	rows := []application.ActiveTaskOverviewRow{
 		activeRow("t1", "p1", "projA", "taskA", "bA", "/wtA", 300),
 	}
 	tb := newActiveSessionsBackend(rows...)
@@ -134,7 +134,7 @@ func TestListActiveSessions_AttentionEmptyArrayNotNull(t *testing.T) {
 	ts := httptest.NewServer(s.mux)
 	defer ts.Close()
 
-	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/sessions/active", ""))
+	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/tasks/active", ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,18 +152,19 @@ func TestListActiveSessions_AttentionEmptyArrayNotNull(t *testing.T) {
 func TestListProjects_TaskSummaries(t *testing.T) {
 	tb := &projectSummaryBackend{
 		fakeTaskBackend: &fakeTaskBackend{},
-		summaries: []task.ProjectTaskSummary{
-			{TaskID: "t1", Name: "taskA", ProjectID: "p1", Status: task.StatusActive,
-				InitStatus: task.InitStatusNone, Branch: "b1", WorktreePath: "/wt1",
+		summaries: []application.ProjectTaskSummary{
+			{TaskID: "t1", Name: "taskA", ProjectID: "p1", Status: application.StatusActive,
+				InitStatus: application.InitStatusNone, Branch: "b1", WorktreePath: "/wt1",
 				UpdatedAt: 100, AttentionCount: 2},
-			{TaskID: "t2", Name: "taskB", ProjectID: "p1", Status: task.StatusSuspended,
-				InitStatus: task.InitStatusSucceeded, Branch: "b2", WorktreePath: "/wt2",
+			{TaskID: "t2", Name: "taskB", ProjectID: "p1", Status: application.StatusSuspended,
+				InitStatus: application.InitStatusSucceeded, Branch: "b2", WorktreePath: "/wt2",
 				UpdatedAt: 200, AttentionCount: 0},
 		},
+		agentStatusSnapshot: map[string]string{"t1": "busy"},
 	}
 	projs := newFakeProjectStore()
 	projs.projects["p1"] = storeProjectRow{ID: "p1", Name: "projA", Path: "/p", DefaultBranch: "main", Kind: "repo", CreatedAt: 50}
-	projs.counts["p1"] = storeTaskCounts{Total: 2, ByStatus: map[string]int{task.StatusActive: 1, task.StatusSuspended: 1}}
+	projs.counts["p1"] = storeTaskCounts{Total: 2, ByStatus: map[string]int{application.StatusActive: 1, application.StatusSuspended: 1}}
 
 	s := newAPITestServer(t, tb)
 	s.projs = projs
@@ -192,57 +193,86 @@ func TestListProjects_TaskSummaries(t *testing.T) {
 	if len(got[0].TaskSummaries) != 2 {
 		t.Fatalf("tasks summaries len = %d, want 2", len(got[0].TaskSummaries))
 	}
-	// attention_count 字段验证
+	// updated_at / attention_count / agentStatus 快照字段透传验证。updated_at 为 P1.9a
+	// 迁移回归锚点：seed 值（100/200）必须原样到达响应，映射丢失或零值即失败。
+	// agentStatus（projects-stream）：t1（active）读内存快照 busy；t2（suspended）不读、省略。
 	for _, ts := range got[0].TaskSummaries {
-		if ts.ID == "t1" && ts.AttentionCount != 2 {
-			t.Errorf("t1 attention_count = %d, want 2", ts.AttentionCount)
+		switch ts.ID {
+		case "t1":
+			if ts.UpdatedAt != 100 {
+				t.Errorf("t1 updated_at = %d, want 100", ts.UpdatedAt)
+			}
+			if ts.AttentionCount != 2 {
+				t.Errorf("t1 attention_count = %d, want 2", ts.AttentionCount)
+			}
+			if ts.AgentStatus != "busy" {
+				t.Errorf("t1 agentStatus = %q, want busy (memory snapshot)", ts.AgentStatus)
+			}
+		case "t2":
+			if ts.UpdatedAt != 200 {
+				t.Errorf("t2 updated_at = %d, want 200", ts.UpdatedAt)
+			}
+			if ts.AgentStatus != "" {
+				t.Errorf("t2 agentStatus = %q, want empty (suspended, not hydrated)", ts.AgentStatus)
+			}
 		}
+	}
+	// projects-stream：/projects MUST NOT 实时探测 agentStatus。
+	if calls := tb.agentStatusCallCount(); calls != 0 {
+		t.Errorf("AgentStatus realtime probe called %d times, want 0", calls)
 	}
 }
 
-// projectSummaryBackend 注入 ListProjectTaskSummaries 返回值。
+// projectSummaryBackend 注入 ListProjectTaskSummaries 返回值；projects-stream 起 agentStatus
+// 经 agentStatusSnapshot 内存快照注入（与 activeSessionsBackend 同模式），
+// 实时探测 AgentStatus 仅记录调用供断言「不再实时探测」。
 type projectSummaryBackend struct {
 	*fakeTaskBackend
-	summaries []task.ProjectTaskSummary
+	summaries []application.ProjectTaskSummary
+	// agentStatusSnapshot 注入每个 taskID 的内存快照值；缺省返回空串（降级）。
+	agentStatusSnapshot map[string]string
+	// agentStatusCalls 记录实时探测 AgentStatus 被调用的 taskID。
+	agentStatusMu    sync.Mutex
+	agentStatusCalls []string
 }
 
-func (b *projectSummaryBackend) ListProjectTaskSummaries(ctx context.Context) ([]task.ProjectTaskSummary, error) {
-	out := make([]task.ProjectTaskSummary, len(b.summaries))
+func (b *projectSummaryBackend) ListProjectTaskSummaries(ctx context.Context) ([]application.ProjectTaskSummary, error) {
+	out := make([]application.ProjectTaskSummary, len(b.summaries))
 	copy(out, b.summaries)
 	return out, nil
 }
 
-// slowAgentStatusBackend 注入阻塞 AgentStatus（测试水合 deadline 生效）。
-type slowAgentStatusBackend struct {
-	*projectSummaryBackend
-	delay time.Duration
+// AgentStatus 实时探测：projects-stream 后 /projects 改读内存快照，本方法仅记录调用供断言。
+func (b *projectSummaryBackend) AgentStatus(ctx context.Context, taskID string) string {
+	b.agentStatusMu.Lock()
+	b.agentStatusCalls = append(b.agentStatusCalls, taskID)
+	b.agentStatusMu.Unlock()
+	return ""
 }
 
-func (b *slowAgentStatusBackend) AgentStatus(ctx context.Context, taskID string) string {
-	select {
-	case <-time.After(b.delay):
-		return "idle"
-	case <-ctx.Done():
-		return "" // deadline 命中 → 省略
-	}
+func (b *projectSummaryBackend) AgentStatusSnapshot(taskID string) string {
+	return b.agentStatusSnapshot[taskID]
 }
 
-// TestListProjects_HydrationDeadline 验证水合 3s 预算生效：
-// AgentStatus 阻塞 10s 但水合 deadline 3s 后放弃，响应在 ~3s 内返回且 agentStatus 省略。
-func TestListProjects_HydrationDeadline(t *testing.T) {
-	tb := &slowAgentStatusBackend{
-		projectSummaryBackend: &projectSummaryBackend{
-			fakeTaskBackend: &fakeTaskBackend{},
-			summaries: []task.ProjectTaskSummary{
-				{TaskID: "t1", Name: "taskA", ProjectID: "p1", Status: task.StatusActive,
-					InitStatus: task.InitStatusNone, Branch: "b1", WorktreePath: "/wt1", UpdatedAt: 100},
-			},
+func (b *projectSummaryBackend) agentStatusCallCount() int {
+	b.agentStatusMu.Lock()
+	defer b.agentStatusMu.Unlock()
+	return len(b.agentStatusCalls)
+}
+
+// TestListProjects_AgentStatusSnapshotDegradation 验证 active 任务无内存快照时
+// agentStatus 省略（projects-stream 降级语义：快照不可用 → omitempty，不实时探测、不阻塞响应）。
+func TestListProjects_AgentStatusSnapshotDegradation(t *testing.T) {
+	tb := &projectSummaryBackend{
+		fakeTaskBackend: &fakeTaskBackend{},
+		summaries: []application.ProjectTaskSummary{
+			{TaskID: "t1", Name: "taskA", ProjectID: "p1", Status: application.StatusActive,
+				InitStatus: application.InitStatusNone, Branch: "b1", WorktreePath: "/wt1", UpdatedAt: 100},
 		},
-		delay: 10 * time.Second,
 	}
 	projs := newFakeProjectStore()
 	projs.projects["p1"] = storeProjectRow{ID: "p1", Name: "projA", Path: "/p", DefaultBranch: "main", Kind: "repo", CreatedAt: 50}
-	projs.counts["p1"] = storeTaskCounts{Total: 1, ByStatus: map[string]int{task.StatusActive: 1}}
+	projs.counts["p1"] = storeTaskCounts{Total: 1, ByStatus: map[string]int{application.StatusActive: 1}}
 
 	s := newAPITestServer(t, tb)
 	s.projs = projs
@@ -250,19 +280,13 @@ func TestListProjects_HydrationDeadline(t *testing.T) {
 	ts := httptest.NewServer(s.mux)
 	defer ts.Close()
 
-	start := time.Now()
 	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/projects", ""))
-	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	// 水合 deadline 3s + 少量开销，远小于 10s
-	if elapsed > 6*time.Second {
-		t.Fatalf("hydration did not respect 3s deadline: took %v", elapsed)
 	}
 	var got []projectDTO
 	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
@@ -271,8 +295,12 @@ func TestListProjects_HydrationDeadline(t *testing.T) {
 	if len(got) != 1 || len(got[0].TaskSummaries) != 1 {
 		t.Fatalf("unexpected response: %+v", got)
 	}
-	// agentStatus 应被省略（水合超时降级）
+	// 无快照 → 空串省略（降级）。
 	if got[0].TaskSummaries[0].AgentStatus != "" {
-		t.Errorf("agentStatus should be omitted on deadline, got %q", got[0].TaskSummaries[0].AgentStatus)
+		t.Errorf("agentStatus = %q, want empty (snapshot unavailable, degraded)", got[0].TaskSummaries[0].AgentStatus)
+	}
+	// MUST NOT 实时探测。
+	if calls := tb.agentStatusCallCount(); calls != 0 {
+		t.Errorf("AgentStatus realtime probe called %d times, want 0", calls)
 	}
 }

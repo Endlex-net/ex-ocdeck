@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
   AttentionKind,
   buildCommandCenterView,
@@ -492,9 +494,9 @@ describe('shouldClearRefreshing finally 清刷新标志', () => {
   });
 });
 
-// ---------------- sessions 首屏状态机（loading / error / empty / ready） ----------------
+// ---------------- sessions 首屏状态机（loading / connecting / error / empty / ready） ----------------
 
-describe('resolveSessionsBootstrap sessions 首屏状态机', () => {
+describe('resolveSessionsBootstrap sessions 首屏状态机（SSE 版）', () => {
   const base = {
     projectsInit: false,
     projectsLen: 0,
@@ -507,24 +509,64 @@ describe('resolveSessionsBootstrap sessions 首屏状态机', () => {
     parkedLen: 0,
   };
 
-  it('尚未完成首次请求且无数据 → loading', () => {
+  it('projects 未初始化且无数据 → loading（sessions 各阶段均不改变整页 loading 判定）', () => {
     expect(resolveSessionsBootstrap(base)).toBe('loading');
-    expect(resolveSessionsBootstrap({ ...base, projectsInit: true })).toBe('loading');
-  });
-
-  it('首次 sessions 失败 → error（不 loading、不 empty）', () => {
+    expect(resolveSessionsBootstrap({ ...base, sessionsAttempted: true })).toBe('loading');
     expect(
-      resolveSessionsBootstrap({
-        ...base,
-        projectsInit: true,
-        sessionsAttempted: true,
-        sessionsInitialized: false,
-        sessionsError: '加载活跃会话失败',
-      }),
-    ).toBe('error');
+      resolveSessionsBootstrap({ ...base, sessionsAttempted: true, sessionsInitialized: true }),
+    ).toBe('loading');
   });
 
-  it('两侧成功初始化且无任务 → empty', () => {
+  it('projects 初始化为空 + sessions 首帧未到 → connecting（不整页 loading、不空态）', () => {
+    const phase = resolveSessionsBootstrap({ ...base, projectsInit: true });
+    expect(phase).toBe('connecting');
+    expect(phase).not.toBe('loading');
+    expect(phase).not.toBe('empty');
+  });
+
+  it('projects 有数据 + sessions 首帧未到 → connecting（不升级整页 loading，projects-only 照常渲染）', () => {
+    const phase = resolveSessionsBootstrap({
+      ...base,
+      projectsInit: true,
+      projectsLen: 1,
+      activeLen: 2,
+    });
+    expect(phase).toBe('connecting');
+    expect(phase).not.toBe('loading');
+    // 分区有条目仍渲染列表（projects-only 数据不隐藏）
+    expect(sectionBodyMode(phase, 2)).toBe('list');
+    // 空分区不显示「暂无…」占位
+    expect(sectionBodyMode(phase, 0)).toBe('none');
+  });
+
+  it('首次连接失败 → error（不与 connecting/loading/empty 并存）', () => {
+    const phase = resolveSessionsBootstrap({
+      ...base,
+      projectsInit: true,
+      sessionsAttempted: true,
+      sessionsInitialized: false,
+      sessionsError: '无法连接服务端（ocdeck-server 未运行？）',
+    });
+    expect(phase).toBe('error');
+    expect(phase).not.toBe('connecting');
+    expect(phase).not.toBe('loading');
+    expect(phase).not.toBe('empty');
+  });
+
+  it('projects 非空 + sessions 首帧为空数组 → ready（继续 projects-only 渲染，不显示全局空态）', () => {
+    const phase = resolveSessionsBootstrap({
+      ...base,
+      projectsInit: true,
+      projectsLen: 1,
+      sessionsAttempted: true,
+      sessionsInitialized: true,
+      activeLen: 1,
+    });
+    expect(phase).toBe('ready');
+    expect(phase).not.toBe('empty');
+  });
+
+  it('两侧均成功初始化且三区皆空 → empty', () => {
     expect(
       resolveSessionsBootstrap({
         ...base,
@@ -534,40 +576,12 @@ describe('resolveSessionsBootstrap sessions 首屏状态机', () => {
       }),
     ).toBe('empty');
   });
-
-  it('成功空 sessions 但有活跃任务分区 → ready（非 empty）', () => {
-    expect(
-      resolveSessionsBootstrap({
-        ...base,
-        projectsInit: true,
-        projectsLen: 1,
-        sessionsAttempted: true,
-        sessionsInitialized: true,
-        activeLen: 2,
-      }),
-    ).toBe('ready');
-  });
-
-  it('首次失败后不得与 empty 并存', () => {
-    const phase = resolveSessionsBootstrap({
-      ...base,
-      projectsInit: true,
-      sessionsAttempted: true,
-      sessionsInitialized: false,
-      sessionsError: 'err',
-      attentionLen: 0,
-      activeLen: 0,
-      parkedLen: 0,
-    });
-    expect(phase).toBe('error');
-    expect(phase).not.toBe('empty');
-    expect(phase).not.toBe('loading');
-  });
 });
 
 describe('shouldShowSectionEmpty 分区空态门禁', () => {
-  it('loading / error → 不展示分区「暂无…」', () => {
+  it('loading / connecting / error → 不展示分区「暂无…」', () => {
     expect(shouldShowSectionEmpty('loading')).toBe(false);
+    expect(shouldShowSectionEmpty('connecting')).toBe(false);
     expect(shouldShowSectionEmpty('error')).toBe(false);
   });
 
@@ -576,14 +590,14 @@ describe('shouldShowSectionEmpty 分区空态门禁', () => {
     expect(shouldShowSectionEmpty('ready')).toBe(true);
   });
 
-  it('首次 sessions 失败链路：error 相位抑制分区空态', () => {
+  it('首次连接失败链路：error 相位抑制分区空态', () => {
     const phase = resolveSessionsBootstrap({
       projectsInit: true,
       projectsLen: 0,
       sessionsAttempted: true,
       sessionsInitialized: false,
       sessionsLen: 0,
-      sessionsError: '加载活跃会话失败',
+      sessionsError: '无法连接服务端（ocdeck-server 未运行？）',
       attentionLen: 0,
       activeLen: 0,
       parkedLen: 0,
@@ -594,15 +608,16 @@ describe('shouldShowSectionEmpty 分区空态门禁', () => {
 });
 
 describe('sectionBodyMode 列表始终渲染 / 空态门禁', () => {
-  it('itemCount>0 时任意 phase 均为 list（sessions 失败不隐藏 projects 数据）', () => {
-    for (const phase of ['loading', 'error', 'empty', 'ready'] as const) {
+  it('itemCount>0 时任意 phase 均为 list（sessions 连接中/失败不隐藏 projects 数据）', () => {
+    for (const phase of ['loading', 'connecting', 'error', 'empty', 'ready'] as const) {
       expect(sectionBodyMode(phase, 2)).toBe('list');
       expect(sectionBodyMode(phase, 1)).toBe('list');
     }
   });
 
-  it('itemCount=0 时 loading/error → none（不显示暂无…）', () => {
+  it('itemCount=0 时 loading/connecting/error → none（不显示暂无…）', () => {
     expect(sectionBodyMode('loading', 0)).toBe('none');
+    expect(sectionBodyMode('connecting', 0)).toBe('none');
     expect(sectionBodyMode('error', 0)).toBe('none');
   });
 
@@ -611,11 +626,34 @@ describe('sectionBodyMode 列表始终渲染 / 空态门禁', () => {
     expect(sectionBodyMode('ready', 0)).toBe('empty');
   });
 
-  it('sessions 失败 + projects 有活跃/挂起任务：列表渲染、空态不显示', () => {
-    // 注意：hasAnyData=true 时 resolveSessionsBootstrap 不走 error 分支（见状态机）；
-    // 渲染侧用 sectionBodyMode 保证：即便 phase 为 error，有条目也 list。
-    expect(sectionBodyMode('error', 3)).toBe('list'); // active
-    expect(sectionBodyMode('error', 1)).toBe('list'); // parked
-    expect(sectionBodyMode('error', 0)).toBe('none'); // 无条目才抑制
+  it('sessions 连接中 + projects 有活跃/挂起任务：列表渲染、空态不显示', () => {
+    expect(sectionBodyMode('connecting', 3)).toBe('list'); // active
+    expect(sectionBodyMode('connecting', 1)).toBe('list'); // parked
+    expect(sectionBodyMode('connecting', 0)).toBe('none'); // 无条目才抑制
+  });
+});
+
+// ---------------- 页面接线契约（SSE 订阅替代 5s 轮询，design D5 / tasks P2.7.2） ----------------
+
+describe('CommandCenterPage SSE 接线契约（源码断言）', () => {
+  const src = readFileSync(
+    fileURLToPath(new URL('../pages/CommandCenterPage.tsx', import.meta.url)),
+    'utf8',
+  );
+
+  it('不再以 usePoll/interval 轮询 sessions/active，也不直接调用 REST listActiveSessions', () => {
+    expect(src).not.toMatch(/usePoll/);
+    expect(src).not.toMatch(/pollSessions/);
+    expect(src).not.toMatch(/listActiveSessions/);
+    expect(src).not.toMatch(/setInterval/);
+  });
+
+  it('mount 订阅 SSE、unmount 关闭（effect cleanup 调 sub.close()）', () => {
+    expect(src).toMatch(/subscribeActiveSessions\(\{/);
+    expect(src).toMatch(/return \(\) => sub\.close\(\)/);
+  });
+
+  it('用户可见文案不再出现「每 5 秒」刷新表述（改为连接状态中性文案）', () => {
+    expect(src).not.toContain('每 5 秒');
   });
 });

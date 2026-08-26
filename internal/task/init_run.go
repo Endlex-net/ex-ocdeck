@@ -47,12 +47,12 @@ func (m *Manager) runInitAttempt(taskID string) {
 	defer m.runnerWG.Done()
 
 	// ClaimInitRun CAS（§4：admission 后第一个 DB 操作）。
-	claimed, err := m.store.ClaimInitRun(m.runnerCtx, taskID)
+	claimed, err := m.writeClaimInitRun(m.runnerCtx, taskID)
 	if err != nil {
 		log.Printf("init runner: claim task %s: %v", taskID, err)
 		return
 	}
-	if !claimed {
+	if !claimed.Matched {
 		// 并发下另一执行者已 claim 或状态已变，不重复执行。
 		return
 	}
@@ -71,13 +71,13 @@ func (m *Manager) runInitAttempt(taskID string) {
 		status = InitStatusFailed
 		initError = sql.NullString{String: initErr.Error(), Valid: true}
 	}
-	updated, ferr := m.store.FinishInitRun(finishCtx, taskID, status, initError)
+	updated, ferr := m.writeFinishInitRun(finishCtx, taskID, status, initError)
 	if ferr != nil {
 		// DB error MUST NOT 激活（§4）。
 		log.Printf("init runner: finish task %s: %v", taskID, ferr)
 		return
 	}
-	if !updated {
+	if !updated.Matched {
 		// rows=0：任务已被外部收敛（如服务重启），不激活（§4）。
 		log.Printf("init runner: task %s init_status no longer running (externally converged)", taskID)
 		return
@@ -162,12 +162,12 @@ func (m *Manager) runRerunInitAttempt(taskID string, wgRelease func()) {
 		initError = sql.NullString{String: initErr.Error(), Valid: true}
 	}
 	// 成功不自动激活（§6）：仅落账，不 triggerActivate。
-	updated, ferr := m.store.FinishInitRun(finishCtx, taskID, status, initError)
+	updated, ferr := m.writeFinishInitRun(finishCtx, taskID, status, initError)
 	if ferr != nil {
 		log.Printf("rerun init: finish task %s: %v", taskID, ferr)
 		return
 	}
-	if !updated {
+	if !updated.Matched {
 		log.Printf("rerun init: task %s init_status no longer running (externally converged)", taskID)
 		return
 	}

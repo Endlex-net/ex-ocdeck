@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"ocdeck/internal/task"
+	"ocdeck/internal/application"
 )
 
 // mockGitBackend 嵌入 fakeTaskBackend 并允许注入 git 方法的返回值，
@@ -16,8 +16,8 @@ import (
 // 此处仅断言 API 层：经 mock backend、mapTaskErr 映射、响应 JSON 字段。
 type mockGitBackend struct {
 	*fakeTaskBackend
-	statusFn  func(ctx context.Context, taskID string) (task.GitStatusDTO, error)
-	diffFn    func(ctx context.Context, taskID, ref, path string, untracked bool) (task.GitDiffDTO, error)
+	statusFn  func(ctx context.Context, taskID string) (application.GitStatusDTO, error)
+	diffFn    func(ctx context.Context, taskID, ref, path string, untracked bool) (application.GitDiffDTO, error)
 	commitFn  func(ctx context.Context, taskID, message string, paths []string) error
 	pushFn    func(ctx context.Context, taskID string) error
 	commitMsg string
@@ -28,18 +28,18 @@ func newMockGitBackend() *mockGitBackend {
 	return &mockGitBackend{fakeTaskBackend: &fakeTaskBackend{}}
 }
 
-func (m *mockGitBackend) GitStatus(ctx context.Context, taskID string) (task.GitStatusDTO, error) {
+func (m *mockGitBackend) GitStatus(ctx context.Context, taskID string) (application.GitStatusDTO, error) {
 	if m.statusFn != nil {
 		return m.statusFn(ctx, taskID)
 	}
-	return task.GitStatusDTO{}, nil
+	return application.GitStatusDTO{}, nil
 }
 
-func (m *mockGitBackend) GitDiff(ctx context.Context, taskID, ref, path string, untracked bool) (task.GitDiffDTO, error) {
+func (m *mockGitBackend) GitDiff(ctx context.Context, taskID, ref, path string, untracked bool) (application.GitDiffDTO, error) {
 	if m.diffFn != nil {
 		return m.diffFn(ctx, taskID, ref, path, untracked)
 	}
-	return task.GitDiffDTO{}, nil
+	return application.GitDiffDTO{}, nil
 }
 
 func (m *mockGitBackend) GitCommit(ctx context.Context, taskID, message string, paths []string) error {
@@ -62,14 +62,14 @@ func (m *mockGitBackend) GitPush(ctx context.Context, taskID string) error {
 // （git API 测试改用 mockGitBackend 注入 git 方法，不再经真实 worktree。）
 type gitTaskBackend struct {
 	*fakeTaskBackend
-	tasks    map[string]task.TaskRow
+	tasks    map[string]application.TaskRow
 	statusFn func(ctx context.Context, taskID string) string
 }
 
-func newGitTaskBackend(rows ...task.TaskRow) *gitTaskBackend {
+func newGitTaskBackend(rows ...application.TaskRow) *gitTaskBackend {
 	g := &gitTaskBackend{
 		fakeTaskBackend: &fakeTaskBackend{},
-		tasks:           map[string]task.TaskRow{},
+		tasks:           map[string]application.TaskRow{},
 	}
 	for _, r := range rows {
 		g.tasks[r.ID] = r
@@ -77,16 +77,16 @@ func newGitTaskBackend(rows ...task.TaskRow) *gitTaskBackend {
 	return g
 }
 
-func (g *gitTaskBackend) Get(ctx context.Context, taskID string) (task.TaskRow, error) {
+func (g *gitTaskBackend) Get(ctx context.Context, taskID string) (application.TaskRow, error) {
 	r, ok := g.tasks[taskID]
 	if !ok {
-		return task.TaskRow{}, &task.OpError{Code: "not_found", Err: errNotFound(taskID)}
+		return application.TaskRow{}, &application.OpError{Code: "not_found", Err: errNotFound(taskID)}
 	}
 	return r, nil
 }
 
-func (g *gitTaskBackend) List(ctx context.Context, projectID string) ([]task.TaskRow, error) {
-	var out []task.TaskRow
+func (g *gitTaskBackend) List(ctx context.Context, projectID string) ([]application.TaskRow, error) {
+	var out []application.TaskRow
 	for _, r := range g.tasks {
 		if r.ProjectID == projectID {
 			out = append(out, r)
@@ -118,10 +118,10 @@ func newGitAPIServer(t *testing.T, tb TaskBackend) *Server {
 
 func TestGitAPI_Status_JsonShape(t *testing.T) {
 	tb := newMockGitBackend()
-	tb.statusFn = func(ctx context.Context, taskID string) (task.GitStatusDTO, error) {
-		return task.GitStatusDTO{
+	tb.statusFn = func(ctx context.Context, taskID string) (application.GitStatusDTO, error) {
+		return application.GitStatusDTO{
 			Branch: "feature/x",
-			Files: []task.GitFileDTO{
+			Files: []application.GitFileDTO{
 				{Path: "a.txt", X: " ", Y: "M", Staged: false, Unstaged: true, Untracked: false, Additions: 1, Deletions: 0, IsBinary: false},
 				{Path: "b.txt", X: "?", Y: "?", Staged: false, Unstaged: false, Untracked: true, Additions: 0, Deletions: 0, IsBinary: false},
 			},
@@ -160,8 +160,8 @@ func TestGitAPI_Status_JsonShape(t *testing.T) {
 
 func TestGitAPI_Diff_JsonShape(t *testing.T) {
 	tb := newMockGitBackend()
-	tb.diffFn = func(ctx context.Context, taskID, ref, path string, untracked bool) (task.GitDiffDTO, error) {
-		return task.GitDiffDTO{Diff: "hello diff", Truncated: false}, nil
+	tb.diffFn = func(ctx context.Context, taskID, ref, path string, untracked bool) (application.GitDiffDTO, error) {
+		return application.GitDiffDTO{Diff: "hello diff", Truncated: false}, nil
 	}
 	s := newGitAPIServer(t, tb)
 	ts := httptest.NewServer(s.mux)
@@ -246,7 +246,7 @@ func TestGitAPI_Push_OK(t *testing.T) {
 // TestGitAPI_ErrorMapping 覆盖 not_found/conflict/invalid_input/git_error 映射。
 func TestGitAPI_ErrorMapping(t *testing.T) {
 	opErr := func(code, msg string) error {
-		return &task.OpError{Code: code, Err: strErr(msg)}
+		return &application.OpError{Code: code, Err: strErr(msg)}
 	}
 	cases := []struct {
 		name   string
@@ -260,37 +260,37 @@ func TestGitAPI_ErrorMapping(t *testing.T) {
 		// status
 		{"status not_found", "GET", "/api/v1/tasks/nope/git/status", "",
 			func(b *mockGitBackend) {
-				b.statusFn = func(context.Context, string) (task.GitStatusDTO, error) {
-					return task.GitStatusDTO{}, opErr("not_found", "task not found")
+				b.statusFn = func(context.Context, string) (application.GitStatusDTO, error) {
+					return application.GitStatusDTO{}, opErr("not_found", "task not found")
 				}
 			},
 			http.StatusNotFound, CodeNotFound},
 		{"status conflict", "GET", "/api/v1/tasks/tk1/git/status", "",
 			func(b *mockGitBackend) {
-				b.statusFn = func(context.Context, string) (task.GitStatusDTO, error) {
-					return task.GitStatusDTO{}, opErr("conflict", "task busy")
+				b.statusFn = func(context.Context, string) (application.GitStatusDTO, error) {
+					return application.GitStatusDTO{}, opErr("conflict", "task busy")
 				}
 			},
 			http.StatusConflict, CodeConflict},
 		{"status git_error", "GET", "/api/v1/tasks/tk1/git/status", "",
 			func(b *mockGitBackend) {
-				b.statusFn = func(context.Context, string) (task.GitStatusDTO, error) {
-					return task.GitStatusDTO{}, opErr("git_error", "fatal: not a git repo")
+				b.statusFn = func(context.Context, string) (application.GitStatusDTO, error) {
+					return application.GitStatusDTO{}, opErr("git_error", "fatal: not a git repo")
 				}
 			},
 			http.StatusUnprocessableEntity, CodeGitError},
 		// diff
 		{"diff not_found", "GET", "/api/v1/tasks/nope/git/diff?ref=HEAD&path=a.txt", "",
 			func(b *mockGitBackend) {
-				b.diffFn = func(context.Context, string, string, string, bool) (task.GitDiffDTO, error) {
-					return task.GitDiffDTO{}, opErr("not_found", "task not found")
+				b.diffFn = func(context.Context, string, string, string, bool) (application.GitDiffDTO, error) {
+					return application.GitDiffDTO{}, opErr("not_found", "task not found")
 				}
 			},
 			http.StatusNotFound, CodeNotFound},
 		{"diff git_error", "GET", "/api/v1/tasks/tk1/git/diff", "",
 			func(b *mockGitBackend) {
-				b.diffFn = func(context.Context, string, string, string, bool) (task.GitDiffDTO, error) {
-					return task.GitDiffDTO{}, opErr("git_error", "fatal: bad ref")
+				b.diffFn = func(context.Context, string, string, string, bool) (application.GitDiffDTO, error) {
+					return application.GitDiffDTO{}, opErr("git_error", "fatal: bad ref")
 				}
 			},
 			http.StatusUnprocessableEntity, CodeGitError},
@@ -415,9 +415,9 @@ func TestGitAPI_Diff_UntrackedParam(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			tb := newMockGitBackend()
 			var gotUntracked bool
-			tb.diffFn = func(ctx context.Context, taskID, ref, path string, untracked bool) (task.GitDiffDTO, error) {
+			tb.diffFn = func(ctx context.Context, taskID, ref, path string, untracked bool) (application.GitDiffDTO, error) {
 				gotUntracked = untracked
-				return task.GitDiffDTO{Diff: "ok", Truncated: false}, nil
+				return application.GitDiffDTO{Diff: "ok", Truncated: false}, nil
 			}
 			s := newGitAPIServer(t, tb)
 			ts := httptest.NewServer(s.mux)
@@ -473,12 +473,12 @@ func TestGitAPI_Diff_UntrackedInvariants(t *testing.T) {
 			var gotPath, gotRef string
 			var gotUntracked bool
 			var called bool
-			tb.diffFn = func(ctx context.Context, taskID, ref, path string, untracked bool) (task.GitDiffDTO, error) {
+			tb.diffFn = func(ctx context.Context, taskID, ref, path string, untracked bool) (application.GitDiffDTO, error) {
 				called = true
 				gotPath = path
 				gotRef = ref
 				gotUntracked = untracked
-				return task.GitDiffDTO{}, &task.OpError{Code: "invalid_input", Err: strErr("invariant rejected")}
+				return application.GitDiffDTO{}, &application.OpError{Code: "invalid_input", Err: strErr("invariant rejected")}
 			}
 			s := newGitAPIServer(t, tb)
 			ts := httptest.NewServer(s.mux)

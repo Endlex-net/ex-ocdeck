@@ -12,7 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"ocdeck/internal/git"
+	"ocdeck/internal/application"
+	"ocdeck/internal/infrastructure/git"
 )
 
 // blockingLifecycleRunner 是可阻塞、context-aware 的 mock LifecycleRunner（Phase 3 稳定性测试用）。
@@ -291,7 +292,7 @@ func newGateFinalizeStore() *gateFinalizeStore {
 	}
 }
 
-func (s *gateFinalizeStore) UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) error {
+func (s *gateFinalizeStore) UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) (application.TransitionResult, error) {
 	// 仅 deletion_failed 落账走闸门（脚本失败后的 finalizeOnFail）。
 	if status == StatusDeletionFailed {
 		s.finalizeEnteredMu.Lock()
@@ -303,7 +304,7 @@ func (s *gateFinalizeStore) UpdateTaskStatus(ctx context.Context, id, status str
 		select {
 		case <-s.finalizeGate:
 		case <-ctx.Done():
-			return ctx.Err()
+			return application.TransitionResult{}, ctx.Err()
 		}
 	}
 	return s.mockStore.UpdateTaskStatus(ctx, id, status, lastError)
@@ -758,7 +759,7 @@ func newClaimBlockingStore() *claimBlockingStore {
 	}
 }
 
-func (s *claimBlockingStore) ClaimInitRerun(ctx context.Context, taskID string) (bool, error) {
+func (s *claimBlockingStore) ClaimInitRerun(ctx context.Context, taskID string) (application.MutationResult, error) {
 	// 先执行真实 claim（置 running），再通知入场并阻塞——模拟"claim 已落库但 RerunInit
 	// 尚未释放锁"的临界区窗口。
 	claimed, err := s.mockStore.ClaimInitRerun(ctx, taskID)
@@ -795,21 +796,21 @@ func newCommitBlockingStore(blockMethod string) *commitBlockingStore {
 	}
 }
 
-func (s *commitBlockingStore) UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (bool, error) {
+func (s *commitBlockingStore) UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (application.TransitionResult, error) {
 	if s.blockMethod == "conditional" && fromStatus == StatusSuspended && toStatus == StatusActivating {
 		s.signalAndWait()
 	}
 	return s.mockStore.UpdateTaskStatusConditional(ctx, id, fromStatus, toStatus, lastError)
 }
 
-func (s *commitBlockingStore) BeginDeleteIntent(ctx context.Context, id, mode string, fromStatuses []string) (bool, error) {
+func (s *commitBlockingStore) BeginDeleteIntent(ctx context.Context, id, mode string, fromStatuses []string) (application.TransitionResult, error) {
 	if s.blockMethod == "beginDelete" {
 		s.signalAndWait()
 	}
 	return s.mockStore.BeginDeleteIntent(ctx, id, mode, fromStatuses)
 }
 
-func (s *commitBlockingStore) ArchiveTask(ctx context.Context, id string) error {
+func (s *commitBlockingStore) ArchiveTask(ctx context.Context, id string) (application.TransitionResult, error) {
 	if s.blockMethod == "archive" {
 		s.signalAndWait()
 	}
@@ -1339,8 +1340,8 @@ type claimRerunErrStore struct {
 	*mockStore
 }
 
-func (s *claimRerunErrStore) ClaimInitRerun(ctx context.Context, taskID string) (bool, error) {
-	return false, fmt.Errorf("db claim error")
+func (s *claimRerunErrStore) ClaimInitRerun(ctx context.Context, taskID string) (application.MutationResult, error) {
+	return application.MutationResult{}, fmt.Errorf("db claim error")
 }
 func (s *claimRerunErrStore) seedProject(p ProjectRow) { s.mockStore.seedProject(p) }
 
@@ -1437,7 +1438,7 @@ type finishBlockStore struct {
 	finishEntered chan struct{}
 }
 
-func (s *finishBlockStore) FinishInitRun(ctx context.Context, taskID, status string, initError sql.NullString) (bool, error) {
+func (s *finishBlockStore) FinishInitRun(ctx context.Context, taskID, status string, initError sql.NullString) (application.MutationResult, error) {
 	select {
 	case s.finishEntered <- struct{}{}:
 	default:
@@ -1445,7 +1446,7 @@ func (s *finishBlockStore) FinishInitRun(ctx context.Context, taskID, status str
 	select {
 	case <-s.finishGate:
 	case <-ctx.Done():
-		return false, ctx.Err()
+		return application.MutationResult{}, ctx.Err()
 	}
 	return s.mockStore.FinishInitRun(ctx, taskID, status, initError)
 }
@@ -1522,7 +1523,7 @@ type deleteBlockStore struct {
 	deleteEntered chan struct{}
 }
 
-func (s *deleteBlockStore) DeleteTask(ctx context.Context, id string) error {
+func (s *deleteBlockStore) DeleteTask(ctx context.Context, id string) (application.DeleteResult, error) {
 	select {
 	case s.deleteEntered <- struct{}{}:
 	default:
@@ -1530,7 +1531,7 @@ func (s *deleteBlockStore) DeleteTask(ctx context.Context, id string) error {
 	select {
 	case <-s.deleteGate:
 	case <-ctx.Done():
-		return ctx.Err()
+		return application.DeleteResult{}, ctx.Err()
 	}
 	return s.mockStore.DeleteTask(ctx, id)
 }
@@ -1570,8 +1571,8 @@ type claimRerunFailStore struct {
 	*mockStore
 }
 
-func (s *claimRerunFailStore) ClaimInitRerun(ctx context.Context, taskID string) (bool, error) {
-	return false, nil // rows=0
+func (s *claimRerunFailStore) ClaimInitRerun(ctx context.Context, taskID string) (application.MutationResult, error) {
+	return application.MutationResult{}, nil // rows=0
 }
 func (s *claimRerunFailStore) seedProject(p ProjectRow) { s.mockStore.seedProject(p) }
 
@@ -1736,7 +1737,7 @@ func (s *orderTraceStore) snapshot() []string {
 	return out
 }
 
-// newLifecycleTestRepo 创建真实 git repo（参考 internal/git/git_test.go newTestRepo），
+// newLifecycleTestRepo 创建真实 git repo（参考 internal/infrastructure/git/git_test.go newTestRepo），
 // 含 .gitignore + 一个 ignored 文件（.env）+ 一个 untracked 文件，供 ListIgnoredUntracked 枚举。
 func newLifecycleTestRepo(t *testing.T) string {
 	t.Helper()
@@ -1930,9 +1931,9 @@ type deleteFailStore struct {
 	deleteFail bool
 }
 
-func (s *deleteFailStore) DeleteTask(ctx context.Context, id string) error {
+func (s *deleteFailStore) DeleteTask(ctx context.Context, id string) (application.DeleteResult, error) {
 	if s.deleteFail {
-		return fmt.Errorf("db delete error")
+		return application.DeleteResult{}, fmt.Errorf("db delete error")
 	}
 	return s.mockStore.DeleteTask(ctx, id)
 }

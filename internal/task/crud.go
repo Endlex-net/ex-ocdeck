@@ -11,7 +11,133 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"ocdeck/internal/application"
+	apptask "ocdeck/internal/application/task"
+	ocdecktask "ocdeck/internal/domain/task"
 )
+
+// --- P1.4.6 strangler 双路径写 helper ---
+//
+// Create/Retry/Activate 的任务行写入经此处分流：注入 LifecycleService 时走 persist+commit
+// 封装（commit helper 经 NoopPublisher，调用位就绪无实际发布），未注入时回退 legacy 直连
+// store 路径（单测路径行为不变）。外部副作用（worktree/tmux/opencode）与调度仍留在 Manager。
+
+// writeCreateTask 插入任务行（creating 意图落库，crud.go 调用点）。
+func (m *Manager) writeCreateTask(ctx context.Context, row TaskRow) error {
+	if m.lifecycle != nil {
+		return m.lifecycle.CreateTask(ctx, taskRowToSnapshot(row))
+	}
+	return m.store.CreateTask(ctx, row)
+}
+
+// writeStatus 无条件状态写入（含 last_error）。
+func (m *Manager) writeStatus(ctx context.Context, id, status string, lastError sql.NullString) (application.TransitionResult, error) {
+	if m.lifecycle != nil {
+		return m.lifecycle.UpdateStatus(ctx, id, ocdecktask.Status(status), nullStringToPtr(lastError))
+	}
+	return m.store.UpdateTaskStatus(ctx, id, status, lastError)
+}
+
+// writeStatusConditional CAS 状态写入（fromStatus 失配返回 !Matched）。
+func (m *Manager) writeStatusConditional(ctx context.Context, id, from, to string, lastError sql.NullString) (application.TransitionResult, error) {
+	if m.lifecycle != nil {
+		return m.lifecycle.UpdateStatusConditional(ctx, id, ocdecktask.Status(from), ocdecktask.Status(to), nullStringToPtr(lastError))
+	}
+	return m.store.UpdateTaskStatusConditional(ctx, id, from, to, lastError)
+}
+
+// writeCommitCreated 创建提交点（expectedStatus CAS → suspended + init_status）。
+func (m *Manager) writeCommitCreated(ctx context.Context, id, expectedStatus, initStatus string) (application.TransitionResult, error) {
+	if m.lifecycle != nil {
+		return m.lifecycle.CommitCreated(ctx, id, ocdecktask.Status(expectedStatus), ocdecktask.InitStatus(initStatus))
+	}
+	return m.store.CommitCreated(ctx, id, expectedStatus, initStatus)
+}
+
+// writeDeleteMode 写入 delete_mode（Retry deletion_failed 重入）。
+func (m *Manager) writeDeleteMode(ctx context.Context, id, mode string) (application.MutationResult, error) {
+	if m.lifecycle != nil {
+		return m.lifecycle.SetDeleteMode(ctx, id, ocdecktask.DeleteMode(mode))
+	}
+	return m.store.SetTaskDeleteMode(ctx, id, mode)
+}
+
+// writeEnvSnapshot 写入 env_snapshot（Activate 合并快照持久化与补偿清空）。
+func (m *Manager) writeEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) (application.MutationResult, error) {
+	if m.lifecycle != nil {
+		return m.lifecycle.UpdateEnvSnapshot(ctx, id, nullStringToPtr(envSnapshot))
+	}
+	return m.store.UpdateTaskEnvSnapshot(ctx, id, envSnapshot)
+}
+
+// writeLastPort 写入 last_port（Activate 端口写回）。
+func (m *Manager) writeLastPort(ctx context.Context, id string, port int) (application.MutationResult, error) {
+	if m.lifecycle != nil {
+		return m.lifecycle.UpdateLastPort(ctx, id, port)
+	}
+	return m.store.UpdateTaskLastPort(ctx, id, port)
+}
+
+// writeBeginDeleteIntent 写入删除意图（deleting 迁移，fromStatuses 守卫）。
+func (m *Manager) writeBeginDeleteIntent(ctx context.Context, id, mode string, fromStatuses []string) (application.TransitionResult, error) {
+	if m.lifecycle != nil {
+		statuses := make([]ocdecktask.Status, len(fromStatuses))
+		for i, s := range fromStatuses {
+			statuses[i] = ocdecktask.Status(s)
+		}
+		return m.lifecycle.BeginDeleteIntent(ctx, id, ocdecktask.DeleteMode(mode), statuses)
+	}
+	return m.store.BeginDeleteIntent(ctx, id, mode, fromStatuses)
+}
+
+// writeDeleteTask 删除任务行（级联剩余会话；commit 先发 session.deleted 再 task.deleted）。
+func (m *Manager) writeDeleteTask(ctx context.Context, id string) (application.DeleteResult, error) {
+	if m.lifecycle != nil {
+		return m.lifecycle.DeleteTask(ctx, id)
+	}
+	return m.store.DeleteTask(ctx, id)
+}
+
+// writeNoticeCAS 后台通知 CAS 重写（activity_changed 仅当 updated_at 前进）。
+func (m *Manager) writeNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error) {
+	if m.lifecycle != nil {
+		return m.lifecycle.UpdateNoticeCAS(ctx, id, nullStringToPtr(expected), nullStringToPtr(newNotice))
+	}
+	return m.store.UpdateTaskNoticeCAS(ctx, id, expected, newNotice)
+}
+
+// writeConvergeInterruptedInitRuns 收敛中断 init run（init_status 写入不发事件，P1.6.1）。
+func (m *Manager) writeConvergeInterruptedInitRuns(ctx context.Context) (int64, error) {
+	if m.lifecycle != nil {
+		return m.lifecycle.ConvergeInterruptedInitRuns(ctx)
+	}
+	return m.store.ConvergeInterruptedInitRuns(ctx)
+}
+
+// writeClaimInitRun 认领 init run（init_status 写入不发事件，P1.6.1）。
+func (m *Manager) writeClaimInitRun(ctx context.Context, id string) (application.MutationResult, error) {
+	if m.lifecycle != nil {
+		return m.lifecycle.ClaimInitRun(ctx, id)
+	}
+	return m.store.ClaimInitRun(ctx, id)
+}
+
+// writeClaimInitRerun 认领 init 重跑（init_status 写入不发事件，P1.6.1）。
+func (m *Manager) writeClaimInitRerun(ctx context.Context, id string) (application.MutationResult, error) {
+	if m.lifecycle != nil {
+		return m.lifecycle.ClaimInitRerun(ctx, id)
+	}
+	return m.store.ClaimInitRerun(ctx, id)
+}
+
+// writeFinishInitRun 写入 init run 终态（init_status 写入不发事件，P1.6.1）。
+func (m *Manager) writeFinishInitRun(ctx context.Context, id, initStatus string, initError sql.NullString) (application.MutationResult, error) {
+	if m.lifecycle != nil {
+		return m.lifecycle.FinishInitRun(ctx, id, ocdecktask.InitStatus(initStatus), nullStringToPtr(initError))
+	}
+	return m.store.FinishInitRun(ctx, id, initStatus, initError)
+}
 
 // Create 在项目下创建任务：按 proj.Kind 分叉（add-plain-dir-project D2/D10）。
 //   - repo：生成 worktree + 分支（分支 ocdeck/<task-name-slug>，worktree 路径
@@ -89,7 +215,7 @@ func (m *Manager) createRepo(ctx context.Context, projectID, taskName string, pr
 	}
 
 	// ① 意图落库：插入任务行（status=creating）。
-	if err := m.store.CreateTask(ctx, TaskRow{
+	if err := m.writeCreateTask(ctx, TaskRow{
 		ID: taskID, ProjectID: projectID, Name: taskName,
 		Branch: branch, Status: StatusCreating, WorktreePath: wtPath, BaseRef: resolvedBaseRef,
 	}); err != nil {
@@ -100,7 +226,7 @@ func (m *Manager) createRepo(ctx context.Context, projectID, taskName string, pr
 	if err := m.wt.Add(ctx, repoPath, wtPath, branch, resolvedBaseRef); err != nil {
 		// worktree add 失败 → creation_failed（前置检查已通过，失败发生在副作用阶段）。
 		le := sql.NullString{String: fmt.Errorf("worktree add: %w", err).Error(), Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusCreationFailed, le)
+		_, _ = m.writeStatus(ctx, taskID, StatusCreationFailed, le)
 		row, _ := m.store.GetTask(ctx, taskID)
 		return row, newOpErr(codeGitError, fmt.Errorf("worktree add: %w", err))
 	}
@@ -112,7 +238,7 @@ func (m *Manager) createRepo(ctx context.Context, projectID, taskName string, pr
 	cfg, warnings, inheritErr := m.runInherit(ctx, repoPath, wtPath, projectID)
 	if inheritErr != nil {
 		le := sql.NullString{String: fmt.Errorf("inherit: %w", inheritErr).Error(), Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusCreationFailed, le)
+		_, _ = m.writeStatus(ctx, taskID, StatusCreationFailed, le)
 		row, _ := m.store.GetTask(ctx, taskID)
 		return row, newOpErr(codeInternal, fmt.Errorf("inherit: %w", inheritErr))
 	}
@@ -125,17 +251,17 @@ func (m *Manager) createRepo(ctx context.Context, projectID, taskName string, pr
 	if cfg.InitScript != "" {
 		initStatus = InitStatusPending
 	}
-	committed, err := m.store.CommitCreated(ctx, taskID, StatusCreating, initStatus)
+	committed, err := m.writeCommitCreated(ctx, taskID, StatusCreating, initStatus)
 	if err != nil {
 		le := sql.NullString{String: fmt.Errorf("commit created: %w", err).Error(), Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusCreationFailed, le)
+		_, _ = m.writeStatus(ctx, taskID, StatusCreationFailed, le)
 		row, _ := m.store.GetTask(ctx, taskID)
 		return row, newOpErr(codeInternal, fmt.Errorf("commit created: %w", err))
 	}
-	if !committed {
+	if !committed.Matched {
 		// 状态已被并发改变（预期 creating → 已变），落 creation_failed。
 		le := sql.NullString{String: "commit created: status changed concurrently", Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusCreationFailed, le)
+		_, _ = m.writeStatus(ctx, taskID, StatusCreationFailed, le)
 		row, _ := m.store.GetTask(ctx, taskID)
 		return row, newOpErr(codeConflict, fmt.Errorf("commit created: status changed concurrently"))
 	}
@@ -181,7 +307,7 @@ func (m *Manager) createDir(ctx context.Context, projectID, taskName string, pro
 
 	taskID := newTaskID()
 	// ① 意图落库：插入任务行（status=creating，Branch=""，WorktreePath=canonical 项目路径）。
-	if err := m.store.CreateTask(ctx, TaskRow{
+	if err := m.writeCreateTask(ctx, TaskRow{
 		ID: taskID, ProjectID: projectID, Name: taskName,
 		Branch: "", Status: StatusCreating, WorktreePath: canonicalPath, BaseRef: "",
 	}); err != nil {
@@ -193,7 +319,7 @@ func (m *Manager) createDir(ctx context.Context, projectID, taskName string, pro
 	cfg, err := m.store.GetLifecycleConfig(ctx, projectID)
 	if err != nil {
 		le := sql.NullString{String: fmt.Errorf("read lifecycle config: %w", err).Error(), Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusCreationFailed, le)
+		_, _ = m.writeStatus(ctx, taskID, StatusCreationFailed, le)
 		row, _ := m.store.GetTask(ctx, taskID)
 		return row, newOpErr(codeInternal, fmt.Errorf("read lifecycle config: %w", err))
 	}
@@ -203,16 +329,16 @@ func (m *Manager) createDir(ctx context.Context, projectID, taskName string, pro
 	if cfg.InitScript != "" {
 		initStatus = InitStatusPending
 	}
-	committed, err := m.store.CommitCreated(ctx, taskID, StatusCreating, initStatus)
+	committed, err := m.writeCommitCreated(ctx, taskID, StatusCreating, initStatus)
 	if err != nil {
 		le := sql.NullString{String: fmt.Errorf("commit created: %w", err).Error(), Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusCreationFailed, le)
+		_, _ = m.writeStatus(ctx, taskID, StatusCreationFailed, le)
 		row, _ := m.store.GetTask(ctx, taskID)
 		return row, newOpErr(codeInternal, fmt.Errorf("commit created: %w", err))
 	}
-	if !committed {
+	if !committed.Matched {
 		le := sql.NullString{String: "commit created: status changed concurrently", Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, taskID, StatusCreationFailed, le)
+		_, _ = m.writeStatus(ctx, taskID, StatusCreationFailed, le)
 		row, _ := m.store.GetTask(ctx, taskID)
 		return row, newOpErr(codeConflict, fmt.Errorf("commit created: status changed concurrently"))
 	}
@@ -325,10 +451,10 @@ func (m *Manager) Retry(ctx context.Context, taskID string, confirmDirty bool) e
 		// 先置 deleting 再执行（deletion_failed → deleting，design.md §19/§8）。
 		// 在 kind 校验通过后转换，保证未知 kind 零副作用（状态不变）。
 		if row.Status == StatusDeletionFailed {
-			if err := m.store.SetTaskDeleteMode(ctx, row.ID, string(mode)); err != nil {
+			if _, err := m.writeDeleteMode(ctx, row.ID, string(mode)); err != nil {
 				return newOpErr(codeInternal, err)
 			}
-			if err := m.store.UpdateTaskStatus(ctx, row.ID, StatusDeleting, sql.NullString{}); err != nil {
+			if _, err := m.writeStatus(ctx, row.ID, StatusDeleting, sql.NullString{}); err != nil {
 				return newOpErr(codeInternal, err)
 			}
 		}
@@ -344,12 +470,12 @@ func (m *Manager) Retry(ctx context.Context, taskID string, confirmDirty bool) e
 			snap, derr := m.wt.DirtyFiles(ctx, row.WorktreePath)
 			if derr != nil {
 				le := sql.NullString{String: fmt.Errorf("retry: preflight dirty snapshot: %w", derr).Error(), Valid: true}
-				_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusDeletionFailed, le)
+				_, _ = m.writeStatus(ctx, row.ID, StatusDeletionFailed, le)
 				return newOpErr(codeGitError, fmt.Errorf("retry: preflight dirty snapshot: %w", derr))
 			}
 			if len(snap) > 0 && !confirmDirty {
 				le := sql.NullString{String: "retry: worktree has dirty files; confirm deletion again", Valid: true}
-				_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusDeletionFailed, le)
+				_, _ = m.writeStatus(ctx, row.ID, StatusDeletionFailed, le)
 				return newOpErr(codeConflict, errors.New("worktree: retry delete has dirty files; confirm deletion again with confirmDirty=true"))
 			}
 			preflightDirty = snap
@@ -396,7 +522,7 @@ func (m *Manager) retryCreateRepo(ctx context.Context, row TaskRow, proj Project
 	// repo 任务落库 BaseRef MUST 非空（空值仅 dir 使用，D10 fail-closed）。
 	if row.BaseRef == "" {
 		le := sql.NullString{String: "retry: repo task has empty base_ref (fail-closed)", Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
+		_, _ = m.writeStatus(ctx, row.ID, StatusCreationFailed, le)
 		return 0, newOpErr(codeInvalidState, errors.New("retry: repo task has empty base_ref (fail-closed)"))
 	}
 	// 严格产物验证：通过则跳过 add，否则重新 add。
@@ -404,17 +530,17 @@ func (m *Manager) retryCreateRepo(ctx context.Context, row TaskRow, proj Project
 		// 产物不完整或不存在 → 重新 add。先检查分支冲突（B1）。
 		if exists, berr := m.wt.BranchExists(ctx, proj.Path, row.Branch); berr != nil {
 			le := sql.NullString{String: fmt.Errorf("branch existence check: %w", berr).Error(), Valid: true}
-			_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
+			_, _ = m.writeStatus(ctx, row.ID, StatusCreationFailed, le)
 			return 0, newOpErr(codeInternal, fmt.Errorf("branch existence check: %w", berr))
 		} else if exists {
 			le := sql.NullString{String: fmt.Errorf("branch %s already exists", row.Branch).Error(), Valid: true}
-			_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
+			_, _ = m.writeStatus(ctx, row.ID, StatusCreationFailed, le)
 			return 0, newOpErr(codeConflict, fmt.Errorf("branch %s already exists", row.Branch))
 		}
 		// D10：重建用落库 BaseRef，MUST NOT 重读 proj.DefaultBranch。
 		if err := m.wt.Add(ctx, proj.Path, row.WorktreePath, row.Branch, row.BaseRef); err != nil {
 			le := sql.NullString{String: fmt.Errorf("retry worktree add: %w", err).Error(), Valid: true}
-			_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
+			_, _ = m.writeStatus(ctx, row.ID, StatusCreationFailed, le)
 			return 0, newOpErr(codeGitError, err)
 		}
 	}
@@ -423,7 +549,7 @@ func (m *Manager) retryCreateRepo(ctx context.Context, row TaskRow, proj Project
 	cfg, warnings, inheritErr := m.runInherit(ctx, proj.Path, row.WorktreePath, row.ProjectID)
 	if inheritErr != nil {
 		le := sql.NullString{String: fmt.Errorf("inherit: %w", inheritErr).Error(), Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
+		_, _ = m.writeStatus(ctx, row.ID, StatusCreationFailed, le)
 		return 0, newOpErr(codeInternal, fmt.Errorf("inherit: %w", inheritErr))
 	}
 	m.writeInheritLog(m.inheritLogPath(row.ID), warnings)
@@ -433,13 +559,13 @@ func (m *Manager) retryCreateRepo(ctx context.Context, row TaskRow, proj Project
 	if cfg.InitScript != "" {
 		initStatus = InitStatusPending
 	}
-	committed, err := m.store.CommitCreated(ctx, row.ID, StatusCreationFailed, initStatus)
+	committed, err := m.writeCommitCreated(ctx, row.ID, StatusCreationFailed, initStatus)
 	if err != nil {
 		le := sql.NullString{String: fmt.Errorf("commit created: %w", err).Error(), Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
+		_, _ = m.writeStatus(ctx, row.ID, StatusCreationFailed, le)
 		return 0, newOpErr(codeInternal, err)
 	}
-	if !committed {
+	if !committed.Matched {
 		// 状态已被并发改变，保留原状态。
 		return 0, newOpErr(codeConflict, fmt.Errorf("commit created: status changed concurrently"))
 	}
@@ -457,18 +583,18 @@ func (m *Manager) retryCreateDir(ctx context.Context, row TaskRow, proj ProjectR
 	canonicalPath, err := filepath.EvalSymlinks(proj.Path)
 	if err != nil {
 		le := sql.NullString{String: fmt.Errorf("retry: dir project path not accessible: %w", err).Error(), Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
+		_, _ = m.writeStatus(ctx, row.ID, StatusCreationFailed, le)
 		return 0, newOpErr(codeInvalidState, fmt.Errorf("retry: dir project path not accessible: %w", err))
 	}
 	info, err := os.Stat(canonicalPath)
 	if err != nil {
 		le := sql.NullString{String: fmt.Errorf("retry: dir project path not accessible: %w", err).Error(), Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
+		_, _ = m.writeStatus(ctx, row.ID, StatusCreationFailed, le)
 		return 0, newOpErr(codeInvalidState, fmt.Errorf("retry: dir project path not accessible: %w", err))
 	}
 	if !info.IsDir() {
 		le := sql.NullString{String: fmt.Errorf("retry: dir project path is not a directory: %s", canonicalPath).Error(), Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
+		_, _ = m.writeStatus(ctx, row.ID, StatusCreationFailed, le)
 		return 0, newOpErr(codeInvalidState, fmt.Errorf("retry: dir project path is not a directory: %s", canonicalPath))
 	}
 
@@ -476,7 +602,7 @@ func (m *Manager) retryCreateDir(ctx context.Context, row TaskRow, proj ProjectR
 	cfg, err := m.store.GetLifecycleConfig(ctx, row.ProjectID)
 	if err != nil {
 		le := sql.NullString{String: fmt.Errorf("read lifecycle config: %w", err).Error(), Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
+		_, _ = m.writeStatus(ctx, row.ID, StatusCreationFailed, le)
 		return 0, newOpErr(codeInternal, fmt.Errorf("read lifecycle config: %w", err))
 	}
 
@@ -485,13 +611,13 @@ func (m *Manager) retryCreateDir(ctx context.Context, row TaskRow, proj ProjectR
 	if cfg.InitScript != "" {
 		initStatus = InitStatusPending
 	}
-	committed, err := m.store.CommitCreated(ctx, row.ID, StatusCreationFailed, initStatus)
+	committed, err := m.writeCommitCreated(ctx, row.ID, StatusCreationFailed, initStatus)
 	if err != nil {
 		le := sql.NullString{String: fmt.Errorf("commit created: %w", err).Error(), Valid: true}
-		_ = m.store.UpdateTaskStatus(ctx, row.ID, StatusCreationFailed, le)
+		_, _ = m.writeStatus(ctx, row.ID, StatusCreationFailed, le)
 		return 0, newOpErr(codeInternal, err)
 	}
-	if !committed {
+	if !committed.Matched {
 		return 0, newOpErr(codeConflict, fmt.Errorf("commit created: status changed concurrently"))
 	}
 	if initStatus == InitStatusPending {
@@ -501,6 +627,10 @@ func (m *Manager) retryCreateDir(ctx context.Context, row TaskRow, proj ProjectR
 }
 
 // Archive 归档（design.md §19 Archive 行：纯 DB，状态须为 suspended）。
+//
+// P1.4.4：注入 LifecycleService 时委托（guard 经 domain CanArchive、CAS 经 ports、
+// commit helper 经 NoopPublisher），未注入时回退 legacy 直连 store 路径。
+// OpError 映射逐字不变（api.TaskBackend 契约冻结不变量）。
 func (m *Manager) Archive(ctx context.Context, taskID string) error {
 	unlock, err := m.tryLockTask(taskID)
 	if err != nil {
@@ -508,24 +638,47 @@ func (m *Manager) Archive(ctx context.Context, taskID string) error {
 	}
 	defer unlock()
 
+	if m.lifecycle != nil {
+		return m.mapLifecycleArchiveErr(ctx, taskID)
+	}
 	row, err := m.store.GetTask(ctx, taskID)
 	if err != nil {
 		return newOpErr(codeNotFound, fmt.Errorf("task not found: %w", err))
 	}
-	if row.Status != StatusSuspended {
-		return newOpErr(codeInvalidState, fmt.Errorf("archive requires suspended, got %s", row.Status))
-	}
-	// init_status 门禁（design.md tasks 3.7）：init 进行中拒绝归档。
-	if row.InitStatus == InitStatusPending || row.InitStatus == InitStatusRunning {
+	// guard 委托 domain/task.CanArchive（design D0 P1.4.2 strangler 第二步）。
+	// 委托前后行为 byte-equivalent：guard 拒绝时按现状维度顺序生成错误（status 优先，init 次之）。
+	if !rehydrateGuardView(row).CanArchive() {
+		if row.Status != StatusSuspended {
+			return newOpErr(codeInvalidState, fmt.Errorf("archive requires suspended, got %s", row.Status))
+		}
+		// init_status 门禁（design.md tasks 3.7）：init 进行中拒绝归档。
 		return newOpErr(codeInvalidState, fmt.Errorf("archive: task %s init in progress (init_status=%s)", taskID, row.InitStatus))
 	}
-	if err := m.store.ArchiveTask(ctx, taskID); err != nil {
+	if _, err := m.store.ArchiveTask(ctx, taskID); err != nil {
 		return newOpErr(codeInternal, err)
 	}
 	return nil
 }
 
+// mapLifecycleArchiveErr 委托 LifecycleService.Archive 并映射 typed error 为 OpError（逐字不变）。
+func (m *Manager) mapLifecycleArchiveErr(ctx context.Context, taskID string) error {
+	err := m.lifecycle.Archive(ctx, taskID)
+	if err == nil {
+		return nil
+	}
+	var ae *apptask.ArchiveError
+	if errors.As(err, &ae) {
+		return newOpErr(codeInvalidState, errors.New(ae.Error()))
+	}
+	if errors.Is(err, application.ErrTaskNotFound) {
+		return newOpErr(codeNotFound, fmt.Errorf("task not found: %w", err))
+	}
+	return newOpErr(codeInternal, err)
+}
+
 // Restore 从归档恢复挂起（design.md §19 Restore 行：纯 DB，状态须为 archived）。
+//
+// P1.4.4：注入 LifecycleService 时委托，未注入时回退 legacy 直连 store 路径。
 func (m *Manager) Restore(ctx context.Context, taskID string) error {
 	unlock, err := m.tryLockTask(taskID)
 	if err != nil {
@@ -533,21 +686,51 @@ func (m *Manager) Restore(ctx context.Context, taskID string) error {
 	}
 	defer unlock()
 
+	if m.lifecycle != nil {
+		return m.mapLifecycleRestoreErr(ctx, taskID)
+	}
 	row, err := m.store.GetTask(ctx, taskID)
 	if err != nil {
 		return newOpErr(codeNotFound, fmt.Errorf("task not found: %w", err))
 	}
-	if row.Status != StatusArchived {
+	// guard 委托 domain/task.CanRestore（design D0 P1.4.2 strangler 第二步），byte-equivalent。
+	if !rehydrateGuardView(row).CanRestore() {
 		return newOpErr(codeInvalidState, fmt.Errorf("restore requires archived, got %s", row.Status))
 	}
-	if err := m.store.RestoreTask(ctx, taskID); err != nil {
+	if _, err := m.store.RestoreTask(ctx, taskID); err != nil {
 		return newOpErr(codeInternal, err)
 	}
 	return nil
 }
 
+// mapLifecycleRestoreErr 委托 LifecycleService.Restore 并映射 typed error 为 OpError（逐字不变）。
+func (m *Manager) mapLifecycleRestoreErr(ctx context.Context, taskID string) error {
+	err := m.lifecycle.Restore(ctx, taskID)
+	if err == nil {
+		return nil
+	}
+	var re *apptask.RestoreError
+	if errors.As(err, &re) {
+		return newOpErr(codeInvalidState, errors.New(re.Error()))
+	}
+	if errors.Is(err, application.ErrTaskNotFound) {
+		return newOpErr(codeNotFound, fmt.Errorf("task not found: %w", err))
+	}
+	return newOpErr(codeInternal, err)
+}
+
 // Get 返回任务详情（design.md §18 Get）。
+//
+// P1.4.4：注入 LifecycleService 时委托（经 TaskReadRepository 读全行快照，还原为 TaskRow），
+// 未注入时回退 legacy 直连 store 路径。OpError 映射逐字不变。
 func (m *Manager) Get(ctx context.Context, taskID string) (TaskRow, error) {
+	if m.lifecycle != nil {
+		snap, err := m.lifecycle.Get(ctx, taskID)
+		if err != nil {
+			return TaskRow{}, newOpErr(codeNotFound, fmt.Errorf("task not found: %w", err))
+		}
+		return taskSnapshotToTaskRow(snap), nil
+	}
 	row, err := m.store.GetTask(ctx, taskID)
 	if err != nil {
 		return TaskRow{}, newOpErr(codeNotFound, fmt.Errorf("task not found: %w", err))
@@ -556,7 +739,20 @@ func (m *Manager) Get(ctx context.Context, taskID string) (TaskRow, error) {
 }
 
 // List 返回项目下任务列表（design.md §18 List）。
+//
+// P1.4.4：注入 LifecycleService 时委托，未注入时回退 legacy 直连 store 路径。
 func (m *Manager) List(ctx context.Context, projectID string) ([]TaskRow, error) {
+	if m.lifecycle != nil {
+		snaps, err := m.lifecycle.List(ctx, projectID)
+		if err != nil {
+			return nil, newOpErr(codeInternal, err)
+		}
+		out := make([]TaskRow, 0, len(snaps))
+		for _, s := range snaps {
+			out = append(out, taskSnapshotToTaskRow(s))
+		}
+		return out, nil
+	}
 	rows, err := m.store.ListTasksByProject(ctx, projectID)
 	if err != nil {
 		return nil, newOpErr(codeInternal, err)
@@ -621,13 +817,13 @@ func (m *Manager) RerunInit(ctx context.Context, taskID string) (TaskRow, error)
 		return TaskRow{}, newOpErr(codeInvalidState, fmt.Errorf("rerun init requires init_status failed or succeeded, got %s", row.InitStatus))
 	}
 	// ClaimInitRerun CAS：竞争 conflict。
-	claimed, cerr := m.store.ClaimInitRerun(ctx, taskID)
+	claimed, cerr := m.writeClaimInitRerun(ctx, taskID)
 	if cerr != nil {
 		unlockOnce()
 		wgRelease()
 		return TaskRow{}, newOpErr(codeInternal, cerr)
 	}
-	if !claimed {
+	if !claimed.Matched {
 		// 并发下已被 claim 或状态已变。
 		unlockOnce()
 		wgRelease()

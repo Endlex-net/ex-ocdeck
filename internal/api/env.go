@@ -10,7 +10,7 @@ import (
 )
 
 // EnvStore 提供 project/task/global 级 env CRUD 能力（design.md §21、env-management spec）。
-// 复用 internal/store 既有 Queries 方法签名，经 adapter 解耦 store 包结构。
+// 复用 internal/infrastructure/store 既有 Queries 方法签名，经 adapter 解耦 store 包结构。
 type EnvStore interface {
 	// 项目级
 	ListProjectEnvVars(ctx context.Context, projectID string) ([]envVarRow, error)

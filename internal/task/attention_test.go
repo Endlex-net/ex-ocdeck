@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // --- 辅助 ---
@@ -217,7 +217,7 @@ func TestAttention_AlignReplace_PreserveSince(t *testing.T) {
 		permReq("r1", "s1", "bash", "rm"),
 		permReq("r2", "s2", "edit", "file"),
 	}
-	a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign)
+	a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
 
 	snap := a.attentionSnapshot()
 	if len(snap.Permissions) != 2 {
@@ -237,7 +237,7 @@ func TestAttention_CapabilityStateMachine(t *testing.T) {
 		a := newAttentionState()
 		oc := newMockOC(true)
 		oc.listPermissionsResult = []opencode.PermissionRequest{}
-		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign)
+		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
 		a.mu.Lock()
 		if a.perm.cap != capAvailable {
 			t.Fatalf("cap = %v, want available", a.perm.cap)
@@ -249,14 +249,14 @@ func TestAttention_CapabilityStateMachine(t *testing.T) {
 		a := newAttentionState()
 		oc := newMockOC(true)
 		oc.listPermissionsErr = opencode.ErrCapabilityUnsupported
-		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign)
+		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
 		a.mu.Lock()
 		cap := a.perm.cap
 		a.mu.Unlock()
 		if cap != capUnsupported {
 			t.Fatalf("cap = %v, want unsupported", cap)
 		}
-		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign)
+		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
 		snap := a.attentionSnapshot()
 		if len(snap.Permissions) != 0 {
 			t.Fatalf("unsupported should expose empty array, got %+v", snap.Permissions)
@@ -267,7 +267,7 @@ func TestAttention_CapabilityStateMachine(t *testing.T) {
 		a := newAttentionState()
 		oc := newMockOC(true)
 		oc.listPermissionsErr = errors.New("500 internal error")
-		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign)
+		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
 		a.mu.Lock()
 		if a.perm.cap != capDegraded {
 			t.Fatalf("cap = %v, want degraded", a.perm.cap)
@@ -279,7 +279,7 @@ func TestAttention_CapabilityStateMachine(t *testing.T) {
 		a := newAttentionState()
 		oc := newMockOC(true)
 		oc.listPermissionsResult = []opencode.PermissionRequest{permReq("r1", "s1", "bash")}
-		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign)
+		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
 		a.mu.Lock()
 		if a.perm.cap != capAvailable {
 			t.Fatalf("cap = %v, want available", a.perm.cap)
@@ -288,7 +288,7 @@ func TestAttention_CapabilityStateMachine(t *testing.T) {
 
 		oc.listPermissionsResult = nil
 		oc.listPermissionsErr = errors.New("500")
-		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign)
+		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
 		a.mu.Lock()
 		if a.perm.cap != capDegraded {
 			t.Fatalf("cap = %v, want degraded", a.perm.cap)
@@ -301,7 +301,7 @@ func TestAttention_CapabilityStateMachine(t *testing.T) {
 
 		oc.listPermissionsErr = nil
 		oc.listPermissionsResult = []opencode.PermissionRequest{}
-		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign)
+		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
 		a.mu.Lock()
 		if a.perm.cap != capAvailable {
 			t.Fatalf("cap = %v, want available", a.perm.cap)
@@ -313,10 +313,10 @@ func TestAttention_CapabilityStateMachine(t *testing.T) {
 		a := newAttentionState()
 		oc := newMockOC(true)
 		oc.listPermissionsResult = []opencode.PermissionRequest{permReq("r1", "s1", "bash")}
-		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign)
+		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
 		oc.listPermissionsResult = nil
 		oc.listPermissionsErr = opencode.ErrCapabilityUnsupported
-		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign)
+		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
 		a.mu.Lock()
 		if a.perm.cap != capUnsupported {
 			t.Fatalf("cap = %v, want unsupported", a.perm.cap)
@@ -333,8 +333,8 @@ func TestAttention_CapabilityStateMachine(t *testing.T) {
 		oc := newMockOC(true)
 		oc.listPermissionsErr = opencode.ErrCapabilityUnsupported
 		oc.listQuestionsResult = []opencode.QuestionRequest{questReq("q1", "s1", "h", "q")}
-		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign)
-		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionQuestion, reconcileAlign)
+		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
+		a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionQuestion, reconcileAlign, nil)
 		a.mu.Lock()
 		if a.perm.cap != capUnsupported {
 			t.Fatalf("perm cap = %v, want unsupported", a.perm.cap)
@@ -354,7 +354,7 @@ func TestAttention_CanceledNeutral(t *testing.T) {
 	oc.listPermissionsErr = context.Canceled
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	a.reconcileAttention(ctx, oc, "/wt", opencode.AttentionPermission, reconcileAlign)
+	a.reconcileAttention(ctx, oc, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
 	a.mu.Lock()
 	if a.perm.cap != capUnknown {
 		t.Fatalf("canceled should not transition: cap = %v, want unknown", a.perm.cap)
@@ -367,7 +367,7 @@ func TestAttention_DeadlineExceededIsDegraded(t *testing.T) {
 	a := newAttentionState()
 	oc := newMockOC(true)
 	oc.listPermissionsErr = context.DeadlineExceeded
-	a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign)
+	a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
 	a.mu.Lock()
 	if a.perm.cap != capDegraded {
 		t.Fatalf("deadline exceeded should be degraded: cap = %v, want degraded", a.perm.cap)
@@ -381,7 +381,7 @@ func TestAttention_UnsupportedIgnoresSSE(t *testing.T) {
 	a := newAttentionState()
 	oc := newMockOC(true)
 	oc.listPermissionsErr = opencode.ErrCapabilityUnsupported
-	a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign)
+	a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
 	a.applyAttentionEvent(permAsked("r1", "s1", "bash"))
 	snap := a.attentionSnapshot()
 	if len(snap.Permissions) != 0 {
@@ -402,7 +402,7 @@ func TestAttention_SuspendReconcileRace(t *testing.T) {
 	wrap := &blockingPermOC{inner: oc, block: blockCh, entered: entered}
 	done := make(chan struct{})
 	go func() {
-		a.reconcileAttention(context.Background(), wrap, "/wt", opencode.AttentionPermission, reconcileBackground)
+		a.reconcileAttention(context.Background(), wrap, "/wt", opencode.AttentionPermission, reconcileBackground, nil)
 		close(done)
 	}()
 	// 确定性同步：等 REST 进入后再挂起
@@ -456,7 +456,7 @@ func TestAttention_BackgroundREST_InFlightSSE(t *testing.T) {
 	wrap := &blockingPermOC{inner: oc, block: blockCh, entered: entered}
 	done := make(chan struct{})
 	go func() {
-		a.reconcileAttention(context.Background(), wrap, "/wt", opencode.AttentionPermission, reconcileBackground)
+		a.reconcileAttention(context.Background(), wrap, "/wt", opencode.AttentionPermission, reconcileBackground, nil)
 		close(done)
 	}()
 	<-entered
@@ -482,7 +482,7 @@ func TestAttention_BufferSinceIsObservationTime(t *testing.T) {
 	wrap := &blockingPermOC{inner: oc, block: blockCh, entered: entered}
 	done := make(chan struct{})
 	go func() {
-		a.reconcileAttention(context.Background(), wrap, "/wt", opencode.AttentionPermission, reconcileBackground)
+		a.reconcileAttention(context.Background(), wrap, "/wt", opencode.AttentionPermission, reconcileBackground, nil)
 		close(done)
 	}()
 	<-entered
@@ -521,7 +521,7 @@ func TestAttention_TakeoverMergesOldBuffer(t *testing.T) {
 		permReq("r1", "s1", "bash"),
 		permReq("r3", "s2", "run"),
 	}
-	a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileBackground)
+	a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileBackground, nil)
 
 	snap := a.attentionSnapshot()
 	ids := make(map[string]bool)
@@ -549,7 +549,7 @@ func TestAttention_Background404DiscardsBuffer(t *testing.T) {
 	wrap := &blockingPermOC{inner: oc, block: blockCh, entered: entered}
 	done := make(chan struct{})
 	go func() {
-		a.reconcileAttention(context.Background(), wrap, "/wt", opencode.AttentionPermission, reconcileBackground)
+		a.reconcileAttention(context.Background(), wrap, "/wt", opencode.AttentionPermission, reconcileBackground, nil)
 		close(done)
 	}()
 	<-entered
@@ -587,7 +587,7 @@ func TestAttention_AlignPreemptedByBackground(t *testing.T) {
 	wrapAlign := &blockingPermOC{inner: ocAlign, block: blockCh, entered: entered}
 	alignDone := make(chan struct{})
 	go func() {
-		a.reconcileAttention(context.Background(), wrapAlign, "/wt", opencode.AttentionPermission, reconcileAlign)
+		a.reconcileAttention(context.Background(), wrapAlign, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
 		close(alignDone)
 	}()
 	<-entered
@@ -595,7 +595,7 @@ func TestAttention_AlignPreemptedByBackground(t *testing.T) {
 	// 后台路径抢占：REST 返回空快照
 	ocBg := newMockOC(true)
 	ocBg.listPermissionsResult = []opencode.PermissionRequest{}
-	a.reconcileAttention(context.Background(), ocBg, "/wt", opencode.AttentionPermission, reconcileBackground)
+	a.reconcileAttention(context.Background(), ocBg, "/wt", opencode.AttentionPermission, reconcileBackground, nil)
 
 	// 放行 align REST
 	close(blockCh)
@@ -621,7 +621,7 @@ func TestAttention_BackgroundPreemptedByAlign(t *testing.T) {
 	oc.listPermissionsResult = []opencode.PermissionRequest{}
 	bgDone := make(chan struct{})
 	go func() {
-		a.reconcileAttention(context.Background(), wrap, "/wt", opencode.AttentionPermission, reconcileBackground)
+		a.reconcileAttention(context.Background(), wrap, "/wt", opencode.AttentionPermission, reconcileBackground, nil)
 		close(bgDone)
 	}()
 	<-entered
@@ -631,7 +631,7 @@ func TestAttention_BackgroundPreemptedByAlign(t *testing.T) {
 		permReq("r1", "s1", "bash"),
 		permReq("r2", "s2", "edit"),
 	}
-	a.reconcileAttention(context.Background(), oc2, "/wt", opencode.AttentionPermission, reconcileAlign)
+	a.reconcileAttention(context.Background(), oc2, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
 
 	close(blockCh)
 	<-bgDone
@@ -659,7 +659,7 @@ func TestAttention_BackgroundNon404ReplayBuffer(t *testing.T) {
 	wrap := &blockingPermOC{inner: oc, block: blockCh, entered: entered}
 	done := make(chan struct{})
 	go func() {
-		a.reconcileAttention(context.Background(), wrap, "/wt", opencode.AttentionPermission, reconcileBackground)
+		a.reconcileAttention(context.Background(), wrap, "/wt", opencode.AttentionPermission, reconcileBackground, nil)
 		close(done)
 	}()
 	<-entered
@@ -740,8 +740,8 @@ func TestAttention_BackgroundRetry_ConcurrentTypes(t *testing.T) {
 	seed.listPermissionsErr = errors.New("500")
 	seed.listQuestionsErr = errors.New("500")
 	a := newAttentionState()
-	a.reconcileAttention(context.Background(), seed, "/wt", opencode.AttentionPermission, reconcileAlign)
-	a.reconcileAttention(context.Background(), seed, "/wt", opencode.AttentionQuestion, reconcileAlign)
+	a.reconcileAttention(context.Background(), seed, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
+	a.reconcileAttention(context.Background(), seed, "/wt", opencode.AttentionQuestion, reconcileAlign, nil)
 	a.mu.Lock()
 	if !a.perm.isDegradedLocked() || !a.quest.isDegradedLocked() {
 		a.mu.Unlock()
@@ -795,7 +795,7 @@ func TestAttention_DegradedScanNoRace(t *testing.T) {
 	a := newAttentionState()
 	oc := newMockOC(true)
 	oc.listPermissionsErr = errors.New("500")
-	a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign)
+	a.reconcileAttention(context.Background(), oc, "/wt", opencode.AttentionPermission, reconcileAlign, nil)
 
 	// 并发：后台扫描 cap + SSE 写入 + 快照读取
 	var wg sync.WaitGroup

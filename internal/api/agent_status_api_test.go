@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"ocdeck/internal/task"
+	"ocdeck/internal/application"
 )
 
 // agentStatusTaskBackend 返回固定 agentStatus 供 DTO 测试。
@@ -22,8 +22,8 @@ func (a *agentStatusTaskBackend) AgentStatus(ctx context.Context, taskID string)
 }
 
 // Get 返回带 ProjectID 的零值任务行，供 handleGetTask 在 fail-closed kind 校验下通过。
-func (a *agentStatusTaskBackend) Get(ctx context.Context, taskID string) (task.TaskRow, error) {
-	return task.TaskRow{ID: taskID, ProjectID: a.getTaskID}, nil
+func (a *agentStatusTaskBackend) Get(ctx context.Context, taskID string) (application.TaskRow, error) {
+	return application.TaskRow{ID: taskID, ProjectID: a.getTaskID}, nil
 }
 
 // newAgentStatusServer 构造带 ProjectStore + TaskBackend 的 Server（agentStatus 测试用）。
@@ -97,4 +97,4 @@ func TestTaskDTO_AgentStatus_EmptyWhenDegraded(t *testing.T) {
 }
 
 // 编译期断言：task 仅用于 OpError 等类型引用（防止重构误删 import）。
-var _ task.DeleteMode
+var _ application.DeleteMode

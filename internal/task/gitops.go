@@ -5,34 +5,19 @@ import (
 	"errors"
 	"fmt"
 
-	"ocdeck/internal/git"
+	"ocdeck/internal/application"
+	"ocdeck/internal/infrastructure/git"
 )
 
 // GitFileDTO 单文件状态（design.md §21 git/status，与 internal/api/git.go gitFileDTO 字段一致）。
 // lane B 将按 internal/task.GitStatus/GitDiff/GitCommit/GitPush 签名重接 API，DTO 定义在 task 包。
-type GitFileDTO struct {
-	Path      string `json:"path"`
-	X         string `json:"x"`
-	Y         string `json:"y"`
-	Staged    bool   `json:"staged"`
-	Unstaged  bool   `json:"unstaged"`
-	Untracked bool   `json:"untracked"`
-	Additions int    `json:"additions"`
-	Deletions int    `json:"deletions"`
-	IsBinary  bool   `json:"isBinary"`
-}
+type GitFileDTO = application.GitFileDTO
 
 // GitStatusDTO status 响应（含当前分支，design.md §21 git/status）。
-type GitStatusDTO struct {
-	Branch string       `json:"branch"`
-	Files  []GitFileDTO `json:"files"`
-}
+type GitStatusDTO = application.GitStatusDTO
 
 // GitDiffDTO diff 响应（unified diff 文本 + 截断标记，design.md §21 git/diff）。
-type GitDiffDTO struct {
-	Diff      string `json:"diff"`
-	Truncated bool   `json:"truncated"`
-}
+type GitDiffDTO = application.GitDiffDTO
 
 // assertGitRepoTask 解析任务所属项目 kind，校验该任务可作为 git 操作目标（add-plain-dir-project D5）。
 // 在执行任何 git 命令前调用：dir 项目 → codeInvalidInput（明确"project kind is dir (not a git repository)"），
@@ -55,7 +40,7 @@ func (m *Manager) assertGitRepoTask(ctx context.Context, row TaskRow) (ProjectRo
 
 // GitStatus 返回任务 worktree 的 git 状态（design.md §9/§21）。
 // 持任务锁（与 Suspend/Delete 等生命周期操作互斥，冲突返回 409）防并发。
-// 复用 internal/git.Status + git.CurrentBranch；只读，不进 repo 写锁。
+// 复用 internal/infrastructure/git.Status + git.CurrentBranch；只读，不进 repo 写锁。
 // not_found 语义与现有一致：任务不存在返回 codeNotFound。
 func (m *Manager) GitStatus(ctx context.Context, taskID string) (GitStatusDTO, error) {
 	unlock, err := m.tryLockTask(taskID)

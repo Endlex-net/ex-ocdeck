@@ -1,4 +1,6 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
   resolveRoute,
   normalizeFrom,
@@ -13,9 +15,11 @@ import {
   isThemePreference,
   createStore,
   __resetProjectsStoreForTest,
+  __projectsStoreAccessForTest,
   __themeStoreForTest,
   type StoreDeps,
   type StoreSnapshot,
+  type StreamHandlers,
 } from '../hooks';
 import { matchCommand, type PaletteCommand } from '../components/CommandPalette';
 import { runProjectMutation, createErrorMessage, deleteErrorMessage } from '../hooks';
@@ -629,6 +633,208 @@ describe('共享 store single-flight 与 trailing refresh（驱动生产 createS
     expect(getCallCount()).toBe(callCountBefore);
     expect(getSnap().error).toBe('');
     handle.store.dispose();
+  });
+});
+
+describe('共享 store SSE 订阅与 30s 兜底轮询（projects-stream design D6）', () => {
+  beforeEach(() => {
+    __resetProjectsStoreForTest();
+  });
+
+  const p = (id: string): Project => ({
+    id,
+    name: id,
+    path: '/p/' + id,
+    kind: 'repo',
+    default_branch: 'main',
+    created_at: 0,
+    task_count: 0,
+    tasks_by_status: {},
+    tasks: [],
+  });
+
+  /** 等待所有微任务排空（doLoad async 链跨多个 await 点）。 */
+  async function flushMicrotasks(n = 10) {
+    for (let i = 0; i < n; i++) await Promise.resolve();
+  }
+
+  /** 捕获流回调的 fake streamFactory：工厂创建即被调用，close 为 spy。 */
+  function fakeStream() {
+    let handlers!: StreamHandlers;
+    const close = vi.fn();
+    const factory = vi.fn((h: StreamHandlers) => {
+      handlers = h;
+      return { close };
+    });
+    return {
+      factory,
+      close,
+      emitData: (projects: Project[]) => handlers.onData(projects),
+      emitError: (message: string) => handlers.onError(message),
+    };
+  }
+
+  it('store 创建即建立流订阅；dispose 关闭订阅', () => {
+    const stream = fakeStream();
+    const handle = createStore({ loader: async () => [], streamFactory: stream.factory });
+    expect(stream.factory).toHaveBeenCalledTimes(1);
+    handle.store.dispose();
+    expect(stream.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('snapshot/update 帧整表替换快照：首帧即 initialized、清 error，update 覆盖', async () => {
+    const stream = fakeStream();
+    const handle = createStore({ loader: async () => [], streamFactory: stream.factory });
+    stream.emitError('项目连接中断'); // 首帧前错误 → error 通道
+    expect(handle.getSnapshot().error).toBe('项目连接中断');
+    stream.emitData([p('a')]); // snapshot 帧
+    let snap = handle.getSnapshot();
+    expect(snap.projects.map((x) => x.id)).toEqual(['a']);
+    expect(snap.initialized).toBe(true);
+    expect(snap.loading).toBe(false);
+    expect(snap.error).toBe('');
+    stream.emitData([p('b')]); // update 帧（整表替换，非合并）
+    snap = handle.getSnapshot();
+    expect(snap.projects.map((x) => x.id)).toEqual(['b']);
+    handle.store.dispose();
+  });
+
+  it('流失败静默保留旧数据：error 暴露、projects 不清空', async () => {
+    const stream = fakeStream();
+    const handle = createStore({ loader: async () => [], streamFactory: stream.factory });
+    stream.emitData([p('a')]);
+    stream.emitError('项目连接中断');
+    const snap = handle.getSnapshot();
+    expect(snap.projects).toHaveLength(1); // 保留旧数据（侧栏不闪空态）
+    expect(snap.error).toBe('项目连接中断');
+    expect(snap.loading).toBe(false);
+    handle.store.dispose();
+  });
+
+  it('兜底轮询保持数据新鲜：注入 timer 触发仍走 loader（single-flight pollOnce 不变）', async () => {
+    const stream = fakeStream();
+    let loadCount = 0;
+    let latest = [p('x1')];
+    const loader = async () => {
+      loadCount += 1;
+      return latest;
+    };
+    let fire!: () => void;
+    const handle = createStore({
+      loader,
+      startTimer: (f) => {
+        fire = f;
+        return () => {};
+      },
+      streamFactory: stream.factory,
+    });
+    expect(loadCount).toBe(1); // createStore 首次加载
+    await flushMicrotasks(); // 等首次加载 settle（否则 fire 被合并进在途请求）
+    latest = [p('x2')]; // 模拟流外变更（项目 CRUD 无事件），仅 REST 可见
+    fire(); // 兜底周期 tick
+    await flushMicrotasks();
+    expect(loadCount).toBe(2);
+    expect(handle.getSnapshot().projects.map((x) => x.id)).toEqual(['x2']);
+    fire();
+    await flushMicrotasks();
+    expect(loadCount).toBe(3);
+    handle.store.dispose();
+  });
+
+  it('流订阅存在时 refresh() 仍立即触发 REST 重载（用户主动操作立即收敛）', async () => {
+    const stream = fakeStream();
+    let loadCount = 0;
+    const loader = async () => {
+      loadCount += 1;
+      return [];
+    };
+    const handle = createStore({ loader, streamFactory: stream.factory });
+    expect(loadCount).toBe(1);
+    await handle.store.refresh();
+    expect(loadCount).toBe(2);
+    handle.store.dispose();
+  });
+
+  it('兜底周期源码契约：30s 常量、不存在固定 5s 轮询', () => {
+    const src = readFileSync(fileURLToPath(new URL('../hooks.ts', import.meta.url)), 'utf8');
+    expect(src).toContain('PROJECTS_FALLBACK_POLL_MS = 30000');
+    expect(src).not.toMatch(/setInterval\(fire, 5000\)/);
+  });
+});
+
+describe('共享 store 401 终止与懒重建（UNAUTHORIZED_EVENT → reset → 重新认证后重建）', () => {
+  type Listener = (e: Event) => void;
+  let listeners: Listener[];
+
+  beforeEach(() => {
+    __resetProjectsStoreForTest();
+    listeners = [];
+    // fake window：只承接 addEventListener（getStoreHandle 首建时的 401 重置绑定）
+    vi.stubGlobal('window', {
+      addEventListener: (_type: string, l: Listener) => listeners.push(l),
+      removeEventListener: (_type: string, _l: Listener) => {},
+      dispatchEvent: () => true,
+    });
+  });
+  afterEach(() => {
+    __resetProjectsStoreForTest();
+    vi.unstubAllGlobals();
+  });
+
+  /** 计数 loader + 计数流工厂（close spy）。 */
+  function makeDeps() {
+    const counts = { loads: 0, streams: 0, closes: 0 };
+    const deps: StoreDeps = {
+      loader: async () => {
+        counts.loads += 1;
+        return [];
+      },
+      streamFactory: () => {
+        counts.streams += 1;
+        return {
+          close: () => {
+            counts.closes += 1;
+          },
+        };
+      },
+    };
+    return { deps, counts };
+  }
+
+  /** 模拟 401：api.ts request()/sse.ts 流在 clearToken 后派发 UNAUTHORIZED_EVENT。 */
+  const fireUnauthorized = () => {
+    for (const l of listeners) l(new Event('ocdeck:unauthorized'));
+  };
+
+  it('流 401 → 事件释放 store；重新认证后再次访问懒重建（新工厂 + 立即首次加载），事件双发不重复订阅', async () => {
+    const a = makeDeps();
+    const h1 = __projectsStoreAccessForTest(a.deps);
+    expect(a.counts.streams).toBe(1); // 创建即订阅
+    expect(a.counts.loads).toBe(1); // 立即首次加载
+    expect(listeners).toHaveLength(1); // 首建即绑定 401 重置（一次）
+
+    fireUnauthorized(); // 模拟流 401：sse 核心已 clearToken + dispatch，订阅永久终止
+    fireUnauthorized(); // 并发 REST 401 同事件双发：reset 幂等
+    expect(a.counts.closes).toBe(1); // 旧 store 流被关闭（且仅一次）
+    expect(listeners).toHaveLength(1); // 不重复绑定
+
+    // 重新认证后的消费方首次访问：懒重建，走 getStoreHandle 真实路径
+    const b = makeDeps();
+    const h2 = __projectsStoreAccessForTest(b.deps);
+    expect(h2).not.toBe(h1);
+    expect(b.counts.streams).toBe(1); // 新流恰好一次（无双订阅）
+    expect(b.counts.loads).toBe(1); // 首次加载恢复（loader 立即 resolve）
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(h2.getSnapshot().initialized).toBe(true);
+  });
+
+  it('单例复用：事件之外重复访问不重建（同一句柄、工厂只调一次）', () => {
+    const a = makeDeps();
+    const h1 = __projectsStoreAccessForTest(a.deps);
+    const h2 = __projectsStoreAccessForTest(a.deps);
+    expect(h2).toBe(h1);
+    expect(a.counts.streams).toBe(1);
+    expect(a.counts.loads).toBe(1);
   });
 });
 

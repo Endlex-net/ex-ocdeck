@@ -11,7 +11,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"ocdeck/internal/pty"
+	"ocdeck/internal/infrastructure/pty"
 )
 
 // dialWS 连接到 httptest server 的 /ws 端点，返回 websocket 连接。

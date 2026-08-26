@@ -1,0 +1,9 @@
+{"id":"evt_03bdc3597001ma8SGEAOP6m95k","type":"server.connected","properties":{}}
+{"id":"evt_03bdce5870014t8e0nCAK4Qks4","type":"session.status","properties":{"sessionID":"ses_fc4359334ffe59lfDo3O5vKb1d","status":{"type":"busy"}}}
+{"id":"evt_03bdce5f7001RlDH3CT9onvud4","type":"session.status","properties":{"sessionID":"ses_fc4359334ffe59lfDo3O5vKb1d","status":{"type":"retry","attempt":1,"message":"p17 stub rate limit","next":1787710728671}}}
+{"id":"evt_03bdcf9df002Yc5Kpf1Az0WiTG","type":"session.status","properties":{"sessionID":"ses_fc4359334ffe59lfDo3O5vKb1d","status":{"type":"idle"}}}
+{"id":"evt_03bdcf9df0033R1T4Z54Ue9L7r","type":"session.idle","properties":{"sessionID":"ses_fc4359334ffe59lfDo3O5vKb1d"}}
+{"id":"evt_03bdcf9df001QQZPl6UURw5Ba4","type":"session.error","properties":{"sessionID":"ses_fc4359334ffe59lfDo3O5vKb1d","error":{"name":"APIError","data":{"message":"p17 stub rate limit","statusCode":429,"isRetryable":true,"responseHeaders":{"content-length":"104","content-type":"application/json","date":"Wed, 26 Aug 2026 02:18:52 GMT","retry-after":"1","server":"BaseHTTP/0.6 Python/3.10.4"},"responseBody":"{\"error\": {\"message\": \"p17 stub rate limit\", \"type\": \"rate_limit_error\", \"code\": \"rate_limit_exceeded\"}}","metadata":{"url":"http://127.0.0.1:50401/v1/responses"}}}}}
+{"id":"evt_synthetic_unknown_type","type":"future.unknown","properties":{"sessionID":"ses_fc4359334ffe59lfDo3O5vKb1d"}}
+{"id":"evt_synthetic_missing_session_id","type":"session.status","properties":{"status":{"type":"busy"}}}
+{"id":"evt_synthetic_missing_status_type","type":"session.status","properties":{"sessionID":"ses_fc4359334ffe59lfDo3O5vKb1d","status":{"attempt":2}}}

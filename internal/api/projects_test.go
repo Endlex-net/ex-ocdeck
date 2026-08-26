@@ -10,11 +10,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
 	"ocdeck/internal/config"
-	"ocdeck/internal/store"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // fakeProjectStore 内存实现 ProjectStore，用于测试。
@@ -62,6 +63,8 @@ func (f *fakeProjectStore) ListProjects(ctx context.Context) ([]storeProjectRow,
 	for _, p := range f.projects {
 		out = append(out, p)
 	}
+	// 按 ID 排序保证确定性（map 迭代乱序会使快照/REST parity 断言不稳定）。
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
 }
 

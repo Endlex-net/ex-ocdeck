@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // TestAgentStatus_NonActiveReturnsEmpty 验证非 active 任务 agentStatus 为空串。

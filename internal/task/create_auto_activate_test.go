@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // newTestManagerWithLifecycle 构造 Manager 并注入可取消 lifecycle ctx（供自动激活测试，

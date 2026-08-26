@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"ocdeck/internal/config"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // --- Lane C：运行时事件与注册竞态 ---

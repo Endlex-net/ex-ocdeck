@@ -4,14 +4,14 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"ocdeck/internal/task"
+	"ocdeck/internal/application"
 )
 
 // registerGitRoutes 注册任务 worktree 的 git 状态/diff/commit/push 路由（design.md §21、§9）。
 // status/diff 为只读，MUST NOT 进 repo 写锁（git-operations spec）。
 // commit/push 在 worktree 内执行本机 git，保 hooks/签名行为，错误原样透传 git stderr。
 //
-// 经 TaskManager GitOps（task.Manager.GitStatus/GitDiff/GitCommit/GitPush）调用，
+// 经 TaskManager GitOps（task 层 Manager facade 的 GitStatus/GitDiff/GitCommit/GitPush）调用，
 // 持任务锁与 Suspend/Delete 等生命周期操作互斥，避免 api 绕过 TaskManager 致
 // worktree 在 git 操作中被移除（P6 并发竞争修复）。
 func (s *Server) registerGitRoutes(mux *http.ServeMux) {
@@ -25,12 +25,12 @@ func (s *Server) registerGitRoutes(mux *http.ServeMux) {
 }
 
 // gitStatusResponse status 响应（含当前分支）。
-// 复用 task.GitStatusDTO（JSON 字段与既有前端契约一致）。
-type gitStatusResponse = task.GitStatusDTO
+// 复用 application.GitStatusDTO（JSON 字段与既有前端契约一致）。
+type gitStatusResponse = application.GitStatusDTO
 
 // gitDiffResponse diff 响应（unified diff 文本 + 截断标记）。
-// 复用 task.GitDiffDTO（JSON 字段与既有前端契约一致）。
-type gitDiffResponse = task.GitDiffDTO
+// 复用 application.GitDiffDTO（JSON 字段与既有前端契约一致）。
+type gitDiffResponse = application.GitDiffDTO
 
 // gitCommitReq commit 请求体。paths 为空表示提交全部改动。
 type gitCommitReq struct {
@@ -39,7 +39,7 @@ type gitCommitReq struct {
 }
 
 // handleGitStatus GET /api/v1/tasks/:id/git/status（design.md §9/§21）。
-// 经 TaskManager.GitStatus 持任务锁，DTO 直接复用 task.GitStatusDTO。
+// 经 TaskManager.GitStatus 持任务锁，DTO 直接复用 application.GitStatusDTO。
 func (s *Server) handleGitStatus(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
 	st, err := s.tasks.GitStatus(r.Context(), taskID)
@@ -55,7 +55,7 @@ func (s *Server) handleGitStatus(w http.ResponseWriter, r *http.Request) {
 // ref 可选（默认工作区 vs 索引/HEAD），path 可选（空=全仓 diff，受 DiffMaxFiles 限制）。
 // untracked 查询参数值域：absent / "0" / "1"，其他值 → invalid_input。
 // untracked=1 时透传 untracked=true，调用方声明模式，服务端不二次探测。
-// 经 TaskManager.GitDiff 持任务锁，DTO 直接复用 task.GitDiffDTO。
+// 经 TaskManager.GitDiff 持任务锁，DTO 直接复用 application.GitDiffDTO。
 func (s *Server) handleGitDiff(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
 	ref := r.URL.Query().Get("ref")

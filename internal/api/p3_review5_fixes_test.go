@@ -10,7 +10,7 @@ import (
 
 	"github.com/coder/websocket"
 
-	"ocdeck/internal/task"
+	"ocdeck/internal/application"
 )
 
 // --- Fix 8: HasSession infra error → 1011（不得误判 4010 掩盖 infra 故障） ---
@@ -21,7 +21,7 @@ import (
 func TestAPI_WSTUI_ReopenAttachInfraError_1011(t *testing.T) {
 	tb := &fakeTaskBackend{
 		// infra 错误映射为 codeInternal（task 层 HasSession infra error → newOpErr(codeInternal,...)）。
-		reopenErr: &task.OpError{Code: "internal", Err: errors.New("tmux infra: has session failed")},
+		reopenErr: &application.OpError{Code: "internal", Err: errors.New("tmux infra: has session failed")},
 	}
 	s := newAPITestServer(t, tb)
 	srv := httptest.NewServer(s.mux)
@@ -49,7 +49,7 @@ func TestAPI_WSTUI_ReopenAttachInfraError_1011(t *testing.T) {
 // （任务确非活跃）→ 4010 task suspended，区分 infra 错误路径。
 func TestAPI_WSTUI_ReopenAttachSuspended_4010(t *testing.T) {
 	tb := &fakeTaskBackend{
-		reopenErr: &task.OpError{Code: "invalid_state", Err: errors.New("task not active")},
+		reopenErr: &application.OpError{Code: "invalid_state", Err: errors.New("task not active")},
 	}
 	s := newAPITestServer(t, tb)
 	srv := httptest.NewServer(s.mux)

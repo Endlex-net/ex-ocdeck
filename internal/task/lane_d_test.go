@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // --- 任务 1：taskBusy 机制 ---

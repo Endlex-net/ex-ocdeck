@@ -9,9 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // --- Fix 1: deletion_failed 时一次性 serve kill tickets 不得丢弃 ---
@@ -371,8 +372,8 @@ type noConvergeStore struct {
 	*mockStore
 }
 
-func (s *noConvergeStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (bool, error) {
-	return false, nil // 始终冲突，不收敛
+func (s *noConvergeStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error) {
+	return application.MutationResult{}, nil // 始终冲突，不收敛
 }
 
 // --- 测试升级：reconcile active-resume 完整路径 ---

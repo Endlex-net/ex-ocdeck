@@ -5,63 +5,68 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
-	"sync"
-	"time"
 
-	"ocdeck/internal/pty"
-	"ocdeck/internal/task"
+	"ocdeck/internal/application"
+	"ocdeck/internal/infrastructure/pty"
 )
 
 // TaskBackend 是 api 层调用的 TaskManager 能力（design.md §18 task 行 + §21 路由）。
-// api handler 只做 DTO/HTTP 语义，不做编排。返回 task.TaskRow + error（api 做 DTO 转换）。
+// api handler 只做 DTO/HTTP 语义，不做编排。返回 application.TaskRow + error（api 做 DTO 转换）。
 type TaskBackend interface {
-	Create(ctx context.Context, projectID, taskName, baseRef string) (task.TaskRow, error)
+	Create(ctx context.Context, projectID, taskName, baseRef string) (application.TaskRow, error)
 	Activate(ctx context.Context, taskID string) error
 	Suspend(ctx context.Context, taskID string) error
 	Archive(ctx context.Context, taskID string) error
 	Restore(ctx context.Context, taskID string) error
-	Delete(ctx context.Context, taskID string, mode task.DeleteMode, confirmDirty bool) error
+	Delete(ctx context.Context, taskID string, mode application.DeleteMode, confirmDirty bool) error
 	Retry(ctx context.Context, taskID string, confirmDirty bool) error
-	ReopenAttach(ctx context.Context, taskID string) (task.TerminalID, error)
-	CreateShell(ctx context.Context, taskID string) (task.TerminalID, error)
-	CloseShell(ctx context.Context, terminalID task.TerminalID) error
-	Get(ctx context.Context, taskID string) (task.TaskRow, error)
-	List(ctx context.Context, projectID string) ([]task.TaskRow, error)
-	ListTaskSessions(ctx context.Context, taskID string) ([]task.SessionRow, error)
-	ListShells(taskID string) ([]task.TerminalID, error)
+	ReopenAttach(ctx context.Context, taskID string) (application.TerminalID, error)
+	CreateShell(ctx context.Context, taskID string) (application.TerminalID, error)
+	CloseShell(ctx context.Context, terminalID application.TerminalID) error
+	Get(ctx context.Context, taskID string) (application.TaskRow, error)
+	List(ctx context.Context, projectID string) ([]application.TaskRow, error)
+	ListTaskSessions(ctx context.Context, taskID string) ([]application.SessionRow, error)
+	ListShells(taskID string) ([]application.TerminalID, error)
 	ValidateShellTerminal(tid string) error
 	AttachPty(sessionName string, cols, rows int) (*pty.Pty, error)
 	// AgentStatus 返回任务 agent 运行态（idle/busy/retry/空串，design.md 2.8）。
 	// 非 active 或查询失败返回空串（降级不阻塞详情返回）。
 	AgentStatus(ctx context.Context, taskID string) string
+	// AgentStatusSnapshot 读 agentStatus 内存快照（sse-active-sessions design D4）。
+	// 不可用（无 runtime/连接代无效/零 owned）返回空串（omitempty 省略）。
+	// 供 active sessions/SSE 与 /projects 任务摘要组装消费（projects-stream）；
+	// 与 AgentStatus 实时探测语义并存、互不影响。
+	AgentStatusSnapshot(taskID string) string
 	// ListAllActiveTaskIDs 返回当前 active 任务 ID
 	//（供全局配置保存后受影响任务提示，design.md §13）。
 	ListAllActiveTaskIDs(ctx context.Context) ([]string, error)
 	// ListActiveTaskOverview 聚合全部 active 任务的跨项目概览
-	//（cross-project-active-sessions：GET /api/v1/sessions/active 读模型来源）。
-	// 返回不含 agentStatus 的投影行；agentStatus 由 handler 并发 hydration 填充。
-	ListActiveTaskOverview(ctx context.Context) ([]task.ActiveTaskOverviewRow, error)
+	//（cross-project-active-sessions：GET /api/v1/tasks/active 读模型来源）。
+	// 返回不含 agentStatus 的投影行；agentStatus 由 API 层组装读内存快照
+	//（AgentStatusSnapshot，sse-active-sessions P2.2）填充到 DTO。
+	ListActiveTaskOverview(ctx context.Context) ([]application.ActiveTaskOverviewRow, error)
 	// Attention 返回任务注意力信号快照（design.md D6）。非 active/无 runtime 返回空快照。
 	// 纯读聚合，不影响任务状态机。API 层据此透出 attention 字段（空数组非 null）。
-	Attention(taskID string) (task.Attention, bool)
+	Attention(taskID string) (application.Attention, bool)
 	// ListProjectTaskSummaries 聚合全部任务摘要（design.md D4 GET /projects tasks 摘要）。
-	// 纯读聚合；store 失败返回错误（API 层 500 不水合）。agentStatus hydration 在 API 层。
-	ListProjectTaskSummaries(ctx context.Context) ([]task.ProjectTaskSummary, error)
+	// 纯读聚合；store 失败返回错误（API 层 500）。active 摘要的 agentStatus 由 API 层
+	// 组装读内存快照（AgentStatusSnapshot）填充。
+	ListProjectTaskSummaries(ctx context.Context) ([]application.ProjectTaskSummary, error)
 
 	// Git 状态/diff/commit/push 经 TaskManager GitOps（design.md §9/§21）。
 	// 持任务锁与 Suspend/Delete 等生命周期操作互斥，避免 api 绕过 TaskManager 致
-	// worktree 在 git 操作中被移除（P6 并发竞争修复）。DTO 直接复用 task 包类型，
-	// 前端 JSON 契约不变（task.GitStatusDTO/GitDiffDTO 字段与既有响应一致）。
-	// 错误语义经 *task.OpError 携带：not_found/conflict/invalid_input/git_error，
+	// worktree 在 git 操作中被移除（P6 并发竞争修复）。DTO 直接复用 application 包类型，
+	// 前端 JSON 契约不变（application.GitStatusDTO/GitDiffDTO 字段与既有响应一致）。
+	// 错误语义经 *application.OpError 携带：not_found/conflict/invalid_input/git_error，
 	// 由 mapTaskErr 统一映射 HTTP code/msg。
-	GitStatus(ctx context.Context, taskID string) (task.GitStatusDTO, error)
-	GitDiff(ctx context.Context, taskID, ref, path string, untracked bool) (task.GitDiffDTO, error)
+	GitStatus(ctx context.Context, taskID string) (application.GitStatusDTO, error)
+	GitDiff(ctx context.Context, taskID, ref, path string, untracked bool) (application.GitDiffDTO, error)
 	GitCommit(ctx context.Context, taskID, message string, paths []string) error
 	GitPush(ctx context.Context, taskID string) error
 	// RerunInit 手动重跑 init 脚本（design.md §8，tasks 3.6）。
 	// 返回 claim 后的任务行（init_status=running），供 API 层 200+DTO。
-	// task.OpError 映射：invalid_state → 422、conflict → 409。
-	RerunInit(ctx context.Context, taskID string) (task.TaskRow, error)
+	// application.OpError 映射：invalid_state → 422、conflict → 409。
+	RerunInit(ctx context.Context, taskID string) (application.TaskRow, error)
 	// ReadInitLog 读取 init 日志（design.md §7.4/§8）：inherit 警告节 + init.log 拼接，tail ≤64KB。
 	// 任务不存在 → not_found；无日志文件返回空串非错误。
 	ReadInitLog(ctx context.Context, taskID string) (string, error)
@@ -116,7 +121,16 @@ func (s *Server) registerTaskRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/tasks/{id}/terminals", s.handleListTerminals)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/terminals", s.handleCreateTerminal)
 	mux.HandleFunc("DELETE /api/v1/terminals/{tid}", s.handleCloseTerminal)
+	// projects-stream task 命名：canonical /tasks/active；旧 /sessions/active 保留为兼容别名
+	//（sse-active-sessions design Non-Goals：兼容与调试用途），同一 handler、同一响应。
+	mux.HandleFunc("GET /api/v1/tasks/active", s.handleListActiveSessions)
 	mux.HandleFunc("GET /api/v1/sessions/active", s.handleListActiveSessions)
+	// SSE 流端点（sse-active-sessions P2.3，design D3）：与 /tasks/active 同享
+	// Bearer 子 mux；需事件订阅端口注入（SetEventSubscriber 须先于 RebuildRoutes）。
+	// projects-stream 改名 /tasks/active/stream（sse-active-sessions 引入未发布，不留旧路径别名）。
+	if s.eventSubscriber != nil {
+		mux.HandleFunc("GET /api/v1/tasks/active/stream", s.handleActiveSessionsStream)
+	}
 	// WS 端点由 registerWSRoutes 单独挂载（不走 api 子 mux，design.md §21）。
 }
 
@@ -271,9 +285,9 @@ func (s *Server) handleReopenAttach(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
-	mode := task.DeleteNormal
+	mode := application.DeleteNormal
 	if m := r.URL.Query().Get("mode"); m == "force" {
-		mode = task.DeleteForce
+		mode = application.DeleteForce
 	} else if m != "" && m != "normal" {
 		writeApiError(w, NewError(CodeInvalidInput, "mode must be normal or force"))
 		return
@@ -303,7 +317,7 @@ func (s *Server) handleRetryTask(w http.ResponseWriter, r *http.Request) {
 
 // handleRerunInit POST /api/v1/tasks/{id}/rerun-init（design.md §8）。
 // 独立 handler（非 handleTaskAction——既有 helper 返回 204）；成功 200 + 任务 DTO。
-// task.OpError 映射走 mapTaskErr（invalid_state → 422、conflict → 409）。
+// application.OpError 映射走 mapTaskErr（invalid_state → 422、conflict → 409）。
 //
 // fail-closed（D6）：RerunInit 会在 claim/执行脚本产生副作用；project_kind MUST 在副作用前
 // 取得。预取（Get + requireProjectKind）失败 MUST NOT 调用 RerunInit，直接返回错误
@@ -385,7 +399,7 @@ func (s *Server) handleCreateTerminal(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCloseTerminal(w http.ResponseWriter, r *http.Request) {
-	tid := task.TerminalID(r.PathValue("tid"))
+	tid := application.TerminalID(r.PathValue("tid"))
 	if err := s.tasks.CloseShell(r.Context(), tid); err != nil {
 		writeApiError(w, mapTaskErr(err))
 		return
@@ -446,8 +460,8 @@ type questionItemDTO struct {
 	Question string `json:"question"`
 }
 
-// toAttentionDTO 将 task.Attention 快照转为 DTO（空集合为非 nil 空数组，spec）。
-func toAttentionDTO(att task.Attention) attentionDTO {
+// toAttentionDTO 将 application.Attention 快照转为 DTO（空集合为非 nil 空数组，spec）。
+func toAttentionDTO(att application.Attention) attentionDTO {
 	perms := make([]permissionDTO, 0, len(att.Permissions))
 	for _, p := range att.Permissions {
 		perms = append(perms, permissionDTO{
@@ -468,8 +482,9 @@ func toAttentionDTO(att task.Attention) attentionDTO {
 }
 
 // activeSessionDTO 跨项目 active 任务概览 DTO（cross-project-active-sessions D3/D4）。
-// 读模型（task.ActiveTaskOverviewRow）不含 agentStatus；handler hydration worker 并发填充。
-// AgentStatus 失败/超时为空串，经 omitempty 省略（idle/busy/retry 三态）。
+// 读模型（application.ActiveTaskOverviewRow）不含 agentStatus；组装
+//（buildActiveSessionsSnapshot，P2.2 起与 SSE 共享）读内存快照填充。
+// AgentStatus 快照不可用为空串，经 omitempty 省略（idle/busy/retry 三态）。
 // Attention 纯读快照（design.md D6），空数组非 null。
 type activeSessionDTO struct {
 	TaskID       string       `json:"task_id"`
@@ -483,7 +498,7 @@ type activeSessionDTO struct {
 	Attention    attentionDTO `json:"attention"`
 }
 
-func toTaskDTO(t task.TaskRow, projectKind string) taskRowDTO {
+func toTaskDTO(t application.TaskRow, projectKind string) taskRowDTO {
 	dto := taskRowDTO{
 		ID: t.ID, ProjectID: t.ProjectID, Name: t.Name, Branch: t.Branch, Status: t.Status,
 		WorktreePath: t.WorktreePath, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
@@ -509,7 +524,7 @@ func toTaskDTO(t task.TaskRow, projectKind string) taskRowDTO {
 	return dto
 }
 
-func toSessionDTOs(rows []task.SessionRow) []sessionRowDTO {
+func toSessionDTOs(rows []application.SessionRow) []sessionRowDTO {
 	out := make([]sessionRowDTO, 0, len(rows))
 	for _, s := range rows {
 		out = append(out, sessionRowDTO{SessionID: s.SessionID, LastSeenAt: s.LastSeenAt})
@@ -517,54 +532,25 @@ func toSessionDTOs(rows []task.SessionRow) []sessionRowDTO {
 	return out
 }
 
-// handleListActiveSessions GET /api/v1/sessions/active（cross-project-active-sessions D3/D4）。
-// 纯读聚合：store 查询 → DTO 转换 → 并发 hydration agentStatus（per-request cap 8、3s budget）。
-// store 失败 → 500，不进入 hydration；空结果 → JSON `[]`（非 null）；agentStatus 失败/超时省略字段。
+// handleListActiveSessions GET /api/v1/tasks/active（cross-project-active-sessions D3/D4；
+// projects-stream 起 canonical，旧 /sessions/active 为兼容别名）。
+// 纯读聚合：经 buildActiveSessionsSnapshot 组装（overview + attention + agentStatus 内存
+// 快照，P2.2 与 SSE 共享；原实时水合 worker 已移除）。store 失败 → 500，不进入组装；
+// 空结果 → JSON `[]`（非 null）；agentStatus 快照不可用时空串经 omitempty 省略。
 func (s *Server) handleListActiveSessions(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.tasks.ListActiveTaskOverview(r.Context())
+	out, err := s.buildActiveSessionsSnapshot(r.Context())
 	if err != nil {
 		writeError(w, CodeInternal, "list active sessions failed")
 		return
 	}
-	out := make([]activeSessionDTO, 0, len(rows))
-	for _, row := range rows {
-		dto := activeSessionDTO{
-			TaskID: row.ID, ProjectID: row.ProjectID, ProjectName: row.ProjectName,
-			Name: row.Name, Branch: row.Branch, WorktreePath: row.WorktreePath,
-			LastActiveAt: row.LastActiveAt,
-		}
-		// D6 注意力信号快照透出（空数组非 null）。
-		att, _ := s.tasks.Attention(row.ID)
-		dto.Attention = toAttentionDTO(att)
-		out = append(out, dto)
-	}
-	// Hydration worker（D4）：per-request 信号量 cap 8、3s budget；每 goroutine 仅写自己的 out[i]。
-	hctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-	defer cancel()
-	sem := make(chan struct{}, 8)
-	var wg sync.WaitGroup
-	for i := range out {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-hctx.Done():
-				return
-			}
-			out[i].AgentStatus = s.tasks.AgentStatus(hctx, out[i].TaskID)
-		}(i)
-	}
-	wg.Wait()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-// mapTaskErr 将 task.OpError 映射为 *ApiError（design.md §21）。
+// mapTaskErr 将 application.OpError 映射为 *ApiError（design.md §21）。
 func mapTaskErr(err error) *ApiError {
-	code := task.OpErrorCode(err)
+	code := application.OpErrorCode(err)
 	if code == "" {
 		return NewError(CodeInternal, "internal error")
 	}

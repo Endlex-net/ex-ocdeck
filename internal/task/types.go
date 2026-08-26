@@ -13,47 +13,50 @@ package task
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
-	"ocdeck/internal/pty"
+	"ocdeck/internal/application"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
+	"ocdeck/internal/infrastructure/pty"
 )
 
+// --- 迁移别名（sse-active-sessions P1.9a：定义已迁至 internal/application，
+// 锁定 import 方向 api → application（design.md D0:55）；本包及既有引用零改动） ---
+
 // DeleteMode 删除模式（design.md §19）。
-type DeleteMode string
+type DeleteMode = application.DeleteMode
 
 const (
-	DeleteNormal DeleteMode = "normal"
-	DeleteForce  DeleteMode = "force"
+	DeleteNormal = application.DeleteNormal
+	DeleteForce  = application.DeleteForce
 )
 
 // TerminalID 标识一个 shell 终端（design.md §18 CreateShell/CloseShell）。
-type TerminalID string
+type TerminalID = application.TerminalID
 
 // Status 用户态 + 内部过渡态（design.md §5）。
 const (
-	StatusSuspended      = "suspended"
-	StatusActive         = "active"
-	StatusArchived       = "archived"
-	StatusCreating       = "creating"
-	StatusCreationFailed = "creation_failed"
-	StatusActivating     = "activating"
-	StatusSuspending     = "suspending"
-	StatusDeleting       = "deleting"
-	StatusDeletionFailed = "deletion_failed"
+	StatusSuspended      = application.StatusSuspended
+	StatusActive         = application.StatusActive
+	StatusArchived       = application.StatusArchived
+	StatusCreating       = application.StatusCreating
+	StatusCreationFailed = application.StatusCreationFailed
+	StatusActivating     = application.StatusActivating
+	StatusSuspending     = application.StatusSuspending
+	StatusDeleting       = application.StatusDeleting
+	StatusDeletionFailed = application.StatusDeletionFailed
 )
 
 // InitStatus init_status 域（design.md §3：none | pending | running | succeeded | failed）。
 // Create 链按是否配置 init 脚本落 pending（待 InitRunner 执行）或 none（无脚本直接激活）。
 // 既有任务迁移为 none。Activate 门禁按 §5 五分支放行/拒绝。
 const (
-	InitStatusNone      = "none"
-	InitStatusPending   = "pending"
-	InitStatusRunning   = "running"
-	InitStatusSucceeded = "succeeded"
-	InitStatusFailed    = "failed"
+	InitStatusNone      = application.InitStatusNone
+	InitStatusPending   = application.InitStatusPending
+	InitStatusRunning   = application.InitStatusRunning
+	InitStatusSucceeded = application.InitStatusSucceeded
+	InitStatusFailed    = application.InitStatusFailed
 )
 
 // --- 依赖接口（design.md §18，供 mock 边界） ---
@@ -106,7 +109,7 @@ type WorktreeBackend interface {
 	// ResolveBaseRef 将 base_ref 短名解析为全限定 ref（add-plain-dir-project D10）。
 	// 解析顺序 refs/heads/<name> → refs/remotes/<name>（heads 优先），仅接受这两个命名空间；
 	// 不存在返回错误（调用方映射 invalid_input）。调用方 MUST 先经 ValidateBranchName 做规范校验。
-	// 无副作用只读，前置完成于落库前。task 包不直接依赖 internal/git，经此端口解析。
+	// 无副作用只读，前置完成于落库前。task 包不直接依赖 internal/infrastructure/git，经此端口解析。
 	ResolveBaseRef(ctx context.Context, repoPath, shortName string) (string, error)
 	// VerifyWorktreeProduct 严格产物验证（B1：RetryCreate 幂等跳过 add 的判定依据，
 	// design.md §19 Create Retry 行）。校验：路径存在 + .git 文件 + rev-parse --is-inside-work-tree
@@ -124,7 +127,7 @@ type WorktreeBackend interface {
 //
 // Slug 永不返回 error：由实现内部决定 AI 提炼或回退到机械 slugify（fallback 由 wiring 注入，
 // 通常是 task.Slugify）。返回的 slug 已经过清洗或 fallback，调用方直接拼 `ocdeck/` 前缀即可。
-// 本接口只定义抽象，避免 task 包 import internal/ai；具体实现（ai.SlugNamer）在 main.go
+// 本接口只定义抽象，避免 task 包 import internal/infrastructure/ai；具体实现（ai.SlugNamer）在 main.go
 // wiring 阶段注入（tasks 3.3）。Manager 持有 namer 为 nil 时回退到本包 Slugify（防 panic）。
 type BranchNamer interface {
 	Slug(ctx context.Context, taskName string) string
@@ -189,46 +192,24 @@ type worktreeRemoveOpts struct {
 }
 
 // --- 错误语义（design.md §21 code 枚举，task 层用 typed error，边界映射在 api） ---
+// OpError 定义已迁至 internal/application（operror.go）；此处保留别名与薄包装。
 
-// OpError 携带语义化错误码，供 api 层映射 HTTP code/msg（design.md §21）。
-// task 层内部流转 err-first；仅在跨边界返回时附带 code。
-type OpError struct {
-	Code string // 对应 api.ErrorCode 枚举（conflict/not_found/invalid_state/...）
-	Err  error
-}
-
-func (e *OpError) Error() string {
-	if e.Err != nil {
-		return e.Err.Error()
-	}
-	return e.Code
-}
-
-func (e *OpError) Unwrap() error { return e.Err }
-
-// CodeOf 返回错误码（供 api 边界映射）。
-func (e *OpError) CodeOf() string { return e.Code }
+type OpError = application.OpError
 
 // OpErrorCode 返回 OpError 的 code（若 err 为 *OpError，否则空串）。
-func OpErrorCode(err error) string {
-	var oe *OpError
-	if errors.As(err, &oe) {
-		return oe.Code
-	}
-	return ""
-}
+func OpErrorCode(err error) string { return application.OpErrorCode(err) }
 
 // newOpErr 构造 OpError。
-func newOpErr(code string, err error) *OpError { return &OpError{Code: code, Err: err} }
+func newOpErr(code string, err error) *OpError { return application.NewOpErr(code, err) }
 
 // 错误码常量（与 api.ErrorCode 字面量一致，避免循环引用）。
 const (
-	codeConflict       = "conflict"
-	codeNotFound       = "not_found"
-	codeInvalidState   = "invalid_state"
-	codeInvalidInput   = "invalid_input"
-	codeInternal       = "internal"
-	codeProcessError   = "process_error"
-	codeGitError       = "git_error"
-	codeOCIncompatible = "oc_incompatible"
+	codeConflict       = application.CodeConflict
+	codeNotFound       = application.CodeNotFound
+	codeInvalidState   = application.CodeInvalidState
+	codeInvalidInput   = application.CodeInvalidInput
+	codeInternal       = application.CodeInternal
+	codeProcessError   = application.CodeProcessError
+	codeGitError       = application.CodeGitError
+	codeOCIncompatible = application.CodeOCIncompatible
 )

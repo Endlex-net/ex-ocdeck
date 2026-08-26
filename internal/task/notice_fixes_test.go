@@ -7,7 +7,8 @@ import (
 	"sync"
 	"testing"
 
-	"ocdeck/internal/process"
+	"ocdeck/internal/application"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // TestRecordResidualNotice_ReadbackConverge 验证 recordResidualNotice CAS 写回后读回校验收敛（A）。
@@ -38,13 +39,20 @@ func TestRecordResidualNotice_ReadbackConverge(t *testing.T) {
 }
 
 // TestRecordSessionOverflowNotice_IdempotentReadback 验证 overflow notice 幂等写入并读回收敛（A）。
+// P1.4.5：overflow 前置 CAS 迁移到 application/task.RunAlign，经 alignSessions 走完整路径。
 func TestRecordSessionOverflowNotice_IdempotentReadback(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
 	m := newTestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
+	// 用一个返回 overflow 错误的 OCClient（连续两次全量对齐均 overflow）。
+	oc := &overflowOC{}
 
-	m.recordSessionOverflowNotice(context.Background(), "t1")
-	m.recordSessionOverflowNotice(context.Background(), "t1") // 幂等：不应重复追加
+	if err := m.alignSessions(context.Background(), "t1", "/wt", oc, AlignModeRepo); err != nil {
+		t.Fatalf("alignSessions: %v", err)
+	}
+	if err := m.alignSessions(context.Background(), "t1", "/wt", oc, AlignModeRepo); err != nil {
+		t.Fatalf("alignSessions (repeat): %v", err) // 幂等：不应重复追加
+	}
 
 	row, _ := store.GetTask(context.Background(), "t1")
 	entries, _ := parseNotices(row.Notice)
@@ -67,11 +75,11 @@ type casFailingStore struct {
 	mu       sync.Mutex
 }
 
-func (s *casFailingStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (bool, error) {
+func (s *casFailingStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error) {
 	s.mu.Lock()
 	s.casCalls++
 	s.mu.Unlock()
-	return false, nil
+	return application.MutationResult{}, nil
 }
 
 // TestRetryTaskNotices_CASExhaustionAggregatesError 验证 CAS 循环耗尽时 retryTaskNotices

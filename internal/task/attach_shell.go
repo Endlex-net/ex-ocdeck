@@ -11,9 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
-	"ocdeck/internal/pty"
+	"ocdeck/internal/application/runtime"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
+	"ocdeck/internal/infrastructure/pty"
 )
 
 // ReopenAttach 重开 TUI attach 会话（design.md §18 ReopenAttach + §4 TUI 消失保持活跃）。
@@ -86,7 +87,7 @@ func (m *Manager) ReopenAttach(ctx context.Context, taskID string) (TerminalID, 
 		//（TUI 重开失败可重试），MUST NOT attach 不属本任务的 session。
 		// UpdateTaskStatus 写 last_error 同时保持 status=active（不收敛状态）。
 		le := sql.NullString{String: fmt.Sprintf("reopen attach: %v", aerr), Valid: true}
-		if uerr := m.store.UpdateTaskStatus(ctx, taskID, StatusActive, le); uerr != nil {
+		if _, uerr := m.writeStatus(ctx, taskID, StatusActive, le); uerr != nil {
 			log.Printf("reopen attach: record last_error for task %s: %v", taskID, uerr)
 		}
 		return "", newOpErr(codeProcessError, fmt.Errorf("reopen attach: %w", aerr))
@@ -215,21 +216,19 @@ func (m *Manager) CloseShell(ctx context.Context, terminalID TerminalID) error {
 }
 
 // watchShellExit 监视 shell 会话退出（记录日志级事件；shell 退出不改变任务状态）。
-// 回调校验三元组（B4 回调隔离，针对当前 runtime 注册表，C1：不捕获本地快照）。
+// 回调校验（B4 回调隔离，针对当前 runtime 注册表，C1：不捕获本地快照）。
 // 事件类型分发（C1 typed RuntimeEvent）：
 //   - WatchEventSessionExit → shell_exit：从注册表与 watchCancels 移除自身；
 //   - WatchEventInfraError → shell infra 错误：记录日志 + 移除 group（shell 不收敛任务运行时，
 //     与 serve/tui infra 错误不同，shell infra 不影响任务活跃状态）。
 func (m *Manager) watchShellExit(taskID, shellName string) {
-	gen := 0
-	inst := ""
+	tok := runtime.InstVersion("")
 	if rt := m.getRuntime(taskID); rt != nil {
-		gen = rt.generation
-		inst = rt.instanceID
+		tok = rt.instVersion
 	}
 	cancel, done := m.proc.WatchExit(shellName, func(ev process.WatchEvent) {
 		cur := m.getRuntime(taskID)
-		if cur == nil || !cur.matchesRegistry(gen, shellName, inst) {
+		if cur == nil || !cur.matchesRegistry(tok, shellName) {
 			return
 		}
 		switch ev.Type {

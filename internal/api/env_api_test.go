@@ -8,7 +8,7 @@ import (
 	"os"
 	"testing"
 
-	"ocdeck/internal/task"
+	"ocdeck/internal/application"
 )
 
 // fakeEnvStore 内存实现 EnvStore，用于 env API 测试。
@@ -202,7 +202,7 @@ func TestEnvAPI_TaskCRUD(t *testing.T) {
 	envs := newFakeEnvStore()
 	tb := &gitTaskBackend{
 		fakeTaskBackend: &fakeTaskBackend{},
-		tasks:           map[string]task.TaskRow{"t1": {ID: "t1", ProjectID: "p1", Status: task.StatusSuspended}},
+		tasks:           map[string]application.TaskRow{"t1": {ID: "t1", ProjectID: "p1", Status: application.StatusSuspended}},
 	}
 	projs := newFakeProjectStore()
 	s := newEnvAPIServer(t, projs, envs, tb)
@@ -260,7 +260,7 @@ func TestEnvAPI_TaskEnvNotFound_404(t *testing.T) {
 	envs := newFakeEnvStore()
 	tb := &gitTaskBackend{
 		fakeTaskBackend: &fakeTaskBackend{},
-		tasks:           map[string]task.TaskRow{},
+		tasks:           map[string]application.TaskRow{},
 	}
 	projs := newFakeProjectStore()
 	s := newEnvAPIServer(t, projs, envs, tb)
@@ -320,7 +320,7 @@ func TestEnvAPI_ReservedKeyRejected(t *testing.T) {
 		envs := newFakeEnvStore()
 		tb := &gitTaskBackend{
 			fakeTaskBackend: &fakeTaskBackend{},
-			tasks:           map[string]task.TaskRow{"t1": {ID: "t1", ProjectID: "p1", Status: task.StatusSuspended}},
+			tasks:           map[string]application.TaskRow{"t1": {ID: "t1", ProjectID: "p1", Status: application.StatusSuspended}},
 		}
 		projs := newFakeProjectStore()
 		s := newEnvAPIServer(t, projs, envs, tb)
@@ -621,7 +621,7 @@ func TestEnvAPI_InvalidChars_422(t *testing.T) {
 	envs := newFakeEnvStore()
 	tb := &gitTaskBackend{
 		fakeTaskBackend: &fakeTaskBackend{},
-		tasks:           map[string]task.TaskRow{"t1": {ID: "t1", ProjectID: "p1", Status: task.StatusSuspended}},
+		tasks:           map[string]application.TaskRow{"t1": {ID: "t1", ProjectID: "p1", Status: application.StatusSuspended}},
 	}
 	s := newEnvAPIServer(t, projs, envs, tb)
 	ts := httptest.NewServer(s.mux)
@@ -687,7 +687,7 @@ func TestEnvAPI_ValidKeys_Stored(t *testing.T) {
 	envs := newFakeEnvStore()
 	tb := &gitTaskBackend{
 		fakeTaskBackend: &fakeTaskBackend{},
-		tasks:           map[string]task.TaskRow{"t1": {ID: "t1", ProjectID: "p1", Status: task.StatusSuspended}},
+		tasks:           map[string]application.TaskRow{"t1": {ID: "t1", ProjectID: "p1", Status: application.StatusSuspended}},
 	}
 	s := newEnvAPIServer(t, projs, envs, tb)
 	ts := httptest.NewServer(s.mux)

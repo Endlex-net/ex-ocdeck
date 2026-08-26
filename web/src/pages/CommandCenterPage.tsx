@@ -1,7 +1,8 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { navigate } from '../router';
-import { usePoll, useProjects, useProjectsRefresh } from '../hooks';
+import { useProjects, useProjectsRefresh } from '../hooks';
+import { subscribeActiveSessions } from '../sse';
 import {
   isTransitional,
   parseNotice,
@@ -31,7 +32,7 @@ import {
 } from '../palette-focus';
 import './command-center.css';
 
-/** sessions/active 快照（本页 5s single-flight 轮询）。 */
+/** tasks/active 快照（本页 SSE 订阅，帧驱动整表替换）。 */
 interface SessionsSnapshot {
   sessions: ActiveSessionItem[];
   loading: boolean;
@@ -74,13 +75,14 @@ export function shouldClearRefreshing(
 }
 
 /**
- * 指挥中心 sessions 首屏状态机（纯函数，可测）。
- * - loading：projects 未就绪或 sessions 尚未完成首次请求，且尚无数据
- * - error：sessions 首次失败（attempted && !initialized && error），不与 loading/空态并存
+ * 指挥中心 sessions 首屏状态机（纯函数，可测，design D5：SSE 订阅版）。
+ * - loading：仅 projects 自身未初始化且无数据（sessions 未首帧不升级为整页 loading）
+ * - connecting：sessions 首帧未到（无错误）——独立「连接中」，抑制全局与分区空态，projects 数据照常渲染
+ * - error：首次连接失败（attempted && !initialized && error），不与 connecting/loading/空态并存
  * - empty：两侧均已成功初始化且三区皆空
  * - ready：其余（有数据或分区可渲染）
  */
-export type SessionsBootstrapPhase = 'loading' | 'error' | 'empty' | 'ready';
+export type SessionsBootstrapPhase = 'loading' | 'connecting' | 'error' | 'empty' | 'ready';
 
 export function resolveSessionsBootstrap(opts: {
   projectsInit: boolean;
@@ -100,20 +102,24 @@ export function resolveSessionsBootstrap(opts: {
     opts.activeLen > 0 ||
     opts.parkedLen > 0;
 
-  // 首次 sessions 失败：只报错（不 loading、不空态）
+  // 首次连接失败：只报错（不 loading、不空态、不连接中）
   if (opts.sessionsAttempted && !opts.sessionsInitialized && opts.sessionsError) {
     return 'error';
   }
 
-  // 仍在等首次结果且无数据 → loading
-  if ((!opts.projectsInit || !opts.sessionsAttempted) && !hasAnyData) {
+  // 整页 loading 仅由 projects 未初始化驱动
+  if (!opts.projectsInit && !hasAnyData) {
     return 'loading';
+  }
+
+  // sessions 首帧未到：独立连接中（不升级整页 loading，抑制全局与分区空态）
+  if (!opts.sessionsInitialized) {
+    return 'connecting';
   }
 
   // 两侧均成功初始化且无任务 → 真空态
   if (
     opts.projectsInit &&
-    opts.sessionsInitialized &&
     opts.attentionLen === 0 &&
     opts.activeLen === 0 &&
     opts.parkedLen === 0
@@ -126,7 +132,7 @@ export function resolveSessionsBootstrap(opts: {
 
 /**
  * 分区空态是否展示（纯函数）。
- * - loading / error：抑制「暂无…」空态占位
+ * - loading / connecting / error：抑制「暂无…」空态占位
  * - empty / ready：允许分区空态占位
  * 注意：只门禁空态占位，非空列表 MUST 始终渲染（双快照：projects-only 任务仍须呈现）。
  */
@@ -136,9 +142,9 @@ export function shouldShowSectionEmpty(phase: SessionsBootstrapPhase): boolean {
 
 /**
  * 分区主体渲染模式（纯函数）。
- * - list：有条目 → 始终渲染列表（sessions 失败/加载中不隐藏 projects 数据）
+ * - list：有条目 → 始终渲染列表（sessions 连接中/失败不隐藏 projects 数据）
  * - empty：无条目且 phase 允许 → 「暂无…」
- * - none：无条目且 phase 为 loading/error → 不渲染占位（只留错误条/加载指示）
+ * - none：无条目且 phase 为 loading/connecting/error → 不渲染占位（只留错误条/连接指示）
  */
 export function sectionBodyMode(
   phase: SessionsBootstrapPhase,
@@ -154,38 +160,33 @@ export function CommandCenterPage() {
   const { projects, initialized: projectsInit, error: storeError } = useProjects();
   const refresh = useProjectsRefresh();
 
-  // 本页 sessions/active 轮询（5s single-flight）
+  // 本页 tasks/active SSE 订阅（design D5）：mount 订阅 / unmount close；帧驱动整表替换
   const [snap, setSnap] = useState<SessionsSnapshot>(EMPTY);
-  const inflightRef = useRef(false);
-  const pollSessions = async () => {
-    if (inflightRef.current) return; // single-flight
-    inflightRef.current = true;
-    try {
-      const sessions = await api.listActiveSessions();
-      setSnap({
-        sessions,
-        loading: false,
-        initialized: true,
-        attempted: true,
-        error: '',
-        lastSuccessAt: Date.now(),
-      });
-    } catch (err) {
-      // 失败：attempted=true 退出 loading；initialized 仅成功置 true（空响应也算成功）。
-      // 保留旧 sessions + lastSuccessAt；error 独立展示，不与 loading/空态并存。
-      setSnap((s) => ({
-        sessions: s.sessions,
-        loading: false,
-        initialized: s.initialized,
-        attempted: true,
-        error: err instanceof ApiError ? `[${err.code}] ${err.message}` : '加载活跃会话失败',
-        lastSuccessAt: s.lastSuccessAt,
-      }));
-    } finally {
-      inflightRef.current = false;
-    }
-  };
-  usePoll(pollSessions, 5000, []);
+  useEffect(() => {
+    const sub = subscribeActiveSessions({
+      onData: (sessions) =>
+        setSnap({
+          sessions,
+          loading: false,
+          initialized: true,
+          attempted: true,
+          error: '',
+          lastSuccessAt: Date.now(),
+        }),
+      // 失败：attempted=true；initialized 仅首帧到达置 true。保留旧 sessions + lastSuccessAt；
+      // error 独立展示（首连失败走 bootstrap error 相位，不与连接中并存）。
+      onError: (error) =>
+        setSnap((s) => ({
+          sessions: s.sessions,
+          loading: false,
+          initialized: s.initialized,
+          attempted: true,
+          error,
+          lastSuccessAt: s.lastSuccessAt,
+        })),
+    });
+    return () => sub.close();
+  }, []);
 
   const view = useMemo(
     () => buildCommandCenterView(projects, snap.sessions),
@@ -194,12 +195,12 @@ export function CommandCenterPage() {
 
   const activeCount = view.active.length;
   const attentionCount = view.attention.length;
-  // 刷新时间指示：未成功过显示"加载中…"；成功过显示相对时间（对齐设计稿"刚刚刷新"文案）；失败时错误提示独立展示
-  const lastRefresh = snap.lastSuccessAt
-    ? `${relTimeMs(snap.lastSuccessAt)}刷新`
-    : snap.attempted && snap.error
-      ? '刷新失败'
-      : '加载中…';
+  // 连接状态指示：首帧前显示连接中/连接失败（首连失败相位独立展示，不并存）；首帧后显示相对更新时间
+  const connStatus = !snap.initialized
+    ? snap.error
+      ? '连接失败'
+      : '连接中…'
+    : `${relTimeMs(snap.lastSuccessAt)}更新`;
 
   const bootstrap = resolveSessionsBootstrap({
     projectsInit,
@@ -254,11 +255,11 @@ export function CommandCenterPage() {
         <div className="od-page-title">
           <h1>指挥中心</h1>
           <p className="muted cc-head-sub">
-            {activeCount} 个活跃任务 · {attentionCount} 个需要关注 · 每 5 秒刷新
+            {activeCount} 个活跃任务 · {attentionCount} 个需要关注 · 自动更新
           </p>
         </div>
         <div className="od-page-actions">
-          <span className="cc-poll-status">{lastRefresh}</span>
+          <span className="cc-poll-status">{connStatus}</span>
           <button
             className="od-btn od-btn-primary"
             onClick={() => setNewTaskOpen((v) => !v)}
@@ -341,10 +342,17 @@ export function CommandCenterPage() {
         </div>
       )}
 
-      {/* 加载占位（首次无数据时，不与空态/分区同时出现） */}
+      {/* 加载占位（projects 自身未初始化时，不与空态/分区同时出现） */}
       {initialLoading && (
         <div className="od-empty">
           <span className="spinner spinner-inline" aria-hidden /> 加载中…
+        </div>
+      )}
+
+      {/* 连接中指示（sessions 首帧未到；projects 数据照常渲染，抑制空态占位） */}
+      {bootstrap === 'connecting' && (
+        <div className="od-empty">
+          <span className="spinner spinner-inline" aria-hidden /> 连接中…
         </div>
       )}
 

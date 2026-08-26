@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { api, ApiError } from './api';
+import { api, ApiError, UNAUTHORIZED_EVENT } from './api';
+import { subscribeProjects } from './sse';
 import type { Project } from './types';
 
 /** 轮询：立即执行一次，之后每 intervalMs 执行。组件卸载自动清理。 */
@@ -158,17 +159,29 @@ function safeReadTheme(): string | null {
   }
 }
 
-/* ==================== App 层共享 projects 轮询 store ====================
- * design.md D4：壳层侧栏、指挥中心与项目管理页同一数据源；应用内不得存在第二个 /projects 轮询。
- * store 暴露 single-flight refresh()（trailing 语义）：变更操作成功后调用；
- * 若调用时已有轮询在途，在该请求结束后再补发一次——refresh() 承诺其结果反映调用之后的最新状态。
- * 轮询失败保留上次成功数据静默展示（侧栏不闪空态）；error 暴露给页面用于错误提示。 */
+ /* ==================== App 层共享 projects store（SSE 订阅 + 兜底轮询） ====================
+  * design.md D4 / projects-stream design D6：壳层侧栏、指挥中心与项目管理页同一数据源；
+  * 应用内不得存在第二个 /projects 轮询（store 内部的兜底轮询不算）。
+  * store 创建即订阅 /api/v1/projects/stream（帧整表替换快照）+ 30s 常驻兜底轮询——
+  * 已知限制：项目 CRUD 不产生领域事件，流外变更（外部新建/删除项目）只能由兜底轮询
+  * 覆盖（最长 ~30s 可见）；用户主动操作经 refresh() 立即收敛。
+  * store 暴露 single-flight refresh()（trailing 语义）：变更操作成功后调用；
+  * 若调用时已有轮询在途，在该请求结束后再补发一次——refresh() 承诺其结果反映调用之后的最新状态。
+  * 流/轮询失败保留上次成功数据静默展示（侧栏不闪空态）；error 暴露给页面用于错误提示。 */
 
-/** store 依赖：loader 与 timer 抽象，便于契约测试受控注入。 */
+/** SSE 流回调句柄：store 拥有帧语义（整表替换/错误通道），工厂只决定传输。 */
+export interface StreamHandlers {
+  onData: (projects: Project[]) => void;
+  onError: (message: string) => void;
+}
+
+/** store 依赖：loader / 兜底轮询 timer / SSE 流工厂，便于契约测试受控注入。 */
 export interface StoreDeps {
   loader: () => Promise<Project[]>;
-  /** 轮询定时器工厂（默认 setInterval）；返回清理函数。 */
+  /** 兜底轮询定时器工厂（默认 setInterval，生产 30s）；返回清理函数。 */
   startTimer?: (fire: () => void) => () => void;
+  /** SSE 流订阅工厂（生产订阅 /api/v1/projects/stream，见 createProductionStore）。 */
+  streamFactory?: (handlers: StreamHandlers) => { close(): void };
 }
 
 export interface StoreSnapshot {
@@ -189,7 +202,7 @@ interface ProjectsStore {
   /** trailing refresh()：变更操作成功后调用，承诺反映调用后的最新状态。
    *  在途时返回的 Promise 在 trailing 请求完成（成功 resolve / 失败 reject）后才 settle。 */
   refresh: () => Promise<void>;
-  /** 释放定时器等资源（测试隔离用）。 */
+  /** 释放定时器与 SSE 订阅等资源（测试隔离用）。 */
   dispose: () => void;
 }
 
@@ -201,9 +214,11 @@ interface StoreHandle {
 
 let storeHandle: StoreHandle | null = null;
 
-/** 共享 projects store 单例（5s 轮询 + single-flight + trailing refresh）。
- *  首次调用创建 store 并启动 5s 轮询；后续调用复用同一实例。
- *  生产环境固定 5s 间隔 + api.listProjects；测试通过 createStore 直接注入受控依赖。 */
+/** 共享 projects store 单例（SSE 订阅 + 30s 兜底轮询 + single-flight + trailing refresh）。
+ *  首次消费方访问创建 store：建立 /api/v1/projects/stream 订阅并启动兜底轮询；后续访问复用同一实例。
+ *  401 生命周期：UNAUTHORIZED_EVENT（api.ts request / sse.ts 流在清 token 后派发）→ 单例重置；
+ *  重新认证后消费方首次访问以新 token 懒重建（新订阅 + 立即首次加载）。
+ *  生产环境固定 api.listProjects + 30s 兜底 + subscribeProjects；测试通过 createStore 直接注入受控依赖。 */
 export function useProjects(): StoreSnapshot {
   const h = getStoreHandle();
   return useSyncExternalStore(
@@ -218,19 +233,48 @@ export function useProjectsRefresh(): () => Promise<void> {
   return getStoreHandle().store.refresh;
 }
 
-function getStoreHandle(): StoreHandle {
+function getStoreHandle(deps?: StoreDeps): StoreHandle {
   if (storeHandle) return storeHandle;
-  storeHandle = createProductionStore();
+  storeHandle = deps ? createStore(deps) : createProductionStore();
+  bindUnauthorizedReset();
   return storeHandle;
 }
+
+/** 生产 store 重置（401 → 重新认证生命周期）：释放当前 store（关闭 SSE 订阅、停止兜底
+ *  轮询）并清除单例缓存；下一次消费方访问时懒重建——重建发生在重新认证后（App 切回
+ *  已认证渲染），保证新订阅使用新 token。幂等：无在管 store 时为 no-op。 */
+export function resetProjectsStore(): void {
+  if (!storeHandle) return;
+  storeHandle.store.dispose();
+  storeHandle = null;
+}
+
+/** 401 重置绑定（应用生命周期注册一次）：事件由 request()/sse 流在 clearToken 后派发，
+ *  即旧 token 被拒的时刻——此刻释放 store 安全，且 MUST NOT 在事件上急切重建订阅
+ *  （token 已清除，重建会用无效 token）；重建交给重新认证后的首次消费方访问。 */
+let unauthorizedResetBound = false;
+function bindUnauthorizedReset(): void {
+  if (unauthorizedResetBound || typeof window === 'undefined') return;
+  unauthorizedResetBound = true;
+  window.addEventListener(UNAUTHORIZED_EVENT, () => resetProjectsStore());
+}
+
+/** 测试专用：以注入依赖模拟消费方对生产单例的访问（走 getStoreHandle 真实路径，
+ *  覆盖「事件 → 释放 → 再次访问懒重建」的生命周期）。 */
+export const __projectsStoreAccessForTest = (deps?: StoreDeps): StoreHandle =>
+  getStoreHandle(deps);
+
+/** 兜底轮询周期（projects-stream design D6）：项目 CRUD 无事件，流外变更最长 ~30s 可见。 */
+const PROJECTS_FALLBACK_POLL_MS = 30000;
 
 function createProductionStore(): StoreHandle {
   return createStore({
     loader: () => api.listProjects(),
     startTimer: (fire) => {
-      const id = setInterval(fire, 5000);
+      const id = setInterval(fire, PROJECTS_FALLBACK_POLL_MS);
       return () => clearInterval(id);
     },
+    streamFactory: (handlers) => subscribeProjects(handlers),
   });
 }
 
@@ -238,7 +282,9 @@ function createProductionStore(): StoreHandle {
  *  - pollOnce 在途时直接返回在途 Promise、不设 trailing 标记（轮询不产生额外补发）。
  *  - refresh 在途时标记 trailing 并排队 waiter，补发请求结束（成功/失败）后才 settle waiter；
  *    失败时 waiter reject（调用方感知失败），pendingTrailing 不丢（下次触发仍补发）。
- *  - 实例隔离：每次调用独立的 snapshot/listeners/inflight/timer，dispose() 释放定时器。 */
+ *  - SSE 流（deps.streamFactory，design D6）：创建即订阅，snapshot/update 帧整表替换快照
+ *    （首帧即 initialized）；流失败走 error 通道、保留旧数据；dispose 关闭订阅。
+ *  - 实例隔离：每次调用独立的 snapshot/listeners/inflight/timer/订阅，dispose() 释放。 */
 export function createStore(deps: StoreDeps): StoreHandle {
   // 实例局部状态（不共享模块全局）。
   let snapshot: StoreSnapshot = { projects: [], loading: false, initialized: false, error: '' };
@@ -328,7 +374,18 @@ export function createStore(deps: StoreDeps): StoreHandle {
     });
   };
 
-  // 启动 5s 轮询（single-flight：并发请求合并为一次在途，pollOnce 不产生补发）。
+  // SSE 流订阅（design D6）：帧整表替换（首帧即 initialized、清 error）；
+  // 流失败走 error 通道、保留旧数据（沿轮询失败语义，侧栏不闪空态）。
+  const stream = deps.streamFactory?.({
+    onData: (projects) => {
+      initialized = true;
+      set({ projects, error: '', loading: false, initialized: true });
+    },
+    onError: (message) => set({ error: message, loading: false }),
+  });
+
+  // 启动首次加载与兜底轮询（间隔由 startTimer 注入，生产 30s；
+  // single-flight：并发请求合并为一次在途，pollOnce 不产生补发）。
   void pollOnce();
   let stopTimer: (() => void) | undefined;
   if (deps.startTimer) stopTimer = deps.startTimer(() => void pollOnce());
@@ -343,6 +400,7 @@ export function createStore(deps: StoreDeps): StoreHandle {
       refresh,
       dispose: () => {
         stopTimer?.();
+        stream?.close();
         listeners.clear();
       },
     },
@@ -350,11 +408,8 @@ export function createStore(deps: StoreDeps): StoreHandle {
   };
 }
 
-/** 重置 store 单例（仅供测试：隔离用例、注入受控依赖）。 */
-export function __resetProjectsStoreForTest(): void {
-  if (storeHandle) storeHandle.store.dispose();
-  storeHandle = null;
-}
+/** 测试隔离用（历史导出名）：与生产 resetProjectsStore 同一实现。 */
+export const __resetProjectsStoreForTest = resetProjectsStore;
 
 /* ==================== mutation 编排契约（共享：原 ProjectsPage.tsx，tasks 8.5 迁移） ====================
  *  mutation 成败只由 API 调用决定；成功后才调 refresh()（trailing），refresh 失败静默

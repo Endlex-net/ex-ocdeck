@@ -9,10 +9,11 @@ import (
 	"sync"
 	"testing"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
-	"ocdeck/internal/store"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // --- Fix 2：Suspend shell 错误聚合 + suspended 状态提交失败处理 ---
@@ -24,9 +25,9 @@ type failingUpdateStatusStore struct {
 	updateStatusErr error
 }
 
-func (s *failingUpdateStatusStore) UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) error {
+func (s *failingUpdateStatusStore) UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) (application.TransitionResult, error) {
 	if s.updateStatusErr != nil && status == StatusSuspended {
-		return s.updateStatusErr
+		return application.TransitionResult{}, s.updateStatusErr
 	}
 	return s.mockStore.UpdateTaskStatus(ctx, id, status, lastError)
 }

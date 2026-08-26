@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"ocdeck/internal/store"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // TestManager_ListActiveTaskOverview_Delegate 验证 Manager.ListActiveTaskOverview

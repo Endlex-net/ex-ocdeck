@@ -13,8 +13,8 @@ import (
 
 	"github.com/coder/websocket"
 
-	"ocdeck/internal/pty"
-	"ocdeck/internal/task"
+	"ocdeck/internal/application"
+	"ocdeck/internal/infrastructure/pty"
 )
 
 // fakeTaskBackend 内存实现 TaskBackend，用于 API 层测试。
@@ -22,43 +22,43 @@ type fakeTaskBackend struct {
 	reopenErr      error
 	validateErr    error
 	validateCalls  []string
-	listShellsRes  []task.TerminalID
+	listShellsRes  []application.TerminalID
 	attachPtyFn    func(sessionName string, cols, rows int) (*pty.Pty, error)
 	attachPtyCalls []string
 }
 
-func (f *fakeTaskBackend) Create(ctx context.Context, projectID, taskName, baseRef string) (task.TaskRow, error) {
-	return task.TaskRow{}, nil
+func (f *fakeTaskBackend) Create(ctx context.Context, projectID, taskName, baseRef string) (application.TaskRow, error) {
+	return application.TaskRow{}, nil
 }
 func (f *fakeTaskBackend) Activate(ctx context.Context, taskID string) error { return nil }
 func (f *fakeTaskBackend) Suspend(ctx context.Context, taskID string) error  { return nil }
 func (f *fakeTaskBackend) Archive(ctx context.Context, taskID string) error  { return nil }
 func (f *fakeTaskBackend) Restore(ctx context.Context, taskID string) error  { return nil }
-func (f *fakeTaskBackend) Delete(ctx context.Context, taskID string, mode task.DeleteMode, confirmDirty bool) error {
+func (f *fakeTaskBackend) Delete(ctx context.Context, taskID string, mode application.DeleteMode, confirmDirty bool) error {
 	return nil
 }
 func (f *fakeTaskBackend) Retry(ctx context.Context, taskID string, confirmDirty bool) error {
 	return nil
 }
-func (f *fakeTaskBackend) ReopenAttach(ctx context.Context, taskID string) (task.TerminalID, error) {
+func (f *fakeTaskBackend) ReopenAttach(ctx context.Context, taskID string) (application.TerminalID, error) {
 	return "", f.reopenErr
 }
-func (f *fakeTaskBackend) CreateShell(ctx context.Context, taskID string) (task.TerminalID, error) {
+func (f *fakeTaskBackend) CreateShell(ctx context.Context, taskID string) (application.TerminalID, error) {
 	return "", nil
 }
-func (f *fakeTaskBackend) CloseShell(ctx context.Context, terminalID task.TerminalID) error {
+func (f *fakeTaskBackend) CloseShell(ctx context.Context, terminalID application.TerminalID) error {
 	return nil
 }
-func (f *fakeTaskBackend) Get(ctx context.Context, taskID string) (task.TaskRow, error) {
-	return task.TaskRow{}, nil
+func (f *fakeTaskBackend) Get(ctx context.Context, taskID string) (application.TaskRow, error) {
+	return application.TaskRow{}, nil
 }
-func (f *fakeTaskBackend) List(ctx context.Context, projectID string) ([]task.TaskRow, error) {
+func (f *fakeTaskBackend) List(ctx context.Context, projectID string) ([]application.TaskRow, error) {
 	return nil, nil
 }
-func (f *fakeTaskBackend) ListTaskSessions(ctx context.Context, taskID string) ([]task.SessionRow, error) {
+func (f *fakeTaskBackend) ListTaskSessions(ctx context.Context, taskID string) ([]application.SessionRow, error) {
 	return nil, nil
 }
-func (f *fakeTaskBackend) ListShells(taskID string) ([]task.TerminalID, error) {
+func (f *fakeTaskBackend) ListShells(taskID string) ([]application.TerminalID, error) {
 	return f.listShellsRes, nil
 }
 func (f *fakeTaskBackend) ValidateShellTerminal(tid string) error {
@@ -76,33 +76,36 @@ func (f *fakeTaskBackend) AttachPty(sessionName string, cols, rows int) (*pty.Pt
 // AgentStatus 返回空串（2.8 默认降级，具体行为在 task 包测试覆盖）。
 func (f *fakeTaskBackend) AgentStatus(ctx context.Context, taskID string) string { return "" }
 
+// AgentStatusSnapshot 内存快照读取（sse-active-sessions D4）；fake 默认不可用。
+func (f *fakeTaskBackend) AgentStatusSnapshot(taskID string) string { return "" }
+
 // ListAllActiveTaskIDs 返回空切片（全局配置受影响任务提示的默认空响应）。
 func (f *fakeTaskBackend) ListAllActiveTaskIDs(ctx context.Context) ([]string, error) {
 	return []string{}, nil
 }
 
 // ListActiveTaskOverview 默认返回空切片（cross-project-active-sessions API 测试默认空响应）；
-// 具体 store 聚合行为由 internal/store 测试覆盖，hydration 行为由 active_sessions_api_test 覆盖。
-func (f *fakeTaskBackend) ListActiveTaskOverview(ctx context.Context) ([]task.ActiveTaskOverviewRow, error) {
-	return []task.ActiveTaskOverviewRow{}, nil
+// 具体 store 聚合行为由 internal/infrastructure/store 测试覆盖，hydration 行为由 active_sessions_api_test 覆盖。
+func (f *fakeTaskBackend) ListActiveTaskOverview(ctx context.Context) ([]application.ActiveTaskOverviewRow, error) {
+	return []application.ActiveTaskOverviewRow{}, nil
 }
 
 // Attention 默认返回空快照（design.md D6 API 透出测试默认空响应）。
-func (f *fakeTaskBackend) Attention(taskID string) (task.Attention, bool) {
-	return task.Attention{Permissions: []task.PendingPermission{}, Questions: []task.PendingQuestion{}}, false
+func (f *fakeTaskBackend) Attention(taskID string) (application.Attention, bool) {
+	return application.Attention{Permissions: []application.PendingPermission{}, Questions: []application.PendingQuestion{}}, false
 }
 
 // ListProjectTaskSummaries 默认返回空切片（projects tasks 摘要测试默认空响应）。
-func (f *fakeTaskBackend) ListProjectTaskSummaries(ctx context.Context) ([]task.ProjectTaskSummary, error) {
-	return []task.ProjectTaskSummary{}, nil
+func (f *fakeTaskBackend) ListProjectTaskSummaries(ctx context.Context) ([]application.ProjectTaskSummary, error) {
+	return []application.ProjectTaskSummary{}, nil
 }
 
 // Git 默认实现（noop / 零值）：git API 测试在 gitTaskBackend / mockGitBackend 中覆盖。
-func (f *fakeTaskBackend) GitStatus(ctx context.Context, taskID string) (task.GitStatusDTO, error) {
-	return task.GitStatusDTO{}, nil
+func (f *fakeTaskBackend) GitStatus(ctx context.Context, taskID string) (application.GitStatusDTO, error) {
+	return application.GitStatusDTO{}, nil
 }
-func (f *fakeTaskBackend) GitDiff(ctx context.Context, taskID, ref, path string, untracked bool) (task.GitDiffDTO, error) {
-	return task.GitDiffDTO{}, nil
+func (f *fakeTaskBackend) GitDiff(ctx context.Context, taskID, ref, path string, untracked bool) (application.GitDiffDTO, error) {
+	return application.GitDiffDTO{}, nil
 }
 func (f *fakeTaskBackend) GitCommit(ctx context.Context, taskID, message string, paths []string) error {
 	return nil
@@ -111,8 +114,8 @@ func (f *fakeTaskBackend) GitPush(ctx context.Context, taskID string) error { re
 
 // Lifecycle config / init rerun / logs 默认实现（noop / 空值）：
 // 实际行为由 lifecycle_config_api_test.go 与具体场景注入 mock 覆盖。
-func (f *fakeTaskBackend) RerunInit(ctx context.Context, taskID string) (task.TaskRow, error) {
-	return task.TaskRow{}, nil
+func (f *fakeTaskBackend) RerunInit(ctx context.Context, taskID string) (application.TaskRow, error) {
+	return application.TaskRow{}, nil
 }
 func (f *fakeTaskBackend) ReadInitLog(ctx context.Context, taskID string) (string, error) {
 	return "", nil
@@ -140,8 +143,8 @@ func newAPITestServer(t *testing.T, tb TaskBackend) *Server {
 
 func TestAPI_ReopenAttach_BusyReturns409(t *testing.T) {
 	tb := &fakeTaskBackend{
-		// task.OpError codeConflict → api 映射 409。
-		reopenErr: &task.OpError{Code: "conflict", Err: errors.New("task busy")},
+		// application.OpError codeConflict → api 映射 409。
+		reopenErr: &application.OpError{Code: "conflict", Err: errors.New("task busy")},
 	}
 	s := newAPITestServer(t, tb)
 	srv := httptest.NewServer(s.mux)
@@ -172,9 +175,9 @@ func TestAPI_WSShell_RejectsInvalidTerminal_4004(t *testing.T) {
 		tid         string
 		validateErr error
 	}{
-		{"garbage tid", "not-a-session", &task.OpError{Code: "invalid_input", Err: errors.New("invalid")}},
-		{"serve session tid", "ocdeck-t1-serve", &task.OpError{Code: "invalid_input", Err: errors.New("not shell")}},
-		{"not found", "ocdeck-t1-shell-99", &task.OpError{Code: "not_found", Err: errors.New("not alive")}},
+		{"garbage tid", "not-a-session", &application.OpError{Code: "invalid_input", Err: errors.New("invalid")}},
+		{"serve session tid", "ocdeck-t1-serve", &application.OpError{Code: "invalid_input", Err: errors.New("not shell")}},
+		{"not found", "ocdeck-t1-shell-99", &application.OpError{Code: "not_found", Err: errors.New("not alive")}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -213,7 +216,7 @@ func TestAPI_WSShell_RejectsInvalidTerminal_4004(t *testing.T) {
 // 不得误发 4004 致前端永久停止重连（terminal-streaming spec 契约：1011 走默认重连路径，临时可恢复）。
 func TestAPI_WSShell_ValidateInfraError_1011(t *testing.T) {
 	tb := &fakeTaskBackend{
-		validateErr: &task.OpError{Code: "process_error", Err: errors.New("tmux protocol error")},
+		validateErr: &application.OpError{Code: "process_error", Err: errors.New("tmux protocol error")},
 	}
 	s := newAPITestServer(t, tb)
 	srv := httptest.NewServer(s.mux)
@@ -239,7 +242,7 @@ func TestAPI_WSShell_ValidateInfraError_1011(t *testing.T) {
 // TestAPI_WSShell_ValidateNotFound_4004 验证第三轮：ValidateShellTerminal 返回 not_found → 4004。
 func TestAPI_WSShell_ValidateNotFound_4004(t *testing.T) {
 	tb := &fakeTaskBackend{
-		validateErr: &task.OpError{Code: "not_found", Err: errors.New("shell not alive")},
+		validateErr: &application.OpError{Code: "not_found", Err: errors.New("shell not alive")},
 	}
 	s := newAPITestServer(t, tb)
 	srv := httptest.NewServer(s.mux)

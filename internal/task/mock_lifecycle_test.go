@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"sync"
+
+	"ocdeck/internal/application"
 )
 
 // 本文件为 Phase 3 生命周期配置测试提供 mockStore 扩展（design.md §2.1/§3），
@@ -64,72 +66,72 @@ func (s *mockStore) UpsertLifecycleConfig(ctx context.Context, projectID, inheri
 	return nil
 }
 
-func (s *mockStore) CommitCreated(ctx context.Context, taskID, expectedStatus, initStatus string) (bool, error) {
+func (s *mockStore) CommitCreated(ctx context.Context, taskID, expectedStatus, initStatus string) (application.TransitionResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.tasks[taskID]
 	if !ok {
-		return false, fmt.Errorf("not found")
+		return application.TransitionResult{}, fmt.Errorf("not found")
 	}
 	if t.Status != expectedStatus {
-		return false, nil
+		return application.TransitionResult{}, nil
 	}
 	t.Status = StatusSuspended
 	t.InitStatus = initStatus
 	t.LastError = sql.NullString{}
 	t.UpdatedAt = 10
 	s.tasks[taskID] = t
-	return true, nil
+	return application.TransitionResult{MutationResult: application.MutationResult{Matched: true, Changed: true}}, nil
 }
 
-func (s *mockStore) ClaimInitRun(ctx context.Context, taskID string) (bool, error) {
+func (s *mockStore) ClaimInitRun(ctx context.Context, taskID string) (application.MutationResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.tasks[taskID]
 	if !ok {
-		return false, fmt.Errorf("not found")
+		return application.MutationResult{}, fmt.Errorf("not found")
 	}
 	if t.Status != StatusSuspended || t.InitStatus != InitStatusPending {
-		return false, nil
+		return application.MutationResult{}, nil
 	}
 	t.InitStatus = InitStatusRunning
 	t.UpdatedAt = 11
 	s.tasks[taskID] = t
-	return true, nil
+	return application.MutationResult{Matched: true, Changed: true}, nil
 }
 
-func (s *mockStore) ClaimInitRerun(ctx context.Context, taskID string) (bool, error) {
+func (s *mockStore) ClaimInitRerun(ctx context.Context, taskID string) (application.MutationResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.tasks[taskID]
 	if !ok {
-		return false, fmt.Errorf("not found")
+		return application.MutationResult{}, fmt.Errorf("not found")
 	}
 	if t.Status != StatusSuspended || (t.InitStatus != InitStatusFailed && t.InitStatus != InitStatusSucceeded) {
-		return false, nil
+		return application.MutationResult{}, nil
 	}
 	t.InitStatus = InitStatusRunning
 	t.InitError = sql.NullString{}
 	t.UpdatedAt = 12
 	s.tasks[taskID] = t
-	return true, nil
+	return application.MutationResult{Matched: true, Changed: true}, nil
 }
 
-func (s *mockStore) FinishInitRun(ctx context.Context, taskID, status string, initError sql.NullString) (bool, error) {
+func (s *mockStore) FinishInitRun(ctx context.Context, taskID, status string, initError sql.NullString) (application.MutationResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.tasks[taskID]
 	if !ok {
-		return false, fmt.Errorf("not found")
+		return application.MutationResult{}, fmt.Errorf("not found")
 	}
 	if t.InitStatus != InitStatusRunning {
-		return false, nil
+		return application.MutationResult{}, nil
 	}
 	t.InitStatus = status
 	t.InitError = initError
 	t.UpdatedAt = 13
 	s.tasks[taskID] = t
-	return true, nil
+	return application.MutationResult{Matched: true, Changed: true}, nil
 }
 
 func (s *mockStore) ConvergeInterruptedInitRuns(ctx context.Context) (int64, error) {

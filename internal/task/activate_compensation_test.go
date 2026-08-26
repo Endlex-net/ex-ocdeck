@@ -8,7 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/application"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // ctxAwareStore 装饰 *mockStore，在调用方 ctx 已取消（ctx.Err()!=nil）时对补偿路径
@@ -48,42 +49,42 @@ func (s *ctxAwareStore) deadCalls() []string {
 	return out
 }
 
-func (s *ctxAwareStore) UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) error {
+func (s *ctxAwareStore) UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) (application.MutationResult, error) {
 	if err := deadCtxErr(ctx); err != nil {
 		s.noteDeadCall("UpdateTaskEnvSnapshot")
-		return err
+		return application.MutationResult{}, err
 	}
 	return s.mockStore.UpdateTaskEnvSnapshot(ctx, id, envSnapshot)
 }
 
-func (s *ctxAwareStore) UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (bool, error) {
+func (s *ctxAwareStore) UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (application.TransitionResult, error) {
 	if err := deadCtxErr(ctx); err != nil {
 		s.noteDeadCall("UpdateTaskStatusConditional")
-		return false, err
+		return application.TransitionResult{}, err
 	}
 	return s.mockStore.UpdateTaskStatusConditional(ctx, id, fromStatus, toStatus, lastError)
 }
 
-func (s *ctxAwareStore) UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) error {
+func (s *ctxAwareStore) UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) (application.TransitionResult, error) {
 	if err := deadCtxErr(ctx); err != nil {
 		s.noteDeadCall("UpdateTaskStatus")
-		return err
+		return application.TransitionResult{}, err
 	}
 	return s.mockStore.UpdateTaskStatus(ctx, id, status, lastError)
 }
 
-func (s *ctxAwareStore) UpdateTaskNotice(ctx context.Context, id string, notice sql.NullString) error {
+func (s *ctxAwareStore) UpdateTaskNotice(ctx context.Context, id string, notice sql.NullString) (application.MutationResult, error) {
 	if err := deadCtxErr(ctx); err != nil {
 		s.noteDeadCall("UpdateTaskNotice")
-		return err
+		return application.MutationResult{}, err
 	}
 	return s.mockStore.UpdateTaskNotice(ctx, id, notice)
 }
 
-func (s *ctxAwareStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (bool, error) {
+func (s *ctxAwareStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error) {
 	if err := deadCtxErr(ctx); err != nil {
 		s.noteDeadCall("UpdateTaskNoticeCAS")
-		return false, err
+		return application.MutationResult{}, err
 	}
 	return s.mockStore.UpdateTaskNoticeCAS(ctx, id, expected, newNotice)
 }

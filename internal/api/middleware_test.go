@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 func TestAuthMiddleware_MissingToken_401(t *testing.T) {

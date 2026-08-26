@@ -3,7 +3,7 @@ package api
 import (
 	"context"
 
-	"ocdeck/internal/store"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // storeEnvAdapter 包装 *store.DB 实现 EnvStore，做 row 类型转换，

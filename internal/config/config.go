@@ -19,7 +19,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // ShutdownPolicy 关停策略（design.md §10）。
@@ -32,8 +32,8 @@ const (
 )
 
 // ContractBaseline / ContractMinVersion 是已验证契约区间的上/下限（design.md §11/§20）。
-// 版本号仅作告警非门禁；激活门禁是能力探测。区间检查见 internal/opencode/CONTRACT.md。
-// 唯一真值定义在 internal/opencode（契约归属方），这里通过常量别名引用，避免跨包重复字面量。
+// 版本号仅作告警非门禁；激活门禁是能力探测。区间检查见 internal/infrastructure/opencode/CONTRACT.md。
+// 唯一真值定义在 internal/infrastructure/opencode（契约归属方），这里通过常量别名引用，避免跨包重复字面量。
 const (
 	ContractBaseline   = opencode.ContractBaseline
 	ContractMinVersion = opencode.ContractMinVersion

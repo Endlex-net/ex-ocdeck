@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // panicNamer 实现 BranchNamer，被调用即 panic——证明 dir 路径不调用 Namer。

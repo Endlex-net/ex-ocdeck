@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"ocdeck/internal/config"
-	"ocdeck/internal/git"
+	"ocdeck/internal/infrastructure/git"
 )
 
 // === 反证实验：阻塞 1（splitInheritPatterns 逐行解析） ===

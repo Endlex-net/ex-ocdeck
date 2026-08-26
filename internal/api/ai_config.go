@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"ocdeck/internal/ai"
+	"ocdeck/internal/infrastructure/ai"
 )
 
 // aiConfigDTO 为 GET / PUT /api/v1/ai/config 的统一响应体（design.md D6）。

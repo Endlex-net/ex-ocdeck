@@ -60,7 +60,7 @@ export interface QuestionSignal {
   since: number;
 }
 
-/** 注意力信号快照（design.md D6 GET /tasks/:id 与 /sessions/active 透出）。
+/** 注意力信号快照（design.md D6 GET /tasks/:id 与 /tasks/active 透出）。
  *  空集合为非 nil 空数组（后端保证）；unsupported 透出空数组。 */
 export interface Attention {
   permissions: PermissionSignal[];
@@ -109,7 +109,7 @@ export interface TerminalInfo {
   terminal_id: string;
 }
 
-/** GET /sessions/active 响应元素（cross-project-active-sessions design.md D3）。
+/** GET /tasks/active 响应元素（历史路径 sessions/active，见 cross-project-active-sessions design.md D3）。
  *  agentStatus 水合失败/超时时省略，渲染按未知降级处理。 */
 export interface ActiveSessionItem {
   task_id: string;
@@ -121,7 +121,7 @@ export interface ActiveSessionItem {
   /** 最近活跃时间（Unix 秒）：task_sessions.last_seen_at 的 MAX，无会话行回退 tasks.updated_at。 */
   last_active_at: number;
   agentStatus?: string;
-  /** 注意力信号快照（design.md D6 GET /sessions/active 透出）。空数组非 null；unsupported 为空数组。 */
+  /** 注意力信号快照（design.md D6 GET /tasks/active 透出）。空数组非 null；unsupported 为空数组。 */
   attention?: Attention;
 }
 
