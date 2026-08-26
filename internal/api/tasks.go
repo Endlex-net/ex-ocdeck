@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
-	"sync"
-	"time"
 
 	"ocdeck/internal/application"
 	"ocdeck/internal/pty"
@@ -121,6 +119,11 @@ func (s *Server) registerTaskRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/tasks/{id}/terminals", s.handleCreateTerminal)
 	mux.HandleFunc("DELETE /api/v1/terminals/{tid}", s.handleCloseTerminal)
 	mux.HandleFunc("GET /api/v1/sessions/active", s.handleListActiveSessions)
+	// SSE 流端点（sse-active-sessions P2.3，design D3）：与 /sessions/active 同享
+	// Bearer 子 mux；需事件订阅端口注入（SetEventSubscriber 须先于 RebuildRoutes）。
+	if s.eventSubscriber != nil {
+		mux.HandleFunc("GET /api/v1/sessions/active/stream", s.handleActiveSessionsStream)
+	}
 	// WS 端点由 registerWSRoutes 单独挂载（不走 api 子 mux，design.md §21）。
 }
 
@@ -522,45 +525,15 @@ func toSessionDTOs(rows []application.SessionRow) []sessionRowDTO {
 }
 
 // handleListActiveSessions GET /api/v1/sessions/active（cross-project-active-sessions D3/D4）。
-// 纯读聚合：store 查询 → DTO 转换 → 并发 hydration agentStatus（per-request cap 8、3s budget）。
-// store 失败 → 500，不进入 hydration；空结果 → JSON `[]`（非 null）；agentStatus 失败/超时省略字段。
+// 纯读聚合：经 buildActiveSessionsSnapshot 组装（overview + attention + agentStatus 内存
+// 快照，P2.2 与 SSE 共享；原实时水合 worker 已移除）。store 失败 → 500，不进入组装；
+// 空结果 → JSON `[]`（非 null）；agentStatus 快照不可用时空串经 omitempty 省略。
 func (s *Server) handleListActiveSessions(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.tasks.ListActiveTaskOverview(r.Context())
+	out, err := s.buildActiveSessionsSnapshot(r.Context())
 	if err != nil {
 		writeError(w, CodeInternal, "list active sessions failed")
 		return
 	}
-	out := make([]activeSessionDTO, 0, len(rows))
-	for _, row := range rows {
-		dto := activeSessionDTO{
-			TaskID: row.ID, ProjectID: row.ProjectID, ProjectName: row.ProjectName,
-			Name: row.Name, Branch: row.Branch, WorktreePath: row.WorktreePath,
-			LastActiveAt: row.LastActiveAt,
-		}
-		// D6 注意力信号快照透出（空数组非 null）。
-		att, _ := s.tasks.Attention(row.ID)
-		dto.Attention = toAttentionDTO(att)
-		out = append(out, dto)
-	}
-	// Hydration worker（D4）：per-request 信号量 cap 8、3s budget；每 goroutine 仅写自己的 out[i]。
-	hctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-	defer cancel()
-	sem := make(chan struct{}, 8)
-	var wg sync.WaitGroup
-	for i := range out {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-hctx.Done():
-				return
-			}
-			out[i].AgentStatus = s.tasks.AgentStatus(hctx, out[i].TaskID)
-		}(i)
-	}
-	wg.Wait()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)

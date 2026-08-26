@@ -32,6 +32,11 @@ type Server struct {
 	eventSubscriber EventSubscriber
 	httpSrv         *http.Server
 
+	// sseCoalesce/sseHeartbeat SSE 流合并窗口与心跳间隔（sse-active-sessions P2.3）。
+	// 零值用生产默认（500ms/25s）；仅供同包测试注入短间隔，不改变生产语义。
+	sseCoalesce  time.Duration
+	sseHeartbeat time.Duration
+
 	// watchdogStateProvider 返回 watchdog 运行态字符串（off/running/degraded），
 	// 供 /server/status 接线（design.md §21）。nil 时回退 "off"。
 	watchdogStateProvider func() string
@@ -239,6 +244,17 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	return r.ResponseWriter.Write(b)
 }
 
+// Unwrap 暴露底层 ResponseWriter（sse-active-sessions P2.5）。http.ResponseController
+// 经 Unwrap 链获取底层扩展能力；缺失 Unwrap 时控制器无法到达真实连接。
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+// FlushError 刷新底层连接并传播错误（sse-active-sessions P2.5）。SSE handler 经
+// http.NewResponseController(w).Flush() 写帧：控制器优先匹配 FlushError，仅实现
+// 无返回值 Flush() 会吞底层 flush 错误；此处委托控制底层 ResponseWriter 完成刷新。
+func (r *statusRecorder) FlushError() error {
+	return http.NewResponseController(r.ResponseWriter).Flush()
+}
+
 // SetWatchdogStateProvider 注入 watchdog 运行态查询函数（design.md §21）。
 // 由 cmd/ocdeck-server 在 kill_immediate 模式下注入 WatchdogManager.StateString；
 // 其他模式 nil，/server/status 回退 "off"。
@@ -277,7 +293,11 @@ func (s *Server) Start(ctx context.Context) error {
 	s.httpSrv = &http.Server{
 		Addr:    addr,
 		Handler: s.mux,
-		// 读超时防慢速攻击；无写超时（WS/长任务需要）。
+		// BaseContext：请求 ctx 派生自服务进程 ctx（sse-active-sessions P2.4）——
+		// 进程取消先传导到 in-flight 请求（含 SSE stream：handler 经 r.Context()
+		// 观测取消退出），再进入下方 5s Shutdown 预算，关停顺序为「先取消 stream
+		// 再 Shutdown」。读超时防慢速攻击；无写超时（WS/长任务需要）。
+		BaseContext:       func(net.Listener) context.Context { return ctx },
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	ln, err := net.Listen("tcp", addr)
