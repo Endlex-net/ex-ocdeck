@@ -11,9 +11,9 @@ import (
 
 	"ocdeck/internal/application"
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
-	"ocdeck/internal/store"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // --- Fix 2：Suspend shell 错误聚合 + suspended 状态提交失败处理 ---

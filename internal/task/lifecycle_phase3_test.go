@@ -13,9 +13,9 @@ import (
 
 	"ocdeck/internal/application"
 	"ocdeck/internal/config"
-	"ocdeck/internal/git"
-	"ocdeck/internal/lifecycle"
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/git"
+	"ocdeck/internal/infrastructure/lifecycle"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // newLifecycleTestManager 构造注入 LifecycleRunner + LogDir 的 Manager（Phase 3 测试用）。

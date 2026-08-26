@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"ocdeck/internal/git"
+	"ocdeck/internal/infrastructure/git"
 )
 
 // mockLifecycleRunner 记录 RunScript 调用并支持注入结果（design.md §7.1，Phase 3 测试用）。

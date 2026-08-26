@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // AgentStatus 返回任务的 agent 运行态（design.md 2.8：任务详情/列表 DTO 增加 agentStatus，

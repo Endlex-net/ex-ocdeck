@@ -9,7 +9,7 @@ import (
 	"os"
 
 	"ocdeck/internal/application/runtime"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // hostEnv 读取宿主环境变量（design.md §2：基础集从宿主取，不继承全部）。

@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // recordingProc 包装 mockProc，按调用顺序记录 NewSession（含端口）/KillSession 事件，

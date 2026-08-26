@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/pty"
+	"ocdeck/internal/infrastructure/pty"
 )
 
 // TaskBackend 是 api 层调用的 TaskManager 能力（design.md §18 task 行 + §21 路由）。

@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"ocdeck/internal/git"
+	"ocdeck/internal/infrastructure/git"
 )
 
 // inheritLogCap 为 task 层 inherit.log 单次写入上限（design.md §7.4：1MB）。

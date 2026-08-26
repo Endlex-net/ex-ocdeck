@@ -14,7 +14,7 @@ import (
 	"testing"
 
 	"ocdeck/internal/config"
-	"ocdeck/internal/store"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // fakeProjectStore 内存实现 ProjectStore，用于测试。

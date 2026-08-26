@@ -18,7 +18,7 @@ import (
 
 	"ocdeck/internal/application"
 	ocdecksess "ocdeck/internal/domain/session"
-	"ocdeck/internal/store"
+	"ocdeck/internal/infrastructure/store"
 )
 
 func seedTaskWithProject(t *testing.T, db *store.DB, taskID string) {

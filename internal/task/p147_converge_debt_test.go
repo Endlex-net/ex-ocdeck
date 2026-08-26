@@ -15,7 +15,7 @@ import (
 	"ocdeck/internal/application/runtime"
 	apptask "ocdeck/internal/application/task"
 	ocdeckevent "ocdeck/internal/domain/event"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // --- Suspend 经 LifecycleService 路由 ---

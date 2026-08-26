@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // --- Fix 1: notice 身份/去重按会话（snapshot_failed 转 degraded 时旧项消失、不膨胀） ---

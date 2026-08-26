@@ -14,7 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"ocdeck/internal/git"
+	"ocdeck/internal/infrastructure/git"
 )
 
 // Manager 管理 worktree 的创建与删除，基于 config.DataDir。

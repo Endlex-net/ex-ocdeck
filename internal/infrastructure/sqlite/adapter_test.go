@@ -8,7 +8,7 @@ import (
 
 	"ocdeck/internal/application"
 	ocdecktask "ocdeck/internal/domain/task"
-	"ocdeck/internal/store"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // TestAdapter_ImplementsApplicationPorts 确保 Adapter 满足所有 application ports 接口。

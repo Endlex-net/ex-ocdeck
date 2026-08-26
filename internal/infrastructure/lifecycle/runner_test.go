@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"ocdeck/internal/git"
+	"ocdeck/internal/infrastructure/git"
 )
 
 // --- RunScript 测试 ---

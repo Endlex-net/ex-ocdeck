@@ -9,7 +9,7 @@ import (
 	"github.com/coder/websocket"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/pty"
+	"ocdeck/internal/infrastructure/pty"
 )
 
 // handleWSTUI 处理 /ws/terminal/:taskID（TUI 终端，design.md §7/§21）。

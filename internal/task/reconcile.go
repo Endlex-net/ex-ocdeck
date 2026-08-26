@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // Reconcile 启动 reconciliation（design.md §5 + §10 shutdownPolicy 三模式 + tasks 3.8）。

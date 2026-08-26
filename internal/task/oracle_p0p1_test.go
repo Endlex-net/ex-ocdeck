@@ -11,8 +11,8 @@ import (
 
 	"ocdeck/internal/application"
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // programmableDirtyWorktree 允许测试按调用序号返回不同的 DirtyFiles 结果，

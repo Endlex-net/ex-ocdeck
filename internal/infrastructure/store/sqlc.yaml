@@ -1,6 +1,6 @@
 # sqlc 配置（参考用）。
 #
-# 说明：本机无 sqlc CLI，internal/store/queries.go 为手写实现，方法签名风格对齐 sqlc 生成产物。
+# 说明：本机无 sqlc CLI，internal/infrastructure/store/queries.go 为手写实现，方法签名风格对齐 sqlc 生成产物。
 # 若后续安装 sqlc，可直接基于此配置与 queries/*.sql 生成，替换手写 Queries 而不影响调用方。
 version: "2"
 sql:

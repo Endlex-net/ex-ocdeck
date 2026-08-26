@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // tuiCmdArgv 返回 mockProc 记录的 TUI 会话 CmdArgv（§4 锚定测试断言 --session <id>）。

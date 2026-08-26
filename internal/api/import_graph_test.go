@@ -93,14 +93,14 @@ func TestDomainStdlibOnly(t *testing.T) {
 	}
 }
 
-// TestInfrastructureNoAPIDependency 断言 internal/infrastructure 与 internal/store
-// （含测试二进制）不依赖 ocdeck/internal/api：api 是边界适配层，只能位于依赖方向
+// TestInfrastructureNoAPIDependency 断言 internal/infrastructure/...（含 store，
+// 含测试二进制）不依赖 ocdeck/internal/api：api 是边界适配层，只能位于依赖方向
 // 末端（design.md D0:55 api → application → domain），下层包反向 import api 会
 // 制造隐式依赖环。
 func TestInfrastructureNoAPIDependency(t *testing.T) {
-	for _, pkg := range goListOutput(t, "-deps", "-test", "ocdeck/internal/infrastructure/...", "ocdeck/internal/store") {
+	for _, pkg := range goListOutput(t, "-deps", "-test", "ocdeck/internal/infrastructure/...") {
 		if depMatches(pkg, "ocdeck/internal/api") {
-			t.Fatalf("internal/infrastructure and internal/store must not depend on ocdeck/internal/api (design.md D0:55)")
+			t.Fatalf("internal/infrastructure must not depend on ocdeck/internal/api (design.md D0:55)")
 		}
 	}
 }

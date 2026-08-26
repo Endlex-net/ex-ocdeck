@@ -9,8 +9,8 @@ import (
 
 	"ocdeck/internal/application"
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // 本文件为 R7 评审修复测试提供 mock 扩展，不修改 mock_test.go（另一 lane 独占）。

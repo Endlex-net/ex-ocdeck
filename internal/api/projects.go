@@ -1,6 +1,6 @@
 // Package api 实现 HTTP/WS 端点、token 中间件与统一错误结构（design.md §14/§21）。
 //
-// projects.go 的 git 校验（git.IsGitRepo / git.ResolveDefaultBranch）直接调用 internal/git，
+// projects.go 的 git 校验（git.IsGitRepo / git.ResolveDefaultBranch）直接调用 internal/infrastructure/git，
 // 不经 TaskManager GitOps——这是 api 边界例外：
 // 项目注册/删除只读探测远端仓库的 git 属性，无任务生命周期共享状态、无并发竞争
 // （无 worktree 写操作、无与 Suspend/Delete 互斥的资源）。TaskManager GitOps 持任务锁是
@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/git"
+	"ocdeck/internal/infrastructure/git"
 )
 
 // registerProjectRoutes 注册 projects 相关路由（design.md §21）。

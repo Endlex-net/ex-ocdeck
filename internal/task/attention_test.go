@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // --- 辅助 ---

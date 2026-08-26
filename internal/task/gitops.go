@@ -6,7 +6,7 @@ import (
 	"fmt"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/git"
+	"ocdeck/internal/infrastructure/git"
 )
 
 // GitFileDTO 单文件状态（design.md §21 git/status，与 internal/api/git.go gitFileDTO 字段一致）。
@@ -40,7 +40,7 @@ func (m *Manager) assertGitRepoTask(ctx context.Context, row TaskRow) (ProjectRo
 
 // GitStatus 返回任务 worktree 的 git 状态（design.md §9/§21）。
 // 持任务锁（与 Suspend/Delete 等生命周期操作互斥，冲突返回 409）防并发。
-// 复用 internal/git.Status + git.CurrentBranch；只读，不进 repo 写锁。
+// 复用 internal/infrastructure/git.Status + git.CurrentBranch；只读，不进 repo 写锁。
 // not_found 语义与现有一致：任务不存在返回 codeNotFound。
 func (m *Manager) GitStatus(ctx context.Context, taskID string) (GitStatusDTO, error) {
 	unlock, err := m.tryLockTask(taskID)

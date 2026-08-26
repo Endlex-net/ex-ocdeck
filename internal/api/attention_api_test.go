@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // attentionTaskBackend 注入 Attention 返回值，供 API 透出字段测试。

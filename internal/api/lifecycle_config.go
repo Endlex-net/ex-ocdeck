@@ -11,7 +11,7 @@ import (
 )
 
 // LifecycleConfigStore 提供 project_lifecycle_configs 读写能力（design.md §2/§8）。
-// 复用 internal/store 既有 Queries 方法签名，经 adapter 解耦 store 包结构。
+// 复用 internal/infrastructure/store 既有 Queries 方法签名，经 adapter 解耦 store 包结构。
 type LifecycleConfigStore interface {
 	// GetLifecycleConfig 读取项目生命周期配置。缺行返回空配置（三字段空串），非错误。
 	GetLifecycleConfig(ctx context.Context, projectID string) (lifecycleConfigRow, error)
@@ -66,7 +66,7 @@ func (r lifecycleConfigUpsertReq) validate() *ApiError {
 	if len(r.PreDeleteScript) > lifecycleScriptMax {
 		return NewError(CodeInvalidInput, "pre_delete_script exceeds 64KB limit")
 	}
-	// 逐行校验 glob 语法（空行与 # 注释行忽略）。与 internal/lifecycle 执行侧同库
+	// 逐行校验 glob 语法（空行与 # 注释行忽略）。与 internal/infrastructure/lifecycle 执行侧同库
 	// （doublestar/v4 ValidatePattern），保证校验与执行一致。
 	lineNo := 0
 	for _, raw := range strings.Split(r.InheritPatterns, "\n") {

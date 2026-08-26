@@ -180,7 +180,7 @@ func RepoLock(repoPath string) *sync.Mutex {
 var repoLockAcquiredHook func(canonicalPath string, acquired bool)
 
 // RepoLockAcquiredHookForTest 是 repoLockAcquiredHook 的导出别名，供跨包测试
-// （internal/worktree）注入观察 hook。仅测试使用，生产路径保持 nil。
+// （internal/infrastructure/worktree）注入观察 hook。仅测试使用，生产路径保持 nil。
 var RepoLockAcquiredHookForTest func(canonicalPath string, acquired bool)
 
 // canonicalLockKey 归一 repoPath 为 canonical path（与 RepoLock 同 key）。

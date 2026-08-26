@@ -19,13 +19,12 @@ import (
 	"syscall"
 	"time"
 
-	"ocdeck/internal/git"
-
 	"github.com/bmatcuk/doublestar/v4"
+	"ocdeck/internal/infrastructure/git"
 )
 
 // LifecycleRunner 生命周期脚本与文件继承机制（design.md §7.1）。
-// internal/lifecycle 实现，task 编排层注入 mock。
+// internal/infrastructure/lifecycle 实现，task 编排层注入 mock。
 type LifecycleRunner interface {
 	// RunScript 在 dir 下以 env 执行 script（/bin/sh -c），stdout+stderr 写入 logPath
 	//（每次执行 truncate 重写；RunScript 是该日志文件的唯一写入者）。
@@ -33,7 +32,7 @@ type LifecycleRunner interface {
 	// timeout 到期杀整个进程组（避免孙子进程泄漏）返回超时错误。exit 0 返回 nil。
 	RunScript(ctx context.Context, dir string, env map[string]string, script, logPath string, timeout time.Duration) error
 
-	// CopyInherited 将 entries（来自 internal/git 的文件级枚举）中匹配 patterns 的
+	// CopyInherited 将 entries（来自 internal/infrastructure/git 的文件级枚举）中匹配 patterns 的
 	// 文件从 repoPath 复制进 wtPath，保持相对路径与权限；符号链接按链接复制；
 	// 普通文件 MUST no-clobber 原子发布：同目录临时文件完整写入（fsync+chmod）后
 	// link(2) 到目标（EEXIST → 目标已存在，跳过+警告），再 unlink 临时文件——
@@ -409,7 +408,7 @@ func isContainedRel(rel string) bool {
 	return true
 }
 
-// isGitPath 判断相对路径是否位于 .git 下（与 internal/git 同语义，避免跨包依赖）。
+// isGitPath 判断相对路径是否位于 .git 下（与 internal/infrastructure/git 同语义，避免跨包依赖）。
 func isGitPath(p string) bool {
 	if p == ".git" {
 		return true

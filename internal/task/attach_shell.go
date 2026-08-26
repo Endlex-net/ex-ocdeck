@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"ocdeck/internal/application/runtime"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
-	"ocdeck/internal/pty"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
+	"ocdeck/internal/infrastructure/pty"
 )
 
 // ReopenAttach 重开 TUI attach 会话（design.md §18 ReopenAttach + §4 TUI 消失保持活跃）。

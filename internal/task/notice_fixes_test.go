@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // TestRecordResidualNotice_ReadbackConverge 验证 recordResidualNotice CAS 写回后读回校验收敛（A）。

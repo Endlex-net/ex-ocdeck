@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"ocdeck/internal/git"
+	"ocdeck/internal/infrastructure/git"
 )
 
 // helper: 在 t.TempDir() 创建真实 git 仓库，返回仓库路径。

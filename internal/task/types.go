@@ -16,9 +16,9 @@ import (
 	"fmt"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
-	"ocdeck/internal/pty"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
+	"ocdeck/internal/infrastructure/pty"
 )
 
 // --- 迁移别名（sse-active-sessions P1.9a：定义已迁至 internal/application，
@@ -109,7 +109,7 @@ type WorktreeBackend interface {
 	// ResolveBaseRef 将 base_ref 短名解析为全限定 ref（add-plain-dir-project D10）。
 	// 解析顺序 refs/heads/<name> → refs/remotes/<name>（heads 优先），仅接受这两个命名空间；
 	// 不存在返回错误（调用方映射 invalid_input）。调用方 MUST 先经 ValidateBranchName 做规范校验。
-	// 无副作用只读，前置完成于落库前。task 包不直接依赖 internal/git，经此端口解析。
+	// 无副作用只读，前置完成于落库前。task 包不直接依赖 internal/infrastructure/git，经此端口解析。
 	ResolveBaseRef(ctx context.Context, repoPath, shortName string) (string, error)
 	// VerifyWorktreeProduct 严格产物验证（B1：RetryCreate 幂等跳过 add 的判定依据，
 	// design.md §19 Create Retry 行）。校验：路径存在 + .git 文件 + rev-parse --is-inside-work-tree
@@ -127,7 +127,7 @@ type WorktreeBackend interface {
 //
 // Slug 永不返回 error：由实现内部决定 AI 提炼或回退到机械 slugify（fallback 由 wiring 注入，
 // 通常是 task.Slugify）。返回的 slug 已经过清洗或 fallback，调用方直接拼 `ocdeck/` 前缀即可。
-// 本接口只定义抽象，避免 task 包 import internal/ai；具体实现（ai.SlugNamer）在 main.go
+// 本接口只定义抽象，避免 task 包 import internal/infrastructure/ai；具体实现（ai.SlugNamer）在 main.go
 // wiring 阶段注入（tasks 3.3）。Manager 持有 namer 为 nil 时回退到本包 Slugify（防 panic）。
 type BranchNamer interface {
 	Slug(ctx context.Context, taskName string) string

@@ -7,11 +7,11 @@ import (
 	"ocdeck/internal/application"
 	ocdecktask "ocdeck/internal/domain/task"
 	ocdecksess "ocdeck/internal/domain/session"
-	"ocdeck/internal/git"
-	"ocdeck/internal/process"
-	"ocdeck/internal/pty"
-	"ocdeck/internal/store"
-	"ocdeck/internal/worktree"
+	"ocdeck/internal/infrastructure/git"
+	"ocdeck/internal/infrastructure/process"
+	"ocdeck/internal/infrastructure/pty"
+	"ocdeck/internal/infrastructure/store"
+	"ocdeck/internal/infrastructure/worktree"
 )
 
 // StoreAdapter 包装 *store.DB 实现 TaskStore（row 类型转换）。
@@ -493,13 +493,13 @@ func (a *WorktreeAdapter) BranchExists(ctx context.Context, repoPath, branch str
 }
 
 // ValidateBranchName 用 git check-ref-format 校验分支名合法性（P1：Create 前置检查，
-// design.md §19）。委托 internal/git.ValidateBranchName，保持 worktree 包不引入新公开方法。
+// design.md §19）。委托 internal/infrastructure/git.ValidateBranchName，保持 worktree 包不引入新公开方法。
 func (a *WorktreeAdapter) ValidateBranchName(ctx context.Context, repoPath, branch string) error {
 	return git.ValidateBranchName(ctx, repoPath, branch)
 }
 
 // ResolveBaseRef 将 base_ref 短名解析为全限定 ref（add-plain-dir-project D10）。
-// 委托 internal/git.ResolveBaseRef；task 包不直接依赖 internal/git，经此端口解析。
+// 委托 internal/infrastructure/git.ResolveBaseRef；task 包不直接依赖 internal/infrastructure/git，经此端口解析。
 func (a *WorktreeAdapter) ResolveBaseRef(ctx context.Context, repoPath, shortName string) (string, error) {
 	return git.ResolveBaseRef(ctx, repoPath, shortName)
 }

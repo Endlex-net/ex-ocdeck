@@ -22,7 +22,7 @@ import (
 	"sync"
 	"time"
 
-	"ocdeck/internal/pty"
+	"ocdeck/internal/infrastructure/pty"
 )
 
 // SessionSpec 描述一次 tmux 会话创建请求（design.md §18）。
@@ -318,7 +318,7 @@ func exitCodeOf(err error) int {
 const execOutputLimit = 16 * 1024 * 1024
 
 // boundedBuffer 有界写入缓冲，满足 io.Writer 契约，超限丢弃并标记 overflow。
-// 借鉴 internal/git/exec.go 同款实现。
+// 借鉴 internal/infrastructure/git/exec.go 同款实现。
 type boundedBuffer struct {
 	buf      []byte
 	overflow bool

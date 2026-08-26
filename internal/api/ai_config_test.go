@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"ocdeck/internal/ai"
+	"ocdeck/internal/infrastructure/ai"
 )
 
 // newAIConfigAPIServer 构造注入了 ai.Store 的 Server（路由注册前注入，沿用 main wiring 顺序）。

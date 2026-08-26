@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // 本文件补齐 tasks.md 1.16-1.19 P1 门禁覆盖差距（审计后真实缺口）。

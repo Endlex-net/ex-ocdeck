@@ -16,8 +16,8 @@ import (
 	"ocdeck/internal/application/runtime"
 	apptask "ocdeck/internal/application/task"
 	ocdecksess "ocdeck/internal/domain/session"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // envBaselineKeys 是 design.md §2 规定的最小基础集 env key（不含 OCDECK_*/密码）。

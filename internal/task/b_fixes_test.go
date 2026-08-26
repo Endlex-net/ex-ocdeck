@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // TestKeyedMutex_ConcurrentSameTask409 验证同一任务的并发操作返回 409（B3）。

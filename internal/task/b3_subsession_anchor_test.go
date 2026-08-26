@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"testing"
 
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // TestB3_AnchorIsolatesSubsession_LateLastSeen 验证 B3 锚定隔离：

@@ -24,7 +24,7 @@ import (
 
 	"ocdeck/internal/application"
 	ocdeckevent "ocdeck/internal/domain/event"
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // --- fake EventSubscriber：内存可控订阅器（per-topic 事件/溢出 channel） ---

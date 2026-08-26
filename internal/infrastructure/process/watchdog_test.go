@@ -30,7 +30,7 @@ func TestWatchdog_KillsServerOnParentDeath(t *testing.T) {
 	}
 
 	// 编译 ocdeck-server 二进制到临时目录。
-	// exec.Command 继承测试进程 cwd（internal/process），需切到模块根目录才能解析 ./cmd/ocdeck-server。
+	// exec.Command 继承测试进程 cwd（internal/infrastructure/process），需切到模块根目录才能解析 ./cmd/ocdeck-server。
 	modRoot, err := findModuleRoot()
 	if err != nil {
 		t.Fatalf("find module root: %v", err)
@@ -137,7 +137,7 @@ func pidSuffix() string {
 func ppidStr(pid int) string { return strconv.Itoa(pid) }
 
 // findModuleRoot 返回当前 go module 根目录（go env GOMOD 去掉尾部 go.mod）。
-// 测试进程 cwd 在 internal/process 下，直接用 ./cmd/ocdeck-server 无法解析。
+// 测试进程 cwd 在 internal/infrastructure/process 下，直接用 ./cmd/ocdeck-server 无法解析。
 func findModuleRoot() (string, error) {
 	out, err := exec.Command("go", "env", "GOMOD").Output()
 	if err != nil {

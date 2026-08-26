@@ -13,9 +13,9 @@ import (
 	"ocdeck/internal/config"
 	ocdecktask "ocdeck/internal/domain/task"
 	ocdecksess "ocdeck/internal/domain/session"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
-	"ocdeck/internal/pty"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
+	"ocdeck/internal/infrastructure/pty"
 )
 
 // --- mock store ---

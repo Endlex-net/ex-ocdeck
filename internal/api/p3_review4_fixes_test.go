@@ -14,7 +14,7 @@ import (
 	"github.com/coder/websocket"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/pty"
+	"ocdeck/internal/infrastructure/pty"
 )
 
 // fakeTaskBackend 内存实现 TaskBackend，用于 API 层测试。
@@ -85,7 +85,7 @@ func (f *fakeTaskBackend) ListAllActiveTaskIDs(ctx context.Context) ([]string, e
 }
 
 // ListActiveTaskOverview 默认返回空切片（cross-project-active-sessions API 测试默认空响应）；
-// 具体 store 聚合行为由 internal/store 测试覆盖，hydration 行为由 active_sessions_api_test 覆盖。
+// 具体 store 聚合行为由 internal/infrastructure/store 测试覆盖，hydration 行为由 active_sessions_api_test 覆盖。
 func (f *fakeTaskBackend) ListActiveTaskOverview(ctx context.Context) ([]application.ActiveTaskOverviewRow, error) {
 	return []application.ActiveTaskOverviewRow{}, nil
 }

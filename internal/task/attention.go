@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // --- 三层类型模型（含 Since，本地首次观察时间） ---

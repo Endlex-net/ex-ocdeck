@@ -72,6 +72,6 @@ ocdeck 对 opencode 的兼容性按**已验证版本区间**声明，当前为 *
    ```
 
 2. **相邻对核验**：扩展区间必须按相邻版本逐对 diff（例如 18→19、19→20、20→21），禁止从当前上限一次性跳到更远 tag（中间 tag 的改了又改回会被漏掉）。**零 DIFF**：把 `ContractBaseline` 上调到新版本；若向下扩区间则同时下调 `ContractMinVersion`。
-3. **有 DIFF**：对照上表分析影响；必要时改 `internal/opencode`（漂移只改本包）与相关测试。
+3. **有 DIFF**：对照上表分析影响；必要时改 `internal/infrastructure/opencode`（漂移只改本包）与相关测试。
 4. 手工启动 `opencode serve --port <p> --hostname 127.0.0.1`（设好 `OPENCODE_SERVER_PASSWORD`），按脚本末尾 checklist live-probe：health / session CRUD / status / permission / question。
 5. `go build ./... && go test ./...`。

@@ -16,7 +16,7 @@ import (
 
 	apptask "ocdeck/internal/application/task"
 	"ocdeck/internal/config"
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // TestP148_Delete_Normal_ViaLifecycle：注入 LifecycleService 后 Delete Normal 成功，

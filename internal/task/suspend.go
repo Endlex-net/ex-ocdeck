@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"time"
 
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // Suspend 挂起任务（design.md §19 Suspend 行 + §5 互斥决策树三分支）。

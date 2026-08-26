@@ -5,7 +5,7 @@ import (
 	"log"
 	"sync"
 
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // agentStatusModeA 是 agentStatus 维护模式的编译期常量（design.md D4 模式执行矩阵，

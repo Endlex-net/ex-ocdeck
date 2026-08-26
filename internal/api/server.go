@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"ocdeck/internal/ai"
 	"ocdeck/internal/config"
-	storepkg "ocdeck/internal/store"
+	"ocdeck/internal/infrastructure/ai"
+	storepkg "ocdeck/internal/infrastructure/store"
 )
 
 // Server 持有 HTTP 服务与依赖。本任务提供骨架与占位路由。
@@ -53,7 +53,7 @@ type StoreRO interface {
 }
 
 // ProjectStore 项目注册所需的 store 能力（design.md §21 projects 路由）。
-// 复用 internal/store 既有 Queries 方法签名。
+// 复用 internal/infrastructure/store 既有 Queries 方法签名。
 type ProjectStore interface {
 	CreateProject(ctx context.Context, id, name, path, defaultBranch, kind string) error
 	GetProject(ctx context.Context, id string) (storeProjectRow, error)

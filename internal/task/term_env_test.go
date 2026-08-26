@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // unsetEnvForTest 在测试期间取消指定 env 变量并在 t.Cleanup 恢复原值。

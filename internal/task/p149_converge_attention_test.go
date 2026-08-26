@@ -23,7 +23,7 @@ import (
 	"ocdeck/internal/application"
 	"ocdeck/internal/application/runtime"
 	ocdeckevent "ocdeck/internal/domain/event"
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // attentionCount 返回已发布的 serve_runtime.attention_changed 事件数。

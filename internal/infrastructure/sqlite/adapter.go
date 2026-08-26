@@ -17,7 +17,7 @@ import (
 	"ocdeck/internal/application"
 	ocdecktask "ocdeck/internal/domain/task"
 	ocdecksess "ocdeck/internal/domain/session"
-	"ocdeck/internal/store"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // Adapter 包装 *store.DB 实现 application ports 子集（design.md D0）。

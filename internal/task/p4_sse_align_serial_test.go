@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // 本文件验证 P4 门禁项：SSE 首次对齐与重连串行化。

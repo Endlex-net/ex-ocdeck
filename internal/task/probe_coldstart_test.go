@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // probeSequenceOC 装饰 mockOC，使 Probe 按预设序列返回，逐次消费。

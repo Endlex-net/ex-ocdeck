@@ -20,7 +20,7 @@ import (
 	"time"
 
 	apptask "ocdeck/internal/application/task"
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // newP146TestManager 构造注入完整 LifecycleService（Tasks+Read+Sessions ports）的 Manager。

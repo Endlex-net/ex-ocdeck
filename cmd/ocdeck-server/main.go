@@ -15,17 +15,17 @@ import (
 	"syscall"
 	"time"
 
-	"ocdeck/internal/ai"
 	"ocdeck/internal/api"
 	apptask "ocdeck/internal/application/task"
 	"ocdeck/internal/config"
+	"ocdeck/internal/infrastructure/ai"
 	"ocdeck/internal/infrastructure/eventbus"
+	"ocdeck/internal/infrastructure/lifecycle"
+	"ocdeck/internal/infrastructure/process"
 	sqlite "ocdeck/internal/infrastructure/sqlite"
-	"ocdeck/internal/lifecycle"
-	"ocdeck/internal/process"
-	"ocdeck/internal/store"
+	"ocdeck/internal/infrastructure/store"
+	"ocdeck/internal/infrastructure/worktree"
 	"ocdeck/internal/task"
-	"ocdeck/internal/worktree"
 )
 
 func main() {

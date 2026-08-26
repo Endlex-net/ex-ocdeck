@@ -54,3 +54,4 @@
 - [x] P2.8 端到端验证（依赖全部 Phase 2 lane）：
   - [x] P2.8.1 手工/脚本联调：启动服务端，建立 SSE 连接收到首帧 snapshot；触发任务 session 活动后在 500ms 合并窗口到期后收到 update（允许明确的组装/flush 调度容差）；杀连接观察前端退避重连；关停服务观察连接及时释放
   - [x] P2.8.2 `go build ./... && go test ./... -race` 与前端 `tsc`/测试全绿
+- [x] P2.9 驱动包归拢 `internal/infrastructure/`（2026-08-26 决定，本迭代内完成）：opencode/process/pty/worktree/git/ai/lifecycle/store 八包 `git mv` 至 `internal/infrastructure/`（包名不变，仅 import 路径经 ast_grep_replace 批量重写）；`config/` 保留顶层（组装根配置，非端口背后驱动）；`task/` facade 不动（收缩是独立事项）。更新 import-graph 架构断言测试路径；零行为变化，单一 commit

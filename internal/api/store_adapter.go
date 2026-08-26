@@ -3,7 +3,7 @@ package api
 import (
 	"context"
 
-	"ocdeck/internal/store"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // storeProjectAdapter 包装 *store.DB 实现 ProjectStore，做 row 类型转换，

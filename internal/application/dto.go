@@ -8,7 +8,7 @@ package application
 import (
 	"database/sql"
 
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // DeleteMode 删除模式（design.md §19）。

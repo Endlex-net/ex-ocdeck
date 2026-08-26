@@ -14,13 +14,13 @@ import (
 	"ocdeck/internal/application/runtime"
 	apptask "ocdeck/internal/application/task"
 	"ocdeck/internal/config"
-	"ocdeck/internal/lifecycle"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/process"
+	"ocdeck/internal/infrastructure/lifecycle"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // TaskStore 抽象 TaskManager 所需的 store 能力（design.md §8/§18）。
-// 方法签名对齐 internal/store.Queries，便于 *store.DB 直接实现（adapter 在 api 层）。
+// 方法签名对齐 internal/infrastructure/store.Queries，便于 *store.DB 直接实现（adapter 在 api 层）。
 type TaskStore interface {
 	// 项目
 	GetProject(ctx context.Context, id string) (ProjectRow, error)

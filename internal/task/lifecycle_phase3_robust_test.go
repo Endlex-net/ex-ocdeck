@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/git"
+	"ocdeck/internal/infrastructure/git"
 )
 
 // blockingLifecycleRunner 是可阻塞、context-aware 的 mock LifecycleRunner（Phase 3 稳定性测试用）。
@@ -1737,7 +1737,7 @@ func (s *orderTraceStore) snapshot() []string {
 	return out
 }
 
-// newLifecycleTestRepo 创建真实 git repo（参考 internal/git/git_test.go newTestRepo），
+// newLifecycleTestRepo 创建真实 git repo（参考 internal/infrastructure/git/git_test.go newTestRepo），
 // 含 .gitignore + 一个 ignored 文件（.env）+ 一个 untracked 文件，供 ListIgnoredUntracked 枚举。
 func newLifecycleTestRepo(t *testing.T) string {
 	t.Helper()

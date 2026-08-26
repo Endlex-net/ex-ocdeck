@@ -6,8 +6,8 @@ import (
 	"testing"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/opencode"
-	"ocdeck/internal/store"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // --- add-plain-dir-project D8：session 归属隔离测试（tasks.md 3.4） ---
@@ -21,7 +21,7 @@ func seedDirProjectTask(s *mockStore, taskID, projectID string) TaskRow {
 	return t
 }
 
-// TestClaimTaskSession_ConcurrentUniqueOwnership 的真实 SQLite 原子性验证在 internal/store
+// TestClaimTaskSession_ConcurrentUniqueOwnership 的真实 SQLite 原子性验证在 internal/infrastructure/store
 // 包（TestClaimTaskSession_ConcurrentUniqueOwnership_RealSQLite）；mockStore 不保证生产
 // 事务原子性，故此处不再覆盖（避免 mockStore 并发 seedProject 的 data race）。
 

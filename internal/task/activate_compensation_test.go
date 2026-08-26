@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // ctxAwareStore 装饰 *mockStore，在调用方 ctx 已取消（ctx.Err()!=nil）时对补偿路径

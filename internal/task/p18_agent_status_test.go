@@ -17,7 +17,7 @@ import (
 	"ocdeck/internal/config"
 	ocdeckevent "ocdeck/internal/domain/event"
 	ocdecksess "ocdeck/internal/domain/session"
-	"ocdeck/internal/opencode"
+	"ocdeck/internal/infrastructure/opencode"
 )
 
 // --- 测试基建 ---
