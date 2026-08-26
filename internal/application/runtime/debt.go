@@ -26,6 +26,12 @@ type DebtEntry struct {
 	TaskID string
 	Token  InstVersion
 	Phase  DebtPhase
+	// AttentionInvalidated 记录态：该令牌的外部可见 attention 失效已发布过（供 worker
+	// 捕获时预判与测试断言）。发布所有权的唯一原子权威是
+	// ClaimAttentionInvalidation 的 marker（registry.go invalidationPublished）——
+	// 本标记在登记时随调用方状态记录，与 marker 最终一致，但发布决策 MUST 走 claim。
+	// 同令牌合并只单调（true 后不回退）；新代替换安装的是新令牌自身的发布状态。
+	AttentionInvalidated bool
 }
 
 // RegisterIfCurrent 以触发令牌做登记前过期判定并登记/替换/合并债务（design.md D2
@@ -42,13 +48,19 @@ type DebtEntry struct {
 // 过期判定通过后按 taskID 去重登记（design.md D2:341-342）：
 //   - 无既有登记 → 插入；
 //   - 既有登记令牌 != trigger → 新代登记原子替换旧注册项（旧债不得挡住新代超时登记，
-//     否则任务可能留在 active 且无托管 SSE）；
+//     否则任务可能留在 active 且无托管 SSE）；替换安装新令牌自身的失效发布状态；
 //   - 令牌相同 → 阶段单调合并取较高阶段（pre+pre=pre；pre+post=post），
-//     MUST NOT postCleanup→preCleanup 回退。
+//     MUST NOT postCleanup→preCleanup 回退；失效标记同样只单调合并（true 后不回退）。
+//
+// attentionInvalidated 记录「该令牌的可见失效已（或即将在同一流程内）发布」：
+//   - 超时路径传登记前捕获的可见性（发布紧跟登记成功）；
+//   - CAS 矩阵 ②a/②c/③a 重登记传 true（矩阵本轮已发布过或 claim 失败即他人已发布）；
+//   - 其余调用方传 false。
 //
 // 返回 (registered, actualPhase)：registered=false 时 actualPhase 为既有登记的阶段
-//（无登记时为零值），供调用方诊断。
-func (r *Registry) RegisterIfCurrent(taskID string, trigger InstVersion, phase DebtPhase, currentRuntime *InstVersion) (registered bool, actualPhase DebtPhase) {
+//（无登记时为零值），供调用方诊断。发布决策不经由本方法——唯一权威是
+// ClaimAttentionInvalidation 在发布点的原子认领。
+func (r *Registry) RegisterIfCurrent(taskID string, trigger InstVersion, phase DebtPhase, currentRuntime *InstVersion, attentionInvalidated bool) (registered bool, actualPhase DebtPhase) {
 	r.genMu.Lock()
 	defer r.genMu.Unlock()
 	existing, hasExisting := r.debts[taskID]
@@ -59,20 +71,42 @@ func (r *Registry) RegisterIfCurrent(taskID string, trigger InstVersion, phase D
 		return false, 0
 	}
 	if !hasExisting {
-		r.debts[taskID] = DebtEntry{TaskID: taskID, Token: trigger, Phase: phase}
+		r.debts[taskID] = DebtEntry{TaskID: taskID, Token: trigger, Phase: phase, AttentionInvalidated: attentionInvalidated}
 		return true, phase
 	}
 	if existing.Token != trigger {
 		// 触发令牌仍是当前代（过期判定已通过）而既有登记为旧代 → 原子替换
-		//（design.md D2:341「新代登记原子替换旧注册项」）。
-		r.debts[taskID] = DebtEntry{TaskID: taskID, Token: trigger, Phase: phase}
+		//（design.md D2:341「新代登记原子替换旧注册项」）；替换安装新令牌自身的
+		// 失效发布状态。
+		r.debts[taskID] = DebtEntry{TaskID: taskID, Token: trigger, Phase: phase, AttentionInvalidated: attentionInvalidated}
 		return true, phase
 	}
 	if phase > existing.Phase {
 		existing.Phase = phase
-		r.debts[taskID] = existing
 	}
+	if attentionInvalidated {
+		existing.AttentionInvalidated = true
+	}
+	r.debts[taskID] = existing
 	return true, existing.Phase
+}
+
+// ClaimAttentionInvalidation 原子认领「发布该令牌 attention 可见失效」的所有权
+//（唯一权威，genMu 锁域内）：tombstone 仍等于该令牌（当前代，design.md fencing 语义
+//「Registry 只认当前版本；tombstone 权威」）且 marker 不等于该令牌 → 占位并返回 true
+//（本次调用获准发布）；任一不满足 → 返回 false（该事实已发布过，或令牌已被换代淘汰
+// ——旧代令牌 MUST NOT 发布过期失效，防止 A→B→延迟 A 的 stale 重复发布）。
+// 在发布点（而非捕获点）调用，消除「捕获时查询标记、发布时使用」的 TOCTOU 双发窗口
+//（持锁回调清理期间超时回调并发认领发布）。换代即永久关闭旧令牌的认领（tombstone
+// 单向推进）；无需在分配新令牌时清理旧 marker（fencing 已拒绝）。
+func (r *Registry) ClaimAttentionInvalidation(taskID string, tok InstVersion) bool {
+	r.genMu.Lock()
+	defer r.genMu.Unlock()
+	if r.lastToken[taskID] != tok || r.invalidationPublished[taskID] == tok {
+		return false
+	}
+	r.invalidationPublished[taskID] = tok
+	return true
 }
 
 // triggerCurrentLocked 判定触发令牌是否仍为当前代（调用方持 genMu）。

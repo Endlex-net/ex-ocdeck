@@ -351,7 +351,7 @@ func p147SeedPostCleanupDebt(t *testing.T, m *Manager) runtime.InstVersion {
 	m.setRuntime("t1", rt)
 	tok := rt.instVersion
 	m.clearRuntime("t1")
-	registered, _ := m.runtimeRegistry.RegisterIfCurrent("t1", tok, runtime.DebtPhasePostCleanup, nil)
+	registered, _ := m.runtimeRegistry.RegisterIfCurrent("t1", tok, runtime.DebtPhasePostCleanup, nil, false)
 	if !registered {
 		t.Fatal("prereq: postCleanup debt register failed")
 	}
@@ -367,7 +367,8 @@ func TestP147_Matrix_W3b_CommittedFalseNonActive_DeletesDebtNoPublish(t *testing
 	tok := p147SeedPostCleanupDebt(t, m)
 
 	// 持锁提交段：env 清 + CAS(active→suspended) 在 suspended 行上 !Matched → ③b。
-	m.convergeCommitCAS(context.Background(), "t1", convergeDebtPostCleanupReason, tok, nil)
+	// visible=false：postCleanup 债务（失效已在超时登记时发布）。
+	m.convergeCommitCAS(context.Background(), "t1", convergeDebtPostCleanupReason, tok, false, nil)
 
 	if _, ok := m.runtimeRegistry.Get("t1"); ok {
 		t.Fatal("W③b MUST compare-and-delete debt when reread is non-active")
@@ -389,7 +390,8 @@ func TestP147_Matrix_W2b_StatusErrNonActive_ResyncThenDeletesDebt(t *testing.T) 
 	tok := p147SeedPostCleanupDebt(t, m)
 
 	// 持锁提交段：CAS 写失败（statusErr 非 nil）→ ② → resync → 重读 suspended → ②b 删除。
-	m.convergeCommitCAS(context.Background(), "t1", convergeDebtPostCleanupReason, tok, nil)
+	// visible=false：postCleanup 债务（失效已在超时登记时发布）。
+	m.convergeCommitCAS(context.Background(), "t1", convergeDebtPostCleanupReason, tok, false, nil)
 
 	if _, ok := m.runtimeRegistry.Get("t1"); ok {
 		t.Fatal("W②b MUST compare-and-delete debt when reread is non-active despite status error")

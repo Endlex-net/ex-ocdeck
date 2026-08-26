@@ -66,6 +66,12 @@ type Registry struct {
 	//（NewInstVersion）/tombstone 更新同一互斥锁域（genMu，design.md D0:342），
 	// 保证登记的过期判定、阶段推进与新代分配串行化。
 	debts map[string]DebtEntry
+	// invalidationPublished 记录 taskID 最近一次已发布 attention 可见失效的令牌
+	//（taskID → token）。ClaimAttentionInvalidation 的 marker：发布所有权的唯一
+	// 原子权威（genMu 锁域内比较并占位），消除「捕获时查询、发布时使用」的 TOCTOU
+	// 双发窗口。换代自然重新获准（不同令牌 = 不同事实）；无需在新令牌分配时清理
+	//（旧 marker 与新令牌比较不等即获准）。
+	invalidationPublished map[string]InstVersion
 	// genValueFn 为令牌值生成器（测试接缝：默认 newInstVersionValue，测试注入
 	// 脚本化序列以确定性复现候选碰撞）。仅本包内可替换，生产路径恒为默认实现。
 	genValueFn func() InstVersion
@@ -74,10 +80,11 @@ type Registry struct {
 // New 构造空 Registry。
 func New() *Registry {
 	return &Registry{
-		lastToken:  make(map[string]InstVersion),
-		issued:     make(map[string]map[InstVersion]struct{}),
-		debts:      make(map[string]DebtEntry),
-		genValueFn: newInstVersionValue,
+		lastToken:             make(map[string]InstVersion),
+		issued:                make(map[string]map[InstVersion]struct{}),
+		debts:                 make(map[string]DebtEntry),
+		invalidationPublished: make(map[string]InstVersion),
+		genValueFn:            newInstVersionValue,
 	}
 }
 

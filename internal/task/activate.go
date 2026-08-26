@@ -1516,17 +1516,24 @@ func (m *Manager) convergeToSuspendedChecked(taskID, reason string, tok runtime.
 	defer unlock()
 	// 触发令牌隔离（统一原 SSE checkGen 路径与 watcher 路径）：当前 runtime 为 nil 或令牌
 	// 不匹配 → 旧实例延迟回调，跳过收敛（不清理新实例/已清 runtime）。
-	if rt := m.getRuntime(taskID); rt == nil || rt.instVersion != tok {
+	rt := m.getRuntime(taskID)
+	if rt == nil || rt.instVersion != tok {
 		log.Printf("convergeToSuspended: stale token callback (task %s instVersion=%s) skipped", taskID, tok)
 		return
 	}
+	// 清理前捕获 attention 外部可见快照存在性（design.md D2「清理前捕获外部可见状态」；
+	// cleanup 会经 clearRuntime→clearAttention 清空快照，事后不可读），供 CAS 矩阵
+	// ②/③a/③c 的 attention 失效发布判定。发布决策在发布点原子 claim
+	//（ClaimAttentionInvalidation）：本捕获与矩阵发布之间的长清理窗口内，无需任务锁的
+	// 超时回调可能已认领发布同一事实（TOCTOU），claim 失败即被抑制。
+	attentionVisible := m.attentionVisible(rt)
 	ctx := context.Background()
 	// 停 SSE + kill tui/shell 会话。notice 持久化失败聚合进 last_error（不静默，design.md §8）。
 	// cleanupActivationRuntime 内部 fail-closed 记 retryable notice（P4 复评阻塞 5）。
 	cleanupErr := m.cleanupActivationRuntime(ctx, taskID)
 	// 清除 env 快照 + active→suspended CAS + D2 嵌套决策表（converge_debt.go）。
 	// env 快照写回错误聚合进 last_error，不静默吞错（P4 复评阻塞 5）。
-	m.convergeCommitCAS(ctx, taskID, reason, tok, cleanupErr)
+	m.convergeCommitCAS(ctx, taskID, reason, tok, attentionVisible, cleanupErr)
 }
 
 // handleInfraError 处理 tmux 持续基础设施故障（C1：infra_error 明确处理路径，不得静默）。
