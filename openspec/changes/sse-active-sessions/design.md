@@ -530,7 +530,7 @@ main.go
 
 ## Risks / Trade-offs
 
-- [状态事件契约不完全确定（确切 type 字符串与字段路径待实测）] → tasks 设 Phase 0 实测门禁：捕获 idle/busy/retry 三类真实 fixture 并固化解析契约测试；未命中 fail-closed 忽略；门禁失败启用 D4 fallback（低频探测缓存）。
+- [状态事件契约（已实测确认，原"待实测"项）] → P1.7.3 动态可靠性门禁已于 2026-08-26 在 opencode 1.18.18 执行，裁定 **MODE A（事件驱动）**：状态事件 type 字符串为 `session.status`，状态字段路径为 `properties.status.type`（retry 额外携带 `properties.status.{attempt:int, message:string, next:epoch-ms}`）。诚实披露：两轮独立运行（独立驱动/判定实现）C1/C2/C4/C5 均 PASS；第二 lane 初判 C3 FAIL 经行级取证认定为判定器锚定伪影——被标事件全是驱动按协议自发的后续 turn，服务端零迟到旧事件——按预登记判据「迟到旧事件改离最终目标值」的本意裁定 C3 PASS，两轮一致收敛 MODE A。证据归档于本机临时路径（可能已回收）：`/var/folders/yk/5bvypw1121s2h7mf08c1x0pr0000gn/T/opencode/p17/`（run1 判定 `results/verdict.txt`，第二 lane `results_run2_preserved/`）。契约 fixture 与解析测试已固化至 `internal/opencode/testdata/session_status_events.jsonl` 与 `ParseSessionStatusEvent`（P1.7.1/P1.7.2）；未命中/畸形事件 fail-closed 忽略语义保持；模式按 D4 模式执行矩阵为编译期常量（MUST NOT 运行时配置），fallback 模式 B 保留为规格内备选、不启用。
 - [DDD 重构中漏事件或状态语义漂移（写点众多）] → 以全部 store 写调用点形成 D2 提交矩阵；每迁移一个用例做正向/CAS 未命中/store error/同值 no-op 测试；旧 facade 只允许单写路径。
 - [ServeRuntime 换代、回调等锁、teardown 与债务 worker 竞态] → 单一 Registry 锁域 + instVersion 令牌 + tombstone + compare-and-delete + preCleanup→postCleanup 单调状态机；`go test -race` 加可控 barrier 测试。
 - [DB、Runtime、Publish 三者无原子事务；session 物理键弱于领域模型] → publish-after-commit；不确定结果发 resync；Overflow+全量快照兜底；SessionRepository 方法闭合为 Claim/TouchOwned/DeleteOwned/Align/OwnedSessions/OwnerOf（禁通用 Save/Upsert）；历史重复归属读到时 fail-closed。
@@ -543,6 +543,6 @@ main.go
 
 ## Open Questions
 
-- opencode session 状态事件的确切 `type` 字符串与 status 字段路径（Phase 0 实测，见 D4/门禁）。
+- opencode session 状态事件契约已由 P1.7.3 门禁实测确认（`session.status` / `properties.status.type` + retry extras，MODE A；见 Risks 首条固化记录）。
 
 （合并窗口固定为 500ms——本变更的确定值；后续如需调整另走规格变更，不在实施中临时修改。）
