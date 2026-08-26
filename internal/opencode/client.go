@@ -226,6 +226,11 @@ type Client struct {
 	// 为 nil 时仅内部计数；非 nil 时同步调用，调用方据此落日志/告警。
 	onMalformed func(raw sseRawEvent, err error)
 
+	// onDisconnect 断流回调（P1.8.4，design D4 断流感知）：已建立的 SSE 连接终止
+	//（established 且非 ctx 主动取消）后、进入重连退避前同步调用一次。
+	// 从未建立的连接与主动 ctx 取消 MUST NOT 触发（区分网络断流与正常关停）。
+	onDisconnect func()
+
 	// malformedCount 累计 malformed 事件数（供诊断）。
 	malformedCount int64
 }
@@ -247,8 +252,11 @@ type Options struct {
 	HeartbeatTimeout time.Duration
 	// OnReady 首次 SSE 连接建立后的就绪信号（见 Client.onReady）。可选。
 	OnReady func()
-	// OnMalformed 解析失败事件回调（见 Client.onMalformed）。可选。
+	// OnMalformed 解析失败的事件回调（见 Client.onMalformed）。可选。
 	OnMalformed func(raw sseRawEvent, err error)
+	// OnDisconnect 断流回调（见 Client.onDisconnect）：已建立连接终止、退避前同步一次。
+	// 主动 ctx 取消与从未建立的连接不触发。可选。
+	OnDisconnect func()
 }
 
 const (
@@ -306,6 +314,7 @@ func NewClient(port int, password string, opts Options) *Client {
 		heartbeatTimeout:  opts.HeartbeatTimeout,
 		onReady:           opts.OnReady,
 		onMalformed:       opts.OnMalformed,
+		onDisconnect:      opts.OnDisconnect,
 	}
 }
 
@@ -572,6 +581,11 @@ func (c *Client) SubscribeEvents(ctx context.Context, dir string, onEvent func(E
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
+		}
+		// 断流回调（P1.8.4）：仅已建立连接终止（established 且非 ctx 取消）时、进入
+		// 重连退避前同步调用一次；从未建立的连接不触发。
+		if established && c.onDisconnect != nil {
+			c.onDisconnect()
 		}
 		// 永久错误：不重试，快速失败上报。
 		if isPermanentSSEError(err) {

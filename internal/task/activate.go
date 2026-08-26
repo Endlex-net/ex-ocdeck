@@ -981,14 +981,32 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 	rt.mu.Unlock()
 
 	readyCh := make(chan struct{}, 1)
+	// 连接代跟踪（P1.8 复评阻塞 3）：每次连接建立（OnReady 首连/onReconnect 重连）
+	// 记录当前连接代，断流回调捕获该值传入 apply——client 回调均在 SSE goroutine 内
+	// 串行（断流先于下一连接建立），捕获值即刚断连接的代；旧连接的延迟回调经 apply
+	// 的 epoch 匹配被拒，不得误伤新连接代。
+	var connEpochMu sync.Mutex
+	var connEpoch uint64
 	ocWithReady := m.ocFactory(port, password, opencode.Options{
 		HealthTimeout:    2 * time.Second,
 		HeartbeatTimeout: 60 * time.Second,
 		OnReady: func() {
+			// P1.8：连接建立 → 新连接代 + aligning（epoch 单调，独立于激活代，design D4）。
+			connEpochMu.Lock()
+			connEpoch = rt.ensureAgentStatusState().apply(agentStatusOp{kind: agentOpConnect}).Epoch
+			connEpochMu.Unlock()
 			select {
 			case readyCh <- struct{}{}:
 			default:
 			}
+		},
+		// P1.8.4：已建立连接终止（非主动取消）→ 重连退避前同步回调一次。task 层校验
+		// runtime 激活代身份后经唯一 apply 使回调捕获的连接代失效（design D4 断流感知）。
+		OnDisconnect: func() {
+			connEpochMu.Lock()
+			epoch := connEpoch
+			connEpochMu.Unlock()
+			m.handleAgentStatusDisconnect(taskID, rt, epoch)
 		},
 	})
 
@@ -1064,6 +1082,10 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 			buffering = true
 			buffered = nil
 			bufMu.Unlock()
+			// P1.8：重连建立 → 新连接代 + aligning（对齐串行域内，断流的旧 epoch 已失效）。
+			connEpochMu.Lock()
+			connEpoch = rt.ensureAgentStatusState().apply(agentStatusOp{kind: agentOpConnect}).Epoch
+			connEpochMu.Unlock()
 			if err := m.alignSessions(sseCtx, taskID, wtPath, ocWithReady, mode); err != nil {
 				// 重连对齐失败 MUST 收敛任务状态（design.md §4）：不得只取消 SSE 留 active 假象。
 				// serve 可能仍存活但无法追踪会话，视同运行时不可确定 → cleanup runtime + suspended + last_error。
@@ -1075,6 +1097,9 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 			}
 			// D6 注意力对账（align 路径）：session align 成功后、drainAndRelease 前。失败不影响任务状态机。
 			m.reconcileTaskAttention(sseCtx, rt, ocWithReady, wtPath)
+			// P1.8.3：agentStatus 对账（align 成功后、drainAndRelease 前；失败仅保持不可用，
+			// 不影响任务生命周期）。
+			m.reconcileAgentStatus(sseCtx, rt, taskID, wtPath, ocWithReady)
 			// B4b：先排空全部缓冲事件再置 buffering=false 放行实时事件（design.md §4）。
 			drainAndRelease()
 		}
@@ -1106,6 +1131,8 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 		}
 		// D6 注意力对账（align 路径）：首次 align 成功后、drainAndRelease 前。
 		m.reconcileTaskAttention(sseCtx, rt, ocWithReady, wtPath)
+		// P1.8.3：agentStatus 对账（首次 align 成功后、drainAndRelease 前）。
+		m.reconcileAgentStatus(sseCtx, rt, taskID, wtPath, ocWithReady)
 		// B4b：先排空全部缓冲事件再置 buffering=false 放行实时事件（design.md §4）。
 		drainAndRelease()
 		alignMu.Unlock()
@@ -1186,7 +1213,10 @@ func (m *Manager) handleSSEEvent(ctx context.Context, taskID, wtPath string, ev 
 			if !cres.Claimed {
 				log.Printf("task %s: sse session.created for session %s conflict (owned by task %s); skipping",
 					taskID, sid, cres.OwnerTaskID)
+				return nil
 			}
+			// P1.8.2：owned 成员变更经唯一 apply 维护（默认 idle、重聚合、可用性）。
+			m.noteAgentSessionClaimed(taskID, sid)
 			return nil
 		}
 		cres, cerr := m.store.ClaimTaskSession(ctx, taskID, sid, createdAt, nowUnixI(), lastSeen, ev.ParentID())
@@ -1196,7 +1226,9 @@ func (m *Manager) handleSSEEvent(ctx context.Context, taskID, wtPath string, ev 
 		if !cres.Claimed {
 			log.Printf("task %s: sse session.created for session %s conflict (owned by task %s); skipping",
 				taskID, sid, cres.OwnerTaskID)
+			return nil
 		}
+		m.noteAgentSessionClaimed(taskID, sid)
 	case "session.deleted":
 		sid := ev.SessionID()
 		if sid == "" {
@@ -1213,11 +1245,14 @@ func (m *Manager) handleSSEEvent(ctx context.Context, taskID, wtPath string, ev 
 			if _, err := m.lifecycle.DeleteOwnedSession(ctx, taskID, ocdecksess.ID(sid)); err != nil {
 				return fmt.Errorf("delete session %s: %w", sid, err)
 			}
+			// P1.8.2：owned 成员移除经同一 apply 维护（重聚合、可用性 1→0）。
+			m.noteAgentSessionDeleted(taskID, sid)
 			return nil
 		}
 		if _, err := m.store.DeleteTaskSession(ctx, taskID, sid); err != nil {
 			return fmt.Errorf("delete session %s: %w", sid, err)
 		}
+		m.noteAgentSessionDeleted(taskID, sid)
 	default:
 		// D6 注意力事件：permission/question v1+v2 家族。ParseAttentionEvent 命中则应用，
 		// 未知/缺字段静默忽略。注意力事件处理永不返回错误（不影响任务状态机）。
@@ -1256,6 +1291,10 @@ func (m *Manager) handleSSEEvent(ctx context.Context, taskID, wtPath string, ev 
 				return nil
 			}
 		}
+		// P1.8.2（模式 A）：session.status 事件经上方归属反查（fail-closed）后更新
+		// agentStatus 内存态；解析失败/未知枚举静默忽略。模式 B 不解析不 apply
+		//（design D4 模式执行矩阵；模式分支经参数化暴露给测试，无运行时切换）。
+		m.applySessionStatusEvent(taskID, ev, agentStatusModeA)
 	}
 	return nil
 }
@@ -1399,6 +1438,8 @@ func (m *Manager) resolveAnchorSession(ctx context.Context, oc OCClient, row Tas
 		if !cres.Claimed {
 			return "", fmt.Errorf("anchor session %s conflict (owned by task %s); MUST NOT attach", created.ID, cres.OwnerTaskID)
 		}
+		// P1.8.2：锚定 claim 同为 owned 成员生产点（对账成功时 owned 可能为空，靠本钩子 0→1）。
+		m.noteAgentSessionClaimed(row.ID, created.ID)
 		return created.ID, nil
 	}
 	cres, perr := m.store.ClaimTaskSession(ctx, row.ID, created.ID,
@@ -1410,6 +1451,7 @@ func (m *Manager) resolveAnchorSession(ctx context.Context, oc OCClient, row Tas
 	if !cres.Claimed {
 		return "", fmt.Errorf("anchor session %s conflict (owned by task %s); MUST NOT attach", created.ID, cres.OwnerTaskID)
 	}
+	m.noteAgentSessionClaimed(row.ID, created.ID)
 	return created.ID, nil
 }
 
@@ -1523,17 +1565,21 @@ func (m *Manager) convergeToSuspendedChecked(taskID, reason string, tok runtime.
 	}
 	// 清理前捕获 attention 外部可见快照存在性（design.md D2「清理前捕获外部可见状态」；
 	// cleanup 会经 clearRuntime→clearAttention 清空快照，事后不可读），供 CAS 矩阵
-	// ②/③a/③c 的 attention 失效发布判定。发布决策在发布点原子 claim
-	//（ClaimAttentionInvalidation）：本捕获与矩阵发布之间的长清理窗口内，无需任务锁的
-	// 超时回调可能已认领发布同一事实（TOCTOU），claim 失败即被抑制。
+	// ②/③a/③c 的 attention 失效发布判定。run_status 失效为「捕获即 apply」
+	//（design.md:426）：单次唯一 apply 内读取投影、置失效并返回 typed delta（事件
+	// from 与事实号只来自该 delta），供矩阵发布。发布决策在发布点原子 claim
+	//（ClaimAttentionInvalidation/ClaimRunStatusInvalidation，per-aspect/per-fact marker）：
+	// 本捕获与矩阵发布之间的长清理窗口内，无需任务锁的超时回调可能已认领发布同一
+	// 事实（TOCTOU），claim 失败即被抑制。
 	attentionVisible := m.attentionVisible(rt)
+	runStatusInvalidation := rt.invalidateAgentStatus()
 	ctx := context.Background()
 	// 停 SSE + kill tui/shell 会话。notice 持久化失败聚合进 last_error（不静默，design.md §8）。
 	// cleanupActivationRuntime 内部 fail-closed 记 retryable notice（P4 复评阻塞 5）。
 	cleanupErr := m.cleanupActivationRuntime(ctx, taskID)
 	// 清除 env 快照 + active→suspended CAS + D2 嵌套决策表（converge_debt.go）。
 	// env 快照写回错误聚合进 last_error，不静默吞错（P4 复评阻塞 5）。
-	m.convergeCommitCAS(ctx, taskID, reason, tok, attentionVisible, cleanupErr)
+	m.convergeCommitCAS(ctx, taskID, reason, tok, attentionVisible, runStatusInvalidation, cleanupErr)
 }
 
 // handleInfraError 处理 tmux 持续基础设施故障（C1：infra_error 明确处理路径，不得静默）。

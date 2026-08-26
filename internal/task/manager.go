@@ -306,7 +306,9 @@ type taskRuntime struct {
 	watchDones   map[string]<-chan struct{} // sessionName -> watch goroutine 退出信号（join 用）
 	// attention 任务注意力状态（design.md D6）。懒初始化（激活对账时构造）。
 	attention *attentionState
-	mu        sync.Mutex
+	// agentStatus agent 运行态内存快照（design.md D4，P1.8）。懒初始化（激活对账时构造）。
+	agentStatus *agentStatusState
+	mu          sync.Mutex
 }
 
 // runtimeGroup 对应 design.md §2 RuntimeGroup。
@@ -558,6 +560,8 @@ func (m *Manager) clearRuntime(taskID string) {
 	m.rtMu.Unlock()
 	if rt != nil {
 		rt.clearAttention()
+		// P1.8：agentStatus 内存态一并清空（在途对账写回被 connected 守卫拒绝）。
+		rt.clearAgentStatus()
 		rt.stopAll()
 	}
 }
@@ -662,6 +666,9 @@ func (m *Manager) backgroundLoop(ctx context.Context) {
 			// P1.4.7：收敛债务 tick 分支（design.md D2 债务两阶段：锁超时登记的
 			// preCleanup/postCleanup 由 worker 持锁消化；锁忙任务跳过本轮不阻塞周期）。
 			m.processConvergeDebts(ctx)
+			// P1.8：agentStatus 对账重试（仅 reconcilePending 阶段连接代；模式 B 另含
+			// valid 周期探测，design D4）。
+			m.retryAgentStatusReconcile(ctx, agentStatusModeA)
 		}
 	}
 }

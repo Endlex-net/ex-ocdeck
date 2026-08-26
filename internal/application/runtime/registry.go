@@ -44,6 +44,14 @@ import (
 // 也无需防——旧进程回调随进程死亡，比对只发生在单进程生命周期内。
 type InstVersion string
 
+// runStatusFact 标识一次 run_status 失效事实：令牌 + 该次失效 apply 分配的写代号
+//（task 侧 agentStatusState.writeGen，单调递增）。同一令牌上「失效→恢复→再失效」
+// 是不同事实（写代号更高），各自恰好发布一次；claim 按 (token, factID) 判定同一事实。
+type runStatusFact struct {
+	Token  InstVersion
+	FactID uint64
+}
+
 // Registry 是 ServeRuntime 实体的 instVersion/tombstone 管理权威（design.md D0 step 3）。
 // 单一锁域：genMu 保护 tombstone 与收敛债务表。MUST NOT 与旧 Manager 字段双写。
 //
@@ -72,6 +80,12 @@ type Registry struct {
 	// 双发窗口。换代自然重新获准（不同令牌 = 不同事实）；无需在新令牌分配时清理
 	//（旧 marker 与新令牌比较不等即获准）。
 	invalidationPublished map[string]InstVersion
+	// runStatusInvalidated 记录 taskID 最近一次已发布 run_status 失效事实的
+	//（令牌, 事实号）对（ClaimRunStatusInvalidation 的 marker）。与 attention 的
+	// token-only marker 不同：run_status 失效在同一令牌上可先后发生多次（失效→恢复
+	//→再失效各为独立事实，事实号取自失效 apply 分配的写代号，单调递增），claim 按
+	// (token, factID) 精确去重。
+	runStatusInvalidated map[string]runStatusFact
 	// genValueFn 为令牌值生成器（测试接缝：默认 newInstVersionValue，测试注入
 	// 脚本化序列以确定性复现候选碰撞）。仅本包内可替换，生产路径恒为默认实现。
 	genValueFn func() InstVersion
@@ -84,6 +98,7 @@ func New() *Registry {
 		issued:                make(map[string]map[InstVersion]struct{}),
 		debts:                 make(map[string]DebtEntry),
 		invalidationPublished: make(map[string]InstVersion),
+		runStatusInvalidated:  make(map[string]runStatusFact),
 		genValueFn:            newInstVersionValue,
 	}
 }

@@ -76,6 +76,9 @@ func (f *fakeTaskBackend) AttachPty(sessionName string, cols, rows int) (*pty.Pt
 // AgentStatus 返回空串（2.8 默认降级，具体行为在 task 包测试覆盖）。
 func (f *fakeTaskBackend) AgentStatus(ctx context.Context, taskID string) string { return "" }
 
+// AgentStatusSnapshot 内存快照读取（sse-active-sessions D4）；fake 默认不可用。
+func (f *fakeTaskBackend) AgentStatusSnapshot(taskID string) string { return "" }
+
 // ListAllActiveTaskIDs 返回空切片（全局配置受影响任务提示的默认空响应）。
 func (f *fakeTaskBackend) ListAllActiveTaskIDs(ctx context.Context) ([]string, error) {
 	return []string{}, nil

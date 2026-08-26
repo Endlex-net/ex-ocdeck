@@ -279,6 +279,45 @@ func TestP147_ClaimAttentionInvalidation_StaleDelayedTokenNeverClaims(t *testing
 	}
 }
 
+// TestP18_ClaimRunStatusInvalidation_PerFact per-fact 认领语义（round-4）：
+//   - 首次认领（tok, g1）→ true；
+//   - 同一事实重复认领 → false（恰好发布一次）；
+//   - 恢复后的再失效（更高事实号 g2 > g1）→ true（新事实，不被旧 marker 抑制）；
+//   - 同令牌更低事实号的迟到乱序认领 → false（已被更新事实取代）；
+//   - 换代后旧令牌 → false（tombstone fencing，与 attention 同）；
+//   - 任务隔离。
+func TestP18_ClaimRunStatusInvalidation_PerFact(t *testing.T) {
+	r := New()
+	v1 := r.NewInstVersion("t1")
+
+	if !r.ClaimRunStatusInvalidation("t1", v1, 3) {
+		t.Fatal("first fact claim MUST be allowed")
+	}
+	if r.ClaimRunStatusInvalidation("t1", v1, 3) {
+		t.Fatal("same-fact republish MUST be rejected")
+	}
+	// 恢复→再失效：更高事实号新事实 → 获准。
+	if !r.ClaimRunStatusInvalidation("t1", v1, 7) {
+		t.Fatal("higher-fact claim after recovery MUST be allowed (new fact)")
+	}
+	// 乱序迟到的更低事实号：已被更高事实取代 → 拒绝。
+	if r.ClaimRunStatusInvalidation("t1", v1, 5) {
+		t.Fatal("out-of-order lower-fact claim MUST be rejected")
+	}
+	// 换代：tombstone 推进 → 旧令牌任何事实号一律拒绝；新令牌获准。
+	v2 := r.NewInstVersion("t1")
+	if r.ClaimRunStatusInvalidation("t1", v1, 9) {
+		t.Fatal("claim for an older token after generation moved on MUST be rejected")
+	}
+	if !r.ClaimRunStatusInvalidation("t1", v2, 1) {
+		t.Fatal("claim for the newer token MUST be allowed")
+	}
+	// 任务隔离。
+	vOther := r.NewInstVersion("t2")
+	if !r.ClaimRunStatusInvalidation("t2", vOther, 2) {
+		t.Fatal("first claim for another task MUST be allowed")
+	}
+}
 
 // 才置 postCleanup；同令牌已 postCleanup → ok；令牌已换 → tokenMoved 且不删除；
 // 记录缺失 → missing。

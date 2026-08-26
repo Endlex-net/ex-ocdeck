@@ -128,7 +128,7 @@ func TestP149_Matrix_W3a_VisibleAttention_InvalidatesAndRegisters(t *testing.T) 
 	tok := rt.instVersion
 	m.clearRuntime("t1")
 
-	m.convergeCommitCAS(context.Background(), "t1", convergeDebtPostCleanupReason, tok, true, nil)
+	m.convergeCommitCAS(context.Background(), "t1", convergeDebtPostCleanupReason, tok, true, agentStatusDelta{}, nil)
 
 	if n := pub.attentionCount(); n != 1 {
 		t.Fatalf("③a with visible attention MUST publish attention_changed exactly once, got %d", n)
@@ -149,7 +149,7 @@ func TestP149_Matrix_Committed_NoAttentionEvent(t *testing.T) {
 	m, pub := p147ManagerWithRecordingPublisher(t, store)
 	tok := p147SeedPostCleanupDebt(t, m)
 
-	m.convergeCommitCAS(context.Background(), "t1", convergeDebtPostCleanupReason, tok, true, nil)
+	m.convergeCommitCAS(context.Background(), "t1", convergeDebtPostCleanupReason, tok, true, agentStatusDelta{}, nil)
 
 	assertStatus(t, store, "t1", StatusSuspended)
 	if n := pub.attentionCount(); n != 0 {
@@ -174,7 +174,7 @@ func TestP149_Matrix_W2b_VisibleAttention_PublishesViaTopOfBranch2(t *testing.T)
 	m, pub := p147ManagerWithRecordingPublisher(t, errStore)
 	tok := p147SeedPostCleanupDebt(t, m)
 
-	m.convergeCommitCAS(context.Background(), "t1", convergeDebtPostCleanupReason, tok, true, nil)
+	m.convergeCommitCAS(context.Background(), "t1", convergeDebtPostCleanupReason, tok, true, agentStatusDelta{}, nil)
 
 	if n := pub.attentionCount(); n != 1 {
 		t.Fatalf("②b gets the ②-top conservative attention publish (design.md:425), want exactly once, got %d", n)
@@ -314,7 +314,7 @@ func TestP149_TOCTOU_TimeoutClaimsDuringHeldLockCleanupWindow_SinglePublish(t *t
 
 	// A：携带过期捕获值（visible=true，捕获时无标记）到达矩阵发布点 → claim 失败，
 	// 不得二次发布。
-	m.convergeCommitCAS(context.Background(), "t1", "sse stream ended", tok, true, nil)
+	m.convergeCommitCAS(context.Background(), "t1", "sse stream ended", tok, true, agentStatusDelta{}, nil)
 
 	if n := pub.attentionCount(); n != 1 {
 		t.Fatalf("TOCTOU: timeout claim during held-lock cleanup window MUST yield exactly one attention_changed, got %d", n)

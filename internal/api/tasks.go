@@ -34,6 +34,10 @@ type TaskBackend interface {
 	// AgentStatus 返回任务 agent 运行态（idle/busy/retry/空串，design.md 2.8）。
 	// 非 active 或查询失败返回空串（降级不阻塞详情返回）。
 	AgentStatus(ctx context.Context, taskID string) string
+	// AgentStatusSnapshot 读 agentStatus 内存快照（sse-active-sessions design D4）。
+	// 不可用（无 runtime/连接代无效/零 owned）返回空串（omitempty 省略）。
+	// 供 active sessions/SSE 组装消费（P2）；与 AgentStatus 实时探测语义并存、互不影响。
+	AgentStatusSnapshot(taskID string) string
 	// ListAllActiveTaskIDs 返回当前 active 任务 ID
 	//（供全局配置保存后受影响任务提示，design.md §13）。
 	ListAllActiveTaskIDs(ctx context.Context) ([]string, error)

@@ -100,12 +100,39 @@ func (r *Registry) RegisterIfCurrent(taskID string, trigger InstVersion, phase D
 //（持锁回调清理期间超时回调并发认领发布）。换代即永久关闭旧令牌的认领（tombstone
 // 单向推进）；无需在分配新令牌时清理旧 marker（fencing 已拒绝）。
 func (r *Registry) ClaimAttentionInvalidation(taskID string, tok InstVersion) bool {
+	return r.claimInvalidation(taskID, tok, r.invalidationPublished)
+}
+
+// ClaimRunStatusInvalidation 原子认领「发布该令牌 run_status 第 factID 号失效事实」
+// 的所有权（genMu 锁域内）。与 attention 的 token-only claim 不同：run_status 失效在
+// 同一令牌上可先后发生多次——恢复（状态事件/对账）使失效标记清除并推进写代号，
+// 之后的再失效携带更高 factID，是新事实 MUST 获准发布（不被旧 marker 错误抑制）。
+// 认领失败条件（任一）：tombstone 已不等于该令牌（换代 fencing）；marker 已记录同
+// 令牌下 >= factID 的事实（同一事实的重复认领，或更低写代号的迟到乱序认领——均为
+// 已发布或已被更新事实取代的旧事实）。attention 的 ClaimAttentionInvalidation 语义
+// 不变。
+func (r *Registry) ClaimRunStatusInvalidation(taskID string, tok InstVersion, factID uint64) bool {
 	r.genMu.Lock()
 	defer r.genMu.Unlock()
-	if r.lastToken[taskID] != tok || r.invalidationPublished[taskID] == tok {
+	if r.lastToken[taskID] != tok {
 		return false
 	}
-	r.invalidationPublished[taskID] = tok
+	if existing, ok := r.runStatusInvalidated[taskID]; ok && existing.Token == tok && existing.FactID >= factID {
+		return false
+	}
+	r.runStatusInvalidated[taskID] = runStatusFact{Token: tok, FactID: factID}
+	return true
+}
+
+// claimInvalidation per-aspect 发布所有权认领核心（调用方传入该 aspect 的 marker 表）：
+// tombstone 匹配当前代且 marker 未占位 → 原子占位返回 true。
+func (r *Registry) claimInvalidation(taskID string, tok InstVersion, claimed map[string]InstVersion) bool {
+	r.genMu.Lock()
+	defer r.genMu.Unlock()
+	if r.lastToken[taskID] != tok || claimed[taskID] == tok {
+		return false
+	}
+	claimed[taskID] = tok
 	return true
 }
 
