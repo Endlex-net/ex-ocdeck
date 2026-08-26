@@ -1,43 +1,54 @@
 import { clearToken, getToken, UNAUTHORIZED_EVENT } from './api';
-import type { ActiveSessionItem } from './types';
+import type { ActiveSessionItem, Project } from './types';
 
 /** 连接状态（连接状态 UI 用）：connecting = 连接/重连尝试中；open = 已收到有效帧。 */
-export type ActiveSessionsConnState = 'connecting' | 'open';
+export type StreamConnState = 'connecting' | 'open';
+/** 兼容别名（tasks/active 订阅方沿用旧名）。 */
+export type ActiveSessionsConnState = StreamConnState;
 
-export interface SubscribeActiveSessionsOptions {
-  /** snapshot 与 update 同构（design D5）：data 均为 ActiveSessionItem 裸数组，整表替换。 */
-  onData(sessions: ActiveSessionItem[]): void;
+/** 帧 data 校验（JSON 解析后调用）：合法返回条目数组，协议错误返回 null。 */
+export type StreamDataValidator<T> = (data: unknown) => T[] | null;
+
+export interface SubscribeStreamOptions<T> {
+  onData(items: T[]): void;
   /** 连接/协议错误。本层不回调 onData 即保留旧数据；401 不走此通道。 */
   onError(message: string): void;
   /** 可选：连接状态变化（connecting ↔ open）。 */
-  onStateChange?(state: ActiveSessionsConnState): void;
+  onStateChange?(state: StreamConnState): void;
+  /** 帧 data 校验：合法返回条目数组，协议错误返回 null。缺省仅要求 JSON 数组。 */
+  validate?: StreamDataValidator<T>;
+  /** 连接中断/帧格式错误文案的场景名词（如「活跃会话」「项目」）。 */
+  errorLabel: string;
 }
 
-const STREAM_PATH = '/api/v1/sessions/active/stream';
+/** 缺省校验：data 为 JSON 数组即接受（snapshot/update 均为裸数组）。 */
+const asArray = <T>(data: unknown): T[] | null => (Array.isArray(data) ? (data as T[]) : null);
+
 /** 指数退避（design D5）：1s 起步 ×2，上限 30s；首个有效帧到达后重置为初始值。 */
 const BACKOFF_INITIAL_MS = 1000;
 const BACKOFF_MAX_MS = 30000;
 
 /**
- * 订阅 sessions/active SSE 流（design D5）。
- * fetch + Bearer（复用 api.ts 的 getToken/401 通道）+ ReadableStream 手动分帧。
- * 断线/非 401 错误后指数退避重连；协议错误（非法 JSON/非数组 data）保留旧数据、
- * 终止当前连接并退避重连且不重置退避。
+ * 通用 SSE 流订阅（fetch + Bearer + ReadableStream 手动分帧 + 指数退避重连；
+ * projects-stream design D6 参数化：订阅路径 + 帧数据校验，多场景共用同一实现）。
+ * 协议错误（非法 JSON / 校验失败）保留旧数据、终止当前连接并退避重连且不重置退避。
  * close() 为永久终态：置 closed 标志、中断当前 fetch、取消在途退避计时器；
  * 此后所有恢复点（各 await 之后、退避 timer 回调、loop 入口、setState/onData/
  * onError 同步回调 close() 后的继续执行）都不再发起 fetch、创建新 timer、
  * 安排重连或重复派发回调。
  */
-export function subscribeActiveSessions(
-  opts: SubscribeActiveSessionsOptions,
+export function subscribeStream<T>(
+  path: string,
+  opts: SubscribeStreamOptions<T>,
 ): { close(): void } {
+  const validate = opts.validate ?? asArray<T>;
   let closed = false;
   let backoffMs = BACKOFF_INITIAL_MS;
   let abortCtrl: AbortController | null = null;
   let backoffTimer: ReturnType<typeof setTimeout> | null = null;
-  let connState: ActiveSessionsConnState | null = null;
+  let connState: StreamConnState | null = null;
 
-  const setState = (s: ActiveSessionsConnState) => {
+  const setState = (s: StreamConnState) => {
     if (s === connState) return;
     connState = s;
     opts.onStateChange?.(s);
@@ -94,10 +105,11 @@ export function subscribeActiveSessions(
       } catch {
         return false;
       }
-      if (!Array.isArray(data)) return false;
+      const items = validate(data);
+      if (items === null) return false;
       backoffMs = BACKOFF_INITIAL_MS; // 首个有效帧到达 → 重置退避
       setState('open');
-      opts.onData(data as ActiveSessionItem[]);
+      opts.onData(items);
       return true;
     };
 
@@ -137,12 +149,12 @@ export function subscribeActiveSessions(
       }
     } catch {
       if (ctrl.signal.aborted) return 'aborted';
-      opts.onError('活跃会话连接中断');
+      opts.onError(`${opts.errorLabel}连接中断`);
       return 'read-error';
     }
     if (invalidFrame) {
       // 协议错误：保留旧数据（不回调 onData）、终止当前连接、退避重连且不重置退避
-      opts.onError('活跃会话推送数据格式错误');
+      opts.onError(`${opts.errorLabel}推送数据格式错误`);
       ctrl.abort();
       return 'invalid';
     }
@@ -157,7 +169,7 @@ export function subscribeActiveSessions(
     const ctrl = new AbortController();
     abortCtrl = ctrl;
     try {
-      const res = await fetch(STREAM_PATH, {
+      const res = await fetch(path, {
         headers: { Authorization: `Bearer ${getToken()}` },
         signal: ctrl.signal,
       });
@@ -198,4 +210,38 @@ export function subscribeActiveSessions(
       abortCtrl?.abort();
     },
   };
+}
+
+export interface SubscribeActiveSessionsOptions {
+  /** snapshot 与 update 同构（design D5）：data 均为 ActiveSessionItem 裸数组，整表替换。 */
+  onData(sessions: ActiveSessionItem[]): void;
+  /** 连接/协议错误。本层不回调 onData 即保留旧数据；401 不走此通道。 */
+  onError(message: string): void;
+  /** 可选：连接状态变化（connecting ↔ open）。 */
+  onStateChange?(state: ActiveSessionsConnState): void;
+}
+
+/** 订阅 tasks/active SSE 流（design D5；projects-stream 改名，旧 sessions/active 路径不留）。 */
+export function subscribeActiveSessions(
+  opts: SubscribeActiveSessionsOptions,
+): { close(): void } {
+  return subscribeStream<ActiveSessionItem>('/api/v1/tasks/active/stream', {
+    ...opts,
+    errorLabel: '活跃会话',
+  });
+}
+
+export interface SubscribeProjectsOptions {
+  /** snapshot 与 update 同构（projects-stream design D6）：data 均为 Project 裸数组，整表替换。 */
+  onData(projects: Project[]): void;
+  onError(message: string): void;
+  onStateChange?(state: StreamConnState): void;
+}
+
+/** 订阅 projects SSE 流（projects-stream design D6）：侧栏/指挥中心/项目管理页共享 store 数据源。 */
+export function subscribeProjects(opts: SubscribeProjectsOptions): { close(): void } {
+  return subscribeStream<Project>('/api/v1/projects/stream', {
+    ...opts,
+    errorLabel: '项目',
+  });
 }

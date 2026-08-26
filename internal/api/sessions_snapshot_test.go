@@ -108,7 +108,7 @@ func TestBuildActiveSessionsSnapshot_HandlerShapeUnchanged(t *testing.T) {
 	ts := httptest.NewServer(s.mux)
 	defer ts.Close()
 
-	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/sessions/active", ""))
+	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/tasks/active", ""))
 	if err != nil {
 		t.Fatal(err)
 	}

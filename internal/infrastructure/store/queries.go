@@ -383,7 +383,7 @@ func (q *Queries) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 }
 
 // ActiveTaskOverviewRow 跨项目 active 任务概览投影行（cross-project-active-sessions D2）。
-// 仅供 GET /api/v1/sessions/active 读模型：不含 status/init 等详情字段，不携带 agentStatus。
+// 仅供 GET /api/v1/tasks/active 读模型：不含 status/init 等详情字段，不携带 agentStatus。
 // last_active_at 为 MAX(task_sessions.last_seen_at)，无 session 时回退 t.updated_at。
 type ActiveTaskOverviewRow struct {
 	ID           string

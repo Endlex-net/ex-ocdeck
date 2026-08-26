@@ -364,7 +364,7 @@ func newStreamTestServer(t *testing.T, tb TaskBackend, sub *fakeStreamSubscriber
 // openActiveSessionsStream 发起已认证的 SSE 请求并返回响应。
 func openActiveSessionsStream(t *testing.T, url string) *http.Response {
 	t.Helper()
-	resp, err := http.DefaultClient.Do(authedReq("GET", url+"/api/v1/sessions/active/stream", ""))
+	resp, err := http.DefaultClient.Do(authedReq("GET", url+"/api/v1/tasks/active/stream", ""))
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
 	}
@@ -374,7 +374,7 @@ func openActiveSessionsStream(t *testing.T, url string) *http.Response {
 // --- 建连状态机 ---
 
 // TestActiveSessionsStream_FirstFrameBareArraySnapshot 首帧为裸数组 snapshot，
-// 无需等心跳立即可读；SSE headers 正确；帧 data 与 REST /sessions/active 响应
+// 无需等心跳立即可读；SSE headers 正确；帧 data 与 REST /tasks/active 响应
 // 完全同构（attention.permissions/questions 子结构、agentStatus omitempty）。
 func TestActiveSessionsStream_FirstFrameBareArraySnapshot(t *testing.T) {
 	rows := []application.ActiveTaskOverviewRow{
@@ -433,7 +433,7 @@ func TestActiveSessionsStream_FirstFrameBareArraySnapshot(t *testing.T) {
 	}
 
 	// 与 REST 响应逐字段同构。
-	restResp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/sessions/active", ""))
+	restResp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/tasks/active", ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -758,7 +758,7 @@ func TestActiveSessionsStream_Unauthorized401(t *testing.T) {
 	ts := httptest.NewServer(s.mux)
 	defer ts.Close()
 
-	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/sessions/active/stream", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/tasks/active/stream", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -779,6 +779,35 @@ func TestActiveSessionsStream_Unauthorized401(t *testing.T) {
 	}
 }
 
+// TestActiveSessionsStream_LegacyPathJSON404 projects-stream 改名后旧流路径不留别名：
+// /api/v1/sessions/active/stream 返回 JSON 404（非 SSE）。
+func TestActiveSessionsStream_LegacyPathJSON404(t *testing.T) {
+	tb := newStreamBackend()
+	sub := &fakeStreamSubscriber{}
+	s := newStreamTestServer(t, tb, sub, 50*time.Millisecond, 5*time.Second)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/sessions/active/stream", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("content-type = %q, want application/json", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"code":"not_found"`) {
+		t.Errorf("body = %q, want JSON error body with not_found code", string(body))
+	}
+	if sub.liveSubs() != 0 {
+		t.Errorf("legacy path must not subscribe, liveSubs = %d", sub.liveSubs())
+	}
+}
+
 // TestActiveSessionsStream_ClientDisconnectClosesSubscriptions 客户端断开
 // （请求 ctx 取消）：handler 退出、四路订阅归零。
 func TestActiveSessionsStream_ClientDisconnectClosesSubscriptions(t *testing.T) {
@@ -789,7 +818,7 @@ func TestActiveSessionsStream_ClientDisconnectClosesSubscriptions(t *testing.T) 
 	defer ts.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"/api/v1/sessions/active/stream", nil)
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"/api/v1/tasks/active/stream", nil)
 	req.Header.Set("Authorization", "Bearer testtoken")
 	respCh := make(chan *http.Response, 1)
 	go func() {
@@ -940,7 +969,7 @@ func TestActiveSessionsStream_WriteFailureUnsubscribesAndExits(t *testing.T) {
 
 			fw := &flakyFlushWriter{header: http.Header{}, failAfter: c.failAfter}
 			rec := &statusRecorder{ResponseWriter: fw, status: http.StatusOK}
-			req := httptest.NewRequest("GET", "/api/v1/sessions/active/stream", nil)
+			req := httptest.NewRequest("GET", "/api/v1/tasks/active/stream", nil)
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
@@ -984,7 +1013,7 @@ func TestActiveSessionsStream_WriteErrorUnsubscribesAndExits(t *testing.T) {
 	s := newStreamTestServer(t, tb, sub, 20*time.Millisecond, time.Hour)
 
 	rec := &statusRecorder{ResponseWriter: &failWriteWriter{header: http.Header{}}, status: http.StatusOK}
-	req := httptest.NewRequest("GET", "/api/v1/sessions/active/stream", nil)
+	req := httptest.NewRequest("GET", "/api/v1/tasks/active/stream", nil)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

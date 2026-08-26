@@ -34,20 +34,23 @@ type TaskBackend interface {
 	AgentStatus(ctx context.Context, taskID string) string
 	// AgentStatusSnapshot 读 agentStatus 内存快照（sse-active-sessions design D4）。
 	// 不可用（无 runtime/连接代无效/零 owned）返回空串（omitempty 省略）。
-	// 供 active sessions/SSE 组装消费（P2）；与 AgentStatus 实时探测语义并存、互不影响。
+	// 供 active sessions/SSE 与 /projects 任务摘要组装消费（projects-stream）；
+	// 与 AgentStatus 实时探测语义并存、互不影响。
 	AgentStatusSnapshot(taskID string) string
 	// ListAllActiveTaskIDs 返回当前 active 任务 ID
 	//（供全局配置保存后受影响任务提示，design.md §13）。
 	ListAllActiveTaskIDs(ctx context.Context) ([]string, error)
 	// ListActiveTaskOverview 聚合全部 active 任务的跨项目概览
-	//（cross-project-active-sessions：GET /api/v1/sessions/active 读模型来源）。
-	// 返回不含 agentStatus 的投影行；agentStatus 由 handler 并发 hydration 填充。
+	//（cross-project-active-sessions：GET /api/v1/tasks/active 读模型来源）。
+	// 返回不含 agentStatus 的投影行；agentStatus 由 API 层组装读内存快照
+	//（AgentStatusSnapshot，sse-active-sessions P2.2）填充到 DTO。
 	ListActiveTaskOverview(ctx context.Context) ([]application.ActiveTaskOverviewRow, error)
 	// Attention 返回任务注意力信号快照（design.md D6）。非 active/无 runtime 返回空快照。
 	// 纯读聚合，不影响任务状态机。API 层据此透出 attention 字段（空数组非 null）。
 	Attention(taskID string) (application.Attention, bool)
 	// ListProjectTaskSummaries 聚合全部任务摘要（design.md D4 GET /projects tasks 摘要）。
-	// 纯读聚合；store 失败返回错误（API 层 500 不水合）。agentStatus hydration 在 API 层。
+	// 纯读聚合；store 失败返回错误（API 层 500）。active 摘要的 agentStatus 由 API 层
+	// 组装读内存快照（AgentStatusSnapshot）填充。
 	ListProjectTaskSummaries(ctx context.Context) ([]application.ProjectTaskSummary, error)
 
 	// Git 状态/diff/commit/push 经 TaskManager GitOps（design.md §9/§21）。
@@ -118,11 +121,15 @@ func (s *Server) registerTaskRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/tasks/{id}/terminals", s.handleListTerminals)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/terminals", s.handleCreateTerminal)
 	mux.HandleFunc("DELETE /api/v1/terminals/{tid}", s.handleCloseTerminal)
+	// projects-stream task 命名：canonical /tasks/active；旧 /sessions/active 保留为兼容别名
+	//（sse-active-sessions design Non-Goals：兼容与调试用途），同一 handler、同一响应。
+	mux.HandleFunc("GET /api/v1/tasks/active", s.handleListActiveSessions)
 	mux.HandleFunc("GET /api/v1/sessions/active", s.handleListActiveSessions)
-	// SSE 流端点（sse-active-sessions P2.3，design D3）：与 /sessions/active 同享
+	// SSE 流端点（sse-active-sessions P2.3，design D3）：与 /tasks/active 同享
 	// Bearer 子 mux；需事件订阅端口注入（SetEventSubscriber 须先于 RebuildRoutes）。
+	// projects-stream 改名 /tasks/active/stream（sse-active-sessions 引入未发布，不留旧路径别名）。
 	if s.eventSubscriber != nil {
-		mux.HandleFunc("GET /api/v1/sessions/active/stream", s.handleActiveSessionsStream)
+		mux.HandleFunc("GET /api/v1/tasks/active/stream", s.handleActiveSessionsStream)
 	}
 	// WS 端点由 registerWSRoutes 单独挂载（不走 api 子 mux，design.md §21）。
 }
@@ -475,8 +482,9 @@ func toAttentionDTO(att application.Attention) attentionDTO {
 }
 
 // activeSessionDTO 跨项目 active 任务概览 DTO（cross-project-active-sessions D3/D4）。
-// 读模型（application.ActiveTaskOverviewRow）不含 agentStatus；handler hydration worker 并发填充。
-// AgentStatus 失败/超时为空串，经 omitempty 省略（idle/busy/retry 三态）。
+// 读模型（application.ActiveTaskOverviewRow）不含 agentStatus；组装
+//（buildActiveSessionsSnapshot，P2.2 起与 SSE 共享）读内存快照填充。
+// AgentStatus 快照不可用为空串，经 omitempty 省略（idle/busy/retry 三态）。
 // Attention 纯读快照（design.md D6），空数组非 null。
 type activeSessionDTO struct {
 	TaskID       string       `json:"task_id"`
@@ -524,7 +532,8 @@ func toSessionDTOs(rows []application.SessionRow) []sessionRowDTO {
 	return out
 }
 
-// handleListActiveSessions GET /api/v1/sessions/active（cross-project-active-sessions D3/D4）。
+// handleListActiveSessions GET /api/v1/tasks/active（cross-project-active-sessions D3/D4；
+// projects-stream 起 canonical，旧 /sessions/active 为兼容别名）。
 // 纯读聚合：经 buildActiveSessionsSnapshot 组装（overview + attention + agentStatus 内存
 // 快照，P2.2 与 SSE 共享；原实时水合 worker 已移除）。store 失败 → 500，不进入组装；
 // 空结果 → JSON `[]`（非 null）；agentStatus 快照不可用时空串经 omitempty 省略。

@@ -2,13 +2,13 @@
  * 指挥中心「需要关注」推导 selector（design.md D7 + spec.md command-center）。
  *
  * 全部为纯函数：无 React、无 IO，可单测驱动。输入为两个快照（projects 摘要树 +
- * sessions/active 列表），输出为三分区任务视图与「需要关注」注意力项。
+ * tasks/active 列表），输出为三分区任务视图与「需要关注」注意力项。
  *
  * 双快照 join 规则（字段级来源，spec.md「双快照 join 规则」）：
  * - projects 快照为准：status/init_status/branch/worktree_path/last_error/notice/updated_at
  *   及身份字段（name/project_id/project_name）。
- * - sessions/active 快照为准：last_active_at/agentStatus/attention。
- * - projects 摘要的 agentStatus 仅在该任务缺席 sessions/active 时使用（projects-only 活跃任务）。
+ * - tasks/active 快照为准：last_active_at/agentStatus/attention。
+ * - projects 摘要的 agentStatus 仅在该任务缺席 tasks/active 时使用（projects-only 活跃任务）。
  * - 不存在两端同字段优先级冲突；MUST NOT 在请求内做合并修复（下一轮轮询自然收敛）。
  */
 
@@ -45,13 +45,13 @@ export interface MergedTask {
   project_name: string;
   /** 项目类型（来自 projects 快照；sessions-only 任务缺省 repo）。 */
   project_kind: 'repo' | 'dir';
-  /** 活跃时间：sessions/active 提供 last_active_at，缺席时回退 updated_at。 */
+  /** 活跃时间：tasks/active 提供 last_active_at，缺席时回退 updated_at。 */
   last_active_at: number;
-  /** agent 状态：sessions/active 为准，projects-only 活跃任务回退 summary.agentStatus。 */
+  /** agent 状态：tasks/active 为准，projects-only 活跃任务回退 summary.agentStatus。 */
   agentStatus?: string;
-  /** 注意力：sessions/active 为准；projects-only 活跃任务为空。 */
+  /** 注意力：tasks/active 为准；projects-only 活跃任务为空。 */
   attention: Attention;
-  /** 是否仅存在于 projects 快照（无对应 sessions/active 行）。 */
+  /** 是否仅存在于 projects 快照（无对应 tasks/active 行）。 */
   projectsOnly: boolean;
 }
 
@@ -87,7 +87,7 @@ const ACTIVE_STATUSES = new Set(['active', 'creation_failed', 'deletion_failed']
 const TRANSITIONAL_BUT_ACTIVE = new Set(['creating', 'activating', 'suspending', 'deleting']);
 const PARKED_STATUSES = new Set(['suspended', 'archived']);
 
-/** 构造 sessions/active 索引：task_id → ActiveSessionItem。 */
+/** 构造 tasks/active 索引：task_id → ActiveSessionItem。 */
 export function indexSessions(sessions: ActiveSessionItem[]): Map<string, ActiveSessionItem> {
   const m = new Map<string, ActiveSessionItem>();
   for (const s of sessions) m.set(s.task_id, s);
@@ -109,9 +109,9 @@ export function flattenProjects(
 
 /** 双快照 join：按字段级来源合并单个任务（spec.md join 规则）。
  *  身份字段（project_id/project_name）+ 状态字段以 projects 快照为准；
- *  last_active_at/agentStatus/attention 以 sessions/active 快照为准。
+ *  last_active_at/agentStatus/attention 以 tasks/active 快照为准。
  *  仅存在于 projects 快照：按 projects 状态归入分区，活跃任务可推导 1/2/5/6 类。
- *  仅存在于 sessions/active 快照：归「其余活跃任务」，可推导 3/4/6 类。 */
+ *  仅存在于 tasks/active 快照：归「其余活跃任务」，可推导 3/4/6 类。 */
 export function mergeTask(
   entry: { task: TaskSummary; project_id: string; project_name: string; project_kind?: 'repo' | 'dir' },
   session: ActiveSessionItem | undefined,
@@ -125,7 +125,7 @@ export function mergeTask(
       project_id: entry.project_id,
       project_name: entry.project_name,
       project_kind,
-      // last_active_at/agentStatus/attention 以 sessions/active 为准
+      // last_active_at/agentStatus/attention 以 tasks/active 为准
       last_active_at: session.last_active_at,
       agentStatus: session.agentStatus,
       attention: session.attention ?? EMPTY_ATTENTION,
@@ -145,7 +145,7 @@ export function mergeTask(
   };
 }
 
-/** 构造仅存在于 sessions/active 的任务视图（无 projects 摘要）。
+/** 构造仅存在于 tasks/active 的任务视图（无 projects 摘要）。
  *  project_kind 缺省 repo（无 projects 快照信息；dir 降级文案以 projects 快照为准，sessions-only 不涉及）。 */
 export function sessionOnlyTask(s: ActiveSessionItem): MergedTask {
   return {
@@ -264,7 +264,7 @@ export function selectActive(merged: MergedTask[], excludeIds?: Set<string>): Me
 /** 「挂起与归档」分区：suspended + archived。
  *  排序（用户决策：挂起优先）：suspended 全部排在 archived 之前；
  *  各组内 updated_at 倒序，时间相同 ID 升序 tie-break（稳定）。
- *  注意：挂起与归档使用 projects 快照的 updated_at（sessions/active 不覆盖非活跃任务）。 */
+ *  注意：挂起与归档使用 projects 快照的 updated_at（tasks/active 不覆盖非活跃任务）。 */
 export function selectParked(merged: MergedTask[]): MergedTask[] {
   const out = merged.filter((m) => PARKED_STATUSES.has(m.task.status));
   out.sort((a, b) => {
@@ -294,7 +294,7 @@ export function buildCommandCenterView(
   // 合并 projects 快照任务
   const mergedFromProjects = flat.map((e) => mergeTask(e, sessionIdx.get(e.task.id)));
 
-  // 补充仅存在于 sessions/active 的任务（无对应 projects 摘要）
+  // 补充仅存在于 tasks/active 的任务（无对应 projects 摘要）
   const seenIds = new Set(flat.map((e) => e.task.id));
   const sessionOnly = sessions.filter((s) => !seenIds.has(s.task_id)).map(sessionOnlyTask);
 

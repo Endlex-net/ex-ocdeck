@@ -9,7 +9,7 @@ vi.mock('../api', () => ({
 }));
 
 import { clearToken, getToken, UNAUTHORIZED_EVENT } from '../api';
-import { subscribeActiveSessions } from '../sse';
+import { subscribeActiveSessions, subscribeProjects } from '../sse';
 import type { ActiveSessionItem } from '../types';
 
 const clearTokenMock = vi.mocked(clearToken);
@@ -151,7 +151,7 @@ describe('sessions/active SSE 订阅（sse.ts，design D5）', () => {
       const sub = subscribe();
       await settle();
       expect(fetchMock).toHaveBeenCalledWith(
-        '/api/v1/sessions/active/stream',
+        '/api/v1/tasks/active/stream',
         expect.objectContaining({
           headers: { Authorization: 'Bearer fake-token' },
         }),
@@ -340,6 +340,30 @@ describe('sessions/active SSE 订阅（sse.ts，design D5）', () => {
       expect(signal.aborted).toBe(true);
       await vi.advanceTimersByTimeAsync(5000);
       expect(fetchMock).toHaveBeenCalledTimes(1); // 卸载后不再发起新连接
+    });
+  });
+
+  describe('projects preset（subscribeStream 参数化，projects-stream D6）', () => {
+    it('请求 /api/v1/projects/stream 并携带 Bearer 头（与 tasks/active 同一核心）', async () => {
+      fetchMock.mockReset().mockResolvedValueOnce(sseResponse([frame('snapshot', '[]')]));
+      const sub = subscribeProjects({ onData, onError });
+      await settle();
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/v1/projects/stream',
+        expect.objectContaining({
+          headers: { Authorization: 'Bearer fake-token' },
+        }),
+      );
+      sub.close();
+    });
+
+    it('非数组 data → onError（errorLabel=项目 前缀文案）且不回调 onData', async () => {
+      fetchMock.mockReset().mockResolvedValueOnce(sseResponse([frame('snapshot', '{"x":1}')]));
+      const sub = subscribeProjects({ onData, onError });
+      await settle();
+      expect(onError).toHaveBeenCalledWith('项目推送数据格式错误');
+      expect(onData).not.toHaveBeenCalled();
+      sub.close();
     });
   });
 

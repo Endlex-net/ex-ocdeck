@@ -15,7 +15,7 @@ import (
 )
 
 // activeSessionsBackend 可注入 ListActiveTaskOverview 返回值与 agentStatus 内存
-// 快照行为，供 GET /api/v1/sessions/active handler 测试（cross-project-active-sessions
+// 快照行为，供 GET /api/v1/tasks/active handler 测试（cross-project-active-sessions
 // D3/D4；P2.2 起改读 AgentStatusSnapshot，实时探测 AgentStatus 不再被调用）。
 type activeSessionsBackend struct {
 	*fakeTaskBackend
@@ -116,7 +116,7 @@ func TestListActiveSessions_HappyPath(t *testing.T) {
 	ts := httptest.NewServer(s.mux)
 	defer ts.Close()
 
-	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/sessions/active", ""))
+	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/tasks/active", ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestListActiveSessions_PartialDegradationKeepsSuccessfulAgentStatus(t *test
 	ts := httptest.NewServer(s.mux)
 	defer ts.Close()
 
-	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/sessions/active", ""))
+	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/tasks/active", ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestListActiveSessions_EmptyReturnsArrayNotNull(t *testing.T) {
 	ts := httptest.NewServer(s.mux)
 	defer ts.Close()
 
-	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/sessions/active", ""))
+	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/tasks/active", ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestListActiveSessions_StoreFailureReturns500NoHydration(t *testing.T) {
 	ts := httptest.NewServer(s.mux)
 	defer ts.Close()
 
-	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/sessions/active", ""))
+	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/tasks/active", ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +254,7 @@ func TestListActiveSessions_UnauthorizedWithoutToken(t *testing.T) {
 	ts := httptest.NewServer(s.mux)
 	defer ts.Close()
 
-	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/sessions/active", nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/tasks/active", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -277,7 +277,7 @@ func TestListActiveSessions_ReadModelImmutability(t *testing.T) {
 	ts := httptest.NewServer(s.mux)
 	defer ts.Close()
 
-	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/sessions/active", ""))
+	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/tasks/active", ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,6 +293,39 @@ func TestListActiveSessions_ReadModelImmutability(t *testing.T) {
 	}
 	if r.AgentStatus != "busy" {
 		t.Errorf("agentStatus = %q, want busy", r.AgentStatus)
+	}
+}
+
+// TestListActiveSessions_LegacyAliasSameResponse 验证 projects-stream 兼容别名
+// /api/v1/sessions/active 与 canonical /api/v1/tasks/active 响应完全一致。
+func TestListActiveSessions_LegacyAliasSameResponse(t *testing.T) {
+	rows := []application.ActiveTaskOverviewRow{
+		activeRow("t1", "p1", "projA", "taskA", "bA", "/wtA", 100),
+	}
+	tb := newActiveSessionsBackend(rows...)
+	tb.agentStatusSnapshot = map[string]string{"t1": "idle"}
+	s := newAPITestServer(t, tb)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	canonical := authedReq("GET", ts.URL+"/api/v1/tasks/active", "")
+	alias := authedReq("GET", ts.URL+"/api/v1/sessions/active", "")
+	for _, req := range []*http.Request{canonical, alias} {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200", req.URL.Path, resp.StatusCode)
+		}
+		if got := resp.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("%s: content-type = %q, want application/json", req.URL.Path, got)
+		}
+		body, got := readAndDecode(t, resp.Body)
+		if len(got) != 1 || got[0].TaskID != "t1" {
+			t.Errorf("%s: body = %s, want single t1 row", req.URL.Path, body)
+		}
 	}
 }
 

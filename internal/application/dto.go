@@ -80,8 +80,8 @@ type SessionRow struct {
 }
 
 // ActiveTaskOverviewRow 跨项目 active 任务概览投影行（cross-project-active-sessions D1/D2）。
-// 仅供 GET /api/v1/sessions/active 读模型：字段与 store.ActiveTaskOverviewRow 一一对应，
-// 不携带 agentStatus（由 API 层 hydration worker 并发填充到 DTO）。
+// 仅供 GET /api/v1/tasks/active 读模型：字段与 store.ActiveTaskOverviewRow 一一对应，
+// 不携带 agentStatus（由 API 层组装读内存快照填充到 DTO，sse-active-sessions P2.2）。
 type ActiveTaskOverviewRow struct {
 	ID           string
 	ProjectID    string

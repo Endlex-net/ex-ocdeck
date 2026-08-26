@@ -32,7 +32,7 @@ import {
 } from '../palette-focus';
 import './command-center.css';
 
-/** sessions/active 快照（本页 SSE 订阅，帧驱动整表替换）。 */
+/** tasks/active 快照（本页 SSE 订阅，帧驱动整表替换）。 */
 interface SessionsSnapshot {
   sessions: ActiveSessionItem[];
   loading: boolean;
@@ -160,7 +160,7 @@ export function CommandCenterPage() {
   const { projects, initialized: projectsInit, error: storeError } = useProjects();
   const refresh = useProjectsRefresh();
 
-  // 本页 sessions/active SSE 订阅（design D5）：mount 订阅 / unmount close；帧驱动整表替换
+  // 本页 tasks/active SSE 订阅（design D5）：mount 订阅 / unmount close；帧驱动整表替换
   const [snap, setSnap] = useState<SessionsSnapshot>(EMPTY);
   useEffect(() => {
     const sub = subscribeActiveSessions({
