@@ -232,8 +232,10 @@ describe('TermSession 陈旧连接回调竞态（G4-8 socket identity guard）',
     // 陈旧 onopen 到达：guard 丢弃，不重复发送 auth 帧。
     stale.onopen?.();
     expect(stale.send).not.toHaveBeenCalled();
-    // 陈旧 onmessage 到达：guard 丢弃，不写终端。
-    stale.onmessage?.({ data: 'x' } as MessageEvent);
+    // 陈旧 onmessage 到达：guard 丢弃。用二进制帧（G4-8 反例识别力：无 guard 时
+    // 二进制帧必走 this.term.write，文本帧会被非 JSON 分支吞掉、断言失效）。
+    const bin = new ArrayBuffer(1);
+    stale.onmessage?.({ data: bin } as MessageEvent);
     expect(termInstance.write).not.toHaveBeenCalled();
     // 当前代 onopen 正常发送。
     current.onopen?.();
