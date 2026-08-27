@@ -1,5 +1,5 @@
 // sessions_test.go 验证 P1.4.5 session 用例与 Align 编排的事务边界
-//（design.md D0:80/86 + canonical opencode-orchestration spec overflow 语义）。
+// （design.md D0:80/86 + canonical opencode-orchestration spec overflow 语义）。
 //
 // 覆盖：
 //   - RunAlign overflow（complete=false）：notice CAS 失败 MUST NOT 执行 Align；
@@ -18,8 +18,8 @@ import (
 
 	"ocdeck/internal/application"
 	ocdeckevent "ocdeck/internal/domain/event"
-	ocdecktask "ocdeck/internal/domain/task"
 	ocdecksess "ocdeck/internal/domain/session"
+	ocdecktask "ocdeck/internal/domain/task"
 )
 
 // fakeSessionRepo 实现 application.SessionRepository（仅本测试所需子集，其余 panic）。
@@ -167,8 +167,8 @@ type testError struct{ msg string }
 func (e *testError) Error() string { return e.msg }
 
 // TestP162_OverflowCASRealChange_PublishesActivityChangedEvenIfAlignFails 验证 P1.6.2
-// overflow 分支（LifecycleService 路径）：notice CAS 命中且真实变更（Changed &&
-// UpdatedAtAdvanced）时发布 task.activity_changed；发布先于 Align 提交，
+// overflow 分支（LifecycleService 路径）：notice CAS 命中且真实变更（Changed=true）
+// 时发布 task.activity_changed；发布先于 Align 提交，
 // 随后 Align 失败 MUST NOT 回滚已发布事件（事务外独立提交，design.md D0:86）。
 func TestP162_OverflowCASRealChange_PublishesActivityChangedEvenIfAlignFails(t *testing.T) {
 	repo := &fakeTaskRepo{mutationRes: application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: true}}
@@ -347,7 +347,7 @@ func TestP145_ClaimTouchDelete_CommitHelpers(t *testing.T) {
 }
 
 // TestP145_AlignCommitHelpers 验证 align 提交点：session 行计数>0 发布一次 sessions.aligned；
-// 全量无变化不发布；notice 真实推进（Changed+UpdatedAtAdvanced）另发 task.activity_changed。
+// 全量无变化不发布；notice 真实变更（Changed=true，含同秒）另发 task.activity_changed。
 func TestP145_AlignCommitHelpers(t *testing.T) {
 	newPub := func() (*LifecycleService, *recordingPublisher) {
 		pub := &recordingPublisher{}
@@ -381,10 +381,28 @@ func TestP145_AlignCommitHelpers(t *testing.T) {
 			t.Fatalf("events = %v, want [task.activity_changed]", pub.events)
 		}
 	})
+	t.Run("same-second notice change publishes task.activity_changed", func(t *testing.T) {
+		svc, pub := newPub()
+		svc.commitSessionsAligned("t1", application.AlignResult{
+			TaskMutation: application.MutationResult{Matched: true, Changed: true},
+		})
+		if len(pub.events) != 1 || pub.events[0] != string(ocdeckevent.TypeTaskActivityChanged) {
+			t.Fatalf("events = %v, want [task.activity_changed]", pub.events)
+		}
+	})
+	t.Run("notice unchanged does not publish", func(t *testing.T) {
+		svc, pub := newPub()
+		svc.commitSessionsAligned("t1", application.AlignResult{
+			TaskMutation: application.MutationResult{Matched: true, Changed: false},
+		})
+		if len(pub.events) != 0 {
+			t.Fatalf("unchanged notice should not publish, got %v", pub.events)
+		}
+	})
 }
 
 // TestP145_CommitAttentionChange 验证 attention 提交位：发布 serve_runtime.attention_changed
-//（NoopPublisher 阶段由 recordingPublisher 断言调用位；真实事件生产在 P1.6）。
+// （NoopPublisher 阶段由 recordingPublisher 断言调用位；真实事件生产在 P1.6）。
 func TestP145_CommitAttentionChange(t *testing.T) {
 	pub := &recordingPublisher{}
 	svc := New(Options{Tasks: &fakeTaskRepo{}, Read: &fakeReadRepo{}, Sessions: &fakeSessionRepo{}, Publish: pub})

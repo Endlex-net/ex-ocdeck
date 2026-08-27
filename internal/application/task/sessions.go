@@ -1,5 +1,5 @@
 // sessions.go 实现 Session claim/touch/delete/align 用例与 Attention apply 提交位
-//（design.md D0:141 迁移第 5 步）。
+// （design.md D0:141 迁移第 5 步）。
 //
 // 统一形态：
 //  1. 决策先于副作用：claim/touch/delete 的领域判定由 Repository 事务原子完成并返回
@@ -22,8 +22,8 @@ import (
 
 	"ocdeck/internal/application"
 	ocdeckevent "ocdeck/internal/domain/event"
-	ocdecktask "ocdeck/internal/domain/task"
 	ocdecksess "ocdeck/internal/domain/session"
+	ocdecktask "ocdeck/internal/domain/task"
 )
 
 // AlignPorts 聚合 align 用例所需的窄端口（session Align + notice CAS + 任务行读取）。
@@ -47,7 +47,7 @@ func (p svcAlignPorts) Align(ctx context.Context, taskID string, mode ocdecksess
 }
 
 // UpdateTaskNoticeCAS 经 LifecycleService.UpdateNoticeCAS 提交：overflow notice CAS
-// 真实变更（Changed && UpdatedAtAdvanced）发布 task.activity_changed（P1.6.2）。
+// 真实变更（Changed=true）发布 task.activity_changed（P1.6.2 / task-detail-stream D0）。
 // 事务外 CAS 先于 Align 提交与发布，Align 失败不回滚（design.md D0:86）。
 func (p svcAlignPorts) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice *string) (application.MutationResult, error) {
 	return p.s.UpdateNoticeCAS(ctx, id, expected, newNotice)
@@ -189,8 +189,8 @@ func recordSessionOverflowNotice(ctx context.Context, p AlignPorts, taskID strin
 //
 // complete=true：读 Task 全行 → domain ClearSessionOverflowNotice → NoticeMutation
 // {Expected=读取的当前 notice, New=清除后的编码}。notice JSON 损坏时返回同值 no-op 决策
-//（对齐 legacy noticeFn parse 失败保持当前值不动的语义）。complete=false 返回零值
-//（Align 不触碰 notice，overflow 已由事务外 CAS 写入）。
+// （对齐 legacy noticeFn parse 失败保持当前值不动的语义）。complete=false 返回零值
+// （Align 不触碰 notice，overflow 已由事务外 CAS 写入）。
 func decideAlignNotice(ctx context.Context, p AlignPorts, taskID string, complete bool) (application.NoticeMutation, error) {
 	if !complete {
 		return application.NoticeMutation{}, nil
@@ -261,8 +261,8 @@ func (s *LifecycleService) commitSessionDelete(taskID string, sessionID ocdeckse
 }
 
 // commitSessionsAligned 提交 align 结果：session 行计数（inserted+touched+deleted）总和 >0
-// 发布一次 sessions.aligned；事务内 notice 真实推进另按 updated_at 规则发布
-// task.activity_changed（design.md D2 align 行；本阶段 NoopPublisher）。
+// 发布一次 sessions.aligned；事务内 notice 真实变更（Changed=true）另发
+// task.activity_changed（task-detail-stream D0，不再要求 updated_at 跨秒）。
 func (s *LifecycleService) commitSessionsAligned(taskID string, res application.AlignResult) {
 	if res.Inserted+res.Touched+res.Deleted > 0 {
 		ids := make([]string, 0, len(res.AffectedSessionIDs))
@@ -271,7 +271,7 @@ func (s *LifecycleService) commitSessionsAligned(taskID string, res application.
 		}
 		s.publish.Publish(ocdeckevent.NewSessionsAligned(taskID, res.Inserted, res.Touched, res.Deleted, ids))
 	}
-	if res.TaskMutation.Changed && res.TaskMutation.UpdatedAtAdvanced {
+	if res.TaskMutation.Changed {
 		s.publish.Publish(ocdeckevent.NewTaskActivityChanged(taskID))
 	}
 }
