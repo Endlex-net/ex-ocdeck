@@ -44,7 +44,7 @@
 - `task.created`（topic `task`，RID=task 主键）
 - `task.status_changed`（topic `task`，RID=task 主键）
 - `task.deleted`（topic `task`，RID=task 主键）
-- `task.activity_changed`（topic `task`，RID=task 主键；仅当提交未伴随 `task.status_changed` 时发布——真实状态迁移只发 `task.status_changed`，其 `updated_at` 推进由它承载；`init_status`/`init_error` 写入即使推进 `updated_at` 也 MUST NOT 触发本事件）
+- `task.activity_changed`（topic `task`，RID=task 主键；仅当提交未伴随 `task.status_changed` 时发布——真实状态迁移只发 `task.status_changed`，其 `updated_at` 推进由它承载；发布条件为**未伴随 status 迁移的任务行非 status 真实变更提交 `Changed=true`**——**不再要求 `updated_at` 跨秒推进**，覆盖 `notice`/`last_port`/`delete_mode`/同状态 `last_error`/`env_snapshot`（不直接透出 DTO，仅作保守失效通知）/align 事务内 notice 等全部既有提交点；`init_status`/`init_error` 系列写入（`ClaimInitRun`/`ClaimInitRerun`/`FinishInitRun`）真实变更 MUST 触发本事件（task-detail-stream 解除 P1.6.1 冻结）；校验失败、存储失败、CAS 未命中、无实际变化路径 MUST NOT 发布）
 - `session.claimed` / `session.touched` / `session.deleted`（topic `session`，RID=session 主键）
 - `sessions.aligned`（topic `session`，RID=task 主键）
 - `serve_runtime.attention_changed`（topic `serve_runtime`，RID=ServeRuntime 主键 instVersion）
@@ -71,6 +71,16 @@
 
 - **WHEN** `CreateTask` 插入可见行成功
 - **THEN** 总线发布 `task.created`，已连接的指挥中心 SSE 不因此单独推送 `update`（projects 任务树流按其消费过滤另行推送）
+
+#### Scenario: init 系列写入真实变更发布 activity_changed
+
+- **WHEN** `ClaimInitRun`/`ClaimInitRerun`/`FinishInitRun` 提交且 `init_status`/`init_error` 真实变更（Changed=true）且该提交未伴随 `task.status_changed`
+- **THEN** 总线发布一次 `task.activity_changed`（RID=task 主键），不要求 `updated_at` 跨秒；校验失败、存储失败、未命中、无变化路径不发布
+
+#### Scenario: 启动期收敛不发布
+
+- **WHEN** 进程启动期 `ConvergeInterruptedInitRuns` 在 HTTP 开放前执行（零订阅者）并收敛 stale init runs
+- **THEN** 不挂接 `task.activity_changed` 发布（明确例外；订阅方以开放后首帧全量快照收敛）
 
 #### Scenario: 数组元素字段完整
 
