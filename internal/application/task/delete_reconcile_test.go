@@ -5,9 +5,9 @@
 //   - BeginDeleteIntent：StatusChanged=true 发布 task.status_changed（无 task.deleted）；
 //   - DeleteTask：Affected=0 零发布；Affected>0 先逐个发布 session.deleted（CascadedSessionIDs
 //     顺序），最后 task.deleted（P1.6.1 发布顺序契约）；
-//   - UpdateNoticeCAS：仅 Changed && UpdatedAtAdvanced 发布 task.activity_changed；
-//   - ConvergeInterruptedInitRuns/ClaimInitRun/FinishInitRun：init_status 写入零发布
-//     （P1.6.1：init_status 写入不发事件，即使 updated_at 前进）。
+//   - UpdateNoticeCAS：Changed=true 发布 task.activity_changed（不再要求跨秒）；
+//   - ClaimInitRun/ClaimInitRerun/FinishInitRun：真实变更发布一次 activity_changed；
+//     ConvergeInterruptedInitRuns 启动期例外，不发布。
 package task
 
 import (
@@ -113,7 +113,17 @@ func TestP148_DeleteTask_ErrorNoPublish(t *testing.T) {
 	}
 }
 
-func TestP148_UpdateNoticeCAS_ChangedPublishesActivityOnlyWhenAdvanced(t *testing.T) {
+func TestP148_UpdateNoticeCAS_ChangedPublishesActivity(t *testing.T) {
+	sameSecond := &fakeTaskRepo{mutationRes: application.MutationResult{Matched: true, Changed: true}}
+	pubSameSecond := &recordingPublisher{}
+	if _, err := newSvc(sameSecond, &fakeReadRepo{}, pubSameSecond).UpdateNoticeCAS(
+		context.Background(), "t1", nil, strPtr("n1")); err != nil {
+		t.Fatalf("UpdateNoticeCAS err: %v", err)
+	}
+	if len(pubSameSecond.events) != 1 || pubSameSecond.events[0] != string(ocdeckevent.TypeTaskActivityChanged) {
+		t.Fatalf("same-second events = %v, want [task.activity_changed]", pubSameSecond.events)
+	}
+
 	advanced := &fakeTaskRepo{mutationRes: application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: true}}
 	pubAdvanced := &recordingPublisher{}
 	if _, err := newSvc(advanced, &fakeReadRepo{}, pubAdvanced).UpdateNoticeCAS(
@@ -124,7 +134,6 @@ func TestP148_UpdateNoticeCAS_ChangedPublishesActivityOnlyWhenAdvanced(t *testin
 		t.Fatalf("events = %v, want [task.activity_changed]", pubAdvanced.events)
 	}
 
-	// CAS 未命中（!Changed）零发布。
 	unmatched := &fakeTaskRepo{mutationRes: application.MutationResult{Matched: false}}
 	pubUnmatched := &recordingPublisher{}
 	if _, err := newSvc(unmatched, &fakeReadRepo{}, pubUnmatched).UpdateNoticeCAS(
@@ -134,10 +143,18 @@ func TestP148_UpdateNoticeCAS_ChangedPublishesActivityOnlyWhenAdvanced(t *testin
 	if len(pubUnmatched.events) != 0 {
 		t.Fatalf("!Changed should not publish, got %v", pubUnmatched.events)
 	}
+
+	pubErr := &recordingPublisher{}
+	if _, err := newSvc(&fakeTaskRepo{mutationErr: errors.New("db error")}, &fakeReadRepo{}, pubErr).UpdateNoticeCAS(
+		context.Background(), "t1", nil, strPtr("n1")); err == nil {
+		t.Fatal("want err, got nil")
+	}
+	if len(pubErr.events) != 0 {
+		t.Fatalf("error path should not publish, got %v", pubErr.events)
+	}
 }
 
-func TestP148_InitStatusWritesNeverPublish(t *testing.T) {
-	// ConvergeInterruptedInitRuns n>0 零发布。
+func TestP148_ConvergeInterruptedInitRuns_NeverPublishes(t *testing.T) {
 	conv := &fakeTaskRepo{convergeN: 3}
 	pubConv := &recordingPublisher{}
 	if n, err := newSvc(conv, &fakeReadRepo{}, pubConv).ConvergeInterruptedInitRuns(context.Background()); err != nil || n != 3 {
@@ -146,24 +163,52 @@ func TestP148_InitStatusWritesNeverPublish(t *testing.T) {
 	if len(pubConv.events) != 0 {
 		t.Fatalf("converge should not publish, got %v", pubConv.events)
 	}
+}
 
-	// ClaimInitRun / FinishInitRun Changed=true（含 updated_at 前进）零发布（P1.6.1）。
-	changed := application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: true}
-	pubClaim := &recordingPublisher{}
-	if _, err := newSvc(&fakeTaskRepo{mutationRes: changed}, &fakeReadRepo{}, pubClaim).ClaimInitRun(
-		context.Background(), "t1"); err != nil {
-		t.Fatalf("ClaimInitRun err: %v", err)
-	}
-	if len(pubClaim.events) != 0 {
-		t.Fatalf("ClaimInitRun should not publish, got %v", pubClaim.events)
-	}
+func TestP148_InitStatusWritesPublishActivityOnChange(t *testing.T) {
+	sameSecond := application.MutationResult{Matched: true, Changed: true}
+	unchanged := application.MutationResult{Matched: true, Changed: false}
 
-	pubFinish := &recordingPublisher{}
-	if _, err := newSvc(&fakeTaskRepo{mutationRes: changed}, &fakeReadRepo{}, pubFinish).FinishInitRun(
-		context.Background(), "t1", ocdecktask.InitStatusFailed, strPtr("boom")); err != nil {
-		t.Fatalf("FinishInitRun err: %v", err)
+	calls := []struct {
+		name string
+		fn   func(*LifecycleService) error
+	}{
+		{"ClaimInitRun", func(s *LifecycleService) error {
+			_, err := s.ClaimInitRun(context.Background(), "t1")
+			return err
+		}},
+		{"ClaimInitRerun", func(s *LifecycleService) error {
+			_, err := s.ClaimInitRerun(context.Background(), "t1")
+			return err
+		}},
+		{"FinishInitRun", func(s *LifecycleService) error {
+			_, err := s.FinishInitRun(context.Background(), "t1", ocdecktask.InitStatusFailed, strPtr("boom"))
+			return err
+		}},
 	}
-	if len(pubFinish.events) != 0 {
-		t.Fatalf("FinishInitRun should not publish, got %v", pubFinish.events)
+	for _, c := range calls {
+		pub := &recordingPublisher{}
+		if err := c.fn(newSvc(&fakeTaskRepo{mutationRes: sameSecond}, &fakeReadRepo{}, pub)); err != nil {
+			t.Fatalf("%s err: %v", c.name, err)
+		}
+		if len(pub.events) != 1 || pub.events[0] != string(ocdeckevent.TypeTaskActivityChanged) {
+			t.Fatalf("%s events = %v, want [task.activity_changed]", c.name, pub.events)
+		}
+
+		pubNoop := &recordingPublisher{}
+		if err := c.fn(newSvc(&fakeTaskRepo{mutationRes: unchanged}, &fakeReadRepo{}, pubNoop)); err != nil {
+			t.Fatalf("%s no-op err: %v", c.name, err)
+		}
+		if len(pubNoop.events) != 0 {
+			t.Fatalf("%s no-op should not publish, got %v", c.name, pubNoop.events)
+		}
+
+		pubErr := &recordingPublisher{}
+		if err := c.fn(newSvc(&fakeTaskRepo{mutationErr: errors.New("db error")}, &fakeReadRepo{}, pubErr)); err == nil {
+			t.Fatalf("%s: want err, got nil", c.name)
+		}
+		if len(pubErr.events) != 0 {
+			t.Fatalf("%s error path should not publish, got %v", c.name, pubErr.events)
+		}
 	}
 }

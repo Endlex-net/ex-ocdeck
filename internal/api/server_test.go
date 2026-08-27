@@ -2,11 +2,14 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -34,12 +37,13 @@ func TestStatusRecorder_Passthrough200(t *testing.T) {
 	}
 }
 
-// TestStatusRecorder_Swallows404Body 验证 404/405 的 header/body 不转发（由
-// jsonNotFoundHandler 统一重写）。
-func TestStatusRecorder_Swallows404Body(t *testing.T) {
+// TestStatusRecorder_Buffers404UntilFlush 验证 404/405 缓冲 header/body，未 flush
+// 前不转发到底层（由 jsonNotFoundHandler 决定转发或重写）。
+func TestStatusRecorder_Buffers404UntilFlush(t *testing.T) {
 	underlying := httptest.NewRecorder()
 	rec := &statusRecorder{ResponseWriter: underlying, status: http.StatusOK}
 
+	rec.Header().Set("Content-Type", "text/plain")
 	rec.WriteHeader(http.StatusNotFound)
 	if _, err := rec.Write([]byte("default mux text")); err != nil {
 		t.Fatalf("write: %v", err)
@@ -48,7 +52,117 @@ func TestStatusRecorder_Swallows404Body(t *testing.T) {
 		t.Errorf("recorder status = %d, want 404", rec.status)
 	}
 	if underlying.Body.Len() != 0 {
-		t.Errorf("underlying body = %q, want swallowed", underlying.Body.String())
+		t.Errorf("underlying body = %q, want buffered until flush", underlying.Body.String())
+	}
+	if rec.jsonEnvelope() {
+		t.Fatal("plain-text 404 must not be treated as JSON envelope")
+	}
+}
+
+func TestJSONNotFoundHandler_ForwardsJSONEnvelope(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, CodeNotFound, "task not found")
+	})
+	ts := httptest.NewServer(jsonNotFoundHandler(inner))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/v1/tasks/missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("content-type = %q, want application/json", ct)
+	}
+	var eb errorBody
+	if err := json.NewDecoder(resp.Body).Decode(&eb); err != nil {
+		t.Fatal(err)
+	}
+	if eb.Error.Code != CodeNotFound || eb.Error.Message != "task not found" {
+		t.Errorf("envelope = %+v, want not_found/task not found", eb.Error)
+	}
+}
+
+func TestJSONNotFoundHandler_Rewrites405KeepsAllow(t *testing.T) {
+	inner := http.NewServeMux()
+	inner.HandleFunc("GET /api/v1/server/status", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	ts := httptest.NewServer(jsonNotFoundHandler(inner))
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/server/status", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", resp.StatusCode)
+	}
+	if allow := resp.Header.Get("Allow"); !strings.Contains(allow, http.MethodGet) {
+		t.Errorf("Allow = %q, want to keep GET from mux", allow)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("content-type = %q, want application/json rewrite", ct)
+	}
+	var eb errorBody
+	if err := json.NewDecoder(resp.Body).Decode(&eb); err != nil {
+		t.Fatal(err)
+	}
+	if eb.Error.Code != CodeNotFound {
+		t.Errorf("code = %s, want not_found", eb.Error.Code)
+	}
+}
+
+func TestJSONNotFoundHandler_HeaderOnly200Passthrough(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Custom", "keep-me")
+		w.Header().Set("Content-Type", "text/plain")
+	})
+	ts := httptest.NewServer(jsonNotFoundHandler(inner))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/header-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Custom"); got != "keep-me" {
+		t.Errorf("X-Custom = %q, want keep-me (header-only 200)", got)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/plain" {
+		t.Errorf("content-type = %q, want text/plain passthrough", ct)
+	}
+}
+
+func TestJSONNotFoundHandler_RewritesPlainText404(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "404 page not found", http.StatusNotFound)
+	})
+	ts := httptest.NewServer(jsonNotFoundHandler(inner))
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/nope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"code":"not_found"`) {
+		t.Errorf("body = %q, want rewritten JSON envelope", body)
+	}
+	if strings.Contains(string(body), "page not found") {
+		t.Errorf("plain mux text leaked: %s", body)
 	}
 }
 
@@ -97,6 +211,29 @@ func TestStatusRecorder_FlushErrorPropagates(t *testing.T) {
 	}
 	if !fw.flushed {
 		t.Error("underlying FlushError not reached via ResponseController")
+	}
+}
+
+func TestStatusRecorder_FlushErrorImplicit200CopiesBufferedHeaders(t *testing.T) {
+	underlying := httptest.NewRecorder()
+	rec := &statusRecorder{ResponseWriter: underlying, status: http.StatusOK}
+	rec.Header().Set("X-Custom", "keep-me")
+	rec.Header().Set("Content-Type", "text/plain")
+
+	if err := rec.FlushError(); err != nil {
+		t.Fatalf("FlushError: %v", err)
+	}
+	if !rec.wrote || rec.status != http.StatusOK {
+		t.Errorf("recorder status=%d wrote=%v, want implicit 200", rec.status, rec.wrote)
+	}
+	if underlying.Code != http.StatusOK {
+		t.Errorf("underlying code = %d, want 200", underlying.Code)
+	}
+	if got := underlying.Header().Get("X-Custom"); got != "keep-me" {
+		t.Errorf("X-Custom = %q, want keep-me after implicit 200 flush", got)
+	}
+	if ct := underlying.Header().Get("Content-Type"); ct != "text/plain" {
+		t.Errorf("content-type = %q, want text/plain passthrough", ct)
 	}
 }
 

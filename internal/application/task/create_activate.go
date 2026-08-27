@@ -1,11 +1,11 @@
 // create_activate.go 实现 Create/Retry/Activate 用例的 DB 事实写入薄封装
-//（design.md D0:142 迁移第 6 步，P1.4.6）。
+// （design.md D0:142 迁移第 6 步，P1.4.6）。
 //
 // 统一形态：persist + commit helper。Manager facade 保持流程管理器角色（worktree/tmux/
 // opencode/锁与调度不动），仅任务行写入经本层路由：
 //   - 迁移类写入（UpdateStatus/Conditional/CommitCreated）：StatusChanged=true 走
 //     commitTransition（发布 task.status_changed）；否则走 commitTaskMutation
-//     （activity_changed 仅 Changed && UpdatedAtAdvanced）。
+//     （activity_changed 仅 Changed=true）。
 //   - 变更类写入（SetDeleteMode/UpdateEnvSnapshot/UpdateLastPort）：commitTaskMutation。
 //   - CreateTask：成功后 commitTaskCreated（发布 task.created）。
 //
@@ -91,7 +91,7 @@ func (s *LifecycleService) UpdateLastPort(ctx context.Context, id string, port i
 }
 
 // commitTransitionResult 提交迁移类写入：真实状态迁移发布 task.status_changed，
-// 否则（同值 no-op / 同值 last_error 变更）按 updated_at 规则发布 task.activity_changed。
+// 否则（同值 no-op / 同值 last_error 变更）按 Changed=true 发布 task.activity_changed。
 func (s *LifecycleService) commitTransitionResult(ctx context.Context, taskID string, res application.TransitionResult) {
 	if res.StatusChanged {
 		s.commitTransition(ctx, taskID, res)

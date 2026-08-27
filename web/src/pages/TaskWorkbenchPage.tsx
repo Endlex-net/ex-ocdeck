@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { navigate } from '../router';
 import { resolveBackHref, type FromSource } from '../router';
-import { usePoll, useMediaQuery, useProjects, useProjectsRefresh } from '../hooks';
+import { useMediaQuery, useProjects, useProjectsRefresh } from '../hooks';
+import { subscribeTask } from '../sse';
 import { isTransitional, initActivateBlockReason, parseNotice, type Task } from '../types';
 import { shouldCloseOverflowOnBlur } from './workbench-overflow';
 import { StatusBadge } from '../components/StatusBadge';
@@ -161,27 +162,21 @@ export function TaskWorkbenchPage({
     setVisited((v) => (v.has(t) ? v : new Set(v).add(t)));
   };
 
-  const load = async () => {
-    try {
-      setTask(await api.getTask(taskID));
-      setError('');
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 404) setNotFound(true);
-      else setError(err instanceof ApiError ? err.message : '加载失败');
-    }
-  };
-  // init_status pending|running 视为活跃（tasks.md 5.3：轮询条件不只看 task.status）
-  const initActive = task?.init_status === 'pending' || task?.init_status === 'running';
-  usePoll(
-    () => void load(),
-    (task && isTransitional(task.status)) || initActive ? 2000 : 4000,
-    [task?.status, task?.init_status],
-  );
+  useEffect(() => {
+    const sub = subscribeTask(taskID, {
+      onData: (next) => {
+        setTask(next);
+        setError('');
+      },
+      onError: setError,
+      onGone: () => setNotFound(true),
+    });
+    return () => sub.close();
+  }, [taskID]);
 
-  /** 任务操作成功后的统一回调：刷新本任务 + 共享 store（侧栏/指挥中心同步，tasks 8.8）。
-   *  TaskActions/RerunInitButton 仅在成功时调 onDone（P3 修复），失败走 onError + 本页轮询。 */
+  /** 任务操作成功后的统一回调：共享 store 同步（侧栏/指挥中心，tasks 8.8）。
+   *  本任务详情由流推送承接；TaskActions/RerunInitButton 仅在成功时调 onDone。 */
   const onTaskActionDone = () => {
-    void load();
     void refreshShared().catch(() => {});
   };
 
@@ -286,6 +281,15 @@ export function TaskWorkbenchPage({
             返回指挥中心
           </button>
         </div>
+      </div>
+    );
+  }
+
+  if (task === null) {
+    return (
+      <div className="wb-not-found">
+        <div className="empty">连接中…</div>
+        {error && <div className="alert-bar alert-error mono">{error}</div>}
       </div>
     );
   }
@@ -612,7 +616,7 @@ function ActivateButton({
           await api.taskAction(task.id, 'activate');
           onDone();
         } catch (err) {
-          // 失败仅走 onError（不调 onDone/refresh）；状态由本页轮询收敛（与 TaskActions 语义一致，P3 修复 7）。
+          // 失败仅走 onError（不调 onDone/refresh）；状态由 SSE 推送收敛（与 TaskActions 语义一致，P3 修复 7）。
           onError(err instanceof ApiError ? err.message : '激活失败');
         } finally {
           setBusy(false);

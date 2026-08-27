@@ -22,12 +22,17 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"time"
 
 	ocdeckevent "ocdeck/internal/domain/event"
 )
+
+// errStreamGone 推送路径 assembleGone 命中后的包级 sentinel：调用方按写失败同等
+// 处理（退订退出 handler），但不记错误日志（正常业务终态，task-detail-stream D3）。
+var errStreamGone = errors.New("read model stream gone")
 
 // readModelStreamTopics SSE 消费的四个领域 topic（sse-active-sessions design D3）；
 // 顺序固定，订阅句柄按下标对应（事件循环的静态 select 逐路挂接）。
@@ -42,12 +47,15 @@ var readModelStreamTopics = []ocdeckevent.Topic{
 // 参数（日志前缀/500 文案）；四 topic 订阅、合并窗口、溢出重推、心跳与退出纪律
 // 全部固定在核心内，不注入行为。
 type readModelStreamConfig struct {
-	// assemble 组装场景全量快照，返回与对应 REST 响应同构的 DTO 裸数组；store 失败
+	// assemble 组装场景完整快照，与对应 REST 响应同构（裸数组或单对象）；store 失败
 	// 返回 error（初始组装经 errCopy 返 500，重推保持 dirty 重试）。
 	assemble func(ctx context.Context) (any, error)
 	// eventDirty 场景消费过滤表（如 eventDirtiesActiveSessions）：标脏后重组装
 	// 全量快照重推，不做增量合并。
 	eventDirty func(ev ocdeckevent.Event) bool
+	// assembleGone 可选：判定组装错误是否表示主体已消失。nil 时全部路径保持现有行为。
+	// 初始组装 gone → JSON 404（不写 SSE 头）；pushUpdate gone → 返回 errStreamGone。
+	assembleGone func(error) bool
 	// logPrefix 重推组装/序列化失败日志的前缀（如 "active sessions stream"）。
 	logPrefix string
 	// errCopy 初始组装失败 500 错误信封文案（如 "list active sessions failed"）。
@@ -73,9 +81,14 @@ func (s *Server) runReadModelStream(w http.ResponseWriter, r *http.Request, cfg 
 		}
 	}()
 
-	// 初始组装（写 SSE headers 前）：失败 → 退订 + 500 标准错误信封。
+	// 初始组装（写 SSE headers 前）：失败 → 退订 + 500 标准错误信封；
+	// assembleGone 命中 → JSON 404（不写 SSE 头，订阅经 defer 退订）。
 	snap, err := cfg.assemble(ctx)
 	if err != nil {
+		if cfg.assembleGone != nil && cfg.assembleGone(err) {
+			writeError(w, CodeNotFound, "task not found")
+			return
+		}
 		writeError(w, CodeInternal, cfg.errCopy)
 		return
 	}
@@ -124,13 +137,17 @@ func (s *Server) runReadModelStream(w http.ResponseWriter, r *http.Request, cfg 
 	window := time.NewTicker(coalesce)
 	defer window.Stop()
 
-	// pushUpdate 重组装全量快照并写一帧 update（design D3：update 为全量裸数组而非
-	// 增量 diff）。组装/序列化失败保持 dirty、记日志、不写帧、不重置心跳（连接保留，
-	// 由窗口/心跳 tick 或溢出重推重试）；仅成功写出并 flush 后清除 dirty 并重置心跳；
-	// 写/flush 失败返回 error，调用方立即退订退出。
+	// pushUpdate 重组装全量快照并写一帧 update（design D3：update 为场景完整快照、
+	// 与对应 REST 响应同构，而非增量 diff）。组装/序列化失败保持 dirty、记日志、不写帧、
+	// 不重置心跳（连接保留，由窗口/心跳 tick 或溢出重推重试）；assembleGone 命中返回
+	// errStreamGone（调用方退订退出，不记错误日志）；仅成功写出并 flush 后清除 dirty
+	// 并重置心跳；写/flush 失败返回 error，调用方立即退订退出。
 	pushUpdate := func() error {
 		snap, err := cfg.assemble(ctx)
 		if err != nil {
+			if cfg.assembleGone != nil && cfg.assembleGone(err) {
+				return errStreamGone
+			}
 			log.Printf("%s: reassemble snapshot failed, keep dirty for retry: %v", cfg.logPrefix, err)
 			return nil
 		}
