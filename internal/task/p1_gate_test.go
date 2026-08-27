@@ -616,9 +616,8 @@ func TestReopenAttach_ConcurrentIdempotentReuse(t *testing.T) {
 	seedSuspendedTask(store, "t1", "p1")
 	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
 	proc := newMockProc()
-	proc.sessions[serveSessionName("t1")] = true
-	proc.sessions[tuiSessionName("t1")] = true // TUI 已存在
-	proc.envValues[serveSessionName("t1")] = map[string]string{
+	proc.sessions[runtimeSessionName("t1")] = true
+	proc.envValues[runtimeSessionName("t1")] = map[string]string{
 		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001",
 	}
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
@@ -646,10 +645,10 @@ func TestReopenAttach_ConcurrentIdempotentReuse(t *testing.T) {
 			t.Errorf("ReopenAttach[%d]: %v", i, err)
 		}
 	}
-	want := tuiSessionName("t1")
+	want := runtimeSessionName("t1")
 	for i, tid := range results {
 		if string(tid) != want {
-			t.Errorf("ReopenAttach[%d] tid = %s, want %s (reuse existing tui)", i, tid, want)
+			t.Errorf("ReopenAttach[%d] tid = %s, want %s (reuse existing runtime)", i, tid, want)
 		}
 	}
 	// 已存在 tui 时不得重复创建（NewSession 不应被调用）。
@@ -665,31 +664,22 @@ func TestReopenAttach_RecreatesMissingTUI(t *testing.T) {
 	seedSuspendedTask(store, "t1", "p1")
 	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
 	proc := newMockProc()
-	proc.sessions[serveSessionName("t1")] = true
-	// serve env 供 recoverPassword + port 读回。
-	proc.envValues[serveSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001",
-	}
-	// env snapshot 供 loadEnvSnapshot（ReopenAttach 建新 tui 时复用快照）。
-	snap := envSnapshot{Vars: map[string]string{"OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1"}}
-	snapBytes, _ := encodeEnvSnapshot(snap)
-	store.mutTask("t1", func(r *TaskRow) { r.EnvSnapshot = snapBytes })
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
-	// runtime 必须存在（ReopenAttach 注册 group + watchTUIExit 依赖 runtime）。
-	rt := m.newRuntime("t1")
-	m.setRuntime("t1", rt)
-	rt.registerGroup(roleLegacyServe, serveSessionName("t1"))
-
-	// TUI 不存在 → 重建。
 	tid, err := m.ReopenAttach(context.Background(), "t1")
+	if err == nil {
+		t.Fatal("ReopenAttach without runtime must return recovering")
+	}
+	if OpErrorCode(err) != codeRecovering {
+		t.Fatalf("code=%s want recovering, err=%v", OpErrorCode(err), err)
+	}
+	_ = tid
+	proc.sessions[runtimeSessionName("t1")] = true
+	tid, err = m.ReopenAttach(context.Background(), "t1")
 	if err != nil {
-		t.Fatalf("ReopenAttach (recreate): %v", err)
+		t.Fatalf("ReopenAttach (runtime present): %v", err)
 	}
-	if string(tid) != tuiSessionName("t1") {
-		t.Errorf("tid = %s, want %s", tid, tuiSessionName("t1"))
-	}
-	if !proc.sessions[tuiSessionName("t1")] {
-		t.Error("TUI session should be created when missing")
+	if string(tid) != runtimeSessionName("t1") {
+		t.Errorf("tid = %s, want %s", tid, runtimeSessionName("t1"))
 	}
 	// 再调用一次：复用已建 TUI（幂等）。
 	namesBefore := proc.newSessionNamesSnapshot()
@@ -697,8 +687,8 @@ func TestReopenAttach_RecreatesMissingTUI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReopenAttach (reuse): %v", err)
 	}
-	if string(tid2) != tuiSessionName("t1") {
-		t.Errorf("reuse tid = %s, want %s", string(tid2), tuiSessionName("t1"))
+	if string(tid2) != runtimeSessionName("t1") {
+		t.Errorf("reuse tid = %s, want %s", string(tid2), runtimeSessionName("t1"))
 	}
 	if got := proc.newSessionNamesSnapshot(); len(got) != len(namesBefore) {
 		t.Errorf("NewSession after reuse: %d calls, want %d (idempotent)", len(got), len(namesBefore))

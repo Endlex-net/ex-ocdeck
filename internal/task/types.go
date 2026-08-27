@@ -212,4 +212,5 @@ const (
 	codeProcessError   = application.CodeProcessError
 	codeGitError       = application.CodeGitError
 	codeOCIncompatible = application.CodeOCIncompatible
+	codeRecovering     = application.CodeRecovering
 )

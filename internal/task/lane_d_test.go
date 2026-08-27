@@ -41,7 +41,7 @@ func TestLockTaskWait_CtxCancel_Conflict(t *testing.T) {
 	defer unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel()
-	_, err := m.ReopenAttach(ctx, "t1")
+	_, err := m.lockTaskWait(ctx, "t1")
 	if err == nil {
 		t.Fatal("expected error on ctx cancel during lock wait")
 	}
@@ -59,29 +59,22 @@ func TestLockTaskWait_StatusChangedAfterLock_InvalidState(t *testing.T) {
 	seedSuspendedTask(store, "t1", "p1")
 	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
 	proc := newMockProc()
-	proc.sessions[serveSessionName("t1")] = true
-	proc.sessions[tuiSessionName("t1")] = true
+	proc.sessions[runtimeSessionName("t1")] = true
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 
-	// 主 goroutine 持锁，使 ReopenAttach 进入等待路径。
 	unlock, _ := m.tryLockTask("t1")
 
-	// 异步：等待 ReopenAttach 进入等待后，改状态为 suspended 再释放锁，
-	// 使 lockTaskWait 拿到锁后复查到非 active → invalid_state。
-	reopenDone := make(chan error, 1)
+	waitDone := make(chan error, 1)
 	go func() {
-		_, err := m.ReopenAttach(context.Background(), "t1")
-		reopenDone <- err
+		_, err := m.lockTaskWait(context.Background(), "t1")
+		waitDone <- err
 	}()
-	// 等待 ReopenAttach 确实进入等待。
 	time.Sleep(50 * time.Millisecond)
-	// 改状态为 suspended（等待期间任务被挂起）。
 	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusSuspended })
-	// 释放锁，让等待方拿到锁后复查。
 	unlock()
 
 	select {
-	case err := <-reopenDone:
+	case err := <-waitDone:
 		if err == nil {
 			t.Fatal("expected invalid_state after status changed during wait")
 		}
@@ -89,7 +82,7 @@ func TestLockTaskWait_StatusChangedAfterLock_InvalidState(t *testing.T) {
 			t.Errorf("code=%v want invalid_state (status changed during wait), err=%v", OpErrorCode(err), err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("ReopenAttach did not return after lock released")
+		t.Fatal("lockTaskWait did not return after lock released")
 	}
 }
 
@@ -100,9 +93,8 @@ func TestLockTaskWait_NormalWaitSuccess(t *testing.T) {
 	seedSuspendedTask(store, "t1", "p1")
 	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
 	proc := newMockProc()
-	proc.sessions[serveSessionName("t1")] = true
-	proc.sessions[tuiSessionName("t1")] = true
-	proc.envValues[serveSessionName("t1")] = map[string]string{"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001"}
+	proc.sessions[runtimeSessionName("t1")] = true
+	proc.envValues[runtimeSessionName("t1")] = map[string]string{"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001"}
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 
 	// 手动持锁。
@@ -114,14 +106,11 @@ func TestLockTaskWait_NormalWaitSuccess(t *testing.T) {
 		unlock()
 	}()
 
-	// ReopenAttach 等待锁，拿到后复查 active，tui 已存在 → 复用返回。
-	tid, err := m.ReopenAttach(context.Background(), "t1")
+	unlock2, err := m.lockTaskWait(context.Background(), "t1")
 	if err != nil {
-		t.Fatalf("ReopenAttach: %v", err)
+		t.Fatalf("lockTaskWait: %v", err)
 	}
-	if string(tid) != tuiSessionName("t1") {
-		t.Errorf("tid=%s want %s (reuse existing tui)", tid, tuiSessionName("t1"))
-	}
+	unlock2()
 }
 
 // --- 任务 2：Lane D ---

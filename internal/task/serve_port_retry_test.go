@@ -211,7 +211,7 @@ func noticeTicketsOf(e noticeEntry) []string {
 }
 
 func countNewServe(proc *mockProc, taskID string) int {
-	name := serveSessionName(taskID)
+	name := runtimeSessionName(taskID)
 	n := 0
 	for _, s := range proc.newSessionNamesSnapshot() {
 		if s == name {
@@ -222,7 +222,7 @@ func countNewServe(proc *mockProc, taskID string) int {
 }
 
 func countKillServe(proc *mockProc, taskID string) int {
-	name := serveSessionName(taskID)
+	name := runtimeSessionName(taskID)
 	n := 0
 	for _, s := range proc.killOrderSnapshot() {
 		if s == name {
@@ -263,7 +263,7 @@ func TestWaitServeReadyOrDead_SessionDiedIsSentinel(t *testing.T) {
 	proc := newMockProc()
 	oc := newMockOC(false)
 	m := newTestManager(t, store, proc, newMockWorktree(), oc)
-	err := m.waitServeReadyOrDead(context.Background(), oc, serveSessionName("t1"))
+	err := m.waitServeReadyOrDead(context.Background(), oc, runtimeSessionName("t1"))
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -305,7 +305,7 @@ func TestPortRetry_AdjacentPortsDifferOnHealthTimeoutClean(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	final, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	final, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err != nil {
 		t.Fatalf("startServeWithPortRetry: %v", err)
 	}
@@ -362,7 +362,7 @@ func TestPortRetry_SessionDiedRotatesWithoutKill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	final, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	final, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err != nil {
 		t.Fatalf("startServeWithPortRetry: %v", err)
 	}
@@ -410,11 +410,11 @@ func TestPortRetry_KillInfraErrorTerminalNotice(t *testing.T) {
 	store := newMockStore()
 	row := seedSuspendedTask(store, "t1", "p1")
 	base := newMockProc()
-	proc := wrapProcKill(base, map[string]error{serveSessionName("t1"): errors.New("tmux kill infra")})
+	proc := wrapProcKill(base, map[string]error{runtimeSessionName("t1"): errors.New("tmux kill infra")})
 	oc := &alwaysUnhealthyOC{}
 	m := newServeRetryManager(t, store, proc, oc, config.PortRange{Min: 50000, Max: 50005})
 	env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-	_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err == nil {
 		t.Fatal("expected terminal error")
 	}
@@ -437,7 +437,7 @@ func TestPortRetry_ReapFailedTerminalWithTickets(t *testing.T) {
 	store := newMockStore()
 	row := seedSuspendedTask(store, "t1", "p1")
 	base := newMockProc()
-	base.killResults[serveSessionName("t1")] = process.KillResult{
+	base.killResults[runtimeSessionName("t1")] = process.KillResult{
 		SessionKilled:  true,
 		Disposition:    process.DispositionReapFailed,
 		CleanupTickets: []string{"tk-reap-1"},
@@ -445,7 +445,7 @@ func TestPortRetry_ReapFailedTerminalWithTickets(t *testing.T) {
 	oc := &alwaysUnhealthyOC{}
 	m := newServeRetryManager(t, store, base, oc, config.PortRange{Min: 50000, Max: 50005})
 	env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-	_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err == nil {
 		t.Fatal("expected terminal")
 	}
@@ -472,7 +472,7 @@ func TestPortRetry_ReapFailedNoticeWriteFail_PendingHandoff(t *testing.T) {
 	row := seedSuspendedTask(inner, "t1", "p1")
 	inner.mutTask("t1", func(tr *TaskRow) { tr.Status = StatusActivating })
 	base := newMockProc()
-	base.killResults[serveSessionName("t1")] = process.KillResult{
+	base.killResults[runtimeSessionName("t1")] = process.KillResult{
 		SessionKilled:  true,
 		Disposition:    process.DispositionReapFailed,
 		CleanupTickets: []string{"tk-handoff"},
@@ -480,7 +480,7 @@ func TestPortRetry_ReapFailedNoticeWriteFail_PendingHandoff(t *testing.T) {
 	oc := &alwaysUnhealthyOC{}
 	m := newServeRetryManager(t, store, base, oc, config.PortRange{Min: 50000, Max: 50005})
 	env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-	_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -534,10 +534,10 @@ func TestPortRetry_SnapshotFailedAndKillFailedTerminal(t *testing.T) {
 			store := newMockStore()
 			row := seedSuspendedTask(store, "t1", "p1")
 			base := newMockProc()
-			base.killResults[serveSessionName("t1")] = tc.res
+			base.killResults[runtimeSessionName("t1")] = tc.res
 			m := newServeRetryManager(t, store, base, &alwaysUnhealthyOC{}, config.PortRange{Min: 50000, Max: 50005})
 			env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-			_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+			_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 			if err == nil {
 				t.Fatal("expected terminal")
 			}
@@ -570,7 +570,7 @@ func TestPortRetry_SnapshotMissingDegradedContinuesRotate(t *testing.T) {
 	})
 	withFastServeReady(m)
 	env, _ := m.mergeEnvSnapshot(context.Background(), row, failPort)
-	final, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), failPort, "pw", env)
+	final, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), failPort, "pw", env, "")
 	if err != nil {
 		t.Fatalf("expected rotate success: %v", err)
 	}
@@ -594,12 +594,12 @@ func TestPortRetry_SnapshotMissingNoticeWriteFailTerminal(t *testing.T) {
 	store := &noticeAlwaysFailStore{mockStore: inner}
 	row := seedSuspendedTask(inner, "t1", "p1")
 	base := newMockProc()
-	base.killResults[serveSessionName("t1")] = process.KillResult{
+	base.killResults[runtimeSessionName("t1")] = process.KillResult{
 		SessionKilled: false, Disposition: process.DispositionSnapshotMissingDegraded,
 	}
 	m := newServeRetryManager(t, store, base, &alwaysUnhealthyOC{}, config.PortRange{Min: 50000, Max: 50005})
 	env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-	_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err == nil {
 		t.Fatal("expected terminal on notice write fail")
 	}
@@ -627,10 +627,10 @@ func TestPortRetry_UnknownAndContradictoryKillResultTerminal(t *testing.T) {
 			store := newMockStore()
 			row := seedSuspendedTask(store, "t1", "p1")
 			base := newMockProc()
-			base.killResults[serveSessionName("t1")] = tc.res
+			base.killResults[runtimeSessionName("t1")] = tc.res
 			m := newServeRetryManager(t, store, base, &alwaysUnhealthyOC{}, config.PortRange{Min: 50000, Max: 50005})
 			env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-			_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+			_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 			if err == nil {
 				t.Fatal("expected terminal")
 			}
@@ -654,7 +654,7 @@ func TestPortRetry_PersistEnvSnapshotFailNoNewSession(t *testing.T) {
 	proc := &selectiveDieProc{mockProc: base, dieUntil: 1, newCount: &nc}
 	m := newServeRetryManager(t, store, proc, newMockOC(true), config.PortRange{Min: 50000, Max: 50010})
 	env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-	_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err == nil {
 		t.Fatal("expected persist failure")
 	}
@@ -682,12 +682,12 @@ func TestPortRetry_NoticeWriteFailNoAllocate(t *testing.T) {
 	store := &noticeAlwaysFailStore{mockStore: inner}
 	row := seedSuspendedTask(inner, "t1", "p1")
 	base := newMockProc()
-	base.killResults[serveSessionName("t1")] = process.KillResult{
+	base.killResults[runtimeSessionName("t1")] = process.KillResult{
 		SessionKilled: true, Disposition: process.DispositionReapFailed, CleanupTickets: []string{"tk"},
 	}
 	m := newServeRetryManager(t, store, base, &alwaysUnhealthyOC{}, config.PortRange{Min: 50000, Max: 50005})
 	env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-	_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -709,7 +709,7 @@ func TestPortRetry_AllocateExhaustedWrapsAerr(t *testing.T) {
 	proc := &selectiveDieProc{mockProc: base, dieUntil: 99, newCount: &nc}
 	m := newServeRetryManager(t, store, proc, newMockOC(true), config.PortRange{Min: 50000, Max: 50000})
 	env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-	_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err == nil {
 		t.Fatal("expected exhausted")
 	}
@@ -768,7 +768,7 @@ func TestPortRetry_LastAttemptNoAllocate(t *testing.T) {
 	env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
 	// 仅统计 startServeWithPortRetry 期间的 Valid persist（排除 mergeEnvSnapshot 可能的初始写）。
 	writesBefore, _ := store.snapshot()
-	finalPort, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	finalPort, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err == nil {
 		t.Fatal("expected fail after retries")
 	}
@@ -811,7 +811,7 @@ func TestPortRetry_CtxCancelZeroLocalSideEffects(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 		cancel()
 	}()
-	_, err := m.startServeWithPortRetry(ctx, row, serveSessionName("t1"), 50000, "pw", env)
+	_, err := m.startServeWithPortRetry(ctx, row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err == nil {
 		t.Fatal("expected ctx error")
 	}
@@ -847,7 +847,7 @@ func TestPortRetry_ProbeFailuresNoLocalKillNoRotate(t *testing.T) {
 			// 冷启动 backoff 缩短
 			m.probeColdStartBackoffFn = func() []time.Duration { return []time.Duration{time.Millisecond, time.Millisecond} }
 			env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-			_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+			_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 			if err == nil {
 				t.Fatal("expected probe error")
 			}
@@ -869,7 +869,7 @@ func TestPortRetry_ProbeErrorImmutableOnActivateCompensation(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
 	base := newMockProc()
-	base.killResults[serveSessionName("t1")] = process.KillResult{
+	base.killResults[runtimeSessionName("t1")] = process.KillResult{
 		SessionKilled: true, Disposition: process.DispositionReapFailed, CleanupTickets: []string{"tk-comp"},
 	}
 	oc := newMockOC(true)
@@ -922,7 +922,7 @@ func TestPortRetry_ProbeCompensation_ReapFailedTickets(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
 	base := newMockProc()
-	base.killResults[serveSessionName("t1")] = process.KillResult{
+	base.killResults[runtimeSessionName("t1")] = process.KillResult{
 		SessionKilled: true, Disposition: process.DispositionReapFailed, CleanupTickets: []string{"tk-probe"},
 	}
 	oc := newMockOC(true)
@@ -947,7 +947,7 @@ func TestPortRetry_ProbeCompensation_UnknownDispositionFailClosed(t *testing.T) 
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
 	base := newMockProc()
-	base.killResults[serveSessionName("t1")] = process.KillResult{
+	base.killResults[runtimeSessionName("t1")] = process.KillResult{
 		SessionKilled: true, Disposition: process.CleanupDisposition("totally_unknown"),
 	}
 	oc := newMockOC(true)
@@ -1039,7 +1039,7 @@ func TestReplayPendingCleanups_FailureAggregatesLastError(t *testing.T) {
 	m := newTestManager(t, store, base, newMockWorktree(), newMockOC(true))
 	cause := &pendingCleanupError{
 		pending: pendingCleanup{
-			sessionName: serveSessionName("t1"), cleanupTickets: []string{"tk-r"},
+			sessionName: runtimeSessionName("t1"), cleanupTickets: []string{"tk-r"},
 			reason: noticeReasonReapFailed, retryable: true,
 		},
 		noticeErr: errors.New("first write"),
@@ -1063,14 +1063,14 @@ func TestReplay_UpdatedObservationNotCoveredByOldPending(t *testing.T) {
 	inner.mutTask("t1", func(tr *TaskRow) { tr.Status = StatusActivating })
 	// 会话存在以便外层 kill。
 	base := newMockProc()
-	_ = base.NewSession(process.SessionSpec{Name: serveSessionName("t1"), Dir: "/tmp"})
-	base.killResults[serveSessionName("t1")] = process.KillResult{
+	_ = base.NewSession(process.SessionSpec{Name: runtimeSessionName("t1"), Dir: "/tmp"})
+	base.killResults[runtimeSessionName("t1")] = process.KillResult{
 		SessionKilled: false, Disposition: process.DispositionSnapshotMissingDegraded,
 	}
 	m := newTestManager(t, inner, base, newMockWorktree(), newMockOC(true))
 	cause := &pendingCleanupError{
 		pending: pendingCleanup{
-			sessionName: serveSessionName("t1"), cleanupTickets: []string{"tk-first"},
+			sessionName: runtimeSessionName("t1"), cleanupTickets: []string{"tk-first"},
 			reason: noticeReasonKillFailed, retryable: true,
 		},
 		noticeErr: errors.New("cas"),
@@ -1102,8 +1102,8 @@ func TestCleanupNonActivatePath_NoPendingReplay(t *testing.T) {
 	seedSuspendedTask(inner, "t1", "p1")
 	store := &noticeAlwaysFailStore{mockStore: inner}
 	base := newMockProc()
-	_ = base.NewSession(process.SessionSpec{Name: serveSessionName("t1"), Dir: "/tmp"})
-	base.killResults[serveSessionName("t1")] = process.KillResult{
+	_ = base.NewSession(process.SessionSpec{Name: runtimeSessionName("t1"), Dir: "/tmp"})
+	base.killResults[runtimeSessionName("t1")] = process.KillResult{
 		SessionKilled: true, Disposition: process.DispositionReapFailed, CleanupTickets: []string{"tk"},
 	}
 	m := newTestManager(t, store, base, newMockWorktree(), newMockOC(true))
@@ -1168,7 +1168,7 @@ func TestPortRetry_AdjacentPortsDiffer_ViaSessionDied(t *testing.T) {
 	proc := &selectiveDieProc{mockProc: base, dieUntil: 1, newCount: &nc}
 	m := newServeRetryManager(t, store, proc, newMockOC(true), config.PortRange{Min: 50000, Max: 50010})
 	env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-	final, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	final, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1245,7 +1245,7 @@ func TestPortRetry_NilEnvOnRotate_NoPanicPersistFail(t *testing.T) {
 	var nc atomic.Int32
 	proc := &selectiveDieProc{mockProc: base, dieUntil: 1, newCount: &nc}
 	m := newServeRetryManager(t, store, proc, newMockOC(true), config.PortRange{Min: 50000, Max: 50010})
-	_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", nil)
+	_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", nil, "")
 	if err == nil {
 		t.Fatal("expected persist failure")
 	}
@@ -1266,7 +1266,7 @@ func TestPortRetry_ProbeCompensation_NoticeWriteFailThenReplay(t *testing.T) {
 	store := &noticeFailNStore{mockStore: inner, failN: 8}
 	seedSuspendedTask(inner, "t1", "p1")
 	base := newMockProc()
-	base.killResults[serveSessionName("t1")] = process.KillResult{
+	base.killResults[runtimeSessionName("t1")] = process.KillResult{
 		SessionKilled: true, Disposition: process.DispositionReapFailed, CleanupTickets: []string{"tk-outer"},
 	}
 	oc := newMockOC(true)
@@ -1329,7 +1329,7 @@ func TestPortRetry_NoTmuxServerIsSessionDied(t *testing.T) {
 	proc := &noTmuxServerOnceProc{mockProc: base}
 	m := newServeRetryManager(t, store, proc, newMockOC(true), config.PortRange{Min: 50000, Max: 50010})
 	env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-	final, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	final, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err != nil {
 		t.Fatalf("expected rotate success: %v", err)
 	}
@@ -1353,12 +1353,12 @@ func TestPortRetry_HasSessionInfraErrorNotDied(t *testing.T) {
 	row := seedSuspendedTask(store, "t1", "p1")
 	base := newMockProc()
 	base.hasSessionErr = errors.New("tmux infra weird")
-	base.killResults[serveSessionName("t1")] = process.KillResult{
+	base.killResults[runtimeSessionName("t1")] = process.KillResult{
 		SessionKilled: true, Disposition: process.DispositionReapFailed, CleanupTickets: []string{"tk"},
 	}
 	m := newServeRetryManager(t, store, base, &alwaysUnhealthyOC{}, config.PortRange{Min: 50000, Max: 50005})
 	env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-	_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err == nil {
 		t.Fatal("expected terminal")
 	}
@@ -1375,12 +1375,12 @@ func TestPortRetry_TerminalErrorAggregatesWaitKillNotice(t *testing.T) {
 	store := newMockStore()
 	row := seedSuspendedTask(store, "t1", "p1")
 	base := newMockProc()
-	base.killResults[serveSessionName("t1")] = process.KillResult{
+	base.killResults[runtimeSessionName("t1")] = process.KillResult{
 		SessionKilled: true, Disposition: process.DispositionReapFailed, CleanupTickets: []string{"tk"},
 	}
 	m := newServeRetryManager(t, store, base, &alwaysUnhealthyOC{}, config.PortRange{Min: 50000, Max: 50005})
 	env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-	_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -1409,7 +1409,7 @@ func TestPortRetry_LastAttemptAggregatesDispositionFromEarlierRotate(t *testing.
 	}}
 	m := newServeRetryManager(t, store, missingProc, &alwaysUnhealthyOC{}, config.PortRange{Min: 50000, Max: 50005})
 	env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-	_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err == nil {
 		t.Fatal("expected terminal after retries")
 	}
@@ -1432,7 +1432,7 @@ func TestPortRetry_AllocateFailAggregatesWaitContext(t *testing.T) {
 	proc := &selectiveDieProc{mockProc: base, dieUntil: 99, newCount: &nc}
 	m := newServeRetryManager(t, store, proc, newMockOC(true), config.PortRange{Min: 50000, Max: 50000})
 	env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-	_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err == nil {
 		t.Fatal("expected exhausted")
 	}
@@ -1478,7 +1478,7 @@ func TestPortRetry_AllocateFailPreservesErrorChain(t *testing.T) {
 	proc := &selectiveDieProc{mockProc: base, dieUntil: 99, newCount: &nc}
 	m := newServeRetryManager(t, store, proc, newMockOC(true), config.PortRange{Min: 50000, Max: 50000})
 	env, _ := m.mergeEnvSnapshot(context.Background(), row, 50000)
-	_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", env)
+	_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, "")
 	if err == nil {
 		t.Fatal("expected exhausted")
 	}
@@ -1513,7 +1513,7 @@ func TestPortRetry_PersistFailAggregatesWaitContext(t *testing.T) {
 	var nc atomic.Int32
 	proc := &selectiveDieProc{mockProc: base, dieUntil: 1, newCount: &nc}
 	m := newServeRetryManager(t, store, proc, newMockOC(true), config.PortRange{Min: 50000, Max: 50010})
-	_, err := m.startServeWithPortRetry(context.Background(), row, serveSessionName("t1"), 50000, "pw", nil)
+	_, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", nil, "")
 	if err == nil {
 		t.Fatal("expected persist failure")
 	}

@@ -70,6 +70,17 @@ func (s *sessionTraceStore) ClaimTaskSession(ctx context.Context, taskID, sessio
 	return s.TaskStore.ClaimTaskSession(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
 }
 
+func (s *sessionTraceStore) ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
+	s.mu.Lock()
+	s.trace = append(s.trace, "upsert:"+sessionID)
+	s.mu.Unlock()
+	return s.TaskStore.ClaimTaskSessionAndSetAnchor(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+}
+
+func (s *sessionTraceStore) ClearTaskAnchorConditional(ctx context.Context, taskID, oldAnchor string) (application.MutationResult, error) {
+	return s.TaskStore.ClearTaskAnchorConditional(ctx, taskID, oldAnchor)
+}
+
 // TouchOwnedTaskSession 取代 session.updated 的 upsert；trace 不记录（updated 不创建归属，
 // replay 顺序测试关注 created/deleted 顺序）。
 func (s *sessionTraceStore) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (application.MutationResult, error) {
@@ -289,6 +300,12 @@ func (w *sessionStoreErrWrapper) ClaimTaskSession(ctx context.Context, taskID, s
 		return application.ClaimResult{}, w.upsertErr
 	}
 	return w.TaskStore.ClaimTaskSession(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+}
+func (w *sessionStoreErrWrapper) ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
+	return w.TaskStore.ClaimTaskSessionAndSetAnchor(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+}
+func (w *sessionStoreErrWrapper) ClearTaskAnchorConditional(ctx context.Context, taskID, oldAnchor string) (application.MutationResult, error) {
+	return w.TaskStore.ClearTaskAnchorConditional(ctx, taskID, oldAnchor)
 }
 func (w *sessionStoreErrWrapper) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (application.MutationResult, error) {
 	if w.upsertErr != nil {

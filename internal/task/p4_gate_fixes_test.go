@@ -435,30 +435,6 @@ func TestP4_HandleSSEEvent_StoreError_ConvergesToSuspended(t *testing.T) {
 // TestP4_StartTUI_ListTaskSessionsError_Propagates 验证 P4-6：startTUI 中
 // ListTopLevelTaskSessions 错误 MUST 传播（Activate 失败），不得当空集继续创建/锚定
 // 致 session 归属丢失（design.md §19）。B3：resolveAnchorSession 走顶层会话查询。
-func TestP4_StartTUI_ListTaskSessionsError_Propagates(t *testing.T) {
-	tStore := newMockStore()
-	seedSuspendedTask(tStore, "t1", "p1")
-	proc := newMockProc()
-	proc.envValues[serveSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
-	}
-	// 注入 ListTopLevelTaskSessions 错误（startTUI 预检 session 时失败）。
-	errStore := wrapSessionStoreErr(tStore, nil, nil, nil)
-	errStore.listTopErr = errors.New("db: list top-level sessions failed")
-	oc := newMockOC(true)
-	m := newR7TestManager(t, errStore, proc, newMockWorktree(), oc)
-
-	err := m.Activate(context.Background(), "t1")
-	if err == nil {
-		t.Fatal("Activate must fail when startTUI ListTopLevelTaskSessions errors")
-	}
-	if !strings.Contains(err.Error(), "list top-level sessions") {
-		t.Errorf("error must mention list top-level sessions, got: %v", err)
-	}
-	// MUST 落 suspended（Activate 失败补偿）。
-	assertStatus(t, tStore, "t1", StatusSuspended)
-}
-
 // eventSendOC 发送预置事件后阻塞（用于 handleSSEEvent 错误传播测试）。
 type eventSendOC struct {
 	*mockOC

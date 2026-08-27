@@ -190,7 +190,7 @@ func TestP147_WatcherThreadsToken(t *testing.T) {
 	}
 
 	// 触发 serve 退出事件：watchServeExit 回调 matchesRegistry 校验通过后携带注册令牌收敛。
-	proc.triggerExit(serveSessionName("t1"), process.WatchEvent{Type: process.WatchEventSessionExit})
+	proc.triggerExit(runtimeSessionName("t1"), process.WatchEvent{Type: process.WatchEventSessionExit})
 
 	assertStatus(t, store, "t1", StatusSuspended)
 	if m.getRuntime("t1") != nil {

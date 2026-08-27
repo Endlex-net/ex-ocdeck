@@ -75,7 +75,7 @@ func (c *portHealthOC) Probe(ctx context.Context) (string, error) {
 }
 
 func (c *portHealthOC) ListSessions(ctx context.Context, dir string, limit int) ([]opencode.Session, error) {
-	return nil, nil
+	return []opencode.Session{{ID: "sess-new", Time: opencode.SessionTime{Created: 1, Updated: 1}}}, nil
 }
 
 func (c *portHealthOC) GetSession(ctx context.Context, dir, id string) (opencode.Session, error) {
@@ -199,8 +199,8 @@ func TestStartServeWithPortRetry_PortRewriteConsistency(t *testing.T) {
 		t.Fatalf("初始 env 端口=%s want %d", got, initialPort)
 	}
 
-	serveName := serveSessionName("t1")
-	finalPort, sErr := m.startServeWithPortRetry(context.Background(), row, serveName, initialPort, "pw", env)
+	serveName := runtimeSessionName("t1")
+	finalPort, sErr := m.startServeWithPortRetry(context.Background(), row, serveName, initialPort, "pw", env, "")
 	if sErr != nil {
 		t.Fatalf("startServeWithPortRetry: %v", sErr)
 	}
@@ -280,17 +280,12 @@ func TestStartServeWithPortRetry_TUIEnvUsesFinalPort(t *testing.T) {
 	finalPort := int(row.LastPort.Int64)
 
 	// 断言 TUI 会话 env 的 OCDECK_SERVE_PORT == finalPort（E1 第 3 处）。
-	tuiEnv, ok := proc.envValues[tuiSessionName("t1")]
+	runtimeEnv, ok := proc.envValues[runtimeSessionName("t1")]
 	if !ok {
-		t.Fatal("TUI 会话未创建")
+		t.Fatal("runtime 会话未创建")
 	}
-	if got := tuiEnv["OCDECK_SERVE_PORT"]; got != strconv.Itoa(finalPort) {
-		t.Errorf("TUI env OCDECK_SERVE_PORT=%s want %d (E1 TUI env 同步)", got, finalPort)
-	}
-	// serve 会话 env 也应是 finalPort。
-	serveEnv := proc.envValues[serveSessionName("t1")]
-	if got := serveEnv["OCDECK_SERVE_PORT"]; got != strconv.Itoa(finalPort) {
-		t.Errorf("serve env OCDECK_SERVE_PORT=%s want %d", got, finalPort)
+	if got := runtimeEnv["OCDECK_SERVE_PORT"]; got != strconv.Itoa(finalPort) {
+		t.Errorf("runtime env OCDECK_SERVE_PORT=%s want %d", got, finalPort)
 	}
 }
 

@@ -2,28 +2,30 @@ package task
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"log"
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	"ocdeck/internal/application/runtime"
-	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
 	"ocdeck/internal/infrastructure/pty"
 )
 
-// ReopenAttach 重开 TUI attach 会话（design.md §18 ReopenAttach + §4 TUI 消失保持活跃）。
-// WS 建连与 REST /tasks/:id/attach/reopen 并发幂等：复用同一新 TUI 会话（不产生 409）。
+// ReopenAttach 返回任务进程终端 ID（D8）。本阶段不接 ensureRecovery：
+// runtime 存活且 active → 返回 -runtime；active 但缺失 / activating → typed recovering；
+// 其他状态 → invalid_state。不再创建独立 TUI 会话。
 func (m *Manager) ReopenAttach(ctx context.Context, taskID string) (TerminalID, error) {
-	unlock, err := m.lockTaskWait(ctx, taskID)
+	unlock, err := m.tryLockTask(taskID)
 	if err != nil {
-		// lockTaskWait 已返回语义化 OpError（conflict/invalid_state/not_found），直接透传，
-		// 不再二次包装以免丢失原 code。
+		if OpErrorCode(err) == codeConflict {
+			row, rerr := m.store.GetTask(ctx, taskID)
+			if rerr == nil && row.Status == StatusActivating {
+				return "", newOpErr(codeRecovering, fmt.Errorf("task %s process is starting", taskID))
+			}
+		}
 		return "", err
 	}
 	defer unlock()
@@ -32,76 +34,28 @@ func (m *Manager) ReopenAttach(ctx context.Context, taskID string) (TerminalID, 
 	if err != nil {
 		return "", newOpErr(codeNotFound, fmt.Errorf("task not found: %w", err))
 	}
-	// lockTaskWait 已在拿锁后复查 active；此处仅为防御性二次校验（持锁期间状态不变）。
+	if row.Status == StatusActivating {
+		return "", newOpErr(codeRecovering, fmt.Errorf("task %s process is starting", taskID))
+	}
 	if row.Status != StatusActive {
 		return "", newOpErr(codeInvalidState, fmt.Errorf("reopen attach requires active, got %s", row.Status))
 	}
-	// add-plain-dir-project D8：TUI 重开路径在任何状态修改/运行时副作用前校验项目 kind，
-	// 未知值零副作用报错。kind 不改变对齐（ReopenAttach 无对齐），但满足四入口校验一致。
 	proj, perr := m.store.GetProject(ctx, row.ProjectID)
 	if perr != nil {
 		return "", newOpErr(codeNotFound, fmt.Errorf("project gone: %w", perr))
 	}
 	if _, kerr := alignModeForKind(proj.Kind); kerr != nil {
-		// 未知持久化 kind（DB 损坏值）→ internal（D1）。
 		return "", newOpErr(codeInternal, kerr)
 	}
-	tuiName := tuiSessionName(taskID)
-	// 已存在则复用（幂等）。HasSession 基础设施错误（非 ErrNoTmuxServer）MUST 传播
-	//（不得吞错误当 absent 继续建 TUI，掩盖 infra 故障，design.md §8）。
-	exists, herr := m.proc.HasSession(tuiName)
+	runtimeName := runtimeSessionName(taskID)
+	exists, herr := m.proc.HasSession(runtimeName)
 	if herr != nil && !errors.Is(herr, process.ErrNoTmuxServer) {
-		return "", newOpErr(codeInternal, fmt.Errorf("reopen attach: has tui session: %w", herr))
+		return "", newOpErr(codeInternal, fmt.Errorf("reopen attach: has runtime session: %w", herr))
 	}
 	if exists {
-		return TerminalID(tuiName), nil
+		return TerminalID(runtimeName), nil
 	}
-	env, err := m.loadEnvSnapshot(row)
-	if err != nil {
-		return "", newOpErr(codeInternal, err)
-	}
-	password := m.recoverPassword(ctx, taskID)
-	if password == "" {
-		return "", newOpErr(codeProcessError, fmt.Errorf("cannot recover serve password for task %s", taskID))
-	}
-	// 端口以 serve 会话内 OCDECK_SERVE_PORT 为唯一权威来源（design.md §3/§5：
-	// last_port 仅记录，可能写入失败或过期，MUST NOT 回退）。
-	// 读回失败/空/不可解析 MUST 直接失败（记 last_error 供调用方感知），不得用 last_port 兜底
-	// 致 attach 到错误端口。
-	serveName := serveSessionName(taskID)
-	portStr, perr := m.proc.ShowSessionEnv(serveName, "OCDECK_SERVE_PORT")
-	if perr != nil || portStr == "" {
-		return "", newOpErr(codeProcessError, fmt.Errorf("reopen attach: recover serve port: %w", perr))
-	}
-	port, ok := parsePort(portStr)
-	if !ok {
-		return "", newOpErr(codeProcessError, fmt.Errorf("reopen attach: invalid serve port %q", portStr))
-	}
-	tuiEnv := copyMap(env)
-	tuiEnv["OPENCODE_SERVER_PASSWORD"] = password
-	// 锚定确定 session（design.md §4：不使用 --continue，经 REST 预检/创建后 --session）。
-	oc := m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 5 * time.Second})
-	sessionID, aerr := m.resolveAnchorSession(ctx, oc, row)
-	if aerr != nil {
-		// add-plain-dir-project D8：锚定 claim 冲突 → 记 last_error，任务保持 active 不收敛
-		//（TUI 重开失败可重试），MUST NOT attach 不属本任务的 session。
-		// UpdateTaskStatus 写 last_error 同时保持 status=active（不收敛状态）。
-		le := sql.NullString{String: fmt.Sprintf("reopen attach: %v", aerr), Valid: true}
-		if _, uerr := m.writeStatus(ctx, taskID, StatusActive, le); uerr != nil {
-			log.Printf("reopen attach: record last_error for task %s: %v", taskID, uerr)
-		}
-		return "", newOpErr(codeProcessError, fmt.Errorf("reopen attach: %w", aerr))
-	}
-	if err := m.proc.NewSession(newSessionSpec(tuiName, row.WorktreePath, tuiEnv,
-		[]string{"opencode", "attach", fmt.Sprintf("http://127.0.0.1:%d", port), "--session", sessionID})); err != nil {
-		return "", newOpErr(codeProcessError, err)
-	}
-	// 注册 tui group（B4：groups 真实写入注册表）。
-	if rt := m.getRuntime(taskID); rt != nil {
-		rt.registerGroup(roleLegacyTUI, tuiName)
-	}
-	m.watchTUIExit(taskID, tuiName)
-	return TerminalID(tuiName), nil
+	return "", newOpErr(codeRecovering, fmt.Errorf("task %s process is starting", taskID))
 }
 
 // AttachPty 为 WS 终端构造 attach 客户端 PTY（design.md §18 AttachPty）。

@@ -292,7 +292,7 @@ func (m *Manager) resumeActive(ctx context.Context, t TaskRow) error {
 	}
 	rt := m.newRuntime(t.ID)
 	m.setRuntime(t.ID, rt)
-	rt.registerGroup(roleLegacyServe, serveName)
+	rt.registerGroup(roleRuntime, serveName)
 	if err := m.startSSE(ctx, rt, t.ID, t.WorktreePath, port, pw, mode); err != nil {
 		m.clearRuntime(t.ID)
 		return err
@@ -335,7 +335,7 @@ func (m *Manager) resumeRuntimeWatchers(taskID, serveName string) error {
 	tuiName := tuiSessionName(taskID)
 	if alive, _ := m.proc.HasSession(tuiName); alive {
 		if rt := m.getRuntime(taskID); rt != nil {
-			rt.registerGroup(roleLegacyTUI, tuiName)
+			rt.registerGroup(roleRuntime, tuiName)
 		}
 		m.watchTUIExit(taskID, tuiName)
 	}

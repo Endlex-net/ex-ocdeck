@@ -469,6 +469,31 @@ func (s *mockStore) ClaimTaskSession(ctx context.Context, taskID, sessionID stri
 	return application.ClaimResult{Claimed: true, Changed: true}, nil
 }
 
+func (s *mockStore) ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
+	res, err := s.ClaimTaskSession(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+	if err != nil || !res.Claimed {
+		return res, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t := s.tasks[taskID]
+	t.AnchorSessionID = sql.NullString{String: sessionID, Valid: true}
+	s.tasks[taskID] = t
+	return res, nil
+}
+
+func (s *mockStore) ClearTaskAnchorConditional(ctx context.Context, taskID, oldAnchor string) (application.MutationResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.tasks[taskID]
+	if !ok || !t.AnchorSessionID.Valid || t.AnchorSessionID.String != oldAnchor {
+		return application.MutationResult{}, nil
+	}
+	t.AnchorSessionID = sql.NullString{}
+	s.tasks[taskID] = t
+	return application.MutationResult{Matched: true, Changed: true}, nil
+}
+
 // TouchOwnedTaskSession 镜像 store.TouchOwnedTaskSession：Matched=命中本任务归属行，
 // Changed=last_seen_at 真实推进（值变化条件），绝不插入。
 func (s *mockStore) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (application.MutationResult, error) {
@@ -657,6 +682,9 @@ func newMockProc() *mockProc {
 }
 
 func (p *mockProc) NewSession(spec process.SessionSpec) error {
+	if err := process.ValidateNewSessionName(spec.Name); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.newSessionErr != nil {
@@ -936,9 +964,12 @@ func (c *mockOC) CreateSession(ctx context.Context, dir, title string) (opencode
 		return opencode.Session{}, c.createSessionErr
 	}
 	if c.createSessionResult.ID != "" {
+		c.sessions = append(c.sessions, c.createSessionResult)
 		return c.createSessionResult, nil
 	}
-	return opencode.Session{ID: "sess-new", Time: opencode.SessionTime{Created: 100, Updated: 100}}, nil
+	s := opencode.Session{ID: "sess-new", Time: opencode.SessionTime{Created: 100, Updated: 100}}
+	c.sessions = append(c.sessions, s)
+	return s, nil
 }
 
 // createSessionCountLoad 返回 createSessionCount 的原子读（测试桩线程安全：

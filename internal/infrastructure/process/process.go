@@ -28,8 +28,8 @@ import (
 
 // SessionSpec 描述一次 tmux 会话创建请求（design.md §18）。
 type SessionSpec struct {
-	// Name 会话名，MUST 经 ValidateSessionName 校验（ocdeck-<taskID>-<role>）。
-	// Phase 2 接线点：创建路径改为 ValidateNewSessionName（拒绝 legacy serve/tui）。
+	// Name 会话名，MUST 经 ValidateNewSessionName 校验（ocdeck-<taskID>-<role>，
+	// role ∈ runtime | shell-<n>；legacy serve/tui 不可新建）。
 	Name string
 	// Dir 会话工作目录（tmux new-session -c），MUST 为绝对路径。
 	Dir string
@@ -466,11 +466,9 @@ const termGrace = 2 * time.Second
 // NewSession 创建 tmux 会话（design.md §18）。
 // 命令构造：从白名单 CmdArgv 逐元素单引号转义拼成单个 shell 字符串，
 // env 经 -e KEY=VALUE argv 传递，精确 target -t =<name>。
-//
-// Phase 2 接线点：将下方 ValidateSessionName 替换为 ValidateNewSessionName，
-// 与 Activate 切到 runtime 同批提交。本阶段仍接受 legacy serve/tui（Activate 仍创建双进程）。
+// 创建路径强制 ValidateNewSessionName：仅 runtime | shell-<n>，拒绝 legacy serve/tui。
 func (m *Manager) NewSession(spec SessionSpec) error {
-	if err := ValidateSessionName(spec.Name); err != nil {
+	if err := ValidateNewSessionName(spec.Name); err != nil {
 		return err
 	}
 	if spec.Dir == "" {

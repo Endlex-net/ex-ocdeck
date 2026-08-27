@@ -255,6 +255,14 @@ func (a *StoreAdapter) ClaimTaskSession(ctx context.Context, taskID, sessionID s
 	return a.db.ClaimTaskSession(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
 }
 
+func (a *StoreAdapter) ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
+	return a.db.ClaimTaskSessionAndSetAnchor(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+}
+
+func (a *StoreAdapter) ClearTaskAnchorConditional(ctx context.Context, taskID, oldAnchor string) (application.MutationResult, error) {
+	return a.db.ClearTaskAnchorConditional(ctx, taskID, oldAnchor)
+}
+
 // TouchOwnedTaskSession 条件 UPDATE 仅本任务已归属行的 last_seen_at（D8）。
 // 返回结构化 MutationResult（P1.4.5：Matched=命中归属行，Changed=值真实推进）。
 func (a *StoreAdapter) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (application.MutationResult, error) {

@@ -31,7 +31,7 @@ func TestR7_DeleteTempServeKillError_BlocksDBCommit(t *testing.T) {
 	tStore.sessions["t1"] = []SessionRow{{TaskID: "t1", SessionID: "s1"}}
 	proc := newMockProc()
 	// 一次性 serve kill 产生 reap_failed（非 clean）+ tickets。
-	proc.killResults[serveSessionName("t1")] = process.KillResult{
+	proc.killResults[runtimeSessionName("t1")] = process.KillResult{
 		SessionKilled:  true,
 		Disposition:    process.DispositionReapFailed,
 		CleanupTickets: []string{"r7-temp-serve-tk"},
@@ -407,32 +407,15 @@ func TestR7_ReopenAttach_UsesSessionEnvPort(t *testing.T) {
 		r.EnvSnapshot = sql.NullString{String: `{"vars":{"PATH":"/usr/bin"}}`, Valid: true}
 	})
 	proc := newMockProc()
-	proc.sessions[serveSessionName("t1")] = true
-	proc.envValues[serveSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50099", "OCDECK_TASK_ID": "t1",
-	}
-	// 用 newSessionCapture 捕获 tui NewSession 的 argv（含 attach URL 端口）。
-	cap := wrapNewSessionCapture(proc)
-	m := newR7TestManager(t, tStore, cap, newMockWorktree(), newMockOC(true))
+	proc.sessions[runtimeSessionName("t1")] = true
+	m := newR7TestManager(t, tStore, proc, newMockWorktree(), newMockOC(true))
 
 	tid, err := m.ReopenAttach(context.Background(), "t1")
 	if err != nil {
 		t.Fatalf("ReopenAttach: %v", err)
 	}
-	if string(tid) != tuiSessionName("t1") {
-		t.Fatalf("tid=%s want %s", tid, tuiSessionName("t1"))
-	}
-	// 断言 tui NewSession 的 CmdArgv 含 50099（serve env 端口），不含 50000（last_port）。
-	tuiSpecs := cap.specsFor(tuiSessionName("t1"))
-	if len(tuiSpecs) == 0 {
-		t.Fatal("tui NewSession not captured")
-	}
-	argv := tuiSpecs[len(tuiSpecs)-1].CmdArgv
-	if !argvContains(argv, "http://127.0.0.1:50099") {
-		t.Errorf("tui attach URL must use serve env port 50099, argv=%v", argv)
-	}
-	if argvContains(argv, "50000") {
-		t.Errorf("tui attach URL must NOT use last_port 50000, argv=%v", argv)
+	if string(tid) != runtimeSessionName("t1") {
+		t.Fatalf("tid=%s want %s", tid, runtimeSessionName("t1"))
 	}
 }
 
@@ -458,11 +441,13 @@ func TestR7_ReopenAttach_ServeEnvEmpty_FailsNoFallback(t *testing.T) {
 
 	_, err := m.ReopenAttach(context.Background(), "t1")
 	if err == nil {
-		t.Fatal("ReopenAttach must fail when serve env port empty (no last_port fallback)")
+		t.Fatal("ReopenAttach without runtime must return recovering")
 	}
-	// 不应建 tui（失败前不得有副作用）。
+	if OpErrorCode(err) != codeRecovering {
+		t.Errorf("code=%s want recovering, err=%v", OpErrorCode(err), err)
+	}
 	if specs := cap.specsFor(tuiSessionName("t1")); len(specs) != 0 {
-		t.Errorf("ReopenAttach must not create tui on port recovery failure, got specs=%v", specs)
+		t.Errorf("ReopenAttach must not create tui, got specs=%v", specs)
 	}
 }
 
@@ -476,17 +461,15 @@ func TestR7_ReopenAttach_ServeEnvUnparseable_Fails(t *testing.T) {
 		r.EnvSnapshot = sql.NullString{String: `{"vars":{"PATH":"/usr/bin"}}`, Valid: true}
 	})
 	proc := newMockProc()
-	proc.sessions[serveSessionName("t1")] = true
-	// serve env 端口非数字 → 不可解析 → MUST 失败。
-	proc.envValues[serveSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "not-a-port", "OCDECK_TASK_ID": "t1",
-	}
 	cap := wrapNewSessionCapture(proc)
 	m := newR7TestManager(t, tStore, cap, newMockWorktree(), newMockOC(true))
 
 	_, err := m.ReopenAttach(context.Background(), "t1")
 	if err == nil {
-		t.Fatal("ReopenAttach must fail when serve env port unparseable")
+		t.Fatal("ReopenAttach without runtime must return recovering")
+	}
+	if OpErrorCode(err) != codeRecovering {
+		t.Errorf("code=%s want recovering, err=%v", OpErrorCode(err), err)
 	}
 }
 

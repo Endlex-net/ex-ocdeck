@@ -114,11 +114,10 @@ func TestValidateNewSessionName(t *testing.T) {
 	}
 }
 
-func TestNewSession_AcceptsLegacySuffixUntilPhase2(t *testing.T) {
-	var saw []string
+func TestNewSession_RejectsLegacySuffix(t *testing.T) {
 	m := &Manager{
-		execTmuxFn: func(_ context.Context, args ...string) (string, string, error) {
-			saw = append(saw, args...)
+		execTmuxFn: func(context.Context, ...string) (string, string, error) {
+			t.Fatal("execTmux must not run for rejected legacy names")
 			return "", "", nil
 		},
 	}
@@ -128,12 +127,9 @@ func TestNewSession_AcceptsLegacySuffixUntilPhase2(t *testing.T) {
 			Dir:     "/tmp",
 			CmdArgv: []string{"sleep", "1"},
 		})
-		if err != nil {
-			t.Errorf("NewSession(%q) err=%v, want accept legacy until Phase 2", name, err)
+		if err == nil {
+			t.Errorf("NewSession(%q) err=nil, want reject legacy suffix", name)
 		}
-	}
-	if len(saw) == 0 {
-		t.Fatal("execTmux was not called for legacy NewSession")
 	}
 }
 

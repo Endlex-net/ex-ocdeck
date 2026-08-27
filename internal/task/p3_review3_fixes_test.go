@@ -750,9 +750,14 @@ func TestRealStore_CorruptedNoticeJSON_FailClosed(t *testing.T) {
 type alignFailOC struct {
 	*mockOC
 	listErr error
+	n       int
 }
 
 func (c *alignFailOC) ListSessions(ctx context.Context, dir string, limit int) ([]opencode.Session, error) {
+	c.n++
+	if c.n == 1 {
+		return c.sessions, nil
+	}
 	return nil, c.listErr
 }
 

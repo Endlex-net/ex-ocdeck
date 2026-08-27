@@ -95,11 +95,11 @@ func TestStopAndJoinAllRuntimes_NoLeak(t *testing.T) {
 	// 手动构造活跃 runtime + SSE + serve/tui watch（复用 activate 内部步骤）。
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	rt.registerGroup(roleLegacyServe, serveSessionName("t1"))
+	rt.registerGroup(roleRuntime, runtimeSessionName("t1"))
 	if err := m.startSSE(lifeCtx, rt, "t1", "/wt", 50001, "pw", AlignModeRepo); err != nil {
 		t.Fatalf("startSSE: %v", err)
 	}
-	m.watchServeExit("t1", serveSessionName("t1"))
+	m.watchServeExit("t1", runtimeSessionName("t1"))
 	m.watchTUIExit("t1", tuiSessionName("t1"))
 
 	// 确认 SSE goroutine 活跃（sseCancel 非 nil）。
@@ -144,10 +144,10 @@ func TestWatchExit_G_JoinAfterCancel(t *testing.T) {
 
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	m.watchServeExit("t1", serveSessionName("t1"))
+	m.watchServeExit("t1", runtimeSessionName("t1"))
 
 	rt.mu.Lock()
-	done := rt.watchDones[serveSessionName("t1")]
+	done := rt.watchDones[runtimeSessionName("t1")]
 	rt.mu.Unlock()
 	if done == nil {
 		t.Fatal("watch done channel should be registered")

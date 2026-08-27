@@ -54,10 +54,11 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 
 // suspendRun 执行挂起的外部副作用并按互斥决策树收敛（design.md §5）。
 // 决策树按序判定取首个命中；分支判定以 kill 前 serve 是否存活为准（B7 时机）：
-//   a) kill 前 serve 已死 → 继续完成剩余清理 → suspended（个别失败记 notice + 后台重试）；
-//   b) kill 前 serve 存活且全部 kill 成功 → suspended；
-//   c) kill 前 serve 存活但有 kill 失败 → 尝试修复运行时（恢复完整运行时才算成功）→
-//      修复成功回 active + last_error；修复失败或期间 serve 死亡 → 转分支 a。
+//
+//	a) kill 前 serve 已死 → 继续完成剩余清理 → suspended（个别失败记 notice + 后台重试）；
+//	b) kill 前 serve 存活且全部 kill 成功 → suspended；
+//	c) kill 前 serve 存活但有 kill 失败 → 尝试修复运行时（恢复完整运行时才算成功）→
+//	   修复成功回 active + last_error；修复失败或期间 serve 死亡 → 转分支 a。
 //
 // 不变量：Suspend 已提交 suspending（Suspend 入口），本函数任意失败路径 MUST 收敛到
 // active 或 suspended，不得停留 suspending（Retry 不接受 suspending，只能重启 reconcile，
@@ -69,17 +70,27 @@ func (m *Manager) suspendRun(ctx context.Context, taskID string, mode AlignMode)
 	// 停 SSE 订阅 + 退出监视。
 	m.clearRuntime(taskID)
 
-	// 分支判定时机：kill 前查 serve 是否已死（B7，D2：预探测而非事后推断）。
-	serveName := serveSessionName(taskID)
+	// 分支判定时机：kill 前查进程会话是否已死。Phase 2 进程名为 -runtime，
+	// leftover -serve 仍参与判定与清理。
+	processName := runtimeSessionName(taskID)
+	legacyServe := serveSessionName(taskID)
 	tuiName := tuiSessionName(taskID)
-	serveAliveBeforeKill, herr := m.proc.HasSession(serveName)
+	serveAliveBeforeKill, herr := m.proc.HasSession(processName)
+	if herr == nil && !serveAliveBeforeKill {
+		if alive, lerr := m.proc.HasSession(legacyServe); lerr == nil && alive {
+			serveAliveBeforeKill = true
+			processName = legacyServe
+		} else if lerr != nil && !errors.Is(lerr, process.ErrNoTmuxServer) {
+			herr = lerr
+		}
+	}
 	// B5e：HasSession 基础设施错误（非 ErrNoTmuxServer）MUST 收敛到 suspended，不得直接返回留 suspending。
 	// 保守视为 serve 状态不可判定 → 强制 kill 残余 + finishSuspend 落 suspended + last_error。
 	// infra 错误作为 killResultEntry（killErr）传入 finishSuspend，使 last_error 含 infra 上下文
 	//（finishSund 会提交 suspended + 记 notice + 以 firstErr 作 last_error）。
 	if herr != nil && !errors.Is(herr, process.ErrNoTmuxServer) {
-		forceRes := m.forceKillAll(ctx, []string{tuiName, serveName})
-		forceRes = append(forceRes, killResultEntry{name: serveName, killErr: herr})
+		forceRes := m.forceKillAll(ctx, []string{tuiName, processName, legacyServe})
+		forceRes = append(forceRes, killResultEntry{name: processName, killErr: herr})
 		return newOpErr(codeProcessError, m.finishSuspend(ctx, taskID, forceRes))
 	}
 
@@ -90,12 +101,12 @@ func (m *Manager) suspendRun(ctx context.Context, taskID string, mode AlignMode)
 	//（infra 错误作为 killResultEntry 传入 finishSund，使 last_error 含 infra 上下文）。
 	shellNames, err := m.listShellSessions(taskID)
 	if err != nil {
-		forceRes := m.forceKillAll(ctx, []string{tuiName, serveName})
-		forceRes = append(forceRes, killResultEntry{name: serveName, killErr: err})
+		forceRes := m.forceKillAll(ctx, []string{tuiName, processName, legacyServe})
+		forceRes = append(forceRes, killResultEntry{name: processName, killErr: err})
 		return newOpErr(codeProcessError, m.finishSuspend(ctx, taskID, append(killRes, forceRes...)))
 	}
 	killRes = append(killRes, m.killTaskSessions(ctx, taskID, shellNames)...)
-	killRes = append(killRes, m.killTaskSessions(ctx, taskID, []string{serveName})...)
+	killRes = append(killRes, m.killTaskSessions(ctx, taskID, []string{processName, legacyServe})...)
 
 	// 分支 a：kill 前 serve 已死 → 继续完成剩余清理 → suspended。
 	if !serveAliveBeforeKill {
@@ -119,18 +130,18 @@ func (m *Manager) suspendRun(ctx context.Context, taskID string, mode AlignMode)
 		return nil
 	}
 	// 修复失败或期间 serve 死亡 → 转分支 a：强制 kill 残余 → suspended。
-	forceRes := m.forceKillAll(ctx, []string{tuiName, serveName})
+	forceRes := m.forceKillAll(ctx, []string{tuiName, processName, legacyServe})
 	killRes = append(killRes, forceRes...)
 	return m.finishSuspend(ctx, taskID, killRes)
 }
 
 // killResultEntry 记录一次 KillSession 结果。
 type killResultEntry struct {
-	name      string
-	alive     bool // kill 前 serve 是否存活
-	result    process.KillResult
-	occupied  bool // 会话不存在（absent）
-	killErr   error // KillSession 本身的基础设施错误（非 nil 时 disposition 不可信）
+	name     string
+	alive    bool // kill 前 serve 是否存活
+	result   process.KillResult
+	occupied bool  // 会话不存在（absent）
+	killErr  error // KillSession 本身的基础设施错误（非 nil 时 disposition 不可信）
 }
 
 // killTaskSessions 对 names 中存在的会话执行 KillSession，返回结果集。
@@ -225,10 +236,18 @@ func (m *Manager) finishSuspend(ctx context.Context, taskID string, results []ki
 // mode 为 Suspend 入口已解析的对齐模式（D8：复用传入值，不重复查询项目 kind）。
 // 返回 (fixed, err)：serve 存活且完整运行时重建成功 → (true, nil)；否则 (false, err)。
 func (m *Manager) tryRepairRuntime(ctx context.Context, taskID string, mode AlignMode) (bool, error) {
-	serveName := serveSessionName(taskID)
+	serveName := runtimeSessionName(taskID)
 	alive, err := m.proc.HasSession(serveName)
 	if err != nil || !alive {
-		return false, fmt.Errorf("serve gone before repair: %w", err)
+		legacy := serveSessionName(taskID)
+		if la, lerr := m.proc.HasSession(legacy); lerr == nil && la {
+			serveName = legacy
+			alive = true
+			err = nil
+		}
+	}
+	if err != nil || !alive {
+		return false, fmt.Errorf("runtime gone before repair: %w", err)
 	}
 	row, gerr := m.store.GetTask(ctx, taskID)
 	if gerr != nil {
@@ -256,43 +275,19 @@ func (m *Manager) tryRepairRuntime(ctx context.Context, taskID string, mode Alig
 	// 重建运行时 → SSE 订阅 + 全量对齐（B7：恢复完整运行时）。mode 由 Suspend 入口传入。
 	rt := m.newRuntime(taskID)
 	m.setRuntime(taskID, rt)
-	rt.registerGroup(roleLegacyServe, serveName)
+	rt.registerGroup(roleRuntime, serveName)
 	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode); err != nil {
 		m.clearRuntime(taskID)
 		return false, fmt.Errorf("sse resubscribe: %w", err)
 	}
-	// 重开 tui 会话（若不存在），锚定确定 session（design.md §4：不使用 --continue）。
-	tuiName := tuiSessionName(taskID)
-	if tuiExists, _ := m.proc.HasSession(tuiName); !tuiExists {
-		env, err := m.loadEnvSnapshot(row)
-		if err != nil {
-			m.clearRuntime(taskID)
-			return false, fmt.Errorf("load env snapshot: %w", err)
-		}
-		tuiEnv := copyMap(env)
-		tuiEnv["OPENCODE_SERVER_PASSWORD"] = password
-		sessionID, aerr := m.resolveAnchorSession(ctx, oc, row)
-		if aerr != nil {
-			m.clearRuntime(taskID)
-			return false, fmt.Errorf("reopen tui: %w", aerr)
-		}
-		if err := m.proc.NewSession(newSessionSpec(tuiName, row.WorktreePath, tuiEnv,
-			[]string{"opencode", "attach", fmt.Sprintf("http://127.0.0.1:%d", port), "--session", sessionID})); err != nil {
-			m.clearRuntime(taskID)
-			return false, fmt.Errorf("reopen tui: %w", err)
-		}
-	}
-	rt.registerGroup(roleLegacyTUI, tuiName)
-	// 退出监视（watchers 重建）。
 	m.watchServeExit(taskID, serveName)
-	m.watchTUIExit(taskID, tuiName)
 	return true, nil
 }
 
 // forceKillAll 对已死路径强制 kill 全部会话（尽力清理）。
 // R7 fail-closed：HasSession/KillSession infra 错误 MUST 收集为 killErr entry，
 // 不得吞错——无法清理的会话经 finishSund 记 retryable notice 形成可重试 debt
-//（否则残留会话下次 Activate 被 residual 门禁永久阻塞，design.md §5/§8）。
+// （否则残留会话下次 Activate 被 residual 门禁永久阻塞，design.md §5/§8）。
 // ErrNoTmuxServer 视为 absent（无 server 即无会话可清）。
 func (m *Manager) forceKillAll(ctx context.Context, names []string) []killResultEntry {
 	var out []killResultEntry
@@ -336,7 +331,11 @@ func (m *Manager) listShellSessions(taskID string) ([]string, error) {
 
 // recoverPassword 从 serve 会话环境恢复密码（persist 恢复 / suspend 修复用，design.md §2）。
 func (m *Manager) recoverPassword(ctx context.Context, taskID string) string {
-	pw, err := m.proc.ShowSessionEnv(serveSessionName(taskID), "OPENCODE_SERVER_PASSWORD")
+	pw, err := m.proc.ShowSessionEnv(runtimeSessionName(taskID), "OPENCODE_SERVER_PASSWORD")
+	if err == nil && pw != "" {
+		return pw
+	}
+	pw, err = m.proc.ShowSessionEnv(serveSessionName(taskID), "OPENCODE_SERVER_PASSWORD")
 	if err != nil {
 		return ""
 	}

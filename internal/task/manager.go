@@ -67,6 +67,11 @@ type TaskStore interface {
 	// 实际推进（P1.4.5 结构化）。不加跨任务唯一索引；冲突语义由调用方按入口处理
 	//（SSE/对齐忽略+诊断，锚定失败+last_error）。
 	ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error)
+	// ClaimTaskSessionAndSetAnchor 单事务 claim + 写入 tasks.anchor_session_id（D5）。
+	// 冲突时归属与 anchor 均不修改。
+	ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error)
+	// ClearTaskAnchorConditional 条件清空锚定（D5 CAS）：Matched=命中并清空。
+	ClearTaskAnchorConditional(ctx context.Context, taskID, oldAnchor string) (application.MutationResult, error)
 	// TouchOwnedTaskSession 条件 UPDATE 仅本任务已归属行的 last_seen_at（D8）。
 	// 绝不插入；MutationResult.Matched=命中归属行（同值为 Matched+!Changed），!Matched
 	//（未归属行）为正常路径。供 session.updated 事件使用（MUST NOT 创建归属）。
@@ -281,9 +286,6 @@ type runtimeRole string
 const (
 	roleRuntime runtimeRole = "runtime"
 	roleShell   runtimeRole = "shell"
-	// roleLegacyServe / roleLegacyTUI 仅过渡期使用（Activate 仍建双进程），Phase 2 删除。
-	roleLegacyServe runtimeRole = "serve"
-	roleLegacyTUI   runtimeRole = "tui"
 )
 
 // runtimeGroup 对应 design.md §2 RuntimeGroup。
