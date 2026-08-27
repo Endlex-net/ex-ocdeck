@@ -4,11 +4,10 @@
 // 覆盖（recordingPublisher 断言 commit helper 调用位）：
 //   - CreateTask 成功发布一次 task.created；失败零发布；
 //   - UpdateStatus/Conditional/CommitCreated：StatusChanged=true 发布 task.status_changed
-//     （含 from/to）；同值 status + last_error 变更（Changed+UpdatedAtAdvanced）仅发布
-//     task.activity_changed；Changed 但 updated_at 未跨秒推进零发布；!Matched 零发布；
-//     error 零发布；
-//   - SetDeleteMode/UpdateEnvSnapshot/UpdateLastPort：仅 Changed && UpdatedAtAdvanced
-//     发布 task.activity_changed。
+//     （含 from/to）；同值 status + last_error 变更（Changed=true，含同秒）仅发布
+//     task.activity_changed；!Matched 零发布；error 零发布；
+//   - SetDeleteMode/UpdateEnvSnapshot/UpdateLastPort：Changed=true 发布
+//     task.activity_changed（含同秒）。
 package task
 
 import (
@@ -92,7 +91,7 @@ func TestP146_UpdateStatus_SameStatusLastErrorChangePublishesActivity(t *testing
 	}
 }
 
-func TestP146_UpdateStatus_ChangedWithoutUpdatedAtAdvanceNoPublish(t *testing.T) {
+func TestP146_UpdateStatus_ChangedWithoutUpdatedAtAdvancePublishesActivity(t *testing.T) {
 	repo := &fakeTaskRepo{transitionRes: application.TransitionResult{
 		MutationResult: application.MutationResult{Matched: true, Changed: true},
 	}}
@@ -103,8 +102,8 @@ func TestP146_UpdateStatus_ChangedWithoutUpdatedAtAdvanceNoPublish(t *testing.T)
 	if _, err := svc.UpdateStatus(context.Background(), "t1", ocdecktask.StatusSuspended, &le); err != nil {
 		t.Fatalf("UpdateStatus err: %v", err)
 	}
-	if len(pub.events) != 0 {
-		t.Fatalf("same-second change should not publish, got %v", pub.events)
+	if len(pub.events) != 1 || pub.events[0] != string(ocdeckevent.TypeTaskActivityChanged) {
+		t.Fatalf("same-second change events = %v, want [task.activity_changed]", pub.events)
 	}
 }
 
@@ -139,6 +138,100 @@ func TestP146_CommitCreated_StatusChangedPublishesTransition(t *testing.T) {
 	}
 }
 
+func TestP146_CommitCreated_SameSecondChangePublishesActivity(t *testing.T) {
+	repo := &fakeTaskRepo{transitionRes: application.TransitionResult{
+		MutationResult: application.MutationResult{Matched: true, Changed: true},
+	}}
+	pub := &recordingPublisher{}
+	svc := newSvc(repo, &fakeReadRepo{}, pub)
+	if _, err := svc.CommitCreated(context.Background(), "t1", ocdecktask.StatusCreating, ocdecktask.InitStatusNone); err != nil {
+		t.Fatalf("CommitCreated err: %v", err)
+	}
+	if len(pub.events) != 1 || pub.events[0] != string(ocdeckevent.TypeTaskActivityChanged) {
+		t.Fatalf("events = %v, want [task.activity_changed]", pub.events)
+	}
+}
+
+func TestP146_CommitCreated_NoChangeNoPublish(t *testing.T) {
+	repo := &fakeTaskRepo{transitionRes: application.TransitionResult{
+		MutationResult: application.MutationResult{Matched: true, Changed: false},
+	}}
+	pub := &recordingPublisher{}
+	svc := newSvc(repo, &fakeReadRepo{}, pub)
+	if _, err := svc.CommitCreated(context.Background(), "t1", ocdecktask.StatusCreating, ocdecktask.InitStatusNone); err != nil {
+		t.Fatalf("CommitCreated err: %v", err)
+	}
+	if len(pub.events) != 0 {
+		t.Fatalf("no-change CommitCreated should not publish, got %v", pub.events)
+	}
+}
+
+func TestP146_CommitCreated_ErrorNoPublish(t *testing.T) {
+	repo := &fakeTaskRepo{transitionErr: errors.New("db error")}
+	pub := &recordingPublisher{}
+	svc := newSvc(repo, &fakeReadRepo{}, pub)
+	if _, err := svc.CommitCreated(context.Background(), "t1", ocdecktask.StatusCreating, ocdecktask.InitStatusNone); err == nil {
+		t.Fatal("want err, got nil")
+	}
+	if len(pub.events) != 0 {
+		t.Fatalf("error path should not publish, got %v", pub.events)
+	}
+}
+
+func TestP146_UpdateStatusConditional_SameSecondChangePublishesActivity(t *testing.T) {
+	repo := &fakeTaskRepo{transitionRes: application.TransitionResult{
+		MutationResult: application.MutationResult{Matched: true, Changed: true},
+	}}
+	pub := &recordingPublisher{}
+	svc := newSvc(repo, &fakeReadRepo{}, pub)
+	if _, err := svc.UpdateStatusConditional(context.Background(), "t1", ocdecktask.StatusSuspended, ocdecktask.StatusActivating, nil); err != nil {
+		t.Fatalf("UpdateStatusConditional err: %v", err)
+	}
+	if len(pub.events) != 1 || pub.events[0] != string(ocdeckevent.TypeTaskActivityChanged) {
+		t.Fatalf("events = %v, want [task.activity_changed]", pub.events)
+	}
+}
+
+func TestP146_UpdateStatusConditional_NoChangeNoPublish(t *testing.T) {
+	repo := &fakeTaskRepo{transitionRes: application.TransitionResult{
+		MutationResult: application.MutationResult{Matched: true, Changed: false},
+	}}
+	pub := &recordingPublisher{}
+	svc := newSvc(repo, &fakeReadRepo{}, pub)
+	if _, err := svc.UpdateStatusConditional(context.Background(), "t1", ocdecktask.StatusSuspended, ocdecktask.StatusActivating, nil); err != nil {
+		t.Fatalf("UpdateStatusConditional err: %v", err)
+	}
+	if len(pub.events) != 0 {
+		t.Fatalf("no-change UpdateStatusConditional should not publish, got %v", pub.events)
+	}
+}
+
+func TestP146_UpdateStatusConditional_ErrorNoPublish(t *testing.T) {
+	repo := &fakeTaskRepo{transitionErr: errors.New("db error")}
+	pub := &recordingPublisher{}
+	svc := newSvc(repo, &fakeReadRepo{}, pub)
+	if _, err := svc.UpdateStatusConditional(context.Background(), "t1", ocdecktask.StatusSuspended, ocdecktask.StatusActivating, nil); err == nil {
+		t.Fatal("want err, got nil")
+	}
+	if len(pub.events) != 0 {
+		t.Fatalf("error path should not publish, got %v", pub.events)
+	}
+}
+
+func TestP146_UpdateStatus_NoChangeNoPublish(t *testing.T) {
+	repo := &fakeTaskRepo{transitionRes: application.TransitionResult{
+		MutationResult: application.MutationResult{Matched: true, Changed: false},
+	}}
+	pub := &recordingPublisher{}
+	svc := newSvc(repo, &fakeReadRepo{}, pub)
+	if _, err := svc.UpdateStatus(context.Background(), "t1", ocdecktask.StatusSuspended, nil); err != nil {
+		t.Fatalf("UpdateStatus err: %v", err)
+	}
+	if len(pub.events) != 0 {
+		t.Fatalf("no-change UpdateStatus should not publish, got %v", pub.events)
+	}
+}
+
 func TestP146_UpdateStatusConditional_NotMatchedNoPublish(t *testing.T) {
 	// BeginActivate CAS suspended→activating 失配（!Matched）：零发布。
 	repo := &fakeTaskRepo{}
@@ -157,26 +250,27 @@ func TestP146_UpdateStatusConditional_NotMatchedNoPublish(t *testing.T) {
 	}
 }
 
-func TestP146_Mutations_PublishActivityOnlyWhenAdvanced(t *testing.T) {
+func TestP146_Mutations_PublishActivityOnChange(t *testing.T) {
 	advanced := application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: true}
 	sameSecond := application.MutationResult{Matched: true, Changed: true}
+	unchanged := application.MutationResult{Matched: true, Changed: false}
 
+	calls := []func(s *LifecycleService) error{
+		func(s *LifecycleService) error {
+			_, err := s.SetDeleteMode(context.Background(), "t1", ocdecktask.DeleteModeForce)
+			return err
+		},
+		func(s *LifecycleService) error {
+			env := "snap"
+			_, err := s.UpdateEnvSnapshot(context.Background(), "t1", &env)
+			return err
+		},
+		func(s *LifecycleService) error {
+			_, err := s.UpdateLastPort(context.Background(), "t1", 50001)
+			return err
+		},
+	}
 	t.Run("advanced publishes activity", func(t *testing.T) {
-		calls := []func(s *LifecycleService) error{
-			func(s *LifecycleService) error {
-				_, err := s.SetDeleteMode(context.Background(), "t1", ocdecktask.DeleteModeForce)
-				return err
-			},
-			func(s *LifecycleService) error {
-				env := "snap"
-				_, err := s.UpdateEnvSnapshot(context.Background(), "t1", &env)
-				return err
-			},
-			func(s *LifecycleService) error {
-				_, err := s.UpdateLastPort(context.Background(), "t1", 50001)
-				return err
-			},
-		}
 		for i, call := range calls {
 			pub := &recordingPublisher{}
 			svc := newSvc(&fakeTaskRepo{mutationRes: advanced}, &fakeReadRepo{}, pub)
@@ -188,7 +282,7 @@ func TestP146_Mutations_PublishActivityOnlyWhenAdvanced(t *testing.T) {
 			}
 		}
 	})
-	t.Run("same-second change not publishes", func(t *testing.T) {
+	t.Run("same-second change publishes activity", func(t *testing.T) {
 		pub := &recordingPublisher{}
 		svc := newSvc(&fakeTaskRepo{mutationRes: sameSecond}, &fakeReadRepo{}, pub)
 		if _, err := svc.SetDeleteMode(context.Background(), "t1", ocdecktask.DeleteModeForce); err != nil {
@@ -200,18 +294,37 @@ func TestP146_Mutations_PublishActivityOnlyWhenAdvanced(t *testing.T) {
 		if _, err := svc.UpdateLastPort(context.Background(), "t1", 50001); err != nil {
 			t.Fatal(err)
 		}
-		if len(pub.events) != 0 {
-			t.Fatalf("same-second mutations should not publish, got %v", pub.events)
+		if len(pub.events) != 3 {
+			t.Fatalf("same-second mutations events = %v, want 3 activity_changed", pub.events)
+		}
+		for i, ev := range pub.events {
+			if ev != string(ocdeckevent.TypeTaskActivityChanged) {
+				t.Fatalf("events[%d] = %q, want task.activity_changed", i, ev)
+			}
+		}
+	})
+	t.Run("no change not publishes", func(t *testing.T) {
+		for i, call := range calls {
+			pub := &recordingPublisher{}
+			svc := newSvc(&fakeTaskRepo{mutationRes: unchanged}, &fakeReadRepo{}, pub)
+			if err := call(svc); err != nil {
+				t.Fatalf("call %d err: %v", i, err)
+			}
+			if len(pub.events) != 0 {
+				t.Fatalf("call %d unchanged mutation should not publish, got %v", i, pub.events)
+			}
 		}
 	})
 	t.Run("error not publishes", func(t *testing.T) {
-		pub := &recordingPublisher{}
-		svc := newSvc(&fakeTaskRepo{mutationErr: errors.New("db error")}, &fakeReadRepo{}, pub)
-		if _, err := svc.UpdateLastPort(context.Background(), "t1", 50001); err == nil {
-			t.Fatal("want err, got nil")
-		}
-		if len(pub.events) != 0 {
-			t.Fatalf("error path should not publish, got %v", pub.events)
+		for i, call := range calls {
+			pub := &recordingPublisher{}
+			svc := newSvc(&fakeTaskRepo{mutationErr: errors.New("db error")}, &fakeReadRepo{}, pub)
+			if err := call(svc); err == nil {
+				t.Fatalf("call %d: want err, got nil", i)
+			}
+			if len(pub.events) != 0 {
+				t.Fatalf("call %d error path should not publish, got %v", i, pub.events)
+			}
 		}
 	})
 }

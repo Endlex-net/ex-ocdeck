@@ -35,8 +35,8 @@ const (
 	TypeTaskStatusChanged = "task.status_changed"
 	// TypeTaskDeleted 任务行已删除。RID=task 主键，Payload={from}。
 	TypeTaskDeleted = "task.deleted"
-	// TypeTaskActivityChanged 任务可见字段真实变更且 updated_at 跨秒推进且未伴随 status 迁移。
-	// RID=task 主键，Payload={}。
+	// TypeTaskActivityChanged 未伴随 status 迁移的任务行非 status 真实变更（Changed=true）。
+	// 不再要求 updated_at 跨秒推进。RID=task 主键，Payload={}。
 	TypeTaskActivityChanged = "task.activity_changed"
 	// TypeSessionClaimed 任务认领了 opencode 会话归属（或归属信息被推进）。
 	// RID=session 主键，Payload={task_id}。
@@ -186,7 +186,7 @@ func NewSessionsAligned(taskID string, inserted, touched, deleted int, sessionID
 	return Event{
 		Topic: TopicSession,
 		Type:  TypeSessionsAligned,
-		RID:  taskID,
+		RID:   taskID,
 		Payload: SessionsAlignedPayload{
 			Inserted:   inserted,
 			Touched:    touched,
