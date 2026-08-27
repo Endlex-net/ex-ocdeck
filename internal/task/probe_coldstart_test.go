@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sync"
@@ -65,8 +66,12 @@ func newTestManagerWithShortProbeBackoff(t *testing.T, store TaskStore, proc Pro
 func TestActivate_ProbeColdStartRetryThenSuccess(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
+	store.mutTask("t1", func(tr *TaskRow) {
+		tr.AnchorSessionID = sql.NullString{String: "sess-existing", Valid: true}
+	})
 	proc := newMockProc()
 	oc := newProbeSequenceOC(true, opencode.ErrServeNotReady, nil)
+	oc.sessions = []opencode.Session{{ID: "sess-existing"}}
 	m := newTestManagerWithShortProbeBackoff(t, store, proc, newMockWorktree(), oc)
 
 	if err := m.Activate(context.Background(), "t1"); err != nil {
@@ -75,8 +80,8 @@ func TestActivate_ProbeColdStartRetryThenSuccess(t *testing.T) {
 	if got := oc.probeCalls(); got != 2 {
 		t.Errorf("Probe calls = %d, want 2", got)
 	}
-	if !proc.sessions[serveSessionName("t1")] {
-		t.Error("serve session should NOT be killed during cold-start retry")
+	if !proc.sessions[runtimeSessionName("t1")] {
+		t.Error("runtime session should NOT be killed during cold-start retry")
 	}
 	row, _ := store.GetTask(context.Background(), "t1")
 	if row.Status != StatusActive {
@@ -107,8 +112,8 @@ func TestActivate_ProbeColdStartExhaustedFailsAndKillsSession(t *testing.T) {
 	if got := oc.probeCalls(); got != probeColdStartAttempts {
 		t.Errorf("Probe calls = %d, want %d", got, probeColdStartAttempts)
 	}
-	if proc.sessions[serveSessionName("t1")] {
-		t.Error("serve session should be killed after cold-start retry exhausted")
+	if proc.sessions[runtimeSessionName("t1")] {
+		t.Error("runtime session should be killed after cold-start retry exhausted")
 	}
 	row, _ := store.GetTask(context.Background(), "t1")
 	if row.Status != StatusSuspended {
@@ -138,8 +143,8 @@ func TestActivate_ProbeCapabilityMismatchNoRetry(t *testing.T) {
 	if got := oc.probeCalls(); got != 1 {
 		t.Errorf("Probe calls = %d, want 1 (no retry on mismatch)", got)
 	}
-	if proc.sessions[serveSessionName("t1")] {
-		t.Error("serve session should be killed on capability mismatch")
+	if proc.sessions[runtimeSessionName("t1")] {
+		t.Error("runtime session should be killed on capability mismatch")
 	}
 	row, _ := store.GetTask(context.Background(), "t1")
 	if row.Status != StatusSuspended {
@@ -192,9 +197,13 @@ func TestActivate_ProbeUnknownErrorNoRetry(t *testing.T) {
 func TestActivate_ProbeWrappedErrServeNotReadyRetries(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
+	store.mutTask("t1", func(tr *TaskRow) {
+		tr.AnchorSessionID = sql.NullString{String: "sess-existing", Valid: true}
+	})
 	proc := newMockProc()
 	wrapped := fmt.Errorf("upstream: %w", opencode.ErrServeNotReady)
 	oc := newProbeSequenceOC(true, wrapped, nil)
+	oc.sessions = []opencode.Session{{ID: "sess-existing"}}
 	m := newTestManagerWithShortProbeBackoff(t, store, proc, newMockWorktree(), oc)
 
 	if err := m.Activate(context.Background(), "t1"); err != nil {

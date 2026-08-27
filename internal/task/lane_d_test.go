@@ -41,7 +41,7 @@ func TestLockTaskWait_CtxCancel_Conflict(t *testing.T) {
 	defer unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancel()
-	_, err := m.ReopenAttach(ctx, "t1")
+	_, err := m.lockTaskWait(ctx, "t1")
 	if err == nil {
 		t.Fatal("expected error on ctx cancel during lock wait")
 	}
@@ -52,44 +52,47 @@ func TestLockTaskWait_CtxCancel_Conflict(t *testing.T) {
 
 // --- 任务 2：Lane D ---
 
-// TestLockTaskWait_StatusChangedAfterLock_InvalidState 验证拿锁后复查：
-// 等待期间任务状态被改为 suspended，lockTaskWait 拿锁后返回 invalid_state（不执行副作用）。
-func TestLockTaskWait_StatusChangedAfterLock_InvalidState(t *testing.T) {
+// TestLockTaskWait_StatusChangedAfterLock_OnlyExistsCheck 验证拿锁后复查（G4-3
+// attempt 2 语义）：等待器只复查任务存在，不做 active 状态复查——等锁期间
+// active→suspended/activating 等合法迁移由调用方（ReopenAttach）按 D8 表统一分派，
+// 等待器不得抢先返回 invalid_state（曾导致等锁期间 active→activating 误发 4010）。
+func TestLockTaskWait_StatusChangedAfterLock_OnlyExistsCheck(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
 	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
 	proc := newMockProc()
-	proc.sessions[serveSessionName("t1")] = true
-	proc.sessions[tuiSessionName("t1")] = true
+	proc.sessions[runtimeSessionName("t1")] = true
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 
-	// 主 goroutine 持锁，使 ReopenAttach 进入等待路径。
 	unlock, _ := m.tryLockTask("t1")
 
-	// 异步：等待 ReopenAttach 进入等待后，改状态为 suspended 再释放锁，
-	// 使 lockTaskWait 拿到锁后复查到非 active → invalid_state。
-	reopenDone := make(chan error, 1)
+	waitDone := make(chan struct {
+		unlock func()
+		err    error
+	}, 1)
 	go func() {
-		_, err := m.ReopenAttach(context.Background(), "t1")
-		reopenDone <- err
+		unlock, err := m.lockTaskWait(context.Background(), "t1")
+		waitDone <- struct {
+			unlock func()
+			err    error
+		}{unlock, err}
 	}()
-	// 等待 ReopenAttach 确实进入等待。
 	time.Sleep(50 * time.Millisecond)
-	// 改状态为 suspended（等待期间任务被挂起）。
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusSuspended })
-	// 释放锁，让等待方拿到锁后复查。
+	// 等锁期间状态迁移（active→activating 是恢复场景的真实迁移；suspended 亦同）。
+	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActivating })
 	unlock()
 
 	select {
-	case err := <-reopenDone:
-		if err == nil {
-			t.Fatal("expected invalid_state after status changed during wait")
+	case r := <-waitDone:
+		if r.err != nil {
+			t.Fatalf("lockTaskWait must not fail on legal status transition during wait: %v", r.err)
 		}
-		if OpErrorCode(err) != codeInvalidState {
-			t.Errorf("code=%v want invalid_state (status changed during wait), err=%v", OpErrorCode(err), err)
+		if r.unlock == nil {
+			t.Fatal("expected lock handoff")
 		}
+		r.unlock() // 等待器成功拿锁：状态分派归调用方，不执行副作用
 	case <-time.After(5 * time.Second):
-		t.Fatal("ReopenAttach did not return after lock released")
+		t.Fatal("lockTaskWait did not return after lock released")
 	}
 }
 
@@ -100,9 +103,8 @@ func TestLockTaskWait_NormalWaitSuccess(t *testing.T) {
 	seedSuspendedTask(store, "t1", "p1")
 	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
 	proc := newMockProc()
-	proc.sessions[serveSessionName("t1")] = true
-	proc.sessions[tuiSessionName("t1")] = true
-	proc.envValues[serveSessionName("t1")] = map[string]string{"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001"}
+	proc.sessions[runtimeSessionName("t1")] = true
+	proc.envValues[runtimeSessionName("t1")] = map[string]string{"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001"}
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 
 	// 手动持锁。
@@ -114,14 +116,11 @@ func TestLockTaskWait_NormalWaitSuccess(t *testing.T) {
 		unlock()
 	}()
 
-	// ReopenAttach 等待锁，拿到后复查 active，tui 已存在 → 复用返回。
-	tid, err := m.ReopenAttach(context.Background(), "t1")
+	unlock2, err := m.lockTaskWait(context.Background(), "t1")
 	if err != nil {
-		t.Fatalf("ReopenAttach: %v", err)
+		t.Fatalf("lockTaskWait: %v", err)
 	}
-	if string(tid) != tuiSessionName("t1") {
-		t.Errorf("tid=%s want %s (reuse existing tui)", tid, tuiSessionName("t1"))
-	}
+	unlock2()
 }
 
 // --- 任务 2：Lane D ---

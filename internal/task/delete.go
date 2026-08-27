@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"time"
 
 	ocdecksess "ocdeck/internal/domain/session"
@@ -424,8 +423,14 @@ func (m *Manager) deleteOCSessions(ctx context.Context, row TaskRow) error {
 		return nil
 	}
 	// 取得 serve 端口与密码：优先复用活跃 serve，否则起一次性 serve。
-	serveName := serveSessionName(row.ID)
+	serveName := runtimeSessionName(row.ID)
 	alive, _ := m.proc.HasSession(serveName)
+	if !alive {
+		if legacyAlive, _ := m.proc.HasSession(serveSessionName(row.ID)); legacyAlive {
+			serveName = serveSessionName(row.ID)
+			alive = true
+		}
+	}
 	var port int
 	var password string
 	var errs []error
@@ -495,11 +500,12 @@ func (m *Manager) deleteOCSessions(ctx context.Context, row TaskRow) error {
 				errs = append(errs, nerr)
 			}
 		} else {
+			cls := classifyKillResult(res)
 			if nerr := m.recordResidualNoticeFromDisposition(ctx, row.ID, serveName, res); nerr != nil {
 				errs = append(errs, nerr)
 			}
-			if res.Disposition != "" && res.Disposition != process.DispositionClean {
-				errs = append(errs, fmt.Errorf("temp serve %s cleanup not clean: %s", serveName, res.Disposition))
+			if cls.action != "none" {
+				errs = append(errs, fmt.Errorf("temp serve %s cleanup not clean: %s", serveName, cls.reason))
 			}
 		}
 	}
@@ -513,10 +519,10 @@ func (m *Manager) startTempServe(ctx context.Context, row TaskRow) (int, string,
 		return 0, "", err
 	}
 	password := newRandomPassword()
-	serveName := serveSessionName(row.ID)
+	serveName := runtimeSessionName(row.ID)
 	env := map[string]string{"OPENCODE_SERVER_PASSWORD": password, "OCDECK_TASK_ID": row.ID}
 	if err := m.proc.NewSession(newSessionSpec(serveName, row.WorktreePath, env,
-		[]string{"opencode", "serve", "--port", strconv.Itoa(port), "--hostname", "127.0.0.1"})); err != nil {
+		runtimeCmdArgv(port, ""))); err != nil {
 		return 0, "", err
 	}
 	// 等待就绪。
@@ -534,8 +540,8 @@ func (m *Manager) startTempServe(ctx context.Context, row TaskRow) (int, string,
 		if nerr := m.recordResidualNoticeFromDisposition(ctx, row.ID, serveName, res); nerr != nil {
 			return 0, "", fmt.Errorf("temp serve health check: %w; record notice: %v", err, nerr)
 		}
-		if res.Disposition != "" && res.Disposition != process.DispositionClean {
-			return 0, "", fmt.Errorf("temp serve health check: %w; cleanup not clean: %s", err, res.Disposition)
+		if cls := classifyKillResult(res); cls.action != "none" {
+			return 0, "", fmt.Errorf("temp serve health check: %w; cleanup not clean: %s", err, cls.reason)
 		}
 		return 0, "", fmt.Errorf("temp serve health check: %w", err)
 	}
@@ -545,37 +551,49 @@ func (m *Manager) startTempServe(ctx context.Context, row TaskRow) (int, string,
 // killResidualSessions kill 残余 tmux 会话（serve/tui/shell）。
 // B8：真实返回错误——kill/snapshot/reap 失败 → deletion_failed（不得继续删 worktree/DB 致 tickets 随 CASCADE 丢失）。
 func (m *Manager) killResidualSessions(ctx context.Context, taskID string) error {
-	// kill 残余 tmux 会话：tui → shells → serve（design.md §19/§12；serve 最后杀，
-	// 清理期间继续捕获 session）。
+	// 客户端/shell 先清，runtime 与 leftover serve 后清；任一失败聚合，不 fail-fast。
+	var names []string
+	names = append(names, tuiSessionName(taskID))
 	shellNames, err := m.listShellSessions(taskID)
 	if err != nil {
-		return fmt.Errorf("kill residual sessions: enumerate shells (task %s): %w", taskID, err)
+		err = fmt.Errorf("kill residual sessions: enumerate shells (task %s): %w", taskID, err)
+	} else {
+		names = append(names, shellNames...)
 	}
-	names := append([]string{tuiSessionName(taskID)}, shellNames...)
-	names = append(names, serveSessionName(taskID))
+	names = append(names, runtimeSessionName(taskID), serveSessionName(taskID))
+	var errs []error
+	if err != nil {
+		errs = append(errs, err)
+	}
 	for _, name := range names {
 		exists, herr := m.proc.HasSession(name)
 		if herr != nil && !errors.Is(herr, process.ErrNoTmuxServer) {
-			// R7 fail-closed：HasSession infra 错误 MUST 返回错误落 deletion_failed，
-			// 不得吞错当 absent 继续删 worktree/DB（残留会话下次 Activate 被门禁阻塞，design.md §5/§8）。
-			return fmt.Errorf("kill residual sessions: has session %s: %w", name, herr)
+			errs = append(errs, fmt.Errorf("kill residual sessions: has session %s: %w", name, herr))
+			continue
 		}
 		if !exists {
 			continue
 		}
 		res, kerr := m.proc.KillSession(name)
 		if kerr != nil {
-			return fmt.Errorf("kill residual session %s: %w", name, kerr)
-		}
-		if res.Disposition != "" && res.Disposition != process.DispositionClean {
-			// 记录 notice；notice 写入错误 MUST 聚合（不静默，design.md §8）；返回错误以阻止继续删除（保留 tickets 供重试）。
-			if nerr := m.recordResidualNoticeFromDisposition(ctx, taskID, name, res); nerr != nil {
-				return fmt.Errorf("kill residual session %s: %s; record notice: %w", name, res.Disposition, nerr)
+			if nerr := m.recordResidualNotice(ctx, taskID, name, res.CleanupTickets, noticeReasonKillFailed, true); nerr != nil {
+				errs = append(errs, fmt.Errorf("kill residual session %s: %w; record notice: %v", name, kerr, nerr))
+			} else {
+				errs = append(errs, fmt.Errorf("kill residual session %s: %w", name, kerr))
 			}
-			return fmt.Errorf("kill residual session %s: %s", name, res.Disposition)
+			continue
+		}
+		cls := classifyKillResult(res)
+		if cls.action == "none" {
+			continue
+		}
+		if nerr := m.recordResidualNoticeFromDisposition(ctx, taskID, name, res); nerr != nil {
+			errs = append(errs, fmt.Errorf("kill residual session %s: %s; record notice: %w", name, cls.reason, nerr))
+		} else {
+			errs = append(errs, fmt.Errorf("kill residual session %s: %s", name, cls.reason))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // hasDebtTickets 判断 notice 是否有可重试进程 debt（B8：仅 retryable residual_processes 阻止删除；
@@ -626,9 +644,12 @@ func (m *Manager) retryDebt(ctx context.Context, taskID string, entries []notice
 					// B8：kill 错误不得忽略。同样保留当前 + 后续未处理 entry。
 					return appendRemaining(remaining, entries[i:]), fmt.Errorf("kill session %s: %w", sessionName, kerr)
 				}
-				if res.Disposition != "" && res.Disposition != process.DispositionClean {
+				cls := classifyKillResult(res)
+				if cls.action != "none" {
 					tickets = append(tickets, res.CleanupTickets...)
 					e.Data["cleanupTickets"] = tickets
+					e.Data["reason"] = cls.reason
+					e.Data["retryable"] = cls.retryable
 					remaining = append(remaining, e)
 					continue
 				}

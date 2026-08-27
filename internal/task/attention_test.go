@@ -731,7 +731,7 @@ func TestAttention_BackgroundRetry_ConcurrentTypes(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
 	proc := newMockProc()
-	proc.envValues[serveSessionName("t1")] = map[string]string{
+	proc.envValues[runtimeSessionName("t1")] = map[string]string{
 		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001",
 	}
 

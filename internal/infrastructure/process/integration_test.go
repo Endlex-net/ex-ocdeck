@@ -121,7 +121,7 @@ func TestNewSession_EnvInjected(t *testing.T) {
 	m := newTestManager(t)
 	defer cleanupTmux(t, m)
 
-	name := "ocdeck-task1-serve"
+	name := "ocdeck-task1-runtime"
 	dir := t.TempDir()
 	spec := SessionSpec{
 		Name:    name,
@@ -166,7 +166,7 @@ func TestTmuxSocket_InTmpdir(t *testing.T) {
 	m := newTestManager(t)
 	defer cleanupTmux(t, m)
 
-	name := "ocdeck-socktest-serve"
+	name := "ocdeck-socktest-runtime"
 	spec := SessionSpec{
 		Name:    name,
 		Dir:     t.TempDir(),
@@ -217,7 +217,7 @@ func TestNewSession_CmdArgvWithSpaces(t *testing.T) {
 	defer cleanupTmux(t, m)
 
 	outFile := filepath.Join(t.TempDir(), "out.txt")
-	name := "ocdeck-task2-serve"
+	name := "ocdeck-task2-runtime"
 	dir := t.TempDir()
 	// sh -c 'echo "hello world" > /path' —— 参数含空格与引号。
 	spec := SessionSpec{
@@ -268,7 +268,7 @@ func TestHasSession_DistinguishesAbsent(t *testing.T) {
 	}
 
 	// 创建会话后应返回 true。
-	name := "ocdeck-task3-serve"
+	name := "ocdeck-task3-runtime"
 	spec := SessionSpec{
 		Name:    name,
 		Dir:     t.TempDir(),
@@ -333,7 +333,7 @@ func TestKillSession_Clean(t *testing.T) {
 	m := newTestManager(t)
 	defer cleanupTmux(t, m)
 
-	name := "ocdeck-task4-serve"
+	name := "ocdeck-task4-runtime"
 	spec := SessionSpec{
 		Name:    name,
 		Dir:     t.TempDir(),
@@ -374,7 +374,7 @@ func TestReaper_ReapsEscapedDescendants(t *testing.T) {
 	m := newTestManager(t)
 	defer cleanupTmux(t, m)
 
-	name := "ocdeck-task5-serve"
+	name := "ocdeck-task5-runtime"
 	// 启动一个 bash 子进程，trap "" HUP 忽略 SIGHUP，其内 sleep 600。
 	// kill-session 后该 bash 幸存（reparent 到 init），reaper 应按身份校验后 TERM/KILL。
 	// 逃逸 bash 将自身 PID 写入 marker 文件，供测试精确追踪（S5：避免全局 pgrep
@@ -448,7 +448,7 @@ func TestListSessions_EmptyAndFilters(t *testing.T) {
 	}
 
 	// 创建 ocdeck 会话后应列出。
-	name := "ocdeck-task6-serve"
+	name := "ocdeck-task6-runtime"
 	spec := SessionSpec{
 		Name:    name,
 		Dir:     t.TempDir(),
@@ -487,7 +487,7 @@ func TestWatchExit_FiresOnSessionGone(t *testing.T) {
 	m := newTestManager(t)
 	defer cleanupTmux(t, m)
 
-	name := "ocdeck-task7-serve"
+	name := "ocdeck-task7-runtime"
 	spec := SessionSpec{
 		Name:    name,
 		Dir:     t.TempDir(),
@@ -553,7 +553,7 @@ func TestKillServerGlobal_ReapsAllSessions(t *testing.T) {
 	marker := filepath.Join(dir, "marker")
 	pidFile := filepath.Join(dir, "pid")
 	if err := m.NewSession(SessionSpec{
-		Name:    "ocdeck-task8-serve",
+		Name:    "ocdeck-task8-runtime",
 		Dir:     dir,
 		Env:     map[string]string{},
 		// 逃逸 bash 写自身 PID 到 pidFile，供测试精确追踪（S5：避免全局 pgrep）。
@@ -562,15 +562,15 @@ func TestKillServerGlobal_ReapsAllSessions(t *testing.T) {
 		t.Fatalf("NewSession 1: %v", err)
 	}
 	if err := m.NewSession(SessionSpec{
-		Name:    "ocdeck-task8-tui",
+		Name:    "ocdeck-task8-shell-1",
 		Dir:     dir,
 		Env:     map[string]string{},
 		CmdArgv: []string{"sleep", "30"},
 	}); err != nil {
 		t.Fatalf("NewSession 2: %v", err)
 	}
-	waitForSessionActive(t, m, "ocdeck-task8-serve", 3*time.Second)
-	waitForSessionActive(t, m, "ocdeck-task8-tui", 3*time.Second)
+	waitForSessionActive(t, m, "ocdeck-task8-runtime", 3*time.Second)
+	waitForSessionActive(t, m, "ocdeck-task8-shell-1", 3*time.Second)
 	time.Sleep(500 * time.Millisecond)
 
 	escapedPid := readPidFile(t, pidFile)

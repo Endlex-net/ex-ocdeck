@@ -15,8 +15,10 @@ import (
 
 // --- Lane C：运行时事件与注册竞态 ---
 
-// TestTypedRuntimeEvent_ServeInfraErrorSuspended 验证 C1：serve watcher 收到
-// WatchEventInfraError（tmux 持续故障）→ 完整清理运行时 + last_error + suspended（不静默）。
+// TestTypedRuntimeEvent_ServeInfraErrorSuspended 验证 C1/D4：serve watcher 收到
+// WatchEventInfraError（tmux 持续故障）→ 统一 runtime failure 分派进入幂等恢复
+// （G4-5 收紧断言：不接受 active/activating/suspended 三态全通过——mock 恢复必然
+// 成功，收紧为最终 active + 恰好 1 permit，证明恢复确实发生且仅一次）。
 func TestTypedRuntimeEvent_ServeInfraErrorSuspended(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
@@ -28,53 +30,27 @@ func TestTypedRuntimeEvent_ServeInfraErrorSuspended(t *testing.T) {
 
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	rt.registerGroup("serve", serveSessionName("t1"))
-	rt.registerGroup("tui", tuiSessionName("t1"))
-	m.watchServeExit("t1", serveSessionName("t1"))
+	rt.registerGroup(roleRuntime, runtimeSessionName("t1"))
+	rt.registerGroup(roleRuntime, tuiSessionName("t1"))
+	m.watchServeExit("t1", runtimeSessionName("t1"))
 
-	proc.triggerExit(serveSessionName("t1"), process.WatchEvent{
+	proc.triggerExit(runtimeSessionName("t1"), process.WatchEvent{
 		Type: process.WatchEventInfraError,
 		Err:  errors.New("tmux protocol error"),
 	})
-	time.Sleep(150 * time.Millisecond)
 
-	row, _ := store.GetTask(context.Background(), "t1")
-	if row.Status != StatusSuspended {
-		t.Errorf("infra_error should suspend task; status=%s want suspended", row.Status)
-	}
-	if !row.LastError.Valid || row.LastError.String == "" {
-		t.Error("infra_error must record last_error (not silent)")
+	// 恢复必然发生且收敛回 active（mock 环境无失败注入）。无锚定任务恢复为单
+	// incident 双启动 = 恰好 2 permit；双 incident 才会 ≥3。
+	waitStatusAny(t, store, "t1", 5*time.Second, StatusActive)
+	if got := store.recoveryPermitCount("t1"); got != 2 {
+		t.Errorf("permits=%d want 2 (single recovery incident, dual-start)", got)
 	}
 }
 
-// TestTypedRuntimeEvent_TuiExitKeepsActive 验证 C1：tui watcher session_exit 保持 active（tui_exit 语义）。
-func TestTypedRuntimeEvent_TuiExitKeepsActive(t *testing.T) {
-	store := newMockStore()
-	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
-	proc := newMockProc()
-	proc.sessions[serveSessionName("t1")] = true
-	proc.sessions[tuiSessionName("t1")] = true
-	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
-
-	rt := m.newRuntime("t1")
-	m.setRuntime("t1", rt)
-	rt.registerGroup("serve", serveSessionName("t1"))
-	rt.registerGroup("tui", tuiSessionName("t1"))
-	m.watchTUIExit("t1", tuiSessionName("t1"))
-
-	proc.triggerExit(tuiSessionName("t1"), process.WatchEvent{Type: process.WatchEventSessionExit})
-	time.Sleep(100 * time.Millisecond)
-
-	row, _ := store.GetTask(context.Background(), "t1")
-	if row.Status != StatusActive {
-		t.Errorf("tui_exit should keep active; status=%s want active", row.Status)
-	}
-	// tui group 应已从注册表移除。
-	if _, ok := rt.groups[tuiSessionName("t1")]; ok {
-		t.Error("tui group should be removed from registry after tui_exit")
-	}
-}
+// TestTypedRuntimeEvent_TuiExitKeepsActive：原「TUI 消失保持活跃」语义随独立 TUI
+// 会话模型删除（single-process：TUI 与任务进程同体，-tui 会话仅存在于 legacy
+// 布局并由 reconcile 清理）。等价的「非 runtime 会话退出不影响任务状态」由
+// shell 会话退出测试覆盖（attach_shell 路径，shell_exit 不改变任务状态）。
 
 // TestTypedRuntimeEvent_OldGenIgnored_ViaCurrentRegistry 验证 C1 三元组隔离：
 // 旧代回调不清理新代（回调校验当前 runtime 注册表，非捕获快照）。
@@ -90,16 +66,16 @@ func TestTypedRuntimeEvent_OldGenIgnored_ViaCurrentRegistry(t *testing.T) {
 	// 旧代 runtime + serve group + watcher。
 	oldRT := m.newRuntime("t1")
 	m.setRuntime("t1", oldRT)
-	oldRT.registerGroup("serve", serveSessionName("t1"))
-	m.watchServeExit("t1", serveSessionName("t1"))
+	oldRT.registerGroup(roleRuntime, runtimeSessionName("t1"))
+	m.watchServeExit("t1", runtimeSessionName("t1"))
 
 	// 新代 runtime（generation 递增）。
 	newRT := m.newRuntime("t1")
 	m.setRuntime("t1", newRT)
-	newRT.registerGroup("serve", serveSessionName("t1"))
+	newRT.registerGroup(roleRuntime, runtimeSessionName("t1"))
 
 	// 旧代 watcher 触发 infra_error → 应不匹配新代注册表 → 忽略。
-	proc.triggerExit(serveSessionName("t1"), process.WatchEvent{
+	proc.triggerExit(runtimeSessionName("t1"), process.WatchEvent{
 		Type: process.WatchEventInfraError,
 		Err:  errors.New("old gen infra"),
 	})
@@ -141,8 +117,8 @@ func TestRegisterRuntime_ServeDeadBeforeRegister(t *testing.T) {
 // health/Probe 通过后、注册前崩溃）。
 type lateDieProc struct {
 	*mockProc
-	aliveFor    int
-	hasCalls    int
+	aliveFor int
+	hasCalls int
 }
 
 func (p *lateDieProc) HasSession(name string) (bool, error) {
@@ -248,8 +224,9 @@ type reapFailProc struct {
 
 func (p *reapFailProc) RetryReap(tickets []string) ([]string, error) { return p.left, nil }
 
-// TestPersistResume_RestoresShellWatchersGroups 验证 F2：persist 恢复时补注册 TUI + shell
-// RuntimeGroup 与 watchers（此前仅注册 serve）。
+// TestPersistResume_RestoresShellWatchersGroups 验证 F2：persist 恢复时补注册
+// shell RuntimeGroup 与 watchers（single-process：runtime 会话承载 TUI，无独立
+// -tui 会话；遗留 -tui 会话作为异常会话被清理）。
 func TestPersistResume_RestoresShellWatchersGroups(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
@@ -260,10 +237,9 @@ func TestPersistResume_RestoresShellWatchersGroups(t *testing.T) {
 	store.mutTask("t1", func(r *TaskRow) { r.EnvSnapshot = snapBytes })
 
 	proc := newMockProc()
-	proc.sessions[serveSessionName("t1")] = true
-	proc.sessions[tuiSessionName("t1")] = true
+	proc.sessions[runtimeSessionName("t1")] = true
 	proc.sessions[shellSessionName("t1", 1)] = true
-	proc.envValues[serveSessionName("t1")] = map[string]string{
+	proc.envValues[runtimeSessionName("t1")] = map[string]string{
 		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
 	}
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
@@ -280,12 +256,9 @@ func TestPersistResume_RestoresShellWatchersGroups(t *testing.T) {
 	if rt == nil {
 		t.Fatal("runtime should be registered after persist resume")
 	}
-	// serve/tui/shell group 均应注册。
-	if _, ok := rt.groups[serveSessionName("t1")]; !ok {
-		t.Error("serve group should be registered")
-	}
-	if _, ok := rt.groups[tuiSessionName("t1")]; !ok {
-		t.Error("tui group should be registered (F2: persist restores TUI watchers+groups)")
+	// runtime/shell group 均应注册。
+	if _, ok := rt.groups[runtimeSessionName("t1")]; !ok {
+		t.Error("runtime group should be registered")
 	}
 	if _, ok := rt.groups[shellSessionName("t1", 1)]; !ok {
 		t.Error("shell group should be registered (F2: persist restores shell watchers+groups)")
@@ -351,7 +324,7 @@ func TestActivating_ServeResidualKilled(t *testing.T) {
 }
 
 // TestActiveServeDead_FullRuntimeCleanup 验证 F4：active serve 已死 → 完整运行时清理
-//（watcher/SSE 收敛）后落 suspended。
+// （watcher/SSE 收敛）后落 suspended。
 func TestActiveServeDead_FullRuntimeCleanup(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")

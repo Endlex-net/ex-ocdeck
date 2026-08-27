@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"strconv"
 	"strings"
+
+	"ocdeck/internal/infrastructure/process"
 )
 
 // newTaskID 生成 16 字节随机 hex 任务 ID（与 project ID 同策略）。
@@ -66,11 +68,14 @@ func sessionNameFor(taskID, role string) string {
 	return "ocdeck-" + taskID + "-" + role
 }
 
-// serveSessionName 返回 serve 会话名。
+// serveSessionName 返回 serve 会话名（legacy 双进程布局，Phase 2 前 Activate 仍使用）。
 func serveSessionName(taskID string) string { return sessionNameFor(taskID, "serve") }
 
-// tuiSessionName 返回 tui 会话名。
+// tuiSessionName 返回 tui 会话名（legacy 双进程布局，Phase 2 前 Activate 仍使用）。
 func tuiSessionName(taskID string) string { return sessionNameFor(taskID, "tui") }
+
+// runtimeSessionName 返回单进程 runtime 会话名（design D2）。本阶段仅提供命名，Activate 不切换。
+func runtimeSessionName(taskID string) string { return sessionNameFor(taskID, "runtime") }
 
 // shellSessionName 返回第 n 个 shell 会话名。
 func shellSessionName(taskID string, n int) string {
@@ -90,49 +95,21 @@ func itoa(n int) string {
 	return string(b)
 }
 
-// roleFromSessionName 从会话名解析 role（serve/tui/shell-<n>）。
-// 会话名格式 ocdeck-<taskID>-<role>（§2），role ∈ {serve, tui, shell-<n>}。
-// 按已知 role 后缀匹配，避免用 lastIndex('-') 把 shell-<n> 误拆（B9）。
+// roleFromSessionName 从会话名解析 role 后缀（canonical parser：process.ParseSessionName）。
+// 运行期 ∈ {runtime, shell-<n>}（n>0），同时识别 legacy serve/tui。非法名返回空。
 func roleFromSessionName(name string) string {
-	rest, ok := stripOcdeckPrefix(name)
-	if !ok {
+	_, suffix, err := process.ParseSessionName(name)
+	if err != nil {
 		return ""
 	}
-	// 优先匹配多段 role：shell-<n>、serve、tui（按后缀匹配）。
-	switch {
-	case strings.HasSuffix(rest, "-serve"):
-		return "serve"
-	case strings.HasSuffix(rest, "-tui"):
-		return "tui"
-	case strings.Contains(rest, "-shell-"):
-		return "shell-" + rest[strings.Index(rest, "-shell-")+len("-shell-"):]
-	}
-	return ""
+	return suffix
 }
 
-// taskIDFromSessionName 从 ocdeck-<taskID>-<role> 解析 taskID。
-// 按已知 role 后缀截取前缀部分，避免 lastIndex('-') 对 shell-1 解析错误（B9）。
+// taskIDFromSessionName 从 ocdeck-<taskID>-<role> 解析 taskID（canonical parser）。
 func taskIDFromSessionName(name string) string {
-	rest, ok := stripOcdeckPrefix(name)
-	if !ok {
+	taskID, _, err := process.ParseSessionName(name)
+	if err != nil {
 		return ""
 	}
-	switch {
-	case strings.HasSuffix(rest, "-serve"):
-		return rest[:len(rest)-len("-serve")]
-	case strings.HasSuffix(rest, "-tui"):
-		return rest[:len(rest)-len("-tui")]
-	case strings.Contains(rest, "-shell-"):
-		return rest[:strings.Index(rest, "-shell-")]
-	}
-	return ""
-}
-
-// stripOcdeckPrefix 去除 ocdeck- 前缀，返回 (rest, ok)。
-func stripOcdeckPrefix(name string) (string, bool) {
-	const prefix = "ocdeck-"
-	if !strings.HasPrefix(name, prefix) || len(name) <= len(prefix) {
-		return "", false
-	}
-	return name[len(prefix):], true
+	return taskID
 }

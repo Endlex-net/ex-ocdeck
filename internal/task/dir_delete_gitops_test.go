@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"ocdeck/internal/config"
+	"ocdeck/internal/infrastructure/process"
 )
 
 // panicWorktree 包装 WorktreeBackend，dir 删除 MUST NOT 调用的方法被调用时 panic，
@@ -230,16 +231,19 @@ func TestDelete_Dir_TempServeCwdIsProjectDir(t *testing.T) {
 		t.Fatalf("Delete dir normal with oc sessions: %v", err)
 	}
 	// 断言 temp serve 的 SessionSpec.Dir = 项目目录，CmdArgv 含 opencode serve。
-	specs := capture.specsFor(serveSessionName("t1"))
+	specs := capture.specsFor(runtimeSessionName("t1"))
 	if len(specs) == 0 {
-		t.Fatalf("temp serve session not created; expected NewSession for %s", serveSessionName("t1"))
+		t.Fatalf("temp runtime session not created; expected NewSession for %s", runtimeSessionName("t1"))
 	}
 	spec := specs[0]
 	if spec.Dir != projDir {
 		t.Fatalf("temp serve cwd = %q, want project dir %q (row.WorktreePath)", spec.Dir, projDir)
 	}
-	if len(spec.CmdArgv) == 0 || spec.CmdArgv[0] != "opencode" {
-		t.Fatalf("temp serve CmdArgv must start with opencode; got %v", spec.CmdArgv)
+	if len(spec.CmdArgv) < 5 || spec.CmdArgv[0] != "opencode" || spec.CmdArgv[1] != "--port" {
+		t.Fatalf("temp runtime CmdArgv must be opencode --port; got %v", spec.CmdArgv)
+	}
+	if err := process.ValidateNewSessionName(spec.Name); err != nil {
+		t.Fatalf("temp runtime session name rejected by validator: %v", err)
 	}
 	// 项目目录逐字节不变（temp serve 仅以 cwd 作工作目录，mockProc 不写文件）。
 	// 注：oc session 行已被 DeleteTaskSession 删除（store.DeleteTask 也会清理 sessions）。

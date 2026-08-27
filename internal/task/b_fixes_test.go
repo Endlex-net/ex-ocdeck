@@ -52,7 +52,7 @@ func TestLockTaskWait_CtxCancel(t *testing.T) {
 	// ReopenAttach 在锁被占用时等待；ctx 取消应返回 conflict(ctx.Err)。
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	_, err := m.ReopenAttach(ctx, "t1")
+	_, err := m.lockTaskWait(ctx, "t1")
 	if err == nil {
 		t.Fatal("expected error on ctx cancel during lock wait")
 	}
@@ -75,16 +75,16 @@ func TestCallbackIsolation_OldGenIgnored(t *testing.T) {
 	// 旧代 runtime + serve group。
 	oldRT := m.newRuntime("t1")
 	m.setRuntime("t1", oldRT)
-	oldRT.registerGroup("serve", serveSessionName("t1"))
-	m.watchServeExit("t1", serveSessionName("t1"))
+	oldRT.registerGroup(roleRuntime, runtimeSessionName("t1"))
+	m.watchServeExit("t1", runtimeSessionName("t1"))
 
 	// 模拟新代 runtime：newRuntime 递增 generation，注册新 serve group。
 	newRT := m.newRuntime("t1")
 	m.setRuntime("t1", newRT)
-	newRT.registerGroup("serve", serveSessionName("t1"))
+	newRT.registerGroup(roleRuntime, runtimeSessionName("t1"))
 
 	// 触发旧代 watch 的退出事件（旧 cancel 仍指向 oldRT 闭包）。
-	proc.triggerExit(serveSessionName("t1"), process.WatchEvent{Type: process.WatchEventSessionExit})
+	proc.triggerExit(runtimeSessionName("t1"), process.WatchEvent{Type: process.WatchEventSessionExit})
 	time.Sleep(100 * time.Millisecond)
 
 	// 旧代回调 matchesRegistry 应不匹配新代 → 忽略 → 任务状态保持 active。
@@ -209,14 +209,11 @@ func TestSuspend_BranchC_FullRuntimeRecovery(t *testing.T) {
 		t.Fatal("runtime should be rebuilt after branch c repair")
 	}
 	rt.mu.Lock()
+	_, hasRuntime := rt.groups[runtimeSessionName("t1")]
 	_, hasServe := rt.groups[serveSessionName("t1")]
-	_, hasTUI := rt.groups[tuiSessionName("t1")]
 	rt.mu.Unlock()
-	if !hasServe {
-		t.Error("serve group should be registered after repair")
-	}
-	if !hasTUI {
-		t.Error("tui group should be registered after repair (TUI reopened)")
+	if !hasRuntime && !hasServe {
+		t.Error("runtime group should be registered after repair")
 	}
 	// SSE 应已建立（sseCancel 非 nil）。
 	rt.mu.Lock()
@@ -455,9 +452,20 @@ func TestShellNameParsing(t *testing.T) {
 	}{
 		{"ocdeck-abc123-serve", "serve", "abc123"},
 		{"ocdeck-abc123-tui", "tui", "abc123"},
+		{"ocdeck-abc123-runtime", "runtime", "abc123"},
 		{"ocdeck-abc123-shell-1", "shell-1", "abc123"},
 		{"ocdeck-abc123-shell-12", "shell-12", "abc123"},
 		{"ocdeck-a1b2c3d4-shell-99", "shell-99", "a1b2c3d4"},
+		{"ocdeck-abc123-shell-0", "", ""},
+		{"ocdeck-abc123-shell-00", "", ""},
+		{"ocdeck-abc123-shell-", "", ""},
+		{"ocdeck-abc123-shell-abc", "", ""},
+		{"ocdeck-abc123-worker", "", ""},
+		{"not-ocdeck-abc123-runtime", "", ""},
+		{"ocdeck-", "", ""},
+	}
+	if got := runtimeSessionName("abc123"); got != "ocdeck-abc123-runtime" {
+		t.Errorf("runtimeSessionName = %q, want ocdeck-abc123-runtime", got)
 	}
 	for _, c := range cases {
 		if got := roleFromSessionName(c.name); got != c.role {

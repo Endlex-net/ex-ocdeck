@@ -24,6 +24,7 @@ export type TermConnState =
   | 'connecting'
   | 'connected'
   | 'reconnecting'
+  | 'recovering' // 1013：任务进程恢复中（Try Again Later），轮询任务状态后重连
   | 'suspended' // 4010：任务已挂起，需用户激活
   | 'closed' // 1000：对端正常关闭（如 shell 退出）
   | 'replaced' // 4009：被新连接替换（其他标签页已接管）
@@ -52,6 +53,9 @@ export class TermSession {
   private term: Terminal;
   private fit = new FitAddon();
   private ws: WebSocket | null = null;
+  /** 连接代（G4-8 socket identity guard）：每次 closeSocket/换代自增；陈旧连接的
+   * 异步回调（onopen/onmessage/onclose）据此直接丢弃——不得改写当前连接、状态或重连 timer。 */
+  private wsGen = 0;
   private authed = false;
   private disposed = false;
   private closedByUs = false;
@@ -172,11 +176,18 @@ export class TermSession {
   }
 
   connect(): void {
+    // recoveryProbe（1013 定时探测）：保持「进程启动中」展示不闪「连接中」；
+    // 外部 connect（任务状态回 active 驱动 / 手动重连）按正常状态展示。
+    this.connectInternal(false);
+  }
+
+  private connectInternal(recoveryProbe: boolean): void {
     if (this.disposed) return;
     this.clearTimer();
     this.closedByUs = false;
     this.closeSocket();
-    this.setState(this.retry > 0 ? 'reconnecting' : 'connecting');
+    const gen = this.wsGen; // G4-8：本连接代（closeSocket 已完成换代）
+    this.setState(recoveryProbe ? 'recovering' : this.retry > 0 ? 'reconnecting' : 'connecting');
 
     const ws = new WebSocket(wsURL(this.wsPath));
     ws.binaryType = 'arraybuffer';
@@ -184,6 +195,7 @@ export class TermSession {
     this.authed = false;
 
     ws.onopen = () => {
+      if (gen !== this.wsGen) return; // 陈旧连接回调：新连接已建立，不得发送
       // 首帧：auth + 初始尺寸握手合一。
       this.fitNow();
       ws.send(
@@ -196,6 +208,7 @@ export class TermSession {
       );
     };
     ws.onmessage = (ev: MessageEvent) => {
+      if (gen !== this.wsGen) return; // 陈旧连接回调：不得写入终端/状态
       if (typeof ev.data === 'string') {
         try {
           const msg = JSON.parse(ev.data) as { type?: string };
@@ -221,10 +234,23 @@ export class TermSession {
       /* onclose 随后触发，统一处理 */
     };
     ws.onclose = (ev: CloseEvent) => {
+      // G4-8 socket identity guard：仅当前代连接的 onclose 允许改写状态/timer/
+      // this.ws——陈旧连接（connect 重入后 closeSocket 关闭的旧 socket）的延迟
+      // onclose 不得清空新连接、不得触发误重连。
+      if (gen !== this.wsGen) return;
       this.authed = false;
       this.ws = null;
       if (this.disposed || this.closedByUs) return;
       switch (ev.code) {
+        case 1013:
+          // 任务进程恢复中（Try Again Later）：停止指数退避重连，展示「进程启动中」。
+          // 主路径：任务状态流（SSE）驱动外层 active prop → 回到 active 即重连；
+          // 兜底：定时探测重连（任务状态流断连错过翻转时不卡死；服务端
+          // ensureRecovery 幂等，重连即探测）。
+          this.retry = 0;
+          this.setState('recovering');
+          this.timer = setTimeout(() => this.connectInternal(true), 3000);
+          return;
         case 4001: // 未认证：token 失效，回 token 输入页
           clearToken();
           window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
@@ -323,6 +349,7 @@ export class TermSession {
   // ---------- 内部 ----------
 
   private closeSocket(): void {
+    this.wsGen += 1; // G4-8：换代——在途旧连接的全部异步回调即刻失效
     if (this.ws) {
       try {
         this.ws.close();

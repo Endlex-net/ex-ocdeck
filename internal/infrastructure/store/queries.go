@@ -8,12 +8,13 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
 	"ocdeck/internal/application"
-	ocdecktask "ocdeck/internal/domain/task"
 	ocdecksess "ocdeck/internal/domain/session"
+	ocdecktask "ocdeck/internal/domain/task"
 )
 
 // DBTX 是 *sql.DB 与 *sql.Tx 共同满足的查询接口，使同一组 Queries 方法
@@ -56,23 +57,24 @@ type ProjectRow struct {
 // BaseRef 对应 migration 0008 新增列（add-plain-dir-project D10）：repo 任务的基线分支全引用
 // （如 refs/heads/main），dir 项目任务为空串。
 type TaskRow struct {
-	ID           string
-	ProjectID    string
-	Name         string
-	Branch       string
-	Status       string
-	WorktreePath string
-	LastPort     sql.NullInt64
-	LastError    sql.NullString
-	Notice       sql.NullString
-	DeleteMode   sql.NullString
-	EnvSnapshot  sql.NullString
-	CreatedAt    int64
-	UpdatedAt    int64
-	ArchivedAt   sql.NullInt64
-	InitStatus   string
-	InitError    sql.NullString
-	BaseRef      string
+	ID              string
+	ProjectID       string
+	Name            string
+	Branch          string
+	Status          string
+	WorktreePath    string
+	LastPort        sql.NullInt64
+	LastError       sql.NullString
+	Notice          sql.NullString
+	DeleteMode      sql.NullString
+	EnvSnapshot     sql.NullString
+	CreatedAt       int64
+	UpdatedAt       int64
+	ArchivedAt      sql.NullInt64
+	InitStatus      string
+	InitError       sql.NullString
+	BaseRef         string
+	AnchorSessionID sql.NullString
 }
 
 // LifecycleConfigRow project_lifecycle_configs 表行映射（design.md §2，migration 0007）。
@@ -351,7 +353,8 @@ func (q *Queries) CreateTask(ctx context.Context, t TaskRow) error {
 func (q *Queries) GetTask(ctx context.Context, id string) (TaskRow, error) {
 	row := q.db.QueryRowContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
-		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref
+		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
+		        anchor_session_id
 		 FROM tasks WHERE id = ?`, id)
 	return scanTaskRow(row)
 }
@@ -360,7 +363,8 @@ func (q *Queries) GetTask(ctx context.Context, id string) (TaskRow, error) {
 func (q *Queries) ListTasksByProject(ctx context.Context, projectID string) ([]TaskRow, error) {
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
-		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref
+		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
+		        anchor_session_id
 		 FROM tasks WHERE project_id = ? ORDER BY created_at ASC`, projectID)
 	if err != nil {
 		return nil, err
@@ -373,7 +377,8 @@ func (q *Queries) ListTasksByProject(ctx context.Context, projectID string) ([]T
 func (q *Queries) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
-		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref
+		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
+		        anchor_session_id
 		 FROM tasks ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
@@ -953,7 +958,7 @@ func (q *Queries) ListTaskSessions(ctx context.Context, taskID string) ([]Sessio
 
 // ListTopLevelTaskSessions 列出任务的顶层会话归属行（parent_id 为空），
 // 供锚定候选（resolveAnchorSession/ReopenAttach/Suspend 修复）取最近顶层 session。
-// 语义同 ListTaskSessions 的排序，仅过滤 parent_id IS NULL OR parent_id = ''。
+// 语义同 ListTaskSessions 的排序，仅过滤 parent_id IS NULL OR parent_id = ”。
 func (q *Queries) ListTopLevelTaskSessions(ctx context.Context, taskID string) ([]SessionRow, error) {
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT task_id, session_id, session_created_at, first_seen_at, last_seen_at, parent_id
@@ -1380,8 +1385,8 @@ func (q *Queries) ConvergeInterruptedInitRuns(ctx context.Context) (int64, error
 }
 
 // DeleteAbsentSessions 删除任务中不在 keepSet 内的会话归属行，返回被删除的 session ID
-//（对齐计数用，design.md §4 / D2 align 行）。设计依据 design.md §4：仅完整对齐结果
-//（count < limit）可删缺席行。
+// （对齐计数用，design.md §4 / D2 align 行）。设计依据 design.md §4：仅完整对齐结果
+// （count < limit）可删缺席行。
 func (q *Queries) DeleteAbsentSessions(ctx context.Context, taskID string, keepSet []string) ([]string, error) {
 	selectQry, selectArgs := absentSessionsQuery(taskID, keepSet)
 	rows, err := q.db.QueryContext(ctx, selectQry, selectArgs...)
@@ -1483,7 +1488,8 @@ func scanTaskRow(row rowScanner) (TaskRow, error) {
 	var t TaskRow
 	err := row.Scan(&t.ID, &t.ProjectID, &t.Name, &t.Branch, &t.Status, &t.WorktreePath,
 		&t.LastPort, &t.LastError, &t.Notice, &t.DeleteMode, &t.EnvSnapshot,
-		&t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.InitStatus, &t.InitError, &t.BaseRef)
+		&t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.InitStatus, &t.InitError, &t.BaseRef,
+		&t.AnchorSessionID)
 	return t, err
 }
 
@@ -1529,7 +1535,7 @@ type SessionObservation struct {
 // SQLite 单写者语义下事务无竞态。
 //
 // 返回 application.ClaimResult：Changed=新插入或 last_seen_at/parent_id 实际推进
-//（design.md D0:77，同值幂等 upsert 为 Claimed+!Changed）。
+// （design.md D0:77，同值幂等 upsert 为 Claimed+!Changed）。
 //
 // 冲突判定：存在 task_id != 本任务 且 session_id == sessionID 的行即冲突（OwnerTaskID 为他任务）。
 // 本任务已拥有（task_id == 本任务）→ Claimed=true，刷新 last_seen_at/parent_id（幂等 upsert）。
@@ -1590,9 +1596,302 @@ func (q *Queries) claimTaskSessionInTx(ctx context.Context, taskID, sessionID st
 	return application.ClaimResult{Claimed: true, Changed: changed}, nil
 }
 
+// ClaimTaskSessionAndSetAnchor 单事务 claim session 并写入 tasks.anchor_session_id（D5）。
+// claim 成功后 sessionID 立即成为权威锚定；冲突时归属与 anchor 均不修改。
+func (q *Queries) ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
+	return runTx(ctx, q, func(qtx *Queries) (application.ClaimResult, error) {
+		res, err := qtx.claimTaskSessionInTx(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+		if err != nil || !res.Claimed {
+			return res, err
+		}
+		if _, err := qtx.db.ExecContext(ctx,
+			`UPDATE tasks SET anchor_session_id = ? WHERE id = ?`, sessionID, taskID); err != nil {
+			return application.ClaimResult{}, err
+		}
+		return res, nil
+	})
+}
+
+// ClearTaskAnchorConditional 条件清空锚定（D5 CAS）：
+// `anchor_session_id=NULL WHERE id=? AND anchor_session_id=<old>`。
+// Matched=命中并清空；0 行 → !Matched（调用方复读后判定）。
+func (q *Queries) ClearTaskAnchorConditional(ctx context.Context, taskID, oldAnchor string) (application.MutationResult, error) {
+	res, err := q.db.ExecContext(ctx,
+		`UPDATE tasks SET anchor_session_id = NULL WHERE id = ? AND anchor_session_id = ?`,
+		taskID, oldAnchor)
+	if err != nil {
+		return application.MutationResult{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return application.MutationResult{}, err
+	}
+	if n == 0 {
+		return application.MutationResult{}, nil
+	}
+	return application.MutationResult{Matched: true, Changed: true}, nil
+}
+
+// CompleteRecoveryFailure 条件事务（D3）：expected=activating 时原子完成
+// status=suspended + last_error=<cause> + env_snapshot=NULL。
+// CAS 失配（当前 status 非 activating）时三个字段均不修改，返回 !Matched。
+func (q *Queries) CompleteRecoveryFailure(ctx context.Context, id string, lastError *string) (application.TransitionResult, error) {
+	return runTx(ctx, q, func(qx *Queries) (application.TransitionResult, error) {
+		return qx.completeRecoveryFailureInTx(ctx, id, lastError)
+	})
+}
+
+// completeRecoveryFailureInTx 是 CompleteRecoveryFailure 的事务体（G3-18 抽出，
+// 供 CompleteRecoveryFailureAndClearDebts 在同事务内追加 debt 删除复用）。
+func (qx *Queries) completeRecoveryFailureInTx(ctx context.Context, id string, lastError *string) (application.TransitionResult, error) {
+	row := qx.db.QueryRowContext(ctx,
+		`SELECT status, last_error, env_snapshot, updated_at FROM tasks WHERE id = ?`, id)
+	var curStatus string
+	var curLastError, curEnv sql.NullString
+	var curUpdatedAt int64
+	if err := row.Scan(&curStatus, &curLastError, &curEnv, &curUpdatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return application.TransitionResult{}, nil
+		}
+		return application.TransitionResult{}, err
+	}
+	if curStatus != string(ocdecktask.StatusActivating) {
+		return application.TransitionResult{}, nil
+	}
+	newLE := nullableString(lastError)
+	now := nowUnix()
+	updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+	qry := "UPDATE tasks SET status = ?, last_error = ?, env_snapshot = NULL, " + updClause +
+		" WHERE id = ? AND status = ?"
+	args := []any{string(ocdecktask.StatusSuspended), newLE}
+	args = append(args, updArgs...)
+	args = append(args, id, string(ocdecktask.StatusActivating))
+	res, err := qx.db.ExecContext(ctx, qry, args...)
+	if err != nil {
+		return application.TransitionResult{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return application.TransitionResult{}, err
+	}
+	if n == 0 {
+		return application.TransitionResult{}, nil
+	}
+	return application.TransitionResult{
+		MutationResult: application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt},
+		StatusChanged:  true,
+		From:           ocdecktask.StatusActivating,
+		To:             ocdecktask.StatusSuspended,
+	}, nil
+}
+
+const (
+	recoveryDebtPhaseCleanupNotice = "cleanup_notice"
+	recoveryDebtPhaseComplete      = "complete"
+)
+
+// ErrRecoveryDebtPresent 是激活准入的原子拒绝信号（G3-18）：任务存在未收敛的
+// recovery tagged debt（如 Complete 成功但删除失败遗留，或 CAS mismatch 后留存），
+// 在与状态 CAS 同一事务内检出，调用方零副作用拒绝。
+var ErrRecoveryDebtPresent = errors.New("store: uncleaned recovery debt present")
+
+// CasActivationIfNoRecoveryDebt 激活准入原子事务（G3-18）：无该任务 recovery debt
+// 时执行 fromStatus→toStatus CAS；存在 debt → 返回 ErrRecoveryDebtPresent（零修改）。
+// 用于 Activate（suspended→activating）与 ensureRecovery（active→activating）：
+// 覆盖「Complete 成功 + debt 删除失败 → 旧 intent 重放误伤新激活」窗口。
+func (q *Queries) CasActivationIfNoRecoveryDebt(ctx context.Context, id string, fromStatus, toStatus ocdecktask.Status) (application.TransitionResult, error) {
+	return runTx(ctx, q, func(qx *Queries) (application.TransitionResult, error) {
+		var debts int
+		if err := qx.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM recovery_debts WHERE task_id = ?`, id).Scan(&debts); err != nil {
+			return application.TransitionResult{}, err
+		}
+		if debts > 0 {
+			return application.TransitionResult{}, ErrRecoveryDebtPresent
+		}
+		return qx.updateTaskStatus(ctx, id, toStatus, nil, true, string(fromStatus))
+	})
+}
+
+// CompleteRecoveryFailureAndClearDebts 单事务终态收敛（G3-18）：CompleteRecoveryFailure
+// 的三字段 CAS 与 recovery debt 整组删除原子完成——Complete 成功必伴随 debt 清除，
+// 不存在「Complete 已提交 + debt 残留被下一轮重放误伤新激活」的窗口。CAS 失配
+// （含行不存在）时三字段均不修改，debt 照常删除（服从 DB 最新状态，与既有
+// replayRecoveryDebtsForTask 成功路径语义一致：mismatch → 删）。
+func (q *Queries) CompleteRecoveryFailureAndClearDebts(ctx context.Context, id string, lastError *string) (application.TransitionResult, error) {
+	return runTx(ctx, q, func(qx *Queries) (application.TransitionResult, error) {
+		res, err := qx.completeRecoveryFailureInTx(ctx, id, lastError)
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		if _, derr := qx.db.ExecContext(ctx, `DELETE FROM recovery_debts WHERE task_id = ?`, id); derr != nil {
+			return application.TransitionResult{}, derr
+		}
+		return res, nil
+	})
+}
+
+// RecoveryDebtRow 是 recovery_debts 表行（D3 tagged debt）。
+// cleanup_notice：task_id + session_name + tickets + reason + retryable + cause
+// complete：仅 task_id + cause（其余列空 / retryable=0）
+type RecoveryDebtRow struct {
+	TaskID      string
+	Phase       string
+	SessionName string
+	Tickets     string // JSON 编码 []string
+	Reason      string
+	Retryable   bool
+	Cause       string
+	CreatedAt   int64
+}
+
+// UpsertRecoveryDebt 按 (task_id, session_name) 原地替换未收敛 tagged debt（最新 wins；
+// G3-10：同一任务可有多条 cleanup_notice 行——每 session 一行，complete 行占空串位）。
+func (q *Queries) UpsertRecoveryDebt(ctx context.Context, row RecoveryDebtRow) error {
+	if row.Phase != recoveryDebtPhaseCleanupNotice && row.Phase != recoveryDebtPhaseComplete {
+		return fmt.Errorf("store: invalid recovery debt phase %q", row.Phase)
+	}
+	if row.Phase == recoveryDebtPhaseComplete && row.SessionName != "" {
+		return fmt.Errorf("store: complete debt must use empty session_name, got %q", row.SessionName)
+	}
+	if row.Tickets == "" {
+		row.Tickets = "[]"
+	}
+	retryable := 0
+	if row.Retryable {
+		retryable = 1
+	}
+	_, err := q.db.ExecContext(ctx,
+		`INSERT INTO recovery_debts (task_id, session_name, phase, tickets, reason, retryable, cause, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(task_id, session_name) DO UPDATE SET
+		   phase = excluded.phase,
+		   tickets = excluded.tickets,
+		   reason = excluded.reason,
+		   retryable = excluded.retryable,
+		   cause = excluded.cause,
+		   created_at = excluded.created_at`,
+		row.TaskID, row.SessionName, row.Phase, row.Tickets, row.Reason, retryable, row.Cause, row.CreatedAt)
+	return err
+}
+
+// DeleteRecoveryDebt 删除该任务全部 tagged debt（已收敛或 CAS mismatch 后服从最新
+// 状态；G3-10：按 task_id 整组删除）。
+func (q *Queries) DeleteRecoveryDebt(ctx context.Context, taskID string) error {
+	_, err := q.db.ExecContext(ctx, `DELETE FROM recovery_debts WHERE task_id = ?`, taskID)
+	return err
+}
+
+// ListRecoveryDebts 枚举全部未收敛 tagged debt（Reconcile/后台/Shutdown 重放）。
+func (q *Queries) ListRecoveryDebts(ctx context.Context) ([]RecoveryDebtRow, error) {
+	rows, err := q.db.QueryContext(ctx,
+		`SELECT task_id, phase, session_name, tickets, reason, retryable, cause, created_at FROM recovery_debts`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RecoveryDebtRow
+	for rows.Next() {
+		var r RecoveryDebtRow
+		var retryable int
+		if err := rows.Scan(&r.TaskID, &r.Phase, &r.SessionName, &r.Tickets, &r.Reason, &retryable, &r.Cause, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		r.Retryable = retryable != 0
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// GetRecoveryDebt 读取单任务 tagged debt（测试与定点重放）。
+func (q *Queries) GetRecoveryDebt(ctx context.Context, taskID string) (RecoveryDebtRow, error) {
+	row := q.db.QueryRowContext(ctx,
+		`SELECT task_id, phase, session_name, tickets, reason, retryable, cause, created_at
+		   FROM recovery_debts WHERE task_id = ?`, taskID)
+	var r RecoveryDebtRow
+	var retryable int
+	if err := row.Scan(&r.TaskID, &r.Phase, &r.SessionName, &r.Tickets, &r.Reason, &retryable, &r.Cause, &r.CreatedAt); err != nil {
+		return RecoveryDebtRow{}, err
+	}
+	r.Retryable = retryable != 0
+	return r, nil
+}
+
+// recoveryPermitWindowSec / recoveryPermitMax 为 D3 固定预算：滚动 5 分钟最多 3 个 permit。
+const (
+	recoveryPermitWindowSec int64 = 5 * 60
+	recoveryPermitMax             = 3
+)
+
+// AcquirePermitResult 是 AcquireRecoveryPermit 的结构化结果。
+type AcquirePermitResult struct {
+	Acquired bool // false=窗口已满，未写入新记录
+	Ordinal  int  // 窗口内第几个（1-based）；未取得时为 0
+}
+
+// AcquireRecoveryPermit 原子写入一条 attempt 记录并返回窗口内 ordinal（D3）。
+// now 为调用方注入的 Unix 秒（确定性测试）；先惰性裁剪过期行，窗口已满则不写入。
+func (q *Queries) AcquireRecoveryPermit(ctx context.Context, taskID string, now int64) (AcquirePermitResult, error) {
+	return runTx(ctx, q, func(qtx *Queries) (AcquirePermitResult, error) {
+		windowStart := now - recoveryPermitWindowSec
+		if _, err := qtx.pruneRecoveryAttempts(ctx, taskID, windowStart); err != nil {
+			return AcquirePermitResult{}, err
+		}
+		n, err := qtx.countRecoveryAttemptsSince(ctx, taskID, windowStart)
+		if err != nil {
+			return AcquirePermitResult{}, err
+		}
+		if n >= recoveryPermitMax {
+			return AcquirePermitResult{}, nil
+		}
+		if _, err := qtx.db.ExecContext(ctx,
+			`INSERT INTO task_recovery_attempts (task_id, attempted_at) VALUES (?, ?)`,
+			taskID, now); err != nil {
+			return AcquirePermitResult{}, err
+		}
+		return AcquirePermitResult{Acquired: true, Ordinal: n + 1}, nil
+	})
+}
+
+// CountRecoveryAttemptsInWindow 返回滚动窗口内（now-5min..now）的 attempt 数。
+func (q *Queries) CountRecoveryAttemptsInWindow(ctx context.Context, taskID string, now int64) (int, error) {
+	return q.countRecoveryAttemptsSince(ctx, taskID, now-recoveryPermitWindowSec)
+}
+
+// PruneExpiredRecoveryAttempts 删除 attempted_at < before 的记录（惰性裁剪入口）。
+// taskID 非空则仅裁该任务；空则全表。
+func (q *Queries) PruneExpiredRecoveryAttempts(ctx context.Context, taskID string, before int64) (int64, error) {
+	return q.pruneRecoveryAttempts(ctx, taskID, before)
+}
+
+func (q *Queries) countRecoveryAttemptsSince(ctx context.Context, taskID string, since int64) (int, error) {
+	var n int
+	err := q.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM task_recovery_attempts WHERE task_id = ? AND attempted_at >= ?`,
+		taskID, since).Scan(&n)
+	return n, err
+}
+
+func (q *Queries) pruneRecoveryAttempts(ctx context.Context, taskID string, before int64) (int64, error) {
+	var (
+		res sql.Result
+		err error
+	)
+	if taskID == "" {
+		res, err = q.db.ExecContext(ctx, `DELETE FROM task_recovery_attempts WHERE attempted_at < ?`, before)
+	} else {
+		res, err = q.db.ExecContext(ctx,
+			`DELETE FROM task_recovery_attempts WHERE task_id = ? AND attempted_at < ?`, taskID, before)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // TouchOwnedTaskSession 条件 UPDATE 仅本任务已归属行的 last_seen_at（add-plain-dir-project D8）。
 // 绝不插入；返回 MutationResult：Matched=命中本任务归属行，Changed=值真实推进
-//（WHERE last_seen_at < ? 值变化条件，design.md D2 session touch 行；同值为 Matched+!Changed）。
+// （WHERE last_seen_at < ? 值变化条件，design.md D2 session touch 行；同值为 Matched+!Changed）。
 // 未命中归属行（!Matched）为正常路径，调用方记 debug 不报错。
 func (q *Queries) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (application.MutationResult, error) {
 	res, err := q.db.ExecContext(ctx,
@@ -1738,7 +2037,7 @@ func (q *Queries) alignTaskSessionsInTx(ctx context.Context, taskID string, mode
 //
 // expected 与事务内最新 notice 不匹配 → 返回 application.AlignConflict（调用方事务回滚，
 // 不提交任何 session 行变更）；匹配且 New 不同 → UPDATE 携带 expected 与同值排除谓词
-//（仅跨秒推进 updated_at）；匹配且同值 → Matched+!Changed 原子 no-op。
+// （仅跨秒推进 updated_at）；匹配且同值 → Matched+!Changed 原子 no-op。
 func (q *Queries) alignNoticeInTx(ctx context.Context, taskID string, mut application.NoticeMutation) (application.MutationResult, error) {
 	expNS := nullableString(mut.Expected)
 	newNS := nullableString(mut.New)
@@ -1823,7 +2122,7 @@ func nullStringToPtr(n sql.NullString) *string {
 	return &s
 }
 
-// nullStringValue 返回 sql.NullString 的 String 值，Invalid 时空串（NULL 与 '' 语义等价的
+// nullStringValue 返回 sql.NullString 的 String 值，Invalid 时空串（NULL 与 ” 语义等价的
 // 归一比较用）。
 func nullStringValue(ns sql.NullString) string {
 	if !ns.Valid {

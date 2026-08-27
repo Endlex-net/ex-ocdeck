@@ -21,6 +21,7 @@ const (
 	CodeGitError       ErrorCode = "git_error"
 	CodeProcessError   ErrorCode = "process_error"
 	CodeInternal       ErrorCode = "internal"
+	CodeRecovering     ErrorCode = "recovering"
 )
 
 // errorBody 统一错误响应体 `{"error":{"code","message"}}`（design.md §21）。
@@ -40,7 +41,7 @@ func httpStatusFor(code ErrorCode) int {
 		return http.StatusUnauthorized
 	case CodeNotFound:
 		return http.StatusNotFound
-	case CodeConflict:
+	case CodeConflict, CodeRecovering:
 		return http.StatusConflict
 	case CodeInvalidState:
 		return http.StatusUnprocessableEntity

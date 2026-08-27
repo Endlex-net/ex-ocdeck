@@ -132,6 +132,19 @@ func (s *traceStore) UpdateTaskStatusConditional(ctx context.Context, id, fromSt
 	return s.TaskStore.UpdateTaskStatusConditional(ctx, id, fromStatus, toStatus, lastError)
 }
 
+// CasActivationIfNoRecoveryDebt：G3-18 起激活准入（suspended/active→activating）
+// 走本方法，trace 语义与条件 CAS 一致。
+func (s *traceStore) CasActivationIfNoRecoveryDebt(ctx context.Context, id, fromStatus, toStatus string) (application.TransitionResult, error) {
+	s.tr.record("store", "CasActivationIfNoRecoveryDebt", fmt.Sprintf("id=%s %s->%s", id, fromStatus, toStatus))
+	return s.TaskStore.CasActivationIfNoRecoveryDebt(ctx, id, fromStatus, toStatus)
+}
+
+// CompleteRecoveryFailureAndClearDebts：G3-18 起恢复终态走单事务方法。
+func (s *traceStore) CompleteRecoveryFailureAndClearDebts(ctx context.Context, id string, lastError sql.NullString) (application.TransitionResult, error) {
+	s.tr.record("store", "CompleteRecoveryFailureAndClearDebts", fmt.Sprintf("id=%s", id))
+	return s.TaskStore.CompleteRecoveryFailureAndClearDebts(ctx, id, lastError)
+}
+
 func (s *traceStore) UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) (application.MutationResult, error) {
 	s.tr.record("store", "UpdateTaskEnvSnapshot", fmt.Sprintf("id=%s valid=%v", id, envSnapshot.Valid))
 	return s.TaskStore.UpdateTaskEnvSnapshot(ctx, id, envSnapshot)
@@ -197,6 +210,16 @@ func (s *traceStore) ClaimTaskSession(ctx context.Context, taskID, sessionID str
 	return s.TaskStore.ClaimTaskSession(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
 }
 
+func (s *traceStore) ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
+	s.tr.record("store", "ClaimTaskSessionAndSetAnchor", fmt.Sprintf("id=%s sid=%s", taskID, sessionID))
+	return s.TaskStore.ClaimTaskSessionAndSetAnchor(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+}
+
+func (s *traceStore) ClearTaskAnchorConditional(ctx context.Context, taskID, oldAnchor string) (application.MutationResult, error) {
+	s.tr.record("store", "ClearTaskAnchorConditional", fmt.Sprintf("id=%s old=%s", taskID, oldAnchor))
+	return s.TaskStore.ClearTaskAnchorConditional(ctx, taskID, oldAnchor)
+}
+
 func (s *traceStore) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (application.MutationResult, error) {
 	s.tr.record("store", "TouchOwnedTaskSession", fmt.Sprintf("id=%s sid=%s", taskID, sessionID))
 	return s.TaskStore.TouchOwnedTaskSession(ctx, taskID, sessionID, lastSeenAt)
@@ -252,6 +275,11 @@ func (p *traceProc) ShowSessionEnv(name, key string) (string, error) {
 func (p *traceProc) ShowSessionEnvContext(ctx context.Context, name, key string) (string, error) {
 	p.tr.record("proc", "ShowSessionEnvContext", fmt.Sprintf("%s/%s", name, key))
 	return p.ProcessBackend.ShowSessionEnvContext(ctx, name, key)
+}
+
+func (p *traceProc) WatchExit(name string, callback func(process.WatchEvent)) (func(), <-chan struct{}) {
+	p.tr.record("proc", "WatchExit", name)
+	return p.ProcessBackend.WatchExit(name, callback)
 }
 
 // --- traceWorktree：包装 WorktreeBackend ---
@@ -370,13 +398,15 @@ func newTraceTestManager(t *testing.T, store *mockStore, proc *mockProc, wt *moc
 		return wrapTraceOC(inner, tr)
 	}
 	cfg := testCfg(t)
-	return New(Options{
+	m := New(Options{
 		Cfg:       cfg,
 		Store:     tStore,
 		Proc:      tProc,
 		Worktree:  tWt,
 		OCFactory: wrap,
 	})
+	m.recoveryBackoffFn = func(int) time.Duration { return 0 }
+	return m
 }
 
 // testCfg 构造测试用 config（复用 newTestManager 的默认值）。
@@ -702,8 +732,8 @@ func TestP141_Activate_Success_Trace(t *testing.T) {
 	oc := newMockOC(true)
 	// 预置一个 anchor session 候选（resolveAnchorSession 走 GetSession 预检路径）。
 	oc.sessions = []opencode.Session{{ID: "sess-anchor", Time: opencode.SessionTime{Created: 1, Updated: 1}}}
-	_ = store.UpsertTaskSession(context.Background(), SessionRow{
-		TaskID: "t1", SessionID: "sess-anchor", SessionCreatedAt: 1, FirstSeenAt: 1, LastSeenAt: 1,
+	store.mutTask("t1", func(tr *TaskRow) {
+		tr.AnchorSessionID = sql.NullString{String: "sess-anchor", Valid: true}
 	})
 	tr := &tracer{}
 	m := newTraceTestManager(t, store, proc, wt, oc, tr)
@@ -715,24 +745,24 @@ func TestP141_Activate_Success_Trace(t *testing.T) {
 	// 等待异步 SSE align goroutine 收敛（mock oc.SubscribeEvents 立即 onReady 后阻塞，对齐在主路径内完成）。
 	waitStatus(t, store, "t1", StatusActive, 2*time.Second)
 
-	// 关键顺序：CAS suspended→activating → NewSession(serve) → UpdateTaskLastPort
-	// → SubscribeEvents → AlignTaskSessions → UpdateTaskStatus(active)。
+	// 关键顺序：激活准入（G3-18：CasActivationIfNoRecoveryDebt，suspended→activating）
+	// → NewSession(serve) → UpdateTaskLastPort → SubscribeEvents → AlignTaskSessions
+	// → UpdateTaskStatus(active)。
 	assertOrdered(t, tr, []traceOp{
-		{src: "store", op: "UpdateTaskStatusConditional", key: "suspended->activating"},
-		{src: "proc", op: "NewSession", key: serveSessionName("t1")},
-		{src: "store", op: "UpdateTaskLastPort", key: "t1"},
+		{src: "store", op: "CasActivationIfNoRecoveryDebt", key: "suspended->activating"},
+		{src: "proc", op: "NewSession", key: runtimeSessionName("t1")},
+		{src: "proc", op: "WatchExit", key: runtimeSessionName("t1")},
 		{src: "oc", op: "SubscribeEvents", key: ""},
 		{src: "store", op: "AlignTaskSessions", key: "mode=1"},
-		{src: "proc", op: "NewSession", key: tuiSessionName("t1")},
-		{src: "store", op: "UpdateTaskStatus", key: "status=active"},
+		{src: "oc", op: "Health", key: ""},
+		{src: "store", op: "UpdateTaskLastPort", key: "t1"},
+		{src: "store", op: "UpdateTaskStatusConditional", key: "activating->active"},
 	}, "Activate.success")
 
-	// CAS suspended→activating 恰好一次；UpdateTaskStatus(active) 恰好一次。
+	// G3-18：条件 CAS 仅剩提交步（activating→active）；准入走 CasActivation。
 	assertOpCount(t, tr, "store", "UpdateTaskStatusConditional", 1, "Activate.success")
-	// 关键提交点：active 提交恰好一次。
-	if n := tr.countOp("store", "UpdateTaskStatus"); n < 1 {
-		t.Errorf("Activate.success: UpdateTaskStatus(active) MUST 至少一次（active 提交），got %d", n)
-	}
+	assertOpCount(t, tr, "store", "CasActivationIfNoRecoveryDebt", 1, "Activate.success")
+	assertOpNever(t, tr, "store", "UpdateTaskStatus", "Activate.success")
 	// 无 BeginDeleteIntent/ArchiveTask/RestoreTask/DeleteTask（非删除/归档流程）。
 	assertOpNever(t, tr, "store", "BeginDeleteIntent", "Activate.success")
 	assertOpNever(t, tr, "store", "DeleteTask", "Activate.success")
@@ -854,7 +884,9 @@ func TestP141_Suspend_GuardReject_Trace(t *testing.T) {
 // TestP141_Delete_Normal_Success_Trace 冻结 Delete Normal 成功路径副作用顺序：
 // 静态检查（GetTask status、GetProject kind、init_status 门禁、wt.PreflightDelete、wt.DirtyFiles）
 // → store.BeginDeleteIntent(deleting) → deleteResume：
-//   retryDebtGate（row.Notice 空→通过）→ deleteOCSessions（ListTaskSessions 空→跳过）
+//
+//	retryDebtGate（row.Notice 空→通过）→ deleteOCSessions（ListTaskSessions 空→跳过）
+//
 // → killResidualSessions（proc.HasSession/ListSessions→无残余）→ pre-delete（无脚本→跳过）
 // → wt.Remove → store.DeleteTask → clearRuntime。
 //

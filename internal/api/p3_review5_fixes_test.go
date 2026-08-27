@@ -70,3 +70,57 @@ func TestAPI_WSTUI_ReopenAttachSuspended_4010(t *testing.T) {
 		t.Errorf("invalid_state close=%v want %d (4010 task suspended)", got, wsCloseTaskSuspended)
 	}
 }
+
+// TestAPI_WSTUI_ReopenAttachRecovering_1013 验证 D8（Phase 4）：ReopenAttach 返回
+// typed recovering（进程恢复中）→ WS close code 1013（Try Again Later），前端据此
+// 轮询任务状态后重连；MUST NOT 映射为 4010 suspended 或其他非重试关闭码。
+func TestAPI_WSTUI_ReopenAttachRecovering_1013(t *testing.T) {
+	tb := &fakeTaskBackend{
+		reopenErr: &application.OpError{Code: "recovering", Err: errors.New("task t1 process is starting")},
+	}
+	s := newAPITestServer(t, tb)
+	srv := httptest.NewServer(s.mux)
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws/terminal/t1"
+	conn, _, err := websocket.Dial(context.Background(), url, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow()
+	authBody, _ := json.Marshal(wsAuthReq{Type: "auth", Token: "testtoken", Cols: 80, Rows: 24})
+	if err := conn.Write(context.Background(), websocket.MessageText, authBody); err != nil {
+		t.Fatalf("write auth: %v", err)
+	}
+	_, _, rerr := conn.Read(context.Background())
+	if got := websocket.CloseStatus(rerr); got != websocket.StatusCode(wsCloseRecovering) {
+		t.Errorf("recovering close=%v want %d (1013 try again later, NOT 4010 suspended)", got, wsCloseRecovering)
+	}
+}
+
+// TestAPI_WSTUI_ReopenAttachConflict_1011Not4010 验证 G4-3：锁竞争等 transient
+// conflict（ReopenAttach 等锁超时后仍忙）→ 1011 可重试关闭，MUST NOT 进 4010
+// 让前端误判挂起停止重连。
+func TestAPI_WSTUI_ReopenAttachConflict_1011Not4010(t *testing.T) {
+	tb := &fakeTaskBackend{
+		reopenErr: &application.OpError{Code: "conflict", Err: errors.New("task busy")},
+	}
+	s := newAPITestServer(t, tb)
+	srv := httptest.NewServer(s.mux)
+	defer srv.Close()
+
+	url := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws/terminal/t1"
+	conn, _, err := websocket.Dial(context.Background(), url, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow()
+	authBody, _ := json.Marshal(wsAuthReq{Type: "auth", Token: "testtoken", Cols: 80, Rows: 24})
+	if err := conn.Write(context.Background(), websocket.MessageText, authBody); err != nil {
+		t.Fatalf("write auth: %v", err)
+	}
+	_, _, rerr := conn.Read(context.Background())
+	if got := websocket.CloseStatus(rerr); got != websocket.StatusCode(wsCloseInternalError) {
+		t.Errorf("conflict close=%v want %d (1011 retryable, NOT 4010 suspended)", got, wsCloseInternalError)
+	}
+}

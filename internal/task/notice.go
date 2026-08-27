@@ -197,14 +197,18 @@ func (m *Manager) recordResidualNotice(ctx context.Context, taskID, sessionName 
 	return fmt.Errorf("record residual notice: CAS did not converge (task %s, session %s)", taskID, sessionName)
 }
 
-// recordResidualNoticeFromDisposition 唯一映射 disposition → notice（B6）。
-// clean 不记；其余即使无 tickets 也记。返回 recordResidualNotice 的 error（不静默）。
+// recordResidualNoticeFromDisposition 按 KillResult 完整处置表记 notice（B6/G4-4
+// 同款语义，Phase 5 技术债 a）：复用 classifyKillResult——仅一致 clean 不记；
+// snapshot_missing_degraded 记 non-retryable；kill/disposition 失败、未知 disposition
+// 或 SessionKilled 矛盾一律 retryable kill_failed 显式记录（MUST NOT 静默返回 nil，
+// 否则调用方可能留下无 notice/debt 索引的存活进程）。返回 recordResidualNotice 的
+// error（不静默）。
 func (m *Manager) recordResidualNoticeFromDisposition(ctx context.Context, taskID, sessionName string, res process.KillResult) error {
-	reason, retryable, ok := dispositionToNotice(res.Disposition)
-	if !ok {
+	cls := classifyKillResult(res)
+	if cls.action == "none" {
 		return nil
 	}
-	return m.recordResidualNotice(ctx, taskID, sessionName, res.CleanupTickets, reason, retryable)
+	return m.recordResidualNotice(ctx, taskID, sessionName, res.CleanupTickets, cls.reason, cls.retryable)
 }
 
 // casWriteNotices 将 remaining notice CAS 写回（design.md §8：新 tickets 不丢失）。
@@ -345,17 +349,15 @@ func (m *Manager) retryTaskNotices(ctx context.Context, t TaskRow, entries []not
 					errs = append(errs, fmt.Errorf("kill-session %s: %w", sessionName, kerr))
 					continue
 				}
-				if res.Disposition != process.DispositionClean {
-					// 仍失败：合并新 tickets，按新 disposition 更新 reason/retryable（唯一映射）。
+				cls := classifyKillResult(res)
+				if cls.action != "none" {
+					// 仍失败：合并新 tickets，按 classifyKillResult 完整表更新
+					// reason/retryable（未知/矛盾一律 retryable kill_failed，不得经
+					// dispositionToNotice 吞掉 ok=false 当成功清债）。
 					tickets = append(tickets, res.CleanupTickets...)
 					e.Data["cleanupTickets"] = tickets
-					reason, retry, _ := dispositionToNotice(res.Disposition)
-					e.Data["reason"] = reason
-					e.Data["retryable"] = retry
-					if !retry {
-						// 转为不可重试 degraded（保留告警）。
-						e.Data["retryable"] = false
-					}
+					e.Data["reason"] = cls.reason
+					e.Data["retryable"] = cls.retryable
 					remaining = append(remaining, e)
 					continue
 				}

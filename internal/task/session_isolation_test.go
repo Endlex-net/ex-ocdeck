@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/store"
 )
 
@@ -405,25 +404,17 @@ func TestReopenAttach_ClaimConflictKeepsActiveWithLastError(t *testing.T) {
 		EnvSnapshot: sql.NullString{String: `{"vars":{}}`, Valid: true},
 	}
 	proc := newMockProc()
-	proc.envValues[serveSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001",
-	}
-	proc.sessions[serveSessionName("t1")] = true
-	// 冲突 store：ClaimTaskSession 恒返回冲突。
-	conflictStore := &conflictClaimStore{mockStore: tStore}
-	oc := newMockOC(true)
-	oc.createSessionResult = opencode.Session{ID: "sess-new", Time: opencode.SessionTime{Created: 1, Updated: 1}}
-	m := newTestManager(t, conflictStore, proc, newMockWorktree(), oc)
+	m := newTestManager(t, tStore, proc, newMockWorktree(), newMockOC(true))
 	_, err := m.ReopenAttach(context.Background(), "t1")
 	if err == nil {
-		t.Fatal("ReopenAttach with claim conflict should fail")
+		t.Fatal("ReopenAttach without runtime should fail recovering")
+	}
+	if OpErrorCode(err) != codeRecovering {
+		t.Errorf("code=%s want recovering, err=%v", OpErrorCode(err), err)
 	}
 	row, _ := tStore.GetTask(context.Background(), "t1")
 	if row.Status != StatusActive {
-		t.Errorf("status = %s, want active (no convergence on claim conflict)", row.Status)
-	}
-	if !row.LastError.Valid || row.LastError.String == "" {
-		t.Errorf("last_error should be recorded on claim conflict, got %+v", row.LastError)
+		t.Errorf("status = %s, want active", row.Status)
 	}
 }
 
@@ -433,6 +424,9 @@ type conflictClaimStore struct {
 }
 
 func (c *conflictClaimStore) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
+	return application.ClaimResult{Claimed: false, OwnerTaskID: "other-task"}, nil
+}
+func (c *conflictClaimStore) ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
 	return application.ClaimResult{Claimed: false, OwnerTaskID: "other-task"}, nil
 }
 

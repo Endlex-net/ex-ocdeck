@@ -18,6 +18,7 @@ import (
 	ocdecksess "ocdeck/internal/domain/session"
 	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // envBaselineKeys 是 design.md §2 规定的最小基础集 env key（不含 OCDECK_*/密码）。
@@ -76,7 +77,7 @@ func (m *Manager) mergeEnvSnapshot(ctx context.Context, row TaskRow, port int) (
 	merged["OCDECK_SERVE_PORT"] = strconv.Itoa(port)
 	// 持久化快照（不含密码）。
 	if err := m.persistEnvSnapshot(ctx, row.ID, merged); err != nil {
-		return nil, err
+		return nil, &persistEnvSnapshotError{err: err}
 	}
 	return merged, nil
 }
@@ -214,6 +215,13 @@ func (m *Manager) allocatePort(lastPort sql.NullInt64, exclude int) (int, error)
 	return 0, fmt.Errorf("serve port range %d-%d exhausted", pr.Min, pr.Max)
 }
 
+// portAllocationError 标记端口范围耗尽（G3-5：Recovery 分派为终态补偿，
+// cause=分配错误；Activate 沿用 OpError code 映射，行为不变）。
+type portAllocationError struct{ err error }
+
+func (e *portAllocationError) Error() string { return e.err.Error() }
+func (e *portAllocationError) Unwrap() error { return e.err }
+
 // isPortFree 探测端口是否可用（bind 后立即释放）。
 func isPortFree(port int) bool {
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
@@ -224,9 +232,9 @@ func isPortFree(port int) bool {
 	return true
 }
 
-// Activate 激活任务（design.md §19 Activate 行 + §2/§3/§4/§11）。
-// 前置检查 → 置 activating → 分配端口+合并 env → NewSession(serve) → 健康检查+Probe
-// → SSE 订阅+全量对齐 → NewSession(tui) → active。
+// Activate 激活任务（single-process-opencode D1/D5）。
+// 前置检查 → 置 activating → 分配端口+合并 env → NewSession(runtime) → 健康检查+Probe（ready）
+// → 锚定 bootstrap → token/group/watcher → SSE+对齐 → last_port → CAS active。
 func (m *Manager) Activate(ctx context.Context, taskID string) error {
 	unlock, err := m.tryLockTask(taskID)
 	if err != nil {
@@ -256,6 +264,15 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 	// 前置检查：无未清理的旧代残留会话（tmux ls 中仍存在该任务会话则拒绝）。
 	if err := m.checkNoResidualSessions(ctx, taskID); err != nil {
 		return err
+	}
+	// 前置检查（G3-16 ABA 防护，首选方案）：任务存在进行中的 recovery incident 时
+	// 拒绝激活。消除「旧 incident 被 Complete 唤醒 → 新 Activate 在 runtime 发布前
+	// 重写 activating → 旧 incident 复核见 runtime=nil+activating 误判可继续」的
+	// 重叠窗口——incident 注销（退出路径 defer）后 Activate 即恢复放行；incident
+	// 退出是毫秒-秒级，用户重试即可。相比 activation/recovery epoch 显式代数，
+	// 本方案零新增状态、单一拒绝点，简单可靠。
+	if m.hasActiveRecoveryIncident(taskID) {
+		return newOpErr(codeConflict, fmt.Errorf("task %s recovery in progress; retry after it settles", taskID))
 	}
 	// 前置检查：无未清理的 cleanup debt（任意 retryable=true notice 拒绝激活）。
 	if hasRetryable, err := m.hasRetryableNotice(ctx, row); err != nil {
@@ -289,9 +306,13 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 		}
 	}
 
-	// ① 置 activating。
-	updated, err := m.writeStatusConditional(ctx, taskID, StatusSuspended, StatusActivating, sql.NullString{})
+	// ① 置 activating。G3-18：激活准入原子拒绝未清 recovery debt（Complete 成功
+	// 但删除失败遗留 / CAS mismatch 留存的旧 intent 不得被重放误伤本次激活）。
+	updated, err := m.beginActivation(ctx, taskID, StatusSuspended)
 	if err != nil {
+		if errors.Is(err, store.ErrRecoveryDebtPresent) {
+			return newOpErr(codeConflict, fmt.Errorf("task %s has uncleaned recovery debt; resolve (replay) before activate", taskID))
+		}
 		return newOpErr(codeInternal, err)
 	}
 	if !updated.Matched {
@@ -299,7 +320,12 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 	}
 
 	if err := m.activateRun(ctx, taskID, mode); err != nil {
-		// 失败：清理已建会话（serve/tui/shell）→ suspended + last_error（design.md §19 补偿）。
+		var handled *errActivateCommitHandled
+		if errors.As(err, &handled) {
+			m.replayHandledCleanup(ctx, taskID, err)
+			return handled.err
+		}
+		// 失败：清理已建会话（runtime/shell）→ suspended + last_error（design.md §19 补偿）。
 		// 补偿 MUST 用脱离调用方取消的 context：activateRun 可能在 probe 退避/健康检查等
 		// 步骤因 ctx 取消返回，此时调用方 ctx 已取消，真实 store 用 ExecContext 会因 ctx 取消
 		// 失败 → 清快照/状态回退/notice 持久化全部失败且错误被忽略 → 任务卡 activating。
@@ -307,13 +333,26 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 		m.runActivateFailureCompensation(ctx, taskID, err)
 		return err
 	}
-	// 提交点：active。提交失败补偿（杀已建会话回 suspended，B5）。
-	if _, err := m.writeStatus(ctx, taskID, StatusActive, sql.NullString{}); err != nil {
-		commitErr := fmt.Errorf("commit active: %w", err)
-		m.runActivateFailureCompensation(ctx, taskID, commitErr)
-		return newOpErr(codeInternal, err)
-	}
 	return nil
+}
+
+// errActivateCommitHandled 表示 CAS mismatch 反向清理已按本 attempt token 做完，
+// MUST NOT 再走通用补偿（禁写 status/last_error/env_snapshot/anchor）。
+type errActivateCommitHandled struct{ err error }
+
+func (e *errActivateCommitHandled) Error() string { return e.err.Error() }
+func (e *errActivateCommitHandled) Unwrap() error { return e.err }
+
+func (m *Manager) replayHandledCleanup(reqCtx context.Context, taskID string, err error) {
+	pendings := foldPendingCleanups(err, nil)
+	if len(pendings) == 0 {
+		return
+	}
+	replayCtx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), activateCompensationFinalizeTimeout)
+	defer cancel()
+	if rerr := m.replayPendingCleanups(replayCtx, taskID, pendings); rerr != nil {
+		log.Printf("activate: CAS mismatch pending replay for task %s: %v", taskID, rerr)
+	}
 }
 
 // activateCompensationTimeout 是 cleanup 阶段（kill 已建会话、枚举 shell、记 residual notice）
@@ -455,7 +494,7 @@ func (m *Manager) replayPendingCleanups(ctx context.Context, taskID string, pend
 	return errors.Join(errs...)
 }
 
-// activateRun 执行激活的外部副作用序列（serve → probe → SSE → tui）。
+// activateRun 执行激活的外部副作用序列（runtime → probe/ready → D5 bootstrap → SSE → last_port）。
 // mode 由 Activate 早期 kind 门禁解析后传入（add-plain-dir-project D8）。
 func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode) error {
 	row, err := m.store.GetTask(ctx, taskID)
@@ -463,59 +502,151 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 		return err
 	}
 
-	// ② 分配端口、合并 env 快照并持久化。
 	port, err := m.allocatePort(row.LastPort, 0)
 	if err != nil {
-		return newOpErr(codeConflict, err)
+		return &portAllocationError{err: newOpErr(codeConflict, err)}
 	}
 	env, err := m.mergeEnvSnapshot(ctx, row, port)
 	if err != nil {
 		return newOpErr(codeInternal, err)
 	}
 
-	// ③ NewSession(serve) + 健康检查：EADDRINUSE 自动换端口重试（design.md §3，B5）。
-	// serve 在 tmux 内运行 opencode serve --port；端口被占时进程启动但健康检查不就绪。
-	// 重试：换新端口 + 重新合并 env（OCDECK_SERVE_PORT 变）+ 重建 serve 会话。
+	runtimeName := runtimeSessionName(taskID)
 	password := newRandomPassword()
-	serveName := serveSessionName(taskID)
-	port, err = m.startServeWithPortRetry(ctx, row, serveName, port, password, env)
+	port, password, err = m.bootstrapRuntime(ctx, row, runtimeName, port, password, env, nil, false)
 	if err != nil {
 		return err
 	}
-	// 端口写回 DB（仅记录，非事实来源，design.md §3）。B7b：写入错误不得忽略。
-	if _, err := m.writeLastPort(ctx, taskID, port); err != nil {
-		// 端口写回失败非致命（last_port 仅交叉校验），但不得静默吞错。
-		// serve 已起在 port，继续后续流程；记录日志供运维感知。
-		log.Printf("activate: update last port for task %s: %v (serve running on %d)", taskID, err, port)
-	}
+	return m.commitRuntimeReady(ctx, taskID, row.WorktreePath, runtimeName, port, password, mode, nil)
+}
 
-	// ⑤ SSE 订阅（onReady 等待建立 → 全量对齐 → 事件 upsert）。
-	// 注册前校验 serve 会话仍存活（C2：避免注册已被 tmux 回收的会话造成孤儿注册表；
-	// serve 在 Probe 后、注册前可能崩溃，此时清已建会话回 suspended）。
-	if alive, _ := m.proc.HasSession(serveName); !alive {
-		_, _ = m.proc.KillSession(serveName) // best-effort 清理
-		return newOpErr(codeProcessError, fmt.Errorf("serve session gone before runtime register"))
+// commitRuntimeReady 成功提交序列（D3/Phase 2）：token/group/watcher → SSE+align → final health → last_port → CAS active。
+// onRegister（仅 Recovery 传入，G3-19）：runtime 发布前回调，把本 attempt 的新
+// token 显式绑定到发起 incident（不经 setRuntime 通用挂钩，避免误绑新代 token）。
+func (m *Manager) commitRuntimeReady(ctx context.Context, taskID, wtPath, runtimeName string, port int, password string, mode AlignMode, onRegister func(rt *taskRuntime)) error {
+	// 注册前探活：HasSession infra 与 absent 必须拆开。本函数 MUST NOT 本地
+	// KillSession——KillResult（含 nil error + reap_failed tickets，reaper.go）
+	// 若在此丢弃，会话已删后外层补偿只看到 absent，tickets 永久丢失。
+	// 唯一清理 owner：Activate → runActivateFailureCompensation /
+	// cleanupActivationRuntimeCollect；Recovery → confirmRuntimeTerminated。
+	alive, herr := m.proc.HasSession(runtimeName)
+	if herr != nil && !errors.Is(herr, process.ErrNoTmuxServer) {
+		return newOpErr(codeProcessError, fmt.Errorf("runtime session probe before register: %w", herr))
+	}
+	if !alive {
+		return newOpErr(codeProcessError, fmt.Errorf("runtime session gone before runtime register"))
 	}
 	rt := m.newRuntime(taskID)
+	if onRegister != nil {
+		onRegister(rt)
+	}
 	m.setRuntime(taskID, rt)
-	// 注册 serve group（B4：groups 真实写入注册表）。
-	rt.registerGroup("serve", serveName)
-	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode); err != nil {
+	rt.registerGroup(roleRuntime, runtimeName)
+	m.watchServeExit(taskID, runtimeName)
+	if err := m.startSSE(ctx, rt, taskID, wtPath, port, password, mode); err != nil {
 		return newOpErr(codeProcessError, fmt.Errorf("sse subscribe: %w", err))
 	}
-
-	// ⑥ NewSession(tui)：opencode attach --session（无记录或 404 时先经 REST 创建会话锚定，§4）。
-	if err := m.startTUI(ctx, row, port, password, env); err != nil {
-		return newOpErr(codeProcessError, fmt.Errorf("tui session: %w", err))
+	oc := m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 10 * time.Second})
+	if _, herr := oc.Health(ctx); herr != nil {
+		return newOpErr(codeProcessError, fmt.Errorf("final health: %w", herr))
 	}
-	// 注册 tui group（B4）。
-	rt.registerGroup("tui", tuiSessionName(taskID))
+	if _, err := m.writeLastPort(ctx, taskID, port); err != nil {
+		return newOpErr(codeInternal, &lastPortWriteError{err: fmt.Errorf("write last port: %w", err)})
+	}
+	// G3-1：CAS 前排空本 attempt runtime 的 SSE fatal——fatal 与 CAS 在同一同步域分派，
+	// 杜绝「CAS 提交无 SSE 的 active」窗口（Recovery 无 incident 时此处恒为 nil，Activate 不受影响）。
+	if fatalErr := m.incidentFatalFor(taskID, rt.instVersion); fatalErr != nil {
+		return newOpErr(codeProcessError, fmt.Errorf("sse fatal before commit: %w", fatalErr))
+	}
+	cas, err := m.writeStatusConditional(ctx, taskID, StatusActivating, StatusActive, sql.NullString{})
+	if err != nil {
+		return newOpErr(codeInternal, fmt.Errorf("commit active: %w", err))
+	}
+	if cas.Matched {
+		// G3-1：CAS 后 fatal → 已提交 active，经幂等 ensureRecovery 立即开新 incident
+		//（same-token 状态/锁校验保证不产生并发双恢复）。
+		if fatalErr := m.incidentFatalFor(taskID, rt.instVersion); fatalErr != nil {
+			go m.ensureRecovery(taskID, rt.instVersion)
+		}
+		return nil
+	}
+	fresh, rerr := m.store.GetTask(ctx, taskID)
+	if rerr != nil {
+		rbErr := m.rollbackAttemptRuntime(ctx, taskID, runtimeName, rt.instVersion)
+		cause := newOpErr(codeInternal, fmt.Errorf("commit active reread: %w", rerr))
+		return wrapHandledRollback(cause, rbErr)
+	}
+	if fresh.Status == StatusActive {
+		if cur := m.getRuntime(taskID); cur != nil && cur.instVersion == rt.instVersion {
+			return nil
+		}
+	}
+	rbErr := m.rollbackAttemptRuntime(ctx, taskID, runtimeName, rt.instVersion)
+	cause := newOpErr(codeConflict, fmt.Errorf("task %s state changed before activate commit", taskID))
+	return wrapHandledRollback(cause, rbErr)
+}
 
-	// 退出监视：serve 异常消失 → 完整清理 → suspended（design.md §4）。
-	m.watchServeExit(taskID, serveName)
-	// TUI 消失 serve 存活 → 标记可重开（保持活跃）。
-	m.watchTUIExit(taskID, tuiSessionName(taskID))
-	return nil
+func wrapHandledRollback(cause, rbErr error) error {
+	if rbErr == nil {
+		return &errActivateCommitHandled{err: cause}
+	}
+	var pce *pendingCleanupError
+	if errors.As(rbErr, &pce) {
+		return &errActivateCommitHandled{err: rbErr}
+	}
+	return &errActivateCommitHandled{err: fmt.Errorf("%w; rollback: %v", cause, rbErr)}
+}
+
+func (m *Manager) rollbackAttemptRuntime(ctx context.Context, taskID, runtimeName string, tok runtime.InstVersion) error {
+	cur := m.getRuntime(taskID)
+	if cur == nil || cur.instVersion != tok {
+		return nil
+	}
+	cur.stopAllJoin()
+	m.rtMu.Lock()
+	replaced := m.runtimes[taskID] != nil && m.runtimes[taskID] != cur
+	if m.runtimes[taskID] == cur {
+		delete(m.runtimes, taskID)
+	}
+	m.rtMu.Unlock()
+	if replaced {
+		return nil
+	}
+
+	nctx, ncancel := withResidualNoticeCtx(ctx)
+	defer ncancel()
+	exists, herr := m.proc.HasSession(runtimeName)
+	if herr != nil && !errors.Is(herr, process.ErrNoTmuxServer) {
+		return m.rollbackNotice(nctx, taskID, runtimeName, nil, noticeReasonKillFailed, true, herr)
+	}
+	if !exists {
+		return nil
+	}
+	if cur := m.getRuntime(taskID); cur != nil && cur.instVersion != tok {
+		return nil
+	}
+	res, kerr := m.proc.KillSession(runtimeName)
+	if kerr != nil {
+		return m.rollbackNotice(nctx, taskID, runtimeName, res.CleanupTickets, noticeReasonKillFailed, true, kerr)
+	}
+	cls := classifyKillResult(res)
+	if cls.action == "none" {
+		return nil
+	}
+	return m.rollbackNotice(nctx, taskID, runtimeName, res.CleanupTickets, cls.reason, cls.retryable, fmt.Errorf("rollback disposition %s", res.Disposition))
+}
+
+func (m *Manager) rollbackNotice(ctx context.Context, taskID, sessionName string, tickets []string, reason string, retryable bool, cause error) error {
+	nerr := m.recordResidualNotice(ctx, taskID, sessionName, tickets, reason, retryable)
+	if nerr == nil {
+		// G3-2/G3-5：notice 已落库的 retryable/infra 回退失败 → typed 终态
+		//（Recovery MUST NOT 再创建进程；Activate 补偿行为不变）。
+		return &retryableCleanupError{err: cause}
+	}
+	if perr := m.persistOrphanDebt(ctx, sessionName, tickets); perr != nil {
+		log.Printf("activate: persist rollback debt %s: %v", sessionName, perr)
+	}
+	return recordNoticeOrPending(sessionName, tickets, reason, retryable, nerr, cause)
 }
 
 // 生产默认健康轮询预算（design.md：500ms 间隔、10s deadline）。
@@ -604,23 +735,31 @@ func (m *Manager) waitServeReadyOrDead(ctx context.Context, oc OCClient, serveNa
 	return fmt.Errorf("health check timeout")
 }
 
+// capabilityProbeError 标记能力探测失败（G3-5：Recovery 分派为终态补偿——「探测失败
+// 不轮换」；Activate 路径沿用 OpError code 映射，行为不变）。
+type capabilityProbeError struct{ err error }
+
+func (e *capabilityProbeError) Error() string { return e.err.Error() }
+func (e *capabilityProbeError) Unwrap() error { return e.err }
+
 // probeErrToOpCode 按 design.md §11/§21 将 Probe 返回的 sentinel 错误映射为 OpError code：
 //   - ErrServeNotReady（网络/超时/serve 未就绪）→ process_error（可重试）
 //   - ErrCapabilityMismatch（结构不兼容）→ oc_incompatible（激活门禁拒绝）
 //   - ErrUnauthorized（401，Basic Auth 凭据错误）→ internal（内部 bug）
 //
 // Probe 内部已用 classifyProbeErr 归类为这些 sentinel；此处用 errors.Is 兼容 wrap（%w）。
+// 返回错误统一包 capabilityProbeError（typed 分派，G3-5；文本不变）。
 func probeErrToOpCode(err error) (string, error) {
 	switch {
 	case errors.Is(err, opencode.ErrCapabilityMismatch):
-		return codeOCIncompatible, fmt.Errorf("capability probe: %w", err)
+		return codeOCIncompatible, &capabilityProbeError{err: fmt.Errorf("capability probe: %w", err)}
 	case errors.Is(err, opencode.ErrUnauthorized):
-		return codeInternal, fmt.Errorf("capability probe (unauthorized, internal bug): %w", err)
+		return codeInternal, &capabilityProbeError{err: fmt.Errorf("capability probe (unauthorized, internal bug): %w", err)}
 	case errors.Is(err, opencode.ErrServeNotReady):
-		return codeProcessError, fmt.Errorf("capability probe (serve not ready): %w", err)
+		return codeProcessError, &capabilityProbeError{err: fmt.Errorf("capability probe (serve not ready): %w", err)}
 	default:
 		// 未知错误保守按 process_error（可重试），避免误判为不可恢复。
-		return codeProcessError, fmt.Errorf("capability probe: %w", err)
+		return codeProcessError, &capabilityProbeError{err: fmt.Errorf("capability probe: %w", err)}
 	}
 }
 
@@ -832,16 +971,66 @@ func wrapServeWaitCause(waitErr error, finalErr error, parts ...string) error {
 	return fmt.Errorf("%s: %w", msg, finalErr)
 }
 
-// startServeWithPortRetry 创建 serve 会话并健康检查；未就绪时按 D2 门禁换端口重试。
-// 端口变更时 MUST 同步三处 OCDECK_SERVE_PORT（design.md §3 E1）：
-//   - 内存 env map（传给后续 startTUI）
-//   - 持久化 tasks.env_snapshot（UpdateTaskEnvSnapshot）
-//   - 新建 serve 会话环境（serveEnv）
-//
-// Probe 失败 MUST NOT 本地 kill / 换端口；kill+notice 委托外层 compensation。
+// runtimeCmdArgv 构造单进程启动 argv：`opencode --port <p> --hostname 127.0.0.1`，
+// 有锚定时追加 `--session <id>`（D1/D5）。密码经 env 注入，禁止进 argv。
+func runtimeCmdArgv(port int, sessionID string) []string {
+	argv := []string{"opencode", "--port", strconv.Itoa(port), "--hostname", "127.0.0.1"}
+	if sessionID != "" {
+		argv = append(argv, "--session", sessionID)
+	}
+	return argv
+}
+
+// startServeWithPortRetry 创建 runtime 会话并健康检查；未就绪时按既有门禁换端口重试
+// （Activate 形态：无 permit、密码复用）。sessionID 非空时命令携带 `--session`。
 // 返回最终可用端口；轮换路径终态错误可携带 pendingCleanupError。
-func (m *Manager) startServeWithPortRetry(ctx context.Context, row TaskRow, serveName string, port int, password string, env map[string]string) (int, error) {
+func (m *Manager) startServeWithPortRetry(ctx context.Context, row TaskRow, serveName string, port int, password string, env map[string]string, sessionID string) (int, error) {
+	port, _, err := m.startRuntimeWithPortRetry(ctx, row, serveName, port, password, env, sessionID, nil, false)
+	return port, err
+}
+
+// startRuntimeWithPortRetry 单进程启动 + 健康检查 + 能力探测（Activate/Recovery 共用）。
+// 每轮原子序列（G3-4）：permit（beforeCreate，仅 Recovery）→ 端口分配（轮换）→
+// env 快照持久化 → NewSession（Recovery 每次重新生成密码）→ 健康轮询 → 能力探测。
+// 端口变更时 MUST 同步三处 OCDECK_SERVE_PORT：内存 env map、持久化 tasks.env_snapshot、
+// 新建 runtime 会话环境。Probe 失败 MUST NOT 本地 kill / 换端口；kill+notice 委托外层
+// compensation。返回最终可用端口与本次创建实际使用的密码；轮换路径终态错误可携带
+// pendingCleanupError。
+func (m *Manager) startRuntimeWithPortRetry(ctx context.Context, row TaskRow, serveName string, port int, password string, env map[string]string, sessionID string, beforeCreate func() error, freshPassword bool) (int, string, error) {
+	// prevWaitErr / prevRotateParts 承载上一轮健康失败上下文（G3-4：端口分配移至轮次
+	// 顶部、permit 之后；轮间上下文经此传递，操作顺序与既有一致）。
+	var prevWaitErr error
+	var prevRotateParts []string
 	for attempt := 0; attempt < servePortRetries; attempt++ {
+		// (0) Recovery permit：MUST 先于端口分配与任何进程副作用（D3/G3-4）。
+		if beforeCreate != nil {
+			if err := beforeCreate(); err != nil {
+				return port, password, err
+			}
+		}
+		if attempt > 0 {
+			// (1) 端口轮换（G3-4 移至轮次顶部）：排除刚失败端口后分配；失败 MUST 包装
+			// aerr（%w）并保留上轮 wait 上下文。
+			newPort, aerr := m.allocatePort(sql.NullInt64{Int64: int64(port), Valid: true}, port)
+			if aerr != nil {
+				return port, password, &portAllocationError{err: newOpErr(codeConflict, wrapServeWaitCause(prevWaitErr, aerr, prevRotateParts...))}
+			}
+			port = newPort
+			// (2) persist 失败 → 终态，MUST NOT NewSession。保留 wait + disposition 上下文，%w 包装 perr。
+			// env 可能为 nil（调用方/测试注入）；写入前初始化，语义仍是更新后 persist。
+			if env == nil {
+				env = make(map[string]string)
+			}
+			env["OCDECK_SERVE_PORT"] = strconv.Itoa(port)
+			if perr := m.persistEnvSnapshot(ctx, row.ID, env); perr != nil {
+				return port, password, newOpErr(codeInternal, &persistEnvSnapshotError{err: wrapServeWaitCause(prevWaitErr, perr, prevRotateParts...)})
+			}
+		}
+		// Recovery 每次创建进程重新生成密码（G3-4：MUST NOT 循环复用同密码；
+		// Activate 沿用传入密码不变）。
+		if freshPassword {
+			password = newRandomPassword()
+		}
 		serveEnv := copyMap(env)
 		serveEnv["OPENCODE_SERVER_PASSWORD"] = password
 		serveEnv["OCDECK_SERVE_PORT"] = strconv.Itoa(port)
@@ -849,9 +1038,9 @@ func (m *Manager) startServeWithPortRetry(ctx context.Context, row TaskRow, serv
 			Name:    serveName,
 			Dir:     row.WorktreePath,
 			Env:     serveEnv,
-			CmdArgv: []string{"opencode", "serve", "--port", strconv.Itoa(port), "--hostname", "127.0.0.1"},
+			CmdArgv: runtimeCmdArgv(port, sessionID),
 		}); err != nil {
-			return port, newOpErr(codeProcessError, fmt.Errorf("serve session: %w", err))
+			return port, password, newOpErr(codeProcessError, fmt.Errorf("runtime session: %w", err))
 		}
 		oc := m.ocFactory(port, password, opencode.Options{
 			HealthTimeout: 2 * time.Second,
@@ -862,9 +1051,9 @@ func (m *Manager) startServeWithPortRetry(ctx context.Context, row TaskRow, serv
 			// 同时认 wait 返回的取消错误与调用方 ctx（墙钟竞态下 wait 可能先返回 timeout）。
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				if ctx.Err() != nil {
-					return port, ctx.Err()
+					return port, password, ctx.Err()
 				}
-				return port, err
+				return port, password, err
 			}
 			// (b) 进程已死亡：无 KillSession / disposition / notice → 直接预算检查。
 			canRotate := errors.Is(err, errServeSessionDied)
@@ -879,9 +1068,11 @@ func (m *Manager) startServeWithPortRetry(ctx context.Context, row TaskRow, serv
 					ncancel()
 					cause := newOpErr(codeProcessError, aggregateServeWaitErr(err, fmt.Sprintf("kill: %v", kerr)))
 					if nerr != nil {
-						return port, recordNoticeOrPending(serveName, res.CleanupTickets, noticeReasonKillFailed, true, nerr, cause)
+						return port, password, recordNoticeOrPending(serveName, res.CleanupTickets, noticeReasonKillFailed, true, nerr, cause)
 					}
-					return port, cause
+					// G3-2/G3-5：kill infra 错误（notice 已落库）→ retryable cleanup debt
+					// 在位，Recovery MUST NOT 再创建进程（typed 终态；Activate 行为不变）。
+					return port, password, &retryableCleanupError{err: cause}
 				}
 				cls := classifyKillResult(res)
 				switch cls.action {
@@ -895,7 +1086,7 @@ func (m *Manager) startServeWithPortRetry(ctx context.Context, row TaskRow, serv
 						cause := newOpErr(codeProcessError, aggregateServeWaitErr(err,
 							fmt.Sprintf("disposition: %s", res.Disposition),
 							fmt.Sprintf("notice: %v", nerr)))
-						return port, recordNoticeOrPending(serveName, res.CleanupTickets, cls.reason, cls.retryable, nerr, cause)
+						return port, password, recordNoticeOrPending(serveName, res.CleanupTickets, cls.reason, cls.retryable, nerr, cause)
 					}
 					// snapshot_missing_degraded 记 notice 后可继续；保留 disposition 供末次终态聚合。
 					canRotate = true
@@ -909,30 +1100,20 @@ func (m *Manager) startServeWithPortRetry(ctx context.Context, row TaskRow, serv
 					}
 					cause := newOpErr(codeProcessError, aggregateServeWaitErr(err, parts...))
 					if nerr != nil {
-						return port, recordNoticeOrPending(serveName, res.CleanupTickets, cls.reason, cls.retryable, nerr, cause)
+						return port, password, recordNoticeOrPending(serveName, res.CleanupTickets, cls.reason, cls.retryable, nerr, cause)
 					}
-					return port, cause
+					// G3-2/G3-5：retryable/未知矛盾 disposition（notice 已落库）→
+					// Recovery MUST NOT 再创建进程（typed 终态；Activate 行为不变）。
+					return port, password, &retryableCleanupError{err: cause}
 				}
 			}
 			// (d) 末次预算：MUST NOT allocate/persist。终态聚合 wait + 本轮可得 disposition。
 			if attempt == servePortRetries-1 {
-				return port, newOpErr(codeProcessError, aggregateServeWaitErr(err, rotateParts...))
+				return port, password, newOpErr(codeProcessError, aggregateServeWaitErr(err, rotateParts...))
 			}
-			// (e) 排除刚失败端口后分配；失败 MUST 包装 aerr（%w）并保留 wait 上下文。
-			newPort, aerr := m.allocatePort(sql.NullInt64{Int64: int64(port), Valid: true}, port)
-			if aerr != nil {
-				return port, newOpErr(codeConflict, wrapServeWaitCause(err, aerr, rotateParts...))
-			}
-			port = newPort
-			// (f) persist 失败 → 终态，MUST NOT NewSession。保留 wait + disposition 上下文，%w 包装 perr。
-			// env 可能为 nil（调用方/测试注入）；写入前初始化，语义仍是更新后 persist。
-			if env == nil {
-				env = make(map[string]string)
-			}
-			env["OCDECK_SERVE_PORT"] = strconv.Itoa(port)
-			if perr := m.persistEnvSnapshot(ctx, row.ID, env); perr != nil {
-				return port, newOpErr(codeInternal, wrapServeWaitCause(err, perr, rotateParts...))
-			}
+			// (e) 轮换上下文带入下一轮顶部（permit → allocate → persist → NewSession）。
+			prevWaitErr = err
+			prevRotateParts = rotateParts
 			continue
 		}
 		// 健康就绪 → 能力探测。
@@ -940,12 +1121,26 @@ func (m *Manager) startServeWithPortRetry(ctx context.Context, row TaskRow, serv
 		// （kill+notice 委托外层 runActivateFailureCompensation）。
 		if err := m.probeWithColdStartRetry(ctx, oc); err != nil {
 			code, ferr := probeErrToOpCode(err)
-			return port, newOpErr(code, ferr)
+			return port, password, newOpErr(code, ferr)
 		}
-		return port, nil
+		return port, password, nil
 	}
-	return port, newOpErr(codeProcessError, fmt.Errorf("serve not ready after %d port retries", servePortRetries))
+	return port, password, newOpErr(codeProcessError, fmt.Errorf("serve not ready after %d port retries", servePortRetries))
 }
+
+// persistEnvSnapshotError 标记 env 快照写失败（G3-5：Recovery 分派为 attempt 重试；
+// Activate 仍走既有终态补偿）。
+type persistEnvSnapshotError struct{ err error }
+
+func (e *persistEnvSnapshotError) Error() string { return e.err.Error() }
+func (e *persistEnvSnapshotError) Unwrap() error { return e.err }
+
+// lastPortWriteError 标记 tasks.last_port 写失败（G3-5：Recovery 在提交回滚后重试；
+// Activate 走既有补偿）。
+type lastPortWriteError struct{ err error }
+
+func (e *lastPortWriteError) Error() string { return e.err.Error() }
+func (e *lastPortWriteError) Unwrap() error { return e.err }
 
 // persistEnvSnapshot 将已合并的 env map 持久化为 tasks.env_snapshot（不含密码）。
 // 端口变更重试时复用 mergeEnvSnapshot 的持久化路径，保证快照与新端口一致（E1）。
@@ -1036,7 +1231,9 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 			// R7 failpoint：session 落库错误 MUST 收敛运行时（design.md §4/§19）。
 			for _, ev := range replay {
 				if err := m.handleSSEEvent(sseCtx, taskID, wtPath, ev); err != nil {
-					go m.convergeToSuspendedForGen(taskID, "sse replay session store error: "+err.Error(), rt.instVersion)
+					// G3-1：经统一 fatal 上报（incident 同步域 + 幂等 ensureRecovery），
+					// 提交期 fatal 不得因 activating no-op 而丢失。
+					m.reportRuntimeFatal(taskID, rt.instVersion, fmt.Errorf("sse buffered event: %w", err))
 					return
 				}
 			}
@@ -1064,10 +1261,9 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 			}
 			bufMu.Unlock()
 			// R7 failpoint：session 落库错误 MUST 收敛运行时（会话归属丢失 → 运行时不可确定，
-			// design.md §4/§19）。在独立 goroutine 收敛：cleanup 会 kill serve 结束本 ctx，
-			// 需避免在 SSE goroutine 内 join/cancel 造成死锁。
+			// design.md §4/§19）。经统一 fatal 上报（G3-1）。
 			if err := m.handleSSEEvent(sseCtx, taskID, wtPath, ev); err != nil {
-				go m.convergeToSuspendedForGen(taskID, "sse session store error: "+err.Error(), rt.instVersion)
+				m.reportRuntimeFatal(taskID, rt.instVersion, fmt.Errorf("sse event: %w", err))
 				return
 			}
 		}
@@ -1088,11 +1284,10 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 			connEpochMu.Unlock()
 			if err := m.alignSessions(sseCtx, taskID, wtPath, ocWithReady, mode); err != nil {
 				// 重连对齐失败 MUST 收敛任务状态（design.md §4）：不得只取消 SSE 留 active 假象。
-				// serve 可能仍存活但无法追踪会话，视同运行时不可确定 → cleanup runtime + suspended + last_error。
-				// 在新 goroutine 收敛：onReconnect 在 SSE goroutine 内，cleanup 会 kill serve（结束本 goroutine ctx），
-				// 需避免在自身 goroutine 内 join/cancel 造成死锁。
+				// serve 可能仍存活但无法追踪会话，视同运行时不可确定 → 经统一 fatal 上报
+				//（G3-1：incident 同步域 + 幂等 ensureRecovery）。
 				cancel()
-				go m.convergeToSuspendedForGen(taskID, "sse reconnect align failed: "+err.Error(), rt.instVersion)
+				m.reportRuntimeFatal(taskID, rt.instVersion, fmt.Errorf("sse reconnect align: %w", err))
 				return
 			}
 			// D6 注意力对账（align 路径）：session align 成功后、drainAndRelease 前。失败不影响任务状态机。
@@ -1107,14 +1302,14 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 		// 返回非 nil 或正常返回（流结束）都意味着 SSE 不再托管 → 不得留 active 无 SSE 假象。
 		sseErr := ocWithReady.SubscribeEvents(sseCtx, wtPath, onEvent, onReconnect)
 		if sseErr != nil && sseErr != context.Canceled && !errors.Is(sseErr, context.Canceled) {
-			// SSE 流异常结束（非主动 cancel）：在新 goroutine 收敛（cleanup 会 kill serve 结束本 ctx）。
-			go m.convergeToSuspendedForGen(taskID, "sse stream ended: "+sseErr.Error(), rt.instVersion)
+			// SSE 流异常结束（非主动 cancel）：经统一 fatal 上报（G3-1）。
+			m.reportRuntimeFatal(taskID, rt.instVersion, fmt.Errorf("sse stream ended: %w", sseErr))
 			return
 		}
 		// 正常返回（流结束/ctx 取消）：若 ctx 未被主动 cancel（即非 Activate/Shutdown 主动停 SSE），
 		// serve 仍存活但 SSE 流终止 → 收敛。sseCtx 被 cancel 的情况由 Activate 返回路径/Shutdown 处理，不在此收敛。
 		if sseCtx.Err() == nil {
-			go m.convergeToSuspendedForGen(taskID, "sse stream ended (serve may still be alive)", rt.instVersion)
+			m.reportRuntimeFatal(taskID, rt.instVersion, errors.New("sse stream ended"))
 		}
 	}()
 
@@ -1317,7 +1512,7 @@ func (m *Manager) sessionBelongsToTask(ctx context.Context, taskID, sid string) 
 // alignSessions 全量对齐（design.md §4 + add-plain-dir-project D8）：
 // GET /session?directory=<wt>&limit=1000。count<limit → complete=true（删 owned 缺席行）；
 // count==limit → overflow，complete=false，先经事务外 CAS 写 session_overflow notice 再调对齐
-//（对齐失败 notice 保留，B5）。
+// （对齐失败 notice 保留，B5）。
 //
 // mode=AlignModeRepo：listed 逐个原子 claim（单任务场景 guard 不命中，行为与既有 upsert 一致），
 // 冲突 ID 经 align 编排上报日志（冲突 session 在事务内被跳过）。
@@ -1357,112 +1552,186 @@ func (m *Manager) alignSessions(ctx context.Context, taskID, wtPath string, oc O
 	return aerr
 }
 
-// startTUI 锚定确定 session 并创建 TUI 会话（design.md §4 恢复与锚定）。
-// 激活 MUST 立即锚定确定 session，不使用 --continue（其"目录最近会话"语义不等于本任务会话）。
-//  1. 有记录（task_sessions 最近 sessionID）→ GetSession 预检：存在 → attach --session <id>；
-//     404 → 走创建路径；其他错误 → 激活失败。
-//  2. 无记录或预检 404 → CreateSession(dir, title=任务名) → 持久化 task_sessions
-//     （upsert：session_id、session_created_at=time.created、first_seen_at/last_seen_at=time.updated，
-//     与 SSE 对齐语义一致）→ attach --session <newID>。
-//  3. 持久化失败（CreateSession 已成功但 task_sessions 写入失败）→ 聚合错误并激活失败
-//     （不留"session 已建但无归属记录"的不一致；已建 session 可经后续全量对齐补记，不算泄漏）。
-func (m *Manager) startTUI(ctx context.Context, row TaskRow, port int, password string, env map[string]string) error {
-	tuiEnv := copyMap(env)
-	tuiEnv["OPENCODE_SERVER_PASSWORD"] = password
-	tuiName := tuiSessionName(row.ID)
+// anchorStageError 标记 D5 锚定阶段的确定性失败（G3-5：claim 冲突/锚定写失败/条件清空
+// store 错误/CAS 异常 → Recovery 终态补偿；Activate 沿用 OpError code 映射，行为不变）。
+type anchorStageError struct{ err error }
 
-	oc := m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 5 * time.Second})
+func (e *anchorStageError) Error() string { return e.err.Error() }
+func (e *anchorStageError) Unwrap() error { return e.err }
 
-	// 锚定 sessionID：有记录 → 预检存在；无记录或 404 → 创建并持久化。
-	sessionID, err := m.resolveAnchorSession(ctx, oc, row)
-	if err != nil {
-		return err
-	}
-
-	cmdArgv := []string{"opencode", "attach", "http://127.0.0.1:" + strconv.Itoa(port), "--session", sessionID}
-	return m.proc.NewSession(process.SessionSpec{
-		Name:    tuiName,
-		Dir:     row.WorktreePath,
-		Env:     tuiEnv,
-		CmdArgv: cmdArgv,
-	})
-}
-
-// resolveAnchorSession 解析 TUI attach 锚定的 sessionID（design.md §4 锚定）。
-// 有记录 → GetSession 预检存在；无记录或预检 404 → CreateSession 并持久化 task_sessions。
-// 预检/创建的其他错误、持久化失败均返回错误（激活失败，不回退）。
-//
-// B3 锚定隔离：候选 MUST 仅取顶层会话（ListTopLevelTaskSessions，parent_id 为空），
-// 杜绝锚定到 background subagent 子会话（子 session last_seen 更晚时会排到首项，
-// 导致 attach 锚定到子会话而非用户主会话）。
-func (m *Manager) resolveAnchorSession(ctx context.Context, oc OCClient, row TaskRow) (string, error) {
-	// R7 failpoint：ListTopLevelTaskSessions 错误 MUST 传播（不得当空集继续，
-	// 否则丢失既有 session 归属 → 用户会话状态错误恢复，design.md §19 failpoint 表）。
-	sessions, serr := m.store.ListTopLevelTaskSessions(ctx, row.ID)
-	if serr != nil {
-		return "", fmt.Errorf("start tui: list top-level sessions: %w", serr)
-	}
-
-	if len(sessions) > 0 {
-		recentID := sessions[0].SessionID
-		_, gerr := oc.GetSession(ctx, row.WorktreePath, recentID)
-		if gerr == nil {
-			return recentID, nil
+// bootstrapRuntime 执行 D5 确定性锚定协议。Activate（beforeCreate=nil，不耗恢复 permit）
+// 与 Recovery（beforeCreate 非 nil：每次 NewSession 前先取 permit+退避；freshPassword：
+// 每次创建重新生成密码，G3-4）共用。有锚定 → `--session` 启动，ready 后列表校验；
+// 缺席则条件清空转无锚定。无锚定 → 不带 `--session` 启动，POST+claim 后确认 bootstrap
+// 终止，再以 `--session` 双启动。返回最终端口与实际使用的密码。
+func (m *Manager) bootstrapRuntime(ctx context.Context, row TaskRow, runtimeName string, port int, password string, env map[string]string, beforeCreate func() error, freshPassword bool) (int, string, error) {
+	for attempt := 0; attempt < servePortRetries; attempt++ {
+		fresh, rerr := m.store.GetTask(ctx, row.ID)
+		if rerr != nil {
+			return port, password, newOpErr(codeInternal, rerr)
 		}
-		if isSessionNotFound(gerr) {
-			// 404 → 走创建路径。
-		} else {
-			// 其他错误 → 激活失败（不回退）。
-			return "", fmt.Errorf("session precheck: %w", gerr)
+		row = fresh
+		anchor := ""
+		if row.AnchorSessionID.Valid {
+			anchor = row.AnchorSessionID.String
 		}
-	}
+		if anchor != "" {
+			var err error
+			port, password, err = m.startRuntimeWithPortRetry(ctx, row, runtimeName, port, password, env, anchor, beforeCreate, freshPassword)
+			if err != nil {
+				return port, password, err
+			}
+			oc := m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 10 * time.Second})
+			ok, verr := m.anchorPresentInList(ctx, oc, row.WorktreePath, anchor)
+			if verr != nil {
+				return port, password, newOpErr(codeProcessError, verr)
+			}
+			if ok {
+				return port, password, nil
+			}
+			cleared, cerr := m.store.ClearTaskAnchorConditional(ctx, row.ID, anchor)
+			if cerr != nil {
+				return port, password, &anchorStageError{err: newOpErr(codeInternal, fmt.Errorf("clear stale anchor: %w", cerr))}
+			}
+			if !cleared.Matched {
+				reread, rrerr := m.store.GetTask(ctx, row.ID)
+				if rrerr != nil {
+					return port, password, newOpErr(codeInternal, rrerr)
+				}
+				if !reread.AnchorSessionID.Valid || reread.AnchorSessionID.String == "" {
+					anchor = ""
+				} else if reread.AnchorSessionID.String != anchor {
+					if err := m.confirmRuntimeTerminated(ctx, row.ID, runtimeName); err != nil {
+						return port, password, err
+					}
+					password = newRandomPassword()
+					continue
+				} else {
+					return port, password, &anchorStageError{err: newOpErr(codeInternal, fmt.Errorf("clear stale anchor: CAS mismatch with unchanged anchor %s", anchor))}
+				}
+			}
+			if err := m.confirmRuntimeTerminated(ctx, row.ID, runtimeName); err != nil {
+				return port, password, err
+			}
+			password = newRandomPassword()
+		}
 
-	// 无记录或预检 404 → 创建新会话并锚定（design.md §4）。新建的是顶层会话（无 parent）。
-	created, cerr := oc.CreateSession(ctx, row.WorktreePath, row.Name)
-	if cerr != nil {
-		return "", fmt.Errorf("create anchor session: %w", cerr)
-	}
-	// D8：原子 claim 归属（锚定创建路径冲突 → 激活失败，MUST NOT attach 不属本任务的 session）。
-	// 新建 session 理论上必不冲突，但 claim 冲突（边界）时返回错误以避免归属不一致。
-	if m.lifecycle != nil {
-		obs := ocdecksess.Observation{
-			ID: ocdecksess.ID(created.ID), ParentID: "",
-			CreatedAt: int64(created.Time.Created), UpdatedAt: int64(created.Time.Updated),
-			FirstSeenAt: int64(created.Time.Updated),
+		var err error
+		port, password, err = m.startRuntimeWithPortRetry(ctx, row, runtimeName, port, password, env, "", beforeCreate, freshPassword)
+		if err != nil {
+			return port, password, err
 		}
-		cres, perr := m.lifecycle.ClaimSession(ctx, row.ID, obs)
+		oc := m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 10 * time.Second})
+		created, cerr := oc.CreateSession(ctx, row.WorktreePath, row.Name)
+		if cerr != nil {
+			return port, password, &anchorStageError{err: newOpErr(codeProcessError, fmt.Errorf("create anchor session: %w", cerr))}
+		}
+		cres, perr := m.store.ClaimTaskSessionAndSetAnchor(ctx, row.ID, created.ID,
+			int64(created.Time.Created), int64(created.Time.Updated), int64(created.Time.Updated), "")
 		if perr != nil {
-			// store 错误：已建 session 可经后续全量对齐补记，但当前激活 MUST 失败以避免归属不一致。
-			return "", fmt.Errorf("persist anchor session %s: %w", created.ID, perr)
+			return port, password, &anchorStageError{err: newOpErr(codeInternal, fmt.Errorf("persist anchor session %s: %w", created.ID, perr))}
 		}
 		if !cres.Claimed {
-			return "", fmt.Errorf("anchor session %s conflict (owned by task %s); MUST NOT attach", created.ID, cres.OwnerTaskID)
+			return port, password, &anchorStageError{err: newOpErr(codeProcessError, fmt.Errorf("anchor session %s conflict (owned by task %s); MUST NOT attach", created.ID, cres.OwnerTaskID))}
 		}
-		// P1.8.2：锚定 claim 同为 owned 成员生产点（对账成功时 owned 可能为空，靠本钩子 0→1）。
 		m.noteAgentSessionClaimed(row.ID, created.ID)
-		return created.ID, nil
+		if err := m.confirmRuntimeTerminated(ctx, row.ID, runtimeName); err != nil {
+			return port, password, err
+		}
+		password = newRandomPassword()
+		port, password, err = m.startRuntimeWithPortRetry(ctx, row, runtimeName, port, password, env, created.ID, beforeCreate, freshPassword)
+		if err != nil {
+			return port, password, err
+		}
+		oc = m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 10 * time.Second})
+		ok, verr := m.anchorPresentInList(ctx, oc, row.WorktreePath, created.ID)
+		if verr != nil {
+			return port, password, newOpErr(codeProcessError, verr)
+		}
+		if !ok {
+			return port, password, &anchorStageError{err: newOpErr(codeProcessError, fmt.Errorf("anchor session %s missing after dual-start", created.ID))}
+		}
+		return port, password, nil
 	}
-	cres, perr := m.store.ClaimTaskSession(ctx, row.ID, created.ID,
-		int64(created.Time.Created), int64(created.Time.Updated), int64(created.Time.Updated), "")
-	if perr != nil {
-		// store 错误：已建 session 可经后续全量对齐补记，但当前激活 MUST 失败以避免归属不一致。
-		return "", fmt.Errorf("persist anchor session %s: %w", created.ID, perr)
+	return port, password, newOpErr(codeProcessError, fmt.Errorf("anchor bootstrap exhausted after %d attempts", servePortRetries))
+}
+
+func (m *Manager) anchorPresentInList(ctx context.Context, oc OCClient, dir, sessionID string) (bool, error) {
+	sessions, err := oc.ListSessions(ctx, dir, 1000)
+	if err != nil {
+		return false, fmt.Errorf("list sessions for anchor check: %w", err)
 	}
-	if !cres.Claimed {
-		return "", fmt.Errorf("anchor session %s conflict (owned by task %s); MUST NOT attach", created.ID, cres.OwnerTaskID)
+	for _, s := range sessions {
+		if s.ID == sessionID {
+			return true, nil
+		}
 	}
-	m.noteAgentSessionClaimed(row.ID, created.ID)
-	return created.ID, nil
+	return false, nil
+}
+
+// confirmRuntimeTerminated 按 KillResult disposition 确认 runtime 已终止，才可复用会话名与端口。
+func (m *Manager) confirmRuntimeTerminated(ctx context.Context, taskID, runtimeName string) error {
+	exists, herr := m.proc.HasSession(runtimeName)
+	if herr != nil && !errors.Is(herr, process.ErrNoTmuxServer) {
+		// G3-15：HasSession infra 错误 = 未确认终止，fail-closed 按 kill_failed/
+		// retryable 写 notice：成功 → typed cleanup error（Recovery 终态，MUST NOT
+		// 复用固定会话名创建进程）；失败 → 完整 pending。
+		cause := newOpErr(codeProcessError, fmt.Errorf("confirm runtime terminated: has session: %w", herr))
+		nctx, ncancel := withResidualNoticeCtx(ctx)
+		defer ncancel()
+		nerr := m.recordResidualNotice(nctx, taskID, runtimeName, nil, noticeReasonKillFailed, true)
+		if nerr != nil {
+			return recordNoticeOrPending(runtimeName, nil, noticeReasonKillFailed, true, nerr, cause)
+		}
+		return &retryableCleanupError{err: cause}
+	}
+	if !exists {
+		return nil
+	}
+	res, kerr := m.proc.KillSession(runtimeName)
+	nctx, ncancel := withResidualNoticeCtx(ctx)
+	defer ncancel()
+	if kerr != nil {
+		nerr := m.recordResidualNotice(nctx, taskID, runtimeName, res.CleanupTickets, noticeReasonKillFailed, true)
+		cause := newOpErr(codeProcessError, fmt.Errorf("confirm runtime terminated: kill: %w", kerr))
+		if nerr != nil {
+			return recordNoticeOrPending(runtimeName, res.CleanupTickets, noticeReasonKillFailed, true, nerr, cause)
+		}
+		// G3-2/G3-5：kill infra 错误（notice 已落库）→ retryable cleanup debt 在位，
+		// Recovery MUST NOT 再创建进程（typed 终态；Activate 行为不变）。
+		return &retryableCleanupError{err: cause}
+	}
+	cls := classifyKillResult(res)
+	switch cls.action {
+	case "none":
+		return nil
+	case "continue":
+		nerr := m.recordResidualNotice(nctx, taskID, runtimeName, res.CleanupTickets, cls.reason, cls.retryable)
+		if nerr != nil {
+			cause := newOpErr(codeProcessError, fmt.Errorf("confirm runtime terminated: disposition %s", res.Disposition))
+			return recordNoticeOrPending(runtimeName, res.CleanupTickets, cls.reason, cls.retryable, nerr, cause)
+		}
+		return nil
+	default:
+		nerr := m.recordResidualNotice(nctx, taskID, runtimeName, res.CleanupTickets, cls.reason, cls.retryable)
+		cause := newOpErr(codeProcessError, fmt.Errorf("confirm runtime terminated: disposition %s", res.Disposition))
+		if nerr != nil {
+			return recordNoticeOrPending(runtimeName, res.CleanupTickets, cls.reason, cls.retryable, nerr, cause)
+		}
+		// G3-2/G3-5：retryable/未知矛盾 disposition（notice 已落库）→ Recovery MUST
+		// NOT 再创建进程（typed 终态；Activate 行为不变）。
+		return &retryableCleanupError{err: cause}
+	}
 }
 
 // watchServeExit 监视 serve 会话消失 → 完整清理运行时 → suspended + last_error（design.md §4）。
 // 回调校验 (instVersion, sessionName) 仍匹配 Manager 当前注册表，否则忽略（B4 回调隔离：
 // 旧实例回调不清理新实例）。校验针对 m.getRuntime 的当前 runtime，而非注册时捕获的 rt，
 // 保证旧 runtime 被替换后回调即失效（C1：不捕获本地快照）。
-// 事件类型分发（C1 typed RuntimeEvent）：
-//   - WatchEventSessionExit → handleServeExit（serve_exit 语义）；
-//   - WatchEventInfraError（tmux 持续故障）→ handleInfraError（记录 last_error + notice + 收敛运行时，
-//     不得静默）。
+// 事件类型分发（C1 typed RuntimeEvent，single-process D4 统一 runtime failure 分派）：
+//   - WatchEventSessionExit → handleServeExit → ensureRecovery（幂等恢复入口）；
+//   - WatchEventInfraError（tmux 持续故障）→ ensureRecovery（统一分派，不得静默；
+//     恢复前序清理终止该 runtime）。
 //
 // P1.4.7（design.md D0:150）：注册时捕获触发令牌并贯穿传递给 converge——触发令牌是
 // 注册/回调校验时刻的身份，不得在等锁后重读 runtime 顶替。
@@ -1481,7 +1750,7 @@ func (m *Manager) watchServeExit(taskID, serveName string) {
 		case process.WatchEventSessionExit:
 			m.handleServeExit(taskID, tok)
 		case process.WatchEventInfraError:
-			m.handleInfraError(taskID, serveName, ev.Err, tok)
+			m.ensureRecovery(taskID, tok)
 		}
 	})
 	if cur := m.getRuntime(taskID); cur != nil {
@@ -1492,48 +1761,24 @@ func (m *Manager) watchServeExit(taskID, serveName string) {
 	}
 }
 
-// watchTUIExit 监视 TUI 会话消失 → 标记可重开（保持活跃，design.md §4）。
-// 回调校验（B4 回调隔离，针对当前 runtime 注册表，C1：不捕获本地快照）。
-// 事件类型分发（C1 typed RuntimeEvent）：
-//   - WatchEventSessionExit → tui_exit 语义：标记可重开（保持活跃）；
-//   - WatchEventInfraError → handleInfraError（TUI 监视 infra 错误同样收敛运行时）。
-func (m *Manager) watchTUIExit(taskID, tuiName string) {
-	tok := runtime.InstVersion("")
-	if rt := m.getRuntime(taskID); rt != nil {
-		tok = rt.instVersion
-	}
-	cancel, done := m.proc.WatchExit(tuiName, func(ev process.WatchEvent) {
-		cur := m.getRuntime(taskID)
-		if cur == nil || !cur.matchesRegistry(tok, tuiName) {
-			return
-		}
-		switch ev.Type {
-		case process.WatchEventSessionExit:
-			// TUI 消失但 serve 存活 → 标记可重开，保持活跃。
-			// 从注册表移除 TUI group；ReopenAttach 由 WS/REST 触发重建。
-			cur.removeGroup(tuiName)
-		case process.WatchEventInfraError:
-			m.handleInfraError(taskID, tuiName, ev.Err, tok)
-		}
-	})
-	if cur := m.getRuntime(taskID); cur != nil {
-		cur.mu.Lock()
-		cur.watchCancels[tuiName] = cancel
-		cur.watchDones[tuiName] = done
-		cur.mu.Unlock()
-	}
-}
-
 // handleServeExit serve 异常消失（非挂起路径）→ 完整清理运行时 → suspended + last_error。
 // 清除 env snapshot 与 shell（design.md §2/§4：serve 异常退出清快照）。
 // P1.4.7：tok 为 watcher 注册时捕获的触发令牌（design.md D0:150 令牌贯穿）。
+// single-process Phase 4：watchTUIExit 已随独立 TUI 会话模型删除（TUI 与任务进程
+// 同体，-tui 遗留会话仅由 reconcile 清理路径处置）。
 func (m *Manager) handleServeExit(taskID string, tok runtime.InstVersion) {
-	m.convergeToSuspended(taskID, "serve session exited unexpectedly", tok)
+	m.ensureRecovery(taskID, tok)
 }
 
 // convergeToSuspended 收敛活跃任务到 suspended（design.md §4：不得留 active 但无 SSE 托管的运行时）。
-// 非 SSE 路径（serve_exit watcher、handleInfraError）——令牌校验在 convergeToSuspendedChecked
-// 内统一完成（拿锁后按触发令牌比对当前 runtime，含 watcher 路径）。
+//
+// Phase 5：single-process D4 起 watcher/SSE 永久失败统一走幂等 ensureRecovery，
+// 本收敛族无生产 debt producer/入口（不再从 fatal runtime 事件登记 converge debt）；
+// backgroundLoop 的 processConvergeDebts consumer 仍按周期执行，消化历史/测试登记的
+// 两阶段债务。保留理由：既有测试以本族为收敛原语直接消费（D2 attention 失效矩阵、
+// 锁超时两阶段债务合同）。新增生产代码 MUST NOT 接入本族（统一走 ensureRecovery /
+// cleanupTaskRuntimeReconcile）。
+// 令牌校验在 convergeToSuspendedChecked 内统一完成（拿锁后按触发令牌比对当前 runtime）。
 func (m *Manager) convergeToSuspended(taskID, reason string, tok runtime.InstVersion) {
 	m.convergeToSuspendedChecked(taskID, reason, tok)
 }
@@ -1546,7 +1791,7 @@ func (m *Manager) convergeToSuspendedForGen(taskID, reason string, instVersion r
 
 // convergeToSuspendedChecked 统一收敛入口（watcher/SSE 路径一致携带触发令牌，
 // design.md D0:150）。拿锁后校验当前 runtime 令牌仍等于触发令牌——旧实例延迟回调
-//（等锁期间任务被 Suspend→重新 Activate 换代）MUST NOT 清理新实例 runtime（design.md §2
+// （等锁期间任务被 Suspend→重新 Activate 换代）MUST NOT 清理新实例 runtime（design.md §2
 // 令牌隔离）。锁等待超时不再无锁清理/CAS（design.md D0:151 替换行为）：仅按触发令牌
 // 登记两阶段债务，由 backgroundLoop worker 持锁消化（converge_debt.go）。
 func (m *Manager) convergeToSuspendedChecked(taskID, reason string, tok runtime.InstVersion) {
@@ -1582,17 +1827,6 @@ func (m *Manager) convergeToSuspendedChecked(taskID, reason string, tok runtime.
 	m.convergeCommitCAS(ctx, taskID, reason, tok, attentionVisible, runStatusInvalidation, cleanupErr)
 }
 
-// handleInfraError 处理 tmux 持续基础设施故障（C1：infra_error 明确处理路径，不得静默）。
-// 触发来源：WatchExit 连续 tmux 命令失败达到退避上限 → WatchEventInfraError。
-// 处理：取得任务锁 → 完整清理运行时（停 SSE/watcher + kill 残余会话，记 residual notice）
-// → 记 last_error（含底层 infra 错误）→ 落 suspended。
-// 不静默：last_error 与 notice 均落库，供用户与后台周期感知。
-// P1.4.7：tok 为 watcher 注册时捕获的触发令牌（design.md D0:150 令牌贯穿）。
-func (m *Manager) handleInfraError(taskID, sessionName string, infraErr error, tok runtime.InstVersion) {
-	reason := fmt.Sprintf("tmux infra error watching %s: %v", sessionName, infraErr)
-	m.convergeToSuspended(taskID, reason, tok)
-}
-
 // cleanupActivationRuntime 清理激活过程中已建的会话（失败补偿）。
 // 既有签名保留：返回聚合 error；其余三调用点（锁超时/主动收敛/reconcile）行为不变。
 // Activate 失败路径用 cleanupActivationRuntimeCollect 收集 observations 供 pending 回放。
@@ -1616,7 +1850,7 @@ func (m *Manager) cleanupActivationRuntimeCollect(ctx context.Context, taskID st
 		m.clearRuntime(taskID)
 		return fmt.Errorf("enumerate shells for cleanup activation runtime: %w", err), nil
 	}
-	names := append([]string{serveSessionName(taskID), tuiSessionName(taskID)}, shellNames...)
+	names := append([]string{runtimeSessionName(taskID), serveSessionName(taskID), tuiSessionName(taskID)}, shellNames...)
 	var noticeErrs []error
 	var observations []cleanupObservation
 	recordObs := func(name, reason string, retryable bool, tickets []string, nerr error) {

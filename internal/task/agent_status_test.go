@@ -23,7 +23,7 @@ func TestAgentStatus_QueryFailedDegradesEmpty(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
 	proc := newMockProc()
-	proc.envValues[serveSessionName("t1")] = map[string]string{
+	proc.envValues[runtimeSessionName("t1")] = map[string]string{
 		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001",
 	}
 	// 预置一个 session 行（ListTaskSessions 首项为最近 session）。
@@ -44,7 +44,7 @@ func TestAgentStatus_HappyPath(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
 	proc := newMockProc()
-	proc.envValues[serveSessionName("t1")] = map[string]string{
+	proc.envValues[runtimeSessionName("t1")] = map[string]string{
 		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001",
 	}
 	// 预置 sessions：S1 最近（last_seen 最大），S2 较早。期望取 S1 的状态。
@@ -73,7 +73,7 @@ func TestAgentStatus_AggregatesSubagentBusy(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
 	proc := newMockProc()
-	proc.envValues[serveSessionName("t1")] = map[string]string{
+	proc.envValues[runtimeSessionName("t1")] = map[string]string{
 		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001",
 	}
 	store.sessions["t1"] = []SessionRow{
@@ -99,7 +99,7 @@ func TestAgentStatus_AggregatesRetryOverIdle(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
 	proc := newMockProc()
-	proc.envValues[serveSessionName("t1")] = map[string]string{
+	proc.envValues[runtimeSessionName("t1")] = map[string]string{
 		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001",
 	}
 	store.sessions["t1"] = []SessionRow{

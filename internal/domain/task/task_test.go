@@ -244,6 +244,30 @@ func TestStatusMatrix(t *testing.T) {
 			wantErr: false, wantTo: StatusSuspended, wantMigrate: true,
 		},
 		{
+			name: "active→activating (recovery start)",
+			from: StatusActive, initStatus: InitStatusNone,
+			apply: func(t *Task) error { return t.ApplyRecoveryStart() },
+			wantErr: false, wantTo: StatusActivating, wantMigrate: true,
+		},
+		{
+			name: "active→activating recovery rejected (wrong status)",
+			from: StatusSuspended, initStatus: InitStatusNone,
+			apply: func(t *Task) error { return t.ApplyRecoveryStart() },
+			wantErr: true, wantTo: StatusSuspended, wantMigrate: false,
+		},
+		{
+			name: "activating→active (recovery commit)",
+			from: StatusActivating, initStatus: InitStatusNone,
+			apply: func(t *Task) error { return t.ApplyRecoveryCommit() },
+			wantErr: false, wantTo: StatusActive, wantMigrate: true,
+		},
+		{
+			name: "activating→suspended (recovery failure)",
+			from: StatusActivating, initStatus: InitStatusNone,
+			apply: func(t *Task) error { return t.ApplyRecoveryFailure() },
+			wantErr: false, wantTo: StatusSuspended, wantMigrate: true,
+		},
+		{
 			name: "active→suspending (CanSuspend ok)",
 			from: StatusActive, initStatus: InitStatusNone,
 			apply: func(t *Task) error { return t.ApplySuspend() },

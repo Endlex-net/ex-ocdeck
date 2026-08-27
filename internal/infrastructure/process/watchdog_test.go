@@ -113,7 +113,7 @@ func runWatchdogForkChild(t *testing.T) {
 		psProvider: darwinPSProvider{},
 	}
 	if err := m.NewSession(SessionSpec{
-		Name:    "ocdeck-wdtask-serve",
+		Name:    "ocdeck-wdtask-runtime",
 		Dir:     tmpdir,
 		Env:     map[string]string{"K": "v"},
 		CmdArgv: []string{"sleep", "600"},
@@ -121,7 +121,7 @@ func runWatchdogForkChild(t *testing.T) {
 		t.Fatalf("NewSession in fork child: %v", err)
 	}
 	// 确认会话存在。
-	ok, _ := m.HasSession("ocdeck-wdtask-serve")
+	ok, _ := m.HasSession("ocdeck-wdtask-runtime")
 	if !ok {
 		t.Fatalf("session not created in fork child")
 	}

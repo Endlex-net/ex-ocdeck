@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"database/sql"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -31,7 +32,7 @@ type alignSerialOC struct {
 	// maxInflight：观测到的最大并发 ListSessions 数（MUST ==1）。
 	maxInflight atomic.Int32
 	// reconnectRan：reconnect 的 align 已开始（ListSessions 第 2 次调用）。
-	reconnectRan atomic.Bool
+	reconnectRan  atomic.Bool
 	firstSessions []opencode.Session
 	reconnectSess []opencode.Session
 }
@@ -47,11 +48,12 @@ func (c *alignSerialOC) ListSessions(ctx context.Context, dir string, limit int)
 	defer c.inflight.Add(-1)
 	calls := c.listCalls.Add(1)
 	if calls == 1 {
-		// 首次 align：在 barrier 阻塞，测试据此注入 onReconnect。
+		return c.sessions, nil
+	}
+	if calls == 2 {
 		<-c.firstListCh
 		return c.firstSessions, nil
 	}
-	// reconnect align：记录已开始后阻塞，测试断言排队成功后放行。
 	c.reconnectRan.Store(true)
 	<-c.reconnectListCh
 	return c.reconnectSess, nil
@@ -102,6 +104,9 @@ func (c *alignSerialSubscribeOC) SubscribeEvents(ctx context.Context, dir string
 func TestP4_SSEFirstAlignInProgressReconnectSerializes(t *testing.T) {
 	tStore := newMockStore()
 	seedSuspendedTask(tStore, "t1", "p1")
+	tStore.mutTask("t1", func(tr *TaskRow) {
+		tr.AnchorSessionID = sql.NullString{String: "S1", Valid: true}
+	})
 	proc := newMockProc()
 	proc.envValues[serveSessionName("t1")] = map[string]string{
 		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
@@ -117,6 +122,7 @@ func TestP4_SSEFirstAlignInProgressReconnectSerializes(t *testing.T) {
 		firstListCh:     make(chan struct{}),
 		reconnectListCh: make(chan struct{}),
 	}
+	base.sessions = []opencode.Session{{ID: "S1", Time: opencode.SessionTime{Updated: 100, Created: 100}}}
 	sub := &alignSerialSubscribeOC{
 		alignSerialOC:     base,
 		firstAlignStarted: make(chan struct{}),
@@ -136,12 +142,12 @@ func TestP4_SSEFirstAlignInProgressReconnectSerializes(t *testing.T) {
 	// 等主路径进入首次 align（ListSessions 已阻塞，inflight==1）。
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if base.listCalls.Load() == 1 && base.inflight.Load() == 1 {
+		if base.listCalls.Load() == 2 && base.inflight.Load() == 1 {
 			break
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	if base.listCalls.Load() != 1 || base.inflight.Load() != 1 {
+	if base.listCalls.Load() != 2 || base.inflight.Load() != 1 {
 		t.Fatalf("first align not in progress: listCalls=%d inflight=%d", base.listCalls.Load(), base.inflight.Load())
 	}
 
@@ -169,7 +175,7 @@ func TestP4_SSEFirstAlignInProgressReconnectSerializes(t *testing.T) {
 	if base.maxInflight.Load() > 1 {
 		t.Fatalf("concurrent align detected: maxInflight=%d (MUST be <=1)", base.maxInflight.Load())
 	}
-	if base.listCalls.Load() != 1 {
+	if base.listCalls.Load() != 2 {
 		t.Fatalf("reconnect align MUST NOT start before first align completes; listCalls=%d", base.listCalls.Load())
 	}
 
@@ -205,12 +211,12 @@ func TestP4_SSEFirstAlignInProgressReconnectSerializes(t *testing.T) {
 	// 需等其 AlignTaskSessions 落库（listCalls==2 且 inflight==0）后再断言最终状态。
 	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if base.listCalls.Load() == 2 && base.inflight.Load() == 0 {
+		if base.listCalls.Load() == 3 && base.inflight.Load() == 0 {
 			break
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	if base.listCalls.Load() != 2 || base.inflight.Load() != 0 {
+	if base.listCalls.Load() != 3 || base.inflight.Load() != 0 {
 		t.Fatalf("reconnect align not completed: listCalls=%d inflight=%d", base.listCalls.Load(), base.inflight.Load())
 	}
 
@@ -229,8 +235,8 @@ func TestP4_SSEFirstAlignInProgressReconnectSerializes(t *testing.T) {
 		t.Errorf("first align session S1 MUST be overwritten by reconnect full align, got S1 still present")
 	}
 	// align 共执行两次（首次 + reconnect），全程串行（maxInflight==1）。
-	if base.listCalls.Load() != 2 {
-		t.Fatalf("expected exactly 2 align calls (first + reconnect), got %d", base.listCalls.Load())
+	if base.listCalls.Load() != 3 {
+		t.Fatalf("expected 3 ListSessions calls (anchor check + first align + reconnect), got %d", base.listCalls.Load())
 	}
 	if base.maxInflight.Load() != 1 {
 		t.Fatalf("aligns MUST be serialized (maxInflight=1), got %d", base.maxInflight.Load())

@@ -91,9 +91,10 @@ type TaskSnapshot struct {
 	CreatedAt    int64
 	UpdatedAt    int64
 	ArchivedAt   *int64
-	InitStatus   string
-	InitError    *string
-	BaseRef      string
+	InitStatus      string
+	InitError       *string
+	BaseRef         string
+	AnchorSessionID *string
 }
 
 // SessionRepository 表达会话归属隔离的持久化端口（design.md D0:78-86）。

@@ -296,7 +296,9 @@ export function TaskWorkbenchPage({
 
   const notices = parseNotice(task?.notice);
   const status = task?.status ?? '';
-  const tuiReady = status === 'active';
+  // single-process（tasks 5.3）：原「TUI 可重开」标记语义改为「进程在不在」——
+  // 任务 active 即任务进程在（TUI 与进程同体），非 active 即进程不在。
+  const processReady = status === 'active';
   // init 门禁原因（空串 = 可激活）；失败展示以 init_error 为权威信息，日志仅辅助
   const initBlock = task ? initActivateBlockReason(task) : '';
   // pre-delete 失败以 last_error 的 `pre-delete:` 前缀稳定识别（tasks.md 5.3）
@@ -448,7 +450,7 @@ export function TaskWorkbenchPage({
           className={`tab ${tab === TUI_TAB ? 'tab-active' : ''}`}
           onClick={() => switchTab(TUI_TAB)}
         >
-          TUI
+          终端
         </button>
         {shells.map((tid, i) => (
           <span key={tid} className={`tab ${tab === tid ? 'tab-active' : ''}`}>
@@ -503,19 +505,21 @@ export function TaskWorkbenchPage({
         <div className={`pane ${tab === TUI_TAB ? '' : 'pane-hidden'}`}>
           <TerminalView
             wsPath={`/ws/terminal/${taskID}`}
-            active={tab === TUI_TAB && tuiReady}
+            active={tab === TUI_TAB && processReady}
           />
-          {tab === TUI_TAB && task && !tuiReady && (
+          {tab === TUI_TAB && task && !processReady && (
             <div className="terminal-overlay">
               <div className="terminal-overlay-box">
                 {isTransitional(status) ? (
                   <>
                     <span className="spinner" aria-hidden />
-                    <span>任务{status === 'activating' ? '激活中' : '状态变更中'}…</span>
+                    {/* spec（终端重开与恢复中语义）：恢复期统一显示「进程启动中」，
+                        不新增原因字段——activating 同时覆盖用户激活与自动重拉。 */}
+                    <span>{status === 'activating' ? '进程启动中' : '任务状态变更中'}…</span>
                   </>
                 ) : status === 'suspended' ? (
                   <>
-                    <span>任务已挂起，激活后可接入 opencode TUI</span>
+                    <span>任务已挂起，激活后可接入任务终端</span>
                     {initBlock && <span className="terminal-overlay-reason">{initBlock}</span>}
                     <span className="terminal-overlay-actions">
                       <ActivateButton task={task} onDone={onTaskActionDone} onError={setError} />
