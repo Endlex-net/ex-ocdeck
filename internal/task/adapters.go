@@ -5,8 +5,8 @@ import (
 	"database/sql"
 
 	"ocdeck/internal/application"
-	ocdecktask "ocdeck/internal/domain/task"
 	ocdecksess "ocdeck/internal/domain/session"
+	ocdecktask "ocdeck/internal/domain/task"
 	"ocdeck/internal/infrastructure/git"
 	"ocdeck/internal/infrastructure/process"
 	"ocdeck/internal/infrastructure/pty"
@@ -275,6 +275,55 @@ func (a *StoreAdapter) CompleteRecoveryFailure(ctx context.Context, id string, l
 	return a.db.CompleteRecoveryFailure(ctx, id, nullStringToPtr(lastError))
 }
 
+// CasActivationIfNoRecoveryDebt 激活准入原子事务（G3-18）：存在未清 recovery debt
+// 时返回 store.ErrRecoveryDebtPresent（零修改）。
+func (a *StoreAdapter) CasActivationIfNoRecoveryDebt(ctx context.Context, id, fromStatus, toStatus string) (application.TransitionResult, error) {
+	return a.db.CasActivationIfNoRecoveryDebt(ctx, id, ocdecktask.Status(fromStatus), ocdecktask.Status(toStatus))
+}
+
+// CompleteRecoveryFailureAndClearDebts 单事务终态收敛 + debt 整组删除（G3-18）。
+func (a *StoreAdapter) CompleteRecoveryFailureAndClearDebts(ctx context.Context, id string, lastError sql.NullString) (application.TransitionResult, error) {
+	return a.db.CompleteRecoveryFailureAndClearDebts(ctx, id, nullStringToPtr(lastError))
+}
+
+func (a *StoreAdapter) UpsertRecoveryDebt(ctx context.Context, row RecoveryDebtRow) error {
+	return a.db.UpsertRecoveryDebt(ctx, store.RecoveryDebtRow{
+		TaskID:      row.TaskID,
+		Phase:       row.Phase,
+		SessionName: row.SessionName,
+		Tickets:     row.Tickets,
+		Reason:      row.Reason,
+		Retryable:   row.Retryable,
+		Cause:       row.Cause,
+		CreatedAt:   row.CreatedAt,
+	})
+}
+
+func (a *StoreAdapter) DeleteRecoveryDebt(ctx context.Context, taskID string) error {
+	return a.db.DeleteRecoveryDebt(ctx, taskID)
+}
+
+func (a *StoreAdapter) ListRecoveryDebts(ctx context.Context) ([]RecoveryDebtRow, error) {
+	rows, err := a.db.ListRecoveryDebts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]RecoveryDebtRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, RecoveryDebtRow{
+			TaskID:      r.TaskID,
+			Phase:       r.Phase,
+			SessionName: r.SessionName,
+			Tickets:     r.Tickets,
+			Reason:      r.Reason,
+			Retryable:   r.Retryable,
+			Cause:       r.Cause,
+			CreatedAt:   r.CreatedAt,
+		})
+	}
+	return out, nil
+}
+
 // TouchOwnedTaskSession 条件 UPDATE 仅本任务已归属行的 last_seen_at（D8）。
 // 返回结构化 MutationResult（P1.4.5：Matched=命中归属行，Changed=值真实推进）。
 func (a *StoreAdapter) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (application.MutationResult, error) {
@@ -328,20 +377,20 @@ func (a storeAlignPortsAdapter) Align(ctx context.Context, taskID string, mode o
 // align 端口适配读取 notice 原文；与 taskSnapshotToTaskRow 互逆）。
 func taskRowToSnapshot(r TaskRow) application.TaskSnapshot {
 	return application.TaskSnapshot{
-		ID:           r.ID,
-		ProjectID:    r.ProjectID,
-		Name:         r.Name,
-		Branch:       r.Branch,
-		Status:       r.Status,
-		WorktreePath: r.WorktreePath,
-		LastPort:     ptrToNullInt64ToPtr(r.LastPort),
-		LastError:    nullStringToPtr(r.LastError),
-		Notice:       nullStringToPtr(r.Notice),
-		DeleteMode:   nullStringToPtr(r.DeleteMode),
-		EnvSnapshot:  nullStringToPtr(r.EnvSnapshot),
-		CreatedAt:    r.CreatedAt,
-		UpdatedAt:    r.UpdatedAt,
-		ArchivedAt:   ptrToNullInt64ToPtr(r.ArchivedAt),
+		ID:              r.ID,
+		ProjectID:       r.ProjectID,
+		Name:            r.Name,
+		Branch:          r.Branch,
+		Status:          r.Status,
+		WorktreePath:    r.WorktreePath,
+		LastPort:        ptrToNullInt64ToPtr(r.LastPort),
+		LastError:       nullStringToPtr(r.LastError),
+		Notice:          nullStringToPtr(r.Notice),
+		DeleteMode:      nullStringToPtr(r.DeleteMode),
+		EnvSnapshot:     nullStringToPtr(r.EnvSnapshot),
+		CreatedAt:       r.CreatedAt,
+		UpdatedAt:       r.UpdatedAt,
+		ArchivedAt:      ptrToNullInt64ToPtr(r.ArchivedAt),
 		InitStatus:      r.InitStatus,
 		InitError:       nullStringToPtr(r.InitError),
 		BaseRef:         r.BaseRef,
@@ -454,20 +503,20 @@ func toTaskRow(t store.TaskRow) TaskRow {
 // *string/*int64 还原为 sql.NullString/sql.NullInt64（nil → Invalid）。
 func taskSnapshotToTaskRow(s application.TaskSnapshot) TaskRow {
 	return TaskRow{
-		ID:           s.ID,
-		ProjectID:    s.ProjectID,
-		Name:         s.Name,
-		Branch:       s.Branch,
-		Status:       s.Status,
-		WorktreePath: s.WorktreePath,
-		LastPort:     ptrToNullInt64(s.LastPort),
-		LastError:    ptrToNullString(s.LastError),
-		Notice:       ptrToNullString(s.Notice),
-		DeleteMode:   ptrToNullString(s.DeleteMode),
-		EnvSnapshot:  ptrToNullString(s.EnvSnapshot),
-		CreatedAt:    s.CreatedAt,
-		UpdatedAt:    s.UpdatedAt,
-		ArchivedAt:   ptrToNullInt64(s.ArchivedAt),
+		ID:              s.ID,
+		ProjectID:       s.ProjectID,
+		Name:            s.Name,
+		Branch:          s.Branch,
+		Status:          s.Status,
+		WorktreePath:    s.WorktreePath,
+		LastPort:        ptrToNullInt64(s.LastPort),
+		LastError:       ptrToNullString(s.LastError),
+		Notice:          ptrToNullString(s.Notice),
+		DeleteMode:      ptrToNullString(s.DeleteMode),
+		EnvSnapshot:     ptrToNullString(s.EnvSnapshot),
+		CreatedAt:       s.CreatedAt,
+		UpdatedAt:       s.UpdatedAt,
+		ArchivedAt:      ptrToNullInt64(s.ArchivedAt),
 		InitStatus:      s.InitStatus,
 		InitError:       ptrToNullString(s.InitError),
 		BaseRef:         s.BaseRef,

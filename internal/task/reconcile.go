@@ -35,6 +35,12 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 	if rerr := m.restoreCleanupDebts(ctx); rerr != nil {
 		return fmt.Errorf("reconcile: restore orphan debts: %w", rerr)
 	}
+	// G3-3：durable recovery tagged debt 启动重放（cleanup_notice → notice 落库后
+	// CompleteRecoveryFailure；complete → 直接 Complete）。失败 MUST fail-closed 拒绝
+	// 开放 HTTP（与既有 Reconcile fail-closed 一致），残留 debt 由后台周期继续消化。
+	if rerr := m.replayRecoveryDebts(ctx); rerr != nil {
+		return fmt.Errorf("reconcile: replay recovery debts: %w", rerr)
+	}
 	// P0：持久化 cleanup_debts 恢复后 MUST 在开放 HTTP 前完成一次重试收割（不只恢复到内存，
 	// design.md §10）：恢复到内存的逃逸进程 tickets 若不主动收割，下次后台周期（30s）才处理，
 	// 窗口期 reconcile 误判 runtime 已净。此处同步收割一次，仍残留的留给后台周期。

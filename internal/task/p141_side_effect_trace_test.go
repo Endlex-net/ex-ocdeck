@@ -132,6 +132,19 @@ func (s *traceStore) UpdateTaskStatusConditional(ctx context.Context, id, fromSt
 	return s.TaskStore.UpdateTaskStatusConditional(ctx, id, fromStatus, toStatus, lastError)
 }
 
+// CasActivationIfNoRecoveryDebt：G3-18 起激活准入（suspended/active→activating）
+// 走本方法，trace 语义与条件 CAS 一致。
+func (s *traceStore) CasActivationIfNoRecoveryDebt(ctx context.Context, id, fromStatus, toStatus string) (application.TransitionResult, error) {
+	s.tr.record("store", "CasActivationIfNoRecoveryDebt", fmt.Sprintf("id=%s %s->%s", id, fromStatus, toStatus))
+	return s.TaskStore.CasActivationIfNoRecoveryDebt(ctx, id, fromStatus, toStatus)
+}
+
+// CompleteRecoveryFailureAndClearDebts：G3-18 起恢复终态走单事务方法。
+func (s *traceStore) CompleteRecoveryFailureAndClearDebts(ctx context.Context, id string, lastError sql.NullString) (application.TransitionResult, error) {
+	s.tr.record("store", "CompleteRecoveryFailureAndClearDebts", fmt.Sprintf("id=%s", id))
+	return s.TaskStore.CompleteRecoveryFailureAndClearDebts(ctx, id, lastError)
+}
+
 func (s *traceStore) UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) (application.MutationResult, error) {
 	s.tr.record("store", "UpdateTaskEnvSnapshot", fmt.Sprintf("id=%s valid=%v", id, envSnapshot.Valid))
 	return s.TaskStore.UpdateTaskEnvSnapshot(ctx, id, envSnapshot)
@@ -732,10 +745,11 @@ func TestP141_Activate_Success_Trace(t *testing.T) {
 	// 等待异步 SSE align goroutine 收敛（mock oc.SubscribeEvents 立即 onReady 后阻塞，对齐在主路径内完成）。
 	waitStatus(t, store, "t1", StatusActive, 2*time.Second)
 
-	// 关键顺序：CAS suspended→activating → NewSession(serve) → UpdateTaskLastPort
-	// → SubscribeEvents → AlignTaskSessions → UpdateTaskStatus(active)。
+	// 关键顺序：激活准入（G3-18：CasActivationIfNoRecoveryDebt，suspended→activating）
+	// → NewSession(serve) → UpdateTaskLastPort → SubscribeEvents → AlignTaskSessions
+	// → UpdateTaskStatus(active)。
 	assertOrdered(t, tr, []traceOp{
-		{src: "store", op: "UpdateTaskStatusConditional", key: "suspended->activating"},
+		{src: "store", op: "CasActivationIfNoRecoveryDebt", key: "suspended->activating"},
 		{src: "proc", op: "NewSession", key: runtimeSessionName("t1")},
 		{src: "proc", op: "WatchExit", key: runtimeSessionName("t1")},
 		{src: "oc", op: "SubscribeEvents", key: ""},
@@ -745,7 +759,9 @@ func TestP141_Activate_Success_Trace(t *testing.T) {
 		{src: "store", op: "UpdateTaskStatusConditional", key: "activating->active"},
 	}, "Activate.success")
 
-	assertOpCount(t, tr, "store", "UpdateTaskStatusConditional", 2, "Activate.success")
+	// G3-18：条件 CAS 仅剩提交步（activating→active）；准入走 CasActivation。
+	assertOpCount(t, tr, "store", "UpdateTaskStatusConditional", 1, "Activate.success")
+	assertOpCount(t, tr, "store", "CasActivationIfNoRecoveryDebt", 1, "Activate.success")
 	assertOpNever(t, tr, "store", "UpdateTaskStatus", "Activate.success")
 	// 无 BeginDeleteIntent/ArchiveTask/RestoreTask/DeleteTask（非删除/归档流程）。
 	assertOpNever(t, tr, "store", "BeginDeleteIntent", "Activate.success")

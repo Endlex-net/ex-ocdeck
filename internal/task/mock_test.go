@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,11 +13,12 @@ import (
 
 	"ocdeck/internal/application"
 	"ocdeck/internal/config"
-	ocdecktask "ocdeck/internal/domain/task"
 	ocdecksess "ocdeck/internal/domain/session"
+	ocdecktask "ocdeck/internal/domain/task"
 	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
 	"ocdeck/internal/infrastructure/pty"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // --- mock store ---
@@ -31,8 +33,27 @@ type mockStore struct {
 	statusCalls []statusCall
 	// deleteTaskCount 记录 DeleteTask 调用次数（测试经 deleteTaskCount() accessor 读取，避免直接读字段）。
 	deleteTaskCount int
+	// deleteDebtCalls 记录 legacy DeleteRecoveryDebt 调用次数（G3-20 单一清债点断言）。
+	deleteDebtCalls int
 	// recoveryAttempts 按 taskID 记录 D3 permit 时间戳（Unix 秒）。
 	recoveryAttempts map[string][]int64
+	// recoveryDebts 镜像 store.recovery_debts（G3-3 durable tagged debt）。
+	recoveryDebts map[string]RecoveryDebtRow
+	// noticeCasErr 非空时 UpdateTaskNoticeCAS 返回该错误（notice 写失败 failpoint，G3-2/G3-8）。
+	noticeCasErr error
+	// completeRecoveryErr 非空时 CompleteRecoveryFailure 返回该错误（G3-11 intent-first failpoint）。
+	completeRecoveryErr error
+	// completeAndClearErr 非空时 CompleteRecoveryFailureAndClearDebts 返回该错误
+	//（G3-18 单事务 failpoint）。
+	completeAndClearErr error
+	// recoveryDebtUpsertErr 非空时 UpsertRecoveryDebt 返回该错误（G3-11 落盘失败→内存队列 failpoint）。
+	recoveryDebtUpsertErr error
+	// onPermit 在 AcquireRecoveryPermit 成功写入后回调（permit 时序 trace，G3-8）。
+	onPermit func(taskID string)
+	// onLastPort 在 UpdateTaskLastPort 写入前回调（CAS 前/后 failpoint 屏障，G3-8）。
+	onLastPort func(taskID string)
+	// onGetTask 在 GetTask 读取后回调（G3-16 复核屏障：拦截 checkRecoveryContinuable）。
+	onGetTask func(taskID string)
 }
 
 type statusCall struct {
@@ -43,10 +64,11 @@ type statusCall struct {
 
 func newMockStore() *mockStore {
 	return &mockStore{
-		projects:          map[string]ProjectRow{},
-		tasks:             map[string]TaskRow{},
-		sessions:          map[string][]SessionRow{},
-		recoveryAttempts:  map[string][]int64{},
+		projects:         map[string]ProjectRow{},
+		tasks:            map[string]TaskRow{},
+		sessions:         map[string][]SessionRow{},
+		recoveryAttempts: map[string][]int64{},
+		recoveryDebts:    map[string]RecoveryDebtRow{},
 	}
 }
 
@@ -107,9 +129,9 @@ func (s *mockStore) CreateTask(ctx context.Context, t TaskRow) error {
 
 func (s *mockStore) GetTask(ctx context.Context, id string) (TaskRow, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	t, ok := s.tasks[id]
 	if !ok {
+		s.mu.Unlock()
 		return TaskRow{}, fmt.Errorf("not found")
 	}
 	// 与 store schema migration 0007 一致：init_status 缺省为 none
@@ -117,6 +139,12 @@ func (s *mockStore) GetTask(ctx context.Context, id string) (TaskRow, error) {
 	// 读回时归一化为 none，模拟 DB schema 默认值。
 	if t.InitStatus == "" {
 		t.InitStatus = InitStatusNone
+	}
+	s.mu.Unlock()
+	// onGetTask 读后回调（锁外，G3-16 屏障：复核取值后、返回前阻塞——期间测试
+	// 可改状态/关通道，模拟「复核读取与判定之间」的交错窗口）。
+	if s.onGetTask != nil {
+		s.onGetTask(id)
 	}
 	return t, nil
 }
@@ -241,6 +269,9 @@ func (s *mockStore) UpdateTaskEnvSnapshot(ctx context.Context, id string, envSna
 }
 
 func (s *mockStore) UpdateTaskLastPort(ctx context.Context, id string, port int) (application.MutationResult, error) {
+	if s.onLastPort != nil {
+		s.onLastPort(id)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.tasks[id]
@@ -267,6 +298,9 @@ func (s *mockStore) UpdateTaskNotice(ctx context.Context, id string, notice sql.
 func (s *mockStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.noticeCasErr != nil {
+		return application.MutationResult{}, s.noticeCasErr
+	}
 	t, ok := s.tasks[id]
 	if !ok {
 		return application.MutationResult{}, fmt.Errorf("not found")
@@ -277,6 +311,52 @@ func (s *mockStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected
 	t.Notice = newNotice
 	s.tasks[id] = t
 	return application.MutationResult{Matched: true, Changed: true}, nil
+}
+
+// --- recovery tagged debt mock（G3-3/G3-10：镜像 store.recovery_debts 按
+// task_id+session_name 复合键 upsert，同一任务可多条 cleanup_notice 行） ---
+
+func (s *mockStore) UpsertRecoveryDebt(ctx context.Context, row RecoveryDebtRow) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.recoveryDebtUpsertErr != nil {
+		return s.recoveryDebtUpsertErr
+	}
+	if s.recoveryDebts == nil {
+		s.recoveryDebts = map[string]RecoveryDebtRow{}
+	}
+	s.recoveryDebts[row.TaskID+"\x00"+row.SessionName] = row
+	return nil
+}
+
+func (s *mockStore) DeleteRecoveryDebt(ctx context.Context, taskID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleteDebtCalls++
+	for k := range s.recoveryDebts {
+		if taskID == strings.SplitN(k, "\x00", 2)[0] {
+			delete(s.recoveryDebts, k)
+		}
+	}
+	return nil
+}
+
+// deleteDebtCallsCount 返回 legacy DeleteRecoveryDebt 调用计数（G3-20 断言：
+// 清债唯一入口为 CompleteRecoveryFailureAndClearDebts 事务，此计数应为 0）。
+func (s *mockStore) deleteDebtCallsCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deleteDebtCalls
+}
+
+func (s *mockStore) ListRecoveryDebts(ctx context.Context) ([]RecoveryDebtRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []RecoveryDebtRow
+	for _, r := range s.recoveryDebts {
+		out = append(out, r)
+	}
+	return out, nil
 }
 
 func (s *mockStore) SetTaskDeleteMode(ctx context.Context, id, mode string) (application.MutationResult, error) {
@@ -523,12 +603,26 @@ func (s *mockStore) AcquireRecoveryPermit(ctx context.Context, taskID string, no
 		return AcquirePermitResult{}, nil
 	}
 	s.recoveryAttempts[taskID] = append(s.recoveryAttempts[taskID], now)
+	if s.onPermit != nil {
+		s.onPermit(taskID)
+	}
 	return AcquirePermitResult{Acquired: true, Ordinal: len(s.recoveryAttempts[taskID])}, nil
+}
+
+// recoveryPermitCount 持锁返回该任务当前窗口内的 permit 记录数：测试断言（含与
+// 进行中恢复 goroutine 并发的轮询断言）MUST 经此读取，不得无锁直读字段。
+func (s *mockStore) recoveryPermitCount(taskID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.recoveryAttempts[taskID])
 }
 
 func (s *mockStore) CompleteRecoveryFailure(ctx context.Context, id string, lastError sql.NullString) (application.TransitionResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.completeRecoveryErr != nil {
+		return application.TransitionResult{}, s.completeRecoveryErr
+	}
 	t, ok := s.tasks[id]
 	if !ok {
 		return application.TransitionResult{}, fmt.Errorf("not found")
@@ -545,6 +639,71 @@ func (s *mockStore) CompleteRecoveryFailure(ctx context.Context, id string, last
 		MutationResult: application.MutationResult{Matched: true, Changed: true},
 		StatusChanged:  true,
 	}, nil
+}
+
+// --- G3-18 mock：activating 准入拒绝未清 recovery debt + Complete/清 debt 单事务 ---
+
+// CasActivationIfNoRecoveryDebt 镜像 store.CasActivationIfNoRecoveryDebt：存在任一
+// recovery debt 行 → ErrRecoveryDebtPresent 零修改；否则按 CAS 迁移状态。
+func (s *mockStore) CasActivationIfNoRecoveryDebt(ctx context.Context, id, fromStatus, toStatus string) (application.TransitionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.recoveryDebts) > 0 {
+		for k := range s.recoveryDebts {
+			if id == strings.SplitN(k, "\x00", 2)[0] {
+				return application.TransitionResult{}, store.ErrRecoveryDebtPresent
+			}
+		}
+	}
+	t, ok := s.tasks[id]
+	if !ok {
+		return application.TransitionResult{}, fmt.Errorf("not found")
+	}
+	if t.Status != fromStatus {
+		return application.TransitionResult{}, nil
+	}
+	t.Status = toStatus
+	s.tasks[id] = t
+	return application.TransitionResult{
+		MutationResult: application.MutationResult{Matched: true, Changed: true},
+		StatusChanged:  true,
+	}, nil
+}
+
+// CompleteRecoveryFailureAndClearDebts 镜像单事务：completeRecoveryFailure 语义 +
+// 删除该任务全部 debt 行（含 CAS 失配分支）；completeAndClearErr 注入失败。
+func (s *mockStore) CompleteRecoveryFailureAndClearDebts(ctx context.Context, id string, lastError sql.NullString) (application.TransitionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.completeAndClearErr != nil {
+		return application.TransitionResult{}, s.completeAndClearErr
+	}
+	if s.completeRecoveryErr != nil {
+		return application.TransitionResult{}, s.completeRecoveryErr
+	}
+	t, ok := s.tasks[id]
+	if !ok {
+		return application.TransitionResult{}, fmt.Errorf("not found")
+	}
+	var res application.TransitionResult
+	if t.Status == StatusActivating {
+		t.Status = StatusSuspended
+		t.LastError = lastError
+		t.EnvSnapshot = sql.NullString{}
+		t.UpdatedAt = 4
+		s.tasks[id] = t
+		res = application.TransitionResult{
+			MutationResult: application.MutationResult{Matched: true, Changed: true},
+			StatusChanged:  true,
+		}
+	}
+	// CAS 失配也删 debt（服从 DB 最新状态）。
+	for k := range s.recoveryDebts {
+		if id == strings.SplitN(k, "\x00", 2)[0] {
+			delete(s.recoveryDebts, k)
+		}
+	}
+	return res, nil
 }
 
 // TouchOwnedTaskSession 镜像 store.TouchOwnedTaskSession：Matched=命中本任务归属行，
@@ -568,7 +727,7 @@ func (s *mockStore) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID
 
 // AlignTaskSessions 镜像 store.AlignTaskSessions：按 mode 对齐（repo 逐个 claim、冲突上报、
 // ownedOnly 仅刷新 listed∩owned），complete 删 owned 缺席行并对 tasks.notice 做 CAS 镜像
-//（expected 失配返回 application.AlignConflict；同值 no-op），返回结构化 AlignResult。
+// （expected 失配返回 application.AlignConflict；同值 no-op），返回结构化 AlignResult。
 func (s *mockStore) AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, notice application.NoticeMutation) (application.AlignResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -714,14 +873,18 @@ type mockProc struct {
 	newSessionErr error
 	// hasSessionErr 非空时 HasSession 返回该错误（模拟基础设施错误，非 ErrNoTmuxServer）。
 	hasSessionErr error
-	watchCb       map[string]func(process.WatchEvent)
-	envValues     map[string]map[string]string // sessionName -> env
+	// killSessionErr 非空时 KillSession 返回该错误（基础设施错误 failpoint，G3-8 表驱动）。
+	killSessionErr error
+	watchCb        map[string]func(process.WatchEvent)
+	envValues      map[string]map[string]string // sessionName -> env
 	// cmdArgvValues 记录 NewSession 的 CmdArgv（§4 锚定测试断言 --session <id>）。
 	cmdArgvValues map[string][]string
 	// killOrder 记录 KillSession 调用顺序（D1 测试断言 kill 顺序 tui→shells→serve）。
 	killOrder []string
 	// newSessionNames 记录 NewSession 调用顺序（D2 测试断言 serve 死亡不新建 tui）。
 	newSessionNames []string
+	// onNewSession 在 NewSession 成功后回调（permit 时序 trace，G3-8）。测试注入。
+	onNewSession func(name string)
 }
 
 func newMockProc() *mockProc {
@@ -747,6 +910,9 @@ func (p *mockProc) NewSession(spec process.SessionSpec) error {
 	p.sessions[spec.Name] = true
 	p.envValues[spec.Name] = spec.Env
 	p.cmdArgvValues[spec.Name] = spec.CmdArgv
+	if p.onNewSession != nil {
+		p.onNewSession(spec.Name)
+	}
 	return nil
 }
 
@@ -754,6 +920,9 @@ func (p *mockProc) KillSession(name string) (process.KillResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.killOrder = append(p.killOrder, name)
+	if p.killSessionErr != nil {
+		return process.KillResult{}, p.killSessionErr
+	}
 	if res, ok := p.killResults[name]; ok {
 		// 仅当 SessionKilled=true 时才从 sessions 移除（模拟真实 kill-session 语义）。
 		if res.SessionKilled {
@@ -952,6 +1121,10 @@ func (w *mockWorktree) DirtyFiles(ctx context.Context, wtPath string) (map[strin
 // --- mock OCClient ---
 
 type mockOC struct {
+	// mu 串行化 sessions 的并发读写（附带项：SSE 对齐 goroutine 读 ListSessions 与
+	// 恢复/激活路径 CreateSession append 并发，-race 下报 data race）。测试在并发
+	// 开始前的直接字段赋值经 goroutine 创建构成 happens-before，不受影响。
+	mu            sync.Mutex
 	probeErr      error
 	healthOK      bool
 	sessions      []opencode.Session
@@ -997,13 +1170,19 @@ func (c *mockOC) Probe(ctx context.Context) (string, error) {
 }
 
 func (c *mockOC) ListSessions(ctx context.Context, dir string, limit int) ([]opencode.Session, error) {
-	return c.sessions, nil
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]opencode.Session, len(c.sessions))
+	copy(out, c.sessions)
+	return out, nil
 }
 
 func (c *mockOC) GetSession(ctx context.Context, dir, id string) (opencode.Session, error) {
 	if c.getSessionErr != nil {
 		return opencode.Session{}, c.getSessionErr
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, s := range c.sessions {
 		if s.ID == id {
 			return s, nil
@@ -1019,6 +1198,8 @@ func (c *mockOC) CreateSession(ctx context.Context, dir, title string) (opencode
 	if c.createSessionErr != nil {
 		return opencode.Session{}, c.createSessionErr
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.createSessionResult.ID != "" {
 		c.sessions = append(c.sessions, c.createSessionResult)
 		return c.createSessionResult, nil

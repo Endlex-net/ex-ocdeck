@@ -77,6 +77,15 @@ type TaskStore interface {
 	// CompleteRecoveryFailure 条件事务：expected=activating 时原子完成
 	// status=suspended + last_error + 清 env_snapshot；CAS 失配三字段均不改。
 	CompleteRecoveryFailure(ctx context.Context, id string, lastError sql.NullString) (application.TransitionResult, error)
+	// CasActivationIfNoRecoveryDebt 激活准入原子事务（G3-18）：存在未清 recovery
+	// debt → store.ErrRecoveryDebtPresent（零修改），否则执行 from→to CAS。
+	CasActivationIfNoRecoveryDebt(ctx context.Context, id, fromStatus, toStatus string) (application.TransitionResult, error)
+	// CompleteRecoveryFailureAndClearDebts 单事务终态收敛 + debt 整组删除（G3-18）。
+	CompleteRecoveryFailureAndClearDebts(ctx context.Context, id string, lastError sql.NullString) (application.TransitionResult, error)
+	// recovery_debts tagged debt（D3 pending/replay）：按 task_id 原地替换。
+	UpsertRecoveryDebt(ctx context.Context, row RecoveryDebtRow) error
+	DeleteRecoveryDebt(ctx context.Context, taskID string) error
+	ListRecoveryDebts(ctx context.Context) ([]RecoveryDebtRow, error)
 	// TouchOwnedTaskSession 条件 UPDATE 仅本任务已归属行的 last_seen_at（D8）。
 	// 绝不插入；MutationResult.Matched=命中归属行（同值为 Matched+!Changed），!Matched
 	//（未归属行）为正常路径。供 session.updated 事件使用（MUST NOT 创建归属）。
@@ -95,6 +104,18 @@ type TaskStore interface {
 type AcquirePermitResult struct {
 	Acquired bool
 	Ordinal  int
+}
+
+// RecoveryDebtRow 对齐 store.RecoveryDebtRow（D3 tagged debt）。
+type RecoveryDebtRow struct {
+	TaskID      string
+	Phase       string
+	SessionName string
+	Tickets     string
+	Reason      string
+	Retryable   bool
+	Cause       string
+	CreatedAt   int64
 }
 
 // CleanupDebtStore 持久化未收敛的 orphan cleanup tickets（design.md §10）。
@@ -235,10 +256,13 @@ type Manager struct {
 	debtStore CleanupDebtStore
 
 	// shutdownGate 控制自动激活触发准入（B2）：Shutdown 开始后拒绝新自动激活触发。
-	// shutdownGateMu 保护 shutdownStarted 与 autoActivateWG；autoActivateWG 登记所有
-	// triggerActivate goroutine，供 Shutdown 等待自动激活收尾后再清理。
+	// shutdownGateMu 保护 shutdownStarted/shutdownCh 与 autoActivateWG；autoActivateWG
+	// 登记所有 triggerActivate goroutine，供 Shutdown 等待自动激活收尾后再清理。
+	// shutdownCh 在 gate 关闭时 close（G3-9：恢复路径的锁等待据此即时退出，
+	// 不占满 convergeLockDeadline）。
 	shutdownGateMu  sync.Mutex
 	shutdownStarted bool
+	shutdownCh      chan struct{}
 	autoActivateWG  sync.WaitGroup
 
 	// lifecycleRunner 提供 init/pre-delete 脚本执行与 inherit 文件复制（design.md §7.1）。
@@ -265,9 +289,22 @@ type Manager struct {
 	runnerCancel context.CancelFunc
 	runnerWG     sync.WaitGroup
 
-	// recoveryDebts 是 D3 tagged debt（phase=cleanup_notice|complete），供后台/Shutdown 重放。
-	recoveryDebtMu sync.Mutex
-	recoveryDebts  map[string]recoveryTaggedDebt // taskID
+	// recoveryIncidents 登记进行中的恢复 incident（fatal latch + cancel + WaitGroup，
+	// G3-1/G3-7）；tagged debt 的权威载荷在 store.recovery_debts（G3-3），无内存镜像。
+	recoveryIncidentsMu sync.Mutex
+	recoveryIncidents   map[string]*recoveryIncident
+	recoveryWG          sync.WaitGroup
+
+	// recoveryWakes 是恢复退避的状态/token invalidation 唤醒通道（G3-7）：
+	// setRuntime/clearRuntime/状态写入路径 close 当前通道，退避中的 incident 即时
+	// 复核 continuation（状态已离 activating / token 失效 → 立即取消，不等满 timer）。
+	recoveryWakeMu sync.Mutex
+	recoveryWakes  map[string]chan struct{}
+
+	// recoveryDebtFallbacks 是 debt 落盘失败（store 不可写）时的内存重试队列
+	//（G3-11）：后台周期/Shutdown 重试 upsert，未刷空错误由 Shutdown 传播。
+	recoveryDebtFallbackMu sync.Mutex
+	recoveryDebtFallbacks  []RecoveryDebtRow
 }
 
 // orphanFailure 记录孤儿会话清理失败项（F3）：会话名 + kill 失败产生的 cleanup tickets。
@@ -377,7 +414,9 @@ func New(opts Options) *Manager {
 		runtimeRegistry:         runtime.New(),
 		rand4Fn:                 rand4,
 		probeColdStartBackoffFn: defaultProbeColdStartBackoff,
-		recoveryDebts:           make(map[string]recoveryTaggedDebt),
+		recoveryIncidents:       make(map[string]*recoveryIncident),
+		recoveryWakes:           make(map[string]chan struct{}),
+		shutdownCh:              make(chan struct{}),
 	}
 	if m.ocFactory == nil {
 		m.ocFactory = defaultOCFactory
@@ -542,10 +581,17 @@ func (m *Manager) getRuntime(taskID string) *taskRuntime {
 }
 
 // setRuntime 设置任务的运行时。
+// G3-19：不在此处挂钩 incident attempt token——通用挂钩会把新代 runtime token
+// 绑到「注册表当前 incident」（Complete 已改状态但旧 incident 未注销时，新
+// Activate 的 runtime 会被旧 incident 误认领）。token 绑定由 recovery attempt
+// 经 commitRuntimeReady 的 onRegister 回调显式完成。
 func (m *Manager) setRuntime(taskID string, rt *taskRuntime) {
 	m.rtMu.Lock()
-	defer m.rtMu.Unlock()
 	m.runtimes[taskID] = rt
+	m.rtMu.Unlock()
+	// G3-7：token 代际变化即时唤醒恢复退避复核（新 runtime 注册 → 旧 incident
+	// trigger 失效，不得等满退避 timer 才发现）。
+	m.wakeRecoveryIncident(taskID)
 }
 
 // clearRuntime 移除任务的运行时并停止其 SSE/退出监视。
@@ -562,6 +608,7 @@ func (m *Manager) clearRuntime(taskID string) {
 		rt.clearAgentStatus()
 		rt.stopAll()
 	}
+	m.wakeRecoveryIncident(taskID)
 }
 
 // stopAll 停止该运行时的 SSE 订阅与退出监视（design.md §4 lifecycle 收敛）。
@@ -655,7 +702,13 @@ func (m *Manager) backgroundLoop(ctx context.Context) {
 			if err := m.processRetryableNotices(ctx); err != nil {
 				log.Printf("background: retryable notices: %v", err)
 			}
-			m.replayRecoveryDebts(ctx)
+			// G3-11：重试落盘失败的 debt 内存队列（成功后才可被重放）。
+			if err := m.flushRecoveryDebtFallbacks(ctx); err != nil {
+				log.Printf("background: flush recovery debt fallbacks: %v", err)
+			}
+			if err := m.replayRecoveryDebts(ctx); err != nil {
+				log.Printf("background: replay recovery debts: %v", err)
+			}
 			if err := m.retryOrphanSessions(ctx); err != nil {
 				// B2：后台周期不阻塞，但 cleanup_debt 持久化错误 MUST 记录（不静默吞没）。
 				log.Printf("background: retry orphan sessions: %v", err)
@@ -687,8 +740,14 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	// 再执行既有清理。消灭窗口：kill 模式 shutdown 枚举后再建 tmux 会话；
 	// persist 模式 Shutdown 返回后继续注册 runtime/访问 store。
 	m.shutdownGateMu.Lock()
-	m.shutdownStarted = true
+	if !m.shutdownStarted {
+		m.shutdownStarted = true
+		// shutdownCh 在 New 构造（非 nil），此处仅 close：锁等待者捕获的是同一通道
+		//（G3-9），close 即时唤醒；重复 Shutdown 不二次 close。
+		close(m.shutdownCh)
+	}
 	m.shutdownGateMu.Unlock()
+	m.cancelAllRecoveryIncidents()
 
 	// §6.1 固定顺序：关 gate → cancel runnerCtx → wait runnerWG → 关 store。
 	// runnerCtx cancel 紧随 gate 关闭，立即终止在跑脚本进程组，避免被持锁 pre-delete 拉长 Shutdown。
@@ -733,7 +792,29 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	if err := m.processRetryableNotices(ctx); err != nil {
 		log.Printf("shutdown: final retryable notice sweep: %v", err)
 	}
-	m.replayRecoveryDebts(ctx)
+	// G3-7：等待进行中恢复 incident 收尾（cancelAllRecoveryIncidents 已即时取消退避）。
+	waitRecovery := make(chan struct{})
+	go func() {
+		m.recoveryWG.Wait()
+		close(waitRecovery)
+	}()
+	select {
+	case <-waitRecovery:
+	case <-ctx.Done():
+		log.Printf("shutdown: timed out waiting for recovery incidents: %v", ctx.Err())
+	}
+	var killErr error
+	// G3-11：先刷内存 debt 重试队列（落盘成功才可被重放），未刷空的错误 MUST 传播。
+	if err := m.flushRecoveryDebtFallbacks(ctx); err != nil {
+		log.Printf("shutdown: flush recovery debt fallbacks: %v", err)
+		killErr = fmt.Errorf("shutdown: flush recovery debt fallbacks: %w", err)
+	}
+	// G3-3：Shutdown 重放 durable tagged debt（被取消 incident 留下的 activating 由
+	// Complete 收敛；写库失败 MUST 记录并传播）。
+	if err := m.replayRecoveryDebts(ctx); err != nil {
+		log.Printf("shutdown: replay recovery debts: %v", err)
+		killErr = errors.Join(killErr, fmt.Errorf("shutdown: replay recovery debts: %w", err))
+	}
 	// R7：收割内存 orphanFailures（kill 失败的孤儿会话 tickets，非仅 DB notice）。
 	// 后台周期已停（bgCancel），关停时 MUST 主动调用一次 retryOrphanSessions，避免逃逸进程
 	// tickets 仅存内存随进程退出丢失（design.md §10：runtime 已空 = 无会话且无可重试 cleanup debt，
@@ -744,9 +825,8 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	}
 	// kill 模式：按 shutdownPolicy 清理全部任务会话，确认 runtime 已空。
 	policy := m.cfg.ShutdownPolicy
-	var killErr error
 	if policy == config.ShutdownKillOnStart || policy == config.ShutdownKillImmediate {
-		killErr = m.shutdownKillAllSessions(ctx)
+		killErr = errors.Join(killErr, m.shutdownKillAllSessions(ctx))
 		if killErr != nil {
 			// 记录但继续停 runtime goroutine，避免 goroutine 泄漏；错误向上传播。
 			log.Printf("shutdown: kill all sessions: %v", killErr)
@@ -754,11 +834,12 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	} else {
 		// persist 模式：会话保留（tmux 持有），但 orphanFailures 非空意味着仍有未收割的逃逸进程
 		// tickets，不得视为干净退出（design.md §10）。返回错误让调用方感知。
+		// G3-17：join 而非赋值——fallback flush/replay 等先行错误不得被覆盖。
 		m.orphanMu.Lock()
 		orphanRemaining := len(m.orphanFailures)
 		m.orphanMu.Unlock()
 		if orphanRemaining > 0 {
-			killErr = fmt.Errorf("shutdown: %d orphan cleanup tickets remain (persist mode)", orphanRemaining)
+			killErr = errors.Join(killErr, fmt.Errorf("shutdown: %d orphan cleanup tickets remain (persist mode)", orphanRemaining))
 		}
 	}
 	// P4 复评阻塞 3c：shutdownKillAllSessions 新产生的 orphan tickets MUST 再次持久化
