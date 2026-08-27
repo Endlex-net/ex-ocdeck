@@ -37,15 +37,22 @@ func (s *Server) handleWSTUI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 任务须活跃；TUI 会话消失则自动 ReopenAttach（design.md §21）。
-	// 错误按 code 区分关闭码：invalid_state/not_found/conflict（任务确非活跃/锁冲突）
-	// → 4010 task suspended；internal/process_error（infra 故障，如 HasSession tmux 错误）
-	// → 1011 internal error，不得误判为 4010 掩盖 infra 故障（design.md §8/§21）。
+	// 任务须活跃；进程缺失时 ReopenAttach 触发幂等恢复并返回 typed recovering。
+	// 错误按 code 区分关闭码（D8 固定契约）：
+	//   - recovering → 1013 Try Again Later（前端轮询任务状态，回 active 后重连；
+	//     MUST NOT 映射为 4010 suspended 或其他非重试关闭码）；
+	//   - invalid_state/not_found（任务确非活跃）→ 4010 task suspended；
+	//   - conflict（G4-3：锁竞争等 transient，ReopenAttach 等锁超时后仍忙）→ 1011
+	//     可重试关闭，MUST NOT 进 4010 让前端误判挂起停止重连；
+	//   - internal/process_error（infra 故障，如 HasSession tmux 错误）→ 1011 internal
+	//     error，不得误判为 4010 掩盖 infra 故障（design.md §8/§21）。
 	tid, err := s.tasks.ReopenAttach(r.Context(), taskID)
 	if err != nil {
 		code := ErrorCode(application.OpErrorCode(err))
 		switch code {
-		case CodeInvalidState, CodeNotFound, CodeConflict:
+		case CodeRecovering:
+			wsClose(context.Background(), c, wsCloseRecovering, "task process starting")
+		case CodeInvalidState, CodeNotFound:
 			wsClose(context.Background(), c, wsCloseTaskSuspended, "task not active")
 		default:
 			wsClose(context.Background(), c, wsCloseInternalError, "reopen attach failed")

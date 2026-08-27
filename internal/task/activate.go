@@ -1720,10 +1720,10 @@ func (m *Manager) confirmRuntimeTerminated(ctx context.Context, taskID, runtimeN
 // 回调校验 (instVersion, sessionName) 仍匹配 Manager 当前注册表，否则忽略（B4 回调隔离：
 // 旧实例回调不清理新实例）。校验针对 m.getRuntime 的当前 runtime，而非注册时捕获的 rt，
 // 保证旧 runtime 被替换后回调即失效（C1：不捕获本地快照）。
-// 事件类型分发（C1 typed RuntimeEvent）：
-//   - WatchEventSessionExit → handleServeExit（serve_exit 语义）；
-//   - WatchEventInfraError（tmux 持续故障）→ handleInfraError（记录 last_error + notice + 收敛运行时，
-//     不得静默）。
+// 事件类型分发（C1 typed RuntimeEvent，single-process D4 统一 runtime failure 分派）：
+//   - WatchEventSessionExit → handleServeExit → ensureRecovery（幂等恢复入口）；
+//   - WatchEventInfraError（tmux 持续故障）→ ensureRecovery（统一分派，不得静默；
+//     恢复前序清理终止该 runtime）。
 //
 // P1.4.7（design.md D0:150）：注册时捕获触发令牌并贯穿传递给 converge——触发令牌是
 // 注册/回调校验时刻的身份，不得在等锁后重读 runtime 顶替。
@@ -1753,48 +1753,19 @@ func (m *Manager) watchServeExit(taskID, serveName string) {
 	}
 }
 
-// watchTUIExit 监视 TUI 会话消失 → 标记可重开（保持活跃，design.md §4）。
-// 回调校验（B4 回调隔离，针对当前 runtime 注册表，C1：不捕获本地快照）。
-// 事件类型分发（C1 typed RuntimeEvent）：
-//   - WatchEventSessionExit → tui_exit 语义：标记可重开（保持活跃）；
-//   - WatchEventInfraError → handleInfraError（TUI 监视 infra 错误同样收敛运行时）。
-func (m *Manager) watchTUIExit(taskID, tuiName string) {
-	tok := runtime.InstVersion("")
-	if rt := m.getRuntime(taskID); rt != nil {
-		tok = rt.instVersion
-	}
-	cancel, done := m.proc.WatchExit(tuiName, func(ev process.WatchEvent) {
-		cur := m.getRuntime(taskID)
-		if cur == nil || !cur.matchesRegistry(tok, tuiName) {
-			return
-		}
-		switch ev.Type {
-		case process.WatchEventSessionExit:
-			// TUI 消失但 serve 存活 → 标记可重开，保持活跃。
-			// 从注册表移除 TUI group；ReopenAttach 由 WS/REST 触发重建。
-			cur.removeGroup(tuiName)
-		case process.WatchEventInfraError:
-			m.handleInfraError(taskID, tuiName, ev.Err, tok)
-		}
-	})
-	if cur := m.getRuntime(taskID); cur != nil {
-		cur.mu.Lock()
-		cur.watchCancels[tuiName] = cancel
-		cur.watchDones[tuiName] = done
-		cur.mu.Unlock()
-	}
-}
-
 // handleServeExit serve 异常消失（非挂起路径）→ 完整清理运行时 → suspended + last_error。
 // 清除 env snapshot 与 shell（design.md §2/§4：serve 异常退出清快照）。
 // P1.4.7：tok 为 watcher 注册时捕获的触发令牌（design.md D0:150 令牌贯穿）。
+// single-process Phase 4：watchTUIExit 已随独立 TUI 会话模型删除（TUI 与任务进程
+// 同体，-tui 遗留会话仅由 reconcile 清理路径处置）。
 func (m *Manager) handleServeExit(taskID string, tok runtime.InstVersion) {
 	m.ensureRecovery(taskID, tok)
 }
 
 // convergeToSuspended 收敛活跃任务到 suspended（design.md §4：不得留 active 但无 SSE 托管的运行时）。
-// 非 SSE 路径（serve_exit watcher、handleInfraError）——令牌校验在 convergeToSuspendedChecked
-// 内统一完成（拿锁后按触发令牌比对当前 runtime，含 watcher 路径）。
+// single-process D4 起 watcher/SSE 永久失败统一走幂等 ensureRecovery（不再直接落挂起），
+// 本收敛族保留为显式收敛原语（D2 attention 失效矩阵入口；converge_debt 测试直接消费）——
+// 令牌校验在 convergeToSuspendedChecked 内统一完成（拿锁后按触发令牌比对当前 runtime）。
 func (m *Manager) convergeToSuspended(taskID, reason string, tok runtime.InstVersion) {
 	m.convergeToSuspendedChecked(taskID, reason, tok)
 }
@@ -1841,17 +1812,6 @@ func (m *Manager) convergeToSuspendedChecked(taskID, reason string, tok runtime.
 	// 清除 env 快照 + active→suspended CAS + D2 嵌套决策表（converge_debt.go）。
 	// env 快照写回错误聚合进 last_error，不静默吞错（P4 复评阻塞 5）。
 	m.convergeCommitCAS(ctx, taskID, reason, tok, attentionVisible, runStatusInvalidation, cleanupErr)
-}
-
-// handleInfraError 处理 tmux 持续基础设施故障（C1：infra_error 明确处理路径，不得静默）。
-// 触发来源：WatchExit 连续 tmux 命令失败达到退避上限 → WatchEventInfraError。
-// 处理：取得任务锁 → 完整清理运行时（停 SSE/watcher + kill 残余会话，记 residual notice）
-// → 记 last_error（含底层 infra 错误）→ 落 suspended。
-// 不静默：last_error 与 notice 均落库，供用户与后台周期感知。
-// P1.4.7：tok 为 watcher 注册时捕获的触发令牌（design.md D0:150 令牌贯穿）。
-func (m *Manager) handleInfraError(taskID, sessionName string, infraErr error, tok runtime.InstVersion) {
-	reason := fmt.Sprintf("tmux infra error watching %s: %v", sessionName, infraErr)
-	m.convergeToSuspended(taskID, reason, tok)
 }
 
 // cleanupActivationRuntime 清理激活过程中已建的会话（失败补偿）。

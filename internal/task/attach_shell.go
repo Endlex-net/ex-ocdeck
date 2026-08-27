@@ -14,19 +14,34 @@ import (
 	"ocdeck/internal/infrastructure/pty"
 )
 
-// ReopenAttach 返回任务进程终端 ID（D8）。本阶段不接 ensureRecovery：
-// runtime 存活且 active → 返回 -runtime；active 但缺失 / activating → typed recovering；
-// 其他状态 → invalid_state。不再创建独立 TUI 会话。
+// ReopenAttach 返回任务进程终端 ID（D8）。单进程终端链路（Phase 4）：
+//   - runtime 存活且 active → 返回 -runtime 会话名（attach 客户端由 WS 层创建）；
+//   - active 但 runtime 缺失 → 触发幂等 ensureRecoveryFromAttach（G4-1 source-aware：
+//     注册表无 runtime 时由 attach 入口新分配 trigger，修复 rt==nil 永久卡 active）
+//   - 返回 typed recovering；
+//   - activating → 同一 typed recovering，不重复启动；
+//   - 其他状态 → invalid_state。
+//
+// 恢复异步触发（本方法持任务锁，恢复入口内部等锁；执行不阻塞终端请求）。
+// G4-3：锁竞争是 transient（并发 CreateShell/Suspend 等）——等待锁后按 D8 表
+// 重新分派（lockTaskWait 只拿锁不复查状态，等锁期间 active→activating 由主流程
+// activating 分支落 recovering），不得把 transient conflict/状态迁移误发 4010。
 func (m *Manager) ReopenAttach(ctx context.Context, taskID string) (TerminalID, error) {
 	unlock, err := m.tryLockTask(taskID)
 	if err != nil {
-		if OpErrorCode(err) == codeConflict {
-			row, rerr := m.store.GetTask(ctx, taskID)
-			if rerr == nil && row.Status == StatusActivating {
-				return "", newOpErr(codeRecovering, fmt.Errorf("task %s process is starting", taskID))
-			}
+		if OpErrorCode(err) != codeConflict {
+			return "", err
 		}
-		return "", err
+		// 锁被持：activating 快路径（恢复已在进行，typed recovering）。
+		if row, rerr := m.store.GetTask(ctx, taskID); rerr == nil && row.Status == StatusActivating {
+			return "", newOpErr(codeRecovering, fmt.Errorf("task %s process is starting", taskID))
+		}
+		// 等待锁后重新分派（拿锁即复查 active：等锁期间被挂起 → invalid_state；
+		// ctx 取消/超时仍 conflict → 交由 WS 层以可重试语义关闭，不误发 4010）。
+		unlock, err = m.lockTaskWait(ctx, taskID)
+		if err != nil {
+			return "", err
+		}
 	}
 	defer unlock()
 
@@ -55,6 +70,9 @@ func (m *Manager) ReopenAttach(ctx context.Context, taskID string) (TerminalID, 
 	if exists {
 		return TerminalID(runtimeName), nil
 	}
+	// active 但进程缺失：触发幂等恢复（watcher 未达/注册表已清时由终端入口兜底；
+	// G4-1：入口内部对 rt 有/无分别按 callback token / 新分配 trigger 分派）。
+	go m.ensureRecoveryFromAttach(taskID)
 	return "", newOpErr(codeRecovering, fmt.Errorf("task %s process is starting", taskID))
 }
 

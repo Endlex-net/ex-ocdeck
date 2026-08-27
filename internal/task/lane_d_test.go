@@ -52,9 +52,11 @@ func TestLockTaskWait_CtxCancel_Conflict(t *testing.T) {
 
 // --- 任务 2：Lane D ---
 
-// TestLockTaskWait_StatusChangedAfterLock_InvalidState 验证拿锁后复查：
-// 等待期间任务状态被改为 suspended，lockTaskWait 拿锁后返回 invalid_state（不执行副作用）。
-func TestLockTaskWait_StatusChangedAfterLock_InvalidState(t *testing.T) {
+// TestLockTaskWait_StatusChangedAfterLock_OnlyExistsCheck 验证拿锁后复查（G4-3
+// attempt 2 语义）：等待器只复查任务存在，不做 active 状态复查——等锁期间
+// active→suspended/activating 等合法迁移由调用方（ReopenAttach）按 D8 表统一分派，
+// 等待器不得抢先返回 invalid_state（曾导致等锁期间 active→activating 误发 4010）。
+func TestLockTaskWait_StatusChangedAfterLock_OnlyExistsCheck(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
 	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
@@ -64,23 +66,31 @@ func TestLockTaskWait_StatusChangedAfterLock_InvalidState(t *testing.T) {
 
 	unlock, _ := m.tryLockTask("t1")
 
-	waitDone := make(chan error, 1)
+	waitDone := make(chan struct {
+		unlock func()
+		err    error
+	}, 1)
 	go func() {
-		_, err := m.lockTaskWait(context.Background(), "t1")
-		waitDone <- err
+		unlock, err := m.lockTaskWait(context.Background(), "t1")
+		waitDone <- struct {
+			unlock func()
+			err    error
+		}{unlock, err}
 	}()
 	time.Sleep(50 * time.Millisecond)
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusSuspended })
+	// 等锁期间状态迁移（active→activating 是恢复场景的真实迁移；suspended 亦同）。
+	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActivating })
 	unlock()
 
 	select {
-	case err := <-waitDone:
-		if err == nil {
-			t.Fatal("expected invalid_state after status changed during wait")
+	case r := <-waitDone:
+		if r.err != nil {
+			t.Fatalf("lockTaskWait must not fail on legal status transition during wait: %v", r.err)
 		}
-		if OpErrorCode(err) != codeInvalidState {
-			t.Errorf("code=%v want invalid_state (status changed during wait), err=%v", OpErrorCode(err), err)
+		if r.unlock == nil {
+			t.Fatal("expected lock handoff")
 		}
+		r.unlock() // 等待器成功拿锁：状态分派归调用方，不执行副作用
 	case <-time.After(5 * time.Second):
 		t.Fatal("lockTaskWait did not return after lock released")
 	}

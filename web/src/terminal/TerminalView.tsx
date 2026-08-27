@@ -18,6 +18,7 @@ const STATE_LABEL: Record<TermConnState, string> = {
   connecting: '连接中…',
   connected: '',
   reconnecting: '连接断开，正在重连…',
+  recovering: '进程启动中',
   suspended: '任务已挂起',
   closed: '会话已断开',
   replaced: '此终端已在其他标签页打开',
@@ -100,7 +101,7 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
       {showOverlay && (
         <div className="terminal-overlay">
           <div className="terminal-overlay-box">
-            {(state === 'connecting' || state === 'reconnecting') && (
+            {(state === 'connecting' || state === 'reconnecting' || state === 'recovering') && (
               <span className="spinner" aria-hidden />
             )}
             <span>{STATE_LABEL[state]}</span>

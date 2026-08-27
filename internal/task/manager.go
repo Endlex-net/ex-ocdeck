@@ -461,13 +461,16 @@ func (m *Manager) tryLockTask(taskID string) (func(), error) {
 	return func() { kl.mu.Unlock() }, nil
 }
 
-// lockTaskWait 等待获取任务级互斥锁，感知 ctx 取消与内部 deadline。仅 ReopenAttach 使用：
-// 可等待并复查资源后幂等复用（design.md §21：并发 REST/WS 重开幂等复用同一新 TUI 会话）。
+// lockTaskWait 等待获取任务级互斥锁，感知 ctx 取消与内部 deadline。仅 ReopenAttach 使用。
+// G4-3（attempt 2）：等待器只负责拿锁与 not-found 复查，不再做 active 状态复查——
+// 等锁期间 active→activating（并发恢复启动）是合法迁移，若此处判 invalid_state 会
+// 让 ReopenAttach 到不了 activating 分支 → WS 4010（前端停止重连）。拿锁后的完整
+// D8 状态分派（activating→recovering / active→继续 / 其他→invalid_state）统一由
+// 调用方执行，等锁期间被挂起/删除同样由调用方按 D8 表落 invalid_state。
 // taskBusy 机制：
 //   - 内部 deadline（30s）：超时返回 409 conflict "任务忙，请稍后重试"，不得无限等待；
-//   - 拿锁后 MUST 复查任务状态：等待期间任务可能被挂起/删除，非 active → invalid_state
-//     （释放锁后返回，不执行副作用）；
-//   - 现有 ctx 取消感知保留；ReopenAttach 幂等复用语义不变。
+//   - 拿锁后仅复查任务存在（not found → 释放锁返回 not_found，不执行副作用）；
+//   - ctx 取消感知保留。
 //
 // waiter 泄漏修复（R7 TOCTOU）：goroutine 拿锁后通过 select 把锁所有权交给调用方或
 // 在 waitCtx 取消时释放锁——发送与接收同步（unbuffered channel），不存在"检查 abandoned
@@ -475,13 +478,13 @@ func (m *Manager) tryLockTask(taskID string) (func(), error) {
 // select 必走 waitCtx.Done 分支释放锁，锁最终必然可被后续操作获取。
 //
 // 返回 unlock；ctx 取消返回 ctx.Err()（包装为 conflict）；deadline 超时返回 conflict；
-// 拿锁后状态非 active 返回 invalid_state（已释放锁）。
+// 任务不存在返回 not_found（已释放锁）。
 func (m *Manager) lockTaskWait(ctx context.Context, taskID string) (func(), error) {
 	v, _ := m.keyedMu.LoadOrStore(taskID, &keyedLock{})
 	kl := v.(*keyedLock)
 	// TryLock 快路径：无冲突直接返回。
 	if kl.mu.TryLock() {
-		return m.recheckActiveOrUnlock(ctx, taskID, kl)
+		return m.recheckExistsOrUnlock(ctx, taskID, kl)
 	}
 	// 等待路径：unbuffered channel + waitCtx 驱动的锁所有权移交。
 	waitCtx, waitCancel := context.WithTimeout(ctx, lockWaitDeadline)
@@ -499,7 +502,7 @@ func (m *Manager) lockTaskWait(ctx context.Context, taskID string) (func(), erro
 	}()
 	select {
 	case <-lockedCh:
-		return m.recheckActiveOrUnlock(ctx, taskID, kl)
+		return m.recheckExistsOrUnlock(ctx, taskID, kl)
 	case <-waitCtx.Done():
 		// ctx 取消或 deadline 超时：goroutine 会经 waitCtx.Done 释放锁。
 		// 区分：ctx 自身取消 → 包装 ctx.Err()；deadline 超时 → errTaskBusy。
@@ -510,17 +513,12 @@ func (m *Manager) lockTaskWait(ctx context.Context, taskID string) (func(), erro
 	}
 }
 
-// recheckActiveOrUnlock 拿锁后复查任务状态：非 active 释放锁并返回 invalid_state。
-// 等待期间任务可能被挂起/删除，拿锁后不得直接执行副作用。
-func (m *Manager) recheckActiveOrUnlock(ctx context.Context, taskID string, kl *keyedLock) (func(), error) {
-	row, err := m.store.GetTask(ctx, taskID)
-	if err != nil {
+// recheckExistsOrUnlock 拿锁后复查任务存在：不存在释放锁并返回 not_found（不执行
+// 副作用）。状态分派（active/activating/其他）由调用方统一执行（G4-3 attempt 2）。
+func (m *Manager) recheckExistsOrUnlock(ctx context.Context, taskID string, kl *keyedLock) (func(), error) {
+	if _, err := m.store.GetTask(ctx, taskID); err != nil {
 		kl.mu.Unlock()
 		return nil, newOpErr(codeNotFound, fmt.Errorf("task not found: %w", err))
-	}
-	if row.Status != StatusActive {
-		kl.mu.Unlock()
-		return nil, newOpErr(codeInvalidState, fmt.Errorf("task %s no longer active (got %s) after lock wait", taskID, row.Status))
 	}
 	return func() { kl.mu.Unlock() }, nil
 }

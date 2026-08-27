@@ -320,6 +320,113 @@ func (m *Manager) ensureRecovery(taskID string, tok runtime.InstVersion) {
 	m.runRecoveryIncident(ctx, taskID, tok, mode)
 }
 
+// ensureRecoveryFromAttach 是终端入口（ReopenAttach）触发的恢复（G4-1，source-aware）：
+// callback 来源（watcher/SSE）强制 token 匹配现存 runtime；attach 来源在锁内重验
+// active、会话仍缺失、kind 后，注册表无 runtime 时以**新分配** trigger 创建 incident
+// （不得伪造/复用旧 runtime token 绕过校验）——否则 rt==nil 时任务永久卡 active。
+// CAS 幂等（active→activating）保证与 watcher/其他 attach 并发触发不产生双恢复。
+func (m *Manager) ensureRecoveryFromAttach(taskID string) {
+	m.shutdownGateMu.Lock()
+	if m.shutdownStarted {
+		m.shutdownGateMu.Unlock()
+		return
+	}
+	m.recoveryWG.Add(1)
+	m.shutdownGateMu.Unlock()
+	defer m.recoveryWG.Done()
+
+	unlock, err := m.lockTaskForRecovery(taskID)
+	if err != nil {
+		if !m.shutdownStartedLocked() {
+			log.Printf("ensureRecovery: attach lock task %s: %v", taskID, err)
+		}
+		return
+	}
+	if m.shutdownStartedLocked() {
+		unlock()
+		return
+	}
+	row, gerr := m.store.GetTask(context.Background(), taskID)
+	if gerr != nil {
+		log.Printf("ensureRecovery: attach get task %s: %v", taskID, gerr)
+		unlock()
+		return
+	}
+	switch row.Status {
+	case StatusActivating:
+		// 已有 incident 在恢复（watcher/先前触发）：attach 不重复介入。
+		unlock()
+		return
+	case StatusActive:
+		if err := rehydrateGuardView(row).ApplyRecoveryStart(); err != nil {
+			unlock()
+			return
+		}
+	default:
+		unlock()
+		return
+	}
+	// trigger 决策（锁内，无 TOCTOU）：注册表有 runtime → 与 callback 语义一致用其
+	// token；无 runtime（G4-1 窗口：进程消失且注册表已清）→ 复核会话确实缺失后
+	// 标记需新分配 trigger（G4-6：NewInstVersion 会改写权威 tombstone，MUST NOT
+	// 先于 kind 校验/debt 准入/CAS——未知 kind 或未清 debt 本应零副作用）。
+	// 实际分配延后到 beginActivation matched 之后、解锁之前。
+	trigger := runtime.InstVersion("")
+	needNewTrigger := false
+	if rt := m.getRuntime(taskID); rt != nil {
+		trigger = rt.instVersion
+	} else {
+		exists, herr := m.proc.HasSession(runtimeSessionName(taskID))
+		if herr != nil && !errors.Is(herr, process.ErrNoTmuxServer) {
+			// infra 错误：零副作用放弃（不猜测），由 watcher/reconcile 路径兜底。
+			log.Printf("ensureRecovery: attach has-session task %s: %v", taskID, herr)
+			unlock()
+			return
+		}
+		if exists {
+			// 会话仍在而注册表无 runtime：状态撕裂（非本入口职责），零副作用放弃。
+			unlock()
+			return
+		}
+		needNewTrigger = true
+	}
+	proj, perr := m.store.GetProject(context.Background(), row.ProjectID)
+	if perr != nil {
+		log.Printf("ensureRecovery: attach get project for task %s: %v", taskID, perr)
+		unlock()
+		return
+	}
+	mode, kerr := alignModeForKind(proj.Kind)
+	if kerr != nil {
+		log.Printf("ensureRecovery: attach resolve kind for task %s: %v", taskID, kerr)
+		unlock()
+		return
+	}
+
+	ctx := m.lifecycleCtx()
+	cas, cerr := m.beginActivation(ctx, taskID, StatusActive)
+	if cerr != nil {
+		if errors.Is(cerr, store.ErrRecoveryDebtPresent) {
+			log.Printf("ensureRecovery: attach task %s has uncleaned recovery debt; skip", taskID)
+		} else {
+			log.Printf("ensureRecovery: attach CAS active→activating task %s: %v", taskID, cerr)
+		}
+		unlock()
+		return
+	}
+	if !cas.Matched {
+		unlock()
+		return
+	}
+	// G4-6：CAS matched 后、解锁前才分配新 trigger——此前全部拒绝路径
+	//（shutdown/token/状态/会话复核/kind/debt/CAS）保持零 tombstone 副作用。
+	if needNewTrigger {
+		trigger = m.runtimeRegistry.NewInstVersion(taskID)
+	}
+	unlock()
+	m.runRecoveryIncident(ctx, taskID, trigger, mode)
+}
+
 // lockTaskForRecovery 为恢复路径阻塞等待任务锁：与 lockTaskForConverge 语义一致，
 // 但等待可被 Shutdown 即时取消（shutdownCh，G3-9），不占满 convergeLockDeadline。
 func (m *Manager) lockTaskForRecovery(taskID string) (func(), error) {

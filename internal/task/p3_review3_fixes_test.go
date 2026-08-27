@@ -371,9 +371,9 @@ func TestReconcilePrePassDigestsDebtThenResumesActive(t *testing.T) {
 	store.mutTask("t1", func(r *TaskRow) { r.Notice = encodeNotices(notice) })
 
 	proc := newMockProc()
-	// serve 健康（存在 + env + OCDECK_TASK_ID 匹配）；shell 会话不存在（pre-pass 跳过 kill）。
-	proc.sessions[serveSessionName("t1")] = true
-	proc.envValues[serveSessionName("t1")] = map[string]string{
+	// runtime 会话健康（存在 + env + OCDECK_TASK_ID 匹配）；shell 会话不存在（pre-pass 跳过 kill）。
+	proc.sessions[runtimeSessionName("t1")] = true
+	proc.envValues[runtimeSessionName("t1")] = map[string]string{
 		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
 	}
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
@@ -414,8 +414,8 @@ func TestReconcileStaleNoticeNotUsed(t *testing.T) {
 	store.mutTask("t1", func(r *TaskRow) { r.Notice = encodeNotices(notice) })
 
 	proc := newMockProc()
-	proc.sessions[serveSessionName("t1")] = true
-	proc.envValues[serveSessionName("t1")] = map[string]string{
+	proc.sessions[runtimeSessionName("t1")] = true
+	proc.envValues[runtimeSessionName("t1")] = map[string]string{
 		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
 	}
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))

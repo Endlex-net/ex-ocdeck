@@ -129,16 +129,55 @@ func (m *Manager) commitSuspendedReconcile(ctx context.Context, taskID, fromStat
 	return nil
 }
 
-// reconcilePersist persist 模式恢复序列（design.md §5 矩阵）。
+// reconcilePersist persist 模式恢复序列（design.md §5 矩阵 + single-process D7）。
+// 仅 active 任务的存活健康 runtime 可原地 resume；activating 一律视为被中断的
+// 激活/恢复——执行清理并落挂起（单进程无锚定 bootstrap 的中间态无法经会话名
+// 区分，不续跑）。旧版 -serve/-tui 会话随 names 一并按异常会话清理（不热迁移）。
 // KillSession/notice/状态提交错误聚合返回（design.md §5/§8，不静默）。
 // B2：状态 CAS 的 error 与 committed=false 结果 MUST 检查并传播（不得 _, _ 吞没）。
 func (m *Manager) reconcilePersist(ctx context.Context, tasks []TaskRow, sessionsByTask map[string][]string) error {
 	var errs []error
 	for _, t := range tasks {
 		names := sessionsByTask[t.ID]
-		hasServe := containsName(names, serveSessionName(t.ID))
+		hasRuntime := containsName(names, runtimeSessionName(t.ID))
 		switch t.Status {
-		case StatusActive, StatusActivating:
+		case StatusActive:
+			// G4-2（D7：legacy 一律清理）：健康 -runtime 与 legacy -serve/-tui 共存时
+			// legacy 会话不得随 resume 遗留——resume 决策前独立筛出并清理 legacy
+			// role；清理产生 retryable debt → 不得恢复 active。
+			// G4-7：kill/disposition 失败（kerr）本身即阻断 resume——kerr 非空意味着
+			// legacy 会话可能仍存活或 notice 写失败（重读看不到 debt），不得仅聚合
+			// 错误后继续 resumeActive；与 retryable debt 合并为同一「清理 runtime、
+			// 落 suspended」分支。
+			if legacy := legacySessionNames(t.ID, names); len(legacy) > 0 {
+				legacyKerr := m.killTaskSessionsReconcile(ctx, t.ID, legacy)
+				if legacyKerr != nil {
+					errs = append(errs, fmt.Errorf("task %s legacy cleanup: %w", t.ID, legacyKerr))
+				}
+				blocked := legacyKerr != nil
+				reason := "legacy cleanup failed"
+				if !blocked {
+					// 清理后重读 notice：legacy 清理自身产生的 retryable debt 阻断恢复。
+					if cur, rerr := m.store.GetTask(ctx, t.ID); rerr != nil {
+						errs = append(errs, fmt.Errorf("task %s legacy-cleanup reread: %w", t.ID, rerr))
+						blocked = true
+						reason = "legacy cleanup reread failed"
+					} else if hasRetryable, _ := m.hasRetryableNotice(ctx, cur); hasRetryable {
+						blocked = true
+						reason = "legacy cleanup debt blocks resume"
+					}
+				}
+				if blocked {
+					kerr := m.cleanupTaskRuntimeReconcile(ctx, t.ID, names)
+					if cerr := m.commitSuspendedReconcile(ctx, t.ID, t.Status, reason); cerr != nil {
+						errs = append(errs, fmt.Errorf("task %s legacy-block commit suspended: %w", t.ID, cerr))
+					}
+					if kerr != nil {
+						errs = append(errs, fmt.Errorf("task %s cleanup (legacy blocked): %w", t.ID, kerr))
+					}
+					continue
+				}
+			}
 			// cleanup-debt pre-pass 已在 Reconcile 全局首步骤消化（design.md §5）。
 			// hasDebt 判定 MUST 重读任务的当前 notice：pre-pass 可能已清债，
 			// 旧 t.Notice 是 pre-pass 前快照，沿用会导致已清债任务被错误 kill+suspended。
@@ -165,7 +204,7 @@ func (m *Manager) reconcilePersist(ctx context.Context, tasks []TaskRow, session
 				}
 				continue
 			}
-			if hasServe && m.serveHealthyRecoverable(ctx, cur) {
+			if hasRuntime && m.runtimeHealthyRecoverable(ctx, cur) {
 				// 恢复活跃：读回密码与端口 → 重建运行时 → SSE 订阅 + 全量对齐。
 				// 使用重读后的 cur（notice 已消化），避免基于旧快照恢复。
 				if err := m.resumeActive(ctx, cur); err != nil {
@@ -181,15 +220,25 @@ func (m *Manager) reconcilePersist(ctx context.Context, tasks []TaskRow, session
 					errs = append(errs, fmt.Errorf("task %s resume: %w", t.ID, err))
 				}
 			} else {
-				// serve 已消失/健康失败 → 完整运行时清理（残余会话 kill + watcher/SSE 收敛）→ suspended + last_error（F4）。
-				// activating 状态也 MUST kill 残留 serve 会话（此前仅落 suspended 不清进程）。
+				// runtime 已消失/健康失败 → 完整运行时清理（残余会话 kill + watcher/SSE 收敛）→ suspended + last_error（F4）。
 				kerr := m.cleanupTaskRuntimeReconcile(ctx, t.ID, names)
-				if cerr := m.commitSuspendedReconcile(ctx, t.ID, t.Status, "serve gone during reconcile"); cerr != nil {
-					errs = append(errs, fmt.Errorf("task %s serve-gone commit suspended: %w", t.ID, cerr))
+				if cerr := m.commitSuspendedReconcile(ctx, t.ID, t.Status, "runtime gone during reconcile"); cerr != nil {
+					errs = append(errs, fmt.Errorf("task %s runtime-gone commit suspended: %w", t.ID, cerr))
 				}
 				if kerr != nil {
-					errs = append(errs, fmt.Errorf("task %s cleanup (serve gone): %w", t.ID, kerr))
+					errs = append(errs, fmt.Errorf("task %s cleanup (runtime gone): %w", t.ID, kerr))
 				}
+			}
+		case StatusActivating:
+			// D7：activating 一律视为被中断的激活/恢复——清理并落挂起，不续跑
+			//（无锚定 bootstrap 中间态无法经会话名区分，原地 resume 可能把未锚定
+			// 进程错误提升为 active；不持久化 phase，统一走「清理+挂起+重新激活」）。
+			kerr := m.cleanupTaskRuntimeReconcile(ctx, t.ID, names)
+			if cerr := m.commitSuspendedReconcile(ctx, t.ID, t.Status, "interrupted activation during server restart"); cerr != nil {
+				errs = append(errs, fmt.Errorf("task %s interrupted-activation commit suspended: %w", t.ID, cerr))
+			}
+			if kerr != nil {
+				errs = append(errs, fmt.Errorf("task %s cleanup (interrupted activation): %w", t.ID, kerr))
 			}
 		case StatusSuspending:
 			// 以持久化意图为准：完成清理 → suspended。
@@ -251,9 +300,9 @@ func (m *Manager) reconcileKill(ctx context.Context, tasks []TaskRow, sessions [
 	return errors.Join(errs...)
 }
 
-// resumeActive persist 恢复活跃运行时（design.md §5 恢复序列）。
-// 端口以会话内 OCDECK_SERVE_PORT 为准（读回失败 → suspended+last_error，不得静默用 last_port，B9）。
-// env snapshot 解析错误传播（B9）。
+// resumeActive persist 恢复活跃运行时（design.md §5 恢复序列 + single-process D7：
+// 单进程 runtime 会话）。端口以会话内 OCDECK_SERVE_PORT 为准（读回失败 →
+// suspended+last_error，不得静默用 last_port，B9）。env snapshot 解析错误传播（B9）。
 func (m *Manager) resumeActive(ctx context.Context, t TaskRow) error {
 	// add-plain-dir-project D8：persist 恢复路径在任何状态修改/运行时副作用前校验项目 kind，
 	// 未知值零副作用报错；mode 显式传入 startSSE/alignSessions。
@@ -266,13 +315,13 @@ func (m *Manager) resumeActive(ctx context.Context, t TaskRow) error {
 		// 未知持久化 kind（DB 损坏值）→ internal（D1）。
 		return newOpErr(codeInternal, kerr)
 	}
-	serveName := serveSessionName(t.ID)
-	pw, err := m.proc.ShowSessionEnv(serveName, "OPENCODE_SERVER_PASSWORD")
+	runtimeName := runtimeSessionName(t.ID)
+	pw, err := m.proc.ShowSessionEnv(runtimeName, "OPENCODE_SERVER_PASSWORD")
 	if err != nil || pw == "" {
 		return fmt.Errorf("recover password: %w", err)
 	}
 	// 端口以会话内 OCDECK_SERVE_PORT 为准（design.md §5）。
-	portStr, err := m.proc.ShowSessionEnv(serveName, "OCDECK_SERVE_PORT")
+	portStr, err := m.proc.ShowSessionEnv(runtimeName, "OCDECK_SERVE_PORT")
 	if err != nil || portStr == "" {
 		// 读回失败 → 激活失败（不得静默用 last_port，B9）。last_port 仅交叉校验。
 		return fmt.Errorf("recover serve port from session: %w", err)
@@ -287,18 +336,18 @@ func (m *Manager) resumeActive(ctx context.Context, t TaskRow) error {
 		return fmt.Errorf("health check: %w", err)
 	}
 	// 校验会话内 OCDECK_TASK_ID 与任务匹配（design.md §5）。
-	taskIDInSession, terr := m.proc.ShowSessionEnv(serveName, "OCDECK_TASK_ID")
+	taskIDInSession, terr := m.proc.ShowSessionEnv(runtimeName, "OCDECK_TASK_ID")
 	if terr != nil || taskIDInSession != t.ID {
 		return fmt.Errorf("OCDECK_TASK_ID mismatch (got %q want %q): %w", taskIDInSession, t.ID, terr)
 	}
 	// 重建运行时 → SSE 订阅 + 全量对齐。
-	// 注册前校验 serve 会话仍存活（C2：persist 恢复路径同样校验，避免注册已消失会话）。
-	if alive, _ := m.proc.HasSession(serveName); !alive {
-		return fmt.Errorf("serve session gone before runtime register")
+	// 注册前校验 runtime 会话仍存活（C2：persist 恢复路径同样校验，避免注册已消失会话）。
+	if alive, _ := m.proc.HasSession(runtimeName); !alive {
+		return fmt.Errorf("runtime session gone before runtime register")
 	}
 	rt := m.newRuntime(t.ID)
 	m.setRuntime(t.ID, rt)
-	rt.registerGroup(roleRuntime, serveName)
+	rt.registerGroup(roleRuntime, runtimeName)
 	if err := m.startSSE(ctx, rt, t.ID, t.WorktreePath, port, pw, mode); err != nil {
 		m.clearRuntime(t.ID)
 		return err
@@ -313,12 +362,10 @@ func (m *Manager) resumeActive(ctx context.Context, t TaskRow) error {
 	// 先写 active 后恢复 watchers 失败会留"DB active、runtime 已清"假状态（watcher 失败
 	// 后 clearRuntime 但 DB 仍 active）。调整：全部运行时恢复成功后再提交 active；
 	// 恢复失败由调用方 cleanupActivationRuntime + UpdateTaskStatusConditional 回 suspended。
-	// 补注册存活会话的 RuntimeGroup + watchers（F2：persist 恢复完整运行时）。
-	// SSE 订阅+全量对齐完成后补注册 RuntimeGroup（此前仅注册 serve）。
-	// serve watcher + tui/shell watchers + groups。
-	m.watchServeExit(t.ID, serveName)
-	if err := m.resumeRuntimeWatchers(t.ID, serveName); err != nil {
-		// B7b：shell 枚举 infra 错误 fail-closed——清理已起的 serve watcher 后返回错误。
+	// 补注册存活 shell 会话的 RuntimeGroup + watchers（F2；single-process：无 TUI 会话）。
+	m.watchServeExit(t.ID, runtimeName)
+	if err := m.resumeRuntimeWatchers(t.ID); err != nil {
+		// B7b：shell 枚举 infra 错误 fail-closed——清理已起的 watcher 后返回错误。
 		m.clearRuntime(t.ID)
 		return fmt.Errorf("resume runtime watchers: %w", err)
 	}
@@ -331,20 +378,14 @@ func (m *Manager) resumeActive(ctx context.Context, t TaskRow) error {
 	return nil
 }
 
-// resumeRuntimeWatchers 为存活会话补注册 RuntimeGroup + watchers（F2：persist 恢复完整运行时）。
-// 调用方已 setRuntime + registerGroup(serve) + watchServeExit。此处补 TUI 与全部 shell：
-//   - tui 存活 → registerGroup(tui) + watchTUIExit；
-//   - 每个 shell-<n> 存活 → registerGroup(shell) + watchShellExit。
+// resumeRuntimeWatchers 为存活 shell 会话补注册 RuntimeGroup + watchers（F2）。
+// 调用方已 setRuntime + registerGroup(runtime) + watchServeExit；single-process D7：
+// 任务进程与 TUI 同进程，无独立 TUI 会话可恢复（旧 -tui 会话由 reconcile 按
+// legacy 异常会话清理，不进入本路径）。每个 shell-<n> 存活 → registerGroup(shell)
+// + watchShellExit。
 //
 // B7b：shell 枚举 ListSessions 错误 MUST 传播（返回 error，调用方据此 fail-closed）。
-func (m *Manager) resumeRuntimeWatchers(taskID, serveName string) error {
-	tuiName := tuiSessionName(taskID)
-	if alive, _ := m.proc.HasSession(tuiName); alive {
-		if rt := m.getRuntime(taskID); rt != nil {
-			rt.registerGroup(roleRuntime, tuiName)
-		}
-		m.watchTUIExit(taskID, tuiName)
-	}
+func (m *Manager) resumeRuntimeWatchers(taskID string) error {
 	shellNames, err := m.listShellSessions(taskID)
 	if err != nil {
 		return fmt.Errorf("enumerate shells for resume watchers (task %s): %w", taskID, err)
@@ -376,15 +417,16 @@ func (m *Manager) listRuntimeSessions(taskID string) []string {
 	return out
 }
 
-// serveHealthyRecoverable 判断 serve 是否健康可恢复（design.md §5）。
-// 端口以会话内 OCDECK_SERVE_PORT 为准（读回失败 → 不可恢复，B9，不得静默用 last_port）。
-func (m *Manager) serveHealthyRecoverable(ctx context.Context, t TaskRow) bool {
-	serveName := serveSessionName(t.ID)
-	pw, err := m.proc.ShowSessionEnv(serveName, "OPENCODE_SERVER_PASSWORD")
+// runtimeHealthyRecoverable 判断单进程 runtime 会话是否健康可恢复（design.md §5
+// + single-process D7）。端口以会话内 OCDECK_SERVE_PORT 为准（读回失败 →
+// 不可恢复，B9，不得静默用 last_port）。
+func (m *Manager) runtimeHealthyRecoverable(ctx context.Context, t TaskRow) bool {
+	runtimeName := runtimeSessionName(t.ID)
+	pw, err := m.proc.ShowSessionEnv(runtimeName, "OPENCODE_SERVER_PASSWORD")
 	if err != nil || pw == "" {
 		return false
 	}
-	portStr, err := m.proc.ShowSessionEnv(serveName, "OCDECK_SERVE_PORT")
+	portStr, err := m.proc.ShowSessionEnv(runtimeName, "OCDECK_SERVE_PORT")
 	if err != nil || portStr == "" {
 		// 读回失败 → 不可恢复（B9，不得静默用 last_port）。
 		return false
@@ -401,14 +443,35 @@ func (m *Manager) serveHealthyRecoverable(ctx context.Context, t TaskRow) bool {
 	return true
 }
 
+// legacySessionNames 筛出旧双进程布局的 -serve/-tui 会话（G4-2/D7：一律清理，
+// 不支持热迁移）；runtime/shell 不属于 legacy。
+func legacySessionNames(taskID string, names []string) []string {
+	var out []string
+	for _, n := range names {
+		switch roleFromSessionName(n) {
+		case "serve", "tui":
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // killTaskSessionsReconcile 在 reconcile 中 kill 任务的全部会话（记 notice）。
-// KillSession 基础设施错误与 notice 写入错误 MUST 传播返回（design.md §5/§8，不静默）。
+// G4-4：KillResult 处置复用 classifyKillResult 完整 fail-closed 表——仅一致 clean
+// 无 notice；snapshot_missing_degraded 记 non-retryable；retryable/未知/矛盾
+// disposition 与 KillSession infra 错误显式记录（不得经 FromDisposition 把未知值
+// 静默当成功，遗留无 notice/debt 的存活进程）。错误聚合返回（不静默，design.md §5/§8）。
 func (m *Manager) killTaskSessionsReconcile(ctx context.Context, taskID string, names []string) error {
 	var errs []error
 	for _, name := range names {
 		exists, herr := m.proc.HasSession(name)
 		if herr != nil && !errors.Is(herr, process.ErrNoTmuxServer) {
-			errs = append(errs, fmt.Errorf("has-session %s: %w", name, herr))
+			nerr := m.recordResidualNotice(ctx, taskID, name, nil, noticeReasonKillFailed, true)
+			if nerr != nil {
+				errs = append(errs, fmt.Errorf("has-session %s: %w (notice: %v)", name, herr, nerr))
+			} else {
+				errs = append(errs, fmt.Errorf("has-session %s: %w", name, herr))
+			}
 			continue
 		}
 		if !exists {
@@ -416,11 +479,21 @@ func (m *Manager) killTaskSessionsReconcile(ctx context.Context, taskID string, 
 		}
 		res, kerr := m.proc.KillSession(name)
 		if kerr != nil {
-			errs = append(errs, fmt.Errorf("kill session %s: %w", name, kerr))
+			nerr := m.recordResidualNotice(ctx, taskID, name, res.CleanupTickets, noticeReasonKillFailed, true)
+			if nerr != nil {
+				errs = append(errs, fmt.Errorf("kill session %s: %w (notice: %v)", name, kerr, nerr))
+			} else {
+				errs = append(errs, fmt.Errorf("kill session %s: %w", name, kerr))
+			}
 			continue
 		}
-		if nerr := m.recordResidualNoticeFromDisposition(ctx, taskID, name, res); nerr != nil {
-			errs = append(errs, nerr)
+		cls := classifyKillResult(res)
+		if cls.action == "none" {
+			// 一致 clean：无 notice intent。
+			continue
+		}
+		if nerr := m.recordResidualNotice(ctx, taskID, name, res.CleanupTickets, cls.reason, cls.retryable); nerr != nil {
+			errs = append(errs, fmt.Errorf("notice %s: %w", name, nerr))
 		}
 	}
 	return errors.Join(errs...)

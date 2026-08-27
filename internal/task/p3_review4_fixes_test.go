@@ -374,7 +374,7 @@ func (s *noConvergeStore) UpdateTaskNoticeCAS(ctx context.Context, id string, ex
 // 此处补充断言 SSE 订阅后状态保持 active 且 sessions 对齐完成。）
 
 // TestReconcileResumeActive_FullPath 验证 active-resume 完整路径：
-// pre-pass 消化 debt → serve 健康 → resumeActive 重建 runtime + SSE + 全量对齐 → 保持 active。
+// pre-pass 消化 debt → runtime 会话健康 → resumeActive 重建 runtime + SSE + 全量对齐 → 保持 active。
 func TestReconcileResumeActive_FullPath(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
@@ -383,8 +383,8 @@ func TestReconcileResumeActive_FullPath(t *testing.T) {
 	snapBytes, _ := encodeEnvSnapshot(snap)
 	store.mutTask("t1", func(r *TaskRow) { r.EnvSnapshot = snapBytes })
 	proc := newMockProc()
-	proc.sessions[serveSessionName("t1")] = true
-	proc.envValues[serveSessionName("t1")] = map[string]string{
+	proc.sessions[runtimeSessionName("t1")] = true
+	proc.envValues[runtimeSessionName("t1")] = map[string]string{
 		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
 	}
 	// 有 sessions 行（对齐后应保留）。
