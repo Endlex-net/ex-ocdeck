@@ -192,10 +192,16 @@ func TestP147_WatcherThreadsToken(t *testing.T) {
 	// 触发 serve 退出事件：watchServeExit 回调 matchesRegistry 校验通过后携带注册令牌收敛。
 	proc.triggerExit(runtimeSessionName("t1"), process.WatchEvent{Type: process.WatchEventSessionExit})
 
-	assertStatus(t, store, "t1", StatusSuspended)
-	if m.getRuntime("t1") != nil {
-		t.Fatal("runtime must be cleaned after serve exit converge")
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		row, _ := store.GetTask(context.Background(), "t1")
+		if row.Status == StatusActive || row.Status == StatusActivating {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
+	row, _ := store.GetTask(context.Background(), "t1")
+	t.Fatalf("status=%s want activating|active after watcher recovery", row.Status)
 }
 
 // --- worker 消化债务 ---

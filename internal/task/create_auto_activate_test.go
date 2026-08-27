@@ -25,6 +25,7 @@ func newTestManagerWithLifecycle(t *testing.T, store TaskStore, proc ProcessBack
 		return &readyOC{inner: oc, onReady: opts.OnReady}
 	}
 	m := New(Options{Cfg: cfg, Store: store, Proc: proc, Worktree: wt, OCFactory: wrap})
+	m.recoveryBackoffFn = func(int) time.Duration { return 0 }
 	m.SetLifecycleCtx(lifeCtx)
 	t.Cleanup(cancel)
 	return m, cancel

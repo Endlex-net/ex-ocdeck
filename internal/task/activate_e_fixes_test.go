@@ -121,10 +121,12 @@ func newPortRetryManager(t *testing.T, store TaskStore, proc ProcessBackend, fai
 		// startSSE 依赖 OnReady 触发 readyCh，包裹以在 SubscribeEvents 时调用 onReady。
 		return &readyOCWrap{inner: oc, onReady: opts.OnReady}
 	}
-	return New(Options{
+	m := New(Options{
 		Cfg: cfg, Store: store, Proc: proc, Worktree: newMockWorktree(),
 		OCFactory: factory,
 	})
+	m.recoveryBackoffFn = func(int) time.Duration { return 0 }
+	return m
 }
 
 // readyOCWrap 复用 readyOC 的 OnReady 触发语义，但 inner 为 portHealthOC。

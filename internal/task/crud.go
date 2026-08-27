@@ -79,6 +79,10 @@ func (m *Manager) writeLastPort(ctx context.Context, id string, port int) (appli
 	return m.store.UpdateTaskLastPort(ctx, id, port)
 }
 
+func (m *Manager) writeCompleteRecoveryFailure(ctx context.Context, id string, lastError sql.NullString) (application.TransitionResult, error) {
+	return m.store.CompleteRecoveryFailure(ctx, id, lastError)
+}
+
 // writeBeginDeleteIntent 写入删除意图（deleting 迁移，fromStatuses 守卫）。
 func (m *Manager) writeBeginDeleteIntent(ctx context.Context, id, mode string, fromStatuses []string) (application.TransitionResult, error) {
 	if m.lifecycle != nil {

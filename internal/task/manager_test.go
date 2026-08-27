@@ -366,10 +366,14 @@ func TestServeExit_HandlerSuspended(t *testing.T) {
 	m.watchServeExit("t1", runtimeSessionName("t1"))
 
 	proc.triggerExit(runtimeSessionName("t1"), process.WatchEvent{Type: process.WatchEventSessionExit})
-	// 等待异步处理。
-	time.Sleep(100 * time.Millisecond)
-	row, _ := store.GetTask(context.Background(), "t1")
-	if row.Status != StatusSuspended {
-		t.Errorf("status = %s, want suspended after serve exit", row.Status)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		row, _ := store.GetTask(context.Background(), "t1")
+		if row.Status == StatusActive || row.Status == StatusActivating {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
+	row, _ := store.GetTask(context.Background(), "t1")
+	t.Errorf("status = %s, want activating|active after serve exit recovery", row.Status)
 }

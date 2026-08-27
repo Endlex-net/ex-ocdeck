@@ -385,13 +385,15 @@ func newTraceTestManager(t *testing.T, store *mockStore, proc *mockProc, wt *moc
 		return wrapTraceOC(inner, tr)
 	}
 	cfg := testCfg(t)
-	return New(Options{
+	m := New(Options{
 		Cfg:       cfg,
 		Store:     tStore,
 		Proc:      tProc,
 		Worktree:  tWt,
 		OCFactory: wrap,
 	})
+	m.recoveryBackoffFn = func(int) time.Duration { return 0 }
+	return m
 }
 
 // testCfg 构造测试用 config（复用 newTestManager 的默认值）。

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"ocdeck/internal/application"
 	"ocdeck/internal/config"
@@ -30,6 +31,8 @@ type mockStore struct {
 	statusCalls []statusCall
 	// deleteTaskCount 记录 DeleteTask 调用次数（测试经 deleteTaskCount() accessor 读取，避免直接读字段）。
 	deleteTaskCount int
+	// recoveryAttempts 按 taskID 记录 D3 permit 时间戳（Unix 秒）。
+	recoveryAttempts map[string][]int64
 }
 
 type statusCall struct {
@@ -39,7 +42,12 @@ type statusCall struct {
 }
 
 func newMockStore() *mockStore {
-	return &mockStore{projects: map[string]ProjectRow{}, tasks: map[string]TaskRow{}, sessions: map[string][]SessionRow{}}
+	return &mockStore{
+		projects:          map[string]ProjectRow{},
+		tasks:             map[string]TaskRow{},
+		sessions:          map[string][]SessionRow{},
+		recoveryAttempts:  map[string][]int64{},
+	}
 }
 
 func (s *mockStore) seedProject(p ProjectRow) {
@@ -494,6 +502,51 @@ func (s *mockStore) ClearTaskAnchorConditional(ctx context.Context, taskID, oldA
 	return application.MutationResult{Matched: true, Changed: true}, nil
 }
 
+const mockRecoveryPermitWindowSec int64 = 5 * 60
+const mockRecoveryPermitMax = 3
+
+func (s *mockStore) AcquireRecoveryPermit(ctx context.Context, taskID string, now int64) (AcquirePermitResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.recoveryAttempts == nil {
+		s.recoveryAttempts = map[string][]int64{}
+	}
+	windowStart := now - mockRecoveryPermitWindowSec
+	kept := s.recoveryAttempts[taskID][:0]
+	for _, ts := range s.recoveryAttempts[taskID] {
+		if ts >= windowStart {
+			kept = append(kept, ts)
+		}
+	}
+	s.recoveryAttempts[taskID] = kept
+	if len(kept) >= mockRecoveryPermitMax {
+		return AcquirePermitResult{}, nil
+	}
+	s.recoveryAttempts[taskID] = append(s.recoveryAttempts[taskID], now)
+	return AcquirePermitResult{Acquired: true, Ordinal: len(s.recoveryAttempts[taskID])}, nil
+}
+
+func (s *mockStore) CompleteRecoveryFailure(ctx context.Context, id string, lastError sql.NullString) (application.TransitionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.tasks[id]
+	if !ok {
+		return application.TransitionResult{}, fmt.Errorf("not found")
+	}
+	if t.Status != StatusActivating {
+		return application.TransitionResult{}, nil
+	}
+	t.Status = StatusSuspended
+	t.LastError = lastError
+	t.EnvSnapshot = sql.NullString{}
+	t.UpdatedAt = 4
+	s.tasks[id] = t
+	return application.TransitionResult{
+		MutationResult: application.MutationResult{Matched: true, Changed: true},
+		StatusChanged:  true,
+	}, nil
+}
+
 // TouchOwnedTaskSession 镜像 store.TouchOwnedTaskSession：Matched=命中本任务归属行，
 // Changed=last_seen_at 真实推进（值变化条件），绝不插入。
 func (s *mockStore) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (application.MutationResult, error) {
@@ -764,6 +817,9 @@ func (p *mockProc) WatchExit(name string, callback func(process.WatchEvent)) (fu
 func (p *mockProc) triggerExit(name string, ev process.WatchEvent) {
 	p.mu.Lock()
 	cb := p.watchCb[name]
+	if ev.Type == process.WatchEventSessionExit {
+		delete(p.sessions, name)
+	}
 	p.mu.Unlock()
 	if cb != nil {
 		cb(ev)
@@ -1037,10 +1093,13 @@ func newTestManager(t *testing.T, store TaskStore, proc ProcessBackend, wt Workt
 	wrap := func(port int, password string, opts opencode.Options) OCClient {
 		return &readyOC{inner: oc, onReady: opts.OnReady}
 	}
-	return New(Options{
+	m := New(Options{
 		Cfg: cfg, Store: store, Proc: proc, Worktree: wt,
 		OCFactory: wrap,
 	})
+	// 测试默认跳过 D3 退避，避免 watcher/SSE 恢复把套件拖进 5s/15s/45s。
+	m.recoveryBackoffFn = func(int) time.Duration { return 0 }
+	return m
 }
 
 // readyOC 在 SubscribeEvents 时同步触发 onReady（测试用，避免 startSSE 超时）。

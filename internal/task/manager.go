@@ -72,6 +72,11 @@ type TaskStore interface {
 	ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error)
 	// ClearTaskAnchorConditional 条件清空锚定（D5 CAS）：Matched=命中并清空。
 	ClearTaskAnchorConditional(ctx context.Context, taskID, oldAnchor string) (application.MutationResult, error)
+	// AcquireRecoveryPermit 原子写入一条 attempt 记录并返回窗口内 ordinal（D3）。
+	AcquireRecoveryPermit(ctx context.Context, taskID string, now int64) (AcquirePermitResult, error)
+	// CompleteRecoveryFailure 条件事务：expected=activating 时原子完成
+	// status=suspended + last_error + 清 env_snapshot；CAS 失配三字段均不改。
+	CompleteRecoveryFailure(ctx context.Context, id string, lastError sql.NullString) (application.TransitionResult, error)
 	// TouchOwnedTaskSession 条件 UPDATE 仅本任务已归属行的 last_seen_at（D8）。
 	// 绝不插入；MutationResult.Matched=命中归属行（同值为 Matched+!Changed），!Matched
 	//（未归属行）为正常路径。供 session.updated 事件使用（MUST NOT 创建归属）。
@@ -84,6 +89,12 @@ type TaskStore interface {
 	// ListActiveTaskOverview 聚合全部 active 任务的跨项目概览
 	//（cross-project-active-sessions D2：JOIN projects + LEFT JOIN task_sessions）。
 	ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOverviewRow, error)
+}
+
+// AcquirePermitResult 是 AcquireRecoveryPermit 的结构化结果（对齐 store.AcquirePermitResult）。
+type AcquirePermitResult struct {
+	Acquired bool
+	Ordinal  int
 }
 
 // CleanupDebtStore 持久化未收敛的 orphan cleanup tickets（design.md §10）。
@@ -176,6 +187,11 @@ type Manager struct {
 	// nil 防御回退默认值（直接 &Manager{} 构造的测试）。
 	probeColdStartBackoffFn func() []time.Duration
 
+	// nowUnixFn / recoveryBackoffFn 供 D3 恢复预算确定性测试注入。
+	// nil 时 nowUnixFn 回退 time.Now().Unix()；recoveryBackoffFn 回退 5s/15s/45s。
+	nowUnixFn         func() int64
+	recoveryBackoffFn func(ordinal int) time.Duration
+
 	// serveReadyTimeout / serveReadyPollInterval 控制 waitServeReady* 健康轮询墙钟预算。
 	// 生产默认 10s / 500ms（零值回退）；测试可注入更短值，不得改变生产默认。
 	serveReadyTimeout      time.Duration
@@ -248,6 +264,10 @@ type Manager struct {
 	runnerCtx    context.Context
 	runnerCancel context.CancelFunc
 	runnerWG     sync.WaitGroup
+
+	// recoveryDebts 是 D3 tagged debt（phase=cleanup_notice|complete），供后台/Shutdown 重放。
+	recoveryDebtMu sync.Mutex
+	recoveryDebts  map[string]recoveryTaggedDebt // taskID
 }
 
 // orphanFailure 记录孤儿会话清理失败项（F3）：会话名 + kill 失败产生的 cleanup tickets。
@@ -357,6 +377,7 @@ func New(opts Options) *Manager {
 		runtimeRegistry:         runtime.New(),
 		rand4Fn:                 rand4,
 		probeColdStartBackoffFn: defaultProbeColdStartBackoff,
+		recoveryDebts:           make(map[string]recoveryTaggedDebt),
 	}
 	if m.ocFactory == nil {
 		m.ocFactory = defaultOCFactory
@@ -634,6 +655,7 @@ func (m *Manager) backgroundLoop(ctx context.Context) {
 			if err := m.processRetryableNotices(ctx); err != nil {
 				log.Printf("background: retryable notices: %v", err)
 			}
+			m.replayRecoveryDebts(ctx)
 			if err := m.retryOrphanSessions(ctx); err != nil {
 				// B2：后台周期不阻塞，但 cleanup_debt 持久化错误 MUST 记录（不静默吞没）。
 				log.Printf("background: retry orphan sessions: %v", err)
@@ -711,6 +733,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	if err := m.processRetryableNotices(ctx); err != nil {
 		log.Printf("shutdown: final retryable notice sweep: %v", err)
 	}
+	m.replayRecoveryDebts(ctx)
 	// R7：收割内存 orphanFailures（kill 失败的孤儿会话 tickets，非仅 DB notice）。
 	// 后台周期已停（bgCancel），关停时 MUST 主动调用一次 retryOrphanSessions，避免逃逸进程
 	// tickets 仅存内存随进程退出丢失（design.md §10：runtime 已空 = 无会话且无可重试 cleanup debt，

@@ -371,6 +371,102 @@ func TestMigration0009_AbortTriggerRollsBackColumnAndVersion(t *testing.T) {
 	}
 }
 
+func TestCompleteRecoveryFailure_CASMatchAndMismatch(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	seedProjectTask(t, db, "t1")
+	le := "recovery budget exhausted"
+	snap := `{"vars":{"OCDECK_SERVE_PORT":"50001"}}`
+	if _, err := db.ExecContext(ctx,
+		`UPDATE tasks SET status = ?, last_error = ?, env_snapshot = ? WHERE id = ?`,
+		"activating", "prior", snap, "t1"); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := db.CompleteRecoveryFailure(ctx, "t1", &le)
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	if !res.Matched || !res.Changed || !res.StatusChanged {
+		t.Fatalf("matched=%v changed=%v statusChanged=%v, want true/true/true", res.Matched, res.Changed, res.StatusChanged)
+	}
+	if res.From != "activating" || res.To != "suspended" {
+		t.Fatalf("from=%s to=%s, want activating→suspended", res.From, res.To)
+	}
+	task, err := db.GetTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if task.Status != "suspended" {
+		t.Errorf("status=%s want suspended", task.Status)
+	}
+	if !task.LastError.Valid || task.LastError.String != le {
+		t.Errorf("last_error=%v want %q", task.LastError, le)
+	}
+	if task.EnvSnapshot.Valid {
+		t.Errorf("env_snapshot=%v want NULL", task.EnvSnapshot)
+	}
+
+	if _, err := db.ExecContext(ctx, `UPDATE tasks SET status = ?, last_error = ?, env_snapshot = ? WHERE id = ?`,
+		"active", "keep-me", snap, "t1"); err != nil {
+		t.Fatal(err)
+	}
+	miss, err := db.CompleteRecoveryFailure(ctx, "t1", &le)
+	if err != nil {
+		t.Fatalf("mismatch: %v", err)
+	}
+	if miss.Matched {
+		t.Fatal("CAS mismatch should return !Matched")
+	}
+	task, _ = db.GetTask(ctx, "t1")
+	if task.Status != "active" {
+		t.Errorf("mismatch status=%s want active (unchanged)", task.Status)
+	}
+	if !task.LastError.Valid || task.LastError.String != "keep-me" {
+		t.Errorf("mismatch last_error=%v want keep-me", task.LastError)
+	}
+	if !task.EnvSnapshot.Valid || task.EnvSnapshot.String != snap {
+		t.Errorf("mismatch env_snapshot=%v want preserved", task.EnvSnapshot)
+	}
+}
+
+func TestCompleteRecoveryFailure_AbortRollsBackAllThreeFields(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	seedProjectTask(t, db, "t1")
+	snap := `{"vars":{"OCDECK_SERVE_PORT":"1"}}`
+	if _, err := db.ExecContext(ctx,
+		`UPDATE tasks SET status = ?, last_error = ?, env_snapshot = ? WHERE id = ?`,
+		"activating", "prior", snap, "t1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TRIGGER abort_recovery_complete
+		BEFORE UPDATE OF env_snapshot ON tasks
+		BEGIN
+			SELECT RAISE(ABORT, 'forced complete abort');
+		END`); err != nil {
+		t.Fatalf("create abort trigger: %v", err)
+	}
+	le := "cause"
+	if _, err := db.CompleteRecoveryFailure(ctx, "t1", &le); err == nil {
+		t.Fatal("complete should fail when env_snapshot UPDATE aborts")
+	}
+	task, err := db.GetTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if task.Status != "activating" {
+		t.Errorf("status=%s want activating (rolled back)", task.Status)
+	}
+	if !task.LastError.Valid || task.LastError.String != "prior" {
+		t.Errorf("last_error=%v want prior", task.LastError)
+	}
+	if !task.EnvSnapshot.Valid || task.EnvSnapshot.String != snap {
+		t.Errorf("env_snapshot=%v want preserved", task.EnvSnapshot)
+	}
+}
+
 func TestClaimTaskSessionAndSetAnchor_AnchorUpdateAbortRollsBackClaim(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()

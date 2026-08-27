@@ -263,6 +263,18 @@ func (a *StoreAdapter) ClearTaskAnchorConditional(ctx context.Context, taskID, o
 	return a.db.ClearTaskAnchorConditional(ctx, taskID, oldAnchor)
 }
 
+func (a *StoreAdapter) AcquireRecoveryPermit(ctx context.Context, taskID string, now int64) (AcquirePermitResult, error) {
+	res, err := a.db.AcquireRecoveryPermit(ctx, taskID, now)
+	if err != nil {
+		return AcquirePermitResult{}, err
+	}
+	return AcquirePermitResult{Acquired: res.Acquired, Ordinal: res.Ordinal}, nil
+}
+
+func (a *StoreAdapter) CompleteRecoveryFailure(ctx context.Context, id string, lastError sql.NullString) (application.TransitionResult, error) {
+	return a.db.CompleteRecoveryFailure(ctx, id, nullStringToPtr(lastError))
+}
+
 // TouchOwnedTaskSession 条件 UPDATE 仅本任务已归属行的 last_seen_at（D8）。
 // 返回结构化 MutationResult（P1.4.5：Matched=命中归属行，Changed=值真实推进）。
 func (a *StoreAdapter) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID string, lastSeenAt int64) (application.MutationResult, error) {

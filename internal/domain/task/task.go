@@ -384,6 +384,22 @@ func (t *Task) ApplyActivateCompensate() error {
 	return nil
 }
 
+// ApplyRecoveryStart 迁移 active→activating（D3 恢复前序）。
+// 只表达任务领域 guard（status=active）；runtime token 校验留在 Manager。
+func (t *Task) ApplyRecoveryStart() error {
+	return t.applyStatus(StatusActivating, t.status == StatusActive, "recovery start requires active")
+}
+
+// ApplyRecoveryCommit 迁移 activating→active（D3 恢复成功提交，与 ApplyActivateCommit 同矩阵行）。
+func (t *Task) ApplyRecoveryCommit() error {
+	return t.ApplyActivateCommit()
+}
+
+// ApplyRecoveryFailure 迁移 activating→suspended（D3 终态补偿，与 ApplyActivateCompensate 同矩阵行）。
+func (t *Task) ApplyRecoveryFailure() error {
+	return t.ApplyActivateCompensate()
+}
+
 // ApplySuspend 迁移 active→suspending。guard=CanSuspend。
 func (t *Task) ApplySuspend() error {
 	return t.applyStatus(StatusSuspending, t.CanSuspend(), "suspend requires active")

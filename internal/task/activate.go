@@ -492,11 +492,15 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 
 	runtimeName := runtimeSessionName(taskID)
 	password := newRandomPassword()
-	port, password, err = m.bootstrapRuntime(ctx, row, runtimeName, port, password, env)
+	port, password, err = m.bootstrapRuntime(ctx, row, runtimeName, port, password, env, nil)
 	if err != nil {
 		return err
 	}
+	return m.commitRuntimeReady(ctx, taskID, row.WorktreePath, runtimeName, port, password, mode)
+}
 
+// commitRuntimeReady 成功提交序列（D3/Phase 2）：token/group/watcher → SSE+align → final health → last_port → CAS active。
+func (m *Manager) commitRuntimeReady(ctx context.Context, taskID, wtPath, runtimeName string, port int, password string, mode AlignMode) error {
 	if alive, _ := m.proc.HasSession(runtimeName); !alive {
 		_, _ = m.proc.KillSession(runtimeName)
 		return newOpErr(codeProcessError, fmt.Errorf("runtime session gone before runtime register"))
@@ -505,7 +509,7 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 	m.setRuntime(taskID, rt)
 	rt.registerGroup(roleRuntime, runtimeName)
 	m.watchServeExit(taskID, runtimeName)
-	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode); err != nil {
+	if err := m.startSSE(ctx, rt, taskID, wtPath, port, password, mode); err != nil {
 		return newOpErr(codeProcessError, fmt.Errorf("sse subscribe: %w", err))
 	}
 	oc := m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 10 * time.Second})
@@ -932,7 +936,16 @@ func runtimeCmdArgv(port int, sessionID string) []string {
 // Probe 失败 MUST NOT 本地 kill / 换端口；kill+notice 委托外层 compensation。
 // 返回最终可用端口；轮换路径终态错误可携带 pendingCleanupError。
 func (m *Manager) startServeWithPortRetry(ctx context.Context, row TaskRow, serveName string, port int, password string, env map[string]string, sessionID string) (int, error) {
+	return m.startRuntimeWithPortRetry(ctx, row, serveName, port, password, env, sessionID, nil)
+}
+
+func (m *Manager) startRuntimeWithPortRetry(ctx context.Context, row TaskRow, serveName string, port int, password string, env map[string]string, sessionID string, beforeCreate func() error) (int, error) {
 	for attempt := 0; attempt < servePortRetries; attempt++ {
+		if beforeCreate != nil {
+			if err := beforeCreate(); err != nil {
+				return port, err
+			}
+		}
 		serveEnv := copyMap(env)
 		serveEnv["OPENCODE_SERVER_PASSWORD"] = password
 		serveEnv["OCDECK_SERVE_PORT"] = strconv.Itoa(port)
@@ -1127,7 +1140,7 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 			// R7 failpoint：session 落库错误 MUST 收敛运行时（design.md §4/§19）。
 			for _, ev := range replay {
 				if err := m.handleSSEEvent(sseCtx, taskID, wtPath, ev); err != nil {
-					go m.convergeToSuspendedForGen(taskID, "sse replay session store error: "+err.Error(), rt.instVersion)
+					go m.ensureRecovery(taskID, rt.instVersion)
 					return
 				}
 			}
@@ -1158,7 +1171,7 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 			// design.md §4/§19）。在独立 goroutine 收敛：cleanup 会 kill serve 结束本 ctx，
 			// 需避免在 SSE goroutine 内 join/cancel 造成死锁。
 			if err := m.handleSSEEvent(sseCtx, taskID, wtPath, ev); err != nil {
-				go m.convergeToSuspendedForGen(taskID, "sse session store error: "+err.Error(), rt.instVersion)
+				go m.ensureRecovery(taskID, rt.instVersion)
 				return
 			}
 		}
@@ -1183,7 +1196,7 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 				// 在新 goroutine 收敛：onReconnect 在 SSE goroutine 内，cleanup 会 kill serve（结束本 goroutine ctx），
 				// 需避免在自身 goroutine 内 join/cancel 造成死锁。
 				cancel()
-				go m.convergeToSuspendedForGen(taskID, "sse reconnect align failed: "+err.Error(), rt.instVersion)
+				go m.ensureRecovery(taskID, rt.instVersion)
 				return
 			}
 			// D6 注意力对账（align 路径）：session align 成功后、drainAndRelease 前。失败不影响任务状态机。
@@ -1199,13 +1212,13 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 		sseErr := ocWithReady.SubscribeEvents(sseCtx, wtPath, onEvent, onReconnect)
 		if sseErr != nil && sseErr != context.Canceled && !errors.Is(sseErr, context.Canceled) {
 			// SSE 流异常结束（非主动 cancel）：在新 goroutine 收敛（cleanup 会 kill serve 结束本 ctx）。
-			go m.convergeToSuspendedForGen(taskID, "sse stream ended: "+sseErr.Error(), rt.instVersion)
+			go m.ensureRecovery(taskID, rt.instVersion)
 			return
 		}
 		// 正常返回（流结束/ctx 取消）：若 ctx 未被主动 cancel（即非 Activate/Shutdown 主动停 SSE），
 		// serve 仍存活但 SSE 流终止 → 收敛。sseCtx 被 cancel 的情况由 Activate 返回路径/Shutdown 处理，不在此收敛。
 		if sseCtx.Err() == nil {
-			go m.convergeToSuspendedForGen(taskID, "sse stream ended (serve may still be alive)", rt.instVersion)
+			go m.ensureRecovery(taskID, rt.instVersion)
 		}
 	}()
 
@@ -1451,7 +1464,7 @@ func (m *Manager) alignSessions(ctx context.Context, taskID, wtPath string, oc O
 // bootstrapRuntime 执行 D5 确定性锚定协议（Activate 路径，不消耗恢复 permit）。
 // 有锚定 → `--session` 启动，ready 后列表校验；缺席则条件清空转无锚定。
 // 无锚定 → 不带 `--session` 启动，POST+claim 后确认 bootstrap 终止，再以 `--session` 双启动。
-func (m *Manager) bootstrapRuntime(ctx context.Context, row TaskRow, runtimeName string, port int, password string, env map[string]string) (int, string, error) {
+func (m *Manager) bootstrapRuntime(ctx context.Context, row TaskRow, runtimeName string, port int, password string, env map[string]string, beforeCreate func() error) (int, string, error) {
 	for attempt := 0; attempt < servePortRetries; attempt++ {
 		fresh, rerr := m.store.GetTask(ctx, row.ID)
 		if rerr != nil {
@@ -1464,7 +1477,7 @@ func (m *Manager) bootstrapRuntime(ctx context.Context, row TaskRow, runtimeName
 		}
 		if anchor != "" {
 			var err error
-			port, err = m.startServeWithPortRetry(ctx, row, runtimeName, port, password, env, anchor)
+			port, err = m.startRuntimeWithPortRetry(ctx, row, runtimeName, port, password, env, anchor, beforeCreate)
 			if err != nil {
 				return port, password, err
 			}
@@ -1507,7 +1520,7 @@ func (m *Manager) bootstrapRuntime(ctx context.Context, row TaskRow, runtimeName
 		}
 
 		var err error
-		port, err = m.startServeWithPortRetry(ctx, row, runtimeName, port, password, env, "")
+		port, err = m.startRuntimeWithPortRetry(ctx, row, runtimeName, port, password, env, "", beforeCreate)
 		if err != nil {
 			return port, password, err
 		}
@@ -1529,7 +1542,7 @@ func (m *Manager) bootstrapRuntime(ctx context.Context, row TaskRow, runtimeName
 			return port, password, err
 		}
 		password = newRandomPassword()
-		port, err = m.startServeWithPortRetry(ctx, row, runtimeName, port, password, env, created.ID)
+		port, err = m.startRuntimeWithPortRetry(ctx, row, runtimeName, port, password, env, created.ID, beforeCreate)
 		if err != nil {
 			return port, password, err
 		}
@@ -1626,7 +1639,7 @@ func (m *Manager) watchServeExit(taskID, serveName string) {
 		case process.WatchEventSessionExit:
 			m.handleServeExit(taskID, tok)
 		case process.WatchEventInfraError:
-			m.handleInfraError(taskID, serveName, ev.Err, tok)
+			m.ensureRecovery(taskID, tok)
 		}
 	})
 	if cur := m.getRuntime(taskID); cur != nil {
@@ -1673,7 +1686,7 @@ func (m *Manager) watchTUIExit(taskID, tuiName string) {
 // 清除 env snapshot 与 shell（design.md §2/§4：serve 异常退出清快照）。
 // P1.4.7：tok 为 watcher 注册时捕获的触发令牌（design.md D0:150 令牌贯穿）。
 func (m *Manager) handleServeExit(taskID string, tok runtime.InstVersion) {
-	m.convergeToSuspended(taskID, "serve session exited unexpectedly", tok)
+	m.ensureRecovery(taskID, tok)
 }
 
 // convergeToSuspended 收敛活跃任务到 suspended（design.md §4：不得留 active 但无 SSE 托管的运行时）。

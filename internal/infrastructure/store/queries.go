@@ -1631,6 +1631,53 @@ func (q *Queries) ClearTaskAnchorConditional(ctx context.Context, taskID, oldAnc
 	return application.MutationResult{Matched: true, Changed: true}, nil
 }
 
+// CompleteRecoveryFailure 条件事务（D3）：expected=activating 时原子完成
+// status=suspended + last_error=<cause> + env_snapshot=NULL。
+// CAS 失配（当前 status 非 activating）时三个字段均不修改，返回 !Matched。
+func (q *Queries) CompleteRecoveryFailure(ctx context.Context, id string, lastError *string) (application.TransitionResult, error) {
+	return runTx(ctx, q, func(qx *Queries) (application.TransitionResult, error) {
+		row := qx.db.QueryRowContext(ctx,
+			`SELECT status, last_error, env_snapshot, updated_at FROM tasks WHERE id = ?`, id)
+		var curStatus string
+		var curLastError, curEnv sql.NullString
+		var curUpdatedAt int64
+		if err := row.Scan(&curStatus, &curLastError, &curEnv, &curUpdatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				return application.TransitionResult{}, nil
+			}
+			return application.TransitionResult{}, err
+		}
+		if curStatus != string(ocdecktask.StatusActivating) {
+			return application.TransitionResult{}, nil
+		}
+		newLE := nullableString(lastError)
+		now := nowUnix()
+		updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+		qry := "UPDATE tasks SET status = ?, last_error = ?, env_snapshot = NULL, " + updClause +
+			" WHERE id = ? AND status = ?"
+		args := []any{string(ocdecktask.StatusSuspended), newLE}
+		args = append(args, updArgs...)
+		args = append(args, id, string(ocdecktask.StatusActivating))
+		res, err := qx.db.ExecContext(ctx, qry, args...)
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		if n == 0 {
+			return application.TransitionResult{}, nil
+		}
+		return application.TransitionResult{
+			MutationResult: application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt},
+			StatusChanged:  true,
+			From:           ocdecktask.StatusActivating,
+			To:             ocdecktask.StatusSuspended,
+		}, nil
+	})
+}
+
 // recoveryPermitWindowSec / recoveryPermitMax 为 D3 固定预算：滚动 5 分钟最多 3 个 permit。
 const (
 	recoveryPermitWindowSec int64 = 5 * 60

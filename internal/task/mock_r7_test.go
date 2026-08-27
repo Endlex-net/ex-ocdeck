@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"ocdeck/internal/application"
 	"ocdeck/internal/config"
@@ -118,7 +119,9 @@ func newR7TestManagerWithDebt(t *testing.T, store TaskStore, debt CleanupDebtSto
 	wrap := func(port int, password string, opts opencode.Options) OCClient {
 		return &readyOC{inner: oc, onReady: opts.OnReady}
 	}
-	return New(Options{Cfg: cfg, Store: store, Proc: proc, Worktree: wt, OCFactory: wrap, DebtStore: debt})
+	m := New(Options{Cfg: cfg, Store: store, Proc: proc, Worktree: wt, OCFactory: wrap, DebtStore: debt})
+	m.recoveryBackoffFn = func(int) time.Duration { return 0 }
+	return m
 }
 
 // assertStatus 断言任务状态，失败 fatal。

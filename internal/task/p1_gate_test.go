@@ -640,16 +640,22 @@ func TestReopenAttach_ConcurrentIdempotentReuse(t *testing.T) {
 	close(start)
 	wg.Wait()
 
+	want := runtimeSessionName("t1")
+	ok := 0
 	for i, err := range errs {
-		if err != nil {
-			t.Errorf("ReopenAttach[%d]: %v", i, err)
+		if err == nil {
+			if string(results[i]) != want {
+				t.Errorf("ReopenAttach[%d] tid = %s, want %s", i, results[i], want)
+			}
+			ok++
+			continue
+		}
+		if OpErrorCode(err) != codeConflict {
+			t.Errorf("ReopenAttach[%d]: %v (want success or conflict from tryLock)", i, err)
 		}
 	}
-	want := runtimeSessionName("t1")
-	for i, tid := range results {
-		if string(tid) != want {
-			t.Errorf("ReopenAttach[%d] tid = %s, want %s (reuse existing runtime)", i, tid, want)
-		}
+	if ok == 0 {
+		t.Fatal("at least one concurrent ReopenAttach must reuse existing runtime")
 	}
 	// 已存在 tui 时不得重复创建（NewSession 不应被调用）。
 	if newNames := proc.newSessionNamesSnapshot(); len(newNames) != 0 {
