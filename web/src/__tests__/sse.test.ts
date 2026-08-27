@@ -9,8 +9,8 @@ vi.mock('../api', () => ({
 }));
 
 import { clearToken, getToken, UNAUTHORIZED_EVENT } from '../api';
-import { subscribeActiveSessions, subscribeProjects } from '../sse';
-import type { ActiveSessionItem } from '../types';
+import { subscribeActiveSessions, subscribeProjects, subscribeStream, subscribeTask } from '../sse';
+import type { ActiveSessionItem, Task } from '../types';
 
 const clearTokenMock = vi.mocked(clearToken);
 const getTokenMock = vi.mocked(getToken);
@@ -38,6 +38,21 @@ function item(taskId: string): ActiveSessionItem {
     branch: 'main',
     worktree_path: '/wt',
     last_active_at: 100,
+  };
+}
+
+function taskObj(id: string): Task {
+  return {
+    id,
+    project_id: 'p1',
+    project_kind: 'repo',
+    name: 't-' + id,
+    branch: 'main',
+    status: 'active',
+    worktree_path: '/wt',
+    init_status: 'none',
+    created_at: 1,
+    updated_at: 1,
   };
 }
 
@@ -191,6 +206,37 @@ describe('sessions/active SSE 订阅（sse.ts，design D5）', () => {
       await settle();
       expect(onData).toHaveBeenCalledTimes(1); // 仅首个有效帧；坏帧不回调（调用方保留旧数据）
       expect(onError).toHaveBeenCalledTimes(1);
+      sub.close();
+    });
+  });
+
+  describe('404 onGone 终态（task-detail-stream D5）', () => {
+    it('404 + onGone → 调用 onGone、不 onError、不重连', async () => {
+      const onGone = vi.fn();
+      fetchMock.mockReset().mockResolvedValue(errResponse(404, 'not_found', 'task not found'));
+      const sub = subscribeStream('/api/v1/tasks/t1/stream', {
+        onData,
+        onError,
+        onGone,
+        errorLabel: '任务详情',
+      });
+      await settle();
+      expect(onGone).toHaveBeenCalledTimes(1);
+      expect(onError).not.toHaveBeenCalled();
+      expect(onData).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(60000);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      sub.close();
+    });
+
+    it('无 onGone 时 404 仍走 onError + 退避重连（既有调用方回归）', async () => {
+      fetchMock.mockReset().mockResolvedValue(errResponse(404, 'not_found', 'task not found'));
+      const sub = subscribe();
+      await settle();
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith('[not_found] task not found');
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
       sub.close();
     });
   });
@@ -363,6 +409,118 @@ describe('sessions/active SSE 订阅（sse.ts，design D5）', () => {
       await settle();
       expect(onError).toHaveBeenCalledWith('项目推送数据格式错误');
       expect(onData).not.toHaveBeenCalled();
+      sub.close();
+    });
+  });
+
+  describe('subscribeTask 单对象校验与解包（task-detail-stream D5）', () => {
+    const subscribeT = (taskID = 't1') =>
+      subscribeTask(taskID, { onData, onError, onStateChange });
+
+    it('请求 /api/v1/tasks/{id}/stream 并携带 Bearer 头', async () => {
+      fetchMock.mockReset().mockResolvedValueOnce(sseResponse([frame('snapshot', '{}')]));
+      const sub = subscribeT('tid-9');
+      await settle();
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/v1/tasks/tid-9/stream',
+        expect.objectContaining({
+          headers: { Authorization: 'Bearer fake-token' },
+        }),
+      );
+      sub.close();
+    });
+
+    it('对象 data → onData 解包为单个 Task（非数组）', async () => {
+      const t = taskObj('t1');
+      const ctl = controlledResponse();
+      fetchMock.mockReset().mockResolvedValueOnce(ctl.res);
+      const sub = subscribeT();
+      await settle();
+      ctl.push(frame('snapshot', JSON.stringify(t)));
+      await settle();
+      expect(onData).toHaveBeenCalledTimes(1);
+      expect(onData).toHaveBeenCalledWith(t);
+      expect(onError).not.toHaveBeenCalled();
+      sub.close();
+    });
+
+    it('null data → 协议错误（errorLabel=任务详情）且不解包', async () => {
+      fetchMock.mockReset().mockResolvedValueOnce(sseResponse([frame('snapshot', 'null')]));
+      const sub = subscribeT();
+      await settle();
+      expect(onError).toHaveBeenCalledWith('任务详情推送数据格式错误');
+      expect(onData).not.toHaveBeenCalled();
+      sub.close();
+    });
+
+    it('数组 data → 协议错误且不解包', async () => {
+      fetchMock.mockReset().mockResolvedValueOnce(sseResponse([frame('snapshot', JSON.stringify([taskObj('t1')]))]));
+      const sub = subscribeT();
+      await settle();
+      expect(onError).toHaveBeenCalledWith('任务详情推送数据格式错误');
+      expect(onData).not.toHaveBeenCalled();
+      sub.close();
+    });
+
+    it('primitive data → 协议错误且不解包', async () => {
+      fetchMock.mockReset().mockResolvedValueOnce(sseResponse([frame('snapshot', '"task"')]));
+      const sub = subscribeT();
+      await settle();
+      expect(onError).toHaveBeenCalledWith('任务详情推送数据格式错误');
+      expect(onData).not.toHaveBeenCalled();
+      sub.close();
+    });
+
+    it('首帧前服务端直接 EOF → onError「任务详情连接中断」、状态保持 connecting、安排重连', async () => {
+      fetchMock
+        .mockReset()
+        .mockResolvedValueOnce(sseResponse([]))
+        .mockImplementation(() => Promise.reject(fetchFailed()));
+      const sub = subscribeT();
+      await settle();
+      expect(onError).toHaveBeenCalledWith('任务详情连接中断');
+      expect(onData).not.toHaveBeenCalled();
+      expect(onStateChange.mock.calls.map((c) => c[0])).toEqual(['connecting']);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      sub.close();
+    });
+
+    it('已有数据后 EOF → onError 提示且保留旧数据、退避重连', async () => {
+      const t = taskObj('t1');
+      const ctl = controlledResponse();
+      fetchMock
+        .mockReset()
+        .mockResolvedValueOnce(ctl.res)
+        .mockImplementation(() => Promise.reject(fetchFailed()));
+      const sub = subscribeT();
+      await settle();
+      ctl.push(frame('snapshot', JSON.stringify(t)));
+      await settle();
+      expect(onData).toHaveBeenCalledTimes(1);
+      expect(onData).toHaveBeenCalledWith(t);
+      ctl.close();
+      await settle();
+      expect(onError).toHaveBeenCalledWith('任务详情连接中断');
+      expect(onData).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      sub.close();
+    });
+  });
+
+  describe('reportEndAsError 缺省行为回归', () => {
+    it('未设 reportEndAsError 时 EOF 不 onError，仅退避重连', async () => {
+      fetchMock
+        .mockReset()
+        .mockResolvedValueOnce(sseResponse([]))
+        .mockImplementation(() => Promise.reject(fetchFailed()));
+      const sub = subscribe();
+      await settle();
+      expect(onError).not.toHaveBeenCalled();
+      expect(onData).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
       sub.close();
     });
   });

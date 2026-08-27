@@ -1,5 +1,5 @@
 import { clearToken, getToken, UNAUTHORIZED_EVENT } from './api';
-import type { ActiveSessionItem, Project } from './types';
+import type { ActiveSessionItem, Project, Task } from './types';
 
 /** 连接状态（连接状态 UI 用）：connecting = 连接/重连尝试中；open = 已收到有效帧。 */
 export type StreamConnState = 'connecting' | 'open';
@@ -15,6 +15,10 @@ export interface SubscribeStreamOptions<T> {
   onError(message: string): void;
   /** 可选：连接状态变化（connecting ↔ open）。 */
   onStateChange?(state: StreamConnState): void;
+  /** 可选：HTTP 404 永久终态（任务详情 gone）。提供时不 onError、不重连。 */
+  onGone?(): void;
+  /** 可选：ReadableStream 正常 EOF 也走 onError（任务详情）。缺省 false，仅重连不报错。 */
+  reportEndAsError?: boolean;
   /** 帧 data 校验：合法返回条目数组，协议错误返回 null。缺省仅要求 JSON 数组。 */
   validate?: StreamDataValidator<T>;
   /** 连接中断/帧格式错误文案的场景名词（如「活跃会话」「项目」）。 */
@@ -180,6 +184,12 @@ export function subscribeStream<T>(
         window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
         return;
       }
+      if (res.status === 404 && opts.onGone) {
+        // 永久终态（与 401 同级）：先置 closed，避免 onGone 抛错落入 catch 后重连
+        closed = true;
+        opts.onGone();
+        return;
+      }
       if (!res.ok || !res.body) {
         const message = await httpErrorMessage(res); // close() 可能发生在此 await 期间
         if (closed) return; // 永久关闭：不回调 onError、不安排重连
@@ -189,6 +199,9 @@ export function subscribeStream<T>(
       }
       const outcome = await readStream(res.body, ctrl);
       if (closed || outcome === 'aborted') return;
+      if (outcome === 'ended' && opts.reportEndAsError) {
+        opts.onError(`${opts.errorLabel}连接中断`);
+      }
       // 正常结束（服务端关停/断流）与协议错误都退避重连
       scheduleReconnect();
     } catch {
@@ -243,5 +256,28 @@ export function subscribeProjects(opts: SubscribeProjectsOptions): { close(): vo
   return subscribeStream<Project>('/api/v1/projects/stream', {
     ...opts,
     errorLabel: '项目',
+  });
+}
+
+export interface SubscribeTaskOptions {
+  /** snapshot 与 update 同构：data 为单个 Task 对象，整对象替换。 */
+  onData(task: Task): void;
+  onError(message: string): void;
+  onStateChange?(state: StreamConnState): void;
+  /** HTTP 404：任务不存在/已删除，永久终态。 */
+  onGone?(): void;
+}
+
+/** 订阅任务详情 SSE 流（task-detail-stream D5）：单对象帧，validate 仅校验信封形状。 */
+export function subscribeTask(taskID: string, opts: SubscribeTaskOptions): { close(): void } {
+  return subscribeStream<Task>(`/api/v1/tasks/${taskID}/stream`, {
+    onError: opts.onError,
+    onStateChange: opts.onStateChange,
+    onGone: opts.onGone,
+    reportEndAsError: true,
+    errorLabel: '任务详情',
+    validate: (data) =>
+      typeof data === 'object' && data !== null && !Array.isArray(data) ? [data as Task] : null,
+    onData: (items) => opts.onData(items[0]),
   });
 }
