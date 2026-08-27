@@ -103,7 +103,7 @@ func (m *Manager) writeDeleteTask(ctx context.Context, id string) (application.D
 	return m.store.DeleteTask(ctx, id)
 }
 
-// writeNoticeCAS 后台通知 CAS 重写（activity_changed 仅当 updated_at 前进）。
+// writeNoticeCAS 后台通知 CAS 重写（Changed=true 发布 activity_changed）。
 func (m *Manager) writeNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error) {
 	if m.lifecycle != nil {
 		return m.lifecycle.UpdateNoticeCAS(ctx, id, nullStringToPtr(expected), nullStringToPtr(newNotice))
@@ -111,7 +111,7 @@ func (m *Manager) writeNoticeCAS(ctx context.Context, id string, expected, newNo
 	return m.store.UpdateTaskNoticeCAS(ctx, id, expected, newNotice)
 }
 
-// writeConvergeInterruptedInitRuns 收敛中断 init run（init_status 写入不发事件，P1.6.1）。
+// writeConvergeInterruptedInitRuns 启动期收敛中断 init run（HTTP 开放前零订阅者，不发布）。
 func (m *Manager) writeConvergeInterruptedInitRuns(ctx context.Context) (int64, error) {
 	if m.lifecycle != nil {
 		return m.lifecycle.ConvergeInterruptedInitRuns(ctx)
@@ -119,7 +119,7 @@ func (m *Manager) writeConvergeInterruptedInitRuns(ctx context.Context) (int64, 
 	return m.store.ConvergeInterruptedInitRuns(ctx)
 }
 
-// writeClaimInitRun 认领 init run（init_status 写入不发事件，P1.6.1）。
+// writeClaimInitRun 认领 init run（Changed=true 发布 activity_changed）。
 func (m *Manager) writeClaimInitRun(ctx context.Context, id string) (application.MutationResult, error) {
 	if m.lifecycle != nil {
 		return m.lifecycle.ClaimInitRun(ctx, id)
@@ -127,7 +127,7 @@ func (m *Manager) writeClaimInitRun(ctx context.Context, id string) (application
 	return m.store.ClaimInitRun(ctx, id)
 }
 
-// writeClaimInitRerun 认领 init 重跑（init_status 写入不发事件，P1.6.1）。
+// writeClaimInitRerun 认领 init 重跑（Changed=true 发布 activity_changed）。
 func (m *Manager) writeClaimInitRerun(ctx context.Context, id string) (application.MutationResult, error) {
 	if m.lifecycle != nil {
 		return m.lifecycle.ClaimInitRerun(ctx, id)
@@ -135,7 +135,7 @@ func (m *Manager) writeClaimInitRerun(ctx context.Context, id string) (applicati
 	return m.store.ClaimInitRerun(ctx, id)
 }
 
-// writeFinishInitRun 写入 init run 终态（init_status 写入不发事件，P1.6.1）。
+// writeFinishInitRun 写入 init run 终态（Changed=true 发布 activity_changed）。
 func (m *Manager) writeFinishInitRun(ctx context.Context, id, initStatus string, initError sql.NullString) (application.MutationResult, error) {
 	if m.lifecycle != nil {
 		return m.lifecycle.FinishInitRun(ctx, id, ocdecktask.InitStatus(initStatus), nullStringToPtr(initError))

@@ -197,10 +197,21 @@ func (s *Server) registerWSRoutes(mux *http.ServeMux) {
 // 统一返回 design.md §21 错误结构（保留 next 写入的 HTTP 状态码 404/405）。
 // ServeMux 对未注册路径写 404 纯文本、对已注册路径但方法不匹配写 405 纯文本——
 // 这里改写为 JSON 错误体，避免裸文本泄露内部 mux 行为。
+// 下游已写 Content-Type: application/json 的标准错误信封原样转发（task-detail-stream D3）。
 func jsonNotFoundHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
+		if rec.status != http.StatusNotFound && rec.status != http.StatusMethodNotAllowed {
+			// header-only 隐式 200：下游只写 Header() 未调 WriteHeader/Write。
+			rec.commitPassthroughHeaders()
+			return
+		}
+		if rec.jsonEnvelope() {
+			rec.flushBuffered()
+			return
+		}
+		rec.prepareRewriteHeaders()
 		switch rec.status {
 		case http.StatusNotFound:
 			writeJSONError(w, http.StatusNotFound, CodeNotFound, "no route for "+r.Method+" "+r.URL.Path)
@@ -210,14 +221,36 @@ func jsonNotFoundHandler(next http.Handler) http.Handler {
 	})
 }
 
-// statusRecorder 记录下游写入的状态码，用于在不破坏 next 写入的前提下判断 404/405。
-// 404/405 的 header 与 body 由 jsonNotFoundHandler 在 next 返回后统一重写，
-// 因此对 404/405 不转发 header、吞掉 body；其他状态码照常转发，保证 handler 自定义
-// 状态码（如 201/204）能正确返回。
+// statusRecorder 记录下游写入的状态码。非 404/405 照常转发；404/405 缓冲 header/body，
+// 由 jsonNotFoundHandler 决定原样转发 JSON 信封或重写 mux 裸文本。
+// Unwrap/FlushError 仍委托底层，writeSSEFrame 的 Flush 链路不变。
 type statusRecorder struct {
 	http.ResponseWriter
-	status int
-	wrote  bool
+	status      int
+	wrote       bool
+	bufHeader   http.Header
+	bufBody     []byte
+	bufHdrWrote bool
+}
+
+func (r *statusRecorder) buffering() bool {
+	return r.status == http.StatusNotFound || r.status == http.StatusMethodNotAllowed
+}
+
+func (r *statusRecorder) Header() http.Header {
+	if r.buffering() {
+		if r.bufHeader == nil {
+			r.bufHeader = make(http.Header)
+		}
+		return r.bufHeader
+	}
+	if r.wrote {
+		return r.ResponseWriter.Header()
+	}
+	if r.bufHeader == nil {
+		r.bufHeader = make(http.Header)
+	}
+	return r.bufHeader
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
@@ -227,21 +260,64 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.wrote = true
 	r.status = code
 	if code == http.StatusNotFound || code == http.StatusMethodNotAllowed {
-		// 404/405 不转发，后续由 writeJSONError 统一写状态码与 body。
 		return
 	}
+	r.copyHeaders()
 	r.ResponseWriter.WriteHeader(code)
 }
 
 func (r *statusRecorder) Write(b []byte) (int, error) {
-	// 吞掉 ServeMux 默认 404/405 纯文本 body，由 writeJSONError 统一输出 JSON。
-	if r.status == http.StatusNotFound || r.status == http.StatusMethodNotAllowed {
+	if r.buffering() {
+		r.bufBody = append(r.bufBody, b...)
 		return len(b), nil
 	}
 	if !r.wrote {
 		r.WriteHeader(http.StatusOK)
 	}
 	return r.ResponseWriter.Write(b)
+}
+
+func (r *statusRecorder) jsonEnvelope() bool {
+	ct := r.Header().Get("Content-Type")
+	return strings.HasPrefix(strings.ToLower(ct), "application/json")
+}
+
+func (r *statusRecorder) copyHeaders() {
+	if r.bufHdrWrote || r.bufHeader == nil {
+		return
+	}
+	dst := r.ResponseWriter.Header()
+	for k, vs := range r.bufHeader {
+		dst[k] = append([]string(nil), vs...)
+	}
+	r.bufHdrWrote = true
+}
+
+func (r *statusRecorder) flushBuffered() {
+	r.copyHeaders()
+	r.ResponseWriter.WriteHeader(r.status)
+	if len(r.bufBody) > 0 {
+		_, _ = r.ResponseWriter.Write(r.bufBody)
+	}
+}
+
+// commitPassthroughHeaders 把尚未写出的缓冲 header 提交到底层（header-only 隐式 200）。
+func (r *statusRecorder) commitPassthroughHeaders() {
+	if r.wrote {
+		return
+	}
+	r.copyHeaders()
+}
+
+// prepareRewriteHeaders 重写 mux 裸文本 404/405 前：仅保留下游 Allow，
+// 清除旧 Content-Type/Content-Length，避免与 JSON 信封冲突。
+func (r *statusRecorder) prepareRewriteHeaders() {
+	dst := r.ResponseWriter.Header()
+	if allow := r.Header().Values("Allow"); len(allow) > 0 {
+		dst["Allow"] = append([]string(nil), allow...)
+	}
+	dst.Del("Content-Type")
+	dst.Del("Content-Length")
 }
 
 // Unwrap 暴露底层 ResponseWriter（sse-active-sessions P2.5）。http.ResponseController
@@ -251,7 +327,12 @@ func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter 
 // FlushError 刷新底层连接并传播错误（sse-active-sessions P2.5）。SSE handler 经
 // http.NewResponseController(w).Flush() 写帧：控制器优先匹配 FlushError，仅实现
 // 无返回值 Flush() 会吞底层 flush 错误；此处委托控制底层 ResponseWriter 完成刷新。
+// 尚未 WriteHeader 时先走 recorder 自身 WriteHeader(200)，提交缓冲 header，避免
+// 底层 Flush 隐式 200 丢掉下游 header。
 func (r *statusRecorder) FlushError() error {
+	if !r.wrote {
+		r.WriteHeader(http.StatusOK)
+	}
 	return http.NewResponseController(r.ResponseWriter).Flush()
 }
 

@@ -36,7 +36,7 @@ func (s *LifecycleService) DeleteTask(ctx context.Context, id string) (applicati
 }
 
 // UpdateNoticeCAS conditionally rewrites the task notice and commits an
-// activity_changed event when the mutation advanced updated_at.
+// activity_changed event when the mutation actually changed.
 func (s *LifecycleService) UpdateNoticeCAS(ctx context.Context, id string, expected, newNotice *string) (application.MutationResult, error) {
 	res, err := s.tasks.UpdateTaskNoticeCAS(ctx, id, expected, newNotice)
 	if err != nil {
@@ -47,25 +47,41 @@ func (s *LifecycleService) UpdateNoticeCAS(ctx context.Context, id string, expec
 }
 
 // ConvergeInterruptedInitRuns fails stale init runs left behind by a restart.
-// init_status writes never emit domain events (P1.6.1).
+// Startup-time converge runs before HTTP is open (zero subscribers) and MUST
+// NOT publish activity_changed (task-detail-stream D0 exception).
 func (s *LifecycleService) ConvergeInterruptedInitRuns(ctx context.Context) (int64, error) {
 	return s.tasks.ConvergeInterruptedInitRuns(ctx)
 }
 
 // ClaimInitRun marks an initial run as started for this server instance.
-// init_status writes never emit domain events (P1.6.1).
+// Real changes (Changed=true) publish task.activity_changed.
 func (s *LifecycleService) ClaimInitRun(ctx context.Context, id string) (application.MutationResult, error) {
-	return s.tasks.ClaimInitRun(ctx, id)
+	res, err := s.tasks.ClaimInitRun(ctx, id)
+	if err != nil {
+		return application.MutationResult{}, err
+	}
+	s.commitTaskMutation(ctx, id, res)
+	return res, nil
 }
 
 // ClaimInitRerun marks a finished init run as re-running.
-// init_status writes never emit domain events (P1.6.1).
+// Real changes (Changed=true) publish task.activity_changed.
 func (s *LifecycleService) ClaimInitRerun(ctx context.Context, id string) (application.MutationResult, error) {
-	return s.tasks.ClaimInitRerun(ctx, id)
+	res, err := s.tasks.ClaimInitRerun(ctx, id)
+	if err != nil {
+		return application.MutationResult{}, err
+	}
+	s.commitTaskMutation(ctx, id, res)
+	return res, nil
 }
 
 // FinishInitRun records the terminal init status of an init run.
-// init_status writes never emit domain events (P1.6.1).
+// Real changes (Changed=true) publish task.activity_changed.
 func (s *LifecycleService) FinishInitRun(ctx context.Context, id string, status ocdecktask.InitStatus, initError *string) (application.MutationResult, error) {
-	return s.tasks.FinishInitRun(ctx, id, status, initError)
+	res, err := s.tasks.FinishInitRun(ctx, id, status, initError)
+	if err != nil {
+		return application.MutationResult{}, err
+	}
+	s.commitTaskMutation(ctx, id, res)
+	return res, nil
 }

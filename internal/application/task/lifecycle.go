@@ -31,8 +31,8 @@ type LifecycleService struct {
 
 // Options 构造 LifecycleService 的依赖注入。
 type Options struct {
-	Tasks    application.TaskRepository
-	Read     application.TaskReadRepository
+	Tasks application.TaskRepository
+	Read  application.TaskReadRepository
 	// Sessions 为会话归属端口（P1.4.5 claim/touch/delete/align 用例所需）。
 	// 调用 session 用例的前提是完整注入（与 Tasks/Read 同为构造期合同）。
 	Sessions application.SessionRepository
@@ -80,14 +80,11 @@ func (s *LifecycleService) commitTransition(ctx context.Context, taskID string, 
 	s.publish.Publish(ocdeckevent.NewTaskStatusChanged(taskID, string(res.From), string(res.To)))
 }
 
-// commitTaskMutation 提交非状态迁移的列写入并在真实变更时按 updated_at 规则发布
-// task.activity_changed（design.md D0:133/P1.6.1）。
-//
-// 仅 Changed 且 updated_at 跨秒推进（UpdatedAtAdvanced）时发布（同值 no-op 与同秒实变
-// 不发布，避免秒精度抖动）；Publish 溢出不回滚业务提交。本阶段 Publisher 为 NoopPublisher，
-// 调用位就绪无实际发布。
+// commitTaskMutation 提交非状态迁移的列写入并在真实变更时发布
+// task.activity_changed（task-detail-stream D0：Changed=true 即发，不再要求
+// updated_at 跨秒）。同值 no-op（!Changed）不发布；Publish 溢出不回滚业务提交。
 func (s *LifecycleService) commitTaskMutation(ctx context.Context, taskID string, res application.MutationResult) {
-	if !res.Changed || !res.UpdatedAtAdvanced {
+	if !res.Changed {
 		return
 	}
 	s.publish.Publish(ocdeckevent.NewTaskActivityChanged(taskID))

@@ -108,6 +108,7 @@ func (s *Server) registerTaskRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/projects/{id}/tasks", s.handleListTasks)
 	mux.HandleFunc("POST /api/v1/projects/{id}/tasks", s.handleCreateTask)
 	mux.HandleFunc("GET /api/v1/tasks/{id}", s.handleGetTask)
+	mux.HandleFunc("GET /api/v1/tasks/{id}/stream", s.handleTaskStream)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/activate", s.handleTaskAction(s.tasks.Activate))
 	mux.HandleFunc("POST /api/v1/tasks/{id}/suspend", s.handleTaskAction(s.tasks.Suspend))
 	mux.HandleFunc("POST /api/v1/tasks/{id}/archive", s.handleTaskAction(s.tasks.Archive))
@@ -242,22 +243,30 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 		writeApiError(w, mapTaskErr(err))
 		return
 	}
-	// fail-closed：项目查询失败/未知 kind MUST 返回错误，不得输出空 project_kind（D6）。
-	kind, ae := s.requireProjectKind(r.Context(), t.ProjectID)
+	sessions, _ := s.tasks.ListTaskSessions(r.Context(), taskID)
+	dto, ae := s.buildTaskDetailDTOBase(r.Context(), t, sessions)
 	if ae != nil {
 		writeApiError(w, ae)
 		return
 	}
-	sessions, _ := s.tasks.ListTaskSessions(r.Context(), taskID)
-	dto := toTaskDTO(t, kind)
-	dto.Sessions = toSessionDTOs(sessions)
 	// 2.8：active 时经该任务 serve 实时查询 agentStatus；非 active/查询失败降级为空串。
 	dto.AgentStatus = s.tasks.AgentStatus(r.Context(), taskID)
-	// D6 注意力信号快照透出（空数组非 null）。
-	att, _ := s.tasks.Attention(taskID)
-	dto.Attention = toAttentionDTO(att)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(dto)
+}
+
+// buildTaskDetailDTOBase 共享详情 DTO 纯映射（task-detail-stream D4）：
+// requireProjectKind + toTaskDTO + toSessionDTOs + Attention。查询策略不进 helper。
+func (s *Server) buildTaskDetailDTOBase(ctx context.Context, t application.TaskRow, sessions []application.SessionRow) (taskRowDTO, *ApiError) {
+	kind, ae := s.requireProjectKind(ctx, t.ProjectID)
+	if ae != nil {
+		return taskRowDTO{}, ae
+	}
+	dto := toTaskDTO(t, kind)
+	dto.Sessions = toSessionDTOs(sessions)
+	att, _ := s.tasks.Attention(t.ID)
+	dto.Attention = toAttentionDTO(att)
+	return dto, nil
 }
 
 // handleTaskAction 通用状态机操作 handler（无 body）。
@@ -483,7 +492,7 @@ func toAttentionDTO(att application.Attention) attentionDTO {
 
 // activeSessionDTO 跨项目 active 任务概览 DTO（cross-project-active-sessions D3/D4）。
 // 读模型（application.ActiveTaskOverviewRow）不含 agentStatus；组装
-//（buildActiveSessionsSnapshot，P2.2 起与 SSE 共享）读内存快照填充。
+// （buildActiveSessionsSnapshot，P2.2 起与 SSE 共享）读内存快照填充。
 // AgentStatus 快照不可用为空串，经 omitempty 省略（idle/busy/retry 三态）。
 // Attention 纯读快照（design.md D6），空数组非 null。
 type activeSessionDTO struct {
