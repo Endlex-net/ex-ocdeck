@@ -857,7 +857,7 @@ func (m *Manager) taskOcClient(ctx context.Context, taskID string) (OCClient, st
 	if err != nil || row.Status != StatusActive {
 		return nil, "", false
 	}
-	serveName := serveSessionName(taskID)
+	serveName := runtimeSessionName(taskID)
 	password, perr := m.proc.ShowSessionEnvContext(ctx, serveName, "OPENCODE_SERVER_PASSWORD")
 	if perr != nil || password == "" {
 		return nil, "", false

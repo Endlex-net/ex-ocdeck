@@ -803,6 +803,15 @@ func (s *commitBlockingStore) UpdateTaskStatusConditional(ctx context.Context, i
 	return s.mockStore.UpdateTaskStatusConditional(ctx, id, fromStatus, toStatus, lastError)
 }
 
+// CasActivationIfNoRecoveryDebt：G3-18 起 Activate 的 suspended→activating 准入
+// 走本方法（原子拒绝未清 recovery debt），阻塞点随之迁移。
+func (s *commitBlockingStore) CasActivationIfNoRecoveryDebt(ctx context.Context, id, fromStatus, toStatus string) (application.TransitionResult, error) {
+	if s.blockMethod == "conditional" && fromStatus == StatusSuspended && toStatus == StatusActivating {
+		s.signalAndWait()
+	}
+	return s.mockStore.CasActivationIfNoRecoveryDebt(ctx, id, fromStatus, toStatus)
+}
+
 func (s *commitBlockingStore) BeginDeleteIntent(ctx context.Context, id, mode string, fromStatuses []string) (application.TransitionResult, error) {
 	if s.blockMethod == "beginDelete" {
 		s.signalAndWait()

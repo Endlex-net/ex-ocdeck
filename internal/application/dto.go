@@ -63,9 +63,10 @@ type TaskRow struct {
 	CreatedAt    int64
 	UpdatedAt    int64
 	ArchivedAt   sql.NullInt64
-	InitStatus   string
-	InitError    sql.NullString
-	BaseRef      string
+	InitStatus      string
+	InitError       sql.NullString
+	BaseRef         string
+	AnchorSessionID sql.NullString
 }
 
 // SessionRow 会话归属行（解耦 store 包结构，design.md §18）。

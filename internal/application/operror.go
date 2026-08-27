@@ -48,4 +48,5 @@ const (
 	CodeProcessError   = "process_error"
 	CodeGitError       = "git_error"
 	CodeOCIncompatible = "oc_incompatible"
+	CodeRecovering     = "recovering"
 )

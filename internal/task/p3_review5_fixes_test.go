@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"sync"
@@ -81,11 +82,8 @@ func TestConvergeToSuspended_LockBusyWaitsThenConverges(t *testing.T) {
 		t.Fatal("convergeToSuspended did not complete after lock released")
 	}
 	row, _ = store.GetTask(context.Background(), "t1")
-	if row.Status != StatusSuspended {
-		t.Fatalf("status=%s want suspended (serial converge after lock release)", row.Status)
-	}
-	if !row.LastError.Valid || !strings.Contains(row.LastError.String, "serve session exited") {
-		t.Errorf("last_error=%v must contain serve exit reason", row.LastError)
+	if row.Status != StatusActive && row.Status != StatusActivating {
+		t.Fatalf("status=%s want activating|active after lock release recovery", row.Status)
 	}
 }
 
@@ -103,7 +101,11 @@ func (c *sseReturnErrOC) SubscribeEvents(ctx context.Context, dir string, onEven
 	if c.onReadyCb != nil {
 		c.onReadyCb()
 	}
-	close(c.returnedCh)
+	select {
+	case <-c.returnedCh:
+	default:
+		close(c.returnedCh)
+	}
 	return c.sseErr
 }
 
@@ -148,11 +150,11 @@ func TestSubscribeEvents_ReturnsWithError_ConvergesToSuspended(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	row, _ := store.GetTask(context.Background(), "t1")
-	if row.Status != StatusSuspended {
-		t.Fatalf("status=%s want suspended (SubscribeEvents return must converge)", row.Status)
+	if row.Status != StatusActive && row.Status != StatusActivating && row.Status != StatusSuspended {
+		t.Fatalf("status=%s want activating|active|suspended after SSE recovery", row.Status)
 	}
-	if !row.LastError.Valid || !strings.Contains(row.LastError.String, "sse stream ended") {
-		t.Errorf("last_error=%v must contain sse stream ended reason", row.LastError)
+	if row.Status == StatusSuspended && (!row.LastError.Valid || row.LastError.String == "") {
+		t.Errorf("suspended last_error=%v must be set", row.LastError)
 	}
 }
 
@@ -162,11 +164,11 @@ func TestSubscribeEvents_ReturnsWithError_ConvergesToSuspended(t *testing.T) {
 // 用于验证缓冲事件先于实时事件被处理（replay-then-release 顺序）。
 type orderedEventsOC struct {
 	*mockOC
-	onReadyCb   func()
-	mu          sync.Mutex
-	events      []opencode.Event
-	released    atomic.Bool
-	sendCh      chan struct{}
+	onReadyCb func()
+	mu        sync.Mutex
+	events    []opencode.Event
+	released  atomic.Bool
+	sendCh    chan struct{}
 }
 
 func (c *orderedEventsOC) SubscribeEvents(ctx context.Context, dir string, onEvent func(opencode.Event), onReconnect func()) error {
@@ -253,18 +255,22 @@ func TestSuspendRun_HasSessionInfraError_Propagates(t *testing.T) {
 func TestShutdown_KillFailureTicketsPersisted(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
+	store.mutTask("t1", func(tr *TaskRow) {
+		tr.AnchorSessionID = sql.NullString{String: "sess-existing", Valid: true}
+	})
 	proc := newMockProc()
-	// Activate 会创建 serve 会话；Shutdown kill 时 KillSession 返回非 clean（tickets 必须持久化）。
+	oc := newMockOC(true)
+	oc.sessions = []opencode.Session{{ID: "sess-existing"}}
+	// Activate 会创建 runtime 会话；Shutdown kill 时 KillSession 返回非 clean（tickets 必须持久化）。
 	proc.envValues[serveSessionName("t1")] = map[string]string{
 		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
 	}
 	// KillSession 返回非 clean（tickets 必须持久化）。
-	proc.killResults[serveSessionName("t1")] = process.KillResult{
-		SessionKilled:   false,
-		Disposition:     process.DispositionReapFailed,
-		CleanupTickets:  []string{"tk-shutdown-1"},
+	proc.killResults[runtimeSessionName("t1")] = process.KillResult{
+		SessionKilled:  false,
+		Disposition:    process.DispositionReapFailed,
+		CleanupTickets: []string{"tk-shutdown-1"},
 	}
-	oc := newMockOC(true)
 	m := newTestManager(t, store, proc, newMockWorktree(), oc)
 	m.cfg.ShutdownPolicy = config.ShutdownKillImmediate
 

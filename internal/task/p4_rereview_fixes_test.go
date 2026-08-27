@@ -136,7 +136,7 @@ func TestP4Rereview_Reconcile_NewOrphanTickets_PersistedImmediately(t *testing.T
 	// 预置孤儿会话（无 DB 行的 ocdeck 会话）+ kill 失败产生 tickets。
 	proc.sessions["ocdeck-ghost-serve"] = true
 	proc.killResults["ocdeck-ghost-serve"] = process.KillResult{
-		SessionKilled:  false, Disposition: process.DispositionReapFailed,
+		SessionKilled: false, Disposition: process.DispositionReapFailed,
 		CleanupTickets: []string{"tk-new-orphan"},
 	}
 	m := newR7TestManagerWithDebt(t, s, debt, proc, newMockWorktree(), newMockOC(true))
@@ -164,21 +164,22 @@ func TestP4Rereview_Reconcile_NewOrphanTickets_PersistedImmediately(t *testing.T
 
 // TestP4Rereview_Shutdown_NewOrphanTickets_PersistedAfterKill 验证 P4 复评阻塞 3c：
 // Shutdown kill 模式下 shutdownKillAllSessions 新产生的 orphan tickets MUST 再次持久化
-//（顺序：先收割既有 → kill 全部会话 → 新 orphan 再持久化，不先持久化再 kill）。
+// （顺序：先收割既有 → kill 全部会话 → 新 orphan 再持久化，不先持久化再 kill）。
 func TestP4Rereview_Shutdown_NewOrphanTickets_PersistedAfterKill(t *testing.T) {
 	s := newMockStore()
 	seedSuspendedTask(s, "t1", "p1")
+	s.mutTask("t1", func(tr *TaskRow) {
+		tr.AnchorSessionID = sql.NullString{String: "sess-existing", Valid: true}
+	})
 	debt := newMemCleanupDebtStore()
 	proc := newMockProc()
-	// Activate 会创建 serve 会话；Shutdown kill 时 KillSession 返回非 clean + tickets。
-	proc.envValues[serveSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
-	}
-	proc.killResults[serveSessionName("t1")] = process.KillResult{
+	oc := newMockOC(true)
+	oc.sessions = []opencode.Session{{ID: "sess-existing"}}
+	proc.killResults[runtimeSessionName("t1")] = process.KillResult{
 		SessionKilled: false, Disposition: process.DispositionReapFailed,
 		CleanupTickets: []string{"tk-shutdown-new"},
 	}
-	m := newR7TestManagerWithDebt(t, s, debt, proc, newMockWorktree(), newMockOC(true))
+	m := newR7TestManagerWithDebt(t, s, debt, proc, newMockWorktree(), oc)
 	m.cfg.ShutdownPolicy = config.ShutdownKillImmediate
 	m.SetLifecycleCtx(context.Background())
 
@@ -365,7 +366,7 @@ func TestP4Rereview_SSEStaleGenError_DoesNotClearNewGenRuntime(t *testing.T) {
 }
 
 // TestP4Rereview_SSEStaleGenError_CurrentGenConverges 验证当前代 SSE 错误回调正常收敛
-//（gen 校验通过时 convergeToSuspendedForGen 行为与 convergeToSuspended 一致）。
+// （gen 校验通过时 convergeToSuspendedForGen 行为与 convergeToSuspended 一致）。
 func TestP4Rereview_SSEStaleGenError_CurrentGenConverges(t *testing.T) {
 	s := newMockStore()
 	seedSuspendedTask(s, "t1", "p1")

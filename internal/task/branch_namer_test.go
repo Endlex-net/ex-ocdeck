@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/opencode"
@@ -46,10 +47,12 @@ func newTestManagerWithNamer(t *testing.T, store TaskStore, wt WorktreeBackend, 
 	wrap := func(port int, password string, opts opencode.Options) OCClient {
 		return &readyOC{inner: newMockOC(true), onReady: opts.OnReady}
 	}
-	return New(Options{
+	m := New(Options{
 		Cfg: cfg, Store: store, Proc: newMockProc(), Worktree: wt,
 		OCFactory: wrap, Namer: namer,
 	})
+	m.recoveryBackoffFn = func(int) time.Duration { return 0 }
+	return m
 }
 
 // TestCreate_UsesNamerForBranchSlug 验证 Create 经 Namer 生成分支 slug：

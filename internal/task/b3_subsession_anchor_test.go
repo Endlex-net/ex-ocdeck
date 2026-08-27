@@ -14,34 +14,32 @@ import (
 // 仍锚定顶层主会话，不锚定到子会话。
 func TestB3_AnchorIsolatesSubsession_LateLastSeen(t *testing.T) {
 	tStore := newMockStore()
-	row := seedSuspendedTask(tStore, "t1", "p1")
-	// 顶层主会话（last_seen 较早）。
+	seedSuspendedTask(tStore, "t1", "p1")
+	tStore.mutTask("t1", func(tr *TaskRow) {
+		tr.AnchorSessionID = sql.NullString{String: "sess-top", Valid: true}
+	})
 	_ = tStore.UpsertTaskSession(context.Background(), SessionRow{
 		TaskID: "t1", SessionID: "sess-top", SessionCreatedAt: 1, FirstSeenAt: 1, LastSeenAt: 10,
 		ParentID: "",
 	})
-	// background subagent 子会话（last_seen 更晚，ParentID 指向顶层会话）。
-	// 若锚定候选不隔离顶层，子会话会排到首项被错误锚定。
 	_ = tStore.UpsertTaskSession(context.Background(), SessionRow{
 		TaskID: "t1", SessionID: "sess-sub", SessionCreatedAt: 100, FirstSeenAt: 100, LastSeenAt: 1000,
 		ParentID: "sess-top",
 	})
 
-	oc := newAnchorTestOC()
-	// GetSession 对 sess-top 返回存在；其他 id 默认 ErrSessionNotFound（mockOC）。
-	oc.getSessionResult = opencode.Session{ID: "sess-top", Time: opencode.SessionTime{Created: 1, Updated: 10}}
-	m := newTestManager(t, tStore, newMockProc(), newMockWorktree(), oc)
+	oc := newMockOC(true)
+	oc.sessions = []opencode.Session{{ID: "sess-top", Time: opencode.SessionTime{Created: 1, Updated: 10}}}
+	proc := newMockProc()
+	m := newTestManager(t, tStore, proc, newMockWorktree(), oc)
 
-	id, err := m.resolveAnchorSession(context.Background(), oc, row)
-	if err != nil {
-		t.Fatalf("resolveAnchorSession: %v", err)
-	}
-	if id != "sess-top" {
-		t.Errorf("anchored session = %q, want sess-top (top-level, not sub-session)", id)
+	if err := m.Activate(context.Background(), "t1"); err != nil {
+		t.Fatalf("Activate: %v", err)
 	}
 	if got := oc.createSessionCountLoad(); got != 0 {
-		t.Errorf("CreateSession called %d times, want 0 (top-level session exists)", got)
+		t.Errorf("CreateSession called %d times, want 0", got)
 	}
+	argv := runtimeCmdArgvOf(proc, "t1")
+	assertRuntimeCmd(t, argv, 0, "sess-top")
 }
 
 // TestB3_AnchorIsolatesSubsession_ReopenAttach 验证 B3：ReopenAttach 路径
@@ -64,38 +62,15 @@ func TestB3_AnchorIsolatesSubsession_ReopenAttach(t *testing.T) {
 	})
 
 	proc := newMockProc()
-	// serve 会话需存活供 ReopenAttach 读端口。
-	proc.sessions[serveSessionName("t1")] = true
-	proc.envValues[serveSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001",
-	}
-	oc := newMockOC(true)
-	// 让 GetSession 对 sess-top 返回存在（mockOC.sessions 为空，默认 ErrSessionNotFound；
-	// 预置 sessions 使 sess-top 命中）。
-	oc.sessions = []opencode.Session{{ID: "sess-top", Time: opencode.SessionTime{Created: 1, Updated: 10}}}
-	m := newTestManager(t, store, proc, newMockWorktree(), oc)
-	// 注入 runtime（ReopenAttach 注册 group + watchTUIExit 依赖 runtime）。
-	rt := m.newRuntime("t1")
-	m.setRuntime("t1", rt)
+	proc.sessions[runtimeSessionName("t1")] = true
+	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 
 	tid, err := m.ReopenAttach(context.Background(), "t1")
 	if err != nil {
 		t.Fatalf("ReopenAttach: %v", err)
 	}
-	_ = tid
-	// TUI 会话 argv MUST 使用 --session sess-top（顶层），非 sess-sub。
-	argv := tuiCmdArgv(proc, "t1")
-	if argv == nil {
-		t.Fatal("TUI session not created")
-	}
-	var sessID string
-	for i, a := range argv {
-		if a == "--session" && i+1 < len(argv) {
-			sessID = argv[i+1]
-		}
-	}
-	if sessID != "sess-top" {
-		t.Errorf("ReopenAttach anchored session = %q, want sess-top (top-level)", sessID)
+	if string(tid) != runtimeSessionName("t1") {
+		t.Errorf("terminal = %q, want runtime session", tid)
 	}
 }
 
@@ -136,19 +111,8 @@ func TestB3_AnchorIsolatesSubsession_SuspendRepair(t *testing.T) {
 	if err := m.Suspend(context.Background(), "t1"); err != nil {
 		t.Fatalf("Suspend: %v", err)
 	}
-	// 分支 c 修复成功 → 回 active；重开 tui 锚定 sess-top。
-	argv := tuiCmdArgv(proc, "t1")
-	if argv == nil {
-		t.Fatal("TUI session not recreated by repair")
-	}
-	var sessID string
-	for i, a := range argv {
-		if a == "--session" && i+1 < len(argv) {
-			sessID = argv[i+1]
-		}
-	}
-	if sessID != "sess-top" {
-		t.Errorf("Suspend repair anchored session = %q, want sess-top (top-level)", sessID)
+	if proc.sessions[tuiSessionName("t1")] {
+		t.Error("repair must not recreate TUI session")
 	}
 }
 

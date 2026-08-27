@@ -61,14 +61,14 @@ func TestP146_Create_Repo_ViaLifecycle(t *testing.T) {
 	// 自动激活异步推进至 active（经 lifecycle CAS suspended→activating→active）。
 	waitForStatus(t, store, row.ID, StatusActive, 3*time.Second)
 	proc.mu.Lock()
-	hasServe := proc.sessions[serveSessionName(row.ID)]
+	hasRuntime := proc.sessions[runtimeSessionName(row.ID)]
 	hasTUI := proc.sessions[tuiSessionName(row.ID)]
 	proc.mu.Unlock()
-	if !hasServe {
-		t.Error("serve session not created by auto-activate (via lifecycle)")
+	if !hasRuntime {
+		t.Error("runtime session not created by auto-activate (via lifecycle)")
 	}
-	if !hasTUI {
-		t.Error("tui session not created by auto-activate (via lifecycle)")
+	if hasTUI {
+		t.Error("tui session must not be created by auto-activate (via lifecycle)")
 	}
 }
 
@@ -136,10 +136,10 @@ func TestP146_Retry_CreationFailed_UnlockThenActivate(t *testing.T) {
 	}
 	waitForStatus(t, store, "t1", StatusActive, 3*time.Second)
 	proc.mu.Lock()
-	hasTUI := proc.sessions[tuiSessionName("t1")]
+	hasRuntime := proc.sessions[runtimeSessionName("t1")]
 	proc.mu.Unlock()
-	if !hasTUI {
-		t.Error("tui session not created by auto-activate after retry create (via lifecycle)")
+	if !hasRuntime {
+		t.Error("runtime session not created by auto-activate after retry create (via lifecycle)")
 	}
 }
 

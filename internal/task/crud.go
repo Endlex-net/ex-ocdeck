@@ -33,6 +33,7 @@ func (m *Manager) writeCreateTask(ctx context.Context, row TaskRow) error {
 
 // writeStatus 无条件状态写入（含 last_error）。
 func (m *Manager) writeStatus(ctx context.Context, id, status string, lastError sql.NullString) (application.TransitionResult, error) {
+	defer m.wakeRecoveryIncident(id)
 	if m.lifecycle != nil {
 		return m.lifecycle.UpdateStatus(ctx, id, ocdecktask.Status(status), nullStringToPtr(lastError))
 	}
@@ -41,6 +42,10 @@ func (m *Manager) writeStatus(ctx context.Context, id, status string, lastError 
 
 // writeStatusConditional CAS 状态写入（fromStatus 失配返回 !Matched）。
 func (m *Manager) writeStatusConditional(ctx context.Context, id, from, to string, lastError sql.NullString) (application.TransitionResult, error) {
+	// G3-7：状态离开 activating（Suspend/删除/竞争收敛等）即时唤醒恢复退避复核，
+	// 不得等满退避 timer。唤醒是"复核提示"而非裁决：incident 自身的 CAS（activating→active）
+	// 也会走到这里，退避侧经 checkRecoveryContinuable 以 DB/注册表最新状态判定。
+	defer m.wakeRecoveryIncident(id)
 	if m.lifecycle != nil {
 		return m.lifecycle.UpdateStatusConditional(ctx, id, ocdecktask.Status(from), ocdecktask.Status(to), nullStringToPtr(lastError))
 	}
@@ -77,6 +82,22 @@ func (m *Manager) writeLastPort(ctx context.Context, id string, port int) (appli
 		return m.lifecycle.UpdateLastPort(ctx, id, port)
 	}
 	return m.store.UpdateTaskLastPort(ctx, id, port)
+}
+
+// writeCompleteRecoveryFailure 执行单事务终态收敛 + debt 整组删除（恢复终态/
+// debt 重放共用，G3-18：Complete 与 debt 删除原子完成，消除「Complete 已提交 +
+// debt 残留被下一轮重放误伤新激活」窗口）。该写使任务离开 activating（G3-16：
+// MUST 触发恢复退避唤醒——退避中的 incident 据 DB 最新状态即时放弃，不等满 timer）。
+func (m *Manager) writeCompleteRecoveryFailure(ctx context.Context, id string, lastError sql.NullString) (application.TransitionResult, error) {
+	defer m.wakeRecoveryIncident(id)
+	return m.store.CompleteRecoveryFailureAndClearDebts(ctx, id, lastError)
+}
+
+// beginActivation 激活准入原子事务（G3-18）：存在未清 recovery debt →
+// store.ErrRecoveryDebtPresent 零修改拒绝（Activate 与 ensureRecovery 共用），
+// 覆盖「Complete 成功 + debt 删除失败 → 旧 intent 重放误伤新激活」窗口。
+func (m *Manager) beginActivation(ctx context.Context, id, fromStatus string) (application.TransitionResult, error) {
+	return m.store.CasActivationIfNoRecoveryDebt(ctx, id, fromStatus, StatusActivating)
 }
 
 // writeBeginDeleteIntent 写入删除意图（deleting 迁移，fromStatuses 守卫）。

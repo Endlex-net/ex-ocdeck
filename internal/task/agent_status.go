@@ -17,7 +17,7 @@ func (m *Manager) AgentStatus(ctx context.Context, taskID string) string {
 	if err != nil || row.Status != StatusActive {
 		return ""
 	}
-	serveName := serveSessionName(taskID)
+	serveName := runtimeSessionName(taskID)
 	// D0：AgentStatus 直接经 ShowSessionEnvContext 读取 serve 会话 env（ctx-aware，
 	// 受调用方 deadline 约束），不再经 recoverPassword 间接包一层 Background+5s。
 	password, perr := m.proc.ShowSessionEnvContext(ctx, serveName, "OPENCODE_SERVER_PASSWORD")

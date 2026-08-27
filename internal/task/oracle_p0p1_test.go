@@ -210,7 +210,7 @@ func TestB5_ListShells_InfraErrorReturnsError(t *testing.T) {
 
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	rt.registerGroup("shell", shellSessionName("t1", 1))
+	rt.registerGroup(roleShell, shellSessionName("t1", 1))
 
 	out, err := m.ListShells("t1")
 	if err == nil {
@@ -235,7 +235,7 @@ func TestB5_ListShells_ErrNoTmuxServerReturnsEmpty(t *testing.T) {
 
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	rt.registerGroup("shell", shellSessionName("t1", 1))
+	rt.registerGroup(roleShell, shellSessionName("t1", 1))
 
 	out, err := m.ListShells("t1")
 	if err != nil {
@@ -257,7 +257,7 @@ func TestP1_ValidateShellTerminal_InfraErrorNotMappedToAbsent(t *testing.T) {
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	rt.registerGroup("shell", shellSessionName("t1", 1))
+	rt.registerGroup(roleShell, shellSessionName("t1", 1))
 
 	err := m.ValidateShellTerminal(shellSessionName("t1", 1))
 	if err == nil {

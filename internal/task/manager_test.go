@@ -362,15 +362,18 @@ func TestServeExit_HandlerSuspended(t *testing.T) {
 	// 注入运行时以使 watchServeExit 回调生效（B4：需注册 serve group，回调三元组校验）。
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	rt.registerGroup("serve", serveSessionName("t1"))
-	m.watchServeExit("t1", serveSessionName("t1"))
+	rt.registerGroup(roleRuntime, runtimeSessionName("t1"))
+	m.watchServeExit("t1", runtimeSessionName("t1"))
 
-	// 触发 serve 退出事件。
-	proc.triggerExit(serveSessionName("t1"), process.WatchEvent{Type: process.WatchEventSessionExit})
-	// 等待异步处理。
-	time.Sleep(100 * time.Millisecond)
-	row, _ := store.GetTask(context.Background(), "t1")
-	if row.Status != StatusSuspended {
-		t.Errorf("status = %s, want suspended after serve exit", row.Status)
+	proc.triggerExit(runtimeSessionName("t1"), process.WatchEvent{Type: process.WatchEventSessionExit})
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		row, _ := store.GetTask(context.Background(), "t1")
+		if row.Status == StatusActive || row.Status == StatusActivating {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
+	row, _ := store.GetTask(context.Background(), "t1")
+	t.Errorf("status = %s, want activating|active after serve exit recovery", row.Status)
 }

@@ -25,6 +25,7 @@ func newTestManagerWithLifecycle(t *testing.T, store TaskStore, proc ProcessBack
 		return &readyOC{inner: oc, onReady: opts.OnReady}
 	}
 	m := New(Options{Cfg: cfg, Store: store, Proc: proc, Worktree: wt, OCFactory: wrap})
+	m.recoveryBackoffFn = func(int) time.Duration { return 0 }
 	m.SetLifecycleCtx(lifeCtx)
 	t.Cleanup(cancel)
 	return m, cancel
@@ -69,14 +70,14 @@ func TestCreate_AutoActivateTriggered(t *testing.T) {
 
 	// serve 与 tui 会话 MUST 已创建（走 Activate 全部步骤）。
 	proc.mu.Lock()
-	hasServe := proc.sessions[serveSessionName(row.ID)]
+	hasRuntime := proc.sessions[runtimeSessionName(row.ID)]
 	hasTUI := proc.sessions[tuiSessionName(row.ID)]
 	proc.mu.Unlock()
-	if !hasServe {
-		t.Error("serve session not created by auto-activate")
+	if !hasRuntime {
+		t.Error("runtime session not created by auto-activate")
 	}
-	if !hasTUI {
-		t.Error("tui session not created by auto-activate")
+	if hasTUI {
+		t.Error("tui session must not be created by auto-activate")
 	}
 }
 
@@ -139,10 +140,10 @@ func TestRetryCreationFailed_AutoActivateTriggered(t *testing.T) {
 	// retryCreate 提交 suspended 后异步触发激活 → 推进至 active。
 	waitForStatus(t, store, "t1", StatusActive, 3*time.Second)
 	proc.mu.Lock()
-	hasTUI := proc.sessions[tuiSessionName("t1")]
+	hasRuntime := proc.sessions[runtimeSessionName("t1")]
 	proc.mu.Unlock()
-	if !hasTUI {
-		t.Error("tui session not created by auto-activate after retry create")
+	if !hasRuntime {
+		t.Error("runtime session not created by auto-activate after retry create")
 	}
 }
 

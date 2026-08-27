@@ -19,6 +19,7 @@ const (
 	wsCloseTerminalNotFound = 4004 // shell 终端身份校验失败：非法 tid / 非 shell 会话（design.md §21）
 	wsCloseInternalError    = 1011
 	wsCloseNormal           = 1000
+	wsCloseRecovering       = 1013 // Try Again Later：任务进程恢复中（D8 recovering 契约，前端轮询状态后重连）
 )
 
 // wsMaxFrame WS 帧大小上限（design.md §7）。

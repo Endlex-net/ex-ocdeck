@@ -36,7 +36,14 @@ ANCHORS=(
   packages/opencode/src/event-v2-bridge.ts
   packages/opencode/src/cli/cmd/attach.ts
   packages/opencode/src/cli/tui/validate-session.ts
+  packages/opencode/src/cli/cmd/tui.ts
+  packages/opencode/src/cli/tui/worker.ts
 )
+
+if [[ ${#ANCHORS[@]} -ne 23 ]]; then
+  echo "expected 23 contract anchors, got ${#ANCHORS[@]}" >&2
+  exit 2
+fi
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -84,13 +91,30 @@ for path in "${ANCHORS[@]}"; do
 done
 
 echo
-echo "==> live-probe checklist（手工启动后执行）"
-echo "    opencode serve --port <p> --hostname 127.0.0.1"
-echo "    export OPENCODE_SERVER_PASSWORD=<password>"
+echo "==> live-probe checklist（手工执行；bare TUI external。先设密码，后台启动 + trap 清理）"
 cat <<'EOF'
+    set -euo pipefail
+    export OPENCODE_SERVER_PASSWORD=<password>
+    P=<p>
+    P2=<p2>
+    opencode --port "$P" --hostname 127.0.0.1 >/tmp/ocdeck-contract-p.log 2>&1 &
+    pid=$!
+    pid2=""
+    trap 'kill $pid ${pid2:-} 2>/dev/null || true' EXIT
     AUTH=(-u "opencode:${OPENCODE_SERVER_PASSWORD}")
-    BASE=http://127.0.0.1:<p>
+    BASE=http://127.0.0.1:${P}
     DIR=$(python3 -c 'import urllib.parse,os; print(urllib.parse.quote(os.getcwd(), safe=""))')
+    ready=0
+    for i in $(seq 1 50); do
+      if curl -sS -o /dev/null -w '%{http_code}' "${AUTH[@]}" "${BASE}/global/health" | grep -q '^200$'; then
+        ready=1
+        break
+      fi
+      sleep 0.1
+    done
+    [[ "$ready" == "1" ]]
+    code=$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/global/health")
+    [[ "$code" == "401" ]]
     curl -sS --fail-with-body "${AUTH[@]}" "${BASE}/global/health"
     SID=$(curl -sS --fail-with-body "${AUTH[@]}" -X POST "${BASE}/session?directory=${DIR}" \
       -H 'Content-Type: application/json' -d '{"title":"contract-probe"}' \
@@ -100,9 +124,25 @@ cat <<'EOF'
     curl -sS --fail-with-body "${AUTH[@]}" "${BASE}/session/status?directory=${DIR}"
     curl -sS --fail-with-body "${AUTH[@]}" "${BASE}/permission?directory=${DIR}"
     curl -sS --fail-with-body "${AUTH[@]}" "${BASE}/question?directory=${DIR}"
-    # 短采样：首事件应为 server.connected
-    curl -sS --max-time 2 "${AUTH[@]}" "${BASE}/event?directory=${DIR}" || true
-    # 手工 CLI 检查（不要自动化 TUI）：opencode attach http://127.0.0.1:<p> --session $SID
+    ev=$(curl -sS --max-time 2 "${AUTH[@]}" "${BASE}/event?directory=${DIR}" || true)
+    echo "$ev" | grep -q 'server.connected'
+    if ! grep -q "Error: Session not found" <(opencode --port "$P2" --hostname 127.0.0.1 --session missing-id 2>&1 || true); then
+      echo "FAIL: invalid --session must exit before HTTP ready with 'Error: Session not found'" >&2
+      exit 1
+    fi
+    opencode --port "$P2" --hostname 127.0.0.1 --session "$SID" >/tmp/ocdeck-contract-p2.log 2>&1 &
+    pid2=$!
+    BASE2=http://127.0.0.1:${P2}
+    ready2=0
+    for i in $(seq 1 50); do
+      if curl -sS -o /dev/null -w '%{http_code}' "${AUTH[@]}" "${BASE2}/global/health" | grep -q '^200$'; then
+        ready2=1
+        break
+      fi
+      sleep 0.1
+    done
+    [[ "$ready2" == "1" ]]
+    curl -sS --fail-with-body "${AUTH[@]}" "${BASE2}/session?directory=${DIR}&limit=20" | grep -q "$SID"
     curl -sS --fail-with-body "${AUTH[@]}" -X DELETE "${BASE}/session/${SID}?directory=${DIR}"
 EOF
 

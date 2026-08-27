@@ -67,6 +67,25 @@ type TaskStore interface {
 	// 实际推进（P1.4.5 结构化）。不加跨任务唯一索引；冲突语义由调用方按入口处理
 	//（SSE/对齐忽略+诊断，锚定失败+last_error）。
 	ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error)
+	// ClaimTaskSessionAndSetAnchor 单事务 claim + 写入 tasks.anchor_session_id（D5）。
+	// 冲突时归属与 anchor 均不修改。
+	ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error)
+	// ClearTaskAnchorConditional 条件清空锚定（D5 CAS）：Matched=命中并清空。
+	ClearTaskAnchorConditional(ctx context.Context, taskID, oldAnchor string) (application.MutationResult, error)
+	// AcquireRecoveryPermit 原子写入一条 attempt 记录并返回窗口内 ordinal（D3）。
+	AcquireRecoveryPermit(ctx context.Context, taskID string, now int64) (AcquirePermitResult, error)
+	// CompleteRecoveryFailure 条件事务：expected=activating 时原子完成
+	// status=suspended + last_error + 清 env_snapshot；CAS 失配三字段均不改。
+	CompleteRecoveryFailure(ctx context.Context, id string, lastError sql.NullString) (application.TransitionResult, error)
+	// CasActivationIfNoRecoveryDebt 激活准入原子事务（G3-18）：存在未清 recovery
+	// debt → store.ErrRecoveryDebtPresent（零修改），否则执行 from→to CAS。
+	CasActivationIfNoRecoveryDebt(ctx context.Context, id, fromStatus, toStatus string) (application.TransitionResult, error)
+	// CompleteRecoveryFailureAndClearDebts 单事务终态收敛 + debt 整组删除（G3-18）。
+	CompleteRecoveryFailureAndClearDebts(ctx context.Context, id string, lastError sql.NullString) (application.TransitionResult, error)
+	// recovery_debts tagged debt（D3 pending/replay）：按 task_id 原地替换。
+	UpsertRecoveryDebt(ctx context.Context, row RecoveryDebtRow) error
+	DeleteRecoveryDebt(ctx context.Context, taskID string) error
+	ListRecoveryDebts(ctx context.Context) ([]RecoveryDebtRow, error)
 	// TouchOwnedTaskSession 条件 UPDATE 仅本任务已归属行的 last_seen_at（D8）。
 	// 绝不插入；MutationResult.Matched=命中归属行（同值为 Matched+!Changed），!Matched
 	//（未归属行）为正常路径。供 session.updated 事件使用（MUST NOT 创建归属）。
@@ -79,6 +98,24 @@ type TaskStore interface {
 	// ListActiveTaskOverview 聚合全部 active 任务的跨项目概览
 	//（cross-project-active-sessions D2：JOIN projects + LEFT JOIN task_sessions）。
 	ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOverviewRow, error)
+}
+
+// AcquirePermitResult 是 AcquireRecoveryPermit 的结构化结果（对齐 store.AcquirePermitResult）。
+type AcquirePermitResult struct {
+	Acquired bool
+	Ordinal  int
+}
+
+// RecoveryDebtRow 对齐 store.RecoveryDebtRow（D3 tagged debt）。
+type RecoveryDebtRow struct {
+	TaskID      string
+	Phase       string
+	SessionName string
+	Tickets     string
+	Reason      string
+	Retryable   bool
+	Cause       string
+	CreatedAt   int64
 }
 
 // CleanupDebtStore 持久化未收敛的 orphan cleanup tickets（design.md §10）。
@@ -171,6 +208,11 @@ type Manager struct {
 	// nil 防御回退默认值（直接 &Manager{} 构造的测试）。
 	probeColdStartBackoffFn func() []time.Duration
 
+	// nowUnixFn / recoveryBackoffFn 供 D3 恢复预算确定性测试注入。
+	// nil 时 nowUnixFn 回退 time.Now().Unix()；recoveryBackoffFn 回退 5s/15s/45s。
+	nowUnixFn         func() int64
+	recoveryBackoffFn func(ordinal int) time.Duration
+
 	// serveReadyTimeout / serveReadyPollInterval 控制 waitServeReady* 健康轮询墙钟预算。
 	// 生产默认 10s / 500ms（零值回退）；测试可注入更短值，不得改变生产默认。
 	serveReadyTimeout      time.Duration
@@ -214,10 +256,13 @@ type Manager struct {
 	debtStore CleanupDebtStore
 
 	// shutdownGate 控制自动激活触发准入（B2）：Shutdown 开始后拒绝新自动激活触发。
-	// shutdownGateMu 保护 shutdownStarted 与 autoActivateWG；autoActivateWG 登记所有
-	// triggerActivate goroutine，供 Shutdown 等待自动激活收尾后再清理。
+	// shutdownGateMu 保护 shutdownStarted/shutdownCh 与 autoActivateWG；autoActivateWG
+	// 登记所有 triggerActivate goroutine，供 Shutdown 等待自动激活收尾后再清理。
+	// shutdownCh 在 gate 关闭时 close（G3-9：恢复路径的锁等待据此即时退出，
+	// 不占满 convergeLockDeadline）。
 	shutdownGateMu  sync.Mutex
 	shutdownStarted bool
+	shutdownCh      chan struct{}
 	autoActivateWG  sync.WaitGroup
 
 	// lifecycleRunner 提供 init/pre-delete 脚本执行与 inherit 文件复制（design.md §7.1）。
@@ -243,6 +288,23 @@ type Manager struct {
 	runnerCtx    context.Context
 	runnerCancel context.CancelFunc
 	runnerWG     sync.WaitGroup
+
+	// recoveryIncidents 登记进行中的恢复 incident（fatal latch + cancel + WaitGroup，
+	// G3-1/G3-7）；tagged debt 的权威载荷在 store.recovery_debts（G3-3），无内存镜像。
+	recoveryIncidentsMu sync.Mutex
+	recoveryIncidents   map[string]*recoveryIncident
+	recoveryWG          sync.WaitGroup
+
+	// recoveryWakes 是恢复退避的状态/token invalidation 唤醒通道（G3-7）：
+	// setRuntime/clearRuntime/状态写入路径 close 当前通道，退避中的 incident 即时
+	// 复核 continuation（状态已离 activating / token 失效 → 立即取消，不等满 timer）。
+	recoveryWakeMu sync.Mutex
+	recoveryWakes  map[string]chan struct{}
+
+	// recoveryDebtFallbacks 是 debt 落盘失败（store 不可写）时的内存重试队列
+	//（G3-11）：后台周期/Shutdown 重试 upsert，未刷空错误由 Shutdown 传播。
+	recoveryDebtFallbackMu sync.Mutex
+	recoveryDebtFallbacks  []RecoveryDebtRow
 }
 
 // orphanFailure 记录孤儿会话清理失败项（F3）：会话名 + kill 失败产生的 cleanup tickets。
@@ -275,15 +337,23 @@ type taskRuntime struct {
 	mu          sync.Mutex
 }
 
+// runtimeRole 是 RuntimeGroup.Role 的强类型（design D2）。
+type runtimeRole string
+
+const (
+	roleRuntime runtimeRole = "runtime"
+	roleShell   runtimeRole = "shell"
+)
+
 // runtimeGroup 对应 design.md §2 RuntimeGroup。
 type runtimeGroup struct {
-	Role        string // serve / tui / shell
+	Role        runtimeRole
 	SessionName string
 	InstVersion runtime.InstVersion
 }
 
 // registerGroup 写入注册表（B4：groups 真实写入，回调校验依据）。
-func (rt *taskRuntime) registerGroup(role, sessionName string) {
+func (rt *taskRuntime) registerGroup(role runtimeRole, sessionName string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	rt.groups[sessionName] = &runtimeGroup{
@@ -344,6 +414,9 @@ func New(opts Options) *Manager {
 		runtimeRegistry:         runtime.New(),
 		rand4Fn:                 rand4,
 		probeColdStartBackoffFn: defaultProbeColdStartBackoff,
+		recoveryIncidents:       make(map[string]*recoveryIncident),
+		recoveryWakes:           make(map[string]chan struct{}),
+		shutdownCh:              make(chan struct{}),
 	}
 	if m.ocFactory == nil {
 		m.ocFactory = defaultOCFactory
@@ -388,13 +461,16 @@ func (m *Manager) tryLockTask(taskID string) (func(), error) {
 	return func() { kl.mu.Unlock() }, nil
 }
 
-// lockTaskWait 等待获取任务级互斥锁，感知 ctx 取消与内部 deadline。仅 ReopenAttach 使用：
-// 可等待并复查资源后幂等复用（design.md §21：并发 REST/WS 重开幂等复用同一新 TUI 会话）。
+// lockTaskWait 等待获取任务级互斥锁，感知 ctx 取消与内部 deadline。仅 ReopenAttach 使用。
+// G4-3（attempt 2）：等待器只负责拿锁与 not-found 复查，不再做 active 状态复查——
+// 等锁期间 active→activating（并发恢复启动）是合法迁移，若此处判 invalid_state 会
+// 让 ReopenAttach 到不了 activating 分支 → WS 4010（前端停止重连）。拿锁后的完整
+// D8 状态分派（activating→recovering / active→继续 / 其他→invalid_state）统一由
+// 调用方执行，等锁期间被挂起/删除同样由调用方按 D8 表落 invalid_state。
 // taskBusy 机制：
 //   - 内部 deadline（30s）：超时返回 409 conflict "任务忙，请稍后重试"，不得无限等待；
-//   - 拿锁后 MUST 复查任务状态：等待期间任务可能被挂起/删除，非 active → invalid_state
-//     （释放锁后返回，不执行副作用）；
-//   - 现有 ctx 取消感知保留；ReopenAttach 幂等复用语义不变。
+//   - 拿锁后仅复查任务存在（not found → 释放锁返回 not_found，不执行副作用）；
+//   - ctx 取消感知保留。
 //
 // waiter 泄漏修复（R7 TOCTOU）：goroutine 拿锁后通过 select 把锁所有权交给调用方或
 // 在 waitCtx 取消时释放锁——发送与接收同步（unbuffered channel），不存在"检查 abandoned
@@ -402,13 +478,13 @@ func (m *Manager) tryLockTask(taskID string) (func(), error) {
 // select 必走 waitCtx.Done 分支释放锁，锁最终必然可被后续操作获取。
 //
 // 返回 unlock；ctx 取消返回 ctx.Err()（包装为 conflict）；deadline 超时返回 conflict；
-// 拿锁后状态非 active 返回 invalid_state（已释放锁）。
+// 任务不存在返回 not_found（已释放锁）。
 func (m *Manager) lockTaskWait(ctx context.Context, taskID string) (func(), error) {
 	v, _ := m.keyedMu.LoadOrStore(taskID, &keyedLock{})
 	kl := v.(*keyedLock)
 	// TryLock 快路径：无冲突直接返回。
 	if kl.mu.TryLock() {
-		return m.recheckActiveOrUnlock(ctx, taskID, kl)
+		return m.recheckExistsOrUnlock(ctx, taskID, kl)
 	}
 	// 等待路径：unbuffered channel + waitCtx 驱动的锁所有权移交。
 	waitCtx, waitCancel := context.WithTimeout(ctx, lockWaitDeadline)
@@ -426,7 +502,7 @@ func (m *Manager) lockTaskWait(ctx context.Context, taskID string) (func(), erro
 	}()
 	select {
 	case <-lockedCh:
-		return m.recheckActiveOrUnlock(ctx, taskID, kl)
+		return m.recheckExistsOrUnlock(ctx, taskID, kl)
 	case <-waitCtx.Done():
 		// ctx 取消或 deadline 超时：goroutine 会经 waitCtx.Done 释放锁。
 		// 区分：ctx 自身取消 → 包装 ctx.Err()；deadline 超时 → errTaskBusy。
@@ -437,17 +513,12 @@ func (m *Manager) lockTaskWait(ctx context.Context, taskID string) (func(), erro
 	}
 }
 
-// recheckActiveOrUnlock 拿锁后复查任务状态：非 active 释放锁并返回 invalid_state。
-// 等待期间任务可能被挂起/删除，拿锁后不得直接执行副作用。
-func (m *Manager) recheckActiveOrUnlock(ctx context.Context, taskID string, kl *keyedLock) (func(), error) {
-	row, err := m.store.GetTask(ctx, taskID)
-	if err != nil {
+// recheckExistsOrUnlock 拿锁后复查任务存在：不存在释放锁并返回 not_found（不执行
+// 副作用）。状态分派（active/activating/其他）由调用方统一执行（G4-3 attempt 2）。
+func (m *Manager) recheckExistsOrUnlock(ctx context.Context, taskID string, kl *keyedLock) (func(), error) {
+	if _, err := m.store.GetTask(ctx, taskID); err != nil {
 		kl.mu.Unlock()
 		return nil, newOpErr(codeNotFound, fmt.Errorf("task not found: %w", err))
-	}
-	if row.Status != StatusActive {
-		kl.mu.Unlock()
-		return nil, newOpErr(codeInvalidState, fmt.Errorf("task %s no longer active (got %s) after lock wait", taskID, row.Status))
 	}
 	return func() { kl.mu.Unlock() }, nil
 }
@@ -508,10 +579,17 @@ func (m *Manager) getRuntime(taskID string) *taskRuntime {
 }
 
 // setRuntime 设置任务的运行时。
+// G3-19：不在此处挂钩 incident attempt token——通用挂钩会把新代 runtime token
+// 绑到「注册表当前 incident」（Complete 已改状态但旧 incident 未注销时，新
+// Activate 的 runtime 会被旧 incident 误认领）。token 绑定由 recovery attempt
+// 经 commitRuntimeReady 的 onRegister 回调显式完成。
 func (m *Manager) setRuntime(taskID string, rt *taskRuntime) {
 	m.rtMu.Lock()
-	defer m.rtMu.Unlock()
 	m.runtimes[taskID] = rt
+	m.rtMu.Unlock()
+	// G3-7：token 代际变化即时唤醒恢复退避复核（新 runtime 注册 → 旧 incident
+	// trigger 失效，不得等满退避 timer 才发现）。
+	m.wakeRecoveryIncident(taskID)
 }
 
 // clearRuntime 移除任务的运行时并停止其 SSE/退出监视。
@@ -528,6 +606,7 @@ func (m *Manager) clearRuntime(taskID string) {
 		rt.clearAgentStatus()
 		rt.stopAll()
 	}
+	m.wakeRecoveryIncident(taskID)
 }
 
 // stopAll 停止该运行时的 SSE 订阅与退出监视（design.md §4 lifecycle 收敛）。
@@ -621,6 +700,13 @@ func (m *Manager) backgroundLoop(ctx context.Context) {
 			if err := m.processRetryableNotices(ctx); err != nil {
 				log.Printf("background: retryable notices: %v", err)
 			}
+			// G3-11：重试落盘失败的 debt 内存队列（成功后才可被重放）。
+			if err := m.flushRecoveryDebtFallbacks(ctx); err != nil {
+				log.Printf("background: flush recovery debt fallbacks: %v", err)
+			}
+			if err := m.replayRecoveryDebts(ctx); err != nil {
+				log.Printf("background: replay recovery debts: %v", err)
+			}
 			if err := m.retryOrphanSessions(ctx); err != nil {
 				// B2：后台周期不阻塞，但 cleanup_debt 持久化错误 MUST 记录（不静默吞没）。
 				log.Printf("background: retry orphan sessions: %v", err)
@@ -652,8 +738,14 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	// 再执行既有清理。消灭窗口：kill 模式 shutdown 枚举后再建 tmux 会话；
 	// persist 模式 Shutdown 返回后继续注册 runtime/访问 store。
 	m.shutdownGateMu.Lock()
-	m.shutdownStarted = true
+	if !m.shutdownStarted {
+		m.shutdownStarted = true
+		// shutdownCh 在 New 构造（非 nil），此处仅 close：锁等待者捕获的是同一通道
+		//（G3-9），close 即时唤醒；重复 Shutdown 不二次 close。
+		close(m.shutdownCh)
+	}
 	m.shutdownGateMu.Unlock()
+	m.cancelAllRecoveryIncidents()
 
 	// §6.1 固定顺序：关 gate → cancel runnerCtx → wait runnerWG → 关 store。
 	// runnerCtx cancel 紧随 gate 关闭，立即终止在跑脚本进程组，避免被持锁 pre-delete 拉长 Shutdown。
@@ -698,6 +790,29 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	if err := m.processRetryableNotices(ctx); err != nil {
 		log.Printf("shutdown: final retryable notice sweep: %v", err)
 	}
+	// G3-7：等待进行中恢复 incident 收尾（cancelAllRecoveryIncidents 已即时取消退避）。
+	waitRecovery := make(chan struct{})
+	go func() {
+		m.recoveryWG.Wait()
+		close(waitRecovery)
+	}()
+	select {
+	case <-waitRecovery:
+	case <-ctx.Done():
+		log.Printf("shutdown: timed out waiting for recovery incidents: %v", ctx.Err())
+	}
+	var killErr error
+	// G3-11：先刷内存 debt 重试队列（落盘成功才可被重放），未刷空的错误 MUST 传播。
+	if err := m.flushRecoveryDebtFallbacks(ctx); err != nil {
+		log.Printf("shutdown: flush recovery debt fallbacks: %v", err)
+		killErr = fmt.Errorf("shutdown: flush recovery debt fallbacks: %w", err)
+	}
+	// G3-3：Shutdown 重放 durable tagged debt（被取消 incident 留下的 activating 由
+	// Complete 收敛；写库失败 MUST 记录并传播）。
+	if err := m.replayRecoveryDebts(ctx); err != nil {
+		log.Printf("shutdown: replay recovery debts: %v", err)
+		killErr = errors.Join(killErr, fmt.Errorf("shutdown: replay recovery debts: %w", err))
+	}
 	// R7：收割内存 orphanFailures（kill 失败的孤儿会话 tickets，非仅 DB notice）。
 	// 后台周期已停（bgCancel），关停时 MUST 主动调用一次 retryOrphanSessions，避免逃逸进程
 	// tickets 仅存内存随进程退出丢失（design.md §10：runtime 已空 = 无会话且无可重试 cleanup debt，
@@ -708,9 +823,8 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	}
 	// kill 模式：按 shutdownPolicy 清理全部任务会话，确认 runtime 已空。
 	policy := m.cfg.ShutdownPolicy
-	var killErr error
 	if policy == config.ShutdownKillOnStart || policy == config.ShutdownKillImmediate {
-		killErr = m.shutdownKillAllSessions(ctx)
+		killErr = errors.Join(killErr, m.shutdownKillAllSessions(ctx))
 		if killErr != nil {
 			// 记录但继续停 runtime goroutine，避免 goroutine 泄漏；错误向上传播。
 			log.Printf("shutdown: kill all sessions: %v", killErr)
@@ -718,11 +832,12 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	} else {
 		// persist 模式：会话保留（tmux 持有），但 orphanFailures 非空意味着仍有未收割的逃逸进程
 		// tickets，不得视为干净退出（design.md §10）。返回错误让调用方感知。
+		// G3-17：join 而非赋值——fallback flush/replay 等先行错误不得被覆盖。
 		m.orphanMu.Lock()
 		orphanRemaining := len(m.orphanFailures)
 		m.orphanMu.Unlock()
 		if orphanRemaining > 0 {
-			killErr = fmt.Errorf("shutdown: %d orphan cleanup tickets remain (persist mode)", orphanRemaining)
+			killErr = errors.Join(killErr, fmt.Errorf("shutdown: %d orphan cleanup tickets remain (persist mode)", orphanRemaining))
 		}
 	}
 	// P4 复评阻塞 3c：shutdownKillAllSessions 新产生的 orphan tickets MUST 再次持久化
@@ -779,10 +894,10 @@ func (m *Manager) shutdownKillAllSessions(ctx context.Context) error {
 			killFailed = true
 			continue
 		}
-		// KillResult disposition 判定（design.md §10/§8）：clean 视为已收割；
-		// 非 clean（snapshot_failed/kill_failed/reap_failed/snapshot_missing_degraded）MUST 持久化 tickets
-		// 为 notice（逃逸进程下次启动可定位），不得随会话删除丢弃。
-		if res.Disposition != "" && res.Disposition != process.DispositionClean {
+		// KillResult 经 classifyKillResult 完整表：仅一致 clean 视为已收割；
+		// 未知/矛盾与非 clean MUST 持久化 tickets 为 notice（逃逸进程下次启动可定位），
+		// 不得随会话删除丢弃（design.md §10/§8）。
+		if classifyKillResult(res).action != "none" {
 			// 已知 task：tickets 落该 task 的 DB notice（下次启动 reconcile 经 retryTaskNotices 处理）。
 			// 无 DB 行的孤儿会话：退回内存 orphanFailures，供后台周期 retryOrphanSessions 重试（F3）。
 			if tid := taskIDFromSessionName(name); tid != "" {
@@ -884,7 +999,7 @@ func (m *Manager) retryOrphanSessions(ctx context.Context) error {
 		}
 		if alive {
 			res, kerr := m.proc.KillSession(f.sessionName)
-			if kerr != nil || (res.Disposition != "" && res.Disposition != process.DispositionClean) {
+			if kerr != nil || classifyKillResult(res).action != "none" {
 				// kill 失败：聚合新 tickets 与既有 remaining（不覆盖丢失）。
 				// R7 fail-closed：kill infra 错误时保留既有 f.tickets（reap 可能已清但 kill 失败
 				// 意味会话仍可能存活，保守保留原始 tickets 进下轮重试，design.md §5/§10）。

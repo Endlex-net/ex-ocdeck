@@ -532,7 +532,7 @@ func (m *Manager) applySessionStatusEvent(taskID string, ev opencode.Event, mode
 // 新代）；仅投影真实变化时发布（design D4）。
 func (m *Manager) handleAgentStatusDisconnect(taskID string, rt *taskRuntime, epoch uint64) {
 	cur := m.getRuntime(taskID)
-	if cur == nil || !cur.matchesRegistry(rt.instVersion, serveSessionName(taskID)) {
+	if cur == nil || !cur.matchesRegistry(rt.instVersion, runtimeSessionName(taskID)) {
 		return
 	}
 	m.applyAgentStatusAndCommit(taskID, cur, agentStatusOp{kind: agentOpDisconnect, epoch: epoch})
