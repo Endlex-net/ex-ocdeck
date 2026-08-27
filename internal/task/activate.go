@@ -524,8 +524,16 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 // onRegister（仅 Recovery 传入，G3-19）：runtime 发布前回调，把本 attempt 的新
 // token 显式绑定到发起 incident（不经 setRuntime 通用挂钩，避免误绑新代 token）。
 func (m *Manager) commitRuntimeReady(ctx context.Context, taskID, wtPath, runtimeName string, port int, password string, mode AlignMode, onRegister func(rt *taskRuntime)) error {
-	if alive, _ := m.proc.HasSession(runtimeName); !alive {
-		_, _ = m.proc.KillSession(runtimeName)
+	// 注册前探活：HasSession infra 与 absent 必须拆开。本函数 MUST NOT 本地
+	// KillSession——KillResult（含 nil error + reap_failed tickets，reaper.go）
+	// 若在此丢弃，会话已删后外层补偿只看到 absent，tickets 永久丢失。
+	// 唯一清理 owner：Activate → runActivateFailureCompensation /
+	// cleanupActivationRuntimeCollect；Recovery → confirmRuntimeTerminated。
+	alive, herr := m.proc.HasSession(runtimeName)
+	if herr != nil && !errors.Is(herr, process.ErrNoTmuxServer) {
+		return newOpErr(codeProcessError, fmt.Errorf("runtime session probe before register: %w", herr))
+	}
+	if !alive {
 		return newOpErr(codeProcessError, fmt.Errorf("runtime session gone before runtime register"))
 	}
 	rt := m.newRuntime(taskID)
@@ -1763,8 +1771,13 @@ func (m *Manager) handleServeExit(taskID string, tok runtime.InstVersion) {
 }
 
 // convergeToSuspended 收敛活跃任务到 suspended（design.md §4：不得留 active 但无 SSE 托管的运行时）。
-// single-process D4 起 watcher/SSE 永久失败统一走幂等 ensureRecovery（不再直接落挂起），
-// 本收敛族保留为显式收敛原语（D2 attention 失效矩阵入口；converge_debt 测试直接消费）——
+//
+// Phase 5：single-process D4 起 watcher/SSE 永久失败统一走幂等 ensureRecovery，
+// 本收敛族无生产 debt producer/入口（不再从 fatal runtime 事件登记 converge debt）；
+// backgroundLoop 的 processConvergeDebts consumer 仍按周期执行，消化历史/测试登记的
+// 两阶段债务。保留理由：既有测试以本族为收敛原语直接消费（D2 attention 失效矩阵、
+// 锁超时两阶段债务合同）。新增生产代码 MUST NOT 接入本族（统一走 ensureRecovery /
+// cleanupTaskRuntimeReconcile）。
 // 令牌校验在 convergeToSuspendedChecked 内统一完成（拿锁后按触发令牌比对当前 runtime）。
 func (m *Manager) convergeToSuspended(taskID, reason string, tok runtime.InstVersion) {
 	m.convergeToSuspendedChecked(taskID, reason, tok)

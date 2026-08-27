@@ -500,11 +500,12 @@ func (m *Manager) deleteOCSessions(ctx context.Context, row TaskRow) error {
 				errs = append(errs, nerr)
 			}
 		} else {
+			cls := classifyKillResult(res)
 			if nerr := m.recordResidualNoticeFromDisposition(ctx, row.ID, serveName, res); nerr != nil {
 				errs = append(errs, nerr)
 			}
-			if res.Disposition != "" && res.Disposition != process.DispositionClean {
-				errs = append(errs, fmt.Errorf("temp serve %s cleanup not clean: %s", serveName, res.Disposition))
+			if cls.action != "none" {
+				errs = append(errs, fmt.Errorf("temp serve %s cleanup not clean: %s", serveName, cls.reason))
 			}
 		}
 	}
@@ -539,8 +540,8 @@ func (m *Manager) startTempServe(ctx context.Context, row TaskRow) (int, string,
 		if nerr := m.recordResidualNoticeFromDisposition(ctx, row.ID, serveName, res); nerr != nil {
 			return 0, "", fmt.Errorf("temp serve health check: %w; record notice: %v", err, nerr)
 		}
-		if res.Disposition != "" && res.Disposition != process.DispositionClean {
-			return 0, "", fmt.Errorf("temp serve health check: %w; cleanup not clean: %s", err, res.Disposition)
+		if cls := classifyKillResult(res); cls.action != "none" {
+			return 0, "", fmt.Errorf("temp serve health check: %w; cleanup not clean: %s", err, cls.reason)
 		}
 		return 0, "", fmt.Errorf("temp serve health check: %w", err)
 	}
@@ -582,12 +583,14 @@ func (m *Manager) killResidualSessions(ctx context.Context, taskID string) error
 			}
 			continue
 		}
-		if res.Disposition != "" && res.Disposition != process.DispositionClean {
-			if nerr := m.recordResidualNoticeFromDisposition(ctx, taskID, name, res); nerr != nil {
-				errs = append(errs, fmt.Errorf("kill residual session %s: %s; record notice: %w", name, res.Disposition, nerr))
-			} else {
-				errs = append(errs, fmt.Errorf("kill residual session %s: %s", name, res.Disposition))
-			}
+		cls := classifyKillResult(res)
+		if cls.action == "none" {
+			continue
+		}
+		if nerr := m.recordResidualNoticeFromDisposition(ctx, taskID, name, res); nerr != nil {
+			errs = append(errs, fmt.Errorf("kill residual session %s: %s; record notice: %w", name, cls.reason, nerr))
+		} else {
+			errs = append(errs, fmt.Errorf("kill residual session %s: %s", name, cls.reason))
 		}
 	}
 	return errors.Join(errs...)
@@ -641,9 +644,12 @@ func (m *Manager) retryDebt(ctx context.Context, taskID string, entries []notice
 					// B8：kill 错误不得忽略。同样保留当前 + 后续未处理 entry。
 					return appendRemaining(remaining, entries[i:]), fmt.Errorf("kill session %s: %w", sessionName, kerr)
 				}
-				if res.Disposition != "" && res.Disposition != process.DispositionClean {
+				cls := classifyKillResult(res)
+				if cls.action != "none" {
 					tickets = append(tickets, res.CleanupTickets...)
 					e.Data["cleanupTickets"] = tickets
+					e.Data["reason"] = cls.reason
+					e.Data["retryable"] = cls.retryable
 					remaining = append(remaining, e)
 					continue
 				}

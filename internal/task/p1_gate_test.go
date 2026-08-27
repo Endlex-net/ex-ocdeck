@@ -663,14 +663,19 @@ func TestReopenAttach_ConcurrentIdempotentReuse(t *testing.T) {
 	}
 }
 
-// TestReopenAttach_RecreatesMissingTUI 验证 TUI 消失时 ReopenAttach 重建并注册 group。
-// 与幂等复用互补：无 TUI → 建新 TUI；有 TUI → 复用。
+// TestReopenAttach_RecreatesMissingTUI 验证 runtime 缺失时 ReopenAttach 的 D8 新语义：
+// active + 会话缺失 → typed recovering + 异步触发恢复；恢复收敛后 runtime 在位 →
+// 返回 -runtime terminal id，再调用幂等复用。
+// 旧语义（重建独立 TUI 会话）已随单进程化移除；本测试同步等待后台恢复 goroutine
+//（Phase 4 起 ReopenAttach 对缺失 runtime 异步 ensureRecoveryFromAttach）收敛后再
+// 断言——不得在恢复未结束时直接改 mockProc 字段（-race 下与后台 goroutine 竞争）。
 func TestReopenAttach_RecreatesMissingTUI(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
 	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
+	m.SetLifecycleCtx(context.Background())
 	tid, err := m.ReopenAttach(context.Background(), "t1")
 	if err == nil {
 		t.Fatal("ReopenAttach without runtime must return recovering")
@@ -679,7 +684,18 @@ func TestReopenAttach_RecreatesMissingTUI(t *testing.T) {
 		t.Fatalf("code=%s want recovering, err=%v", OpErrorCode(err), err)
 	}
 	_ = tid
-	proc.sessions[runtimeSessionName("t1")] = true
+	// 等待后台恢复收敛。单一三条件谓词（status==active && 无进行中 incident &&
+	// runtime 会话存活）同时成立才判定完成——分段等待（先 status 再 incidents）在
+	// 「恢复尚未启动」窗口会被初始 active 状态误判为已收敛。收敛前不得直接写
+	// proc 字段（-race 下与后台 goroutine 竞争）。
+	waitFor(t, 10*time.Second, func() bool {
+		row, _ := store.GetTask(context.Background(), "t1")
+		m.recoveryIncidentsMu.Lock()
+		busy := len(m.recoveryIncidents) > 0
+		m.recoveryIncidentsMu.Unlock()
+		alive, _ := proc.HasSession(runtimeSessionName("t1"))
+		return row.Status == StatusActive && !busy && alive
+	})
 	tid, err = m.ReopenAttach(context.Background(), "t1")
 	if err != nil {
 		t.Fatalf("ReopenAttach (runtime present): %v", err)
@@ -687,7 +703,7 @@ func TestReopenAttach_RecreatesMissingTUI(t *testing.T) {
 	if string(tid) != runtimeSessionName("t1") {
 		t.Errorf("tid = %s, want %s", tid, runtimeSessionName("t1"))
 	}
-	// 再调用一次：复用已建 TUI（幂等）。
+	// 再调用一次：复用已恢复的 runtime（幂等）。
 	namesBefore := proc.newSessionNamesSnapshot()
 	tid2, err := m.ReopenAttach(context.Background(), "t1")
 	if err != nil {

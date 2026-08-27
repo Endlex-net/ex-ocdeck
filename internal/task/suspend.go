@@ -175,7 +175,7 @@ func hasKillFailure(results []killResultEntry) bool {
 		if r.killErr != nil {
 			return true
 		}
-		if r.result.Disposition != "" && r.result.Disposition != process.DispositionClean {
+		if classifyKillResult(r.result).action != "none" {
 			return true
 		}
 	}

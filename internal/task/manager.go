@@ -894,10 +894,10 @@ func (m *Manager) shutdownKillAllSessions(ctx context.Context) error {
 			killFailed = true
 			continue
 		}
-		// KillResult disposition 判定（design.md §10/§8）：clean 视为已收割；
-		// 非 clean（snapshot_failed/kill_failed/reap_failed/snapshot_missing_degraded）MUST 持久化 tickets
-		// 为 notice（逃逸进程下次启动可定位），不得随会话删除丢弃。
-		if res.Disposition != "" && res.Disposition != process.DispositionClean {
+		// KillResult 经 classifyKillResult 完整表：仅一致 clean 视为已收割；
+		// 未知/矛盾与非 clean MUST 持久化 tickets 为 notice（逃逸进程下次启动可定位），
+		// 不得随会话删除丢弃（design.md §10/§8）。
+		if classifyKillResult(res).action != "none" {
 			// 已知 task：tickets 落该 task 的 DB notice（下次启动 reconcile 经 retryTaskNotices 处理）。
 			// 无 DB 行的孤儿会话：退回内存 orphanFailures，供后台周期 retryOrphanSessions 重试（F3）。
 			if tid := taskIDFromSessionName(name); tid != "" {
@@ -999,7 +999,7 @@ func (m *Manager) retryOrphanSessions(ctx context.Context) error {
 		}
 		if alive {
 			res, kerr := m.proc.KillSession(f.sessionName)
-			if kerr != nil || (res.Disposition != "" && res.Disposition != process.DispositionClean) {
+			if kerr != nil || classifyKillResult(res).action != "none" {
 				// kill 失败：聚合新 tickets 与既有 remaining（不覆盖丢失）。
 				// R7 fail-closed：kill infra 错误时保留既有 f.tickets（reap 可能已清但 kill 失败
 				// 意味会话仍可能存活，保守保留原始 tickets 进下轮重试，design.md §5/§10）。

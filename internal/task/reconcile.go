@@ -620,7 +620,7 @@ func (m *Manager) killOrphanSession(ctx context.Context, name string) error {
 		return nil
 	}
 	res, err := m.proc.KillSession(name)
-	if err != nil || (res.Disposition != "" && res.Disposition != process.DispositionClean) {
+	if err != nil || classifyKillResult(res).action != "none" {
 		log.Printf("reconcile: kill orphan session %s failed (disposition=%s err=%v)", name, res.Disposition, err)
 		if perr := m.recordOrphanFailure(ctx, name, res.CleanupTickets); perr != nil {
 			if err != nil {
