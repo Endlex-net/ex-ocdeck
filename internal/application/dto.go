@@ -151,8 +151,20 @@ type GitStatusDTO struct {
 	Files  []GitFileDTO `json:"files"`
 }
 
-// GitDiffDTO diff 响应（unified diff 文本 + 截断标记，design.md §21 git/diff）。
+// GitDiffDTO diff 响应（单文件两侧版本内容，design.md §21 git/diff、codemirror-git-diff design D1）。
+// 八字段 MUST 始终全部返回：oldContent/newContent 为两侧内容（UTF-8 文本契约，不承诺字节级
+// round-trip），任一侧不存在（oldExists/newExists=false）时该侧内容与 mode 为空串；
+// oldMode/newMode 为该侧 git 八进制 mode 文本（100644/100755/120000/160000，取自 ref/index
+// 探测记录或工作区类型/权限位）；isBinary=任一侧二进制（前 8000 字节含 NUL，mode 为
+// 120000/160000 的侧不参与嗅探），置位时两侧内容为空；truncated=任一侧内容大小超 512KB 的
+// 截断标记，MUST NOT 兼任二进制含义。派生规则以 git-operations spec「文件 diff 查看」为唯一来源。
 type GitDiffDTO struct {
-	Diff      string `json:"diff"`
-	Truncated bool   `json:"truncated"`
+	OldContent string `json:"oldContent"`
+	NewContent string `json:"newContent"`
+	OldExists  bool   `json:"oldExists"`
+	NewExists  bool   `json:"newExists"`
+	OldMode    string `json:"oldMode"`
+	NewMode    string `json:"newMode"`
+	IsBinary   bool   `json:"isBinary"`
+	Truncated  bool   `json:"truncated"`
 }

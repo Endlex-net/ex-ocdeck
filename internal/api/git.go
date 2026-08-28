@@ -28,8 +28,8 @@ func (s *Server) registerGitRoutes(mux *http.ServeMux) {
 // 复用 application.GitStatusDTO（JSON 字段与既有前端契约一致）。
 type gitStatusResponse = application.GitStatusDTO
 
-// gitDiffResponse diff 响应（unified diff 文本 + 截断标记）。
-// 复用 application.GitDiffDTO（JSON 字段与既有前端契约一致）。
+// gitDiffResponse diff 响应（单文件两侧版本内容 + 存在性/mode/二进制/截断标记，八字段契约，
+// codemirror-git-diff design D1）。复用 application.GitDiffDTO。
 type gitDiffResponse = application.GitDiffDTO
 
 // gitCommitReq commit 请求体。paths 为空表示提交全部改动。
@@ -51,11 +51,12 @@ func (s *Server) handleGitStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(st)
 }
 
-// handleGitDiff GET /api/v1/tasks/:id/git/diff?ref=&path=&untracked=（design.md §9/§21、fix-git-diff）。
-// ref 可选（默认工作区 vs 索引/HEAD），path 可选（空=全仓 diff，受 DiffMaxFiles 限制）。
+// handleGitDiff GET /api/v1/tasks/:id/git/diff?ref=&path=&untracked=（design.md §9/§21、
+// codemirror-git-diff）。ref 可选（空=index stage-0，非空=该 ref 下 blob，经 rev-parse 解析）；
+// path 必填（空 path 的历史全仓 diff 形态已移除，Manager 词法校验返回 invalid_input）。
 // untracked 查询参数值域：absent / "0" / "1"，其他值 → invalid_input。
 // untracked=1 时透传 untracked=true，调用方声明模式，服务端不二次探测。
-// 经 TaskManager.GitDiff 持任务锁，DTO 直接复用 application.GitDiffDTO。
+// 经 TaskManager.GitDiff 持任务锁，DTO 直接复用 application.GitDiffDTO（八字段）。
 func (s *Server) handleGitDiff(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
 	ref := r.URL.Query().Get("ref")

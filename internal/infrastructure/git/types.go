@@ -35,9 +35,23 @@ type FileStatus struct {
 // ErrTooManyFilesChanged 表示变更文件数超过上限。
 var ErrTooManyFilesChanged = errors.New("too many changed files")
 
-// ErrInvalidDiffPath 表示 DiffUntracked 的路径校验失败（绝对路径 / `..` 逃逸 / NUL 等）。
-// Manager 据此映射 invalid_input，MUST 用 errors.Is 判定，禁止字符串匹配。
+// ErrInvalidDiffPath 表示 diff path 词法校验失败（空 / 绝对路径 / `..` 逃逸 / NUL）。
+// Manager 阶段① 词法校验与工作区新侧读取同源调用 ValidateDiffPath，据此映射 invalid_input，
+// MUST 用 errors.Is 判定，禁止字符串匹配。
 var ErrInvalidDiffPath = errors.New("invalid diff path")
+
+// ErrUnmergedPath 表示 index 中 path 无 stage-0 记录但存在同 path 其他 stage 记录（未解决冲突）。
+// Manager 据此映射 invalid_state（MUST NOT 以「旧侧不存在」降级），errors.Is 判定。
+var ErrUnmergedPath = errors.New("unmerged path in index")
+
+// ErrWorktreeEscape 表示新侧工作区文件 resolve 后的真实路径越出 worktree 根（中间级 symlink 逃逸）。
+// Manager 据此映射 invalid_input，errors.Is 判定。
+var ErrWorktreeEscape = errors.New("worktree path escape")
+
+// ErrSubmoduleDirtyProbe 表示子模块 dirty 探测（git status --porcelain）执行失败。
+// Manager 据此映射 git_error 并透传 stderr（spec 错误映射：MUST NOT 静默按 clean 处理，
+// 否则丢失 -dirty 可见语义），errors.Is 判定。
+var ErrSubmoduleDirtyProbe = errors.New("submodule dirty probe failed")
 
 // MaxStatusFiles 变更文件数上限。
 const MaxStatusFiles = 10000

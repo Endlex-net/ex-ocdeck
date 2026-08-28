@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -161,7 +162,12 @@ func TestGitAPI_Status_JsonShape(t *testing.T) {
 func TestGitAPI_Diff_JsonShape(t *testing.T) {
 	tb := newMockGitBackend()
 	tb.diffFn = func(ctx context.Context, taskID, ref, path string, untracked bool) (application.GitDiffDTO, error) {
-		return application.GitDiffDTO{Diff: "hello diff", Truncated: false}, nil
+		return application.GitDiffDTO{
+			OldContent: "old v1\n", NewContent: "new v2\n",
+			OldExists: true, NewExists: true,
+			OldMode: "100644", NewMode: "100755",
+			IsBinary: false, Truncated: false,
+		}, nil
 	}
 	s := newGitAPIServer(t, tb)
 	ts := httptest.NewServer(s.mux)
@@ -175,12 +181,50 @@ func TestGitAPI_Diff_JsonShape(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	var d gitDiffResponse
-	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if d.Diff != "hello diff" {
-		t.Errorf("diff = %q, want 'hello diff'", d.Diff)
+	// 断言精确键集（codemirror-git-diff 八字段契约，旧 "diff" 字段已移除）。
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatal(err)
+	}
+	wantKeys := map[string]bool{
+		"oldContent": false, "newContent": false,
+		"oldExists": false, "newExists": false,
+		"oldMode": false, "newMode": false,
+		"isBinary": false, "truncated": false,
+	}
+	for k := range raw {
+		if _, ok := wantKeys[k]; !ok {
+			t.Errorf("unexpected JSON key %q (old single-field diff contract leaked?)", k)
+		}
+		wantKeys[k] = true
+	}
+	for k, seen := range wantKeys {
+		if !seen {
+			t.Errorf("missing JSON key %q", k)
+		}
+	}
+	var d gitDiffResponse
+	if err := json.Unmarshal(body, &d); err != nil {
+		t.Fatal(err)
+	}
+	if d.OldContent != "old v1\n" {
+		t.Errorf("oldContent = %q, want 'old v1\\n'", d.OldContent)
+	}
+	if d.NewContent != "new v2\n" {
+		t.Errorf("newContent = %q, want 'new v2\\n'", d.NewContent)
+	}
+	if !d.OldExists || !d.NewExists {
+		t.Errorf("exists flags = (old=%v,new=%v), want both true", d.OldExists, d.NewExists)
+	}
+	if d.OldMode != "100644" || d.NewMode != "100755" {
+		t.Errorf("modes = (old=%q,new=%q), want (100644,100755)", d.OldMode, d.NewMode)
+	}
+	if d.IsBinary {
+		t.Errorf("isBinary = true, want false")
 	}
 	if d.Truncated {
 		t.Errorf("truncated = true, want false")
@@ -287,13 +331,29 @@ func TestGitAPI_ErrorMapping(t *testing.T) {
 				}
 			},
 			http.StatusNotFound, CodeNotFound},
-		{"diff git_error", "GET", "/api/v1/tasks/tk1/git/diff", "",
+		// I4：生产 Manager 词法校验先行，空 path 不可达 git_error；请求补 path=a.txt 保持可达形态。
+		{"diff git_error", "GET", "/api/v1/tasks/tk1/git/diff?path=a.txt", "",
 			func(b *mockGitBackend) {
 				b.diffFn = func(context.Context, string, string, string, bool) (application.GitDiffDTO, error) {
 					return application.GitDiffDTO{}, opErr("git_error", "fatal: bad ref")
 				}
 			},
 			http.StatusUnprocessableEntity, CodeGitError},
+		// codemirror-git-diff：unmerged index path → invalid_state；新侧非 ENOENT IO 错误 → internal。
+		{"diff invalid_state (unmerged path)", "GET", "/api/v1/tasks/tk1/git/diff?path=a.txt", "",
+			func(b *mockGitBackend) {
+				b.diffFn = func(context.Context, string, string, string, bool) (application.GitDiffDTO, error) {
+					return application.GitDiffDTO{}, opErr("invalid_state", "unmerged path in index")
+				}
+			},
+			http.StatusUnprocessableEntity, CodeInvalidState},
+		{"diff internal (new side IO error)", "GET", "/api/v1/tasks/tk1/git/diff?path=a.txt", "",
+			func(b *mockGitBackend) {
+				b.diffFn = func(context.Context, string, string, string, bool) (application.GitDiffDTO, error) {
+					return application.GitDiffDTO{}, opErr("internal", "open \"a.txt\": permission denied")
+				}
+			},
+			http.StatusInternalServerError, CodeInternal},
 		// commit
 		{"commit not_found", "POST", "/api/v1/tasks/nope/git/commit", `{"message":"m"}`,
 			func(b *mockGitBackend) {
@@ -415,9 +475,14 @@ func TestGitAPI_Diff_UntrackedParam(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			tb := newMockGitBackend()
 			var gotUntracked bool
+			var called bool
 			tb.diffFn = func(ctx context.Context, taskID, ref, path string, untracked bool) (application.GitDiffDTO, error) {
+				called = true
 				gotUntracked = untracked
-				return application.GitDiffDTO{Diff: "ok", Truncated: false}, nil
+				return application.GitDiffDTO{
+					OldContent: "", NewContent: "ok\n",
+					OldExists: false, NewExists: true, IsBinary: false, Truncated: false,
+				}, nil
 			}
 			s := newGitAPIServer(t, tb)
 			ts := httptest.NewServer(s.mux)
@@ -436,6 +501,10 @@ func TestGitAPI_Diff_UntrackedParam(t *testing.T) {
 				t.Fatalf("status = %d, want %d", resp.StatusCode, c.wantStatus)
 			}
 			if c.wantStatus != http.StatusOK {
+				// 非法值 MUST 在 handler 内拒绝，不调用 backend（词法校验先于锁/git）。
+				if called {
+					t.Errorf("illegal untracked param: backend called, want zero calls")
+				}
 				var eb errorBody
 				if err := json.NewDecoder(resp.Body).Decode(&eb); err != nil {
 					t.Fatal(err)
@@ -444,6 +513,9 @@ func TestGitAPI_Diff_UntrackedParam(t *testing.T) {
 					t.Errorf("code = %s, want %s", eb.Error.Code, c.wantCode)
 				}
 				return
+			}
+			if !called {
+				t.Fatalf("backend not called for valid query")
 			}
 			if gotUntracked != c.wantUntr {
 				t.Errorf("untracked passed = %v, want %v", gotUntracked, c.wantUntr)

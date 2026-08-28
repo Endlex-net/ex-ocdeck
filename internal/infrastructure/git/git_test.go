@@ -2,7 +2,6 @@ package git
 
 import (
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -245,45 +244,6 @@ func TestContextCancel(t *testing.T) {
 	// 期望 context 相关错误或 commandError。
 }
 
-func TestDiffOutput(t *testing.T) {
-	repo := newTestRepo(t)
-	writeFile(t, repo, "README.md", "init\nline2\n")
-	runGit(t, repo, "add", "README.md")
-	runGit(t, repo, "commit", "-qm", "c2")
-	writeFile(t, repo, "README.md", "init\nline2\nline3\n")
-	out, trunc, err := Diff(context.Background(), repo, "HEAD", "README.md")
-	if err != nil {
-		t.Fatalf("Diff: %v", err)
-	}
-	if trunc {
-		t.Error("unexpected truncation")
-	}
-	if !strings.Contains(out, "+line3") {
-		t.Errorf("diff missing addition: %q", out)
-	}
-}
-
-func TestDiffBinaryTruncated(t *testing.T) {
-	repo := newTestRepo(t)
-	bin := []byte{0x00, 0x01, 0x02, 0x03, 0xff}
-	if err := os.WriteFile(filepath.Join(repo, "bin.dat"), bin, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	runGit(t, repo, "add", "bin.dat")
-	runGit(t, repo, "commit", "-qm", "add binary")
-	// 修改二进制。
-	if err := os.WriteFile(filepath.Join(repo, "bin.dat"), []byte{0x00, 0x09, 0x10}, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	out, trunc, err := Diff(context.Background(), repo, "HEAD", "bin.dat")
-	if err != nil {
-		t.Fatalf("Diff: %v", err)
-	}
-	if !trunc {
-		t.Errorf("want truncated=true for binary, got out=%q", out)
-	}
-}
-
 func TestCommitAndPush(t *testing.T) {
 	repo := newTestRepo(t)
 	writeFile(t, repo, "f.txt", "content\n")
@@ -478,46 +438,6 @@ func TestParseStatusPorcelainV2ZKindFilterTargetLimit(t *testing.T) {
 	}
 }
 
-// B2: ref option injection 拒绝。
-func TestDiffRejectsRefOptionInjection(t *testing.T) {
-	repo := newTestRepo(t)
-	writeFile(t, repo, "README.md", "init\nline2\n")
-	runGit(t, repo, "add", "README.md")
-	runGit(t, repo, "commit", "-qm", "c2")
-	// 试图注入 --output= 选项写文件；rev-parse --verify --end-of-options 应拒绝。
-	evilPath := filepath.Join(repo, "evil.txt")
-	_, _, err := Diff(context.Background(), repo, "--output="+evilPath, "README.md")
-	if err == nil {
-		t.Fatal("expected ref injection to be rejected")
-	}
-	if _, statErr := os.Stat(evilPath); statErr == nil {
-		t.Fatalf("evil file created by ref injection: %s", evilPath)
-	}
-}
-
-// B2: pathspec magic literal 化。
-func TestDiffLiteralPathspecRejectsMagic(t *testing.T) {
-	repo := newTestRepo(t)
-	writeFile(t, repo, "a.txt", "1\n")
-	writeFile(t, repo, "b.txt", "2\n")
-	runGit(t, repo, "add", "a.txt", "b.txt")
-	runGit(t, repo, "commit", "-qm", "base")
-	writeFile(t, repo, "a.txt", "1\n2\n")
-	writeFile(t, repo, "b.txt", "2\n3\n")
-	// :(exclude) magic 不应被接受——literal 包裹后应仅匹配字面 ":(exclude)a.txt"（不存在）。
-	out, trunc, err := Diff(context.Background(), repo, "HEAD", ":(exclude)a.txt")
-	if err != nil {
-		// git 报 pathspec 未匹配，接受为非注入证明。
-		return
-	}
-	if trunc {
-		t.Error("unexpected truncation")
-	}
-	if strings.Contains(out, "b.txt") {
-		t.Errorf("magic pathspec leaked into diff: %q", out)
-	}
-}
-
 // B2: commit literal pathspec。
 func TestCommitLiteralPathspec(t *testing.T) {
 	repo := newTestRepo(t)
@@ -538,26 +458,6 @@ func TestCommitLiteralPathspec(t *testing.T) {
 	}
 	if !b.Untracked {
 		t.Errorf("b.txt should be untracked, got %+v", b)
-	}
-}
-
-// B2: literal pathspec 处理冒号开头路径。
-func TestLiteralPathspecColonPath(t *testing.T) {
-	repo := newTestRepo(t)
-	// 用 git add -A 暂存（直接传 :colon.txt 会被 git 当作 magic pathspec 拒绝）。
-	writeFile(t, repo, ":colon.txt", "x\n")
-	runGit(t, repo, "add", "-A")
-	runGit(t, repo, "commit", "-qm", "base")
-	writeFile(t, repo, ":colon.txt", "x\ny\n")
-	out, trunc, err := Diff(context.Background(), repo, "HEAD", ":colon.txt")
-	if err != nil {
-		t.Fatalf("Diff colon path: %v", err)
-	}
-	if trunc {
-		t.Error("unexpected truncation")
-	}
-	if !strings.Contains(out, "+y") {
-		t.Errorf("diff should contain +y for colon path: %q", out)
 	}
 }
 
@@ -620,65 +520,6 @@ func TestRepoLockCanonicalPath(t *testing.T) {
 		t.Fatal("link alias should share lock with real")
 	}
 	muReal.Unlock()
-}
-
-// P2: path 为空时文件数预统计 MUST 带同一 resolved ref，否则大 ref diff 可绕过 DiffMaxFiles。
-// 构造：基线（newTestRepo 的 init 提交）后新增若干文件并提交为 c1，ref=c1 全仓 diff
-// 文件数 < DiffMaxFiles，验证预统计带 ref 后与实际 diff 文件数一致、不误截断。
-func TestDiffEmptyPathPrecountCarriesRef(t *testing.T) {
-	repo := newTestRepo(t)
-	// 在 init 基线之上新增几个文件并提交为 c1。
-	for i := 0; i < 5; i++ {
-		writeFile(t, repo, "f"+pad(i)+".txt", "v1\n")
-		runGit(t, repo, "add", "f"+pad(i)+".txt")
-	}
-	writeFile(t, repo, "README.md", "init\nmore\n")
-	runGit(t, repo, "add", "README.md")
-	runGit(t, repo, "commit", "-qm", "c1")
-	// ref=HEAD~1（init 基线）、path 为空：ref→工作区 diff 含 c1 新增文件 + README 改动，
-	// 文件数 < DiffMaxFiles，预统计带 ref 应一致、不截断。
-	out, trunc, err := Diff(context.Background(), repo, "HEAD~1", "")
-	if err != nil {
-		t.Fatalf("Diff HEAD~1 empty path: %v", err)
-	}
-	if trunc {
-		t.Errorf("unexpected truncation for small ref diff (precount may have used default diff): out=%q", out)
-	}
-	if !strings.Contains(out, "README.md") {
-		t.Errorf("diff should include README.md: %q", out)
-	}
-}
-
-// P2: 带 ref 的全仓 diff 文件数超过 DiffMaxFiles 时 MUST 截断（预统计带 ref）。
-// 构造：init 基线提交后，新增 >DiffMaxFiles 个文件并提交为 c1，回退工作区
-// （git reset --hard HEAD~1）使默认工作区 diff 文件数 = 0，但 ref=c1 的全仓 diff
-// 文件数 = DiffMaxFiles+5。旧实现预统计不带 ref → 文件数=0 不截断；实际 diff 带 ref
-// 输出超大（绕过限制）。修复后预统计带 ref → 文件数 > DiffMaxFiles → truncated=true。
-func TestDiffEmptyPathRefPrecountTruncates(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping large ref diff test in -short mode")
-	}
-	repo := newTestRepo(t)
-	// 在 init 基线之上新增超过 DiffMaxFiles 个文件并提交为 c1。
-	for i := 0; i < DiffMaxFiles+5; i++ {
-		writeFile(t, repo, "f"+pad(i)+".txt", "x\n")
-	}
-	runGit(t, repo, "add", "-A")
-	runGit(t, repo, "commit", "-qm", "c1 with many files")
-	c1 := currentRef(t, repo)
-	// 回退工作区到 init 基线，使默认工作区 diff 为空、ref diff 巨大。
-	runGit(t, repo, "reset", "--hard", "HEAD~1")
-	// ref=c1、path 为空：预统计必须带 ref 才能识别超大文件数 → truncated=true。
-	out, trunc, err := Diff(context.Background(), repo, c1, "")
-	if err != nil {
-		t.Fatalf("Diff: %v", err)
-	}
-	if !trunc {
-		t.Fatalf("expected truncation for ref diff > DiffMaxFiles files, got out len=%d", len(out))
-	}
-	if out != "" {
-		t.Errorf("truncated diff should have empty out, got %d bytes", len(out))
-	}
 }
 
 // currentRef 返回当前 HEAD 的 OID。
@@ -868,7 +709,7 @@ func TestListIgnoredUntrackedTargetLimit(t *testing.T) {
 	}
 }
 
-// --- fix-git-diff-new-file-and-linenum 任务 1.4：DiffUntracked ---
+// --- codemirror-git-diff：按版本读取文件内容（ref/index/工作区三分支）见 content_test.go ---
 
 // cachedDiff 返回 repo 当前 `git diff --cached` 输出，供 index 不变性断言。
 func cachedDiff(t *testing.T, dir string) string {
@@ -880,161 +721,6 @@ func cachedDiff(t *testing.T, dir string) string {
 		t.Fatalf("git diff --cached: %v", err)
 	}
 	return string(out)
-}
-
-func TestDiffUntracked_NonEmptyNewFile(t *testing.T) {
-	repo := newTestRepo(t)
-	writeFile(t, repo, "new.txt", "line1\nline2\nline3\n")
-	out, trunc, err := DiffUntracked(context.Background(), repo, "new.txt")
-	if err != nil {
-		t.Fatalf("DiffUntracked: %v", err)
-	}
-	if trunc {
-		t.Errorf("unexpected truncation for non-empty new file")
-	}
-	if !strings.Contains(out, "new file mode") {
-		t.Errorf("diff missing 'new file mode': %q", out)
-	}
-	if !strings.Contains(out, "+line1") || !strings.Contains(out, "+line2") || !strings.Contains(out, "+line3") {
-		t.Errorf("diff missing additions: %q", out)
-	}
-}
-
-func TestDiffUntracked_EmptyNewFile(t *testing.T) {
-	repo := newTestRepo(t)
-	writeFile(t, repo, "empty.txt", "")
-	out, trunc, err := DiffUntracked(context.Background(), repo, "empty.txt")
-	if err != nil {
-		t.Fatalf("DiffUntracked empty: %v", err)
-	}
-	if trunc {
-		t.Errorf("unexpected truncation for empty new file")
-	}
-	// 空文件仅元数据 diff（含 new file mode，无 hunk）。
-	if !strings.Contains(out, "new file mode") {
-		t.Errorf("empty file diff missing 'new file mode': %q", out)
-	}
-	if strings.Contains(out, "@@") {
-		t.Errorf("empty file diff should have no hunk header: %q", out)
-	}
-}
-
-func TestDiffUntracked_BinaryReturnsTruncated(t *testing.T) {
-	repo := newTestRepo(t)
-	bin := []byte{0x00, 0x01, 0x02, 0x03, 0xff, 0xfe}
-	if err := os.WriteFile(filepath.Join(repo, "bin.dat"), bin, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	out, trunc, err := DiffUntracked(context.Background(), repo, "bin.dat")
-	if err != nil {
-		t.Fatalf("DiffUntracked binary: %v", err)
-	}
-	if !trunc {
-		t.Errorf("binary file should return truncated=true, got out=%q", out)
-	}
-	if out != "" {
-		t.Errorf("binary file should return empty diff, got %q", out)
-	}
-}
-
-func TestDiffUntracked_NonExistentPathReturnsError(t *testing.T) {
-	repo := newTestRepo(t)
-	_, _, err := DiffUntracked(context.Background(), repo, "nope.txt")
-	if err == nil {
-		t.Fatal("non-existent path should return error")
-	}
-}
-
-func TestDiffUntracked_RejectsAbsolute(t *testing.T) {
-	repo := newTestRepo(t)
-	writeFile(t, repo, "x.txt", "x\n")
-	abs := filepath.Join(repo, "x.txt")
-	_, _, err := DiffUntracked(context.Background(), repo, abs)
-	if !errors.Is(err, ErrInvalidDiffPath) {
-		t.Fatalf("absolute path should return ErrInvalidDiffPath; got %v", err)
-	}
-}
-
-func TestDiffUntracked_RejectsParentEscape(t *testing.T) {
-	repo := newTestRepo(t)
-	for _, p := range []string{"../x", "../../etc/passwd", "a/../../b"} {
-		_, _, err := DiffUntracked(context.Background(), repo, p)
-		if !errors.Is(err, ErrInvalidDiffPath) {
-			t.Errorf("path %q should return ErrInvalidDiffPath; got %v", p, err)
-		}
-	}
-}
-
-func TestDiffUntracked_RejectsNUL(t *testing.T) {
-	repo := newTestRepo(t)
-	_, _, err := DiffUntracked(context.Background(), repo, "a\x00b")
-	if !errors.Is(err, ErrInvalidDiffPath) {
-		t.Fatalf("NUL path should return ErrInvalidDiffPath; got %v", err)
-	}
-}
-
-func TestDiffUntracked_IndexInvariant(t *testing.T) {
-	repo := newTestRepo(t)
-	writeFile(t, repo, "tracked.txt", "init\n")
-	runGit(t, repo, "add", "tracked.txt")
-	before := cachedDiff(t, repo)
-
-	writeFile(t, repo, "new.txt", "new content\n")
-	_, _, err := DiffUntracked(context.Background(), repo, "new.txt")
-	if err != nil {
-		t.Fatalf("DiffUntracked: %v", err)
-	}
-	after := cachedDiff(t, repo)
-	if before != after {
-		t.Errorf("index changed after DiffUntracked: before=%q after=%q", before, after)
-	}
-}
-
-func TestDiffUntracked_OutputTruncated(t *testing.T) {
-	repo := newTestRepo(t)
-	// 构造超大输出触发 ErrOutputTruncated：写入大量内容使 diff 超过 16MB exec 输出上限。
-	// diff 输出约为内容字节的 1 倍（每行加 "+" 前缀），写 ~17MB 文本即可触发溢出。
-	big := strings.Repeat("x\n", 9*1024*1024) // ~18MB
-	if err := os.WriteFile(filepath.Join(repo, "big.txt"), []byte(big), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	out, trunc, err := DiffUntracked(context.Background(), repo, "big.txt")
-	// 真值表：溢出 + stdout 非空 + stderr 空 → 512KB 前缀 + truncated=true。
-	if err != nil {
-		t.Fatalf("overflow should be handled as truncated, got err=%v", err)
-	}
-	if !trunc {
-		t.Errorf("overflow should return truncated=true")
-	}
-	if len(out) > DiffMaxBytes {
-		t.Errorf("overflow output should be capped at DiffMaxBytes, got %d", len(out))
-	}
-}
-
-func TestDiffUntracked_TrackedPathDiffUnchanged(t *testing.T) {
-	// 对已跟踪路径传 DiffUntracked 仍返回 new-file diff（调用方声明语义，design D1.4）。
-	// 已跟踪路径的普通 Diff 行为不受影响——单独验证 Diff。
-	repo := newTestRepo(t)
-	writeFile(t, repo, "tracked.txt", "v1\n")
-	runGit(t, repo, "add", "tracked.txt")
-	runGit(t, repo, "commit", "-qm", "add tracked")
-	writeFile(t, repo, "tracked.txt", "v1\nv2\n")
-	// 普通 Diff 返回修改 diff。
-	out, _, err := Diff(context.Background(), repo, "HEAD", "tracked.txt")
-	if err != nil {
-		t.Fatalf("Diff tracked: %v", err)
-	}
-	if !strings.Contains(out, "+v2") {
-		t.Errorf("Diff tracked missing +v2: %q", out)
-	}
-	// DiffUntracked 对已跟踪路径返回 new-file diff（全文新增）。
-	out2, _, err := DiffUntracked(context.Background(), repo, "tracked.txt")
-	if err != nil {
-		t.Fatalf("DiffUntracked tracked: %v", err)
-	}
-	if !strings.Contains(out2, "new file mode") {
-		t.Errorf("DiffUntracked tracked should synthesize new-file diff: %q", out2)
-	}
 }
 
 // --- fix-git-diff-new-file-and-linenum 任务 2.4：untracked 行数统计 ---
@@ -1392,8 +1078,8 @@ func TestUntrackedLineCount_OversizedFileConsumesActualReadBytes(t *testing.T) {
 		t.Errorf("oversized file additions should be 0, got %d", additions)
 	}
 	// used 应远大于 prefix（8000），包含实际续读+触发超限的读取。
-	if used <= untrackedSniffBytes {
-		t.Errorf("oversized file used should exceed prefix (actual read bytes): used=%d, want > %d", used, untrackedSniffBytes)
+	if used <= binarySniffBytes {
+		t.Errorf("oversized file used should exceed prefix (actual read bytes): used=%d, want > %d", used, binarySniffBytes)
 	}
 	// 模拟调用方扣减（clamp 防负数）。
 	if used >= totalRemaining {
