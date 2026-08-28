@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -78,9 +77,9 @@ func mergeEntry(e *FileStatus, s *numstatEntry) {
 }
 
 // untracked 单文件文本读取预算上限：单文件 16MB；全部 untracked 累计 64MB。
-// 仅约束行数读取——二进制嗅探（前 8000 字节 NUL 检测）对所有 regular file 始终执行。
+// 仅约束行数读取——二进制嗅探（前 binarySniffBytes 字节 NUL 检测，常量与 helper 在
+// content.go，与 diff 两侧内容嗅探同口径）对所有 regular file 始终执行。
 const (
-	untrackedSniffBytes  = 8000
 	untrackedFileBudget  = 16 * 1024 * 1024
 	untrackedTotalBudget = 64 * 1024 * 1024
 )
@@ -160,7 +159,7 @@ func countUntrackedLines(ctx context.Context, dir string, entries []FileStatus) 
 // 二进制路径返回 used=0（不消耗文本预算）；文本超预算路径返回 used=实际读取量（行计数无效但预算按实际扣除）。
 // f 的偏移由本函数管理（嗅探后 seek 到 prefix 长度续读）。
 func countUntrackedFileLines(ctx context.Context, f *os.File, e *FileStatus, totalRemaining *int) (additions, used int, err error) {
-	sniff := make([]byte, untrackedSniffBytes)
+	sniff := make([]byte, binarySniffBytes)
 	n, serr := io.ReadFull(f, sniff)
 	if serr != nil && serr != io.EOF && serr != io.ErrUnexpectedEOF {
 		return 0, 0, serr
@@ -168,7 +167,7 @@ func countUntrackedFileLines(ctx context.Context, f *os.File, e *FileStatus, tot
 	prefix := sniff[:n]
 
 	// 嗅探始终执行（含 NUL → IsBinary）。二进制不计行且 prefix 不消耗文本预算。
-	if bytes.IndexByte(prefix, 0) >= 0 {
+	if contentIsBinary(string(prefix)) {
 		e.IsBinary = true
 		return 0, 0, nil
 	}
@@ -302,181 +301,6 @@ func applyRenameNumstat(e *FileStatus, stagedByPath, stagedByRename, unstagedByP
 			mergeEntry(e, s)
 		}
 	}
-}
-
-// DiffMaxBytes 限制单次 unified diff 输出字节数；超限返回 truncated=true。
-const DiffMaxBytes = 512 * 1024
-
-// DiffMaxFiles 限制单次 diff 涉及文件数（path 为空时全仓 diff）；超限返回 truncated=true。
-const DiffMaxFiles = 1000
-
-// Diff 返回 dir 中 path 相对 ref 的 unified diff 文本。
-// ref 为空表示工作区 vs 索引/HEAD 的默认 diff。path 为空表示全部（受 DiffMaxFiles 限制）。
-// 输出超过 DiffMaxBytes、文件数超过 DiffMaxFiles 或文件为二进制时返回 truncated=true。
-// ref 先经 git rev-parse --verify --end-of-options 解析为 OID，防止 option 注入。
-// path 经 literal pathspec 包裹（":(literal)<path>"），防止 pathspec magic 扩大范围。
-func Diff(ctx context.Context, dir, ref, path string) (string, bool, error) {
-	oid := ""
-	if ref != "" {
-		resolved, _, rerr := run(ctx, dir, "rev-parse", "--verify", "--end-of-options", ref)
-		if rerr != nil {
-			return "", false, fmt.Errorf("git diff: invalid ref %q: %w", ref, rerr)
-		}
-		oid = strings.TrimSpace(resolved)
-		if oid == "" {
-			return "", false, fmt.Errorf("git diff: rev-parse returned empty for ref %q", ref)
-		}
-	}
-
-	args := []string{"diff"}
-	if oid != "" {
-		args = append(args, oid)
-	}
-	args = append(args, "--")
-	if path != "" {
-		args = append(args, literalPathspec(path))
-	}
-
-	// path 为空（全仓 diff）时先校验文件数上限。
-	// 预统计 MUST 带与实际 diff 同一 resolved ref（oid），否则大 ref diff 可绕过 DiffMaxFiles
-	//（预统计默认工作区 diff，而实际带 ref 时为 ref→工作区/索引 diff，文件数不同）。
-	if path == "" {
-		nameArgs := []string{"diff", "--name-only", "-z"}
-		if oid != "" {
-			nameArgs = append(nameArgs, oid)
-		}
-		nameArgs = append(nameArgs, "--")
-		nameOut, _, nerr := run(ctx, dir, nameArgs...)
-		if nerr != nil {
-			return "", false, fmt.Errorf("git diff: name-only count failed: %w", nerr)
-		}
-		if countNulRecords(nameOut) > DiffMaxFiles {
-			return "", true, nil
-		}
-	}
-
-	out, _, err := run(ctx, dir, args...)
-	if err != nil {
-		return "", false, err
-	}
-
-	// 二进制文件：git 输出 "Binary files a/x and b/x differ"。
-	if isBinaryDiffOutput(out) {
-		return "", true, nil
-	}
-	if len(out) > DiffMaxBytes {
-		return out[:DiffMaxBytes], true, nil
-	}
-	return out, false, nil
-}
-
-// DiffUntracked 返回 dir 中 untracked 新文件 path 的合成 unified diff。
-// 实现：`git diff --no-index -- <os.DevNull> <path>`（git 对 --no-index 两侧按文件系统路径比较，
-// 不依赖 index，只读无副作用）。diff 子命令已在 exec.go 白名单内，MUST NOT 套 ":(literal)" pathspec。
-//
-// 防御性路径校验：拒绝绝对路径、".." 逃逸、NUL → 返回 sentinel ErrInvalidDiffPath（errors.Is 可判），
-// Manager 据此映射 invalid_input。
-//
-// 输出判定真值表（design.md D1，依据 git --no-index 实测契约：exit=1 歧义，MUST 联合 stdout/stderr）：
-//  1. err==nil（含 stdout 空）→ 正常返回
-//  2. exit==1 && stdout 非空 && stderr 空 → 正常 diff 输出
-//  3. errors.Is(ErrOutputTruncated) && stdout 非空 && stderr 空 → 512KB 前缀 + truncated=true
-//  4. 其他非 nil 错误（exit>1 / stdout 空 / stderr 非空）→ 透传
-//
-// 注意 exec.go:108 溢出路径返回 fmt.Errorf("%w (%v)", ErrOutputTruncated, ce)，
-// errors.As(*exec.ExitError) 在此路径上断裂，MUST 先判 ErrOutputTruncated。
-// stderr 从 run() 第二返回值获取，MUST 校验 stderr 为空以排除 "stdout 部分 + stderr 溢出" 的失败。
-func DiffUntracked(ctx context.Context, dir, path string) (string, bool, error) {
-	if err := validateDiffPath(path); err != nil {
-		return "", false, err
-	}
-
-	out, stderr, err := run(ctx, dir, "diff", "--no-index", "--", os.DevNull, path)
-	if err == nil {
-		// err==nil（含 stdout 空）：正常返回。空新文件经实测 exit=1，不会走到这里；
-		// 但若未来 git 版本对空文件返回 exit=0，此处仍正确兜底。
-		d, trunc := finalizeDiffTruncatable(out)
-		return d, trunc, nil
-	}
-
-	// 真值表顺序：先判 ErrOutputTruncated（溢出路径 errors.As 断裂），再判 exit==1。
-	if errors.Is(err, ErrOutputTruncated) {
-		if out != "" && stderr == "" {
-			d, trunc := finalizeDiffTruncatable(out)
-			return d, trunc, nil
-		}
-		// 溢出但 stdout 空 或 stderr 非空（含 stderr 溢出）→ 失败透传。
-		return "", false, err
-	}
-
-	var ce *commandError
-	if errors.As(err, &ce) {
-		if exitCode(ce) == 1 && out != "" && stderr == "" {
-			// exit=1 + stdout 非空 + stderr 空 → 正常 diff 输出（二进制→truncated=true）。
-			d, trunc := finalizeDiffTruncatable(out)
-			return d, trunc, nil
-		}
-	}
-	// 其他非 nil 错误透传（含 exit>1、stdout 空、stderr 非空）。
-	return "", false, err
-}
-
-// validateDiffPath 校验 DiffUntracked 的路径：拒绝绝对路径、".." 逃逸、NUL。
-func validateDiffPath(path string) error {
-	if path == "" {
-		return fmt.Errorf("%w: empty path", ErrInvalidDiffPath)
-	}
-	if filepath.IsAbs(path) {
-		return fmt.Errorf("%w: absolute path %q", ErrInvalidDiffPath, path)
-	}
-	if strings.ContainsRune(path, 0) {
-		return fmt.Errorf("%w: path contains NUL", ErrInvalidDiffPath)
-	}
-	// filepath.Clean 归一后检查是否逃逸到父目录（".." 或以 "../" 开头）。
-	cleaned := filepath.Clean(path)
-	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return fmt.Errorf("%w: path escapes via .. %q", ErrInvalidDiffPath, path)
-	}
-	return nil
-}
-
-// exitCode 从 commandError 提取 git 进程退出码（非 *exec.ExitError 返回 -1）。
-func exitCode(ce *commandError) int {
-	var ee *exec.ExitError
-	if errors.As(ce.err, &ee) {
-		return ee.ExitCode()
-	}
-	return -1
-}
-
-// finalizeDiffTruncatable 处理 diff 文本并返回 (diff, truncated)：
-// 二进制 → ("", true)；超 512KB → (前缀, true)；否则原样。
-func finalizeDiffTruncatable(out string) (string, bool) {
-	if isBinaryDiffOutput(out) {
-		return "", true
-	}
-	if len(out) > DiffMaxBytes {
-		return out[:DiffMaxBytes], true
-	}
-	return out, false
-}
-
-func isBinaryDiffOutput(s string) bool {
-	return strings.Contains(s, "Binary files ") && strings.Contains(s, "differ")
-}
-
-// countNulRecords 统计 -z 输出中的非空记录数（忽略末尾 trailing NUL 产生的空段）。
-func countNulRecords(s string) int {
-	if s == "" {
-		return 0
-	}
-	n := 0
-	for _, r := range strings.Split(s, "\x00") {
-		if r != "" {
-			n++
-		}
-	}
-	return n
 }
 
 // literalPathspec 将用户路径包裹为 literal pathspec，禁止 magic（glob/exclude 等）。

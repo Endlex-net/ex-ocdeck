@@ -3,7 +3,7 @@
   * 保留组件（TaskWorkbenchPage / GitPanel / EnvEditor / StatusBadge /
   * TaskActions / DeleteTaskModal / LifecycleLogModal / TermAppearanceEditor 等）仍使用旧类名。
  * 本文件提供这些类的定义，颜色全部走 design-system token（CSS 变量），
- * 不含 hex 字面量（token 定义层除外：diff2html 语义色派生自 --success/--danger）。
+ * 不含 hex 字面量（token 定义层除外）。
  *
  * legacy 变量别名（映射到 design-system token，兼容旧类定义内的 var() 引用）：
  *   --text → --fg  /  --text-dim → --muted  /  --bg-panel → --surface
@@ -384,6 +384,11 @@ select.input {
 .alert-notice {
   color: var(--warn);
   background: var(--warn-soft);
+}
+
+.alert-info {
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 
 /* ---------- 工作台布局 ---------- */
@@ -1045,7 +1050,8 @@ select.input {
   flex: 1;
   min-width: 0;
   min-height: 0;
-  /* 纵向滚动保留、横向关闭：横向滚动 owner 唯一为 .d2h-wrapper（design D3 不变量 3） */
+  /* 纵向滚动保留、横向关闭：横向滚动 owner 唯一为各 CodeMirror cm-scroller
+     （codemirror-git-diff spec「diff 视图渲染」：长行不折行、横向滚动） */
   overflow-y: auto;
   overflow-x: hidden;
   display: flex;
@@ -1074,150 +1080,172 @@ select.input {
   margin: 10px 14px;
 }
 
+/* ---------- CodeMirror merge diff 视图（codemirror-git-diff design D6） ---------- */
+
 .diff-view {
-  padding: 10px 14px 24px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
   font-size: 12px;
 }
 
-/* ---------- diff2html 适配（语义色派生自 --success/--danger） ---------- */
+.diff-toolbar {
+  display: flex;
+  gap: 6px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border);
+}
 
-.diff-view .d2h-wrapper {
+/* gitlink（子模块）变更提示下的两侧 commit OID 对照（spec「文件 diff 查看」I1） */
+.diff-gitlink {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  padding: 4px 0;
+  color: var(--fg);
+  font-size: 12px;
+}
+
+.diff-toolbar .btn[aria-pressed='true'] {
+  color: var(--accent);
+  border-color: color-mix(in oklch, var(--accent) 40%, var(--border));
+  background: var(--accent-soft);
+}
+
+.diff-editor {
+  padding: 10px 0 24px;
+}
+
+/* 并排（.cm-mergeView 容器）与单列（单个 .cm-editor）统一外框 */
+.diff-editor > .cm-mergeView,
+.diff-editor > .cm-editor {
   border: 1px solid var(--border);
   border-radius: 6px;
-  /* 唯一横向滚动 owner（design D3 不变量 3）：gutter 与代码同容器同向滚动；
-     overflow-y:hidden 保持圆角裁剪，纵向滚动仍由 .git-diff 承担 */
-  overflow-x: auto;
-  overflow-y: hidden;
   background: var(--bg);
 }
 
-.diff-view .d2h-file-diff {
-  overflow: visible;
+/* 增删语义色派生自 --success/--danger，双类作用域压过 merge 包 baseTheme 的明/暗固定色 */
+.diff-view .diff-editor .cm-merge-a .cm-changedLine,
+.diff-view .diff-editor .cm-deletedChunk {
+  background: color-mix(in oklch, var(--danger) 12%, var(--bg));
 }
 
-.diff-view .d2h-file-wrapper,
-.diff-view .d2h-file-diff,
-.diff-view .d2h-code-wrapper {
-  width: max-content;
-  min-width: 100%;
+.diff-view .diff-editor .cm-merge-b .cm-changedLine,
+.diff-view .diff-editor .cm-insertedLine {
+  background: color-mix(in oklch, var(--success) 12%, var(--bg));
 }
 
-.diff-view .d2h-code-wrapper {
-  position: relative;
+.diff-view .diff-editor .cm-deletedLine {
+  background: color-mix(in oklch, var(--danger) 12%, var(--bg));
 }
 
-.diff-view .d2h-file-header {
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  color: var(--fg);
-}
-
-.diff-view .d2h-file-name-wrapper,
-.diff-view .d2h-file-name {
-  color: var(--fg);
-}
-
-.diff-view .d2h-file-stats {
-  color: var(--muted);
-}
-
-.diff-view .d2h-lines-added {
-  border-color: color-mix(in oklch, var(--success) 40%, transparent);
-  background: var(--success-soft);
-  color: var(--success);
-}
-
-.diff-view .d2h-lines-deleted {
-  border-color: color-mix(in oklch, var(--danger) 40%, transparent);
-  background: var(--danger-soft);
-  color: var(--danger);
-}
-
-.diff-view .d2h-tag {
-  background: var(--surface-hover);
-  border-color: var(--border-strong);
-  color: var(--muted);
-}
-
-.diff-view .d2h-diff-table {
-  color: var(--fg);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  width: max-content;
-  min-width: 100%;
-}
-
-.diff-view .d2h-diff-table td {
-  padding: 0;
-}
-
-.diff-view .d2h-code-linenumber,
-.diff-view .d2h-code-side-linenumber {
-  background: var(--surface);
-  color: var(--muted);
-  border-color: var(--border);
-  line-height: 18px;
-}
-
-.diff-view .d2h-code-line,
-.diff-view .d2h-code-side-line {
-  color: var(--fg);
-  background: var(--bg);
-  line-height: 18px;
-  white-space: nowrap;
-}
-
-.diff-view .d2h-code-line-prefix {
-  color: var(--muted);
-}
-
-.diff-view .d2h-info {
-  background: var(--surface);
-  color: var(--accent);
-}
-
-.diff-view .d2h-ins {
-  background: color-mix(in oklch, var(--success) 14%, var(--bg));
-  border-color: color-mix(in oklch, var(--success) 14%, transparent);
-}
-
-.diff-view .d2h-del {
-  background: color-mix(in oklch, var(--danger) 14%, var(--bg));
-  border-color: color-mix(in oklch, var(--danger) 14%, transparent);
-}
-
-.diff-view .d2h-code-line ins,
-.diff-view .d2h-code-side-line ins {
-  background: color-mix(in oklch, var(--success) 30%, transparent);
-  color: color-mix(in oklch, var(--success) 80%, var(--fg));
-}
-
-.diff-view .d2h-code-line del,
-.diff-view .d2h-code-side-line del {
-  background: color-mix(in oklch, var(--danger) 30%, transparent);
+.diff-view .diff-editor .cm-merge-a .cm-changedText,
+.diff-view .diff-editor .cm-deletedText {
   color: color-mix(in oklch, var(--danger) 75%, var(--fg));
 }
 
-.diff-view .d2h-code-linenumber.d2h-ins,
-.diff-view .d2h-code-side-linenumber.d2h-ins {
-  background: var(--success-soft);
-  color: var(--success);
+.diff-view .diff-editor .cm-merge-b .cm-changedText {
+  color: color-mix(in oklch, var(--success) 75%, var(--fg));
 }
 
-.diff-view .d2h-code-linenumber.d2h-del,
-.diff-view .d2h-code-side-linenumber.d2h-del {
-  background: var(--danger-soft);
-  color: var(--danger);
+.diff-view .diff-editor .cm-merge-a .cm-changedLineGutter,
+.diff-view .diff-editor .cm-deletedLineGutter {
+  background: color-mix(in oklch, var(--danger) 35%, transparent);
 }
 
-.diff-view .d2h-emptyplaceholder {
-  background: var(--surface);
-  border-color: var(--border);
+.diff-view .diff-editor .cm-merge-b .cm-changedLineGutter {
+  background: color-mix(in oklch, var(--success) 35%, transparent);
 }
 
-.diff-view .d2h-file-diff .d2h-del.d2h-change,
-.diff-view .d2h-file-diff .d2h-ins.d2h-change {
-  background: inherit;
+/* 折叠横条（collapseUnchanged 的 .cm-collapsedLines widget）：merge baseTheme 只按 cm 自身
+   明暗标记给色（&light/#f3f3f3、&dark/#222），而本应用主题由 data-theme 设计变量驱动、
+   editorTheme 未声明 dark，cm 恒落入 &light——暗色下呈亮白横条。此处用变量显式覆盖，
+   背景/文字/hover 与 GitPanel 列表项的 surface 体系一致。 */
+.diff-view .diff-editor .cm-collapsedLines {
+  color: var(--muted);
+  background: linear-gradient(to bottom, transparent 0, var(--surface) 30%, var(--surface) 70%, transparent 100%);
+}
+
+.diff-view .diff-editor .cm-collapsedLines:hover {
+  color: var(--fg);
+  background: linear-gradient(to bottom, transparent 0, var(--surface-hover) 30%, var(--surface-hover) 70%, transparent 100%);
+}
+
+/* baseTheme 其余固定色装饰统一对齐设计变量（明暗主题随变量自适应）：
+   &light 变更文本下划线（#ee4433/#22bb22 渐变）、b 侧删除文本底色（#ff000033）、
+   unified 视图 inline 变更行背景与 gutter 标记（#75d）。 */
+.diff-view .diff-editor .cm-merge-a .cm-changedText,
+.diff-view .diff-editor .cm-deletedChunk .cm-deletedText {
+  background: linear-gradient(color-mix(in oklch, var(--danger) 45%, transparent), color-mix(in oklch, var(--danger) 45%, transparent)) bottom / 100% 2px no-repeat;
+}
+
+.diff-view .diff-editor .cm-merge-b .cm-changedText {
+  background: linear-gradient(color-mix(in oklch, var(--success) 45%, transparent), color-mix(in oklch, var(--success) 45%, transparent)) bottom / 100% 2px no-repeat;
+}
+
+.diff-view .diff-editor .cm-merge-b .cm-deletedText {
+  background: color-mix(in oklch, var(--danger) 22%, transparent);
+}
+
+.diff-view .diff-editor .cm-inlineChangedLine {
+  background: color-mix(in oklch, var(--success) 12%, var(--bg));
+}
+
+/* unified 视图无 .cm-merge-b 包装，插入行 gutter 在 baseTheme 中无底色；此处补 success 色。
+   并排 a/b 侧的 gutter 由上方四类作用域规则覆盖（特异性更高），不受此规则影响。 */
+.diff-view .diff-editor .cm-changedLineGutter {
+  background: color-mix(in oklch, var(--success) 35%, transparent);
+}
+
+.diff-view .diff-editor .cm-inlineChangedLineGutter {
+  background: color-mix(in oklch, var(--accent) 45%, transparent);
+}
+
+/* ---------- 语法高亮 token 配色（classHighlighter 稳定 .tok-* 类，design D6/D7） ---------- */
+
+.tok-keyword,
+.tok-atom,
+.tok-bool {
+  color: var(--accent);
+}
+
+.tok-string {
+  color: color-mix(in oklch, var(--success) 70%, var(--fg));
+}
+
+.tok-number,
+.tok-literal {
+  color: var(--warn);
+}
+
+.tok-comment,
+.tok-meta {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.tok-typeName,
+.tok-className,
+.tok-namespace,
+.tok-macroName {
+  color: color-mix(in oklch, var(--accent) 65%, var(--fg));
+}
+
+.tok-propertyName {
+  color: color-mix(in oklch, var(--accent) 60%, var(--fg));
+}
+
+.tok-operator,
+.tok-punctuation {
+  color: var(--muted);
+}
+
+.tok-deleted {
+  color: color-mix(in oklch, var(--danger) 80%, var(--fg));
+}
+
+.tok-inserted {
+  color: color-mix(in oklch, var(--success) 80%, var(--fg));
 }
 
 /* ---------- 工作台页头「⋯」溢出菜单（design task-workbench.html wb-overflow） ----------

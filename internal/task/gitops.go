@@ -16,7 +16,7 @@ type GitFileDTO = application.GitFileDTO
 // GitStatusDTO status 响应（含当前分支，design.md §21 git/status）。
 type GitStatusDTO = application.GitStatusDTO
 
-// GitDiffDTO diff 响应（unified diff 文本 + 截断标记，design.md §21 git/diff）。
+// GitDiffDTO diff 响应（单文件两侧版本内容八字段契约，design.md §21 git/diff）。
 type GitDiffDTO = application.GitDiffDTO
 
 // assertGitRepoTask 解析任务所属项目 kind，校验该任务可作为 git 操作目标（add-plain-dir-project D5）。
@@ -80,19 +80,19 @@ func (m *Manager) GitStatus(ctx context.Context, taskID string) (GitStatusDTO, e
 	return GitStatusDTO{Branch: branch, Files: files}, nil
 }
 
-// GitDiff 返回任务 worktree 中 path 相对 ref 的 unified diff（design.md §9/§21）。
-// 持任务锁（与生命周期操作互斥，冲突 409）。ref 可选（空=工作区 vs 索引/HEAD），
-// path 可选（空=全仓 diff，受 git.DiffMaxFiles 限制）。
-// untracked=true 时调用 git.DiffUntracked 合成新文件 diff；此时 path 必填、ref 必空，
-// 否则返回 invalid_input（在任何 git 命令前校验）。
+// GitDiff 返回任务 worktree 中单文件 path 的两侧版本内容（design.md §9/§21、
+// codemirror-git-diff design D10）。持任务锁（与生命周期操作互斥，冲突 409）。
+// 固定六阶段，多源失败返回首个：①纯词法校验（untracked 组合约束、path 非空、
+// 绝对路径/`..`/NUL，先于任务锁与任何 git 命令/文件读取）→ ②task/worktree/repo kind 校验 →
+// ③ref rev-parse 解析 → ④旧侧探测+读取 → ⑤新侧读取 → ⑥DTO 组装。
+// 内容来源：untracked=1（调用方声明模式，不二次探测）→ 旧侧不存在、新侧为工作区文件；
+// ref 非空 → ref OID 下 blob；ref 空 → index stage-0（无 stage-0 有其他 stage → invalid_state）。
+// 错误矩阵：词法非法/新侧真实路径逃逸 → invalid_input；未解决冲突 → invalid_state；
+// ref 解析与旧侧 git 失败、子模块 dirty 探测失败 → git_error（透传 stderr）；
+// 新侧非 ENOENT IO 错误 → internal。
 func (m *Manager) GitDiff(ctx context.Context, taskID, ref, path string, untracked bool) (GitDiffDTO, error) {
-	unlock, err := m.tryLockTask(taskID)
-	if err != nil {
-		return GitDiffDTO{}, err
-	}
-	defer unlock()
-
-	// 用例不变量（在任何 git 命令前校验）：untracked 模式下 path 必填、ref 必空。
+	// 阶段①：纯词法校验。untracked 组合约束沿用既有消息；path 校验与工作区读取同源
+	//（git.ValidateDiffPath）。MUST 在任务锁与任何 git 命令/文件读取之前完成。
 	if untracked {
 		if path == "" {
 			return GitDiffDTO{}, newOpErr(codeInvalidInput, errors.New("untracked diff requires a path"))
@@ -101,7 +101,17 @@ func (m *Manager) GitDiff(ctx context.Context, taskID, ref, path string, untrack
 			return GitDiffDTO{}, newOpErr(codeInvalidInput, errors.New("untracked diff does not accept a ref"))
 		}
 	}
+	if err := git.ValidateDiffPath(path); err != nil {
+		return GitDiffDTO{}, newOpErr(codeInvalidInput, err)
+	}
 
+	unlock, err := m.tryLockTask(taskID)
+	if err != nil {
+		return GitDiffDTO{}, err
+	}
+	defer unlock()
+
+	// 阶段②：task 存在性与 worktree/repo kind 校验（在任何 git 命令前完成）。
 	row, err := m.store.GetTask(ctx, taskID)
 	if err != nil {
 		return GitDiffDTO{}, newOpErr(codeNotFound, fmt.Errorf("task not found: %w", err))
@@ -109,27 +119,65 @@ func (m *Manager) GitDiff(ctx context.Context, taskID, ref, path string, untrack
 	if row.WorktreePath == "" {
 		return GitDiffDTO{}, newOpErr(codeInvalidState, fmt.Errorf("task %s has no worktree", taskID))
 	}
-	// add-plain-dir-project D5：dir 项目 git 操作降级——MUST 在任何 git 命令前拒绝。
 	if _, err := m.assertGitRepoTask(ctx, row); err != nil {
 		return GitDiffDTO{}, err
 	}
 
-	if untracked {
-		diff, truncated, derr := git.DiffUntracked(ctx, row.WorktreePath, path)
-		if derr != nil {
-			if errors.Is(derr, git.ErrInvalidDiffPath) {
-				return GitDiffDTO{}, newOpErr(codeInvalidInput, derr)
-			}
-			return GitDiffDTO{}, newOpErr(codeGitError, fmt.Errorf("%s", git.StderrOf(derr)))
+	// 阶段③：ref 解析（词法校验全部通过后执行；untracked 模式已保证 ref 为空）。
+	oid := ""
+	if ref != "" {
+		oid, err = git.ResolveRefOID(ctx, row.WorktreePath, ref)
+		if err != nil {
+			return GitDiffDTO{}, newOpErr(codeGitError, fmt.Errorf("%s", git.StderrOf(err)))
 		}
-		return GitDiffDTO{Diff: diff, Truncated: truncated}, nil
 	}
 
-	diff, truncated, derr := git.Diff(ctx, row.WorktreePath, ref, path)
-	if derr != nil {
-		return GitDiffDTO{}, newOpErr(codeGitError, fmt.Errorf("%s", git.StderrOf(derr)))
+	// 阶段④：旧侧探测+读取。untracked=1 为调用方声明的展示模式，旧侧不存在、零 git 探测。
+	var oldSide git.SideContent
+	if untracked {
+		oldSide = git.SideContent{}
+	} else if oid != "" {
+		oldSide, err = git.ReadRefSideContent(ctx, row.WorktreePath, oid, path)
+	} else {
+		oldSide, err = git.ReadIndexSideContent(ctx, row.WorktreePath, path)
 	}
-	return GitDiffDTO{Diff: diff, Truncated: truncated}, nil
+	if err != nil {
+		if errors.Is(err, git.ErrUnmergedPath) {
+			return GitDiffDTO{}, newOpErr(codeInvalidState, err)
+		}
+		return GitDiffDTO{}, newOpErr(codeGitError, fmt.Errorf("%s", git.StderrOf(err)))
+	}
+
+	// 阶段⑤：新侧（工作区）读取。ENOENT 竞态/fifo 等非 regular 类型在读取函数内归为
+	// 新侧不存在；symlink/directory 分别按链接文本/gitlink（rev-parse HEAD）处理；
+	// 子模块 dirty 探测（status --porcelain）失败 → git_error（透传 stderr）。
+	newSide, err := git.ReadWorktreeSideContent(ctx, row.WorktreePath, path)
+	if err != nil {
+		if errors.Is(err, git.ErrInvalidDiffPath) || errors.Is(err, git.ErrWorktreeEscape) {
+			return GitDiffDTO{}, newOpErr(codeInvalidInput, err)
+		}
+		if errors.Is(err, git.ErrSubmoduleDirtyProbe) {
+			return GitDiffDTO{}, newOpErr(codeGitError, fmt.Errorf("%s", git.StderrOf(err)))
+		}
+		return GitDiffDTO{}, newOpErr(codeInternal, err)
+	}
+
+	// 阶段⑥：DTO 组装。isBinary=任一侧二进制，置位后清空两侧内容但不改变 truncated。
+	dto := GitDiffDTO{
+		OldContent: oldSide.Content,
+		NewContent: newSide.Content,
+		OldExists:  oldSide.Exists,
+		NewExists:  newSide.Exists,
+		OldMode:    oldSide.Mode,
+		NewMode:    newSide.Mode,
+		IsBinary:   oldSide.IsBinary || newSide.IsBinary,
+		Truncated:  oldSide.Truncated || newSide.Truncated,
+	}
+	if dto.IsBinary {
+		dto.OldContent = ""
+		dto.NewContent = ""
+	}
+	return dto, nil
 }
 
 // GitCommit 在任务 worktree 中暂存 paths（非空时）并以 message 提交（design.md §9/§21）。

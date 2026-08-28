@@ -182,6 +182,7 @@ export const api = {
   listActiveSessions: () => request<ActiveSessionItem[]>('GET', '/tasks/active'),
 
   gitStatus: (taskID: string) => request<GitStatus>('GET', `/tasks/${taskID}/git/status`),
+  /** 单文件两侧版本内容（八字段契约，见 GitDiffResult）；path 恒非空（空 path 由服务端拒绝）。 */
   gitDiff: (taskID: string, ref: string, path: string, untracked: boolean) =>
     request<GitDiffResult>('GET', `/tasks/${taskID}/git/diff`, undefined, {
       ...(ref ? { ref } : {}),

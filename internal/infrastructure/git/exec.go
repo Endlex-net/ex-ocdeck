@@ -27,6 +27,9 @@ var allowedSubcommands = map[string]struct{}{
 	"branch":            {},
 	"fetch":             {},
 	"remote":            {},
+	// codemirror-git-diff design D3：旧侧 blob 内容读取（ls-tree 探测 + git show <blobOID>）。
+	"show":    {},
+	"ls-tree": {},
 }
 
 // execOutputLimit 是单次命令 stdout/stderr 的硬上限。

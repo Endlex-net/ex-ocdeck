@@ -143,8 +143,19 @@ export interface GitStatus {
   files: GitFileEntry[];
 }
 
+/** GET /tasks/:id/git/diff 响应（codemirror-git-diff spec「文件 diff 查看」）。
+ *  八字段始终全部返回：两侧版本内容 + 存在性 + git mode + 二进制/截断标记。
+ *  mode 为 git 八进制 mode 文本（100644/100755/120000 symlink/160000 gitlink），
+ *  不存在侧的 content 与 mode 均为空串。
+ *  isBinary=true 时两侧内容为空串；truncated 仅表示大小截断（单侧 512KB 上限），不兼任二进制含义。 */
 export interface GitDiffResult {
-  diff: string;
+  oldContent: string;
+  newContent: string;
+  oldExists: boolean;
+  newExists: boolean;
+  oldMode: string;
+  newMode: string;
+  isBinary: boolean;
   truncated: boolean;
 }
 

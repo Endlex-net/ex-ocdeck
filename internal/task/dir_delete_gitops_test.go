@@ -373,8 +373,8 @@ func TestGitops_Dir_StatusDiffCommitPush_InvalidInput(t *testing.T) {
 	if !strings.Contains(err.Error(), "project kind is dir (not a git repository)") {
 		t.Fatalf("GitStatus dir err must mention dir kind; got %v", err)
 	}
-	// GitDiff
-	_, err = m.GitDiff(context.Background(), "t1", "", "", false)
+	// GitDiff（codemirror-git-diff：path 为词法必填，用合法单文件 path 才能测到 dir kind 降级）。
+	_, err = m.GitDiff(context.Background(), "t1", "", "a.txt", false)
 	if !isOpErrCode(err, codeInvalidInput) {
 		t.Fatalf("GitDiff dir: err = %v, want codeInvalidInput", err)
 	}
@@ -407,7 +407,8 @@ func TestGitops_UnknownKind_FailClosed(t *testing.T) {
 	if !strings.Contains(err.Error(), "unknown project kind") {
 		t.Fatalf("GitStatus unknown kind err must mention unknown kind; got %v", err)
 	}
-	_, err = m.GitDiff(context.Background(), "t1", "", "", false)
+	// codemirror-git-diff：path 为词法必填（阶段①），用合法单文件 path 才能测到未知 kind fail-closed。
+	_, err = m.GitDiff(context.Background(), "t1", "", "a.txt", false)
 	if !isOpErrCode(err, codeInternal) {
 		t.Fatalf("GitDiff unknown kind: err = %v, want codeInternal (D1)", err)
 	}

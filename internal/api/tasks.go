@@ -55,10 +55,10 @@ type TaskBackend interface {
 
 	// Git 状态/diff/commit/push 经 TaskManager GitOps（design.md §9/§21）。
 	// 持任务锁与 Suspend/Delete 等生命周期操作互斥，避免 api 绕过 TaskManager 致
-	// worktree 在 git 操作中被移除（P6 并发竞争修复）。DTO 直接复用 application 包类型，
-	// 前端 JSON 契约不变（application.GitStatusDTO/GitDiffDTO 字段与既有响应一致）。
-	// 错误语义经 *application.OpError 携带：not_found/conflict/invalid_input/git_error，
-	// 由 mapTaskErr 统一映射 HTTP code/msg。
+	// worktree 在 git 操作中被移除（P6 并发竞争修复）。DTO 直接复用 application 包类型
+	//（GitDiffDTO 为单文件两侧版本内容八字段契约，codemirror-git-diff design D1）。
+	// 错误语义经 *application.OpError 携带：not_found/conflict/invalid_input/invalid_state/
+	// git_error/internal，由 mapTaskErr 统一映射 HTTP code/msg。
 	GitStatus(ctx context.Context, taskID string) (application.GitStatusDTO, error)
 	GitDiff(ctx context.Context, taskID, ref, path string, untracked bool) (application.GitDiffDTO, error)
 	GitCommit(ctx context.Context, taskID, message string, paths []string) error

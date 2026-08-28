@@ -518,7 +518,8 @@ func TestP1_GitOps_LockMutexWithLifecycle(t *testing.T) {
 	if err == nil || OpErrorCode(err) != codeConflict {
 		t.Errorf("GitStatus with held lock MUST return conflict; got %v", err)
 	}
-	_, err = m.GitDiff(context.Background(), "t1", "", "", false)
+	// codemirror-git-diff：path 为词法必填（阶段①），用合法单文件 path 才能测到锁冲突。
+	_, err = m.GitDiff(context.Background(), "t1", "", "a.txt", false)
 	if err == nil || OpErrorCode(err) != codeConflict {
 		t.Errorf("GitDiff with held lock MUST return conflict; got %v", err)
 	}
@@ -541,7 +542,8 @@ func TestP1_GitOps_NotFoundSemantics(t *testing.T) {
 	if _, err := m.GitStatus(context.Background(), "nope"); err == nil || OpErrorCode(err) != codeNotFound {
 		t.Errorf("GitStatus not_found; got %v", err)
 	}
-	if _, err := m.GitDiff(context.Background(), "nope", "", "", false); err == nil || OpErrorCode(err) != codeNotFound {
+	// codemirror-git-diff：path 为词法必填（阶段①），用合法单文件 path 才能测到 not_found。
+	if _, err := m.GitDiff(context.Background(), "nope", "", "a.txt", false); err == nil || OpErrorCode(err) != codeNotFound {
 		t.Errorf("GitDiff not_found; got %v", err)
 	}
 	if err := m.GitCommit(context.Background(), "nope", "msg", nil); err == nil || OpErrorCode(err) != codeNotFound {
