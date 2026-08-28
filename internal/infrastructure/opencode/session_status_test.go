@@ -15,6 +15,7 @@ import (
 // evt id / sessionID / 时间戳均为原值。后 3 行为合成负例（evt_synthetic_*），置尾、仍为合法 JSONL。
 //
 // 行布局（下标从 0）：
+//
 //	0 server.connected			1 session.status busy
 //	2 session.status retry		3 session.status idle
 //	4 session.idle				5 session.error
@@ -31,7 +32,11 @@ func loadSessionStatusFixture(t *testing.T) []Event {
 	events := make([]Event, 0, len(lines))
 	for i, line := range lines {
 		var ev Event
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+		// UseNumber 镜像生产 parseEvent 解码路径：数字保留 json.Number 词法值
+		//（session.error 的 statusCode 无损 int 判定依赖词法，不经 float64）。
+		dec := json.NewDecoder(strings.NewReader(line))
+		dec.UseNumber()
+		if err := dec.Decode(&ev); err != nil {
 			t.Fatalf("fixture line %d: %v", i+1, err)
 		}
 		events = append(events, ev)
@@ -45,10 +50,10 @@ func loadSessionStatusFixture(t *testing.T) []Event {
 func TestParseSessionStatusEvent(t *testing.T) {
 	const sid = "ses_fc4359334ffe59lfDo3O5vKb1d"
 	tests := []struct {
-		name    string
-		line    int // fixture 行号（1-based）
-		want    SessionStatusEvent
-		wantOK  bool
+		name   string
+		line   int // fixture 行号（1-based）
+		want   SessionStatusEvent
+		wantOK bool
 	}{
 		{name: "server.connected: not a status event", line: 1, wantOK: false},
 		{name: "busy", line: 2, want: SessionStatusEvent{SessionID: sid, Status: StatusBusy}, wantOK: true},

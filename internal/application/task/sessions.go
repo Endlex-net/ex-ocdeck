@@ -233,6 +233,15 @@ func (s *LifecycleService) CommitRunStatusChange(taskID, instVersion, from, to s
 	s.publish.Publish(ocdeckevent.NewServeRuntimeRunStatusChanged(instVersion, taskID, from, to, available))
 }
 
+// CommitSessionError 提交对合法 session.error 的观察（task-notifications D2）：
+// 发布 serve_runtime.session_error。一次性错误事实（非状态投影，不并入 run_status）；
+// RID 为 ServeRuntime 主键 instVersion，Payload 携带 task_id/session_id/name/message/
+// status_code/is_retryable（statusCode/isRetryable 可空，nil 表缺失）。
+func (s *LifecycleService) CommitSessionError(taskID, instVersion, sessionID, name, message string, statusCode *int, isRetryable *bool) {
+	s.publish.Publish(ocdeckevent.NewServeRuntimeSessionError(
+		instVersion, taskID, sessionID, name, message, statusCode, isRetryable))
+}
+
 // --- commit helper（design.md D0:133，NoopPublisher 阶段调用位就绪） ---
 
 // commitSessionClaim 提交 claim 结果：仅真实变更（新插入或 last_seen_at/parent_id 推进）

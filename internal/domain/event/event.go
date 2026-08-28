@@ -3,7 +3,8 @@
 // 本包只依赖 stdlib。它提供：
 //   - Event{Topic, Type, RID, Payload} 信封类型
 //   - 闭合的 Topic 常量（task / session / serve_runtime / control）
-//   - 闭合的 Type 常量（事件类型目录，逐字对齐 design D0 事件类型目录）
+//   - 闭合的 Type 常量（事件类型目录，逐字对齐 design D0 事件类型目录；
+//     task-notifications D2 显式增量：serve_runtime.session_error）
 //   - 各 Type 对应的 typed payload 结构与构造器
 //
 // Bus（基础设施）不做 schema 校验；生产方使用本包的 typed 构造器组装 Event，
@@ -19,7 +20,7 @@ const (
 	TopicTask = "task"
 	// TopicSession session 聚合相关事件（含 sessions.aligned，主体为任务的会话集合）。
 	TopicSession = "session"
-	// TopicServeRuntime ServeRuntime 组件相关事件（attention/run_status）。
+	// TopicServeRuntime ServeRuntime 组件相关事件（attention/run_status/session_error）。
 	TopicServeRuntime = "serve_runtime"
 	// TopicControl 控制事件（resync.requested）。
 	TopicControl = "control"
@@ -55,6 +56,11 @@ const (
 	// TypeServeRuntimeRunStatusChanged ServeRuntime 运行状态或可用性发生变化。
 	// RID=ServeRuntime 主键 instVersion，Payload={task_id, from, to, available}。
 	TypeServeRuntimeRunStatusChanged = "serve_runtime.run_status_changed"
+	// TypeServeRuntimeSessionError 观察 opencode session.error 事件（task-notifications
+	// design D2：对 D0 封闭事件目录的显式增量）。一次性错误事实（非状态投影）。
+	// RID=ServeRuntime 主键 instVersion，
+	// Payload={task_id, session_id, name, message, status_code *int, is_retryable *bool}。
+	TypeServeRuntimeSessionError = "serve_runtime.session_error"
 	// TypeResyncRequested 控制事件：要求订阅方重拉其场景全量。RID 允许空，Payload={}。
 	TypeResyncRequested = "resync.requested"
 )
@@ -117,6 +123,18 @@ type ServeRuntimeRunStatusChangedPayload struct {
 	From      string
 	To        string
 	Available bool
+}
+
+// ServeRuntimeSessionErrorPayload 对应 TypeServeRuntimeSessionError 的 payload
+//（task-notifications D2）。Name/Message 保留原文（TrimSpace 仅用于解析有效性判定）；
+// StatusCode/IsRetryable 可空（解析降级语义见 spec「通知触发——错误未恢复」）。
+type ServeRuntimeSessionErrorPayload struct {
+	TaskID      string
+	SessionID   string
+	Name        string
+	Message     string
+	StatusCode  *int
+	IsRetryable *bool
 }
 
 // --- typed constructors ---
@@ -219,6 +237,25 @@ func NewServeRuntimeRunStatusChanged(instVersion, taskID, from, to string, avail
 			From:      from,
 			To:        to,
 			Available: available,
+		},
+	}
+}
+
+// NewServeRuntimeSessionError 构造 serve_runtime.session_error 事件（task-notifications
+// D2）。RID 为 ServeRuntime 主键 instVersion（P1.4.9：单字符串实例令牌）；statusCode/
+// isRetryable 可空（nil 表缺失）。
+func NewServeRuntimeSessionError(instVersion, taskID, sessionID, name, message string, statusCode *int, isRetryable *bool) Event {
+	return Event{
+		Topic: TopicServeRuntime,
+		Type:  TypeServeRuntimeSessionError,
+		RID:   instVersion,
+		Payload: ServeRuntimeSessionErrorPayload{
+			TaskID:      taskID,
+			SessionID:   sessionID,
+			Name:        name,
+			Message:     message,
+			StatusCode:  statusCode,
+			IsRetryable: isRetryable,
 		},
 	}
 }

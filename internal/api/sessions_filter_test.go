@@ -25,6 +25,10 @@ func TestEventDirtiesActiveSessions(t *testing.T) {
 		// serve_runtime.* 标脏。
 		{"serve_runtime.attention_changed", ocdeckevent.NewServeRuntimeAttentionChanged("iv1", "t1"), true},
 		{"serve_runtime.run_status_changed", ocdeckevent.NewServeRuntimeRunStatusChanged("iv1", "t1", "idle", "busy", true), true},
+		// serve_runtime.session_error：一次性通知输入，快照（attention/run_status 投影）
+		// 不受影响 → 不标脏（task-notifications D2）；payload 非 typed 按本表惯例保守标脏。
+		{"serve_runtime.session_error", ocdeckevent.NewServeRuntimeSessionError("iv1", "t1", "s1", "APIError", "boom", nil, nil), false},
+		{"serve_runtime.session_error malformed payload", ocdeckevent.Event{Topic: ocdeckevent.TopicServeRuntime, Type: ocdeckevent.TypeServeRuntimeSessionError, RID: "iv1", Payload: "x"}, true},
 		// resync.requested 标脏（强制重拉全量）。
 		{"resync.requested", ocdeckevent.NewResyncRequested(), true},
 		// task.activity_changed 标脏。

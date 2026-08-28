@@ -5,6 +5,7 @@ import (
 	"log"
 	"sync"
 
+	ocdecksess "ocdeck/internal/domain/session"
 	"ocdeck/internal/infrastructure/opencode"
 )
 
@@ -524,6 +525,37 @@ func (m *Manager) applySessionStatusEvent(taskID string, ev opencode.Event, mode
 			kind: agentOpStatusEvent, sessionID: sev.SessionID, status: sev.Status,
 		})
 	}
+}
+
+// observeSessionErrorEvent 消费 session.error（task-notifications D2）：先 fail-closed
+// 解析（malformed 静默忽略，不做任何 I/O），再以解析所得 sessionID 做归属反查
+//（MUST NOT 回退 info.id——解析器的必填键就是 properties.sessionID），命中本任务
+// 且 runtime 存活时发布 serve_runtime.session_error。一次性错误事实，不写
+// agentStatus 状态投影（run_status 是状态投影，不并入理由见 design D2）。
+// 归属查询失败仅记日志丢弃事件：通知观察 MUST NOT 中断事件流/影响任务状态机
+//（语义对齐 attention 事件「永不返回错误」）。
+func (m *Manager) observeSessionErrorEvent(ctx context.Context, taskID string, ev opencode.Event) {
+	sev, ok := opencode.ParseSessionErrorEvent(ev)
+	if !ok {
+		return
+	}
+	if m.lifecycle == nil {
+		return
+	}
+	owner, found, err := m.lifecycle.OwnerOf(ctx, ocdecksess.ID(sev.SessionID))
+	if err != nil {
+		log.Printf("task %s: session.error ownership check for %s failed: %v (event dropped)", taskID, sev.SessionID, err)
+		return
+	}
+	if !found || owner != taskID {
+		return
+	}
+	rt := m.getRuntime(taskID)
+	if rt == nil {
+		return
+	}
+	m.lifecycle.CommitSessionError(taskID, string(rt.instVersion),
+		sev.SessionID, sev.Name, sev.Message, sev.StatusCode, sev.IsRetryable)
 }
 
 // handleAgentStatusDisconnect SSE 断流回调（client OnDisconnect，仅已建立连接终止触发，
