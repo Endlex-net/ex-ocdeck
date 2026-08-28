@@ -1,12 +1,12 @@
 // Package notify 提供通知配置存储（task-notifications design D5：ai-provider-config
 // LoadStore 模式平移，参考 internal/infrastructure/ai/config.go）。
 //
-// - 配置文件 <dataDir>/notification.json：临时文件 + 原子 rename、0600。
-// - Store：内存快照 + 写 mutex 串行化「token 合并 → 校验 → 原子写 → 快照替换」；
-//   启动加载不拒绝启动（文件损坏/非法 → 默认配置 + load_error 降级）。
-// - 行为唯一表述在 spec「通知配置存储 / 读写 API / 配置运行时生效」。
-// - bark token 仅在内存与 0600 文件中存在，MUST NOT 明文进日志或 API 响应
-//   （掩码经 MaskToken）。
+//   - 配置文件 <dataDir>/notification.json：临时文件 + 原子 rename、0600。
+//   - Store：内存快照 + 写 mutex 串行化「token 合并 → 校验 → 原子写 → 快照替换」；
+//     启动加载不拒绝启动（文件损坏/非法 → 默认配置 + load_error 降级）。
+//   - 行为唯一表述在 spec「通知配置存储 / 读写 API / 配置运行时生效」。
+//   - bark token 仅在内存与 0600 文件中存在，MUST NOT 明文进日志或 API 响应
+//     （掩码经 MaskToken）。
 package notify
 
 import (
@@ -160,8 +160,8 @@ func loadConfigFile(dataDir string) (cfg notification.Config, ok bool, err error
 // --- 磁盘 schema 必填键解码（spec「通知配置存储」：字段均为必填键） ---
 
 // wireConfig 指针型 wire DTO：缺键与 JSON null 均得到 nil 指针，二者同按
-//「必填键非法」处理（磁盘加载与 PUT 请求体共用本规则）。未知字段忽略
-//（不使用 DisallowUnknownFields，对齐既有 decodeJSON 惯例）。
+// 「必填键非法」处理（磁盘加载与 PUT 请求体共用本规则）。未知字段忽略
+// （不使用 DisallowUnknownFields，对齐既有 decodeJSON 惯例）。
 type wireConfig struct {
 	Enabled            *bool           `json:"enabled"`
 	Categories         *wireCategories `json:"categories"`

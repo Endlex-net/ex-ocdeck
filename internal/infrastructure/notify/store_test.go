@@ -75,7 +75,7 @@ func TestLoadStore_CorruptJSON_DefaultAndLoadErr(t *testing.T) {
 }
 
 // TestLoadStore_InvalidIdleTimeout 文件可解析但阈值越界 → loadErr + 默认配置
-//（fail-safe：通知按默认总开关关闭运行）。
+// （fail-safe：通知按默认总开关关闭运行）。
 func TestLoadStore_InvalidIdleTimeout(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := validNotificationConfig()

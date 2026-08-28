@@ -205,8 +205,8 @@ srv.Serve(ctx)             // 用最终 mux 构造 http.Server 并开始服务
 ### D12: 实现分 lane 与验证策略
 
 - **Lane A 配置与事件契约**：domain/notification 值对象、store、ParseSessionErrorEvent、事件目录扩展。测试：fixture 解析（沿用 session_status_events.jsonl 模式固化真实样本）、store 原子写/掩码/降级。
-- **Lane B 触发器**：application/notification 状态机，fake clock 注入（不睡真实时间）。测试：五类触发、抑制/重新武装、episode 竞争（同 tick error>retry、episode 名额仲裁四分支）、启动基线（含枚举失败禁用触发）、overflow 对账（含对账失败进入 reconciling）、门禁复验、suspend→reactivate 重新武装、busy→retry→busy→retry episode 重开、idle 阈值升高/降低热更新。
-- **Lane C 渠道**：bark（httptest fake server 验证 wire 契约）、macos（注入 command runner fake）、web（fake WebPublisher）。测试：成功/失败判定、降级前缀、超时、禁日志 token、DispatchPlan 固化（LLM 阻塞期间并发 PUT 不影响在途投递）。
+- **Lane B 触发器**：application/notification 状态机，fake clock 注入（不睡真实时间）。测试：五类触发、抑制/重新武装、episode 竞争（同 tick error>retry、episode 名额仲裁四分支）、启动基线（含枚举失败禁用触发）、overflow 对账（含对账失败进入 reconciling）、门禁复验、suspend→reactivate 重新武装、busy→retry→busy→retry episode 重开、idle 阈值升高/降低热更新、DispatchPlan 固化（LLM 阻塞期间并发 PUT 不影响在途投递：在途 URL/LLM 开关/渠道集合/bark endpoint+token 全部保持旧快照，下一次投递用新配置）。
+- **Lane C 渠道**：bark（httptest fake server 验证 wire 契约）、macos（注入 command runner fake）、web（fake WebPublisher）。测试：成功/失败判定、降级前缀、超时、禁日志 token。
 - **Lane D API/UI**：配置 GET/PUT、测试通知、WebHub SSE、设置页子标签、前端通知订阅。测试：状态码矩阵、并发 PUT、SSE 帧格式、多标签、权限分支。
 - **Lane E LLM 总结**：completer 复用 + 预算/降级。最后做，可被前四 lane 独立交付。
 - 全部 lane 完成后 D11 wiring + 端到端冒烟（真实 serve 起任务制造 question/idle）。
