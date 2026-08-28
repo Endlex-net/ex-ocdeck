@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
-import { html as renderDiffHtml } from 'diff2html';
-import 'diff2html/bundles/css/diff2html.min.css';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import type { GitDiffResult, GitFileEntry, GitStatus } from '../types';
+import type { DiffViewMode } from './diff/DiffViewer';
 import { BranchIcon } from '../icons';
+
+// 编辑器代码（CodeMirror 及语言包）整 chunk 懒加载，与主 bundle 分离（design D8）。
+const DiffViewerLazy = lazy(() => import('./diff/DiffViewer'));
 
 interface FileGroup {
   key: string;
@@ -11,7 +13,7 @@ interface FileGroup {
   files: GitFileEntry[];
   /** 该组文件请求 diff 时使用的 ref（暂存组用 HEAD 才能看到索引内容）。 */
   ref: string;
-  /** untracked 组用 `git diff --no-index` 合成 new-file diff（design.md D1）。 */
+  /** untracked 组 ref 为空且 untracked=1：旧侧不存在，渲染为全部新增视图。 */
   untracked: boolean;
 }
 
@@ -30,7 +32,7 @@ function groupFiles(files: GitFileEntry[]): FileGroup[] {
   return groups.filter((g) => g.files.length > 0);
 }
 
-/** 任务工作台 git 面板（design.md 2.6）：status 分组 + diff2html 渲染 + commit/push。 */
+/** 任务工作台 git 面板（design.md 2.6）：status 分组 + CodeMirror merge diff 渲染 + commit/push。 */
 export function GitPanel({ taskID, active }: { taskID: string; active: boolean }) {
   const [status, setStatus] = useState<GitStatus | null>(null);
   const [loadError, setLoadError] = useState('');
@@ -46,6 +48,12 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
   const [diff, setDiff] = useState<GitDiffResult | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
   const [diffError, setDiffError] = useState('');
+  // 用户 diff 形态选择（DR1）：null = 未选择（按视口默认）；跨文件切换与 resize 保留，面板卸载丢弃。
+  const [modeOverride, setModeOverride] = useState<DiffViewMode | null>(null);
+  // 换行开关（design D6）：默认关（横向滚动）；生命周期与 modeOverride 一致（跨文件/视口保留，卸载丢弃）。
+  const [wrapOverride, setWrapOverride] = useState(false);
+  // openDiff 请求序号：仅最新请求可写 diff/diffError/diffLoading（I2 乱序防护）
+  const diffReqSeq = useRef(0);
 
   const loadStatus = async () => {
     setRefreshing(true);
@@ -86,16 +94,21 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
   };
 
   const openDiff = async (path: string, ref: string, untracked: boolean) => {
+    // 乱序防护（I2）：快速切换文件时，晚到的旧响应不得覆盖最新选中文件的 diff 状态
+    const reqID = ++diffReqSeq.current;
     setSelFile({ path, ref });
     setDiff(null);
     setDiffError('');
     setDiffLoading(true);
     try {
-      setDiff(await api.gitDiff(taskID, ref, path, untracked));
+      const result = await api.gitDiff(taskID, ref, path, untracked);
+      if (reqID !== diffReqSeq.current) return;
+      setDiff(result);
     } catch (err) {
+      if (reqID !== diffReqSeq.current) return;
       setDiffError(err instanceof ApiError ? err.message : '加载 diff 失败');
     } finally {
-      setDiffLoading(false);
+      if (reqID === diffReqSeq.current) setDiffLoading(false);
     }
   };
 
@@ -135,16 +148,6 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
   };
 
   const groups = useMemo(() => groupFiles(status?.files ?? []), [status]);
-
-  // diff2html 输出对代码内容做转义，可安全渲染；禁止直接注入原始 diff 文本
-  const diffHtml = useMemo(() => {
-    if (!diff || !diff.diff) return '';
-    return renderDiffHtml(diff.diff, {
-      drawFileList: false,
-      matching: 'lines',
-      outputFormat: 'line-by-line',
-    });
-  }, [diff]);
 
   return (
     <div className="git-panel">
@@ -252,9 +255,6 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
               {selFile.path}
               {selFile.ref && <span className="header-meta">（{selFile.ref}）</span>}
             </div>
-            {diff?.truncated && (
-              <div className="alert-bar alert-notice">diff 过大，已被服务端截断。</div>
-            )}
             {diffLoading && (
               <div className="empty">
                 <span className="spinner spinner-inline" aria-hidden />
@@ -262,12 +262,17 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
               </div>
             )}
             {diffError && <pre className="git-error mono">{diffError}</pre>}
-            {!diffLoading && !diffError && diff && !diff.diff && (
-              <div className="empty">该文件暂无可展示的 diff。</div>
-            )}
-            {diffHtml && (
-              // diff2html 渲染产物（内容已转义）
-              <div className="diff-view" dangerouslySetInnerHTML={{ __html: diffHtml }} />
+            {!diffLoading && !diffError && diff && (
+              <Suspense fallback={<div className="empty">加载 diff 视图…</div>}>
+                <DiffViewerLazy
+                  diff={diff}
+                  path={selFile.path}
+                  modeOverride={modeOverride}
+                  onModeChange={setModeOverride}
+                  wrapOverride={wrapOverride}
+                  onWrapChange={setWrapOverride}
+                />
+              </Suspense>
             )}
           </>
         )}
