@@ -124,10 +124,14 @@ func resolveChannels(channels []notification.Channel, cfg notification.Config) [
 // 失败记日志；无 CapGroup 的渠道由本层给标题加 [<TaskName>] 前缀降级）。异步
 // goroutine 执行（run loop 先标记消费再投递；投递期间到达的新事件按 spec 已接受
 // 竞态语义处理）。全渠道失败不自动重试（已消费语义由调用方保证）。
+// LLM 停止原因总结（D9）在渠道投递前执行：LLM 副作用只发生在门禁全部通过之后
+// （dispatch 调用点），预算内降级——失败/超时/未装配/空白/超长输出不延迟投递
+// 超过上界、不因此失败或丢失通知。
 func (n *Notifier) dispatch(ctx context.Context, plan *notification.DispatchPlan, in notification.Intent) {
 	n.dispatchWG.Add(1)
 	go func() {
 		defer n.dispatchWG.Done()
+		in = n.summarize(ctx, plan, in)
 		var wg sync.WaitGroup
 		for _, rc := range plan.Channels {
 			wg.Add(1)

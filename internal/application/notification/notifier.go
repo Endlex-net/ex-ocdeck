@@ -32,6 +32,8 @@ type Options struct {
 	Cfg            ConfigStore        // 必需（配置快照）
 	Channels       []notification.Channel
 	ResolveBaseURL BaseURLResolver
+	Summarizer     SummaryCompleter // LLM 停止原因总结（D9；nil=未装配，全降级）
+	LLMBudget      time.Duration    // LLM 总结预算上界（默认 5s；测试可注入）
 	Now            func() time.Time // 时钟注入（测试 fake clock；默认 time.Now）
 	TickEvery      time.Duration    // 判定周期（默认 10s）
 }
