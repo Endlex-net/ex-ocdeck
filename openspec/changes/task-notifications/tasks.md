@@ -44,6 +44,6 @@
 
 ## 6. 装配与端到端
 
-- [ ] 6.1 main.go 装配（design D11 伪代码顺序）：notifyStore → webHub → notifier（eventSubscriberAdapter + 窄端口 + ResolveBaseURL(configuredBaseURL)）→ SetNotificationStore/SetNotificationTester → RebuildRoutes → Listen → notifier.Start → Serve；关停 notifier.Stop() 先于 tm.Shutdown
-- [ ] 6.2 `openspec validate task-notifications --strict` 通过；`go build ./...` 与 `go test ./...` 通过；前端 `pnpm -C web build`（或项目既有构建命令）通过
-- [ ] 6.3 端到端冒烟：真实 serve 起任务制造 question/idle，验证 web 通知与测试通知逐渠道报告
+- [x] 6.1 main.go 装配（design D11 伪代码顺序）：notifyStore → webHub → notifier（eventSubscriberAdapter + 窄端口 + ResolveBaseURL(configuredBaseURL)）→ SetNotificationStore/SetNotificationTester → RebuildRoutes → Listen → notifier.Start → Serve；关停 notifier.Stop() 先于 tm.Shutdown
+- [x] 6.2 `openspec validate task-notifications --strict` 通过；`go build ./...` 与 `go test ./...` 通过；前端 `pnpm -C web build`（或项目既有构建命令）通过
+- [x] 6.3 端到端冒烟：真实 serve 起任务制造 question/idle，验证 web 通知与测试通知逐渠道报告

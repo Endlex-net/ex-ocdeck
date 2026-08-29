@@ -115,7 +115,7 @@ func (s *Server) handleTestNotification(w http.ResponseWriter, r *http.Request) 
 		writeJSONError(w, http.StatusUnprocessableEntity, CodeInvalidState, "notification master switch is off, enable it before sending a test")
 		return
 	}
-	base, err := s.notificationBaseURL(st.Config)
+	base, err := s.NotificationBaseURL(st.Config.BaseURL)
 	if err != nil {
 		writeJSONError(w, http.StatusUnprocessableEntity, CodeInvalidState, err.Error())
 		return
@@ -135,12 +135,13 @@ func (s *Server) handleTestNotification(w http.ResponseWriter, r *http.Request) 
 	}{Results: out})
 }
 
-// notificationBaseURL 跳转 base 推导（design D8）：配置 base_url 非空 → 剔除
-// 尾部 '/' 后用之；否则 host 取 ListenAddr（wildcard 0.0.0.0/::/空 → 127.0.0.1），
-// port 取 BoundAddr 实际端口。未 Listen 且未配置 → 错误。
-func (s *Server) notificationBaseURL(cfg domainnotification.Config) (string, error) {
-	if cfg.BaseURL != "" {
-		return strings.TrimRight(cfg.BaseURL, "/"), nil
+// NotificationBaseURL 跳转 base 推导（design D8/D11：BaseURLResolver）。
+// configuredBaseURL 非空 → 剔除尾部 '/' 后用之（由候选判定的 ConfigSnapshot
+// 传入，本方法不读 notifyStore）；否则 host 取 ListenAddr（wildcard
+// 0.0.0.0/::/空 → 127.0.0.1），port 取 BoundAddr 实际端口。未 Listen 且未配置 → 错误。
+func (s *Server) NotificationBaseURL(configuredBaseURL string) (string, error) {
+	if configuredBaseURL != "" {
+		return strings.TrimRight(configuredBaseURL, "/"), nil
 	}
 	addr := s.BoundAddr()
 	if addr == nil {

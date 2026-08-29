@@ -785,13 +785,13 @@ func TestNotificationBaseURL(t *testing.T) {
 
 	cfg := notification.DefaultConfig()
 	cfg.BaseURL = "https://example.com/"
-	if got, err := s.notificationBaseURL(cfg); err != nil || got != "https://example.com" {
+	if got, err := s.NotificationBaseURL(cfg.BaseURL); err != nil || got != "https://example.com" {
 		t.Errorf("configured base = %q err=%v, want https://example.com", got, err)
 	}
 
 	// 未 Listen 且未配置 → error（URL 不可用）。
 	cfg.BaseURL = ""
-	if _, err := s.notificationBaseURL(cfg); err == nil {
+	if _, err := s.NotificationBaseURL(cfg.BaseURL); err == nil {
 		t.Error("base url must be unavailable before Listen without base_url")
 	}
 
@@ -809,7 +809,7 @@ func TestNotificationBaseURL(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	defer l.closeListenerForTest()
-	got, err := l.notificationBaseURL(cfg)
+	got, err := l.NotificationBaseURL(cfg.BaseURL)
 	if err != nil {
 		t.Fatalf("base url after listen: %v", err)
 	}
@@ -831,7 +831,7 @@ func TestNotificationBaseURL(t *testing.T) {
 		t.Fatalf("listen wildcard: %v", err)
 	}
 	defer w.closeListenerForTest()
-	got, err = w.notificationBaseURL(cfg)
+	got, err = w.NotificationBaseURL(cfg.BaseURL)
 	if err != nil {
 		t.Fatalf("wildcard base: %v", err)
 	}
@@ -853,7 +853,7 @@ func TestNotificationBaseURL(t *testing.T) {
 		t.Fatalf("listen localhost: %v", err)
 	}
 	defer h.closeListenerForTest()
-	got, err = h.notificationBaseURL(cfg)
+	got, err = h.NotificationBaseURL(cfg.BaseURL)
 	if err != nil {
 		t.Fatalf("localhost base: %v", err)
 	}
