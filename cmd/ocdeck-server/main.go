@@ -185,14 +185,44 @@ func run() error {
 	if wd != nil {
 		srv.SetWatchdogStateProvider(wd.StateString)
 	}
-	// D11：Listen → notifier.Start → Serve。Listen 失败拒绝启动（fail-closed）。
+	// D11：Listen → notifier.Start → Serve。Listen 失败仍进入统一关停段
+	// （G1：不得绕过 notifier.Stop / tm.Shutdown / bgStop / watchdog 收尾；
+	// Notifier.Stop 支持 Stop-before-Start）。
+	var serveErr error
 	if err := srv.Listen(); err != nil {
-		return err
+		serveErr = err
+	} else {
+		notifier.Start(ctx)
+		// HTTP 服务阻塞直到 ctx 取消（信号）或监听出错。
+		serveErr = srv.Serve(ctx)
 	}
-	notifier.Start(ctx)
-	// HTTP 服务阻塞直到 ctx 取消（信号）或监听出错。
-	serveErr := srv.Serve(ctx)
 
+	return shutdownRuntime(shutdownRuntimeArgs{
+		notifier: notifier,
+		tm:       tm,
+		bgStop:   bgStop,
+		wd:       wd,
+		serveErr: serveErr,
+	})
+}
+
+// runtimeStopper / runtimeShutdowner 关停窄端口（G1 测试注入；生产为
+// *appnotification.Notifier / *task.Manager）。
+type runtimeStopper interface{ Stop() }
+type runtimeShutdowner interface {
+	Shutdown(ctx context.Context) error
+}
+
+// shutdownRuntimeArgs 统一关停所需运行时句柄（G1：Listen 失败与 Serve 返回共用）。
+type shutdownRuntimeArgs struct {
+	notifier runtimeStopper
+	tm       runtimeShutdowner
+	bgStop   func()
+	wd       *process.WatchdogManager
+	serveErr error
+}
+
+func shutdownRuntime(a shutdownRuntimeArgs) error {
 	// 正常关停（design.md §10 顺序）：notifier.Stop 先于 tm.Shutdown（D11：
 	// 不再发通知）；随后 quiesce/TaskManager shutdown——
 	// kill 模式：先杀会话、确认空、再 StopWatchdog、退出（watchdog 不得先停）。
@@ -204,12 +234,20 @@ func run() error {
 	// 此时让进程退出但保留 watchdog 子进程存活，由其轮询到父亡后执行 kill-server。
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
-	notifier.Stop()
-	shutdownErr := tm.Shutdown(shutdownCtx)
+	if a.notifier != nil {
+		a.notifier.Stop()
+	}
+	var shutdownErr error
+	if a.tm != nil {
+		shutdownErr = a.tm.Shutdown(shutdownCtx)
+	}
 	if shutdownErr != nil {
 		log.Printf("warning: taskmanager shutdown: %v (runtime not clean, keeping watchdog alive)", shutdownErr)
 	}
-	bgStop()
+	if a.bgStop != nil {
+		a.bgStop()
+	}
+	wd := a.wd
 	if wd != nil {
 		// 显式分支（design.md §10）：kill_immediate 下 watchdog 是 kill -9 窗口的最后兜底。
 		//   - shutdownErr != nil（runtime 未净：残留会话/debt）→ MUST 保持 watchdog 运行，
@@ -233,7 +271,7 @@ func run() error {
 	if shutdownErr != nil {
 		return shutdownErr
 	}
-	return serveErr
+	return a.serveErr
 }
 
 // spawnWatchdog 构造并启动 watchdog 子进程（design.md §10）。

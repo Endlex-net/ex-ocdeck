@@ -270,9 +270,15 @@ func (n *Notifier) onTaskLeftActive(ctx context.Context, taskID string) {
 	}
 }
 
-// stateFor 取任务触发态；实例换代（instVersion 不一致，B3）时整体重建——旧
-// 实例的计时/名额/去重不延续到新实例。
-func (n *Notifier) stateFor(taskID, instVersion string) *taskState {
+// stateFor 取任务触发态。实例换代（instVersion 不一致，B3）时整体重建——旧
+// 实例的计时/名额/去重不延续到新实例。G2：复验调用方已读的组合快照——任务
+// 当前非 active 时删除该 task 状态且不重建，返回 nil（spec「离开 active 后取消
+// 全部待决计时」；跨 topic 迟到的同实例 serve 事件不得复活状态）。
+func (n *Notifier) stateFor(taskID, instVersion string, snap TaskSnapshot) *taskState {
+	if snap.Task.Status != application.StatusActive {
+		delete(n.states, taskID)
+		return nil
+	}
 	if st, ok := n.states[taskID]; ok && st.instVersion == instVersion {
 		return st
 	}

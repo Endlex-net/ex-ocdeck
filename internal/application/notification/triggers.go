@@ -27,10 +27,10 @@ func (n *Notifier) onAttentionChanged(ctx context.Context, taskID, instVersion s
 	if snap.InstVersion != instVersion {
 		return
 	}
-	if snap.Task.Status != application.StatusActive {
+	st := n.stateFor(taskID, snap.InstVersion, snap)
+	if st == nil {
 		return
 	}
-	st := n.stateFor(taskID, snap.InstVersion)
 	if len(snap.Attention.Questions) > 0 || len(snap.Attention.Permissions) > 0 {
 		st.idleSince = nil // 出现任意 pending：idle 计时取消且本周期不再触发
 	}
@@ -113,7 +113,10 @@ func (n *Notifier) onRunStatusChanged(ctx context.Context, p ocdeckevent.ServeRu
 	if snap.InstVersion != instVersion {
 		return
 	}
-	st := n.stateFor(p.TaskID, snap.InstVersion)
+	st := n.stateFor(p.TaskID, snap.InstVersion, snap)
+	if st == nil {
+		return
+	}
 	now := n.opts.Now()
 	if p.To != runStatusIdle {
 		st.idleSince = nil // 回到非 idle / 不可用：idle 计时取消
@@ -153,10 +156,13 @@ func (n *Notifier) onSessionError(ctx context.Context, p ocdeckevent.ServeRuntim
 	if snap.InstVersion != instVersion {
 		return
 	}
-	if snap.Task.Status != application.StatusActive || snap.RunStatus == runStatusBusy {
-		return // 非 active / 聚合已 busy 的瞬时错误
+	if snap.RunStatus == runStatusBusy {
+		return // 聚合已 busy 的瞬时错误
 	}
-	st := n.stateFor(p.TaskID, snap.InstVersion)
+	st := n.stateFor(p.TaskID, snap.InstVersion, snap)
+	if st == nil {
+		return
+	}
 	st.lastError = p
 	st.startEpisode()
 	if !st.errorSeen {

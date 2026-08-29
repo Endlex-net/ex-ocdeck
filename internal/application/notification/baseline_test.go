@@ -321,6 +321,38 @@ func TestTaskDeletedFromActiveCancels(t *testing.T) {
 	}
 }
 
+// TestLateRunStatusAfterLeaveDoesNotRebuildState G2：跨 topic 乱序——leave
+// 先消费删除状态后，迟到的同 instVersion run_status（快照已非 active）不得经
+// stateFor 重建 idle/retry 计时（spec「离开 active 后取消全部待决计时」）。
+func TestLateRunStatusAfterLeaveDoesNotRebuildState(t *testing.T) {
+	n, ft, _, ch, clk := triggerFixture(t, "idle")
+	ctx := context.Background()
+
+	n.handleEvent(ctx, runStatusEvent("t1", "busy", "idle", true))
+	if n.states["t1"] == nil || n.states["t1"].idleSince == nil {
+		t.Fatal("prereq: idle armed")
+	}
+
+	inactive := activeSnap("t1", "构建服务", "idle")
+	inactive.Task.Status = "suspending"
+	ft.set(inactive)
+	n.handleEvent(ctx, ocdeckevent.NewTaskStatusChanged("t1", "active", "suspending"))
+	if n.states["t1"] != nil {
+		t.Fatal("leave must drop state")
+	}
+
+	n.handleEvent(ctx, runStatusEvent("t1", "busy", "idle", true))
+	if n.states["t1"] != nil {
+		t.Fatal("late same-instance run_status must not rebuild state for inactive task")
+	}
+	clk.add(time.Hour)
+	n.scan(ctx)
+	waitDispatch(n)
+	if got := len(ch.sent()); got != 0 {
+		t.Fatalf("inactive task must not notify after late run_status, sends = %d", got)
+	}
+}
+
 // containsBody 判定发送记录中是否存在包含指定正文的意图。
 func containsBody(sent []notification.Intent, sub string) bool {
 	for _, in := range sent {
