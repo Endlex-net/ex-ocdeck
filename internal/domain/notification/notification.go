@@ -36,7 +36,7 @@ const (
 
 // Intent 渠道无关通知意图（design D4）。类别详情由内容组装进入 Body，意图不单独
 // 携带详情字段；URL 为目标页深链（推导规则 design D8，行为唯一表述 spec
-//「通知内容与跳转链接」）。
+// 「通知内容与跳转链接」）。
 type Intent struct {
 	TaskID   string
 	TaskName string
@@ -57,7 +57,7 @@ type Result struct {
 // Capability 渠道能力位掩码（design D4）：CapGroup（分组）/ CapReplace（同键替换）/
 // CapWithdraw（撤回，本期无渠道实现）。无能力渠道取 0（如 macos 的 osascript 实现，
 // 由 dispatch 层给标题加任务名前缀降级）。能力位矩阵的唯一表述在 spec
-//「通知渠道投递与降级」。
+// 「通知渠道投递与降级」。
 type Capability int
 
 const (

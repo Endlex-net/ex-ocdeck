@@ -89,10 +89,11 @@ type RetryDetail struct {
   episode 存续期间：idle 不武装/已武装取消；retry/error 合计至多通知一次
 ```
 
-- 每任务内存字段表：`idleSince *time.Time`（进入 idle 的武装时刻；扫描时以 `idleSince + 当前配置阈值` 判定到期，支持阈值热更新，spec idle requirement 为唯一表述）、`retryDeadline *time.Time`、`errorDeadline *time.Time`、`episodeActive bool`、`episodeConsumed bool`（名额占用语义见 spec「发送前门禁与投递原子性」仲裁表）、`idleSuppressed bool`、`notifiedQuestions map[requestID]struct{}`、`notifiedPermissions map[requestID]struct{}`（两张独立 map，去重键不跨类型碰撞）、`lastError SessionErrorEvent`。
+- 每任务内存字段表：`idleSince *time.Time`（进入 idle 的武装时刻；扫描时以 `idleSince + 当前配置阈值` 判定到期，支持阈值热更新，spec idle requirement 为唯一表述）、`retryDeadline *time.Time`、`errorDeadline *time.Time`、`errorSeen bool`（本 episode 首个 error 只武装一次；重复 error 仅更新 lastError；episode 结束复位）、`episodeActive bool`、`episodeConsumed bool`（名额占用语义见 spec「发送前门禁与投递原子性」仲裁表）、`idleSuppressed bool`、`notifiedQuestions map[requestID]struct{}`、`notifiedPermissions map[requestID]struct{}`（两张独立 map，去重键不跨类型碰撞）、`lastError SessionErrorEvent`。
+- **runtime fencing（生命周期保护，非 revision 机制）**：serve_runtime 事件 payload 的 RID 即 instVersion；组合快照暴露任务当前 runtime 的 instVersion，Notifier 处理 serve 事件时若与快照实例不一致 MUST 丢弃（旧 runtime 的迟到事件不得污染新 active 实例的状态机）。对账时若快照为 busy 则执行 episode 关闭语义并清除 episodeConsumed；仅对仍存续的非 busy episode 保留名额。
 - **扫描窗口**：10s tick，触发延迟上界 = 阈值 + 10s（60s 阈值 → 最坏 70s），已接受。
 - **启动基线**（spec「通知抑制、启动基线与对账」）：run loop 先 Subscribe 再取基线快照再 drain 队列；基线经 `ListAllActiveTaskIDs` 枚举 active 任务，**枚举失败 → 记错误日志并整体禁用通知触发**（配置 API 与测试通知仍可用，触发器待进程重启恢复）；attention 基线只播种 `notifiedQuestions`/`notifiedPermissions`；idle 不武装；已是 retry → `retryDeadline = now+60s`；不恢复 error 计时。
-- **overflow 对账**（`Sub.Overflow`，`bus.go:136-154`）：保留两张 notified map 与 `episodeConsumed`，取消全部计时，以当前快照按启动基线同规则重建。对账期间 `ListAllActiveTaskIDs` 或快照读取失败 → 进入 reconciling 状态：抑制全部发送，每 10s 重试对账，成功重建后恢复正常判定（MUST NOT 带不可信状态继续投递）。
+- **overflow 对账**（`Sub.Overflow`，`bus.go:136-154`）：检测到溢出后 MUST 先丢弃受污染订阅的既有事件队列（gap 前事件不得在对账后继续解释），再以当前快照重建。保留同实例的两张 notified map、`episodeConsumed` 与 `errorSeen`（runtime 换代或快照 busy 时全部清除），取消全部计时，以当前快照按启动基线同规则重建。每订阅溢出信号为合并信号（容量 1），消费至多一个 token，不得循环清空（防活锁）。对账期间 `ListAllActiveTaskIDs` 或快照读取失败 → 进入 reconciling 状态：抑制全部发送，每 10s 重试对账，成功重建后恢复正常判定（MUST NOT 带不可信状态继续投递）。
 
 ### D4: 渠道抽象与内容组装
 

@@ -11,21 +11,21 @@
 
 ## 2. Lane B：触发器（application/notification）
 
-- [ ] 2.1 新增 `internal/application/notification`：Notifier run loop（单 goroutine 串行：事件/计时/扫描）+ 窄端口（EventSubscriber/EventSubscription、TaskNotificationSnapshot 组合快照、ListAllActiveTaskIDs）
-- [ ] 2.2 task 层小扩展：agentStatus 内存态保留每 session 最近 retry 详情（apply 点 agent_status_state.go:523-525），实现组合快照端口（RetryDetail 有效性 `Attempt>0 && TrimSpace(Message)!=""`，多 session 选择规则 Next>0 最小→Next==0 排后→sessionID 字典序）；不变量：聚合语义与既有事件发布行为不变
-- [ ] 2.3 question/permission 触发：attention_changed → 组合快照读 pending 集合，按（类型, requestID）去重，了结即从去重集合移除
-- [ ] 2.4 idle 触发：仅 `available=true && from=busy && to=idle` 武装（记 idleSince），取消条件全集，扫描以 `idleSince + 当前阈值` 判定（阈值热更新）
-- [ ] 2.5 retry/error 触发 + episode 状态机：retry/error deadline（60s 固定）、episode 开闭、episodeConsumed 名额仲裁（spec「发送前门禁与投递原子性」仲裁表）、同 tick error>retry
-- [ ] 2.6 启动基线与 overflow 对账：先订阅→基线快照→drain；attention 只播种不补发；idle 不武装；retry 从 now+60s；枚举失败禁用触发；overflow 保留两张 notified map 与 `episodeConsumed`、取消全部计时并按基线规则重建、对账失败进 reconciling（10s 重试）
-- [ ] 2.7 发送前门禁与 DispatchPlan（`internal/application/notification/dispatch.go`，dispatch 唯一归属）：复验序列、ConfigSnapshot 单读、DispatchPlan 构造（URL/LLMSummary/ResolvedChannel 固化）、原子标记已消费、门禁失败零副作用、并行投递与失败隔离、无 CapGroup 时标题加 `[<TaskName>]` 前缀、全渠道失败不重试仍计已消费；内容组装模板（design D4：各类别标题/正文/拼接/截断/降级文案）与级别映射
-- [ ] 2.8 Lane B 测试（fake clock，不睡真实时间）：五类触发、抑制/重新武装、episode 仲裁四分支、episode 已消费后 overflow 对账不得由另一异常类别再次投递、启动基线（含枚举失败）、overflow 对账（含 reconciling）、门禁复验、suspend→reactivate、busy→retry→busy→retry、idle 阈值升降热更新、DispatchPlan 并行投递/失败隔离/前缀降级
+- [x] 2.1 新增 `internal/application/notification`：Notifier run loop（单 goroutine 串行：事件/计时/扫描）+ 窄端口（EventSubscriber/EventSubscription、TaskNotificationSnapshot 组合快照、ListAllActiveTaskIDs）
+- [x] 2.2 task 层小扩展：agentStatus 内存态保留每 session 最近 retry 详情（apply 点 agent_status_state.go:523-525），实现组合快照端口（RetryDetail 有效性 `Attempt>0 && TrimSpace(Message)!=""`，多 session 选择规则 Next>0 最小→Next==0 排后→sessionID 字典序）；不变量：聚合语义与既有事件发布行为不变
+- [x] 2.3 question/permission 触发：attention_changed → 组合快照读 pending 集合，按（类型, requestID）去重，了结即从去重集合移除
+- [x] 2.4 idle 触发：仅 `available=true && from=busy && to=idle` 武装（记 idleSince），取消条件全集，扫描以 `idleSince + 当前阈值` 判定（阈值热更新）
+- [x] 2.5 retry/error 触发 + episode 状态机：retry/error deadline（60s 固定）、episode 开闭、episodeConsumed 名额仲裁（spec「发送前门禁与投递原子性」仲裁表）、同 tick error>retry
+- [x] 2.6 启动基线与 overflow 对账：先订阅→基线快照→drain；attention 只播种不补发；idle 不武装；retry 从 now+60s；枚举失败禁用触发；overflow 保留两张 notified map 与 `episodeConsumed`、取消全部计时并按基线规则重建、对账失败进 reconciling（10s 重试）
+- [x] 2.7 发送前门禁与 DispatchPlan（`internal/application/notification/dispatch.go`，dispatch 唯一归属）：复验序列、ConfigSnapshot 单读、DispatchPlan 构造（URL/LLMSummary/ResolvedChannel 固化）、原子标记已消费、门禁失败零副作用、并行投递与失败隔离、无 CapGroup 时标题加 `[<TaskName>]` 前缀、全渠道失败不重试仍计已消费；内容组装模板（design D4：各类别标题/正文/拼接/截断/降级文案）与级别映射
+- [x] 2.8 Lane B 测试（fake clock，不睡真实时间）：五类触发、抑制/重新武装、episode 仲裁四分支、episode 已消费后 overflow 对账不得由另一异常类别再次投递、对账时快照已 busy 则 episode 关闭并清除消费位、启动基线（含枚举失败后 disabled 终态不受 overflow 影响）、overflow 对账（含 reconciling 与 overflow 优先于 tick/事件）、门禁复验、suspend→reactivate 重新武装（含旧 instVersion 事件 fencing）、busy→retry→busy→retry、idle 阈值升降热更新、DispatchPlan 并行投递/失败隔离/前缀降级、DispatchPlan 不可变性（字段级：URL/LLM 开关/渠道集合/bark endpoint+token 在途固化；LLM 阻塞期间并发 PUT 的集成断言随 Lane E 5.2 交付）、Start/Stop 生命周期幂等
 
 ## 3. Lane C：渠道适配器（infrastructure/notify）
 
-- [ ] 3.1 bark.go：POST `<endpoint>/push` JSON（device_key/title/body/level/group/url）、10s 超时、禁重定向/重试、64KiB 响应上限、成功=2xx 且 code==200、token/请求体/响应原文禁日志；Caps=Group；wire 契约以 spec「Bark 渠道」为准
-- [ ] 3.2 macos.go：LookPath 探测 terminal-notifier 与 osascript（均不存在→skipped）；terminal-notifier（Caps=Group|Replace，`-group -title -message -open -sound default`）→ 仅未安装时 osascript（Caps=0，on run argv 固定脚本）；无 shell、10s 硬超时、4KB 输出上限；执行失败不再降级
-- [ ] 3.3 web.go：窄端口 WebPublisher.Publish(Intent) (accepted bool)，Caps=Replace
-- [ ] 3.4 Lane C 测试：bark httptest fake server（wire 契约全项：请求体字段/超时/禁重定向/64KiB 上限/成功判定/token 禁日志）、macos 注入 command runner fake（探测选择、执行失败不再降级、超时与输出上限）、web fake publisher、DispatchPlan 固化（LLM 阻塞期间并发 PUT 不影响在途投递）
+- [x] 3.1 bark.go：POST `<endpoint>/push` JSON（device_key/title/body/level/group/url）、10s 超时、禁重定向/重试、64KiB 响应上限、成功=2xx 且 code==200、token/请求体/响应原文禁日志；Caps=Group；wire 契约以 spec「Bark 渠道」为准
+- [x] 3.2 macos.go：LookPath 探测 terminal-notifier 与 osascript（均不存在→skipped）；terminal-notifier（Caps=Group|Replace，`-group -title -message -open -sound default`）→ 仅未安装时 osascript（Caps=0，on run argv 固定脚本）；无 shell、10s 硬超时、4KB 输出上限；执行失败不再降级
+- [x] 3.3 web.go：窄端口 WebPublisher.Publish(Intent) (accepted bool)，Caps=Replace
+- [x] 3.4 Lane C 测试：bark httptest fake server（wire 契约全项：请求体字段/超时/禁重定向/64KiB 上限/成功判定/token 禁日志）、macos 注入 command runner fake（探测选择、执行失败不再降级、超时与输出上限）、web fake publisher（DispatchPlan 固化的并发 PUT 场景测试随 Lane B 2.8 交付——依赖 dispatch 编排，不属本 lane）
 
 ## 4. Lane D：API 与前端
 
@@ -40,7 +40,7 @@
 ## 5. Lane E：LLM 停止原因总结
 
 - [ ] 5.1 Notifier 接入 ai completer：llm_summary 开关（DispatchPlan 固化）、固定 prompt（design D9 逐字模板）、max_tokens 200、5s 总预算、空白/超 300 字符/失败/未配置 → 确定性摘要降级
-- [ ] 5.2 Lane E 测试：completer fake（成功/超时/空白/超长/未配置分支）、预算上界
+- [ ] 5.2 Lane E 测试：completer fake（成功/超时/空白/超长/未配置分支）、预算上界、LLM 阻塞期间并发 PUT 不影响在途投递的集成断言（DispatchPlan 字段级固化）
 
 ## 6. 装配与端到端
 

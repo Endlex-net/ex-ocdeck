@@ -7,7 +7,7 @@ import (
 )
 
 // SessionErrorEvent 是从 SSE session.error 事件解析出的结构化错误观察
-//（task-notifications design D2；真实样本 testdata/session_status_events.jsonl
+// （task-notifications design D2；真实样本 testdata/session_status_events.jsonl
 // 第 6 行，opencode 1.18.18 实测固化）：envelope {type, properties}，sessionID 在
 // properties.sessionID，错误体在 properties.error.{name, data.{message, statusCode,
 // isRetryable}}。本类型只做事件解析；触发语义（error 计时/episode）归
@@ -21,7 +21,7 @@ type SessionErrorEvent struct {
 }
 
 // ParseSessionErrorEvent 识别并解析 session.error 事件（字段规则唯一表述：spec
-//「通知触发——错误未恢复」）。必填 sessionID/error.name/error.data.message 三者
+// 「通知触发——错误未恢复」）。必填 sessionID/error.name/error.data.message 三者
 // MUST 为 TrimSpace 后非空的字符串（详情保留原文）；缺失、空白或类型非法 →
 // (zero, false) 忽略整个事件（fail-closed，不中断流）。可空字段 statusCode/
 // isRetryable 缺失或 null 合法；存在但类型非法（statusCode 非可无损表示为 Go int

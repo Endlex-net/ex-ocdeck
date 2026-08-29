@@ -131,7 +131,7 @@ func TestSessionErrorDispatch_AgentStatusUntouched(t *testing.T) {
 }
 
 // dispatchSessionErrorEventWithInfoID 构造带 info.id 但 sessionID 缺失/非法的事件
-//（A3：sessionID 不得回退 info.id）。
+// （A3：sessionID 不得回退 info.id）。
 func dispatchSessionErrorEventWithInfoID(infoID string, sessionID interface{}) opencode.Event {
 	props := map[string]interface{}{
 		"info":  map[string]interface{}{"id": infoID},

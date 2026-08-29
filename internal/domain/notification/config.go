@@ -31,7 +31,7 @@ type WebChannelConfig struct {
 
 // BarkChannelConfig bark 渠道配置（endpoint 与 token 均非空才算已配置）。
 // Token 仅在内存与 0600 文件中存在，MUST NOT 明文进日志或 API 响应
-//（掩码规则见基础设施层 notify.MaskToken）。
+// （掩码规则见基础设施层 notify.MaskToken）。
 type BarkChannelConfig struct {
 	Enabled  bool   `json:"enabled"`
 	Endpoint string `json:"endpoint"`

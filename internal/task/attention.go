@@ -228,6 +228,12 @@ func (a *attentionState) removeQuestLocked(id string) bool {
 func (a *attentionState) attentionSnapshot() Attention {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.attentionSnapshotLocked()
+}
+
+// attentionSnapshotLocked attentionSnapshot 的持锁实现（组合快照同锁拷贝用，
+// task-notifications Lane B B5）。
+func (a *attentionState) attentionSnapshotLocked() Attention {
 	return Attention{Permissions: a.permSnapshotLocked(), Questions: a.questSnapshotLocked()}
 }
 
@@ -312,9 +318,15 @@ func equalQuestionItems(x, y []opencode.QuestionItem) bool {
 
 // clearAttention 推进 attentionEpoch（atomic，不依赖 mu）并清空全部集合（短暂持 mu）。
 func (a *attentionState) clearAttention() {
-	a.attentionEpoch.Add(1)
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.clearAttentionLocked()
+}
+
+// clearAttentionLocked clearAttention 的持锁实现（runtime 组合清理用，Lane B B5：
+// 与组合快照同经 attention.mu 互斥）。
+func (a *attentionState) clearAttentionLocked() {
+	a.attentionEpoch.Add(1)
 	a.perm = newPermTypeState()
 	a.quest = newQuestTypeState()
 }
@@ -721,7 +733,7 @@ func (rt *taskRuntime) ensureAttentionState() *attentionState {
 }
 
 // applyAttentionEvent 经 runtime 应用一个注意力事件，返回是否改变外部可见快照
-//（attention 未懒初始化时为 no-op，changed=false）。
+// （attention 未懒初始化时为 no-op，changed=false）。
 func (rt *taskRuntime) applyAttentionEvent(ev opencode.AttentionEvent) bool {
 	rt.mu.Lock()
 	a := rt.attention
