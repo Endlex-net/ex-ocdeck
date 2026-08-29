@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { GlobalEnvEditor } from '../components/GlobalEnvEditor';
+import { NotificationConfigPanel } from '../components/NotificationConfigPanel';
 import { TermAppearanceEditor } from '../components/TermAppearanceEditor';
 import { navigate, type ConfigsTab } from '../router';
 import { useTheme, type ThemePreference } from '../hooks';
 import type { OcConfigContent, OcConfigInfo } from '../types';
 import './settings.css';
 
-/* ============================ 设置四合一（tasks.md 7.1-7.5） ============================
- * 终端外观 / 环境变量 / opencode 配置 / AI 配置合并为单页四子标签。
+/* ============================ 设置多合一（tasks.md 7.1-7.5 + task-notifications D12） ============================
+ * 终端外观 / 环境变量 / opencode 配置 / AI 配置 / 通知 合并为单页子标签。
  * 深链恢复：resolveRoute 已将 #/configs#<tab> 的 fragment 归一为合法 ConfigsTab（未知回 appearance）。
  * 子标签切换更新 hash（replace 模式不污染历史）。
  * 终端外观 / 环境变量复用既有编辑器组件；opencode / AI 逻辑已迁入本页（旧 ConfigsPage/AIConfigPage 已删）。 */
@@ -18,6 +19,7 @@ const TABS: { key: ConfigsTab; label: string; id: string; panel: string }[] = [
   { key: 'env', label: '环境变量', id: 'tab-env', panel: 'panel-env' },
   { key: 'opencode', label: 'opencode 配置', id: 'tab-opencode', panel: 'panel-opencode' },
   { key: 'ai', label: 'AI 配置', id: 'tab-ai', panel: 'panel-ai' },
+  { key: 'notifications', label: '通知', id: 'tab-notifications', panel: 'panel-notifications' },
 ];
 
 const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
@@ -97,6 +99,11 @@ export function SettingsPage({ tab }: { tab: ConfigsTab }) {
       {tab === 'ai' && (
         <div role="tabpanel" id="panel-ai" aria-labelledby="tab-ai">
           <AIConfigPanel />
+        </div>
+      )}
+      {tab === 'notifications' && (
+        <div role="tabpanel" id="panel-notifications" aria-labelledby="tab-notifications">
+          <NotificationConfigPanel />
         </div>
       )}
     </>

@@ -101,10 +101,12 @@ type fakeChannel struct {
 	calls   int
 	fail    bool
 	block   chan struct{} // 非 nil 时 Send 阻塞直到关闭
+	unavail bool          // true → Available()=false（macos skipped 矩阵）
 }
 
 func (c *fakeChannel) Name() string                  { return c.name }
 func (c *fakeChannel) Caps() notification.Capability { return c.caps }
+func (c *fakeChannel) Available() bool               { return !c.unavail }
 func (c *fakeChannel) Send(_ context.Context, in notification.Intent, cfg notification.ChannelConfig) notification.Result {
 	c.mu.Lock()
 	if c.block != nil {

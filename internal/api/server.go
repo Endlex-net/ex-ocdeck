@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/ai"
+	"ocdeck/internal/infrastructure/notify"
 	storepkg "ocdeck/internal/infrastructure/store"
 )
 
@@ -31,6 +33,20 @@ type Server struct {
 	aiConfig        *ai.Store
 	eventSubscriber EventSubscriber
 	httpSrv         *http.Server
+
+	// notifyStore/notificationTester 通知配置存储与测试通知窄端口
+	// （design D11：SetNotificationStore / SetNotificationTester）。
+	notifyStore        *notify.Store
+	notificationTester NotificationTester
+	webHubWriteTimeout time.Duration // 零值用生产默认；测试可注入短期限
+
+	// webHub 通知 SSE 连接注册表（design D7：路由与 web 渠道共享同一实例）。
+	webHub *WebHub
+
+	// listener/lnMu Listen/Serve 拆分状态（design D8）：Listen bind 并记录地址；
+	// Serve 消费 listener。重复 Listen 报错、未 Listen Serve 报错。
+	lnMu     sync.Mutex
+	listener net.Listener
 
 	// sseCoalesce/sseHeartbeat SSE 流合并窗口与心跳间隔（sse-active-sessions P2.3）。
 	// 零值用生产默认（500ms/25s）；仅供同包测试注入短间隔，不改变生产语义。
@@ -91,6 +107,7 @@ func WithProjectStore(cfg *config.Config, store StoreRO, projs ProjectStore) *Se
 		store:     store,
 		projs:     projs,
 		wsClients: newWSClientRegistry(),
+		webHub:    newWebHub(),
 	}
 	s.registerRoutes()
 	return s
@@ -135,6 +152,7 @@ func New(cfg *config.Config, store StoreRO) *Server {
 		auth:      NewTokenAuthenticator(cfg.Token),
 		store:     store,
 		wsClients: newWSClientRegistry(),
+		webHub:    newWebHub(),
 	}
 	if db, ok := store.(*storepkg.DB); ok && db != nil {
 		s.projs = NewProjectStoreAdapter(db)
@@ -168,6 +186,7 @@ func (s *Server) registerRoutes() {
 	s.registerLifecycleConfigRoutes(apiMux) // project lifecycle config（design.md §8）
 	s.registerOCConfigRoutes(apiMux)        // 全局 oc 配置管理（design.md §13/§21）
 	s.registerAIConfigRoutes(apiMux)        // 全局 AI provider 配置（design.md D6）
+	s.registerNotificationRoutes(apiMux)    // 通知配置/测试通知/SSE 流（task-notifications D7）
 
 	// /api/v1 前缀统一挂认证中间件（design.md §14/§21）。
 	// 已认证请求的未知路由/方法返回统一 JSON 404/405（design.md §21 错误结构）。
@@ -364,8 +383,59 @@ func (s *Server) handleServerStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(status)
 }
 
-// Start 启动 HTTP 服务。阻塞直到 ctx 取消或监听出错。
+// Start 启动 HTTP 服务（兼容封装）：Listen + Serve 的组合。阻塞直到 ctx 取消或
+// 监听出错。新装配（design D11）应直接使用 Listen/Serve 拆分形式。
 func (s *Server) Start(ctx context.Context) error {
+	if err := s.Listen(); err != nil {
+		return err
+	}
+	return s.Serve(ctx)
+}
+
+// Listen bind 监听地址并记录 listener 与实际地址（含系统分配端口，design D8）。
+// 只 bind 不启动 Serve；重复调用返回错误。监听地址来自 cfg（ListenAddr/ListenPort，
+// 负端口按 0 处理）。
+func (s *Server) Listen() error {
+	s.lnMu.Lock()
+	defer s.lnMu.Unlock()
+	if s.listener != nil {
+		return fmt.Errorf("listen: already listening on %s", s.listener.Addr().String())
+	}
+	port := s.cfg.ListenPort
+	if port < 0 {
+		port = 0
+	}
+	addr := net.JoinHostPort(s.cfg.ListenAddr, strconv.Itoa(port))
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", addr, err)
+	}
+	s.listener = ln
+	// 成功 bind 后记录实际监听地址（含系统分配端口，design.md §14）。
+	log.Printf("ocdeck-server HTTP listening on %s", ln.Addr().String())
+	return nil
+}
+
+// BoundAddr 返回实际监听地址；Listen 成功前返回 nil（design D8：BaseURL 推导
+// 窄端口只读此方法，Listen 后即可解析）。
+func (s *Server) BoundAddr() net.Addr {
+	s.lnMu.Lock()
+	defer s.lnMu.Unlock()
+	if s.listener == nil {
+		return nil
+	}
+	return s.listener.Addr()
+}
+
+// Serve 以最终 mux 构造 http.Server 并开始服务（design D8）。未 Listen 返回错误。
+// 阻塞直到 ctx 取消或监听出错；ctx 取消时 5s 预算内 Shutdown。
+func (s *Server) Serve(ctx context.Context) error {
+	s.lnMu.Lock()
+	ln := s.listener
+	s.lnMu.Unlock()
+	if ln == nil {
+		return fmt.Errorf("serve: not listening")
+	}
 	port := s.cfg.ListenPort
 	if port < 0 {
 		port = 0
@@ -381,12 +451,6 @@ func (s *Server) Start(ctx context.Context) error {
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("listen %s: %w", addr, err)
-	}
-	// 成功 bind 后记录实际监听地址（含系统分配端口，design.md §14）。
-	log.Printf("ocdeck-server HTTP listening on %s", ln.Addr().String())
 	errCh := make(chan error, 1)
 	go func() {
 		if err := s.httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {

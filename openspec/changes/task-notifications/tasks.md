@@ -29,18 +29,18 @@
 
 ## 4. Lane D：API 与前端
 
-- [ ] 4.1 `internal/api`：WebHub（连接注册表、每连接缓冲 channel 16、非阻塞 enqueue、慢客户端断开、`event: notification` 帧 + spec 唯一 JSON 形状、无重放）+ `GET /api/v1/notifications/stream`
-- [ ] 4.2 `internal/api`：配置 API `GET/PUT /api/v1/notification/config`（GET/PUT JSON 形状、token_masked 掩码、load_error 只读、400/422/500 矩阵、并发 PUT last-writer-wins）+ `POST /api/v1/notification/test`（`{"results":[{name,status,error}]}`，跳过 active/类别复验，总开关关闭返回 422）
-- [ ] 4.3 `Server.Listen() error` / `BoundAddr() net.Addr` / `Serve(ctx)` 拆分（Listen 只 bind 记录地址；重复 Listen 报错；Serve 未 Listen 报错；既有 Start 语义迁移）
-- [ ] 4.4 `internal/api/import_graph_test.go` import 断言扩展：domain/notification stdlib-only、application/notification 不 import infrastructure 具体类型、infrastructure 不依赖 api
-- [ ] 4.5 前端：ConfigsTab 增加 `notifications`、设置页通知子标签（总开关/五类别/阈值/三渠道参数/base_url 提示/llm_summary/保存/测试按钮/web 权限状态与申请入口/load_error 展示，深链 `#/configs#notifications`）
-- [ ] 4.6 前端：App 根部通知 SSE 订阅（仅 web 启用且权限 granted 时连接），`new Notification(title, {body, tag: task_id})`，onclick 聚焦并导航到帧内 url；api.ts/types.ts 增加对应 DTO
-- [ ] 4.7 Lane D 测试：配置 API 状态码矩阵、并发 PUT、测试通知 DTO、WebHub 帧格式/慢客户端断开/多连接、Listen/Serve 拆分、前端子标签渲染与权限分支
+- [x] 4.1 `internal/api`：WebHub（连接注册表、每连接缓冲 channel 16、非阻塞 enqueue、慢客户端断开、`event: notification` 帧 + spec 唯一 JSON 形状、无重放）+ `GET /api/v1/notifications/stream`
+- [x] 4.2 `internal/api`：配置 API `GET/PUT /api/v1/notification/config`（GET/PUT JSON 形状、token_masked 掩码、load_error 只读、400/422/500 矩阵、并发 PUT last-writer-wins）+ `POST /api/v1/notification/test`（`{"results":[{name,status,error}]}`，跳过 active/类别复验，总开关关闭返回 422）
+- [x] 4.3 `Server.Listen() error` / `BoundAddr() net.Addr` / `Serve(ctx)` 拆分（Listen 只 bind 记录地址；重复 Listen 报错；Serve 未 Listen 报错；既有 Start 语义迁移）
+- [x] 4.4 `internal/api/import_graph_test.go` import 断言扩展：domain/notification stdlib-only、application/notification 不 import infrastructure 具体类型、infrastructure 不依赖 api
+- [x] 4.5 前端：ConfigsTab 增加 `notifications`、设置页通知子标签（总开关/五类别/阈值/三渠道参数/base_url 提示/llm_summary/保存/测试按钮/web 权限状态与申请入口/load_error 展示，深链 `#/configs#notifications`）
+- [x] 4.6 前端：App 根部通知 SSE 订阅（仅 web 启用且权限 granted 时连接），`new Notification(title, {body, tag: task_id})`，onclick 聚焦并导航到帧内 url；api.ts/types.ts 增加对应 DTO
+- [x] 4.7 Lane D 测试：配置 API 状态码矩阵、并发 PUT、测试通知 DTO、WebHub 帧格式/慢客户端断开/多连接、Listen/Serve 拆分、前端子标签渲染与权限分支
 
 ## 5. Lane E：LLM 停止原因总结
 
-- [ ] 5.1 Notifier 接入 ai completer：llm_summary 开关（DispatchPlan 固化）、固定 prompt（design D9 逐字模板）、max_tokens 200、5s 总预算、空白/超 300 字符/失败/未配置 → 确定性摘要降级
-- [ ] 5.2 Lane E 测试：completer fake（成功/超时/空白/超长/未配置分支）、预算上界、LLM 阻塞期间并发 PUT 不影响在途投递的集成断言（DispatchPlan 字段级固化）
+- [x] 5.1 Notifier 接入 ai completer：llm_summary 开关（DispatchPlan 固化）、固定 prompt（design D9 逐字模板）、max_tokens 200、5s 总预算、空白/超 300 字符/失败/未配置 → 确定性摘要降级
+- [x] 5.2 Lane E 测试：completer fake（成功/超时/空白/超长/未配置分支）、预算上界、LLM 阻塞期间并发 PUT 不影响在途投递的集成断言（DispatchPlan 字段级固化）
 
 ## 6. 装配与端到端
 

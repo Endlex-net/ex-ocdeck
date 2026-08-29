@@ -104,3 +104,20 @@ func TestInfrastructureNoAPIDependency(t *testing.T) {
 		}
 	}
 }
+
+// TestAppNotificationNoInfrastructure 断言 internal/application/notification
+// 的直接 import 不含 ocdeck/internal/infrastructure 包（task-notifications
+// design D1：任务侧与 bus 依赖全部经窄端口注入，组合根适配——application/
+// notification 不 import infrastructure 具体类型，Lane D 4.4）。断言用直接
+// import 而非传递闭包：Attention 等共享 DTO 在 ocdeck/internal/application
+// （合法上游）中内嵌 opencode 请求类型，为既有架构接受的间接依赖。
+func TestAppNotificationNoInfrastructure(t *testing.T) {
+	for _, line := range goListOutput(t, "-f",
+		`{{range .Imports}}{{.}}{{"\n"}}{{end}}`,
+		"ocdeck/internal/application/notification") {
+		pkg := stripTestDecoration(line)
+		if pkg != "" && strings.HasPrefix(pkg, "ocdeck/internal/infrastructure") {
+			t.Fatalf("internal/application/notification must not import %q (task-notifications D1: narrow ports only)", pkg)
+		}
+	}
+}

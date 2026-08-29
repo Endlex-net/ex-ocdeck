@@ -425,7 +425,7 @@ PUT 请求体 JSON 形状与 GET 相同，仅两处差异：bark 渠道的令牌
 
 ### Requirement: 测试通知
 
-系统 SHALL 提供测试通知入口（`POST /api/v1/notification/test` 与设置页按钮），向全部已启用且已配置的渠道投递一条标识为测试的通知。测试通知 MUST 使用专用局部变体：TaskID 为 `notification-test`、任务名为 `ocdeck`、类别为 test（级别 active）、详情为固定文案「通知链路测试」、跳转链接为设置页 `#/configs#notifications`。测试通知 MUST 跳过任务 active 复验与类别开关检查，仅检查总开关、URL 可用性与渠道启用/配置；MUST 与真实通知走同一投递链路（含级别映射与降级）。响应 MUST 为 200 与逐渠道结果对象，顶层形状唯一表述为 `{"results": [{"name": "...", "status": "success|failed|skipped", "error": "..."}]}`（`status` 枚举：`success` | `failed` | `skipped`，skipped 表示未启用或未配置；`error` 为失败原因，成功或跳过时为空字符串）；各渠道的成功判定 MUST 与该渠道真实投递的判定一致（web 渠道为 WebHub 至少接纳一个已连接前端）。总开关关闭时 MUST 返回 422（invalid_state 或项目惯例等价码）并提示先开启总开关。
+系统 SHALL 提供测试通知入口（`POST /api/v1/notification/test` 与设置页按钮），向全部已启用且已配置的渠道投递一条标识为测试的通知。测试通知 MUST 使用专用局部变体：TaskID 为 `notification-test`、任务名为 `ocdeck`、类别为 test（级别 active）、详情为固定文案「通知链路测试」、跳转链接为设置页 `#/configs#notifications`。测试通知 MUST 跳过任务 active 复验与类别开关检查，仅检查总开关、URL 可用性与渠道启用/配置；MUST 与真实通知走同一投递链路（含级别映射与降级），但 MUST NOT 调用 LLM 总结（test 类别正文为固定文案，不受 llm_summary 开关影响）。响应 MUST 为 200 与逐渠道结果对象，顶层形状唯一表述为 `{"results": [{"name": "...", "status": "success|failed|skipped", "error": "..."}]}`（`status` 枚举：`success` | `failed` | `skipped`，skipped 表示未启用或未配置；`error` 为失败原因，成功或跳过时为空字符串）；各渠道的成功判定 MUST 与该渠道真实投递的判定一致（web 渠道为 WebHub 至少接纳一个已连接前端）。总开关关闭时 MUST 返回 422（invalid_state 或项目惯例等价码）并提示先开启总开关。
 
 #### Scenario: 发送测试通知
 

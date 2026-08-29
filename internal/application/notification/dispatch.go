@@ -3,6 +3,7 @@ package notification
 import (
 	"context"
 	"log"
+	"strings"
 	"sync"
 
 	"ocdeck/internal/application"
@@ -89,34 +90,54 @@ func categoryEnabled(cfg notification.Config, cat notification.Category) bool {
 }
 
 // resolveChannels 「已启用且已配置」渠道固化（spec「通知渠道投递与降级」能力
-// 矩阵：web 启用即已配置；bark endpoint 与 token 均非空才算已配置；macos 启用即
-// 可用——运行环境探测在渠道构造侧（Lane C BuildChannels 按平台构建），本层只按
-// 配置开关与参数固化）。
+// 矩阵：web 启用即已配置；bark endpoint 与 token 均非空才算已配置；macos 仅
+// darwin 且 notifier 可用才算可用，否则 skipped——运行时可用性经
+// ChannelAvailability 可选接口，未实现视为可用）。真实 dispatch 与测试通知
+// 共用 resolveOneChannel，保证 skipped 语义一致。
 func resolveChannels(channels []notification.Channel, cfg notification.Config) []notification.ResolvedChannel {
 	var out []notification.ResolvedChannel
 	for _, ch := range channels {
-		switch ch.Name() {
-		case "web":
-			if cfg.Channels.Web.Enabled {
-				out = append(out, notification.ResolvedChannel{Channel: ch})
-			}
-		case "bark":
-			if cfg.Channels.Bark.Enabled && cfg.Channels.Bark.Endpoint != "" && cfg.Channels.Bark.Token != "" {
-				out = append(out, notification.ResolvedChannel{
-					Channel: ch,
-					Config: notification.ChannelConfig{
-						Endpoint: cfg.Channels.Bark.Endpoint,
-						Token:    cfg.Channels.Bark.Token,
-					},
-				})
-			}
-		case "macos":
-			if cfg.Channels.Macos.Enabled {
-				out = append(out, notification.ResolvedChannel{Channel: ch})
-			}
+		if rc, ok := resolveOneChannel(ch, cfg); ok {
+			out = append(out, rc)
 		}
 	}
 	return out
+}
+
+// resolveOneChannel 单渠道启用/配置/可用性判定。ok=false 表示 skipped。
+func resolveOneChannel(ch notification.Channel, cfg notification.Config) (notification.ResolvedChannel, bool) {
+	switch ch.Name() {
+	case "web":
+		if !cfg.Channels.Web.Enabled {
+			return notification.ResolvedChannel{}, false
+		}
+		return notification.ResolvedChannel{Channel: ch}, true
+	case "bark":
+		if !cfg.Channels.Bark.Enabled || cfg.Channels.Bark.Endpoint == "" || cfg.Channels.Bark.Token == "" {
+			return notification.ResolvedChannel{}, false
+		}
+		return notification.ResolvedChannel{
+			Channel: ch,
+			Config: notification.ChannelConfig{
+				Endpoint: cfg.Channels.Bark.Endpoint,
+				Token:    cfg.Channels.Bark.Token,
+			},
+		}, true
+	case "macos":
+		if !cfg.Channels.Macos.Enabled || !channelAvailable(ch) {
+			return notification.ResolvedChannel{}, false
+		}
+		return notification.ResolvedChannel{Channel: ch}, true
+	default:
+		return notification.ResolvedChannel{}, false
+	}
+}
+
+// channelAvailable 运行时可用性：实现 ChannelAvailability 且 Available()=false
+// 时 skipped；未实现接口视为可用（web/bark 由配置判定）。
+func channelAvailable(ch notification.Channel) bool {
+	av, ok := ch.(notification.ChannelAvailability)
+	return !ok || av.Available()
 }
 
 // dispatch 多渠道并行投递（design D4：单次投递全过程使用 DispatchPlan 固化配置；
@@ -132,21 +153,76 @@ func (n *Notifier) dispatch(ctx context.Context, plan *notification.DispatchPlan
 	go func() {
 		defer n.dispatchWG.Done()
 		in = n.summarize(ctx, plan, in)
-		var wg sync.WaitGroup
-		for _, rc := range plan.Channels {
-			wg.Add(1)
-			go func(rc notification.ResolvedChannel) {
-				defer wg.Done()
-				intent := in
-				if rc.Channel.Caps()&notification.CapGroup == 0 {
-					intent.Title = "[" + in.TaskName + "] " + in.Title
-				}
-				if res := rc.Channel.Send(ctx, intent, rc.Config); !res.OK {
-					log.Printf("notify: channel %s failed for task %s (%s): %s",
-						rc.Channel.Name(), in.TaskID, in.Category, res.Err)
-				}
-			}(rc)
-		}
-		wg.Wait()
+		deliverParallel(ctx, plan.Channels, in, func(name string, res notification.Result) {
+			if !res.OK {
+				log.Printf("notify: channel %s failed for task %s (%s): %s",
+					name, in.TaskID, in.Category, res.Err)
+			}
+		})
 	}()
+}
+
+// SendTestNotification 测试通知投递（spec「测试通知」；design D11
+// SetNotificationTester 窄端口）。跳过 active/类别复验；总开关/URL 由调用方
+// （api）拦截后传入已解析 baseURL。与真实 dispatch 共享渠道解析、前缀降级与
+// 并行 Send；MUST NOT 调用 LLM。返回注入渠道的逐渠道结果（保序）。
+func (n *Notifier) SendTestNotification(ctx context.Context, cfg notification.Config, baseURL string) []notification.ChannelResult {
+	intent := TestIntent(testURL(strings.TrimRight(baseURL, "/")))
+	out := make([]notification.ChannelResult, len(n.opts.Channels))
+	var deliver []notification.ResolvedChannel
+	var deliverIdx []int
+	for i, ch := range n.opts.Channels {
+		rc, ok := resolveOneChannel(ch, cfg)
+		if !ok {
+			out[i] = notification.ChannelResult{
+				Name:   ch.Name(),
+				Status: notification.ChannelStatusSkipped,
+			}
+			continue
+		}
+		deliver = append(deliver, rc)
+		deliverIdx = append(deliverIdx, i)
+	}
+	if len(deliver) == 0 {
+		return out
+	}
+	results := deliverParallel(ctx, deliver, intent, nil)
+	for j, rc := range deliver {
+		status := notification.ChannelStatusFailed
+		errMsg := results[j].Err
+		if results[j].OK {
+			status = notification.ChannelStatusSuccess
+			errMsg = ""
+		}
+		out[deliverIdx[j]] = notification.ChannelResult{
+			Name:   rc.Channel.Name(),
+			Status: status,
+			Error:  errMsg,
+		}
+	}
+	return out
+}
+
+// deliverParallel 多渠道并行 Send（真实 dispatch 与测试通知共用）：无 CapGroup
+// 渠道标题加 [<TaskName>] 前缀。onResult 可选（真实路径记失败日志）。
+func deliverParallel(ctx context.Context, channels []notification.ResolvedChannel, in notification.Intent, onResult func(name string, res notification.Result)) []notification.Result {
+	out := make([]notification.Result, len(channels))
+	var wg sync.WaitGroup
+	for i, rc := range channels {
+		wg.Add(1)
+		go func(i int, rc notification.ResolvedChannel) {
+			defer wg.Done()
+			intent := in
+			if rc.Channel.Caps()&notification.CapGroup == 0 {
+				intent.Title = "[" + in.TaskName + "] " + in.Title
+			}
+			res := rc.Channel.Send(ctx, intent, rc.Config)
+			out[i] = res
+			if onResult != nil {
+				onResult(rc.Channel.Name(), res)
+			}
+		}(i, rc)
+	}
+	wg.Wait()
+	return out
 }

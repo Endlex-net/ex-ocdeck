@@ -6,6 +6,8 @@
 //   - Category/Level：通知类别与级别枚举（字面量为 SSE 契约取值）
 //   - Capability：渠道能力位掩码（Group/Replace/Withdraw；Withdraw 本期无实现、位预留）
 //   - Result/Channel/ChannelConfig/ResolvedChannel/DispatchPlan：渠道投递契约
+//   - ChannelResult：逐渠道投递报告（spec「测试通知」success|failed|skipped）
+//   - ChannelAvailability：可选运行时可用性（macos skipped 判定）
 //   - Config：通知配置模型与磁盘 schema（spec「通知配置存储」）
 package notification
 
@@ -95,4 +97,26 @@ type DispatchPlan struct {
 	URL        string
 	LLMSummary bool
 	Channels   []ResolvedChannel
+}
+
+// ChannelResult 单渠道投递报告（spec「测试通知」逐渠道结果）。Status 枚举
+// success|failed|skipped；Error 为失败原因，成功或跳过时为空串。
+type ChannelResult struct {
+	Name   string
+	Status string
+	Error  string
+}
+
+// 渠道结果 status 字面量（spec「测试通知」枚举，与 API 响应 status 字段同值）。
+const (
+	ChannelStatusSuccess = "success"
+	ChannelStatusFailed  = "failed"
+	ChannelStatusSkipped = "skipped"
+)
+
+// ChannelAvailability 可选渠道能力：声明运行时是否可用。macos 非 darwin 或
+// 无可执行文件时 Available()=false，解析层按 skipped 处理（spec「通知渠道投递
+// 与降级」能力矩阵）。未实现本接口的渠道视为可用（web/bark 由配置判定）。
+type ChannelAvailability interface {
+	Available() bool
 }

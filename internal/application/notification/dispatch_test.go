@@ -376,3 +376,166 @@ func TestDispatch_PlanFixatedDuringInFlight(t *testing.T) {
 		t.Fatalf("next delivery must use new base url, got %q", got)
 	}
 }
+
+// --- 测试通知投递（spec「测试通知」；与真实 dispatch 共享解析/降级/并行投递） ---
+
+func resultByName(results []notification.ChannelResult, name string) notification.ChannelResult {
+	for _, r := range results {
+		if r.Name == name {
+			return r
+		}
+	}
+	return notification.ChannelResult{}
+}
+
+// TestSendTestNotification_SkippedMatrix skipped 矩阵：web 未启用、bark 缺 token、
+// macos 不可用 → status=skipped、Error 空、零次 Send。
+func TestSendTestNotification_SkippedMatrix(t *testing.T) {
+	web := &fakeChannel{name: "web", caps: notification.CapReplace}
+	bark := &fakeChannel{name: "bark", caps: notification.CapGroup}
+	macos := &fakeChannel{name: "macos", caps: 0, unavail: true}
+	n := New(Options{Channels: []notification.Channel{web, bark, macos}})
+
+	cfg := testConfig()
+	cfg.Channels.Web.Enabled = false
+	cfg.Channels.Bark.Token = ""
+	cfg.Channels.Macos.Enabled = true
+
+	got := n.SendTestNotification(context.Background(), cfg, "http://127.0.0.1:9")
+	if len(got) != 3 {
+		t.Fatalf("results len = %d, want 3 (all injected channels reported)", len(got))
+	}
+	for _, name := range []string{"web", "bark", "macos"} {
+		r := resultByName(got, name)
+		if r.Status != notification.ChannelStatusSkipped || r.Error != "" {
+			t.Fatalf("%s = %+v, want skipped with empty error", name, r)
+		}
+	}
+	if web.callCount() != 0 || bark.callCount() != 0 || macos.callCount() != 0 {
+		t.Fatalf("skipped channels must not Send: web=%d bark=%d macos=%d",
+			web.callCount(), bark.callCount(), macos.callCount())
+	}
+}
+
+// TestSendTestNotification_SuccessFailedPrefix 已配置渠道并行投递：success/failed
+// 判定与真实 Send 一致；无 CapGroup 渠道标题加 [ocdeck] 前缀。
+func TestSendTestNotification_SuccessFailedPrefix(t *testing.T) {
+	web := &fakeChannel{name: "web", caps: notification.CapReplace}
+	bark := &fakeChannel{name: "bark", caps: notification.CapGroup, fail: true}
+	macos := &fakeChannel{name: "macos", caps: notification.CapGroup | notification.CapReplace}
+	n := New(Options{Channels: []notification.Channel{web, bark, macos}})
+
+	cfg := testConfig()
+	cfg.Channels.Macos.Enabled = true
+
+	got := n.SendTestNotification(context.Background(), cfg, "http://127.0.0.1:9")
+	if r := resultByName(got, "web"); r.Status != notification.ChannelStatusSuccess || r.Error != "" {
+		t.Fatalf("web = %+v", r)
+	}
+	if r := resultByName(got, "bark"); r.Status != notification.ChannelStatusFailed || r.Error != "scripted failure" {
+		t.Fatalf("bark = %+v", r)
+	}
+	if r := resultByName(got, "macos"); r.Status != notification.ChannelStatusSuccess || r.Error != "" {
+		t.Fatalf("macos = %+v", r)
+	}
+
+	if web.callCount() != 1 || bark.callCount() != 1 || macos.callCount() != 1 {
+		t.Fatalf("enabled channels must Send once: web=%d bark=%d macos=%d",
+			web.callCount(), bark.callCount(), macos.callCount())
+	}
+	if got := web.sent()[0].Title; got != "[ocdeck] 测试通知" {
+		t.Fatalf("no-Group title = %q", got)
+	}
+	if got := bark.sent()[0].Title; got != "测试通知" {
+		t.Fatalf("CapGroup title = %q", got)
+	}
+	if in := web.sent()[0]; in.TaskID != "notification-test" || in.Category != notification.CategoryTest ||
+		in.Level != notification.LevelActive || in.URL != "http://127.0.0.1:9/#/configs#notifications" ||
+		in.Body != "ocdeck 通知链路测试" {
+		t.Fatalf("test intent = %+v", in)
+	}
+	if got := bark.configs[0]; got != (notification.ChannelConfig{Endpoint: "https://api.day.app", Token: "bark-token-123456"}) {
+		t.Fatalf("bark config = %+v", got)
+	}
+}
+
+// TestSendTestNotification_NoLLM test 路径 MUST NOT 调用 LLM（spec 豁免），
+// 即使 cfg.LLMSummary=true 且 Completer 已装配。
+func TestSendTestNotification_NoLLM(t *testing.T) {
+	ch := &fakeChannel{name: "web", caps: notification.CapReplace}
+	fc := &fakeCompleter{result: "不应出现"}
+	n := New(Options{Channels: []notification.Channel{ch}, Summarizer: fc})
+	cfg := testConfig()
+	cfg.LLMSummary = true
+
+	n.SendTestNotification(context.Background(), cfg, "http://x")
+	if fc.callCount() != 0 {
+		t.Fatalf("test notification must not call LLM, calls = %d", fc.callCount())
+	}
+	if got := ch.sent()[0].Body; strings.Contains(got, "AI 总结") {
+		t.Fatalf("body must stay deterministic, got %q", got)
+	}
+}
+
+// TestSendTestNotification_MasterOffStillDelivers 总开关由调用方（api）拦截；
+// 本方法只负责投递，Enabled=false 仍走渠道解析。
+func TestSendTestNotification_MasterOffStillDelivers(t *testing.T) {
+	ch := &fakeChannel{name: "web", caps: notification.CapReplace}
+	n := New(Options{Channels: []notification.Channel{ch}})
+	cfg := testConfig()
+	cfg.Enabled = false
+
+	got := n.SendTestNotification(context.Background(), cfg, "http://x")
+	if r := resultByName(got, "web"); r.Status != notification.ChannelStatusSuccess {
+		t.Fatalf("master-off is caller's 422, method still delivers: %+v", r)
+	}
+}
+
+// TestDispatch_MacosUnavailableSkipped 真实 dispatch 与测试路径统一：macos
+// 不可用按 skipped 不纳入发送（不再由适配器 failed）。
+func TestDispatch_MacosUnavailableSkipped(t *testing.T) {
+	macos := &fakeChannel{name: "macos", caps: 0, unavail: true}
+	web := &fakeChannel{name: "web", caps: notification.CapReplace}
+	ft := newFakeTasks(activeSnap("t1", "构建服务", "idle"))
+	fc := &fakeCfgStore{cfg: testConfig()}
+	cfg := testConfig()
+	cfg.Channels.Bark.Enabled = false
+	cfg.Channels.Macos.Enabled = true
+	fc.set(cfg)
+	clk := newFakeClock()
+	n := newTestNotifier(ft, &fakeLister{ids: []string{"t1"}}, fc,
+		[]notification.Channel{macos, web},
+		func(string) (string, error) { return "http://127.0.0.1:7777", nil }, clk)
+
+	ctx := context.Background()
+	n.handleEvent(ctx, runStatusEvent("t1", "busy", "idle", true))
+	clk.add(60 * time.Second)
+	n.scan(ctx)
+	waitDispatch(n)
+
+	if macos.callCount() != 0 {
+		t.Fatalf("unavailable macos must be skipped, not sent: calls=%d", macos.callCount())
+	}
+	if web.callCount() != 1 {
+		t.Fatalf("web must still deliver, calls=%d", web.callCount())
+	}
+
+	// 仅不可用 macos：真实路径 gateNoChannel（占名额、零投递）。
+	n2 := newTestNotifier(newFakeTasks(activeSnap("t1", "构建服务", "idle")),
+		&fakeLister{ids: []string{"t1"}}, fc, []notification.Channel{macos},
+		func(string) (string, error) { return "http://x", nil }, newFakeClock())
+	e := n2.evaluate("t1", notification.CategoryIdle, cfg, activeSnap("t1", "构建服务", "idle"),
+		func(TaskSnapshot) bool { return true })
+	if e.stage != gateNoChannel {
+		t.Fatalf("unavailable macos only → gateNoChannel, got %v", e.stage)
+	}
+
+	// 同一配置下测试路径报告 skipped，与真实解析共享（不 Send）。
+	testGot := n2.SendTestNotification(context.Background(), cfg, "http://x")
+	if r := resultByName(testGot, "macos"); r.Status != notification.ChannelStatusSkipped {
+		t.Fatalf("test path macos = %+v", r)
+	}
+	if macos.callCount() != 0 {
+		t.Fatalf("shared skip must not Send macos, calls=%d", macos.callCount())
+	}
+}
