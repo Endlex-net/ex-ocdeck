@@ -296,8 +296,8 @@ func TestTaskStream_InitialMissingJSON404(t *testing.T) {
 	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
 		t.Errorf("content-type = %q, want application/json", ct)
 	}
-	if got := resp.Header.Get("Cache-Control"); got == "no-cache" {
-		t.Error("must not write SSE headers on initial gone")
+	if got := resp.Header.Get("Cache-Control"); got != "" {
+		t.Errorf("must not write SSE headers on initial gone, cache-control = %q", got)
 	}
 	var eb errorBody
 	if err := json.NewDecoder(resp.Body).Decode(&eb); err != nil {

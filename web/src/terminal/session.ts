@@ -14,6 +14,7 @@ import { attachTouchGestures, type GestureHandle } from './touch-gestures';
 import { shouldSendInput, encodeBinaryInput, createSyntheticGate, type SyntheticGate } from './input-gate';
 import { createLockOrchestrator, type LockOrchestrator } from './session-coordination';
 import { createImeCompensator, type ImeCompensator } from './ime-compensator';
+import { debugMark } from '../debug';
 
 export { shouldSendInput, encodeBinaryInput, createSyntheticGate, type SyntheticGate } from './input-gate';
 export { createLockOrchestrator, type LockOrchestrator, type LockOrchestratorDeps } from './session-coordination';
@@ -189,6 +190,7 @@ export class TermSession {
     const gen = this.wsGen; // G4-8：本连接代（closeSocket 已完成换代）
     this.setState(recoveryProbe ? 'recovering' : this.retry > 0 ? 'reconnecting' : 'connecting');
 
+    debugMark('odterm:ws-create');
     const ws = new WebSocket(wsURL(this.wsPath));
     ws.binaryType = 'arraybuffer';
     this.ws = ws;
@@ -196,6 +198,7 @@ export class TermSession {
 
     ws.onopen = () => {
       if (gen !== this.wsGen) return; // 陈旧连接回调：新连接已建立，不得发送
+      debugMark('odterm:ws-open');
       // 首帧：auth + 初始尺寸握手合一。
       this.fitNow();
       ws.send(
@@ -213,6 +216,7 @@ export class TermSession {
         try {
           const msg = JSON.parse(ev.data) as { type?: string };
           if (msg.type === 'auth_ok') {
+            debugMark('odterm:auth-ok');
             // 任何 WS 连接建立/auth_ok（含重连、Tab 切换）→ coarse 强制 LOCKED。
             // 必须先于 authed/connected 状态暴露与任何外部回调/fit，防门禁未就绪窗口泄漏。
             this.lockOrchestrator.onAuthOk(this.pointerCoarse, () => {
@@ -228,6 +232,7 @@ export class TermSession {
         }
         return;
       }
+      debugMark('odterm:first-data');
       this.term.write(new Uint8Array(ev.data as ArrayBuffer));
     };
     ws.onerror = () => {

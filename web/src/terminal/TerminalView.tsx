@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { TermSession, type TermConnState } from './session';
 import { loadTermPrefs, TERM_PREFS_CHANGED } from './preferences';
+import { debugMark } from '../debug';
 import { useMediaQuery } from '../hooks';
 import '@xterm/xterm/css/xterm.css';
 import './mobile.css';
@@ -60,6 +61,7 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
     const session = sessionRef.current;
     if (!session) return;
     if (active) {
+      debugMark('odterm:connect-call');
       session.connect();
     } else {
       session.disconnect();

@@ -3,6 +3,7 @@ import { api, ApiError } from '../api';
 import { navigate } from '../router';
 import { resolveBackHref, type FromSource } from '../router';
 import { useMediaQuery, useProjects, useProjectsRefresh } from '../hooks';
+import { debugMark } from '../debug';
 import { subscribeTask } from '../sse';
 import { isTransitional, initActivateBlockReason, parseNotice, type Task } from '../types';
 import { shouldCloseOverflowOnBlur } from './workbench-overflow';
@@ -270,6 +271,11 @@ export function TaskWorkbenchPage({
     document.addEventListener('mousedown', onDocDown);
     return () => document.removeEventListener('mousedown', onDocDown);
   }, [switcherOpen]);
+
+  useEffect(() => {
+    if (!task) return;
+    debugMark('odterm:task-render');
+  }, [task]);
 
   if (notFound) {
     // fullbleed 工作台路由无外层 padding；用自持边距容器（非已删 .page）
