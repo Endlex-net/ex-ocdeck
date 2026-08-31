@@ -17,6 +17,25 @@ const (
 	maxDetailTotalLen = 500
 )
 
+// titleSourcePrefix Title 来源前缀（spec「通知内容与跳转链接」：通知可能经
+// Bark 等通用渠道与其他应用的通知混合呈现，标题 MUST 以 [ocdeck] 标识来源）。
+const titleSourcePrefix = "[ocdeck] "
+
+// titleNameMaxLen Title 中任务名段的截断上界（spec「通知内容与跳转链接」：
+// 任务名截断至 12 字符，过短时原样使用）。
+const titleNameMaxLen = 12
+
+// titleFor Title 统一格式 `[ocdeck] [<任务名>] <类别标题>`（spec「通知内容与
+// 跳转链接」为唯一表述；任务名截 12 rune）。空任务名省略任务名段——spec 未
+// 规定，取确定性处理（不输出空 []）。
+func titleFor(taskName, categoryTitle string) string {
+	name := truncate(taskName, titleNameMaxLen)
+	if name == "" {
+		return titleSourcePrefix + categoryTitle
+	}
+	return titleSourcePrefix + "[" + name + "] " + categoryTitle
+}
+
 // levelFor 级别映射（spec「通知渠道投递与降级」映射表：question/permission →
 // timeSensitive；error → critical；retry → timeSensitive；idle/test → active）。
 func levelFor(cat notification.Category) notification.Level {
@@ -50,16 +69,16 @@ func newIntent(snap TaskSnapshot, cat notification.Category, title, body, url st
 		TaskName: snap.Task.Name,
 		Category: cat,
 		Level:    levelFor(cat),
-		Title:    title,
+		Title:    titleFor(snap.Task.Name, title),
 		Body:     body,
 		URL:      url,
 	}
 }
 
-// questionIntent question 内容组装：Title「等待你的回答」，Body = 任务名 +
-// 提问内容（多条 \n 拼接，单字段截 200、整体截 500）。B14：空白提问字段省略，
-// 全部为空白时整体使用固定降级文案（spec「通知内容与跳转链接」MUST NOT 出现
-// 空白详情）。
+// questionIntent question 内容组装：Title「[ocdeck] [<任务名>] 等待你的回答」，
+// Body = 任务名 + 提问内容（多条 \n 拼接，单字段截 200、整体截 500）。B14：空白
+// 提问字段省略，全部为空白时整体使用固定降级文案（spec「通知内容与跳转链接」
+// MUST NOT 出现空白详情）。
 func questionIntent(snap TaskSnapshot, pq application.PendingQuestion, url string) notification.Intent {
 	fields := make([]string, 0, len(pq.Questions))
 	for _, q := range pq.Questions {
@@ -75,9 +94,9 @@ func questionIntent(snap TaskSnapshot, pq application.PendingQuestion, url strin
 	return newIntent(snap, notification.CategoryQuestion, "等待你的回答", composeBody(snap.Task.Name, detail), url)
 }
 
-// permissionIntent permission 内容组装：Title「等待权限确认」，Body = 任务名 +
-// 权限名 + patterns（`, ` 拼接，同截断）。B14：空白权限名/patterns 条目省略，
-// 详情整体为空白时使用固定降级文案（spec 同上）。
+// permissionIntent permission 内容组装：Title「[ocdeck] [<任务名>] 等待权限确认」，
+// Body = 任务名 + 权限名 + patterns（`, ` 拼接，同截断）。B14：空白权限名/patterns
+// 条目省略，详情整体为空白时使用固定降级文案（spec 同上）。
 func permissionIntent(snap TaskSnapshot, pp application.PendingPermission, url string) notification.Intent {
 	patterns := make([]string, 0, len(pp.Patterns))
 	for _, p := range pp.Patterns {
@@ -111,8 +130,8 @@ const (
 	permissionDetailFallback = "有新权限请求等待确认"
 )
 
-// errorIntent error 内容组装：Title「运行出错」，Body = 任务名 + message
-// （+ ` (HTTP <statusCode>)`，若有）。
+// errorIntent error 内容组装：Title「[ocdeck] [<任务名>] 运行出错」，Body =
+// 任务名 + message（+ ` (HTTP <statusCode>)`，若有）。
 func errorIntent(snap TaskSnapshot, last ocdeckevent.ServeRuntimeSessionErrorPayload, url string) notification.Intent {
 	detail := last.Message
 	if last.StatusCode != nil {
@@ -121,8 +140,8 @@ func errorIntent(snap TaskSnapshot, last ocdeckevent.ServeRuntimeSessionErrorPay
 	return newIntent(snap, notification.CategoryError, "运行出错", composeBody(snap.Task.Name, detail), url)
 }
 
-// retryIntent retry 内容组装：Title「重试未恢复」，详情不可得 → 固定降级文案
-// 「任务持续处于重试状态」（不放弃投递）。
+// retryIntent retry 内容组装：Title「[ocdeck] [<任务名>] 重试未恢复」，详情
+// 不可得 → 固定降级文案「任务持续处于重试状态」（不放弃投递）。
 func retryIntent(snap TaskSnapshot, url string) notification.Intent {
 	detail := "任务持续处于重试状态"
 	if snap.HasRetryDetail {
@@ -131,21 +150,23 @@ func retryIntent(snap TaskSnapshot, url string) notification.Intent {
 	return newIntent(snap, notification.CategoryRetry, "重试未恢复", composeBody(snap.Task.Name, detail), url)
 }
 
-// idleIntent idle 内容组装：Title「任务已空闲」，阈值取触发判定所用配置快照。
+// idleIntent idle 内容组装：Title「[ocdeck] [<任务名>] 任务已空闲」，阈值取
+// 触发判定所用配置快照。
 func idleIntent(snap TaskSnapshot, idleTimeoutSeconds int, url string) notification.Intent {
 	detail := fmt.Sprintf("已空闲超过 %d 秒", idleTimeoutSeconds)
 	return newIntent(snap, notification.CategoryIdle, "任务已空闲", composeBody(snap.Task.Name, detail), url)
 }
 
 // TestIntent 测试通知专用变体（spec「测试通知」：TaskID=notification-test、
-// 任务名 ocdeck、固定文案「ocdeck 通知链路测试」、设置页深链）。
+// 任务名 ocdeck、固定文案「ocdeck 通知链路测试」、设置页深链；Title 走统一
+// 格式，任务名恒为 ocdeck）。
 func TestIntent(url string) notification.Intent {
 	return notification.Intent{
 		TaskID:   "notification-test",
 		TaskName: "ocdeck",
 		Category: notification.CategoryTest,
 		Level:    levelFor(notification.CategoryTest),
-		Title:    "测试通知",
+		Title:    titleFor("ocdeck", "测试通知"),
 		Body:     "ocdeck 通知链路测试",
 		URL:      url,
 	}

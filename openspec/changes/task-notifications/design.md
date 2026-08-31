@@ -118,13 +118,15 @@ type Channel interface {
 **DispatchPlan（投递配置固化）**：候选判定开始时 MUST 只读取一次 `ConfigSnapshot`，门禁复验、URL 推导、LLM 开关与 ResolvedChannel 全部从该快照派生；门禁通过后生成不可变 DispatchPlan——`{URL, LLMSummary bool, Channels []ResolvedChannel}`，其中 `ResolvedChannel{Channel, ChannelConfig}`（bark 固化 endpoint/token；web/macos 无配置字段）。渠道实现 MUST 只持静态依赖（http.Client、exec runner、WebPublisher），MUST NOT 持有或读取 notifyStore；单次投递全过程使用 DispatchPlan 内的固化配置。BaseURL resolver MUST 只读取 `srv.BoundAddr()`；`base_url` 覆盖值 MUST 作为参数从候选判定的 ConfigSnapshot 传入，resolver MUST NOT 自行读取 notifyStore。
 
 - 级别映射固定（spec「通知渠道投递与降级」为唯一表述）。
-- 内容组装模板（Body 均含任务名；多渠道并发时任务名已在 Body，CapGroup 缺失的渠道由 dispatch 层给 Title 加 `[<TaskName>]` 前缀）：
-  - question：Title=「等待你的回答」，Body=任务名 + 提问内容（多条 `\n` 拼接，单字段截 200 字符，整体截 500 字符）
-  - permission：Title=「等待权限确认」，Body=任务名 + 权限名 + patterns（`, ` 拼接，同截断）
-  - error：Title=「运行出错」，Body=任务名 + message（+ ` (HTTP <statusCode>)`，若有）
-  - retry：Title=「重试未恢复」，Body=任务名 + `第 <attempt> 次重试：<message>`；详情不可得 → 固定文案「任务持续处于重试状态」
-  - idle：Title=「任务已空闲」，Body=任务名 + `已空闲超过 <阈值> 秒`
-  - test：Title=「测试通知」，Body=「ocdeck 通知链路测试」
+- 内容组装模板（Title 统一格式 `[ocdeck] [<任务名>] <类别标题>`——Bark 等通用渠道中通知与其他应用混合呈现，任务名截断至 12 rune，spec「通知内容与跳转链接」为唯一表述；Body 含任务名全称与详情）：
+  - question：Title=「[ocdeck] [<任务名>] 等待你的回答」，Body=任务名 + 提问内容（多条 `\n` 拼接，单字段截 200 字符，整体截 500 字符）
+  - permission：Title=「[ocdeck] [<任务名>] 等待权限确认」，Body=任务名 + 权限名 + patterns（`, ` 拼接，同截断）
+  - error：Title=「[ocdeck] [<任务名>] 运行出错」，Body=任务名 + message（+ ` (HTTP <statusCode>)`，若有）
+  - retry：Title=「[ocdeck] [<任务名>] 重试未恢复」，Body=任务名 + `第 <attempt> 次重试：<message>`；详情不可得 → 固定文案「任务持续处于重试状态」
+  - idle：Title=「[ocdeck] [<任务名>] 任务已空闲」，Body=任务名 + `已空闲超过 <阈值> 秒`
+  - test：Title=「[ocdeck] [ocdeck] 测试通知」，Body=「ocdeck 通知链路测试」
+- dispatch 层不再做标题降级（标题统一含任务名后，无 CapGroup 渠道的降级仅表现为通知中心不折叠）。
+- 分组键：Bark `group` 与 terminal-notifier `-group` 使用 `ocdeck/<任务名>`（任务名截 40 字符；分组名用户可见，MUST 可读且自带来源）；web `tag` 保持任务 ID（用户不可见，仅替换去重用途）。
 - 降级文案规则的唯一行为表述在 spec「通知内容与跳转链接」。
 
 ### D5: 通知配置——ai-provider-config 模式平移

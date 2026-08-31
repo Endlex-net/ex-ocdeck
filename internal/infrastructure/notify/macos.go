@@ -89,7 +89,7 @@ func (c *MacosChannel) Send(ctx context.Context, in notification.Intent, _ notif
 	}
 	if c.notifierPath != "" {
 		out, err := c.run(ctx, macosCommandTimeout, c.notifierPath,
-			"-group", in.TaskID,
+			"-group", groupKey(in),
 			"-title", in.Title,
 			"-message", in.Body,
 			"-open", in.URL,

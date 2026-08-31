@@ -655,7 +655,7 @@ func TestNotificationTest_ResultsShapeAndChannelStatuses(t *testing.T) {
 	in := barkSent[0]
 	if in.TaskID != "notification-test" || in.TaskName != "ocdeck" ||
 		in.Category != notification.CategoryTest || in.Level != notification.LevelActive ||
-		in.Title != "测试通知" || in.Body != "ocdeck 通知链路测试" {
+		in.Title != "[ocdeck] [ocdeck] 测试通知" || in.Body != "ocdeck 通知链路测试" {
 		t.Errorf("test intent = %+v", in)
 	}
 	if !strings.HasSuffix(in.URL, "/#/configs#notifications") {

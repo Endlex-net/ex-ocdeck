@@ -120,7 +120,7 @@ func TestMacosChannel_SendTerminalNotifier(t *testing.T) {
 		t.Fatalf("timeout = %v, want 10s hard timeout", call.timeout)
 	}
 	in := macosTestIntent()
-	wantArgs := []string{"-group", in.TaskID, "-title", in.Title, "-message", in.Body, "-open", in.URL, "-sound", "default"}
+	wantArgs := []string{"-group", "ocdeck/demo-task", "-title", in.Title, "-message", in.Body, "-open", in.URL, "-sound", "default"}
 	if strings.Join(call.args, "\x00") != strings.Join(wantArgs, "\x00") {
 		t.Fatalf("args = %q, want %q", call.args, wantArgs)
 	}

@@ -179,7 +179,7 @@ episode 名额占用仲裁（同一 episode 内 retry/error 合计至多一次�
 
 ### Requirement: 通知渠道投递与降级
 
-系统 SHALL 支持三类通知渠道：网页（web）、Bark 推送（bark）、macOS 本地通知（macos）。每次触发 MUST 向全部"已启用且已配置"的渠道并行投递；单一渠道失败 MUST NOT 影响其他渠道投递，MUST NOT 阻塞或影响任务主流程，失败 MUST 记录日志。渠道抽象 MUST 为渠道无关的通知意图（任务 ID/名称、类别、级别、标题、正文、跳转链接；类别详情由内容组装进入正文，意图不单独携带详情字段），各渠道按声明的能力位（分组 Group / 同键替换 Replace / 撤回 Withdraw）落地；渠道缺失分组能力时 MUST 自动降级为标题携带任务名前缀，MUST NOT 报错阻断。通知级别 MUST 按类别映射：question/permission → timeSensitive；error → critical；retry → timeSensitive；idle → active；test → active。
+系统 SHALL 支持三类通知渠道：网页（web）、Bark 推送（bark）、macOS 本地通知（macos）。每次触发 MUST 向全部"已启用且已配置"的渠道并行投递；单一渠道失败 MUST NOT 影响其他渠道投递，MUST NOT 阻塞或影响任务主流程，失败 MUST 记录日志。渠道抽象 MUST 为渠道无关的通知意图（任务 ID/名称、类别、级别、标题、正文、跳转链接；类别详情由内容组装进入正文，意图不单独携带详情字段），各渠道按声明的能力位（分组 Group / 同键替换 Replace / 撤回 Withdraw）落地；标题统一携带任务名（见「通知内容与跳转链接」的标题格式），分组能力缺失的唯一降级表现为通知中心内不折叠分组，MUST NOT 报错阻断。通知级别 MUST 按类别映射：question/permission → timeSensitive；error → critical；retry → timeSensitive；idle → active；test → active。
 
 渠道"已配置"判定与能力位矩阵 MUST 遵循：web —— 启用即已配置，Caps=Replace（无 Group，标题加任务名前缀），零连接投递计为 failed；bark —— endpoint 与 token 均非空才算已配置（否则 skipped），Caps=Group；macos —— 仅 darwin 且 terminal-notifier 或 osascript 可用才算可用（否则 skipped），terminal-notifier Caps=Group|Replace，osascript Caps=0（标题加任务名前缀）；所有渠道本期 MUST NOT 声明 Withdraw。
 
@@ -196,11 +196,11 @@ episode 名额占用仲裁（同一 episode 内 retry/error 合计至多一次�
 #### Scenario: 分组能力缺失自动降级
 
 - **WHEN** 某渠道不支持分组能力
-- **THEN** 该渠道以标题携带任务名前缀的降级形式投递，不报错
+- **THEN** 该渠道正常投递（标题本就统一携带任务名），仅通知中心内不折叠分组，不报错
 
 ### Requirement: Bark 渠道
 
-Bark 渠道 SHALL 通过 HTTP POST 向 `<endpoint>/push` 发送 JSON 请求体（endpoint 尾部 `/` 拼接前剔除），`Content-Type: application/json`。请求体 MUST 包含：`device_key`（值为配置的 token）、`title`、`body`、`level`、`group`（值为任务标识）、`url`（值为 `Intent.URL`，目标页推导规则见「通知内容与跳转链接」）。endpoint 与 token MUST 可配置，endpoint 默认 `https://api.day.app`，支持自建 server。单次请求超时 MUST 为 10 秒，MUST NOT 跟随重定向，MUST NOT 自动重试，响应体读取 MUST 有 64 KiB 大小上界，超限 MUST 判定为失败。投递成功判定 MUST 为：HTTP 2xx 且响应体 JSON 的 `code` 字段等于 200；响应体非法 JSON 或缺 `code` 字段 MUST 判定为失败。token、请求体与 Bark 原始响应体 MUST NOT 写入日志。
+Bark 渠道 SHALL 通过 HTTP POST 向 `<endpoint>/push` 发送 JSON 请求体（endpoint 尾部 `/` 拼接前剔除），`Content-Type: application/json`。请求体 MUST 包含：`device_key`（值为配置的 token）、`title`、`body`、`level`、`group`（值为 `ocdeck/<任务名>`，任务名截断至 40 字符——Bark 为通用推送工具，分组名 MUST 人类可读且自带来源标识）、`url`（值为 `Intent.URL`，目标页推导规则见「通知内容与跳转链接」）。endpoint 与 token MUST 可配置，endpoint 默认 `https://api.day.app`，支持自建 server。单次请求超时 MUST 为 10 秒，MUST NOT 跟随重定向，MUST NOT 自动重试，响应体读取 MUST 有 64 KiB 大小上界，超限 MUST 判定为失败。投递成功判定 MUST 为：HTTP 2xx 且响应体 JSON 的 `code` 字段等于 200；响应体非法 JSON 或缺 `code` 字段 MUST 判定为失败。token、请求体与 Bark 原始响应体 MUST NOT 写入日志。
 
 #### Scenario: 发送 Bark 推送
 
@@ -249,7 +249,7 @@ Bark 渠道 SHALL 通过 HTTP POST 向 `<endpoint>/push` 发送 JSON 请求体�
 
 ### Requirement: macOS 本地通知渠道
 
-macOS 渠道向运行 ocdeck-server 的 Darwin 主机投递本地通知，仅 darwin 运行环境可启用。系统 SHALL 以 `exec.LookPath("terminal-notifier")` 探测：存在时使用 terminal-notifier（以任务标识为 `-group` 实现同任务替换，`-open` 携带跳转链接）；仅当未找到 terminal-notifier 时才选用 osascript `display notification`。terminal-notifier 已存在但执行失败时 MUST NOT 降级到 osascript，仅记录失败。两种实现 MUST 均不使用 shell（argv 直传），osascript 必须使用固定脚本模板经 argv 传入标题与正文，进程 MUST 有统一硬超时与输出大小上界。非 darwin 或两者均不可用时该渠道视为不可用，MUST NOT 影响其他渠道。
+macOS 渠道向运行 ocdeck-server 的 Darwin 主机投递本地通知，仅 darwin 运行环境可启用。系统 SHALL 以 `exec.LookPath("terminal-notifier")` 探测：存在时使用 terminal-notifier（以 `ocdeck/<任务名>`（任务名截断至 40 字符）为 `-group` 实现同任务替换，`-open` 携带跳转链接）；仅当未找到 terminal-notifier 时才选用 osascript `display notification`。terminal-notifier 已存在但执行失败时 MUST NOT 降级到 osascript，仅记录失败。两种实现 MUST 均不使用 shell（argv 直传），osascript 必须使用固定脚本模板经 argv 传入标题与正文，进程 MUST 有统一硬超时与输出大小上界。非 darwin 或两者均不可用时该渠道视为不可用，MUST NOT 影响其他渠道。
 
 #### Scenario: 优先 terminal-notifier
 
@@ -268,7 +268,7 @@ macOS 渠道向运行 ocdeck-server 的 Darwin 主机投递本地通知，仅 da
 
 ### Requirement: 通知内容与跳转链接
 
-每条通知 MUST 包含：任务名称、通知类别（人类可读）、类别详情。类别详情规则：question 为提问内容（多条提问拼接，超出长度截断）；permission 为权限名称与 patterns（多个 patterns 拼接，超出长度截断）；error 为 message（与 statusCode，若有）；retry 为 attempt 与 message（不可得时用固定降级文案）；idle 为已空闲时长；test 为固定文案「通知链路测试」。任何详情字段缺失时 MUST 使用固定降级文案或省略该字段，MUST NOT 出现空白详情。五个真实类别的通知 MUST 携带任务页跳转链接 `#/task/<任务ID>`；test 类别 MUST 携带设置页链接 `#/configs#notifications`（完整 URL 推导规则见设计）。支持跳转的渠道 MUST 实现点击直达对应页面。
+每条通知 MUST 包含：任务名称、通知类别（人类可读）、类别详情。通知标题格式 MUST 为 `[ocdeck] [<任务名>] <类别标题>`（通知可能经 Bark 等通用渠道与其他应用的通知混合呈现；任务名截断至 12 字符，过短时原样使用），test 类别任务名为 `ocdeck`。类别详情规则：question 为提问内容（多条提问拼接，超出长度截断）；permission 为权限名称与 patterns（多个 patterns 拼接，超出长度截断）；error 为 message（与 statusCode，若有）；retry 为 attempt 与 message（不可得时用固定降级文案）；idle 为已空闲时长；test 为固定文案「通知链路测试」。任何详情字段缺失时 MUST 使用固定降级文案或省略该字段，MUST NOT 出现空白详情。五个真实类别的通知 MUST 携带任务页跳转链接 `#/task/<任务ID>`；test 类别 MUST 携带设置页链接 `#/configs#notifications`（完整 URL 推导规则见设计）。支持跳转的渠道 MUST 实现点击直达对应页面。
 
 #### Scenario: 通知内容完整
 

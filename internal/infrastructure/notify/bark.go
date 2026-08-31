@@ -50,7 +50,8 @@ func (c *BarkChannel) Name() string { return "bark" }
 func (c *BarkChannel) Caps() notification.Capability { return notification.CapGroup }
 
 // barkRequest wire 请求体：MUST 包含 device_key/title/body/level/group/url
-// （device_key=token、group=任务标识、url=Intent.URL，level 取 Intent 已映射级别）。
+// （device_key=token、group=ocdeck/<任务名>、url=Intent.URL，level 取 Intent
+// 已映射级别）。
 type barkRequest struct {
 	DeviceKey string `json:"device_key"`
 	Title     string `json:"title"`
@@ -58,6 +59,24 @@ type barkRequest struct {
 	Level     string `json:"level"`
 	Group     string `json:"group"`
 	URL       string `json:"url"`
+}
+
+// groupKeyMaxNameLen 分组键中任务名截断上界（spec「Bark 渠道」：40 字符，rune）。
+const groupKeyMaxNameLen = 40
+
+// groupKey Bark group 与 terminal-notifier -group 共用的分组键（spec「Bark 渠道」
+// 「macOS 本地通知渠道」）：`ocdeck/<任务名>`，任务名截 40 字符（rune）；任务名
+// 为空回退任务 ID。分组名用户可见，MUST 可读且自带来源标识。web tag 不走本键
+// （用户不可见，保持任务 ID 仅作替换去重）。
+func groupKey(in notification.Intent) string {
+	if in.TaskName == "" {
+		return in.TaskID
+	}
+	r := []rune(in.TaskName)
+	if len(r) > groupKeyMaxNameLen {
+		r = r[:groupKeyMaxNameLen]
+	}
+	return "ocdeck/" + string(r)
 }
 
 // barkResponse wire 响应判定字段：指针区分「缺 code 键」与 code=0，两者均失败。
@@ -73,7 +92,7 @@ func (c *BarkChannel) Send(ctx context.Context, in notification.Intent, cfg noti
 		Title:     in.Title,
 		Body:      in.Body,
 		Level:     string(in.Level),
-		Group:     in.TaskID,
+		Group:     groupKey(in),
 		URL:       in.URL,
 	})
 	if err != nil {

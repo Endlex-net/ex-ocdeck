@@ -71,13 +71,38 @@ func contentSnap() TaskSnapshot {
 	return TaskSnapshot{Task: TaskRef{ID: "t1", Name: "构建服务", Status: "active"}, RunStatus: "idle"}
 }
 
+// TestTitleFor Title 统一格式 [ocdeck] [<任务名>] <类别标题>（spec「通知内容与
+// 跳转链接」：任务名截 12 rune、过短原样；test 类别任务名恒为 ocdeck）。
+// 空任务名：spec 未规定，实现取确定性处理——省略任务名段（不输出空 []）。
+func TestTitleFor(t *testing.T) {
+	cases := []struct {
+		name      string
+		taskName  string
+		category  string
+		wantTitle string
+	}{
+		{"short name kept", "构建服务", "任务已空闲", "[ocdeck] [构建服务] 任务已空闲"},
+		{"name truncated to 12 runes", strings.Repeat("任", 13), "运行出错", "[ocdeck] [" + strings.Repeat("任", 12) + "] 运行出错"},
+		{"name exactly 12 runes kept", strings.Repeat("任", 12), "运行出错", "[ocdeck] [" + strings.Repeat("任", 12) + "] 运行出错"},
+		{"empty name omits segment", "", "等待你的回答", "[ocdeck] 等待你的回答"},
+		{"test category name", "ocdeck", "测试通知", "[ocdeck] [ocdeck] 测试通知"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := titleFor(tc.taskName, tc.category); got != tc.wantTitle {
+				t.Fatalf("titleFor(%q, %q) = %q, want %q", tc.taskName, tc.category, got, tc.wantTitle)
+			}
+		})
+	}
+}
+
 func TestQuestionIntent(t *testing.T) {
 	snap := contentSnap()
 	snap.Attention.Questions = []application.PendingQuestion{
 		pendingQuestion("q1", "用哪个分支？", "要跑测试吗？"),
 	}
 	got := questionIntent(snap, snap.Attention.Questions[0], "http://x/#/task/t1")
-	if got.Title != "等待你的回答" {
+	if got.Title != "[ocdeck] [构建服务] 等待你的回答" {
 		t.Fatalf("title = %q", got.Title)
 	}
 	if want := "构建服务\n用哪个分支？\n要跑测试吗？"; got.Body != want {
@@ -162,7 +187,7 @@ func TestPermissionIntent(t *testing.T) {
 		pendingPermission("p1", "bash", "rm -rf /tmp/x", "git status"),
 	}
 	got := permissionIntent(snap, snap.Attention.Permissions[0], "u")
-	if got.Title != "等待权限确认" {
+	if got.Title != "[ocdeck] [构建服务] 等待权限确认" {
 		t.Fatalf("title = %q", got.Title)
 	}
 	if want := "构建服务\nbash: rm -rf /tmp/x, git status"; got.Body != want {
@@ -187,7 +212,7 @@ func TestErrorIntent(t *testing.T) {
 	code := 429
 	last := ocdeckevent.ServeRuntimeSessionErrorPayload{Message: "rate limit", StatusCode: &code}
 	got := errorIntent(snap, last, "u")
-	if got.Title != "运行出错" || got.Level != notification.LevelCritical {
+	if got.Title != "[ocdeck] [构建服务] 运行出错" || got.Level != notification.LevelCritical {
 		t.Fatalf("intent = %+v", got)
 	}
 	if want := "构建服务\nrate limit (HTTP 429)"; got.Body != want {
@@ -205,7 +230,7 @@ func TestRetryIntent(t *testing.T) {
 	snap.HasRetryDetail = true
 	snap.RetryDetail = RetryDetail{Attempt: 3, Message: "API 超时", Next: 123}
 	got := retryIntent(snap, "u")
-	if got.Title != "重试未恢复" || got.Body != "构建服务\n第 3 次重试：API 超时" {
+	if got.Title != "[ocdeck] [构建服务] 重试未恢复" || got.Body != "构建服务\n第 3 次重试：API 超时" {
 		t.Fatalf("intent = %+v", got)
 	}
 	// 详情不可得：固定降级文案，不放弃投递（spec「通知触发——重试持续未恢复」）。
@@ -218,7 +243,7 @@ func TestRetryIntent(t *testing.T) {
 
 func TestIdleIntent(t *testing.T) {
 	got := idleIntent(contentSnap(), 60, "u")
-	if got.Title != "任务已空闲" || got.Body != "构建服务\n已空闲超过 60 秒" {
+	if got.Title != "[ocdeck] [构建服务] 任务已空闲" || got.Body != "构建服务\n已空闲超过 60 秒" {
 		t.Fatalf("intent = %+v", got)
 	}
 }
@@ -229,7 +254,7 @@ func TestTestIntent(t *testing.T) {
 	got := TestIntent("http://x/#/configs#notifications")
 	if got.TaskID != "notification-test" || got.TaskName != "ocdeck" ||
 		got.Category != notification.CategoryTest || got.Level != notification.LevelActive ||
-		got.Title != "测试通知" || got.Body != "ocdeck 通知链路测试" ||
+		got.Title != "[ocdeck] [ocdeck] 测试通知" || got.Body != "ocdeck 通知链路测试" ||
 		got.URL != "http://x/#/configs#notifications" {
 		t.Fatalf("intent = %+v", got)
 	}

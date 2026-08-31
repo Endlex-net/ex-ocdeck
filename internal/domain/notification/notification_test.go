@@ -46,7 +46,7 @@ func TestEnumValues(t *testing.T) {
 }
 
 // TestCapabilityBitmask 验证能力位为独立位掩码（可组合判定）；零值表达无能力
-// （spec 能力矩阵：osascript Caps=0，标题加任务名前缀降级）。
+// （spec 能力矩阵：osascript Caps=0，分组缺失仅表现为通知中心不折叠）。
 func TestCapabilityBitmask(t *testing.T) {
 	if CapGroup <= 0 || CapReplace <= 0 || CapWithdraw <= 0 {
 		t.Fatalf("capability bits must be positive: %d %d %d", CapGroup, CapReplace, CapWithdraw)

@@ -26,9 +26,11 @@ func dispatchFixture(t *testing.T, runStatus string) (*Notifier, *fakeTasks, *fa
 	return n, ft, fc, bark, web, clk
 }
 
-// TestDispatch_ParallelChannelsAndPrefixDegrade 门禁通过：全部已启用已配置渠道
-// 并行收到投递；无 CapGroup 渠道标题加 [<TaskName>] 前缀，CapGroup 渠道不加。
-func TestDispatch_ParallelChannelsAndPrefixDegrade(t *testing.T) {
+// TestDispatch_ParallelChannelsUniformTitle 门禁通过：全部已启用已配置渠道
+// 并行收到投递；Title 由内容组装统一携带任务名，所有渠道（含无 CapGroup 的
+// web）原样收到相同 Title——dispatch 层无标题降级（spec「通知渠道投递与降级」：
+// 分组缺失仅表现为通知中心不折叠）。
+func TestDispatch_ParallelChannelsUniformTitle(t *testing.T) {
 	n, _, _, bark, web, clk := dispatchFixture(t, "idle")
 	ctx := context.Background()
 	n.handleEvent(ctx, runStatusEvent("t1", "busy", "idle", true))
@@ -41,11 +43,11 @@ func TestDispatch_ParallelChannelsAndPrefixDegrade(t *testing.T) {
 			t.Fatalf("channel %s calls = %d, want 1", ch.name, got)
 		}
 	}
-	if got := bark.sent()[0].Title; got != "任务已空闲" {
-		t.Fatalf("CapGroup channel title must not be prefixed, got %q", got)
+	if got := bark.sent()[0].Title; got != "[ocdeck] [构建服务] 任务已空闲" {
+		t.Fatalf("CapGroup channel title = %q", got)
 	}
-	if got := web.sent()[0].Title; got != "[构建服务] 任务已空闲" {
-		t.Fatalf("no-Group channel title must carry task name prefix, got %q", got)
+	if got := web.sent()[0].Title; got != bark.sent()[0].Title {
+		t.Fatalf("no-Group channel must receive identical title, bark=%q web=%q", bark.sent()[0].Title, got)
 	}
 	// bark 固化 endpoint/token（来自配置快照）。
 	if got := bark.configs[0]; got.Endpoint != "https://api.day.app" || got.Token != "bark-token-123456" {
@@ -417,8 +419,8 @@ func TestSendTestNotification_SkippedMatrix(t *testing.T) {
 	}
 }
 
-// TestSendTestNotification_SuccessFailedPrefix 已配置渠道并行投递：success/failed
-// 判定与真实 Send 一致；无 CapGroup 渠道标题加 [ocdeck] 前缀。
+// TestSendTestNotification_SuccessFailedIntent 已配置渠道并行投递：success/failed
+// 判定与真实 Send 一致；Title 由 TestIntent 统一组装，各渠道原样收到相同值。
 func TestSendTestNotification_SuccessFailedPrefix(t *testing.T) {
 	web := &fakeChannel{name: "web", caps: notification.CapReplace}
 	bark := &fakeChannel{name: "bark", caps: notification.CapGroup, fail: true}
@@ -443,11 +445,11 @@ func TestSendTestNotification_SuccessFailedPrefix(t *testing.T) {
 		t.Fatalf("enabled channels must Send once: web=%d bark=%d macos=%d",
 			web.callCount(), bark.callCount(), macos.callCount())
 	}
-	if got := web.sent()[0].Title; got != "[ocdeck] 测试通知" {
-		t.Fatalf("no-Group title = %q", got)
+	if got := web.sent()[0].Title; got != "[ocdeck] [ocdeck] 测试通知" {
+		t.Fatalf("no-Group title = %q, want [ocdeck] [ocdeck] 测试通知", got)
 	}
-	if got := bark.sent()[0].Title; got != "测试通知" {
-		t.Fatalf("CapGroup title = %q", got)
+	if got := bark.sent()[0].Title; got != web.sent()[0].Title {
+		t.Fatalf("CapGroup channel must receive identical title, bark=%q web=%q", got, web.sent()[0].Title)
 	}
 	if in := web.sent()[0]; in.TaskID != "notification-test" || in.Category != notification.CategoryTest ||
 		in.Level != notification.LevelActive || in.URL != "http://127.0.0.1:9/#/configs#notifications" ||

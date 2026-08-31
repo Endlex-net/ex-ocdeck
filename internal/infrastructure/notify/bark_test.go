@@ -110,11 +110,56 @@ func TestBarkChannel_SendWireContract(t *testing.T) {
 		Title:     in.Title,
 		Body:      in.Body,
 		Level:     string(in.Level),
-		Group:     in.TaskID,
+		Group:     "ocdeck/demo-task",
 		URL:       in.URL,
 	}
 	if got != want {
 		t.Fatalf("request body = %+v, want %+v", got, want)
+	}
+}
+
+// TestBarkChannel_GroupKeyReadable group 可读化（spec「Bark 渠道」）：
+// ocdeck/<任务名>，任务名截 40 字符（rune）；任务名为空回退任务 ID。
+func TestBarkChannel_GroupKeyReadable(t *testing.T) {
+	cases := []struct {
+		name      string
+		intent    notification.Intent
+		wantGroup string
+	}{
+		{"normal name", barkTestIntent(), "ocdeck/demo-task"},
+		{"name truncated to 40 runes", func() notification.Intent {
+			in := barkTestIntent()
+			in.TaskName = strings.Repeat("任", 41)
+			return in
+		}(), "ocdeck/" + strings.Repeat("任", 40)},
+		{"name exactly 40 runes kept", func() notification.Intent {
+			in := barkTestIntent()
+			in.TaskName = strings.Repeat("任", 40)
+			return in
+		}(), "ocdeck/" + strings.Repeat("任", 40)},
+		{"empty name falls back to task id", func() notification.Intent {
+			in := barkTestIntent()
+			in.TaskName = ""
+			return in
+		}(), "task-42"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, captured := barkCaptureServer(t, func(w http.ResponseWriter) {
+				_, _ = w.Write([]byte(`{"code":200}`))
+			})
+			res := NewBarkChannel().Send(context.Background(), tc.intent, barkTestConfig(srv.URL))
+			if !res.OK {
+				t.Fatalf("expect success, Err=%q", res.Err)
+			}
+			var got barkRequest
+			if err := json.Unmarshal(captured.rawBody, &got); err != nil {
+				t.Fatalf("decode request body: %v", err)
+			}
+			if got.Group != tc.wantGroup {
+				t.Fatalf("group = %q, want %q", got.Group, tc.wantGroup)
+			}
+		})
 	}
 }
 

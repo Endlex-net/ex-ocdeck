@@ -3,7 +3,8 @@
 // 不经进程内 bus：持 WebPublisher 窄端口（由 api 层 WebHub 实现），Send 直接
 // 转发意图并按 accepted 判定——零连接或全部连接缓冲满（零 enqueue 成功）均为
 // 该渠道投递失败。Publish 为非阻塞 enqueue，无 ctx 语义。Caps=Replace
-// （无 Group，标题任务名前缀降级由 dispatch 层处理；spec 能力矩阵）。
+// （无 Group；Title 由内容组装统一携带任务名，分组缺失仅表现为通知中心不
+// 折叠，spec 能力矩阵）。
 package notify
 
 import (

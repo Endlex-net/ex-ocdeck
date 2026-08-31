@@ -57,9 +57,9 @@ type Result struct {
 }
 
 // Capability 渠道能力位掩码（design D4）：CapGroup（分组）/ CapReplace（同键替换）/
-// CapWithdraw（撤回，本期无渠道实现）。无能力渠道取 0（如 macos 的 osascript 实现，
-// 由 dispatch 层给标题加任务名前缀降级）。能力位矩阵的唯一表述在 spec
-// 「通知渠道投递与降级」。
+// CapWithdraw（撤回，本期无渠道实现）。无能力渠道取 0（如 macos 的 osascript
+// 实现；Title 由内容组装统一携带任务名，分组缺失仅表现为通知中心不折叠，
+// 无代码降级动作）。能力位矩阵的唯一表述在 spec「通知渠道投递与降级」。
 type Capability int
 
 const (

@@ -142,7 +142,7 @@ func channelAvailable(ch notification.Channel) bool {
 
 // dispatch 多渠道并行投递（design D4：单次投递全过程使用 DispatchPlan 固化配置；
 // spec「通知渠道投递与降级」：单一渠道失败不影响其他渠道、不阻塞任务主流程、
-// 失败记日志；无 CapGroup 的渠道由本层给标题加 [<TaskName>] 前缀降级）。异步
+// 失败记日志；Title 由内容组装统一携带任务名，本层不做标题降级）。异步
 // goroutine 执行（run loop 先标记消费再投递；投递期间到达的新事件按 spec 已接受
 // 竞态语义处理）。全渠道失败不自动重试（已消费语义由调用方保证）。
 // LLM 停止原因总结（D9）在渠道投递前执行：LLM 副作用只发生在门禁全部通过之后
@@ -164,8 +164,8 @@ func (n *Notifier) dispatch(ctx context.Context, plan *notification.DispatchPlan
 
 // SendTestNotification 测试通知投递（spec「测试通知」；design D11
 // SetNotificationTester 窄端口）。跳过 active/类别复验；总开关/URL 由调用方
-// （api）拦截后传入已解析 baseURL。与真实 dispatch 共享渠道解析、前缀降级与
-// 并行 Send；MUST NOT 调用 LLM。返回注入渠道的逐渠道结果（保序）。
+// （api）拦截后传入已解析 baseURL。与真实 dispatch 共享渠道解析与并行 Send；
+// MUST NOT 调用 LLM。返回注入渠道的逐渠道结果（保序）。
 func (n *Notifier) SendTestNotification(ctx context.Context, cfg notification.Config, baseURL string) []notification.ChannelResult {
 	intent := TestIntent(testURL(strings.TrimRight(baseURL, "/")))
 	out := make([]notification.ChannelResult, len(n.opts.Channels))
@@ -203,8 +203,10 @@ func (n *Notifier) SendTestNotification(ctx context.Context, cfg notification.Co
 	return out
 }
 
-// deliverParallel 多渠道并行 Send（真实 dispatch 与测试通知共用）：无 CapGroup
-// 渠道标题加 [<TaskName>] 前缀。onResult 可选（真实路径记失败日志）。
+// deliverParallel 多渠道并行 Send（真实 dispatch 与测试通知共用）：Title 由
+// 内容组装统一携带任务名，各渠道原样投递（无 CapGroup 渠道无标题降级——分组
+// 缺失仅表现为通知中心不折叠，spec「通知渠道投递与降级」）。onResult 可选
+// （真实路径记失败日志）。
 func deliverParallel(ctx context.Context, channels []notification.ResolvedChannel, in notification.Intent, onResult func(name string, res notification.Result)) []notification.Result {
 	out := make([]notification.Result, len(channels))
 	var wg sync.WaitGroup
@@ -212,11 +214,7 @@ func deliverParallel(ctx context.Context, channels []notification.ResolvedChanne
 		wg.Add(1)
 		go func(i int, rc notification.ResolvedChannel) {
 			defer wg.Done()
-			intent := in
-			if rc.Channel.Caps()&notification.CapGroup == 0 {
-				intent.Title = "[" + in.TaskName + "] " + in.Title
-			}
-			res := rc.Channel.Send(ctx, intent, rc.Config)
+			res := rc.Channel.Send(ctx, in, rc.Config)
 			out[i] = res
 			if onResult != nil {
 				onResult(rc.Channel.Name(), res)
