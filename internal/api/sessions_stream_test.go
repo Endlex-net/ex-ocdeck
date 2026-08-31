@@ -409,8 +409,11 @@ func TestActiveSessionsStream_FirstFrameBareArraySnapshot(t *testing.T) {
 	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
 		t.Errorf("content-type = %q, want text/event-stream", ct)
 	}
-	if cc := resp.Header.Get("Cache-Control"); cc != "no-cache" {
-		t.Errorf("cache-control = %q, want no-cache", cc)
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-cache, no-transform" {
+		t.Errorf("cache-control = %q, want no-cache, no-transform", cc)
+	}
+	if xa := resp.Header.Get("X-Accel-Buffering"); xa != "no" {
+		t.Errorf("x-accel-buffering = %q, want no", xa)
 	}
 	if conn := resp.Header.Get("Connection"); conn != "keep-alive" {
 		t.Errorf("connection = %q, want keep-alive", conn)

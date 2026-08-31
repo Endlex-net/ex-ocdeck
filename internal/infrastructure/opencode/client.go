@@ -3,7 +3,7 @@
 //
 // 漂移防护策略（§11）：版本号仅告警，激活门禁是能力探测（health + /session/status
 // 结构 + session 列表字段形状；DELETE 形状不做 live 探测，首次真实删除时校验）。
-// 全部端点契约以 OpenCode 1.18.18 源码核验为基线（contract fixture 固化，见 §20），
+// 全部端点契约以 OpenCode 1.18.25 源码核验为基线（contract fixture 固化，见 §20），
 // 漂移只改本包一处。
 //
 // 仅使用标准库（net/http + bufio 手写 SSE 解析）：go.mod 由独立 lane 维护。
@@ -23,7 +23,9 @@ import (
 )
 
 // ContractBaseline 已验证契约区间上限；仅作告警，非门禁；区间检查见 internal/infrastructure/opencode/CONTRACT.md。
-const ContractBaseline = "1.18.18"
+// 1.18.25：scripts/check-opencode-contract.sh v1.18.18→v1.18.25 全锚点核验，仅 /global/upgrade
+// 自升级端点有 diff（target 必填+semver 校验、raw→声明式），ocdeck 使用的端点契约未变。
+const ContractBaseline = "1.18.25"
 
 // ContractMinVersion 已验证契约区间下限；仅作告警，非门禁。
 const ContractMinVersion = "1.18.14"
