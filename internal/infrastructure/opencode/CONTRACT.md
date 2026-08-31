@@ -1,9 +1,11 @@
 # opencode 契约区间
 
-ocdeck 对 opencode 的兼容性按**已验证版本区间**声明，当前为 **[1.18.14, 1.18.18]**。
+ocdeck 对 opencode 的兼容性按**已验证版本区间**声明，当前为 **[1.18.14, 1.18.25]**。
 
 - `ContractMinVersion`（`1.18.14`）：区间下限
-- `ContractBaseline`（`1.18.18`）：区间上限 / 最近一次核验版本
+- `ContractBaseline`（`1.18.25`）：区间上限 / 最近一次核验版本
+
+> 1.18.18 → 1.18.25 核验（2026-08-31）：23 锚点中 21 个字节一致；仅 `handlers/global.ts` / `groups/global.ts` 有 diff，全部位于 `/global/upgrade` 自升级端点（`target` 改为必填 + semver 校验、raw body 改声明式 schema），ocdeck 使用的端点契约未变。
 
 版本检查**仅告警**（启动日志 + `/api/v1/server/status` 的 `versionVerified`），**不是激活门禁**。真正的激活门禁是能力探测：`GET /global/health` 可达、`GET /session/status` 结构、session 列表字段形状（DELETE 形状不做 live 探测，首次真实删除时校验）。区间外的版本仍可尝试激活；探测失败才阻止。
 
