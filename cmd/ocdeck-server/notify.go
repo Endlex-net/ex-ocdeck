@@ -17,12 +17,13 @@ import (
 )
 
 var (
-	_ appnotification.EventSubscriber    = notifyEventSubscriberAdapter{}
-	_ appnotification.SummaryCompleter   = summaryCompleterAdapter{}
-	_ appnotification.TaskSnapshotReader = (*task.Manager)(nil)
-	_ appnotification.ActiveTaskLister   = (*task.Manager)(nil)
-	_ appnotification.ConfigStore        = (*notify.Store)(nil)
-	_ api.NotificationTester             = (*appnotification.Notifier)(nil)
+	_ appnotification.EventSubscriber       = notifyEventSubscriberAdapter{}
+	_ appnotification.SummaryCompleter      = summaryCompleterAdapter{}
+	_ appnotification.TaskSnapshotReader    = (*task.Manager)(nil)
+	_ appnotification.ActiveTaskLister      = (*task.Manager)(nil)
+	_ appnotification.LastAgentOutputReader = (*task.Manager)(nil)
+	_ appnotification.ConfigStore           = (*notify.Store)(nil)
+	_ api.NotificationTester                = (*appnotification.Notifier)(nil)
 )
 
 // notifyEventSubscriberAdapter 把 *eventbus.Bus 适配为通知触发器的 EventSubscriber。

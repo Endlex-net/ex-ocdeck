@@ -26,16 +26,17 @@ const defaultTickInterval = 10 * time.Second
 
 // Options Notifier 依赖注入（design D1 窄端口 + D11 装配形状）。
 type Options struct {
-	Bus            EventSubscriber    // Start 必需（engine 直测可不注入）
-	Tasks          TaskSnapshotReader // 必需
-	ListActive     ActiveTaskLister   // 必需（启动基线与对账枚举）
-	Cfg            ConfigStore        // 必需（配置快照）
-	Channels       []notification.Channel
-	ResolveBaseURL BaseURLResolver
-	Summarizer     SummaryCompleter // LLM 停止原因总结（D9；nil=未装配，全降级）
-	LLMBudget      time.Duration    // LLM 总结预算上界（默认 5s；测试可注入）
-	Now            func() time.Time // 时钟注入（测试 fake clock；默认 time.Now）
-	TickEvery      time.Duration    // 判定周期（默认 10s）
+	Bus             EventSubscriber    // Start 必需（engine 直测可不注入）
+	Tasks           TaskSnapshotReader // 必需
+	ListActive      ActiveTaskLister   // 必需（启动基线与对账枚举）
+	Cfg             ConfigStore        // 必需（配置快照）
+	Channels        []notification.Channel
+	ResolveBaseURL  BaseURLResolver
+	Summarizer      SummaryCompleter      // LLM 停止原因总结（D9；nil=未装配，全降级）
+	LastAgentOutput LastAgentOutputReader // agent 最后一轮输出（D9；nil=未装配，恒不可得）
+	LLMBudget       time.Duration         // LLM 总结预算上界（默认 5s；测试可注入）
+	Now             func() time.Time      // 时钟注入（测试 fake clock；默认 time.Now）
+	TickEvery       time.Duration         // 判定周期（默认 10s）
 }
 
 // Notifier 通知触发编排器。engine 状态（mode/states/subs）仅 run loop goroutine

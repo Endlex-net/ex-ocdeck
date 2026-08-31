@@ -118,13 +118,13 @@ type Channel interface {
 **DispatchPlan（投递配置固化）**：候选判定开始时 MUST 只读取一次 `ConfigSnapshot`，门禁复验、URL 推导、LLM 开关与 ResolvedChannel 全部从该快照派生；门禁通过后生成不可变 DispatchPlan——`{URL, LLMSummary bool, Channels []ResolvedChannel}`，其中 `ResolvedChannel{Channel, ChannelConfig}`（bark 固化 endpoint/token；web/macos 无配置字段）。渠道实现 MUST 只持静态依赖（http.Client、exec runner、WebPublisher），MUST NOT 持有或读取 notifyStore；单次投递全过程使用 DispatchPlan 内的固化配置。BaseURL resolver MUST 只读取 `srv.BoundAddr()`；`base_url` 覆盖值 MUST 作为参数从候选判定的 ConfigSnapshot 传入，resolver MUST NOT 自行读取 notifyStore。
 
 - 级别映射固定（spec「通知渠道投递与降级」为唯一表述）。
-- 内容组装模板（Title 统一格式 `[ocdeck] [<任务名>] <类别标题>`——Bark 等通用渠道中通知与其他应用混合呈现，任务名截断至 12 rune，spec「通知内容与跳转链接」为唯一表述；Body 含任务名全称与详情）：
-  - question：Title=「[ocdeck] [<任务名>] 等待你的回答」，Body=任务名 + 提问内容（多条 `\n` 拼接，单字段截 200 字符，整体截 500 字符）
-  - permission：Title=「[ocdeck] [<任务名>] 等待权限确认」，Body=任务名 + 权限名 + patterns（`, ` 拼接，同截断）
-  - error：Title=「[ocdeck] [<任务名>] 运行出错」，Body=任务名 + message（+ ` (HTTP <statusCode>)`，若有）
-  - retry：Title=「[ocdeck] [<任务名>] 重试未恢复」，Body=任务名 + `第 <attempt> 次重试：<message>`；详情不可得 → 固定文案「任务持续处于重试状态」
-  - idle：Title=「[ocdeck] [<任务名>] 任务已空闲」，Body=任务名 + `已空闲超过 <阈值> 秒`
-  - test：Title=「[ocdeck] [ocdeck] 测试通知」，Body=「ocdeck 通知链路测试」
+- 内容组装模板（Title 统一格式 `OC [<类别枚举值>] <任务名>`——Bark 等通用渠道中通知与其他应用混合呈现，任务名截断至 12 rune，spec「通知内容与跳转链接」为唯一表述；正文不重复任务名，直接为类别详情）：
+  - question：Title=「OC [question] <任务名>」，Body=提问内容（多条 `\n` 拼接，单字段截 200 字符，整体截 500 字符）
+  - permission：Title=「OC [permission] <任务名>」，Body=权限名 + patterns（`, ` 拼接，同截断）
+  - error：Title=「OC [error] <任务名>」，Body=message（+ ` (HTTP <statusCode>)`，若有）
+  - retry：Title=「OC [retry] <任务名>」，Body=`第 <attempt> 次重试：<message>`；详情不可得 → 固定文案「任务持续处于重试状态」
+  - idle：Title=「OC [idle] <任务名>」，Body=`已空闲超过 <阈值> 秒`（LLM 总结可用时附 `AI 总结：…` 行，见 D9）
+  - test：Title=「OC [test] ocdeck」，Body=「ocdeck 通知链路测试」
 - dispatch 层不再做标题降级（标题统一含任务名后，无 CapGroup 渠道的降级仅表现为通知中心不折叠）。
 - 分组键：Bark `group` 与 terminal-notifier `-group` 使用 `ocdeck/<任务名>`（任务名截 40 字符；分组名用户可见，MUST 可读且自带来源）；web `tag` 保持任务 ID（用户不可见，仅替换去重用途）。
 - 降级文案规则的唯一行为表述在 spec「通知内容与跳转链接」。
@@ -162,20 +162,24 @@ func (s *Server) Serve(ctx context.Context) error   // 未 Listen 返回错误�
 完整装配顺序以 D11 为准（构造惰性 notifier → 注入依赖 → RebuildRoutes → Listen → notifier.Start → Serve），BaseURL 闭包惰性读取 `BoundAddr()`，Listen 后即可解析。URL 校验规则（hierarchical、非空 host、禁 userinfo/query/fragment、path 空或 `/`）的唯一表述在 spec「通知配置存储」。
 - URL 不可用时按 spec「发送前门禁」复验失败处理（无副作用）。
 
-### D9: LLM 停止原因总结（选项 B：不拉取会话消息）
+### D9: LLM 停止原因总结（仅 idle，总结 agent 最后一轮输出）
 
-- 输入仅任务名 + 类别 + 类别详情（现 `TaskBackend` 无消息读取能力，`internal/api/tasks.go:15-76`，不为此扩展 serve 调用——YAGNI）。
+- 适用范围：仅 idle 类别触发时调用（spec「LLM 停止原因总结（可选增强，仅 idle）」为唯一表述）；其他类别零 LLM 调用。
+- 输入：任务名 + 类别 + **agent 最后一轮输出**。经新窄端口 `LastAgentOutput(ctx, taskID) (string, bool)` 获取：
+  - client 新增 `ListMessages(ctx, dir, sessionID, limit)` → `GET /session/:id/message?directory=<dir>&limit=<n>`（opencode 公开 API；复用 getJSON 既有鉴权；404/401/解析失败 → 不可得，fail-closed 降级——契约区间扩展候选，CONTRACT.md 待实测后登记）。
+  - task 层实现端口：取任务 runtime 锚会话（无锚则最近更新的 owned session）拉取最近消息（limit 10），取最后一条 role=assistant 的消息，拼接其文本 part（非文本 part 忽略），截断 2000 字符；拉取预算 2s（含在总预算内）。
 - 固定 prompt 模板（逐字）：
 
 ```
-你是通知摘要助手。根据以下任务运行信息，用一两句中文概括该任务停止或等待人工处理的原因，只基于给定信息，不要臆测。
+你是通知摘要助手。根据以下任务运行信息，用一两句中文概括该任务停止时的状态与最后完成的工作，只基于给定信息，不要臆测。
 任务：{{TaskName}}
 类别：{{Category}}
-详情：{{Detail}}
+agent 最后一轮输出：
+{{LastOutput}}
 ```
 
-  max_tokens 200；整体 5s 预算（含 AI 配置读取）；输出空白或超 300 字符 → 降级。复用 `infrastructure/ai` completer 与 aiStore（`main.go:106`）。`llm_summary` 开关在 DispatchPlan 中固化（D4），LLM 执行期间的配置变更不影响本次投递。
-- 失败/超时/未配置 → 确定性摘要；行为唯一表述在 spec「LLM 停止原因总结」。
+  agent 输出不可得时 `{{LastOutput}}` 段替换为「（不可得）」。max_tokens 200；整体 5s 预算（含 agent 输出拉取与 AI 配置读取）；输出空白或超 300 字符 → 降级。复用 `infrastructure/ai` completer 与 aiStore。`llm_summary` 开关在 DispatchPlan 中固化（D4），LLM 执行期间的配置变更不影响本次投递。
+- 失败/超时/未配置/输出不可得 → 确定性摘要（idle 正文仍含「已空闲超过 N 秒」）；行为唯一表述在 spec。
 
 ### D10: macOS 渠道双实现
 

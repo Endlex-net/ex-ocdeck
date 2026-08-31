@@ -74,6 +74,14 @@ type ConfigStore interface {
 	Config() notification.Config
 }
 
+// LastAgentOutputReader agent 最后一轮输出窄端口（task-notifications design D9：
+// task.Manager 实现——锚会话优先、无锚取最近更新 owned session，limit 10 拉取，
+// 最后一条 assistant 消息的文本 part 拼接、截 2000 字符；实现 MUST 尊重 ctx
+// 取消，不可得返回 ok=false，fail-closed 由调用方降级为「（不可得）」）。
+type LastAgentOutputReader interface {
+	LastAgentOutput(ctx context.Context, taskID string) (string, bool)
+}
+
 // BaseURLResolver 跳转 base 推导窄端口（design D8/D11：组合根闭包只读
 // srv.BoundAddr()；配置 base_url 覆盖值由调用方传入，resolver MUST NOT 自行读
 // 配置存储）。

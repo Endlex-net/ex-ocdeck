@@ -1,6 +1,8 @@
 // llm_test.go LLM 停止原因总结（Lane E，task-notifications design D9 + spec
-// 「LLM 停止原因总结（可选增强）」）：DispatchPlan 固化开关、5s 预算上界、
-// 失败/超时/未配置/空白/超长输出确定性降级、LLM 阻塞期间并发 PUT 不影响在途。
+// 「LLM 停止原因总结（可选增强，仅 idle）」）：仅 idle 类别调用（其他类别
+// completer 与 agent 输出拉取双零）、agent 最后一轮输出 prompt、输出不可得降级、
+// 2s 拉取预算（总 5s 上界内）、失败/超时/未配置/空白/超长输出确定性降级、
+// LLM 阻塞期间并发 PUT 不影响在途。
 package notification
 
 import (
@@ -89,20 +91,69 @@ func (f *fakeCompleter) lastMaxTokens() int {
 	return f.maxTokns[len(f.maxTokns)-1]
 }
 
-// llmFixture 标准装置：bark 渠道 + fake completer + 50ms 注入预算（默认 5s 的
-// 可测等价，超时分支不睡真实时间）。
-func llmFixture(t *testing.T) (*Notifier, *fakeTasks, *fakeCfgStore, *fakeChannel, *fakeCompleter, *fakeClock) {
+// fakeAgentOutput 记录型 agent 最后一轮输出 fake（D9）：记录 entry/deadline 供
+// 拉取预算断言；block 非 nil 时阻塞（2s 预算 select 兜底的确定性构造）。
+type fakeAgentOutput struct {
+	mu        sync.Mutex
+	calls     int
+	deadlines []time.Time
+	entryAt   []time.Time
+	result    string
+	ok        bool
+	block     chan struct{}
+}
+
+func (f *fakeAgentOutput) LastAgentOutput(ctx context.Context, _ string) (string, bool) {
+	f.mu.Lock()
+	f.calls++
+	f.entryAt = append(f.entryAt, time.Now())
+	if dl, ok := ctx.Deadline(); ok {
+		f.deadlines = append(f.deadlines, dl)
+	}
+	block := f.block
+	f.mu.Unlock()
+	if block != nil {
+		<-block
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.result, f.ok
+}
+
+func (f *fakeAgentOutput) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *fakeAgentOutput) lastDeadline() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.deadlines[len(f.deadlines)-1]
+}
+
+func (f *fakeAgentOutput) lastEntryTime() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.entryAt[len(f.entryAt)-1]
+}
+
+// llmFixture 标准装置：bark 渠道 + fake completer + agent 输出 fake + 50ms 注入
+// 预算（默认 5s 的可测等价，超时分支不睡真实时间）。
+func llmFixture(t *testing.T) (*Notifier, *fakeTasks, *fakeCfgStore, *fakeChannel, *fakeCompleter, *fakeAgentOutput, *fakeClock) {
 	t.Helper()
 	ft := newFakeTasks(activeSnap("t1", "构建服务", "idle"))
 	fc := &fakeCfgStore{cfg: testConfig()}
 	ch := &fakeChannel{name: "bark", caps: notification.CapGroup}
 	comp := &fakeCompleter{result: "模型返回的总结"}
+	fetch := &fakeAgentOutput{result: "agent 的最终输出", ok: true}
 	clk := newFakeClock()
 	n := newTestNotifier(ft, &fakeLister{ids: []string{"t1"}}, fc, []notification.Channel{ch},
 		func(string) (string, error) { return "http://127.0.0.1:7777", nil }, clk)
 	n.opts.Summarizer = comp
+	n.opts.LastAgentOutput = fetch
 	n.opts.LLMBudget = 50 * time.Millisecond
-	return n, ft, fc, ch, comp, clk
+	return n, ft, fc, ch, comp, fetch, clk
 }
 
 // llmOn 开启 llm_summary 的配置副本。
@@ -113,23 +164,24 @@ func llmOn() notification.Config {
 }
 
 // TestLLM_PromptVerbatim 固定 prompt 模板逐字（design D9）：占位符替换、
-// max_tokens 200、类别用人类可读名（复用 D4 各类别 Title）。
+// max_tokens 200、类别用人类可读名、LastOutput 段原样嵌入。
 func TestLLM_PromptVerbatim(t *testing.T) {
 	in := idleIntent(activeSnap("t1", "构建服务", "idle"), 60, "u")
-	got := buildSummaryPrompt(in, summaryDetail(in))
-	want := "你是通知摘要助手。根据以下任务运行信息，用一两句中文概括该任务停止或等待人工处理的原因，只基于给定信息，不要臆测。\n" +
+	got := buildSummaryPrompt(in, "完成了登录模块重构")
+	want := "你是通知摘要助手。根据以下任务运行信息，用一两句中文概括该任务停止时的状态与最后完成的工作，只基于给定信息，不要臆测。\n" +
 		"任务：构建服务\n" +
 		"类别：任务已空闲\n" +
-		"详情：已空闲超过 60 秒"
+		"agent 最后一轮输出：\n" +
+		"完成了登录模块重构"
 	if got != want {
 		t.Fatalf("prompt = %q, want %q", got, want)
 	}
 }
 
-// TestLLM_SummarySuccess 开关打开且调用成功：正文附带总结；prompt/max_tokens
-// 传参正确；预算 ctx 生效范围内。
+// TestLLM_SummarySuccess idle 开关打开且调用成功：正文附带总结；prompt 携带
+// agent 最后一轮输出；max_tokens 200。
 func TestLLM_SummarySuccess(t *testing.T) {
-	n, _, fc, ch, comp, clk := llmFixture(t)
+	n, _, fc, ch, comp, fetch, clk := llmFixture(t)
 	fc.set(llmOn())
 	ctx := context.Background()
 	n.handleEvent(ctx, runStatusEvent("t1", "busy", "idle", true))
@@ -140,6 +192,9 @@ func TestLLM_SummarySuccess(t *testing.T) {
 	if got := comp.callCount(); got != 1 {
 		t.Fatalf("completer calls = %d, want 1", got)
 	}
+	if got := fetch.callCount(); got != 1 {
+		t.Fatalf("agent output fetch calls = %d, want 1", got)
+	}
 	if comp.lastMaxTokens() != 200 {
 		t.Fatalf("max_tokens = %d, want 200", comp.lastMaxTokens())
 	}
@@ -147,17 +202,157 @@ func TestLLM_SummarySuccess(t *testing.T) {
 	if len(sent) != 1 {
 		t.Fatalf("sends = %d, want 1", len(sent))
 	}
-	if want := "构建服务\n已空闲超过 60 秒\nAI 总结：模型返回的总结"; sent[0].Body != want {
+	if want := "已空闲超过 60 秒\nAI 总结：模型返回的总结"; sent[0].Body != want {
 		t.Fatalf("body = %q, want %q", sent[0].Body, want)
 	}
-	if u := comp.lastUser(); !strings.Contains(u, "任务：构建服务") || !strings.Contains(u, "详情：已空闲超过 60 秒") {
+	if u := comp.lastUser(); !strings.Contains(u, "任务：构建服务") || !strings.Contains(u, "agent 最后一轮输出：\nagent 的最终输出") {
 		t.Fatalf("prompt missing inputs: %q", u)
 	}
 }
 
-// TestLLM_DisabledNoCall 开关关闭（默认）：不发起任何 LLM 调用，正文仅确定性摘要。
+// TestLLM_OnlyIdleCalls D9 范围门控：question/permission/retry/error/test 类别
+// 零 LLM 调用、零 agent 输出拉取（通知本身照常投递）。
+func TestLLM_OnlyIdleCalls(t *testing.T) {
+	t.Run("question", func(t *testing.T) {
+		n, ft, fc, ch, comp, fetch, _ := llmFixture(t)
+		fc.set(llmOn())
+		snap := attentionSnapWith("idle", []application.PendingQuestion{pendingQuestion("q1", "用哪个分支？")}, nil)
+		ft.set(snap)
+		n.handleEvent(context.Background(), attentionEvent("t1"))
+		waitDispatch(n)
+		if comp.callCount() != 0 || fetch.callCount() != 0 {
+			t.Fatalf("question must not call llm/fetch: comp=%d fetch=%d", comp.callCount(), fetch.callCount())
+		}
+		if got := ch.callCount(); got != 1 {
+			t.Fatalf("question notification must still deliver, calls = %d", got)
+		}
+	})
+	t.Run("retry", func(t *testing.T) {
+		n, ft, fc, ch, comp, fetch, clk := llmFixture(t)
+		fc.set(llmOn())
+		snap := activeSnap("t1", "构建服务", "retry")
+		snap.HasRetryDetail = true
+		snap.RetryDetail = RetryDetail{Attempt: 2, Message: "超时"}
+		ft.set(snap)
+		ctx := context.Background()
+		n.handleEvent(ctx, runStatusEvent("t1", "busy", "retry", true))
+		clk.add(60 * time.Second)
+		n.scan(ctx)
+		waitDispatch(n)
+		if comp.callCount() != 0 || fetch.callCount() != 0 {
+			t.Fatalf("retry must not call llm/fetch: comp=%d fetch=%d", comp.callCount(), fetch.callCount())
+		}
+		if got := ch.callCount(); got != 1 {
+			t.Fatalf("retry notification must still deliver, calls = %d", got)
+		}
+	})
+	t.Run("error", func(t *testing.T) {
+		n, _, fc, ch, comp, fetch, clk := llmFixture(t)
+		fc.set(llmOn())
+		ctx := context.Background()
+		n.handleEvent(ctx, sessionErrorEvent("t1", "s1", "boom", nil, nil))
+		clk.add(60 * time.Second)
+		n.scan(ctx)
+		waitDispatch(n)
+		if comp.callCount() != 0 || fetch.callCount() != 0 {
+			t.Fatalf("error must not call llm/fetch: comp=%d fetch=%d", comp.callCount(), fetch.callCount())
+		}
+		if got := ch.callCount(); got != 1 {
+			t.Fatalf("error notification must still deliver, calls = %d", got)
+		}
+	})
+	t.Run("test", func(t *testing.T) {
+		n, _, _, _, comp, fetch, _ := llmFixture(t)
+		cfg := llmOn()
+		n.SendTestNotification(context.Background(), cfg, "http://x")
+		if comp.callCount() != 0 || fetch.callCount() != 0 {
+			t.Fatalf("test notification must not call llm/fetch: comp=%d fetch=%d", comp.callCount(), fetch.callCount())
+		}
+	})
+}
+
+// TestLLM_LastOutputUnavailable agent 输出不可得（拉取失败/超时/未装配）：
+// prompt 的 LastOutput 段为「（不可得）」，总结仍生成、通知照常投递（spec
+// 「agent 输出不可得降级」）。
+func TestLLM_LastOutputUnavailable(t *testing.T) {
+	n, _, fc, ch, comp, fetch, clk := llmFixture(t)
+	fetch.ok = false
+	fc.set(llmOn())
+	ctx := context.Background()
+	n.handleEvent(ctx, runStatusEvent("t1", "busy", "idle", true))
+	clk.add(60 * time.Second)
+	n.scan(ctx)
+	waitDispatch(n)
+
+	if got := comp.callCount(); got != 1 {
+		t.Fatalf("completer must still be called with unavailable output, calls = %d", got)
+	}
+	if u := comp.lastUser(); !strings.Contains(u, "agent 最后一轮输出：\n"+lastOutputUnavailable) {
+		t.Fatalf("prompt must carry %q segment, got %q", lastOutputUnavailable, u)
+	}
+	if sent := ch.sent(); len(sent) != 1 || !strings.Contains(sent[0].Body, "AI 总结：模型返回的总结") {
+		t.Fatalf("summary must still append and deliver, got %+v", sent)
+	}
+}
+
+// TestLLM_FetchNotWired 未装配 agent 输出端口：与不可得同路径（「（不可得）」）。
+func TestLLM_FetchNotWired(t *testing.T) {
+	n, _, fc, ch, comp, _, clk := llmFixture(t)
+	n.opts.LastAgentOutput = nil
+	fc.set(llmOn())
+	ctx := context.Background()
+	n.handleEvent(ctx, runStatusEvent("t1", "busy", "idle", true))
+	clk.add(60 * time.Second)
+	n.scan(ctx)
+	waitDispatch(n)
+
+	if got := comp.callCount(); got != 1 {
+		t.Fatalf("completer calls = %d, want 1", got)
+	}
+	if u := comp.lastUser(); !strings.Contains(u, lastOutputUnavailable) {
+		t.Fatalf("prompt must carry unavailable marker, got %q", u)
+	}
+	if sent := ch.sent(); len(sent) != 1 || !strings.Contains(sent[0].Body, "AI 总结：") {
+		t.Fatalf("delivery must carry summary, got %+v", sent)
+	}
+}
+
+// TestLLM_FetchBudget 拉取预算 2s（design D9，含在总预算内）：阻塞不返回的
+// 端口被 select 兜底截断，deadline-entry ≤ 2s；投递照常完成（「（不可得）」
+// 路径 + completer 正常返回）。
+func TestLLM_FetchBudget(t *testing.T) {
+	n, _, fc, ch, comp, fetch, clk := llmFixture(t)
+	n.opts.LLMBudget = 0 // 默认 5s 总预算，暴露拉取 2s 子预算
+	fetch.block = make(chan struct{})
+	fc.set(llmOn())
+	ctx := context.Background()
+	n.handleEvent(ctx, runStatusEvent("t1", "busy", "idle", true))
+	clk.add(60 * time.Second)
+	start := time.Now()
+	n.scan(ctx)
+	waitDispatch(n)
+
+	if got := fetch.callCount(); got != 1 {
+		t.Fatalf("fetch calls = %d, want 1", got)
+	}
+	if d := fetch.lastDeadline().Sub(fetch.lastEntryTime()); d > lastAgentOutputBudget {
+		t.Fatalf("fetch budget = %v, want ≤ %v", d, lastAgentOutputBudget)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("delivery exceeded total budget, elapsed = %v", elapsed)
+	}
+	if u := comp.lastUser(); !strings.Contains(u, lastOutputUnavailable) {
+		t.Fatalf("blocked fetch must degrade to unavailable marker, got %q", u)
+	}
+	if sent := ch.sent(); len(sent) != 1 {
+		t.Fatalf("delivery must complete within budget, sends = %d", len(sent))
+	}
+}
+
+// TestLLM_DisabledNoCall 开关关闭（默认）：不发起任何 LLM 调用与 agent 输出
+// 拉取，正文仅确定性摘要。
 func TestLLM_DisabledNoCall(t *testing.T) {
-	n, _, _, ch, comp, clk := llmFixture(t) // testConfig 默认 llm_summary=false
+	n, _, _, ch, comp, fetch, clk := llmFixture(t) // testConfig 默认 llm_summary=false
 	ctx := context.Background()
 	n.handleEvent(ctx, runStatusEvent("t1", "busy", "idle", true))
 	clk.add(60 * time.Second)
@@ -167,8 +362,11 @@ func TestLLM_DisabledNoCall(t *testing.T) {
 	if got := comp.callCount(); got != 0 {
 		t.Fatalf("llm_summary off must not call completer, calls = %d", got)
 	}
+	if got := fetch.callCount(); got != 0 {
+		t.Fatalf("llm_summary off must not fetch agent output, calls = %d", got)
+	}
 	sent := ch.sent()
-	if len(sent) != 1 || sent[0].Body != "构建服务\n已空闲超过 60 秒" {
+	if len(sent) != 1 || sent[0].Body != "已空闲超过 60 秒" {
 		t.Fatalf("body = %+v", sent)
 	}
 }
@@ -218,7 +416,7 @@ func TestLLM_FallbackBranches(t *testing.T) {
 			if appended != tc.wantApp {
 				t.Fatalf("summary appended = %v, want %v, body = %q", appended, tc.wantApp, sent[0].Body)
 			}
-			if !strings.HasPrefix(sent[0].Body, "构建服务\n已空闲超过 60 秒") {
+			if !strings.HasPrefix(sent[0].Body, "已空闲超过 60 秒") {
 				t.Fatalf("deterministic summary must be preserved, body = %q", sent[0].Body)
 			}
 		})
@@ -347,10 +545,12 @@ func TestLLM_ZeroCallsOnGateFailure(t *testing.T) {
 			fc := &fakeCfgStore{cfg: cfg}
 			ch := &fakeChannel{name: "bark", caps: notification.CapGroup}
 			comp := &fakeCompleter{result: "总结"}
+			fetch := &fakeAgentOutput{result: "输出", ok: true}
 			clk := newFakeClock()
 			n := newTestNotifier(ft, &fakeLister{ids: []string{"t1"}}, fc, []notification.Channel{ch},
 				resolver, clk)
 			n.opts.Summarizer = comp
+			n.opts.LastAgentOutput = fetch
 			n.opts.LLMBudget = 50 * time.Millisecond
 			ctx := context.Background()
 			// 武装 idle（快照 idle 时条件成立；条件失效用例已改为 busy 快照）。
@@ -360,6 +560,9 @@ func TestLLM_ZeroCallsOnGateFailure(t *testing.T) {
 			waitDispatch(n)
 			if got := comp.callCount(); got != 0 {
 				t.Fatalf("gate failure must not trigger llm call, calls = %d", got)
+			}
+			if got := fetch.callCount(); got != 0 {
+				t.Fatalf("gate failure must not fetch agent output, calls = %d", got)
 			}
 			if got := ch.callCount(); got != 0 {
 				t.Fatalf("gate failure must not deliver, channel calls = %d", got)
@@ -371,7 +574,7 @@ func TestLLM_ZeroCallsOnGateFailure(t *testing.T) {
 // TestLLM_BudgetBoundsDelivery 超时上界内完成降级投递（注入 50ms 预算 + 永不
 // 返回的 completer）：墙钟断言仅作防挂死保护（预算语义见 TestLLM_BudgetClamp）。
 func TestLLM_BudgetBoundsDelivery(t *testing.T) {
-	n, _, fc, ch, _, clk := llmFixture(t)
+	n, _, fc, ch, _, _, clk := llmFixture(t)
 	fc.set(llmOn())
 	n.opts.Summarizer = &fakeCompleter{block: make(chan struct{})} // 永不主动返回
 	ctx := context.Background()
@@ -385,7 +588,7 @@ func TestLLM_BudgetBoundsDelivery(t *testing.T) {
 		t.Fatalf("delivery must complete within budget bound, elapsed = %v", elapsed)
 	}
 	sent := ch.sent()
-	if len(sent) != 1 || sent[0].Body != "构建服务\n已空闲超过 60 秒" {
+	if len(sent) != 1 || sent[0].Body != "已空闲超过 60 秒" {
 		t.Fatalf("fallback delivery = %+v", sent)
 	}
 }
@@ -394,16 +597,16 @@ func TestLLM_BudgetBoundsDelivery(t *testing.T) {
 // PUT（llm 开关/bark token/base_url 全量变更）不影响在途投递——总结仍生成、
 // 渠道仍用计划固化配置与 URL。entered 信号提供确定性时序（无 Sleep 轮询）。
 func TestLLM_PlanFixatedUnderConcurrentPUT(t *testing.T) {
-	n, ft, fc, ch, comp, _ := llmFixture(t)
+	n, ft, fc, ch, comp, _, clk := llmFixture(t)
 	fc.set(llmOn())
 	comp.block = make(chan struct{})
 	comp.entered = make(chan struct{})
 	ctx := context.Background()
 
-	// 在途投递：question 触发（事件驱动即时 dispatch），completer 阻塞中。
-	snap := attentionSnapWith("idle", []application.PendingQuestion{pendingQuestion("q1", "用哪个分支？")}, nil)
-	ft.set(snap)
-	n.handleEvent(ctx, attentionEvent("t1"))
+	// 在途投递：idle 触发（唯一 LLM 类别），completer 阻塞中。
+	n.handleEvent(ctx, runStatusEvent("t1", "busy", "idle", true))
+	clk.add(60 * time.Second)
+	n.scan(ctx)
 	<-comp.entered // 确定性同步：completer 已进入（dispatch 在途）
 
 	// 并发 PUT：llm 开关关、bark token/base_url 全量变更。
@@ -418,10 +621,10 @@ func TestLLM_PlanFixatedUnderConcurrentPUT(t *testing.T) {
 
 	sent := ch.sent()
 	if len(sent) != 1 {
-		t.Fatalf("sends = %d, want 1", len(sent))
+		t.Fatalf("sends = %d", len(sent))
 	}
 	// LLMSummary 在计划中固化：在途投递仍附带总结。
-	if want := "构建服务\n用哪个分支？\nAI 总结：模型返回的总结"; sent[0].Body != want {
+	if want := "已空闲超过 60 秒\nAI 总结：模型返回的总结"; sent[0].Body != want {
 		t.Fatalf("in-flight body must carry plan-fixated summary, got %q", sent[0].Body)
 	}
 	// 渠道配置与 URL 同样来自计划固化（不受并发 PUT 影响）。
@@ -433,11 +636,11 @@ func TestLLM_PlanFixatedUnderConcurrentPUT(t *testing.T) {
 	}
 
 	// 下一次投递使用新配置：llm 关 → 不再调用 completer、新 token/base。
-	snap2 := attentionSnapWith("idle", []application.PendingQuestion{
-		pendingQuestion("q1", "用哪个分支？"), pendingQuestion("q2", "第二个问题"),
-	}, nil)
-	ft.set(snap2)
-	n.handleEvent(ctx, attentionEvent("t1"))
+	ft.set(activeSnap("t1", "构建服务", "idle"))
+	n.handleEvent(ctx, runStatusEvent("t1", "idle", "busy", true))
+	n.handleEvent(ctx, runStatusEvent("t1", "busy", "idle", true))
+	clk.add(60 * time.Second)
+	n.scan(ctx)
 	waitDispatch(n)
 	if got := comp.callCount(); got != 1 {
 		t.Fatalf("next delivery with llm off must not call completer, calls = %d", got)

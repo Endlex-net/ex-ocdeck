@@ -43,7 +43,7 @@ func TestDispatch_ParallelChannelsUniformTitle(t *testing.T) {
 			t.Fatalf("channel %s calls = %d, want 1", ch.name, got)
 		}
 	}
-	if got := bark.sent()[0].Title; got != "[ocdeck] [构建服务] 任务已空闲" {
+	if got := bark.sent()[0].Title; got != "OC [idle] 构建服务" {
 		t.Fatalf("CapGroup channel title = %q", got)
 	}
 	if got := web.sent()[0].Title; got != bark.sent()[0].Title {
@@ -54,7 +54,7 @@ func TestDispatch_ParallelChannelsUniformTitle(t *testing.T) {
 		t.Fatalf("bark fixed config = %+v", got)
 	}
 	// web 意图 Body 不受前缀影响，URL 为任务页深链。
-	if in := web.sent()[0]; in.Body != "构建服务\n已空闲超过 60 秒" || in.URL != "http://127.0.0.1:7777/#/task/t1" {
+	if in := web.sent()[0]; in.Body != "已空闲超过 60 秒" || in.URL != "http://127.0.0.1:7777/#/task/t1" {
 		t.Fatalf("web intent = %+v", in)
 	}
 }
@@ -445,8 +445,8 @@ func TestSendTestNotification_SuccessFailedPrefix(t *testing.T) {
 		t.Fatalf("enabled channels must Send once: web=%d bark=%d macos=%d",
 			web.callCount(), bark.callCount(), macos.callCount())
 	}
-	if got := web.sent()[0].Title; got != "[ocdeck] [ocdeck] 测试通知" {
-		t.Fatalf("no-Group title = %q, want [ocdeck] [ocdeck] 测试通知", got)
+	if got := web.sent()[0].Title; got != "OC [test] ocdeck" {
+		t.Fatalf("no-Group title = %q, want OC [test] ocdeck", got)
 	}
 	if got := bark.sent()[0].Title; got != web.sent()[0].Title {
 		t.Fatalf("CapGroup channel must receive identical title, bark=%q web=%q", got, web.sent()[0].Title)

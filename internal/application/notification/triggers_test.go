@@ -133,7 +133,7 @@ func TestTrigger_IdleTimeoutNotifyAndRearm(t *testing.T) {
 	n.scan(ctx)
 	waitDispatch(n)
 	sent := ch.sent()
-	if len(sent) != 1 || sent[0].Category != notification.CategoryIdle || sent[0].Body != "构建服务\n已空闲超过 60 秒" {
+	if len(sent) != 1 || sent[0].Category != notification.CategoryIdle || sent[0].Body != "已空闲超过 60 秒" {
 		t.Fatalf("idle notify = %+v", sent)
 	}
 	// 通知后抑制：持续 idle 不再触发。
@@ -277,7 +277,7 @@ func TestTrigger_RetryTimeoutNotify(t *testing.T) {
 	n.scan(ctx)
 	waitDispatch(n)
 	sent := ch.sent()
-	if len(sent) != 1 || sent[0].Category != notification.CategoryRetry || sent[0].Body != "构建服务\n第 2 次重试：stub rate limit" {
+	if len(sent) != 1 || sent[0].Category != notification.CategoryRetry || sent[0].Body != "第 2 次重试：stub rate limit" {
 		t.Fatalf("retry notify = %+v", sent)
 	}
 }
@@ -343,7 +343,7 @@ func TestTrigger_ErrorTimeoutNotify(t *testing.T) {
 	if len(sent) != 1 || sent[0].Category != notification.CategoryError || sent[0].Level != notification.LevelCritical {
 		t.Fatalf("error notify = %+v", sent)
 	}
-	if want := "构建服务\np17 stub rate limit (HTTP 429)"; sent[0].Body != want {
+	if want := "p17 stub rate limit (HTTP 429)"; sent[0].Body != want {
 		t.Fatalf("body = %q, want %q", sent[0].Body, want)
 	}
 }

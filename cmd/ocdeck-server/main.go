@@ -170,13 +170,14 @@ func run() error {
 	notifyStore := notify.LoadStore(cfg.DataDir)
 	webHub := srv.NotificationHub()
 	notifier := appnotification.New(appnotification.Options{
-		Bus:            notifyEventSubscriberAdapter{bus},
-		Tasks:          tm,
-		ListActive:     tm,
-		Cfg:            notifyStore,
-		Channels:       notify.BuildChannels(webHub, runtime.GOOS),
-		ResolveBaseURL: srv.NotificationBaseURL,
-		Summarizer:     summaryCompleterAdapter{store: aiStore},
+		Bus:             notifyEventSubscriberAdapter{bus},
+		Tasks:           tm,
+		ListActive:      tm,
+		Cfg:             notifyStore,
+		Channels:        notify.BuildChannels(webHub, runtime.GOOS),
+		ResolveBaseURL:  srv.NotificationBaseURL,
+		Summarizer:      summaryCompleterAdapter{store: aiStore},
+		LastAgentOutput: tm,
 	})
 	srv.SetNotificationStore(notifyStore)
 	srv.SetNotificationTester(notifier)

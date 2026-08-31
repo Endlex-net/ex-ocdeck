@@ -814,3 +814,75 @@ func (m *Manager) TaskNotificationSnapshot(ctx context.Context, taskID string) (
 	}
 	return snap, nil
 }
+
+// agentMessageLister OCClient 的可选消息拉取能力（task-notifications design D9：
+// 生产 ocFactory 返回 *opencode.Client 实现；以可选接口扩展而不动 OCClient——
+// 先例 domain/notification.ChannelAvailability，避免破坏全部既有实现与测试 fake）。
+type agentMessageLister interface {
+	ListMessages(ctx context.Context, dir, sessionID string, limit int) ([]opencode.Message, error)
+}
+
+// LastAgentOutput 常量（design D9）：拉取条数与输出截断上界。
+const (
+	lastAgentMessageLimit   = 10
+	lastAgentOutputMaxRunes = 2000
+)
+
+// messageRoleAssistant opencode message 的 role 枚举值（取 assistant 轮）。
+const messageRoleAssistant = "assistant"
+
+// LastAgentOutput agent 最后一轮输出端口实现（design D9；appnotification.
+// LastAgentOutputReader）：取任务锚会话（无锚取最近更新的 owned session，
+// last_seen_at DESC 与 store ListTaskSessions 同序），limit 10 拉取，取最后
+// 一条 role=assistant 消息拼接其文本 part（非文本 part 忽略），截 2000 字符。
+// 无会话/拉取失败/无 assistant 消息/最后一条 assistant 无文本 part →
+// (zero, false)（fail-closed，调用方降级「（不可得）」，不重试）。
+func (m *Manager) LastAgentOutput(ctx context.Context, taskID string) (string, bool) {
+	row, err := m.store.GetTask(ctx, taskID)
+	if err != nil || row.Status != StatusActive {
+		return "", false
+	}
+	sessionID := ""
+	if row.AnchorSessionID.Valid && row.AnchorSessionID.String != "" {
+		sessionID = row.AnchorSessionID.String
+	} else {
+		sessions, serr := m.store.ListTaskSessions(ctx, taskID)
+		if serr != nil || len(sessions) == 0 {
+			return "", false
+		}
+		sessionID = sessions[0].SessionID // ListTaskSessions 语义：最近更新在前
+	}
+	oc, dir, ok := m.taskOcClient(ctx, taskID)
+	if !ok {
+		return "", false
+	}
+	lm, ok := oc.(agentMessageLister)
+	if !ok {
+		return "", false
+	}
+	msgs, merr := lm.ListMessages(ctx, dir, sessionID, lastAgentMessageLimit)
+	if merr != nil {
+		return "", false
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != messageRoleAssistant {
+			continue
+		}
+		texts := make([]string, 0, len(msgs[i].Parts))
+		for _, p := range msgs[i].Parts {
+			if p.Type == "text" && strings.TrimSpace(p.Text) != "" {
+				texts = append(texts, p.Text)
+			}
+		}
+		if len(texts) == 0 {
+			// 最后一条 assistant 消息无文本 part（纯工具调用）→ 不可得，不回溯更早消息。
+			return "", false
+		}
+		out := strings.Join(texts, "\n")
+		if r := []rune(out); len(r) > lastAgentOutputMaxRunes {
+			out = string(r[:lastAgentOutputMaxRunes])
+		}
+		return out, true
+	}
+	return "", false
+}

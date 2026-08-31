@@ -268,7 +268,7 @@ macOS 渠道向运行 ocdeck-server 的 Darwin 主机投递本地通知，仅 da
 
 ### Requirement: 通知内容与跳转链接
 
-每条通知 MUST 包含：任务名称、通知类别（人类可读）、类别详情。通知标题格式 MUST 为 `[ocdeck] [<任务名>] <类别标题>`（通知可能经 Bark 等通用渠道与其他应用的通知混合呈现；任务名截断至 12 字符，过短时原样使用），test 类别任务名为 `ocdeck`。类别详情规则：question 为提问内容（多条提问拼接，超出长度截断）；permission 为权限名称与 patterns（多个 patterns 拼接，超出长度截断）；error 为 message（与 statusCode，若有）；retry 为 attempt 与 message（不可得时用固定降级文案）；idle 为已空闲时长；test 为固定文案「通知链路测试」。任何详情字段缺失时 MUST 使用固定降级文案或省略该字段，MUST NOT 出现空白详情。五个真实类别的通知 MUST 携带任务页跳转链接 `#/task/<任务ID>`；test 类别 MUST 携带设置页链接 `#/configs#notifications`（完整 URL 推导规则见设计）。支持跳转的渠道 MUST 实现点击直达对应页面。
+每条通知 MUST 包含：任务名称、通知类别（人类可读）、类别详情。通知标题格式 MUST 为 `OC [<类别>] <任务名>`（类别为 question/permission/idle/retry/error/test 的枚举值原样；通知可能经 Bark 等通用渠道与其他应用的通知混合呈现；任务名截断至 12 字符，过短时原样使用，空任务名省略该段），test 类别任务名为 `ocdeck`。正文 MUST NOT 重复任务名（任务名由标题承载），直接为类别详情。类别详情规则：question 为提问内容（多条提问拼接，超出长度截断）；permission 为权限名称与 patterns（多个 patterns 拼接，超出长度截断）；error 为 message（与 statusCode，若有）；retry 为 attempt 与 message（不可得时用固定降级文案）；idle 为已空闲时长（LLM 总结可用时附「AI 总结：…」行）；test 为固定文案「通知链路测试」。任何详情字段缺失时 MUST 使用固定降级文案或省略该字段，MUST NOT 出现空白详情。五个真实类别的通知 MUST 携带任务页跳转链接 `#/task/<任务ID>`；test 类别 MUST 携带设置页链接 `#/configs#notifications`（完整 URL 推导规则见设计）。支持跳转的渠道 MUST 实现点击直达对应页面。
 
 #### Scenario: 通知内容完整
 
@@ -280,19 +280,29 @@ macOS 渠道向运行 ocdeck-server 的 Darwin 主机投递本地通知，仅 da
 - **WHEN** 触发通知
 - **THEN** 通知意图含其类别对应的目标页面深链（真实类别为任务页 `#/task/<任务ID>`，test 为设置页 `#/configs#notifications`）
 
-### Requirement: LLM 停止原因总结（可选增强）
+### Requirement: LLM 停止原因总结（可选增强，仅 idle）
 
-系统 SHALL 提供 LLM 总结开关（默认关闭）。开关打开且 AI 配置可用时，通知正文 MUST 附带由 LLM 生成的停止原因总结，总结输入 MUST 仅为任务名、类别与类别详情（不拉取会话消息）。LLM 调用总预算 MUST 有 5 秒上界；调用失败、超时、未配置、返回空白或超长输出时 MUST 降级为确定性摘要（类别详情），MUST NOT 因此失败或丢失通知，MUST NOT 延迟投递超过该上界。
+系统 SHALL 提供 LLM 总结开关（默认关闭）。开关打开且 AI 配置可用时，**仅 idle 类别**的通知正文 MUST 附带由 LLM 生成的停止原因总结；question/permission/retry/error/test 类别 MUST NOT 调用 LLM。总结输入 MUST 为：任务名、类别、该任务 agent 最后一轮输出的文本内容（经任务运行时会话拉取，工具调用等非文本部分忽略，截断至 2000 字符）。agent 输出拉取失败、无可用输出时 MUST 降级为仅基于任务名与类别的确定性摘要。LLM 调用总预算 MUST 有 5 秒上界（含 agent 输出拉取）；调用失败、超时、未配置、返回空白或超长输出时 MUST 降级为确定性摘要（类别详情），MUST NOT 因此失败或丢失通知，MUST NOT 延迟投递超过该上界。
 
-#### Scenario: LLM 总结成功
+#### Scenario: idle 通知附 LLM 总结
 
-- **WHEN** LLM 总结开关打开、AI 配置可用且调用在预算内成功
-- **THEN** 通知正文含 LLM 生成的停止原因总结
+- **WHEN** LLM 总结开关打开、AI 配置可用、idle 通知触发且 agent 最后一轮输出拉取成功，调用在预算内成功
+- **THEN** idle 通知正文含「AI 总结：…」行，总结基于 agent 最后一轮输出
+
+#### Scenario: 非 idle 类别零 LLM 调用
+
+- **WHEN** LLM 总结开关打开，question/permission/retry/error/test 通知触发
+- **THEN** 通知正文为确定性详情，不发起任何 LLM 调用与 agent 输出拉取
+
+#### Scenario: agent 输出不可得降级
+
+- **WHEN** idle 通知触发但 agent 最后一轮输出拉取失败、超时或无消息
+- **THEN** LLM 总结基于任务名与类别（输出段为「（不可得）」），通知正常投递
 
 #### Scenario: LLM 失败降级
 
 - **WHEN** LLM 总结开关打开但调用失败、超时或输出不可用
-- **THEN** 通知以确定性摘要在预算内正常投递
+- **THEN** 通知以确定性摘要（已空闲时长）在预算内正常投递
 
 #### Scenario: 默认不启用
 

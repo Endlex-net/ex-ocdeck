@@ -71,26 +71,26 @@ func contentSnap() TaskSnapshot {
 	return TaskSnapshot{Task: TaskRef{ID: "t1", Name: "构建服务", Status: "active"}, RunStatus: "idle"}
 }
 
-// TestTitleFor Title 统一格式 [ocdeck] [<任务名>] <类别标题>（spec「通知内容与
-// 跳转链接」：任务名截 12 rune、过短原样；test 类别任务名恒为 ocdeck）。
-// 空任务名：spec 未规定，实现取确定性处理——省略任务名段（不输出空 []）。
+// TestTitleFor Title 统一格式 `OC [<类别枚举值>] <任务名>`（spec「通知内容与
+// 跳转链接」：类别用枚举原值，任务名截 12 rune、过短原样；test 类别任务名
+// 恒为 ocdeck）。空任务名：spec 未规定，实现取确定性处理——省略任务名段。
 func TestTitleFor(t *testing.T) {
 	cases := []struct {
 		name      string
+		cat       notification.Category
 		taskName  string
-		category  string
 		wantTitle string
 	}{
-		{"short name kept", "构建服务", "任务已空闲", "[ocdeck] [构建服务] 任务已空闲"},
-		{"name truncated to 12 runes", strings.Repeat("任", 13), "运行出错", "[ocdeck] [" + strings.Repeat("任", 12) + "] 运行出错"},
-		{"name exactly 12 runes kept", strings.Repeat("任", 12), "运行出错", "[ocdeck] [" + strings.Repeat("任", 12) + "] 运行出错"},
-		{"empty name omits segment", "", "等待你的回答", "[ocdeck] 等待你的回答"},
-		{"test category name", "ocdeck", "测试通知", "[ocdeck] [ocdeck] 测试通知"},
+		{"short name kept", notification.CategoryIdle, "构建服务", "OC [idle] 构建服务"},
+		{"name truncated to 12 runes", notification.CategoryError, strings.Repeat("任", 13), "OC [error] " + strings.Repeat("任", 12)},
+		{"name exactly 12 runes kept", notification.CategoryError, strings.Repeat("任", 12), "OC [error] " + strings.Repeat("任", 12)},
+		{"empty name omits segment", notification.CategoryQuestion, "", "OC [question]"},
+		{"test category name", notification.CategoryTest, "ocdeck", "OC [test] ocdeck"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := titleFor(tc.taskName, tc.category); got != tc.wantTitle {
-				t.Fatalf("titleFor(%q, %q) = %q, want %q", tc.taskName, tc.category, got, tc.wantTitle)
+			if got := titleFor(tc.cat, tc.taskName); got != tc.wantTitle {
+				t.Fatalf("titleFor(%s, %q) = %q, want %q", tc.cat, tc.taskName, got, tc.wantTitle)
 			}
 		})
 	}
@@ -102,10 +102,10 @@ func TestQuestionIntent(t *testing.T) {
 		pendingQuestion("q1", "用哪个分支？", "要跑测试吗？"),
 	}
 	got := questionIntent(snap, snap.Attention.Questions[0], "http://x/#/task/t1")
-	if got.Title != "[ocdeck] [构建服务] 等待你的回答" {
+	if got.Title != "OC [question] 构建服务" {
 		t.Fatalf("title = %q", got.Title)
 	}
-	if want := "构建服务\n用哪个分支？\n要跑测试吗？"; got.Body != want {
+	if want := "用哪个分支？\n要跑测试吗？"; got.Body != want {
 		t.Fatalf("body = %q, want %q", got.Body, want)
 	}
 	if got.Category != notification.CategoryQuestion || got.Level != notification.LevelTimeSensitive || got.URL != "http://x/#/task/t1" {
@@ -121,17 +121,16 @@ func TestQuestionIntent_Truncation(t *testing.T) {
 		pendingQuestion("q1", long, long, long),
 	}
 	got := questionIntent(snap, snap.Attention.Questions[0], "u")
-	detail := strings.TrimPrefix(got.Body, "构建服务\n")
 	joined := strings.Repeat("问", 200) + "\n" + strings.Repeat("问", 200) + "\n" + strings.Repeat("问", 200)
 	want := string([]rune(joined)[:500])
-	if detail != want {
-		t.Fatalf("detail = %d runes, want 500-rune prefix of joined fields (got %q…)", len([]rune(detail)), detail[:50])
+	if got.Body != want {
+		t.Fatalf("body = %d runes, want 500-rune prefix of joined fields (got %q…)", len([]rune(got.Body)), got.Body[:50])
 	}
 	// 单字段截断：仅一条超长提问 → 200。
 	snap.Attention.Questions = []application.PendingQuestion{pendingQuestion("q1", long)}
 	got = questionIntent(snap, snap.Attention.Questions[0], "u")
-	if detail := strings.TrimPrefix(got.Body, "构建服务\n"); detail != strings.Repeat("问", 200) {
-		t.Fatalf("single field detail = %d runes, want 200", len([]rune(detail)))
+	if got.Body != strings.Repeat("问", 200) {
+		t.Fatalf("single field body = %d runes, want 200", len([]rune(got.Body)))
 	}
 }
 
@@ -146,16 +145,16 @@ func TestQuestionIntent_BlankDetailFallback(t *testing.T) {
 		pendingQuestion("q2", "\n\t "),
 	}
 	got := questionIntent(snap, snap.Attention.Questions[0], "u")
-	if want := composeBody("构建服务", questionDetailFallback); got.Body != want {
-		t.Fatalf("all-blank questions must use fallback, body = %q, want %q", got.Body, want)
+	if got.Body != questionDetailFallback {
+		t.Fatalf("all-blank questions must use fallback, body = %q, want %q", got.Body, questionDetailFallback)
 	}
 	// 混合：同一请求内空白提问省略，仅保留有效内容。
 	snap.Attention.Questions = []application.PendingQuestion{
 		pendingQuestion("q1", "   ", "有效提问"),
 	}
 	got = questionIntent(snap, snap.Attention.Questions[0], "u")
-	if want := composeBody("构建服务", "有效提问"); got.Body != want {
-		t.Fatalf("blank field must be omitted, body = %q, want %q", got.Body, want)
+	if got.Body != "有效提问" {
+		t.Fatalf("blank field must be omitted, body = %q", got.Body)
 	}
 }
 
@@ -166,17 +165,17 @@ func TestPermissionIntent_BlankDetailFallback(t *testing.T) {
 	snap := contentSnap()
 	// 空白权限名 + 无 patterns：整体降级。
 	snap.Attention.Permissions = []application.PendingPermission{pendingPermission("p1", "  ")}
-	if got := permissionIntent(snap, snap.Attention.Permissions[0], "u"); got.Body != composeBody("构建服务", permissionDetailFallback) {
+	if got := permissionIntent(snap, snap.Attention.Permissions[0], "u"); got.Body != permissionDetailFallback {
 		t.Fatalf("blank permission without patterns must use fallback, body = %q", got.Body)
 	}
 	// 空白权限名 + 有效 patterns：省略权限名（不含悬置冒号）。
 	snap.Attention.Permissions = []application.PendingPermission{pendingPermission("p1", " ", "rm -rf /tmp/x")}
-	if got := permissionIntent(snap, snap.Attention.Permissions[0], "u"); got.Body != composeBody("构建服务", "rm -rf /tmp/x") {
+	if got := permissionIntent(snap, snap.Attention.Permissions[0], "u"); got.Body != "rm -rf /tmp/x" {
 		t.Fatalf("blank name must be omitted with patterns kept, body = %q", got.Body)
 	}
 	// 空白 patterns 条目省略。
 	snap.Attention.Permissions = []application.PendingPermission{pendingPermission("p1", "bash", "  ", "git status")}
-	if got := permissionIntent(snap, snap.Attention.Permissions[0], "u"); got.Body != composeBody("构建服务", "bash: git status") {
+	if got := permissionIntent(snap, snap.Attention.Permissions[0], "u"); got.Body != "bash: git status" {
 		t.Fatalf("blank pattern must be omitted, body = %q", got.Body)
 	}
 }
@@ -187,10 +186,10 @@ func TestPermissionIntent(t *testing.T) {
 		pendingPermission("p1", "bash", "rm -rf /tmp/x", "git status"),
 	}
 	got := permissionIntent(snap, snap.Attention.Permissions[0], "u")
-	if got.Title != "[ocdeck] [构建服务] 等待权限确认" {
+	if got.Title != "OC [permission] 构建服务" {
 		t.Fatalf("title = %q", got.Title)
 	}
-	if want := "构建服务\nbash: rm -rf /tmp/x, git status"; got.Body != want {
+	if want := "bash: rm -rf /tmp/x, git status"; got.Body != want {
 		t.Fatalf("body = %q, want %q", got.Body, want)
 	}
 	if got.Category != notification.CategoryPermission || got.Level != notification.LevelTimeSensitive {
@@ -202,7 +201,7 @@ func TestPermissionIntent(t *testing.T) {
 func TestPermissionIntent_EmptyPatterns(t *testing.T) {
 	snap := contentSnap()
 	snap.Attention.Permissions = []application.PendingPermission{pendingPermission("p1", "edit")}
-	if got := permissionIntent(snap, snap.Attention.Permissions[0], "u"); got.Body != "构建服务\nedit" {
+	if got := permissionIntent(snap, snap.Attention.Permissions[0], "u"); got.Body != "edit" {
 		t.Fatalf("body = %q", got.Body)
 	}
 }
@@ -212,15 +211,15 @@ func TestErrorIntent(t *testing.T) {
 	code := 429
 	last := ocdeckevent.ServeRuntimeSessionErrorPayload{Message: "rate limit", StatusCode: &code}
 	got := errorIntent(snap, last, "u")
-	if got.Title != "[ocdeck] [构建服务] 运行出错" || got.Level != notification.LevelCritical {
+	if got.Title != "OC [error] 构建服务" || got.Level != notification.LevelCritical {
 		t.Fatalf("intent = %+v", got)
 	}
-	if want := "构建服务\nrate limit (HTTP 429)"; got.Body != want {
+	if want := "rate limit (HTTP 429)"; got.Body != want {
 		t.Fatalf("body = %q, want %q", got.Body, want)
 	}
 	// statusCode 缺失：省略该字段（不出现空括号）。
 	got = errorIntent(snap, ocdeckevent.ServeRuntimeSessionErrorPayload{Message: "boom"}, "u")
-	if got.Body != "构建服务\nboom" {
+	if got.Body != "boom" {
 		t.Fatalf("body without code = %q", got.Body)
 	}
 }
@@ -230,20 +229,20 @@ func TestRetryIntent(t *testing.T) {
 	snap.HasRetryDetail = true
 	snap.RetryDetail = RetryDetail{Attempt: 3, Message: "API 超时", Next: 123}
 	got := retryIntent(snap, "u")
-	if got.Title != "[ocdeck] [构建服务] 重试未恢复" || got.Body != "构建服务\n第 3 次重试：API 超时" {
+	if got.Title != "OC [retry] 构建服务" || got.Body != "第 3 次重试：API 超时" {
 		t.Fatalf("intent = %+v", got)
 	}
 	// 详情不可得：固定降级文案，不放弃投递（spec「通知触发——重试持续未恢复」）。
 	snap.HasRetryDetail = false
 	got = retryIntent(snap, "u")
-	if got.Body != "构建服务\n任务持续处于重试状态" {
+	if got.Body != "任务持续处于重试状态" {
 		t.Fatalf("fallback body = %q", got.Body)
 	}
 }
 
 func TestIdleIntent(t *testing.T) {
 	got := idleIntent(contentSnap(), 60, "u")
-	if got.Title != "[ocdeck] [构建服务] 任务已空闲" || got.Body != "构建服务\n已空闲超过 60 秒" {
+	if got.Title != "OC [idle] 构建服务" || got.Body != "已空闲超过 60 秒" {
 		t.Fatalf("intent = %+v", got)
 	}
 }
@@ -254,7 +253,7 @@ func TestTestIntent(t *testing.T) {
 	got := TestIntent("http://x/#/configs#notifications")
 	if got.TaskID != "notification-test" || got.TaskName != "ocdeck" ||
 		got.Category != notification.CategoryTest || got.Level != notification.LevelActive ||
-		got.Title != "[ocdeck] [ocdeck] 测试通知" || got.Body != "ocdeck 通知链路测试" ||
+		got.Title != "OC [test] ocdeck" || got.Body != "ocdeck 通知链路测试" ||
 		got.URL != "http://x/#/configs#notifications" {
 		t.Fatalf("intent = %+v", got)
 	}

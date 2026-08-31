@@ -1320,3 +1320,13 @@ func (c *readyOC) ListPermissions(ctx context.Context, dir string) ([]opencode.P
 func (c *readyOC) ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error) {
 	return c.inner.ListQuestions(ctx, dir)
 }
+
+// ListMessages 透传可选消息拉取能力（agentMessageLister；inner 未实现时
+// fail-closed 错误——包装层不吞掉 LastAgentOutput 的能力探测）。
+func (c *readyOC) ListMessages(ctx context.Context, dir, sessionID string, limit int) ([]opencode.Message, error) {
+	lm, ok := c.inner.(agentMessageLister)
+	if !ok {
+		return nil, fmt.Errorf("readyOC: inner OCClient does not implement ListMessages")
+	}
+	return lm.ListMessages(ctx, dir, sessionID, limit)
+}

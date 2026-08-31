@@ -18,22 +18,23 @@ const (
 )
 
 // titleSourcePrefix Title 来源前缀（spec「通知内容与跳转链接」：通知可能经
-// Bark 等通用渠道与其他应用的通知混合呈现，标题 MUST 以 [ocdeck] 标识来源）。
-const titleSourcePrefix = "[ocdeck] "
+// Bark 等通用渠道与其他应用的通知混合呈现，标题 MUST 以 OC 标识来源）。
+const titleSourcePrefix = "OC"
 
 // titleNameMaxLen Title 中任务名段的截断上界（spec「通知内容与跳转链接」：
 // 任务名截断至 12 字符，过短时原样使用）。
 const titleNameMaxLen = 12
 
-// titleFor Title 统一格式 `[ocdeck] [<任务名>] <类别标题>`（spec「通知内容与
-// 跳转链接」为唯一表述；任务名截 12 rune）。空任务名省略任务名段——spec 未
-// 规定，取确定性处理（不输出空 []）。
-func titleFor(taskName, categoryTitle string) string {
+// titleFor Title 统一格式 `OC [<类别枚举值>] <任务名>`（spec「通知内容与
+// 跳转链接」为唯一表述；类别用枚举原值，任务名截 12 rune）。空任务名省略
+// 任务名段——spec 未规定，取确定性处理。
+func titleFor(cat notification.Category, taskName string) string {
+	title := titleSourcePrefix + " [" + string(cat) + "]"
 	name := truncate(taskName, titleNameMaxLen)
 	if name == "" {
-		return titleSourcePrefix + categoryTitle
+		return title
 	}
-	return titleSourcePrefix + "[" + name + "] " + categoryTitle
+	return title + " " + name
 }
 
 // levelFor 级别映射（spec「通知渠道投递与降级」映射表：question/permission →
@@ -58,27 +59,22 @@ func truncate(s string, max int) string {
 	return string(r[:max])
 }
 
-// composeBody Body = 任务名 + 换行 + 截断后的详情。
-func composeBody(taskName, detail string) string {
-	return taskName + "\n" + detail
-}
-
-func newIntent(snap TaskSnapshot, cat notification.Category, title, body, url string) notification.Intent {
+func newIntent(snap TaskSnapshot, cat notification.Category, body, url string) notification.Intent {
 	return notification.Intent{
 		TaskID:   snap.Task.ID,
 		TaskName: snap.Task.Name,
 		Category: cat,
 		Level:    levelFor(cat),
-		Title:    titleFor(snap.Task.Name, title),
+		Title:    titleFor(cat, snap.Task.Name),
 		Body:     body,
 		URL:      url,
 	}
 }
 
-// questionIntent question 内容组装：Title「[ocdeck] [<任务名>] 等待你的回答」，
-// Body = 任务名 + 提问内容（多条 \n 拼接，单字段截 200、整体截 500）。B14：空白
-// 提问字段省略，全部为空白时整体使用固定降级文案（spec「通知内容与跳转链接」
-// MUST NOT 出现空白详情）。
+// questionIntent question 内容组装：Title「OC [question] <任务名>」（统一格式
+// 见 titleFor），Body = 提问内容（正文不重复任务名，spec「通知内容与跳转链接」；
+// 多条 \n 拼接，单字段截 200、整体截 500）。B14：空白提问字段省略，全部为空白
+// 时整体使用固定降级文案（MUST NOT 出现空白详情）。
 func questionIntent(snap TaskSnapshot, pq application.PendingQuestion, url string) notification.Intent {
 	fields := make([]string, 0, len(pq.Questions))
 	for _, q := range pq.Questions {
@@ -91,12 +87,12 @@ func questionIntent(snap TaskSnapshot, pq application.PendingQuestion, url strin
 	if strings.TrimSpace(detail) == "" {
 		detail = questionDetailFallback
 	}
-	return newIntent(snap, notification.CategoryQuestion, "等待你的回答", composeBody(snap.Task.Name, detail), url)
+	return newIntent(snap, notification.CategoryQuestion, detail, url)
 }
 
-// permissionIntent permission 内容组装：Title「[ocdeck] [<任务名>] 等待权限确认」，
-// Body = 任务名 + 权限名 + patterns（`, ` 拼接，同截断）。B14：空白权限名/patterns
-// 条目省略，详情整体为空白时使用固定降级文案（spec 同上）。
+// permissionIntent permission 内容组装：Title「OC [permission] <任务名>」，
+// Body = 权限名 + patterns（`, ` 拼接，同截断；正文不重复任务名）。B14：空白
+// 权限名/patterns 条目省略，详情整体为空白时使用固定降级文案。
 func permissionIntent(snap TaskSnapshot, pp application.PendingPermission, url string) notification.Intent {
 	patterns := make([]string, 0, len(pp.Patterns))
 	for _, p := range pp.Patterns {
@@ -119,8 +115,7 @@ func permissionIntent(snap TaskSnapshot, pp application.PendingPermission, url s
 	if strings.TrimSpace(detail) == "" {
 		detail = permissionDetailFallback
 	}
-	return newIntent(snap, notification.CategoryPermission, "等待权限确认",
-		composeBody(snap.Task.Name, detail), url)
+	return newIntent(snap, notification.CategoryPermission, detail, url)
 }
 
 // question/permission 空白详情的固定降级文案（B14；对齐 retry 降级文案的
@@ -130,31 +125,32 @@ const (
 	permissionDetailFallback = "有新权限请求等待确认"
 )
 
-// errorIntent error 内容组装：Title「[ocdeck] [<任务名>] 运行出错」，Body =
-// 任务名 + message（+ ` (HTTP <statusCode>)`，若有）。
+// errorIntent error 内容组装：Title「OC [error] <任务名>」，Body = message
+// （+ ` (HTTP <statusCode>)`，若有；正文不重复任务名）。
 func errorIntent(snap TaskSnapshot, last ocdeckevent.ServeRuntimeSessionErrorPayload, url string) notification.Intent {
 	detail := last.Message
 	if last.StatusCode != nil {
 		detail += fmt.Sprintf(" (HTTP %d)", *last.StatusCode)
 	}
-	return newIntent(snap, notification.CategoryError, "运行出错", composeBody(snap.Task.Name, detail), url)
+	return newIntent(snap, notification.CategoryError, detail, url)
 }
 
-// retryIntent retry 内容组装：Title「[ocdeck] [<任务名>] 重试未恢复」，详情
-// 不可得 → 固定降级文案「任务持续处于重试状态」（不放弃投递）。
+// retryIntent retry 内容组装：Title「OC [retry] <任务名>」，Body=`第 <attempt>
+// 次重试：<message>`（正文不重复任务名）；详情不可得 → 固定降级文案「任务持续
+// 处于重试状态」（不放弃投递）。
 func retryIntent(snap TaskSnapshot, url string) notification.Intent {
 	detail := "任务持续处于重试状态"
 	if snap.HasRetryDetail {
 		detail = fmt.Sprintf("第 %d 次重试：%s", snap.RetryDetail.Attempt, snap.RetryDetail.Message)
 	}
-	return newIntent(snap, notification.CategoryRetry, "重试未恢复", composeBody(snap.Task.Name, detail), url)
+	return newIntent(snap, notification.CategoryRetry, detail, url)
 }
 
-// idleIntent idle 内容组装：Title「[ocdeck] [<任务名>] 任务已空闲」，阈值取
-// 触发判定所用配置快照。
+// idleIntent idle 内容组装：Title「OC [idle] <任务名>」，Body=`已空闲超过
+// <阈值> 秒`（正文不重复任务名），阈值取触发判定所用配置快照。
 func idleIntent(snap TaskSnapshot, idleTimeoutSeconds int, url string) notification.Intent {
 	detail := fmt.Sprintf("已空闲超过 %d 秒", idleTimeoutSeconds)
-	return newIntent(snap, notification.CategoryIdle, "任务已空闲", composeBody(snap.Task.Name, detail), url)
+	return newIntent(snap, notification.CategoryIdle, detail, url)
 }
 
 // TestIntent 测试通知专用变体（spec「测试通知」：TaskID=notification-test、
@@ -166,7 +162,7 @@ func TestIntent(url string) notification.Intent {
 		TaskName: "ocdeck",
 		Category: notification.CategoryTest,
 		Level:    levelFor(notification.CategoryTest),
-		Title:    titleFor("ocdeck", "测试通知"),
+		Title:    titleFor(notification.CategoryTest, "ocdeck"),
 		Body:     "ocdeck 通知链路测试",
 		URL:      url,
 	}
