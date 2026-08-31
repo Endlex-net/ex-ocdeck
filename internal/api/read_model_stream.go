@@ -121,7 +121,8 @@ func (s *Server) runReadModelStream(w http.ResponseWriter, r *http.Request, cfg 
 	// 写 200 + SSE headers，发完整 snapshot 帧后 Flush：首帧立即可达。
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
+	h.Set("Cache-Control", "no-cache, no-transform")
+	h.Set("X-Accel-Buffering", "no")
 	h.Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 	if err := writeSSEFrame(w, sseEventSnapshot, data); err != nil {
