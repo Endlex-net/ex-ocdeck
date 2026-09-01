@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -60,6 +61,20 @@ func runWatchdog(args []string) error {
 }
 
 func run() error {
+	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	showVersion := fs.Bool("version", false, "print version and exit")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		return err
+	}
+	if *showVersion {
+		fmt.Println(version)
+		return nil
+	}
+
+	if err := config.ApplyEnvFile(); err != nil {
+		return err
+	}
+
 	cfg, release, err := config.Load(config.DefaultOptions())
 	if err != nil {
 		return err
@@ -69,8 +84,8 @@ func run() error {
 	// 保证 flock 释放前 SQLite 已关闭、不会与下一实例的 store.Open 竞态。
 	defer release()
 
-	log.Printf("ocdeck-server starting: dataDir=%s listen=%s policy=%s opencode=%s tmux=%s",
-		cfg.DataDir, cfg.ListenAddr, cfg.ShutdownPolicy, cfg.OpenCodeVersion, cfg.TmuxVersion)
+	log.Printf("ocdeck-server starting: version=%s dataDir=%s listen=%s policy=%s opencode=%s tmux=%s",
+		version, cfg.DataDir, cfg.ListenAddr, cfg.ShutdownPolicy, cfg.OpenCodeVersion, cfg.TmuxVersion)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

@@ -1,0 +1,51 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Homebrew tap
+        run: |
+          git clone "https://x-access-token:${{ secrets.TAP_GITHUB_TOKEN }}@github.com/Endlex-net/homebrew-tap.git" homebrew-tap/
+          git -C homebrew-tap config user.name "github-actions[bot]"
+          git -C homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          scripts/update-tap.sh --tag "${{ github.ref_name }}" --tap-dir homebrew-tap

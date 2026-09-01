@@ -397,3 +397,251 @@ func TestLoad_DataDirAbsolutized(t *testing.T) {
 		t.Errorf("DataDir = %q, want abs %q", cfg.DataDir, abs)
 	}
 }
+
+func TestLoad_EnvFileOnly(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, "env")
+	if err := os.WriteFile(envPath, []byte("OCDECK_TOKEN=fromfile\nOCDECK_DATA_DIR="+dir+"\n"), 0o600); err != nil {
+		t.Fatalf("write env file: %v", err)
+	}
+	clearOCDECKEnv(t)
+	t.Setenv("OCDECK_ENV_FILE", envPath)
+
+	cfg, release, err := Load(Options{
+		OS:            OSInfo{GOOS: "darwin"},
+		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
+		TmuxProbe:     func() (string, error) { return "tmux 3.4", nil },
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	defer release()
+	if cfg.Token != "fromfile" {
+		t.Errorf("token mismatch")
+	}
+}
+
+func TestLoad_EnvOverridesFile(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, "env")
+	if err := os.WriteFile(envPath, []byte("OCDECK_TOKEN=fromfile\nOCDECK_DATA_DIR="+dir+"\nOCDECK_LISTEN_ADDR=0.0.0.0\n"), 0o600); err != nil {
+		t.Fatalf("write env file: %v", err)
+	}
+	clearOCDECKEnv(t)
+	t.Setenv("OCDECK_ENV_FILE", envPath)
+	t.Setenv("OCDECK_TOKEN", "fromenv")
+
+	cfg, release, err := Load(Options{
+		OS:            OSInfo{GOOS: "darwin"},
+		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
+		TmuxProbe:     func() (string, error) { return "tmux 3.4", nil },
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	defer release()
+	if cfg.Token != "fromenv" {
+		t.Errorf("token = %q, want fromenv (env overrides file)", cfg.Token)
+	}
+	if cfg.ListenAddr != "0.0.0.0" {
+		t.Errorf("listen = %s, want 0.0.0.0 from file", cfg.ListenAddr)
+	}
+}
+
+func TestLoad_EnvFileMissingIgnored(t *testing.T) {
+	dir := t.TempDir()
+	clearOCDECKEnv(t)
+	t.Setenv("OCDECK_ENV_FILE", filepath.Join(dir, "missing-env"))
+	t.Setenv("OCDECK_TOKEN", "fromenv")
+	t.Setenv("OCDECK_DATA_DIR", dir)
+
+	cfg, release, err := Load(Options{
+		OS:            OSInfo{GOOS: "darwin"},
+		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
+		TmuxProbe:     func() (string, error) { return "tmux 3.4", nil },
+	})
+	if err != nil {
+		t.Fatalf("missing env file must be ignored: %v", err)
+	}
+	defer release()
+	if cfg.Token != "fromenv" {
+		t.Errorf("token mismatch")
+	}
+}
+
+func TestLoad_EnvFilePathOverride(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	defaultDir := filepath.Join(home, ".config", "ocdeck")
+	if err := os.MkdirAll(defaultDir, 0o700); err != nil {
+		t.Fatalf("mkdir default env dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(defaultDir, "env"), []byte("OCDECK_TOKEN=defaultfile\nOCDECK_DATA_DIR="+dir+"\n"), 0o600); err != nil {
+		t.Fatalf("write default env file: %v", err)
+	}
+	custom := filepath.Join(dir, "custom.env")
+	if err := os.WriteFile(custom, []byte("OCDECK_TOKEN=customfile\nOCDECK_DATA_DIR="+dir+"\n"), 0o600); err != nil {
+		t.Fatalf("write custom env file: %v", err)
+	}
+	clearOCDECKEnv(t)
+	t.Setenv("HOME", home)
+	t.Setenv("OCDECK_ENV_FILE", custom)
+
+	cfg, release, err := Load(Options{
+		OS:            OSInfo{GOOS: "darwin"},
+		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
+		TmuxProbe:     func() (string, error) { return "tmux 3.4", nil },
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	defer release()
+	if cfg.Token != "customfile" {
+		t.Errorf("token = %q, want customfile from OCDECK_ENV_FILE", cfg.Token)
+	}
+}
+
+func TestLoad_EnvFileMalformedLinesIgnored(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, "env")
+	content := "# comment\n\nOCDECK_TOKEN=fromfile\nnot-an-assignment\n=emptykey\nOCDECK_DATA_DIR = " + dir + "\nOCDECK_LISTEN_PORT=8080\n"
+	if err := os.WriteFile(envPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("write env file: %v", err)
+	}
+	clearOCDECKEnv(t)
+	t.Setenv("OCDECK_ENV_FILE", envPath)
+
+	cfg, release, err := Load(Options{
+		OS:            OSInfo{GOOS: "darwin"},
+		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
+		TmuxProbe:     func() (string, error) { return "tmux 3.4", nil },
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	defer release()
+	if cfg.Token != "fromfile" {
+		t.Errorf("token mismatch")
+	}
+	if cfg.ListenPort != 8080 {
+		t.Errorf("listen port = %d, want 8080", cfg.ListenPort)
+	}
+}
+
+func TestApplyEnvFile_PATHOverrides(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, "env")
+	if err := os.WriteFile(envPath, []byte("PATH=/from/file/bin\n"), 0o600); err != nil {
+		t.Fatalf("write env file: %v", err)
+	}
+	t.Setenv("OCDECK_ENV_FILE", envPath)
+	t.Setenv("PATH", "/from/real/bin")
+
+	if err := ApplyEnvFile(); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if got := os.Getenv("PATH"); got != "/from/file/bin" {
+		t.Errorf("PATH = %q, want file value", got)
+	}
+}
+
+func TestApplyEnvFile_DoesNotOverrideExisting(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, "env")
+	if err := os.WriteFile(envPath, []byte("OCDECK_TOKEN=fromfile\n"), 0o600); err != nil {
+		t.Fatalf("write env file: %v", err)
+	}
+	t.Setenv("OCDECK_ENV_FILE", envPath)
+	t.Setenv("OCDECK_TOKEN", "fromenv")
+
+	if err := ApplyEnvFile(); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if got := os.Getenv("OCDECK_TOKEN"); got != "fromenv" {
+		t.Errorf("OCDECK_TOKEN = %q, want fromenv", got)
+	}
+}
+
+func TestApplyEnvFile_FillsMissing(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, "env")
+	if err := os.WriteFile(envPath, []byte("OCDECK_TOKEN=fromfile\n"), 0o600); err != nil {
+		t.Fatalf("write env file: %v", err)
+	}
+	t.Setenv("OCDECK_ENV_FILE", envPath)
+	if err := os.Unsetenv("OCDECK_TOKEN"); err != nil {
+		t.Fatalf("unset OCDECK_TOKEN: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Unsetenv("OCDECK_TOKEN") })
+
+	if err := ApplyEnvFile(); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if got := os.Getenv("OCDECK_TOKEN"); got != "fromfile" {
+		t.Errorf("OCDECK_TOKEN = %q, want fromfile", got)
+	}
+}
+
+func TestApplyEnvFile_MissingFileNoop(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("OCDECK_ENV_FILE", filepath.Join(dir, "missing-env"))
+	t.Setenv("OCDECK_TOKEN", "fromenv")
+
+	if err := ApplyEnvFile(); err != nil {
+		t.Fatalf("missing file must be noop: %v", err)
+	}
+	if got := os.Getenv("OCDECK_TOKEN"); got != "fromenv" {
+		t.Errorf("OCDECK_TOKEN = %q, want fromenv", got)
+	}
+}
+
+func TestLoad_ExplicitEnvLookupSkipsFile(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, "env")
+	if err := os.WriteFile(envPath, []byte("OCDECK_TOKEN=fromfile\nOCDECK_DATA_DIR="+dir+"\n"), 0o600); err != nil {
+		t.Fatalf("write env file: %v", err)
+	}
+	t.Setenv("OCDECK_ENV_FILE", envPath)
+
+	_, _, err := Load(Options{
+		EnvLookup: func(key string) (string, bool) {
+			if key == "OCDECK_DATA_DIR" {
+				return dir, true
+			}
+			return "", false
+		},
+		OS:            OSInfo{GOOS: "darwin"},
+		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
+		TmuxProbe:     func() (string, error) { return "tmux 3.4", nil },
+	})
+	if err == nil {
+		t.Fatal("explicit EnvLookup must not fall back to env-file token")
+	}
+}
+
+func clearOCDECKEnv(t *testing.T) {
+	t.Helper()
+	keys := []string{
+		"OCDECK_TOKEN",
+		"OCDECK_DATA_DIR",
+		"OCDECK_LISTEN_ADDR",
+		"OCDECK_LISTEN_PORT",
+		"OCDECK_SERVE_PORT_RANGE",
+		"OCDECK_SHUTDOWN_POLICY",
+		"OCDECK_ALLOWED_ORIGINS",
+		"OCDECK_ENV_FILE",
+	}
+	for _, key := range keys {
+		orig, had := os.LookupEnv(key)
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatalf("unset %s: %v", key, err)
+		}
+		t.Cleanup(func() {
+			if had {
+				_ = os.Setenv(key, orig)
+				return
+			}
+			_ = os.Unsetenv(key)
+		})
+	}
+}
