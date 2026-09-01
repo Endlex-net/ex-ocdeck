@@ -14,8 +14,8 @@ export interface PaletteCommand {
   action?: () => void;
   /** 关键词（含中文，用于模糊匹配）。 */
   keywords?: string;
-  /** agent 状态点（仅任务条目）。 */
-  dot?: 'idle' | 'busy' | 'retry';
+  /** agent 状态点（仅任务条目）；attention = 等待人工（待答问题/待授权限），优先于运行态。 */
+  dot?: 'idle' | 'busy' | 'retry' | 'attention';
 }
 
 /** 模糊匹配：query 按空白分词，每个词须作为子串出现在 group+label+hint+keywords 拼接串中。
@@ -64,7 +64,7 @@ export function CommandPalette({ open, onClose, onNewTask, onRegisterProject }: 
     for (const p of projects) {
       for (const t of p.tasks ?? []) {
         if (t.status === 'archived') continue;
-        const dot = t.agentStatus === 'busy' || t.agentStatus === 'retry' ? t.agentStatus : t.agentStatus === 'idle' ? 'idle' : undefined;
+        const dot = (t.attention_count ?? 0) > 0 ? 'attention' : t.agentStatus === 'busy' || t.agentStatus === 'retry' ? t.agentStatus : t.agentStatus === 'idle' ? 'idle' : undefined;
         tasks.push({
           group: '任务',
           label: t.name,
