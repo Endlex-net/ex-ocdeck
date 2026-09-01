@@ -12,6 +12,19 @@ jobs:
   goreleaser:
     runs-on: macos-latest
     steps:
+      # token 无效时公共仓库 clone 仍会成功（匿名可读），直到 push 才以 exit 128 失败；
+      # 这里用 API 预检，把问题在构建前暴露成可读错误
+      - name: Verify TAP_GITHUB_TOKEN
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${TAP_GITHUB_TOKEN}" https://api.github.com/repos/Endlex-net/homebrew-tap)
+          if [[ "$code" != "200" ]]; then
+            echo "::error::TAP_GITHUB_TOKEN 无效或无权访问 Endlex-net/homebrew-tap (HTTP $code)。请检查 ex-ocdeck Settings -> Secrets -> Actions 中该 secret 的值：token 是否过期、复制不全、或未勾选该仓库。"
+            exit 1
+          fi
+          echo "TAP_GITHUB_TOKEN 验证通过"
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
