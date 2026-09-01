@@ -204,11 +204,13 @@ function SidebarTaskGroups({ projects, currentTaskID }: { projects: Project[]; c
                 aria-current={currentTaskID === t.id ? 'page' : undefined}
                 title={transLabel ? `${t.name}（${transLabel}）` : t.name}
               >
-                {/* 过渡态（创建中/激活中/挂起中）：spinner 呈现；其余沿用 agent 状态点 */}
+                {/* 过渡态（创建中/激活中/挂起中）：spinner 呈现；其余沿用 agent 状态点。
+                    待人工（attention_count>0）蓝点优先于运行态：圆点表达状态语言，
+                    右侧 od-nav-attention 计数丸保留计数职责。 */}
                 {transLabel ? (
                   <span className="od-spinner od-nav-task-spinner" aria-hidden />
                 ) : (
-                  <span className={`od-agent od-agent-${agentDotClass(t.agentStatus)}`}>
+                  <span className={`od-agent od-agent-${agentDotClass(t.agentStatus, t.attention_count)}`}>
                     <span className="od-agent-dot"></span>
                   </span>
                 )}
@@ -227,8 +229,9 @@ function SidebarTaskGroups({ projects, currentTaskID }: { projects: Project[]; c
   );
 }
 
-/** agent 状态点 class（idle/busy/retry；未知降级为 idle dot 不亮）。 */
-function agentDotClass(agentStatus?: string): 'idle' | 'busy' | 'retry' | 'idle-off' {
+/** agent 状态点 class：等待人工（attention_count>0）蓝点优先于 idle/busy/retry；未知降级为 idle-off 不亮。 */
+function agentDotClass(agentStatus?: string, attentionCount = 0): 'idle' | 'busy' | 'retry' | 'attention' | 'idle-off' {
+  if (attentionCount > 0) return 'attention';
   if (agentStatus === 'busy') return 'busy';
   if (agentStatus === 'retry') return 'retry';
   if (agentStatus === 'idle') return 'idle';
