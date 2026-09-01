@@ -18,6 +18,22 @@ jobs:
         with:
           go-version: "1.24"
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      # web/dist 是 go:embed 目标，vet/test 前必须先构建前端
+      - name: Build web
+        run: cd web && pnpm install --frozen-lockfile && pnpm build
+
       - name: Vet
         run: go vet ./...
 
