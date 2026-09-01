@@ -55,7 +55,7 @@ func TestLevelMapping(t *testing.T) {
 	cases := map[notification.Category]notification.Level{
 		notification.CategoryQuestion:   notification.LevelTimeSensitive,
 		notification.CategoryPermission: notification.LevelTimeSensitive,
-		notification.CategoryError:      notification.LevelCritical,
+		notification.CategoryError:      notification.LevelTimeSensitive,
 		notification.CategoryRetry:      notification.LevelTimeSensitive,
 		notification.CategoryIdle:       notification.LevelActive,
 		notification.CategoryTest:       notification.LevelActive,
@@ -211,7 +211,7 @@ func TestErrorIntent(t *testing.T) {
 	code := 429
 	last := ocdeckevent.ServeRuntimeSessionErrorPayload{Message: "rate limit", StatusCode: &code}
 	got := errorIntent(snap, last, "u")
-	if got.Title != "OC [error] 构建服务" || got.Level != notification.LevelCritical {
+	if got.Title != "OC [error] 构建服务" || got.Level != notification.LevelTimeSensitive {
 		t.Fatalf("intent = %+v", got)
 	}
 	if want := "rate limit (HTTP 429)"; got.Body != want {

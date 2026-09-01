@@ -179,7 +179,7 @@ episode 名额占用仲裁（同一 episode 内 retry/error 合计至多一次�
 
 ### Requirement: 通知渠道投递与降级
 
-系统 SHALL 支持三类通知渠道：网页（web）、Bark 推送（bark）、macOS 本地通知（macos）。每次触发 MUST 向全部"已启用且已配置"的渠道并行投递；单一渠道失败 MUST NOT 影响其他渠道投递，MUST NOT 阻塞或影响任务主流程，失败 MUST 记录日志。渠道抽象 MUST 为渠道无关的通知意图（任务 ID/名称、类别、级别、标题、正文、跳转链接；类别详情由内容组装进入正文，意图不单独携带详情字段），各渠道按声明的能力位（分组 Group / 同键替换 Replace / 撤回 Withdraw）落地；标题统一携带任务名（见「通知内容与跳转链接」的标题格式），分组能力缺失的唯一降级表现为通知中心内不折叠分组，MUST NOT 报错阻断。通知级别 MUST 按类别映射：question/permission → timeSensitive；error → critical；retry → timeSensitive；idle → active；test → active。
+系统 SHALL 支持三类通知渠道：网页（web）、Bark 推送（bark）、macOS 本地通知（macos）。每次触发 MUST 向全部"已启用且已配置"的渠道并行投递；单一渠道失败 MUST NOT 影响其他渠道投递，MUST NOT 阻塞或影响任务主流程，失败 MUST 记录日志。渠道抽象 MUST 为渠道无关的通知意图（任务 ID/名称、类别、级别、标题、正文、跳转链接；类别详情由内容组装进入正文，意图不单独携带详情字段），各渠道按声明的能力位（分组 Group / 同键替换 Replace / 撤回 Withdraw）落地；标题统一携带任务名（见「通知内容与跳转链接」的标题格式），分组能力缺失的唯一降级表现为通知中心内不折叠分组，MUST NOT 报错阻断。通知级别 MUST 按类别映射：question/permission → timeSensitive；error → timeSensitive（Bark critical 穿透勿扰与静音，error 场景不授予该最高优先级）；retry → timeSensitive；idle → active；test → active。
 
 渠道"已配置"判定与能力位矩阵 MUST 遵循：web —— 启用即已配置，Caps=Replace（无 Group，标题加任务名前缀），零连接投递计为 failed；bark —— endpoint 与 token 均非空才算已配置（否则 skipped），Caps=Group；macos —— 仅 darwin 且 terminal-notifier 或 osascript 可用才算可用（否则 skipped），terminal-notifier Caps=Group|Replace，osascript Caps=0（标题加任务名前缀）；所有渠道本期 MUST NOT 声明 Withdraw。
 

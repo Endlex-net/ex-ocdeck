@@ -340,7 +340,7 @@ func TestTrigger_ErrorTimeoutNotify(t *testing.T) {
 	n.scan(ctx)
 	waitDispatch(n)
 	sent := ch.sent()
-	if len(sent) != 1 || sent[0].Category != notification.CategoryError || sent[0].Level != notification.LevelCritical {
+	if len(sent) != 1 || sent[0].Category != notification.CategoryError || sent[0].Level != notification.LevelTimeSensitive {
 		t.Fatalf("error notify = %+v", sent)
 	}
 	if want := "p17 stub rate limit (HTTP 429)"; sent[0].Body != want {

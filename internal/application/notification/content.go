@@ -37,14 +37,13 @@ func titleFor(cat notification.Category, taskName string) string {
 	return title + " " + name
 }
 
-// levelFor 级别映射（spec「通知渠道投递与降级」映射表：question/permission →
-// timeSensitive；error → critical；retry → timeSensitive；idle/test → active）。
+// levelFor 级别映射（spec「通知渠道投递与降级」映射表：question/permission/error/
+// retry → timeSensitive（error 不授予 critical——Bark critical 穿透勿扰与静音）；
+// idle/test → active）。
 func levelFor(cat notification.Category) notification.Level {
 	switch cat {
-	case notification.CategoryQuestion, notification.CategoryPermission, notification.CategoryRetry:
+	case notification.CategoryQuestion, notification.CategoryPermission, notification.CategoryRetry, notification.CategoryError:
 		return notification.LevelTimeSensitive
-	case notification.CategoryError:
-		return notification.LevelCritical
 	default: // idle / test
 		return notification.LevelActive
 	}
