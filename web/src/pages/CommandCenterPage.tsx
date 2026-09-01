@@ -416,6 +416,10 @@ function AttentionRow({
   const t = item.task;
   const gotoWorkbench = () => navigate(`/task/${t.id}?from=home`);
   const secondaryLabels = item.secondary.map((k) => attentionKindLabel(k));
+  // 等待人工（权限/提问待处理）时状态徽标变蓝；计数取摘要 attention_count，
+  // sessions-only 任务摘要无计数（0）时以 1 兜底保证状态呈现。
+  const humanPending =
+    item.kinds.has(AttentionKind.PermissionPending) || item.kinds.has(AttentionKind.QuestionPending);
   // 等待类提示（权限/问题）与失败态用琥珀色强调（warn 派生，对齐设计稿 cc-row-hint.urgent）
   const hintUrgent =
     item.kind === AttentionKind.Failed ||
@@ -436,7 +440,7 @@ function AttentionRow({
         <div className="od-row-title">
           {t.name}
           {t.status === 'suspended' && <span className="badge badge-suspended">挂起</span>}
-          <AgentStatusBadge agentStatus={t.agentStatus} />
+          <AgentStatusBadge agentStatus={t.agentStatus} attentionCount={humanPending ? Math.max(1, t.attention_count ?? 0) : 0} />
         </div>
         <div className="od-row-sub mono">
           {item.project_name} · <BranchIcon /> {t.branch}
@@ -586,7 +590,7 @@ function TaskRow({ m }: { m: MergedTask }) {
           {isTransitional(m.task.status) ? (
             <StatusBadge status={m.task.status} />
           ) : null}
-          <AgentStatusBadge agentStatus={m.agentStatus} />
+          <AgentStatusBadge agentStatus={m.agentStatus} attention={m.attention} />
         </div>
         <div className="od-row-sub mono">
           {m.project_name} · <BranchIcon /> {m.task.branch}

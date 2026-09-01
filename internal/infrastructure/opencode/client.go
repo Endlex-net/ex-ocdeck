@@ -888,13 +888,22 @@ func parseSessionStatus(raw jsonRawObject) (SessionStatus, error) {
 }
 
 // parseEvent 将 sseRawEvent 解析为 Event envelope（§20：{type, properties}）。
+// 解码使用 json.Decoder + UseNumber 保留数字词法值（json.Number）：properties
+// 的数值消费方（session.error 的 statusCode 无损 int 判定等）不经 float64 往返；
+// 兼容 float64 的既有读取统一走 floatNumber（已适配 json.Number）。
 func parseEvent(ev sseRawEvent) (Event, error) {
 	var e Event
 	if len(ev.data) == 0 {
 		return Event{Type: ev.Type}, nil
 	}
-	if err := json.Unmarshal(ev.data, &e); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(ev.data))
+	dec.UseNumber()
+	if err := dec.Decode(&e); err != nil {
 		return Event{}, fmt.Errorf("opencode: parse sse event: %w", err)
+	}
+	// 尾随数据判定（对齐 json.Unmarshal 的严格性，Decoder 单值解码默认容忍尾随）。
+	if _, err := dec.Token(); err != io.EOF {
+		return Event{}, fmt.Errorf("opencode: parse sse event: trailing data")
 	}
 	if e.Type == "" {
 		e.Type = ev.Type

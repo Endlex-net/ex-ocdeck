@@ -236,7 +236,7 @@ export function TaskWorkbenchPage({
   // data-od-id / wb-* class 对齐设计稿 task-workbench.html:229
   // 注意：以下 Hook 必须在任何条件 return 之前（404 分支不得改变 Hook 调用次数）。
   const switcherTasks = useMemo(() => {
-    const out: Array<{ taskID: string; name: string; branch: string; projectName: string; agentStatus?: string; current: boolean }> = [];
+    const out: Array<{ taskID: string; name: string; branch: string; projectName: string; agentStatus?: string; attentionCount: number; current: boolean }> = [];
     for (const p of projects) {
       // 与侧栏 SidebarTaskGroups 同源：仅 active+suspended（归档/失败等不显示）
       for (const t of (p.tasks ?? []).filter((x) => x.status === 'active' || x.status === 'suspended')) {
@@ -246,6 +246,7 @@ export function TaskWorkbenchPage({
           branch: t.branch,
           projectName: p.name,
           agentStatus: t.agentStatus,
+          attentionCount: t.attention_count ?? 0,
           current: t.id === taskID,
         });
       }
@@ -351,7 +352,11 @@ export function TaskWorkbenchPage({
                           navigate(`/task/${t.taskID}`);
                         }}
                       >
-                        <span className={`od-agent od-agent-${t.agentStatus ?? ''}`}><span className="od-agent-dot" /></span>
+                        {/* 有待答问题/待授权限时蓝点（等待人工 > 运行态） */}
+                        <span
+                          className={`od-agent od-agent-${t.attentionCount > 0 ? 'attention' : (t.agentStatus ?? '')}`}
+                          title={t.attentionCount > 0 ? `等待人工处理：${t.attentionCount} 个待处理请求` : undefined}
+                        ><span className="od-agent-dot" /></span>
                         <span className="wb-sw-name">{t.name}</span>
                         <span className="mono">{t.branch}</span>
                       </button>
@@ -387,7 +392,7 @@ export function TaskWorkbenchPage({
             日志
           </button>
         )}
-        {task && <AgentStatusBadge agentStatus={task.agentStatus} />}
+        {task && <AgentStatusBadge agentStatus={task.agentStatus} attention={task.attention} />}
         <span className="header-spacer" />
         {error && !isNarrow && <span className="header-error">{error}</span>}
         {task && !isNarrow && (

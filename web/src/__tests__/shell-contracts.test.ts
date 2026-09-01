@@ -335,6 +335,7 @@ describe('ConfigsTab 类型守卫', () => {
     expect(isConfigsTab('env')).toBe(true);
     expect(isConfigsTab('opencode')).toBe(true);
     expect(isConfigsTab('ai')).toBe(true);
+    expect(isConfigsTab('notifications')).toBe(true);
   });
 
   it('非法 tab', () => {

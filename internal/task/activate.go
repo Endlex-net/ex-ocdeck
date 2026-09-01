@@ -1461,6 +1461,14 @@ func (m *Manager) handleSSEEvent(ctx context.Context, taskID, wtPath string, ev 
 			}
 			return nil
 		}
+		// task-notifications D2：session.error 在 B3b 归属反查之前消费（attention/
+		// status 同一消费链）：先 fail-closed 解析，malformed 直接静默忽略、不做
+		// 任何 I/O——畸形事件 MUST NOT 落入通用 sessionID 反查（info.id 回退可能
+		// 触发归属读失败中断事件流）；合法事件由 observe 自带归属检查后发布。
+		if ev.Type == "session.error" {
+			m.observeSessionErrorEvent(ctx, taskID, ev)
+			return nil
+		}
 		// B3b：status/diff 等无 properties.info 的事件，sessionID 取 properties.sessionID
 		//（VERIFICATION.md 实测，回退 properties.info.id），反查 task_sessions 归属，
 		// 命中本任务才处理（design.md §4 补注）。未命中本任务的 session 不动本任务数据。

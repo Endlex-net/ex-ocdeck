@@ -33,6 +33,12 @@ func TestEventDirtiesTaskDetail(t *testing.T) {
 		{"serve_runtime.attention other", ocdeckevent.NewServeRuntimeAttentionChanged("iv1", "t2"), false},
 		{"serve_runtime.run_status self", ocdeckevent.NewServeRuntimeRunStatusChanged("iv1", "t1", "idle", "busy", true), true},
 		{"serve_runtime.run_status other", ocdeckevent.NewServeRuntimeRunStatusChanged("iv1", "t2", "idle", "busy", true), false},
+		// serve_runtime.session_error：一次性通知输入，不改变任务详情投影 → 不标脏
+		//（task-notifications D2；无论 TaskID 是否本任务）。
+		{"serve_runtime.session_error self", ocdeckevent.NewServeRuntimeSessionError("iv1", "t1", "s1", "APIError", "boom", nil, nil), false},
+		{"serve_runtime.session_error other", ocdeckevent.NewServeRuntimeSessionError("iv1", "t2", "s1", "APIError", "boom", nil, nil), false},
+		{"serve_runtime.session_error malformed payload", ocdeckevent.Event{Topic: ocdeckevent.TopicServeRuntime, Type: ocdeckevent.TypeServeRuntimeSessionError, RID: "iv", Payload: nil}, true},
+		{"serve_runtime.session_error wrong topic", ocdeckevent.Event{Topic: ocdeckevent.TopicTask, Type: ocdeckevent.TypeServeRuntimeSessionError, RID: "iv", Payload: ocdeckevent.ServeRuntimeSessionErrorPayload{TaskID: "t2"}}, true},
 		{"resync.requested", ocdeckevent.NewResyncRequested(), true},
 		{"unknown type", ocdeckevent.Event{Topic: ocdeckevent.TopicTask, Type: "task.unknown_future", RID: "t2"}, true},
 		{"unknown type other topic", ocdeckevent.Event{Topic: "future.topic", Type: "future.thing", RID: "x"}, true},

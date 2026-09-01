@@ -162,8 +162,10 @@ function HealthSummary({
   onSelect: (status: string | null) => void;
 }) {
   const counts = healthCounts(project.tasks_by_status);
-  const chips: Array<{ status: string; count: number; dot: 'busy' | 'retry' | null }> = [
-    { status: 'active', count: counts.active, dot: 'busy' },
+  // 有活跃任务待人工（待答问题/待授权限）时活跃 chip 用蓝点，区别于正常运行绿点。
+  const activeNeedsAttention = (project.tasks ?? []).some((t) => t.status === 'active' && (t.attention_count ?? 0) > 0);
+  const chips: Array<{ status: string; count: number; dot: 'attention' | 'busy' | 'retry' | null }> = [
+    { status: 'active', count: counts.active, dot: activeNeedsAttention ? 'attention' : 'busy' },
     { status: 'suspended', count: counts.suspended, dot: null },
     { status: 'archived', count: counts.archived, dot: null },
   ];
@@ -224,6 +226,9 @@ function OverviewPane({
 }) {
   const isDir = project.kind === 'dir';
   const visibleTasks = filterTasksByStatus(tasks, statusFilter);
+  // listTasks 行 DTO 不透出 attention；任务摘要（project.tasks）带 attention_count，
+  // 同一次详情加载（getProject + listTasks 并行）取得，按 id 对齐供状态徽标「等待人工」判定。
+  const attentionByTask = new Map((project.tasks ?? []).map((s) => [s.id, s.attention_count ?? 0]));
   return (
     <div className="pjm-pane" data-pane="overview">
       {isDir && tasks.filter((t) => t.status === 'active').length >= 2 && (
@@ -309,7 +314,7 @@ function OverviewPane({
                         日志
                       </button>
                     )}
-                    <AgentStatusBadge agentStatus={t.agentStatus} />
+                    <AgentStatusBadge agentStatus={t.agentStatus} attentionCount={attentionByTask.get(t.id)} />
                     <TaskActions
                       task={t}
                       onDone={onTaskRowDone}
@@ -943,6 +948,8 @@ export function ProjectsManagePage() {
           <div className="pjm-rail" role="tablist" aria-label="项目列表" data-od-id="project-rail">
             {filteredProjects.map((p) => {
               const activeCount = (p.tasks_by_status ?? {}).active ?? 0;
+              // 有活跃任务待人工时轨道行用蓝点（等待人工），区别于正常运行绿点。
+              const needsAttention = (p.tasks ?? []).some((t) => t.status === 'active' && (t.attention_count ?? 0) > 0);
               return (
                 <button
                   key={p.id}
@@ -961,9 +968,9 @@ export function ProjectsManagePage() {
                       `纯目录 · ${p.task_count} 个任务`
                     ) : (
                       <>
-                        {/* 活跃 >0 时绿点（od-agent 脉冲点，对齐设计稿轨道行） */}
+                        {/* 活跃 >0 时脉冲点（od-agent，对齐设计稿轨道行）：待人工蓝点优先于运行绿点 */}
                         {activeCount > 0 && (
-                          <span className="od-agent od-agent-busy" aria-hidden>
+                          <span className={`od-agent ${needsAttention ? 'od-agent-attention' : 'od-agent-busy'}`} aria-hidden>
                             <span className="od-agent-dot" />
                           </span>
                         )}

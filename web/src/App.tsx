@@ -1,6 +1,11 @@
-import { useCallback, useEffect, useState } from 'react';
-import { getToken, UNAUTHORIZED_EVENT } from './api';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { api, getToken, UNAUTHORIZED_EVENT } from './api';
 import { navigate, useHashRoute, resolveRoute, isConfigsTab, type ConfigsTab } from './router';
+import {
+  showNotification,
+  subscribeNotificationConfigChanged,
+  subscribeNotifications,
+} from './notifications';
 import { useTheme } from './hooks';
 import { TokenGate } from './components/TokenGate';
 import { AppShell } from './components/AppShell';
@@ -11,11 +16,46 @@ import { SettingsPage } from './pages/SettingsPage';
 import { TaskWorkbenchPage } from './pages/TaskWorkbenchPage';
 import { emitPaletteFocus } from './palette-focus';
 
+/** 通知订阅效果（spec「网页通知渠道」）：仅 web 渠道启用且通知权限 granted 时
+ *  连接；收到帧 showNotification（tag 以任务标识收敛），onclick 聚焦并导航到
+ *  帧内 url 的目标页。unauthorized 时登出停订；配置不可读时静默不订阅。 */
+function useNotificationStream(authed: boolean): void {
+  const subRef = useRef<{ close(): void } | null>(null);
+  const [configEpoch, setConfigEpoch] = useState(0);
+  useEffect(() => subscribeNotificationConfigChanged(() => setConfigEpoch((n) => n + 1)), []);
+  useEffect(() => {
+    subRef.current?.close();
+    subRef.current = null;
+    if (!authed) return;
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+    let cancelled = false;
+    api
+      .getNotificationConfig()
+      .then((cfg) => {
+        if (cancelled) return;
+        if (!cfg.enabled || !cfg.channels.web.enabled) return;
+        subRef.current = subscribeNotifications({
+          onIntent: (in_) => showNotification(in_),
+        });
+      })
+      .catch(() => {
+        /* 配置不可读（未配置/网络失败）：静默不订阅 */
+      });
+    return () => {
+      cancelled = true;
+      subRef.current?.close();
+      subRef.current = null;
+    };
+  }, [authed, configEpoch]);
+}
+
 export function App() {
   const [authed, setAuthed] = useState(() => getToken() !== '');
   const route = useHashRoute();
   const { preference, setPreference } = useTheme();
   const [paletteOpen, setPaletteOpen] = useState(false);
+
+  useNotificationStream(authed);
 
   useEffect(() => {
     const onUnauthorized = () => setAuthed(false);
@@ -59,7 +99,7 @@ export function App() {
 
   let page: React.ReactNode;
   if (res.page === 'configs') {
-    // 设置四合一（P3）：四子标签深链恢复（#/configs#appearance|#env|#opencode|#ai）。
+    // 设置多合一（P3 + task-notifications）：子标签深链恢复（#/configs#appearance|env|opencode|ai|notifications）。
     // resolveRoute 已对未知 tab 回退 appearance；此处二次防御（fragment 类型为 string）。
     const tab: ConfigsTab = isConfigsTab(res.fragment) ? res.fragment : 'appearance';
     page = <SettingsPage tab={tab} />;

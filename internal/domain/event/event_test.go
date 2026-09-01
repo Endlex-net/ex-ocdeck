@@ -21,6 +21,7 @@ func TestTypeConstants(t *testing.T) {
 		{"SessionsAligned", TypeSessionsAligned, "sessions.aligned"},
 		{"ServeRuntimeAttentionChanged", TypeServeRuntimeAttentionChanged, "serve_runtime.attention_changed"},
 		{"ServeRuntimeRunStatusChanged", TypeServeRuntimeRunStatusChanged, "serve_runtime.run_status_changed"},
+		{"ServeRuntimeSessionError", TypeServeRuntimeSessionError, "serve_runtime.session_error"},
 		{"ResyncRequested", TypeResyncRequested, "resync.requested"},
 	}
 	for _, c := range cases {
@@ -53,16 +54,17 @@ func TestTopicConstants(t *testing.T) {
 	}
 }
 
-// Type/Topic 闭合常量目录：11 个 Type、4 个 Topic。
+// Type/Topic 闭合常量目录：12 个 Type、4 个 Topic（task-notifications D2 增量后）。
 func TestClosedCatalogSize(t *testing.T) {
 	allTypes := []Type{
 		TypeTaskCreated, TypeTaskStatusChanged, TypeTaskDeleted, TypeTaskActivityChanged,
 		TypeSessionClaimed, TypeSessionTouched, TypeSessionDeleted, TypeSessionsAligned,
 		TypeServeRuntimeAttentionChanged, TypeServeRuntimeRunStatusChanged,
+		TypeServeRuntimeSessionError,
 		TypeResyncRequested,
 	}
-	if len(allTypes) != 11 {
-		t.Fatalf("expected 11 Type constants, got %d", len(allTypes))
+	if len(allTypes) != 12 {
+		t.Fatalf("expected 12 Type constants, got %d", len(allTypes))
 	}
 	// 确认无重复。
 	seen := make(map[Type]bool, len(allTypes))
@@ -188,6 +190,30 @@ func TestNewServeRuntimeRunStatusChanged(t *testing.T) {
 	}
 	if p.TaskID != "tsk_1" || p.From != "idle" || p.To != "busy" || !p.Available {
 		t.Fatalf("payload = %+v", p)
+	}
+}
+
+func TestNewServeRuntimeSessionError(t *testing.T) {
+	code, retry := 429, false
+	got := NewServeRuntimeSessionError("inst_1", "tsk_1", "ses_1", "APIError", "boom", &code, &retry)
+	if got.Topic != TopicServeRuntime || got.Type != TypeServeRuntimeSessionError || got.RID != "inst_1" {
+		t.Fatalf("mismatch: %+v", got)
+	}
+	p, ok := got.Payload.(ServeRuntimeSessionErrorPayload)
+	if !ok {
+		t.Fatalf("payload type = %T", got.Payload)
+	}
+	if p.TaskID != "tsk_1" || p.SessionID != "ses_1" || p.Name != "APIError" || p.Message != "boom" {
+		t.Fatalf("payload = %+v", p)
+	}
+	if p.StatusCode == nil || *p.StatusCode != 429 || p.IsRetryable == nil || *p.IsRetryable {
+		t.Fatalf("nullable payload fields = %+v %+v", p.StatusCode, p.IsRetryable)
+	}
+	// 可空字段 nil 语义：缺失时指针为 nil（不做零值歧义）。
+	gotNil := NewServeRuntimeSessionError("inst_1", "tsk_1", "ses_1", "APIError", "boom", nil, nil)
+	pNil := gotNil.Payload.(ServeRuntimeSessionErrorPayload)
+	if pNil.StatusCode != nil || pNil.IsRetryable != nil {
+		t.Fatalf("absent nullable fields must be nil: %+v", pNil)
 	}
 }
 

@@ -11,16 +11,19 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"syscall"
 	"time"
 
 	"ocdeck/internal/api"
+	appnotification "ocdeck/internal/application/notification"
 	apptask "ocdeck/internal/application/task"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/ai"
 	"ocdeck/internal/infrastructure/eventbus"
 	"ocdeck/internal/infrastructure/lifecycle"
+	"ocdeck/internal/infrastructure/notify"
 	"ocdeck/internal/infrastructure/process"
 	sqlite "ocdeck/internal/infrastructure/sqlite"
 	"ocdeck/internal/infrastructure/store"
@@ -130,7 +133,7 @@ func run() error {
 		DebtStore:       adapter,         // R7：orphan tickets 持久化跨重启恢复（design.md §10）
 		LifecycleRunner: lifecycle.New(), // design.md §7.1：init/pre-delete 脚本与 inherit
 		LogDir:          cfg.DataDir + "/logs",
-		Namer:           namer, // ai-worktree-naming：Create 经 LLM 提炼分支 slug，未配置时内部回退 Slugify
+		Namer:           namer,        // ai-worktree-naming：Create 经 LLM 提炼分支 slug，未配置时内部回退 Slugify
 		Lifecycle:       lifecycleSvc, // P1.4.4：Get/List/Archive/Restore 委托
 	})
 	// 注入 Manager 生命周期 context（design.md §4：SSE/退出监视挂进程 ctx，非 HTTP request ctx）。
@@ -160,14 +163,69 @@ func run() error {
 	} else {
 		log.Printf("warning: oc-config dir unavailable: %v (oc-configs endpoints disabled)", ocCfgErr)
 	}
+
+	// 通知装配（task-notifications design D11）：notifyStore 损坏不致命；
+	// webHub 与 web 渠道共享同一实例；notifier 经窄端口注入。装配本身无致命
+	// 错误（LoadStore 降级默认配置）；Listen 失败拒绝启动（与既有 HTTP 启动一致）。
+	notifyStore := notify.LoadStore(cfg.DataDir)
+	webHub := srv.NotificationHub()
+	notifier := appnotification.New(appnotification.Options{
+		Bus:             notifyEventSubscriberAdapter{bus},
+		Tasks:           tm,
+		ListActive:      tm,
+		Cfg:             notifyStore,
+		Channels:        notify.BuildChannels(webHub, runtime.GOOS),
+		ResolveBaseURL:  srv.NotificationBaseURL,
+		Summarizer:      summaryCompleterAdapter{store: aiStore},
+		LastAgentOutput: tm,
+	})
+	srv.SetNotificationStore(notifyStore)
+	srv.SetNotificationTester(notifier)
+
 	srv.RebuildRoutes()
 	if wd != nil {
 		srv.SetWatchdogStateProvider(wd.StateString)
 	}
-	// HTTP 服务阻塞直到 ctx 取消（信号）或监听出错。
-	serveErr := srv.Start(ctx)
+	// D11：Listen → notifier.Start → Serve。Listen 失败仍进入统一关停段
+	// （G1：不得绕过 notifier.Stop / tm.Shutdown / bgStop / watchdog 收尾；
+	// Notifier.Stop 支持 Stop-before-Start）。
+	var serveErr error
+	if err := srv.Listen(); err != nil {
+		serveErr = err
+	} else {
+		notifier.Start(ctx)
+		// HTTP 服务阻塞直到 ctx 取消（信号）或监听出错。
+		serveErr = srv.Serve(ctx)
+	}
 
-	// 正常关停（design.md §10 顺序）：quiesce/TaskManager shutdown——
+	return shutdownRuntime(shutdownRuntimeArgs{
+		notifier: notifier,
+		tm:       tm,
+		bgStop:   bgStop,
+		wd:       wd,
+		serveErr: serveErr,
+	})
+}
+
+// runtimeStopper / runtimeShutdowner 关停窄端口（G1 测试注入；生产为
+// *appnotification.Notifier / *task.Manager）。
+type runtimeStopper interface{ Stop() }
+type runtimeShutdowner interface {
+	Shutdown(ctx context.Context) error
+}
+
+// shutdownRuntimeArgs 统一关停所需运行时句柄（G1：Listen 失败与 Serve 返回共用）。
+type shutdownRuntimeArgs struct {
+	notifier runtimeStopper
+	tm       runtimeShutdowner
+	bgStop   func()
+	wd       *process.WatchdogManager
+	serveErr error
+}
+
+func shutdownRuntime(a shutdownRuntimeArgs) error {
+	// 正常关停（design.md §10 顺序）：notifier.Stop 先于 tm.Shutdown（D11：
+	// 不再发通知）；随后 quiesce/TaskManager shutdown——
 	// kill 模式：先杀会话、确认空、再 StopWatchdog、退出（watchdog 不得先停）。
 	// persist 模式：会话保留，下次启动 reconcile 恢复。
 	// tm.Shutdown 内部已 join 后台周期 goroutine 并同步收尾残留 retryable debt（H），
@@ -177,11 +235,20 @@ func run() error {
 	// 此时让进程退出但保留 watchdog 子进程存活，由其轮询到父亡后执行 kill-server。
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
-	shutdownErr := tm.Shutdown(shutdownCtx)
+	if a.notifier != nil {
+		a.notifier.Stop()
+	}
+	var shutdownErr error
+	if a.tm != nil {
+		shutdownErr = a.tm.Shutdown(shutdownCtx)
+	}
 	if shutdownErr != nil {
 		log.Printf("warning: taskmanager shutdown: %v (runtime not clean, keeping watchdog alive)", shutdownErr)
 	}
-	bgStop()
+	if a.bgStop != nil {
+		a.bgStop()
+	}
+	wd := a.wd
 	if wd != nil {
 		// 显式分支（design.md §10）：kill_immediate 下 watchdog 是 kill -9 窗口的最后兜底。
 		//   - shutdownErr != nil（runtime 未净：残留会话/debt）→ MUST 保持 watchdog 运行，
@@ -205,7 +272,7 @@ func run() error {
 	if shutdownErr != nil {
 		return shutdownErr
 	}
-	return serveErr
+	return a.serveErr
 }
 
 // spawnWatchdog 构造并启动 watchdog 子进程（design.md §10）。

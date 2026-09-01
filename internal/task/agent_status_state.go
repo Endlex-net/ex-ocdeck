@@ -2,9 +2,13 @@ package task
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"strings"
 	"sync"
 
+	appnotif "ocdeck/internal/application/notification"
+	ocdecksess "ocdeck/internal/domain/session"
 	"ocdeck/internal/infrastructure/opencode"
 )
 
@@ -32,7 +36,7 @@ const (
 // agentStatusDelta 唯一 apply 在锁内捕获的外部投影 typed delta（design D4）。From/To 为
 // 聚合三态（idle/busy/retry）或 "" 表不可用；Available 为变化后外部可用性。发布方在
 // 锁外直接使用本 delta 组装事件，MUST NOT 重新读取 runtime。Epoch 为写入后的当前连接代
-//（Connect 写入即新分配的代）：SSE 断流回调依赖它捕获所属连接代（apply 的 Disconnect
+// （Connect 写入即新分配的代）：SSE 断流回调依赖它捕获所属连接代（apply 的 Disconnect
 // 按代匹配失效，旧连接延迟回调不得误伤新代）。FactID 为失效事实号：仅
 // agentOpInvalidate 实际落态时取该次写入分配的写代号（writeGen，单调），供发布点
 // per-fact claim（同一令牌上失效→恢复→再失效为不同事实，各自恰好发布一次）；其余
@@ -69,6 +73,7 @@ type agentStatusOp struct {
 	kind      agentStatusOpKind
 	sessionID string                                // StatusEvent/OwnedAdd/OwnedRemove
 	status    opencode.SessionStatusType            // StatusEvent
+	retry     *appnotif.RetryDetail                 // StatusEvent：retry 态携带最近详情（task-notifications D3）
 	owned     []string                              // OwnedSet
 	epoch     uint64                                // Disconnect/Invalidate/AlignSuccess/ReconcileBlocked/OwnedSet/ReconcileSuccess/ProbeFailure 的代匹配校验
 	seq       uint64                                // ReconcileSuccess/ProbeFailure 的探测序号校验（发放时最新）
@@ -98,6 +103,7 @@ type agentStatusLease struct {
 type agentStatusState struct {
 	mu          sync.Mutex
 	sessions    map[string]opencode.SessionStatusType
+	retries     map[string]appnotif.RetryDetail // 每 session 最近 retry 详情（仅 retry 态保留，task-notifications D3）
 	connected   bool
 	epoch       uint64
 	phase       agentStatusPhase
@@ -107,7 +113,10 @@ type agentStatusState struct {
 }
 
 func newAgentStatusState() *agentStatusState {
-	return &agentStatusState{sessions: map[string]opencode.SessionStatusType{}}
+	return &agentStatusState{
+		sessions: map[string]opencode.SessionStatusType{},
+		retries:  map[string]appnotif.RetryDetail{},
+	}
 }
 
 // apply 是 agentStatus 内存态的唯一写入口（design D4）。锁内执行变更并按外部投影
@@ -123,9 +132,15 @@ func (a *agentStatusState) apply(op agentStatusOp) agentStatusDelta {
 	switch op.kind {
 	case agentOpStatusEvent:
 		// 归属反查已在调用方完成；断流后防御性忽略。状态事件是新事实：清除强制
-		// 失效标记（lock-timeout 失效 ≠ 断流，不冻结连接代，恢复可发布）。
+		// 失效标记（lock-timeout 失效 ≠ 断流，不冻结连接代，恢复可发布）。retry
+		// 态附加保留最近详情、非 retry 态清除（D3；不影响聚合与发布行为）。
 		if a.connected {
 			a.sessions[op.sessionID] = op.status
+			if op.retry != nil && op.status == opencode.StatusRetry {
+				a.retries[op.sessionID] = *op.retry
+			} else {
+				delete(a.retries, op.sessionID)
+			}
 			a.invalidated = false
 			a.writeGen++
 		}
@@ -137,6 +152,7 @@ func (a *agentStatusState) apply(op agentStatusOp) agentStatusDelta {
 	case agentOpOwnedRemove:
 		if _, ok := a.sessions[op.sessionID]; ok {
 			delete(a.sessions, op.sessionID)
+			delete(a.retries, op.sessionID)
 			a.writeGen++
 		}
 	case agentOpOwnedSet:
@@ -145,14 +161,19 @@ func (a *agentStatusState) apply(op agentStatusOp) agentStatusDelta {
 		// 携带的预对齐成员集 MUST NOT 覆写新代（round-4 BLOCKER）。
 		if a.connected && a.epoch == op.epoch && a.phase == op.phase {
 			next := make(map[string]opencode.SessionStatusType, len(op.owned))
+			nextRetries := make(map[string]appnotif.RetryDetail, len(op.owned))
 			for _, sid := range op.owned {
 				if st, ok := a.sessions[sid]; ok {
 					next[sid] = st // 保留既有状态
+					if d, ok := a.retries[sid]; ok {
+						nextRetries[sid] = d
+					}
 				} else {
 					next[sid] = opencode.StatusIdle
 				}
 			}
 			a.sessions = next
+			a.retries = nextRetries
 			a.writeGen++
 		}
 	case agentOpConnect:
@@ -185,13 +206,16 @@ func (a *agentStatusState) apply(op agentStatusOp) agentStatusDelta {
 		}
 		// 与 owned 集合取交集：REST 是目录级 map，共享目录下他任务 session 状态
 		// 忽略；owned 但状态缺失按 idle（既有契约，agent_status.go）。完全栅栏的
-		// 新鲜事实：清除强制失效标记。
+		// 新鲜事实：清除强制失效标记。离开 retry 的 session 清除其详情保留。
 		for sid := range a.sessions {
 			st := opencode.StatusIdle
 			if v, ok := op.statuses[sid]; ok {
 				st = v
 			}
 			a.sessions[sid] = st
+			if st != opencode.StatusRetry {
+				delete(a.retries, sid)
+			}
 		}
 		a.invalidated = false
 		a.phase = agentPhaseValid
@@ -258,7 +282,7 @@ func aggregateAgentStatus(sessions map[string]opencode.SessionStatusType) string
 // probeCandidate 返回当前是否可发起对账/探测（只读判定；align 后首次对账与后台 30s
 // 重试共用前置）。modeA 为实现期模式常量的参数化形态：模式 A 仅 reconcilePending；
 // 模式 B 周期探测 valid 与 reconcilePending（design D4 模式矩阵）。aligning 一律跳过
-//（align 屏障）。
+// （align 屏障）。
 func (a *agentStatusState) probeCandidate(modeA bool) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -351,10 +375,129 @@ func (a *agentStatusState) snapshotValue() string {
 func (a *agentStatusState) clear() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.clearLocked()
+}
+
+// clearLocked clear 的持锁实现（runtime 组合清理用，Lane B B5：与组合快照同经
+// agentStatus.mu 互斥）。
+func (a *agentStatusState) clearLocked() {
 	a.sessions = map[string]opencode.SessionStatusType{}
+	a.retries = map[string]appnotif.RetryDetail{}
 	a.connected = false
 	a.phase = agentPhaseAligning
 	a.invalidated = false
+}
+
+// statusAndDetail 单次锁内返回聚合投影与任务级 retry 详情（Lane B B5：组合
+// 快照一致性——聚合状态与详情同锁捕获，不出现跨锁撕裂读）。
+func (a *agentStatusState) statusAndDetail() (string, appnotif.RetryDetail, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.statusAndDetailLocked()
+}
+
+// statusAndDetailLocked statusAndDetail 的持锁实现（组合快照同锁拷贝用）。
+func (a *agentStatusState) statusAndDetailLocked() (string, appnotif.RetryDetail, bool) {
+	v, _ := a.projectionLocked()
+	d, ok := a.retryDetailLocked()
+	return v, d, ok
+}
+
+// notifyComposite 组合快照的运行态原子拷贝（Lane B B5）：rt.mu 捕获实例令牌与
+// 状态指针后，固定锁序 attention.mu → agentStatus.mu 同时持有完成 attention
+// 与 agent 聚合/详情拷贝；与 clearNotifyState 互斥——快照不会观察到半清理态
+// （attention 已清而 agent 未清的交错）。
+func (rt *taskRuntime) notifyComposite() (inst string, att Attention, runStatus string, detail appnotif.RetryDetail, hasDetail bool) {
+	rt.mu.Lock()
+	inst = string(rt.instVersion)
+	attState := rt.attention
+	agState := rt.agentStatus
+	rt.mu.Unlock()
+
+	if attState != nil {
+		attState.mu.Lock()
+		defer attState.mu.Unlock()
+	}
+	if agState != nil {
+		agState.mu.Lock()
+		defer agState.mu.Unlock()
+	}
+	if attState != nil {
+		att = attState.attentionSnapshotLocked()
+	} else {
+		att = Attention{Permissions: []PendingPermission{}, Questions: []PendingQuestion{}}
+	}
+	if agState != nil {
+		runStatus, detail, hasDetail = agState.statusAndDetailLocked()
+	}
+	return inst, att, runStatus, detail, hasDetail
+}
+
+// clearNotifyState 原子清理 attention 与 agentStatus（Lane B B5）：固定锁序
+// attention.mu → agentStatus.mu 同时持有后一并清理，与 notifyComposite 互斥。
+// clearRuntime 钩子（原 clearAttention + clearAgentStatus 两步顺序清理的组合
+// 原子化）。
+func (rt *taskRuntime) clearNotifyState() {
+	rt.mu.Lock()
+	attState := rt.attention
+	agState := rt.agentStatus
+	rt.mu.Unlock()
+
+	if attState != nil {
+		attState.mu.Lock()
+		defer attState.mu.Unlock()
+	}
+	if agState != nil {
+		agState.mu.Lock()
+		defer agState.mu.Unlock()
+	}
+	if attState != nil {
+		attState.clearAttentionLocked()
+	}
+	if agState != nil {
+		agState.clearLocked()
+	}
+}
+
+// retryDetail 返回任务级重试详情（task-notifications D3 选择规则）：先过滤有效
+// 详情（Attempt>0 且 TrimSpace(Message) 非空），取 Next>0 中 Next 最小者，Next==0
+// 排最后，并列取 sessionID 字典序最小；无有效详情 ok=false。
+func (a *agentStatusState) retryDetail() (appnotif.RetryDetail, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.retryDetailLocked()
+}
+
+// retryDetailLocked retryDetail 的持锁实现（调用方持 a.mu）。
+func (a *agentStatusState) retryDetailLocked() (appnotif.RetryDetail, bool) {
+	var best appnotif.RetryDetail
+	bestSID := ""
+	have := false
+	for sid, d := range a.retries {
+		if d.Attempt <= 0 || strings.TrimSpace(d.Message) == "" {
+			continue
+		}
+		if !have {
+			best, bestSID, have = d, sid, true
+			continue
+		}
+		// 排序键 (hasNext, next, sessionID)：hasNext 类在前、类内 Next 升序、
+		// 并列字典序最小。
+		dHas, bHas := d.Next > 0, best.Next > 0
+		switch {
+		case dHas != bHas:
+			if dHas {
+				best, bestSID = d, sid
+			}
+		case d.Next != best.Next:
+			if d.Next < best.Next {
+				best, bestSID = d, sid
+			}
+		case sid < bestSID:
+			best, bestSID = d, sid
+		}
+	}
+	return best, have
 }
 
 // --- taskRuntime 接入（attention 先例：懒初始化 + nil 安全读） ---
@@ -395,7 +538,7 @@ func (rt *taskRuntime) clearAgentStatus() {
 // apply 在同一锁域内读取当前投影、置强制不可用并返回 typed delta——事件的 from 与
 // per-fact claim 的事实号（FactID）均只来自本 delta，MUST NOT 另行预读可见性再事后
 // apply（交错下产生陈旧 from）。幂等：已失效/快照本不可见时返回未变化 delta
-//（From==""，发布侧据此跳过）；发布不在本方法——由 publishRunStatusInvalidation
+// （From==""，发布侧据此跳过）；发布不在本方法——由 publishRunStatusInvalidation
 // 在发布点 claim 后执行。
 func (rt *taskRuntime) invalidateAgentStatus() agentStatusDelta {
 	a := rt.agentStatusStateOrNil()
@@ -510,7 +653,7 @@ func (m *Manager) noteAgentSessionDeleted(taskID, sid string) {
 // 内存态（P1.8.2）。modeA 为实现期模式常量的参数化形态：模式 A 解析并 apply，模式 B
 // 不解析不 apply（design D4 模式执行矩阵；生产调用点恒传 agentStatusModeA，测试传
 // false 验证模式 B 等价分支，MUST NOT 运行时切换）。解析失败/未知枚举静默忽略
-//（fail-closed，不中断流）。
+// （fail-closed，不中断流）。
 func (m *Manager) applySessionStatusEvent(taskID string, ev opencode.Event, modeA bool) {
 	if !modeA {
 		return
@@ -520,10 +663,43 @@ func (m *Manager) applySessionStatusEvent(taskID string, ev opencode.Event, mode
 		return
 	}
 	if rt := m.getRuntime(taskID); rt != nil {
-		m.applyAgentStatusAndCommit(taskID, rt, agentStatusOp{
-			kind: agentOpStatusEvent, sessionID: sev.SessionID, status: sev.Status,
-		})
+		op := agentStatusOp{kind: agentOpStatusEvent, sessionID: sev.SessionID, status: sev.Status}
+		if sev.Status == opencode.StatusRetry {
+			op.retry = &appnotif.RetryDetail{Attempt: sev.Attempt, Message: sev.Message, Next: sev.Next}
+		}
+		m.applyAgentStatusAndCommit(taskID, rt, op)
 	}
+}
+
+// observeSessionErrorEvent 消费 session.error（task-notifications D2）：先 fail-closed
+// 解析（malformed 静默忽略，不做任何 I/O），再以解析所得 sessionID 做归属反查
+// （MUST NOT 回退 info.id——解析器的必填键就是 properties.sessionID），命中本任务
+// 且 runtime 存活时发布 serve_runtime.session_error。一次性错误事实，不写
+// agentStatus 状态投影（run_status 是状态投影，不并入理由见 design D2）。
+// 归属查询失败仅记日志丢弃事件：通知观察 MUST NOT 中断事件流/影响任务状态机
+// （语义对齐 attention 事件「永不返回错误」）。
+func (m *Manager) observeSessionErrorEvent(ctx context.Context, taskID string, ev opencode.Event) {
+	sev, ok := opencode.ParseSessionErrorEvent(ev)
+	if !ok {
+		return
+	}
+	if m.lifecycle == nil {
+		return
+	}
+	owner, found, err := m.lifecycle.OwnerOf(ctx, ocdecksess.ID(sev.SessionID))
+	if err != nil {
+		log.Printf("task %s: session.error ownership check for %s failed: %v (event dropped)", taskID, sev.SessionID, err)
+		return
+	}
+	if !found || owner != taskID {
+		return
+	}
+	rt := m.getRuntime(taskID)
+	if rt == nil {
+		return
+	}
+	m.lifecycle.CommitSessionError(taskID, string(rt.instVersion),
+		sev.SessionID, sev.Name, sev.Message, sev.StatusCode, sev.IsRetryable)
 }
 
 // handleAgentStatusDisconnect SSE 断流回调（client OnDisconnect，仅已建立连接终止触发，
@@ -594,8 +770,8 @@ func (m *Manager) retryAgentStatusReconcile(ctx context.Context, modeA bool) {
 // active sessions 与 SSE 组装 helper 使用）。非 active（含 activating 窗口：状态已置
 // activating 而 runtime 可能已完成对账）返回空串——与实时探测 AgentStatus 的降级语义
 // 一致（agent_status.go）。不可用（无 runtime、连接代无效或零 owned）同样返回空串
-//（omitempty 省略，降级语义不变）。既有 Manager.AgentStatus 实时探测语义不变
-//（/projects、/tasks/{id} 消费者不在 P1.8 范围，P1.8.5）。
+// （omitempty 省略，降级语义不变）。既有 Manager.AgentStatus 实时探测语义不变
+// （/projects、/tasks/{id} 消费者不在 P1.8 范围，P1.8.5）。
 func (m *Manager) AgentStatusSnapshot(taskID string) string {
 	row, err := m.store.GetTask(context.Background(), taskID)
 	if err != nil || row.Status != StatusActive {
@@ -610,4 +786,103 @@ func (m *Manager) AgentStatusSnapshot(taskID string) string {
 		return ""
 	}
 	return a.snapshotValue()
+}
+
+// TaskNotificationSnapshot 组合快照端口实现（task-notifications D1/D3）：任务行、
+// attention、run_status 与 retry 详情单次组合读取（Notifier 经 application/
+// notification.TaskSnapshotReader 窄端口消费，组合根装配）。与 AgentStatusSnapshot
+// 不同：不按状态降级过滤（任务行原样返回，active 判定留给调用方门禁）。
+// 一致性边界（Lane B B5）：先读任务行，再经 rt.notifyComposite 于固定锁序下
+// 原子拷贝 attention/agent/instVersion——快照内运行态全部来自同一 runtime 代际，
+// 不与 clearRuntime 的清理交错出现半清理态。
+func (m *Manager) TaskNotificationSnapshot(ctx context.Context, taskID string) (appnotif.TaskSnapshot, error) {
+	row, err := m.store.GetTask(ctx, taskID)
+	if err != nil {
+		return appnotif.TaskSnapshot{}, fmt.Errorf("get task row %s: %w", taskID, err)
+	}
+	snap := appnotif.TaskSnapshot{Task: appnotif.TaskRef{ID: row.ID, Name: row.Name, Status: row.Status}}
+	rt := m.getRuntime(taskID)
+	if rt == nil {
+		return snap, nil
+	}
+	inst, att, runStatus, detail, hasDetail := rt.notifyComposite()
+	snap.InstVersion = inst
+	snap.Attention = att
+	snap.RunStatus = runStatus
+	if hasDetail {
+		snap.RetryDetail, snap.HasRetryDetail = detail, true
+	}
+	return snap, nil
+}
+
+// agentMessageLister OCClient 的可选消息拉取能力（task-notifications design D9：
+// 生产 ocFactory 返回 *opencode.Client 实现；以可选接口扩展而不动 OCClient——
+// 先例 domain/notification.ChannelAvailability，避免破坏全部既有实现与测试 fake）。
+type agentMessageLister interface {
+	ListMessages(ctx context.Context, dir, sessionID string, limit int) ([]opencode.Message, error)
+}
+
+// LastAgentOutput 常量（design D9）：拉取条数与输出截断上界。
+const (
+	lastAgentMessageLimit   = 10
+	lastAgentOutputMaxRunes = 2000
+)
+
+// messageRoleAssistant opencode message 的 role 枚举值（取 assistant 轮）。
+const messageRoleAssistant = "assistant"
+
+// LastAgentOutput agent 最后一轮输出端口实现（design D9；appnotification.
+// LastAgentOutputReader）：取任务锚会话（无锚取最近更新的 owned session，
+// last_seen_at DESC 与 store ListTaskSessions 同序），limit 10 拉取，取最后
+// 一条 role=assistant 消息拼接其文本 part（非文本 part 忽略），截 2000 字符。
+// 无会话/拉取失败/无 assistant 消息/最后一条 assistant 无文本 part →
+// (zero, false)（fail-closed，调用方降级「（不可得）」，不重试）。
+func (m *Manager) LastAgentOutput(ctx context.Context, taskID string) (string, bool) {
+	row, err := m.store.GetTask(ctx, taskID)
+	if err != nil || row.Status != StatusActive {
+		return "", false
+	}
+	sessionID := ""
+	if row.AnchorSessionID.Valid && row.AnchorSessionID.String != "" {
+		sessionID = row.AnchorSessionID.String
+	} else {
+		sessions, serr := m.store.ListTaskSessions(ctx, taskID)
+		if serr != nil || len(sessions) == 0 {
+			return "", false
+		}
+		sessionID = sessions[0].SessionID // ListTaskSessions 语义：最近更新在前
+	}
+	oc, dir, ok := m.taskOcClient(ctx, taskID)
+	if !ok {
+		return "", false
+	}
+	lm, ok := oc.(agentMessageLister)
+	if !ok {
+		return "", false
+	}
+	msgs, merr := lm.ListMessages(ctx, dir, sessionID, lastAgentMessageLimit)
+	if merr != nil {
+		return "", false
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != messageRoleAssistant {
+			continue
+		}
+		texts := make([]string, 0, len(msgs[i].Parts))
+		for _, p := range msgs[i].Parts {
+			if p.Type == "text" && strings.TrimSpace(p.Text) != "" {
+				texts = append(texts, p.Text)
+			}
+		}
+		if len(texts) == 0 {
+			// 最后一条 assistant 消息无文本 part（纯工具调用）→ 不可得，不回溯更早消息。
+			return "", false
+		}
+		out := strings.Join(texts, "\n")
+		if r := []rune(out); len(r) > lastAgentOutputMaxRunes {
+			out = string(r[:lastAgentOutputMaxRunes])
+		}
+		return out, true
+	}
+	return "", false
 }
