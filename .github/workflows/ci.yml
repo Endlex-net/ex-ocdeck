@@ -13,6 +13,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # GitHub macOS runner 未预装 tmux，process 集成测试需要真实 tmux 二进制
+      - name: Install tmux
+        run: brew install tmux
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
