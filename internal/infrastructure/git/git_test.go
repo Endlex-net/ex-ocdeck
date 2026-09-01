@@ -13,7 +13,7 @@ import (
 func newTestRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	runGit(t, dir, "init", "-q")
+	runGit(t, dir, "init", "-q", "-b", "main")
 	runGit(t, dir, "config", "user.email", "t@t.com")
 	runGit(t, dir, "config", "user.name", "tester")
 	// 初始提交以建立 HEAD。
