@@ -28,8 +28,9 @@ var allowedSubcommands = map[string]struct{}{
 	"fetch":             {},
 	"remote":            {},
 	// codemirror-git-diff design D3：旧侧 blob 内容读取（ls-tree 探测 + git show <blobOID>）。
-	"show":    {},
-	"ls-tree": {},
+	"show":     {},
+	"ls-tree":  {},
+	"show-ref": {},
 }
 
 // execOutputLimit 是单次命令 stdout/stderr 的硬上限。
@@ -54,6 +55,15 @@ func (e *commandError) Error() string {
 }
 
 func (e *commandError) Unwrap() error { return e.err }
+
+// gitExitCode 从 git 命令错误中提取进程退出码。commandError 经 Unwrap 暴露 *exec.ExitError。
+func gitExitCode(err error) (int, bool) {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode(), true
+	}
+	return 0, false
+}
 
 // StderrOf 从 git 命令错误中提取原始 stderr 文本（design.md §9/§21：git 错误原样透传 stderr）。
 // 非 commandError（如参数校验错误、context 取消）返回 err.Error() 作为兜底，避免泄露空信息。

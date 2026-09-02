@@ -22,6 +22,7 @@ import {
   resolveSessionsBootstrap,
   shouldShowSectionEmpty,
   sectionBodyMode,
+  resolveNewTaskInit,
 } from '../pages/CommandCenterPage';
 import type { ActiveSessionItem, Project, TaskSummary } from '../types';
 
@@ -655,5 +656,82 @@ describe('CommandCenterPage SSE 接线契约（源码断言）', () => {
 
   it('用户可见文案不再出现「每 5 秒」刷新表述（改为连接状态中性文案）', () => {
     expect(src).not.toContain('每 5 秒');
+  });
+});
+
+describe('resolveNewTaskInit 命令面板初始化信号', () => {
+  const ocdeck = project('p1', [], 'ocdeck');
+  const other = project('p2', [], 'other');
+  const ocdeckTwin = project('p3', [], 'ocdeck');
+  const foobar = project('p4', [], 'foobar');
+
+  it('无 payload 保持 keep', () => {
+    expect(resolveNewTaskInit({}, [ocdeck], 'exact-then-substring')).toEqual({ action: 'keep' });
+  });
+
+  it('空字符串 payload 清空项目选择/过滤词', () => {
+    expect(resolveNewTaskInit({ projectName: '' }, [ocdeck], 'exact-then-substring')).toEqual({
+      action: 'apply',
+      selected: null,
+      projectQuery: '',
+    });
+  });
+
+  it('唯一精确匹配预选', () => {
+    const r = resolveNewTaskInit({ projectName: 'ocdeck' }, [ocdeck, other], 'exact');
+    expect(r).toEqual({ action: 'apply', selected: ocdeck, projectQuery: 'ocdeck' });
+  });
+
+  it('唯一子串匹配在 exact-then-substring 预选', () => {
+    const r = resolveNewTaskInit({ projectName: 'deck' }, [ocdeck, other], 'exact-then-substring');
+    expect(r).toEqual({ action: 'apply', selected: ocdeck, projectQuery: 'ocdeck' });
+  });
+
+  it('matchMode=exact 时子串不预选，填过滤词', () => {
+    expect(resolveNewTaskInit({ projectName: 'deck' }, [ocdeck, other], 'exact')).toEqual({
+      action: 'apply',
+      selected: null,
+      projectQuery: 'deck',
+    });
+  });
+
+  it('零命中填过滤词不预选', () => {
+    expect(resolveNewTaskInit({ projectName: 'zzzz' }, [ocdeck, other], 'exact-then-substring')).toEqual({
+      action: 'apply',
+      selected: null,
+      projectQuery: 'zzzz',
+    });
+  });
+
+  it('多命中不预选填过滤词', () => {
+    expect(resolveNewTaskInit({ projectName: 'ocdeck' }, [ocdeck, ocdeckTwin], 'exact-then-substring')).toEqual({
+      action: 'apply',
+      selected: null,
+      projectQuery: 'ocdeck',
+    });
+  });
+
+  it('有效 projectID 直接选中，不走文本推断', () => {
+    const r = resolveNewTaskInit(
+      { projectName: 'ocdeck', projectID: 'p3' },
+      [ocdeck, ocdeckTwin],
+      'exact-then-substring',
+    );
+    expect(r).toEqual({ action: 'apply', selected: ocdeckTwin, projectQuery: 'ocdeck' });
+  });
+
+  it('失效 projectID 回退唯一文本匹配', () => {
+    const r = resolveNewTaskInit(
+      { projectName: 'foobar', projectID: 'gone' },
+      [ocdeck, foobar],
+      'exact-then-substring',
+    );
+    expect(r).toEqual({ action: 'apply', selected: foobar, projectQuery: 'foobar' });
+  });
+
+  it('失效 projectID 且文本匹配失败则填过滤词', () => {
+    expect(
+      resolveNewTaskInit({ projectName: 'zzzz', projectID: 'gone' }, [ocdeck], 'exact-then-substring'),
+    ).toEqual({ action: 'apply', selected: null, projectQuery: 'zzzz' });
   });
 });

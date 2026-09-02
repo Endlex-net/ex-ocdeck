@@ -1,3 +1,4 @@
+import type { PaletteConfig } from './palette-focus';
 import type {
   ActiveSessionItem,
   AIConfig,
@@ -7,6 +8,9 @@ import type {
   GlobalEnvMode,
   GlobalEnvResponse,
   LifecycleConfig,
+  NotificationConfig,
+  NotificationConfigPut,
+  NotificationTestResult,
   OcConfigContent,
   OcConfigInfo,
   OcConfigSaveResult,
@@ -239,4 +243,16 @@ export const api = {
     model: string;
     thinking: string;
   }) => request<AIConfig>('PUT', '/ai/config', body),
+
+  /** 通知配置（task-notifications）：GET 返回 token_masked 形态；
+   *  PUT 的 token 传空串或含 *** 的掩码值 = 保留已存储原 token（服务端语义）。 */
+  getNotificationConfig: () => request<NotificationConfig>('GET', '/notification/config'),
+  saveNotificationConfig: (body: NotificationConfigPut) =>
+    request<NotificationConfig>('PUT', '/notification/config', body),
+  /** 测试通知：向全部已启用且已配置渠道投递，逐渠道报告结果。总开关关闭时 422。 */
+  testNotification: () => request<{ results: NotificationTestResult[] }>('POST', '/notification/test'),
+
+  /** 命令面板配置：GET/PUT 均为 camelCase 三键 {hotkey, triggerWord, matchMode}。 */
+  getPaletteConfig: () => request<PaletteConfig>('GET', '/palette/config'),
+  putPaletteConfig: (body: PaletteConfig) => request<PaletteConfig>('PUT', '/palette/config', body),
 };

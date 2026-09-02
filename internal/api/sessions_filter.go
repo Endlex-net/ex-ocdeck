@@ -62,6 +62,12 @@ func eventDirtiesActiveSessions(ev ocdeckevent.Event) bool {
 			return true
 		}
 		return p.From == application.StatusActive
+	case ocdeckevent.TypeServeRuntimeSessionError:
+		// task-notifications D2：一次性错误事实（通知触发输入），active sessions
+		// 快照（attention/run_status 投影）不受其影响——合法事件不标脏；
+		// payload 非 typed 按本表惯例保守标脏。
+		_, ok := ev.Payload.(ocdeckevent.ServeRuntimeSessionErrorPayload)
+		return !ok
 	default:
 		// session.* / sessions.aligned / serve_runtime.* / resync.requested /
 		// task.activity_changed / 未知 Type：全部标脏。

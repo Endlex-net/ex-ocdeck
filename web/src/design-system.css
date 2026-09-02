@@ -325,9 +325,19 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .od-agent-idle .od-agent-dot { background: var(--border-strong); }
 .od-agent-busy .od-agent-dot { background: var(--success); animation: od-pulse 1.4s ease-in-out infinite; }
 .od-agent-retry .od-agent-dot { background: var(--warn); animation: od-pulse 0.8s ease-in-out infinite; }
+/* 等待人工（pending question/permission）：蓝点 + 双击脉冲，区别于 busy 匀速心跳与 retry 急促脉冲。 */
+.od-agent-attention .od-agent-dot { background: var(--info); animation: od-pulse-attention 2.4s ease-in-out infinite; }
 @keyframes od-pulse {
   0%, 100% { box-shadow: 0 0 0 0 color-mix(in oklch, currentColor 35%, transparent); opacity: 1; }
   50% { box-shadow: 0 0 0 4px color-mix(in oklch, var(--success) 18%, transparent); opacity: 0.75; }
+}
+/* 双击脉冲：两声短叩 + 长间歇（2.4s 周期），读感为「敲门等人」，与 1.4s/0.8s 匀速脉冲明确区分。 */
+@keyframes od-pulse-attention {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--info) 0%, transparent); opacity: 1; }
+  10% { box-shadow: 0 0 0 4px color-mix(in oklch, var(--info) 22%, transparent); opacity: 0.78; }
+  20% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--info) 0%, transparent); opacity: 1; }
+  30% { box-shadow: 0 0 0 4px color-mix(in oklch, var(--info) 22%, transparent); opacity: 0.78; }
+  40% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--info) 0%, transparent); opacity: 1; }
 }
 
 /* spinner */

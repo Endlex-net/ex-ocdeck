@@ -5,6 +5,10 @@ ocdeck 对 opencode 的兼容性按**已验证版本区间**声明，当前为 *
 - `ContractMinVersion`（`1.18.14`）：区间下限
 - `ContractBaseline`（`1.18.26`）：区间上限 / 最近一次核验版本
 
+> 1.18.18 → 1.18.25 核验（2026-08-31）：23 锚点中 21 个字节一致；仅 `handlers/global.ts` / `groups/global.ts` 有 diff，全部位于 `/global/upgrade` 自升级端点（`target` 改为必填 + semver 校验、raw body 改声明式 schema），ocdeck 使用的端点契约未变。
+>
+> 1.18.25 → 1.18.26 核验（2026-09-02）：23 锚点全部字节一致，ocdeck 使用的端点契约未变。
+
 版本检查**仅告警**（启动日志 + `/api/v1/server/status` 的 `versionVerified`），**不是激活门禁**。真正的激活门禁是能力探测：`GET /global/health` 可达、`GET /session/status` 结构、session 列表字段形状（DELETE 形状不做 live 探测，首次真实删除时校验）。区间外的版本仍可尝试激活；探测失败才阻止。
 
 区间内各版本的契约锚点文件已逐相邻版本核验（锚点 diff SOP，见下"升级 SOP"与"1.18.18→1.18.26 相邻对核验记录"）。扩展区间前必须再跑一遍锚点 diff + live probe。external 分支行为变化（默认不启动真实 server、API 面分叉、auth 语义变化）MUST 阻断区间扩展。
@@ -96,7 +100,7 @@ ocdeck 对 opencode 的兼容性按**已验证版本区间**声明，当前为 *
 ### Attach CLI / TUI（单进程）
 
 - `packages/opencode/src/cli/cmd/attach.ts`
-- `packages/opencode/src/cli/tui/validate-session.ts`（单进程 `--session` 校验：失效 id 在 HTTP 就绪前退出，stderr `Error: Session not found`）
+- `packages/opencode/src/cli/tui/validate-session.ts`（单进程 `--session` 校验：形态合法但缺失的 `ses_` id 在 HTTP 就绪前退出，stderr `Error: Session not found`；不以 `ses` 开头的 id 只走本地 decode，报 `Invalid session ID`）
 - `packages/opencode/src/cli/cmd/tui.ts`（external 分支判断：`--port`/`--hostname` 走真实 HTTP server）
 - `packages/opencode/src/cli/tui/worker.ts`（external 模式下 `Server.listen` 启动路径）
 

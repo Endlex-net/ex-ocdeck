@@ -45,10 +45,17 @@ export function navigate(path: string, replace = false, env: NavigateEnv = defau
   }
 }
 
-/** 设置页四子标签。 */
-export type ConfigsTab = 'appearance' | 'env' | 'opencode' | 'ai';
+/** 设置页子标签。 */
+export type ConfigsTab = 'appearance' | 'env' | 'opencode' | 'ai' | 'notifications' | 'palette';
 
-const CONFIGS_TABS: ReadonlySet<string> = new Set(['appearance', 'env', 'opencode', 'ai']);
+const CONFIGS_TABS: ReadonlySet<string> = new Set([
+  'appearance',
+  'env',
+  'opencode',
+  'ai',
+  'notifications',
+  'palette',
+]);
 
 export function isConfigsTab(v: unknown): v is ConfigsTab {
   return typeof v === 'string' && CONFIGS_TABS.has(v);

@@ -18,7 +18,7 @@ import (
 func newTestRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	runGit(t, dir, "init", "-q")
+	runGit(t, dir, "init", "-q", "-b", "main")
 	runGit(t, dir, "config", "user.email", "t@t.com")
 	runGit(t, dir, "config", "user.name", "tester")
 	writeFile(t, dir, "README.md", "init\n")
@@ -58,6 +58,59 @@ func TestAdd_Success(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dest, ".git")); err != nil {
 		t.Fatalf("worktree .git missing: %v", err)
+	}
+}
+
+func TestBranchExists_Missing(t *testing.T) {
+	repo := newTestRepo(t)
+	mgr := New(t.TempDir())
+	ctx := context.Background()
+	exists, err := mgr.BranchExists(ctx, repo, "ocdeck/never-created")
+	if err != nil {
+		t.Fatalf("BranchExists missing: %v", err)
+	}
+	if exists {
+		t.Error("never-created branch should be (false, nil)")
+	}
+}
+
+func TestBranchExists_AfterAdd(t *testing.T) {
+	repo := newTestRepo(t)
+	mgr := New(t.TempDir())
+	ctx := context.Background()
+	dest := filepath.Join(mgr.dataDir, "worktrees", "p1", "t1")
+	if err := mgr.Add(ctx, repo, dest, "ocdeck/exists-check", "main"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	exists, err := mgr.BranchExists(ctx, repo, "ocdeck/exists-check")
+	if err != nil {
+		t.Fatalf("BranchExists after Add: %v", err)
+	}
+	if !exists {
+		t.Error("branch created by Add should exist")
+	}
+}
+
+func TestBranchExists_NotARepo(t *testing.T) {
+	mgr := New(t.TempDir())
+	ctx := context.Background()
+	exists, err := mgr.BranchExists(ctx, t.TempDir(), "ocdeck/x")
+	if err == nil {
+		t.Fatal("non-git dir should error, not (false, nil)")
+	}
+	if exists {
+		t.Error("non-git dir must not report exists=true")
+	}
+}
+
+func TestGitBranchExists_ErrorConservative(t *testing.T) {
+	ctx := context.Background()
+	if !gitBranchExists(ctx, t.TempDir(), "ocdeck/x") {
+		t.Error("git error (not-a-repo) must be treated as exists, to avoid deleting a branch on failed Add cleanup")
+	}
+	repo := newTestRepo(t)
+	if gitBranchExists(ctx, repo, "ocdeck/never-created") {
+		t.Error("missing branch must be false so failed Add can delete a branch it created")
 	}
 }
 

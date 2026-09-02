@@ -53,6 +53,10 @@ describe('路由解析与重定向', () => {
     expect(resolveRoute('/configs#ai')).toEqual({ kind: 'page', page: 'configs', fragment: 'ai' });
   });
 
+  it('#/configs#palette → configs 页选中 palette tab', () => {
+    expect(resolveRoute('/configs#palette')).toEqual({ kind: 'page', page: 'configs', fragment: 'palette' });
+  });
+
   it('#/configs#未知tab → 回退 appearance', () => {
     expect(resolveRoute('/configs#foobar')).toEqual({
       kind: 'page',
@@ -335,6 +339,8 @@ describe('ConfigsTab 类型守卫', () => {
     expect(isConfigsTab('env')).toBe(true);
     expect(isConfigsTab('opencode')).toBe(true);
     expect(isConfigsTab('ai')).toBe(true);
+    expect(isConfigsTab('notifications')).toBe(true);
+    expect(isConfigsTab('palette')).toBe(true);
   });
 
   it('非法 tab', () => {
@@ -901,20 +907,20 @@ describe('od:palette-focus（命令面板展开+聚焦）', () => {
 
   it('emit 写入 pending；consume 一次后清空（跨路由 mount 兜底）', () => {
     emitPaletteFocus('new-task-name');
-    expect(consumePendingPaletteFocus('new-task-name')).toBe(true);
-    expect(consumePendingPaletteFocus('new-task-name')).toBe(false);
+    expect(consumePendingPaletteFocus('new-task-name')).toEqual({});
+    expect(consumePendingPaletteFocus('new-task-name')).toBeNull();
   });
 
   it('listener 处理后 clearPending，mount 不再二次消费', () => {
     emitPaletteFocus('register-project-name');
     clearPendingPaletteFocus('register-project-name');
-    expect(consumePendingPaletteFocus('register-project-name')).toBe(false);
+    expect(consumePendingPaletteFocus('register-project-name')).toBeNull();
   });
 
   it('consume 只匹配 expected id', () => {
     emitPaletteFocus('new-task-name');
-    expect(consumePendingPaletteFocus('register-project-name')).toBe(false);
-    expect(consumePendingPaletteFocus('new-task-name')).toBe(true);
+    expect(consumePendingPaletteFocus('register-project-name')).toBeNull();
+    expect(consumePendingPaletteFocus('new-task-name')).toEqual({});
   });
 
   it('事件名常量对齐 design 源', () => {

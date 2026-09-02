@@ -1,0 +1,79 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: macos-latest
+    steps:
+      # token 无效时公共仓库 clone 仍会成功（匿名可读），直到 push 才以 exit 128 失败；
+      # 这里用 API 预检，把问题在构建前暴露成可读错误
+      - name: Verify TAP_GITHUB_TOKEN
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${TAP_GITHUB_TOKEN}" https://api.github.com/repos/Endlex-net/homebrew-tap)
+          if [[ "$code" != "200" ]]; then
+            echo "::error::TAP_GITHUB_TOKEN 无效或无权访问 Endlex-net/homebrew-tap (HTTP $code)。请检查 ex-ocdeck Settings -> Secrets -> Actions 中该 secret 的值：token 是否过期、复制不全、或未勾选该仓库。"
+            exit 1
+          fi
+          echo "TAP_GITHUB_TOKEN 验证通过"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # goreleaser 失败时输出 git 状态诊断（日志页加载失败时也能看到这段短输出）
+      - name: Diagnose on failure
+        if: failure()
+        run: |
+          echo "=== git tags ==="
+          git tag -l | tail -5
+          echo "=== HEAD ==="
+          git log --oneline -3
+          git describe --tags 2>&1 || true
+          echo "=== status ==="
+          git status --short | head -20
+          echo "=== remotes ==="
+          git remote -v
+
+      - name: Update Homebrew tap
+        run: |
+          git clone "https://x-access-token:${{ secrets.TAP_GITHUB_TOKEN }}@github.com/Endlex-net/homebrew-tap.git" homebrew-tap/
+          git -C homebrew-tap config user.name "github-actions[bot]"
+          git -C homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          scripts/update-tap.sh --tag "${{ github.ref_name }}" --tap-dir homebrew-tap

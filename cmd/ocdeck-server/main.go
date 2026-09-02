@@ -2,26 +2,31 @@
 //
 // 启动流程：加载配置 + 启动校验 → 打开 SQLite → 启动 HTTP 服务。
 // shutdownPolicy=kill_immediate 时，在任何会话创建之前 SpawnWatchdog（design.md §10）。
-// v1 仅 macOS/Darwin。
+// v1 支持 macOS 与 Linux（含 WSL）。
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"syscall"
 	"time"
 
 	"ocdeck/internal/api"
 	"ocdeck/internal/application/diffreview"
+	appnotification "ocdeck/internal/application/notification"
 	apptask "ocdeck/internal/application/task"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/ai"
 	"ocdeck/internal/infrastructure/eventbus"
 	"ocdeck/internal/infrastructure/lifecycle"
+	"ocdeck/internal/infrastructure/notify"
+	"ocdeck/internal/infrastructure/palette"
 	"ocdeck/internal/infrastructure/process"
 	sqlite "ocdeck/internal/infrastructure/sqlite"
 	"ocdeck/internal/infrastructure/store"
@@ -58,6 +63,20 @@ func runWatchdog(args []string) error {
 }
 
 func run() error {
+	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	showVersion := fs.Bool("version", false, "print version and exit")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		return err
+	}
+	if *showVersion {
+		fmt.Println(version)
+		return nil
+	}
+
+	if err := config.ApplyEnvFile(); err != nil {
+		return err
+	}
+
 	cfg, release, err := config.Load(config.DefaultOptions())
 	if err != nil {
 		return err
@@ -67,8 +86,8 @@ func run() error {
 	// 保证 flock 释放前 SQLite 已关闭、不会与下一实例的 store.Open 竞态。
 	defer release()
 
-	log.Printf("ocdeck-server starting: dataDir=%s listen=%s policy=%s opencode=%s tmux=%s",
-		cfg.DataDir, cfg.ListenAddr, cfg.ShutdownPolicy, cfg.OpenCodeVersion, cfg.TmuxVersion)
+	log.Printf("ocdeck-server starting: version=%s dataDir=%s listen=%s policy=%s opencode=%s tmux=%s",
+		version, cfg.DataDir, cfg.ListenAddr, cfg.ShutdownPolicy, cfg.OpenCodeVersion, cfg.TmuxVersion)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -194,14 +213,70 @@ func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config,
 	} else {
 		log.Printf("warning: oc-config dir unavailable: %v (oc-configs endpoints disabled)", ocCfgErr)
 	}
+
+	// 通知装配（task-notifications design D11）：notifyStore 损坏不致命；
+	// webHub 与 web 渠道共享同一实例；notifier 经窄端口注入。装配本身无致命
+	// 错误（LoadStore 降级默认配置）；Listen 失败拒绝启动（与既有 HTTP 启动一致）。
+	notifyStore := notify.LoadStore(cfg.DataDir)
+	webHub := srv.NotificationHub()
+	notifier := appnotification.New(appnotification.Options{
+		Bus:             notifyEventSubscriberAdapter{bus},
+		Tasks:           tm,
+		ListActive:      tm,
+		Cfg:             notifyStore,
+		Channels:        notify.BuildChannels(webHub, runtime.GOOS),
+		ResolveBaseURL:  srv.NotificationBaseURL,
+		Summarizer:      summaryCompleterAdapter{store: aiStore},
+		LastAgentOutput: tm,
+	})
+	srv.SetNotificationStore(notifyStore)
+	srv.SetNotificationTester(notifier)
+	srv.SetPaletteConfigStore(palette.LoadStore(cfg.DataDir))
+
 	srv.RebuildRoutes()
 	if wd != nil {
 		srv.SetWatchdogStateProvider(wd.StateString)
 	}
-	// HTTP 服务阻塞直到 ctx 取消（信号）或监听出错。
-	serveErr := srv.Start(ctx)
+	// D11：Listen → notifier.Start → Serve。Listen 失败仍进入统一关停段
+	// （G1：不得绕过 notifier.Stop / tm.Shutdown / bgStop / watchdog 收尾；
+	// Notifier.Stop 支持 Stop-before-Start）。
+	var serveErr error
+	if err := srv.Listen(); err != nil {
+		serveErr = err
+	} else {
+		notifier.Start(ctx)
+		// HTTP 服务阻塞直到 ctx 取消（信号）或监听出错。
+		serveErr = srv.Serve(ctx)
+	}
 
-	// 正常关停（design.md §10 顺序）：quiesce/TaskManager shutdown——
+	return shutdownRuntime(shutdownRuntimeArgs{
+		notifier: notifier,
+		tm:       tm,
+		bgStop:   bgStop,
+		wd:       wd,
+		serveErr: serveErr,
+	})
+}
+
+// runtimeStopper / runtimeShutdowner 关停窄端口（G1 测试注入；生产为
+// *appnotification.Notifier / *task.Manager）。
+type runtimeStopper interface{ Stop() }
+type runtimeShutdowner interface {
+	Shutdown(ctx context.Context) error
+}
+
+// shutdownRuntimeArgs 统一关停所需运行时句柄（G1：Listen 失败与 Serve 返回共用）。
+type shutdownRuntimeArgs struct {
+	notifier runtimeStopper
+	tm       runtimeShutdowner
+	bgStop   func()
+	wd       *process.WatchdogManager
+	serveErr error
+}
+
+func shutdownRuntime(a shutdownRuntimeArgs) error {
+	// 正常关停（design.md §10 顺序）：notifier.Stop 先于 tm.Shutdown（D11：
+	// 不再发通知）；随后 quiesce/TaskManager shutdown——
 	// kill 模式：先杀会话、确认空、再 StopWatchdog、退出（watchdog 不得先停）。
 	// persist 模式：会话保留，下次启动 reconcile 恢复。
 	// tm.Shutdown 内部已 join 后台周期 goroutine 并同步收尾残留 retryable debt（H），
@@ -211,11 +286,20 @@ func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config,
 	// 此时让进程退出但保留 watchdog 子进程存活，由其轮询到父亡后执行 kill-server。
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
-	shutdownErr := tm.Shutdown(shutdownCtx)
+	if a.notifier != nil {
+		a.notifier.Stop()
+	}
+	var shutdownErr error
+	if a.tm != nil {
+		shutdownErr = a.tm.Shutdown(shutdownCtx)
+	}
 	if shutdownErr != nil {
 		log.Printf("warning: taskmanager shutdown: %v (runtime not clean, keeping watchdog alive)", shutdownErr)
 	}
-	bgStop()
+	if a.bgStop != nil {
+		a.bgStop()
+	}
+	wd := a.wd
 	if wd != nil {
 		// 显式分支（design.md §10）：kill_immediate 下 watchdog 是 kill -9 窗口的最后兜底。
 		//   - shutdownErr != nil（runtime 未净：残留会话/debt）→ MUST 保持 watchdog 运行，
@@ -239,7 +323,7 @@ func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config,
 	if shutdownErr != nil {
 		return shutdownErr
 	}
-	return serveErr
+	return a.serveErr
 }
 
 // diffReviewStartupGate 启动收敛门禁（design.md D2 重启恢复① + F1/F12①）：

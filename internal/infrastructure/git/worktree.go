@@ -65,6 +65,27 @@ func ResolveRef(ctx context.Context, repoPath, ref string) (string, error) {
 	return oid, nil
 }
 
+// RefExists 判断全限定 ref 是否存在（git show-ref --verify --quiet --end-of-options）。
+// 退出码语义（locale 无关）：0 存在 → (true, nil)；1 不存在 → (false, nil)；
+// 其它（128 非仓库、启动失败、ctx 取消）为真实错误 → (false, err)，不得当 missing。
+// 调用方 MUST 传入全限定 ref（如 refs/heads/<branch>）；空 ref 返回错误。
+func RefExists(ctx context.Context, repoPath, ref string) (bool, error) {
+	if ref == "" {
+		return false, errors.New("git: empty ref")
+	}
+	_, _, err := run(ctx, repoPath, "show-ref", "--verify", "--quiet", "--end-of-options", ref)
+	if err == nil {
+		return true, nil
+	}
+	if ctx.Err() != nil {
+		return false, err
+	}
+	if code, ok := gitExitCode(err); ok && code == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
 // WorktreeRemove 删除 worktree。force=true 时忽略 dirty/untracked。
 // worktree 不存在视为已成功（幂等，design.md §19 资源不存在视为已成功）。
 func WorktreeRemove(ctx context.Context, repoPath, wtPath string, force bool) error {

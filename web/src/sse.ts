@@ -1,4 +1,5 @@
 import { clearToken, getToken, UNAUTHORIZED_EVENT } from './api';
+import { debugMark } from './debug';
 import type { ActiveSessionItem, Project, Task } from './types';
 
 /** 连接状态（连接状态 UI 用）：connecting = 连接/重连尝试中；open = 已收到有效帧。 */
@@ -113,6 +114,7 @@ export function subscribeStream<T>(
       if (items === null) return false;
       backoffMs = BACKOFF_INITIAL_MS; // 首个有效帧到达 → 重置退避
       setState('open');
+      debugMark('odterm:sse-data');
       opts.onData(items);
       return true;
     };

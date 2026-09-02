@@ -40,13 +40,21 @@ export interface AppShellProps {
   onToggleTheme: () => void;
   /** 当前主题偏好，决定切换按钮图标。 */
   themePref: 'system' | 'light' | 'dark';
+  /** 命令面板热键展示文案（App 用 formatHotkey 下发）。 */
+  paletteHotkeyLabel: string;
 }
 
 /** 全局应用壳层（design.md D1 + spec web-ui-shell）：
  *  左侧导航脊柱（品牌区/指挥中心顶层项/任务组/管理组/底栏）+ 内容区。
  *  未认证时 App 不渲染壳层（仅 TokenGate）。ServerStatusBanner 由 App 在壳层内渲染。
  *  ⌘B 折叠为 60px 图标轨，localStorage 持久化，≥768px 生效。 */
-export function AppShell({ children, onOpenPalette, onToggleTheme, themePref }: AppShellProps) {
+export function AppShell({
+  children,
+  onOpenPalette,
+  onToggleTheme,
+  themePref,
+  paletteHotkeyLabel,
+}: AppShellProps) {
   const route = useHashRoute();
   const { projects } = useProjects();
 
@@ -132,11 +140,11 @@ export function AppShell({ children, onOpenPalette, onToggleTheme, themePref }: 
             className="od-sidebar-cmdk"
             type="button"
             onClick={onOpenPalette}
-            title="命令面板（⌘K）"
+            title={`命令面板（${paletteHotkeyLabel}）`}
           >
             <SearchIcon />
             <span className="od-cmdk-label">命令面板</span>
-            <span className="od-palette-kbd">⌘K</span>
+            <span className="od-palette-kbd">{paletteHotkeyLabel}</span>
           </button>
           <span className="od-side-addr" title="本地服务 · 单用户模式">
             {location.host || '127.0.0.1'}
@@ -204,11 +212,13 @@ function SidebarTaskGroups({ projects, currentTaskID }: { projects: Project[]; c
                 aria-current={currentTaskID === t.id ? 'page' : undefined}
                 title={transLabel ? `${t.name}（${transLabel}）` : t.name}
               >
-                {/* 过渡态（创建中/激活中/挂起中）：spinner 呈现；其余沿用 agent 状态点 */}
+                {/* 过渡态（创建中/激活中/挂起中）：spinner 呈现；其余沿用 agent 状态点。
+                    待人工（attention_count>0）蓝点优先于运行态：圆点表达状态语言，
+                    右侧 od-nav-attention 计数丸保留计数职责。 */}
                 {transLabel ? (
                   <span className="od-spinner od-nav-task-spinner" aria-hidden />
                 ) : (
-                  <span className={`od-agent od-agent-${agentDotClass(t.agentStatus)}`}>
+                  <span className={`od-agent od-agent-${agentDotClass(t.agentStatus, t.attention_count)}`}>
                     <span className="od-agent-dot"></span>
                   </span>
                 )}
@@ -227,8 +237,9 @@ function SidebarTaskGroups({ projects, currentTaskID }: { projects: Project[]; c
   );
 }
 
-/** agent 状态点 class（idle/busy/retry；未知降级为 idle dot 不亮）。 */
-function agentDotClass(agentStatus?: string): 'idle' | 'busy' | 'retry' | 'idle-off' {
+/** agent 状态点 class：等待人工（attention_count>0）蓝点优先于 idle/busy/retry；未知降级为 idle-off 不亮。 */
+function agentDotClass(agentStatus?: string, attentionCount = 0): 'idle' | 'busy' | 'retry' | 'attention' | 'idle-off' {
+  if (attentionCount > 0) return 'attention';
   if (agentStatus === 'busy') return 'busy';
   if (agentStatus === 'retry') return 'retry';
   if (agentStatus === 'idle') return 'idle';

@@ -118,7 +118,7 @@ func authedReq(method, url, body string) *http.Request {
 func newTestRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	runGitCmd(t, dir, "init", "-q")
+	runGitCmd(t, dir, "init", "-q", "-b", "main")
 	runGitCmd(t, dir, "config", "user.email", "t@t.com")
 	runGitCmd(t, dir, "config", "user.name", "tester")
 	os.WriteFile(filepath.Join(dir, "README.md"), []byte("init\n"), 0o644)

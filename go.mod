@@ -8,6 +8,7 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/pmezard/go-difflib v1.0.0
 	golang.org/x/sys v0.36.0
+	golang.org/x/text v0.34.0
 	modernc.org/sqlite v1.39.1
 )
 

@@ -604,9 +604,9 @@ func (m *Manager) clearRuntime(taskID string) {
 	delete(m.runtimes, taskID)
 	m.rtMu.Unlock()
 	if rt != nil {
-		rt.clearAttention()
-		// P1.8：agentStatus 内存态一并清空（在途对账写回被 connected 守卫拒绝）。
-		rt.clearAgentStatus()
+		// P1.8：attention 与 agentStatus 一并清空；组合原子清理（Lane B B5：
+		// 与组合快照同锁序互斥，在途对账写回被 connected 守卫拒绝）。
+		rt.clearNotifyState()
 		rt.stopAll()
 	}
 	// D2/3.8：runtime 移除后停止本任务 diff review 调度器（随 runtime 生命周期）。

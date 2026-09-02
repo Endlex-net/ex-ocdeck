@@ -238,6 +238,73 @@ export interface AIConfig {
   load_error?: string;
 }
 
+/** 通知配置五类别开关（snake_case 与后端 DTO 对齐）。 */
+export interface NotificationCategories {
+  question: boolean;
+  permission: boolean;
+  idle: boolean;
+  retry: boolean;
+  error: boolean;
+}
+
+/** 通知配置 bark 渠道（GET 为 token_masked，PUT 提交 token）。 */
+export interface NotificationBarkChannel {
+  enabled: boolean;
+  endpoint: string;
+  token_masked?: string;
+}
+
+/** 通知配置 channels 结构。 */
+export interface NotificationChannels {
+  web: { enabled: boolean };
+  bark: NotificationBarkChannel;
+  macos: { enabled: boolean };
+}
+
+/** GET /api/v1/notification/config 响应（token_masked 形态）。
+ *  load_error 只读、仅配置损坏时出现。 */
+export interface NotificationConfig {
+  enabled: boolean;
+  categories: NotificationCategories;
+  idle_timeout_seconds: number;
+  channels: NotificationChannels;
+  llm_summary: boolean;
+  base_url: string;
+  load_error?: string;
+}
+
+/** PUT /api/v1/notification/config 请求体：bark 令牌字段名为 token（非 token_masked）。 */
+export interface NotificationConfigPut {
+  enabled: boolean;
+  categories: NotificationCategories;
+  idle_timeout_seconds: number;
+  channels: {
+    web: { enabled: boolean };
+    bark: { enabled: boolean; endpoint: string; token: string };
+    macos: { enabled: boolean };
+  };
+  llm_summary: boolean;
+  base_url: string;
+}
+
+/** 测试通知响应元素：status ∈ success | failed | skipped。 */
+export interface NotificationTestResult {
+  name: string;
+  status: 'success' | 'failed' | 'skipped';
+  error: string;
+}
+
+/** 通知 SSE 帧意图（event: notification 的 data，snake_case 七字段）。 */
+export interface NotificationIntent {
+  task_id: string;
+  task_name: string;
+  category: string;
+  level: string;
+  title: string;
+  body: string;
+  url: string;
+}
+
 /** 过渡态：操作进行中，UI 禁用操作并显示 spinner。 */
 export const TRANSITIONAL_STATUS = new Set([
   'creating',

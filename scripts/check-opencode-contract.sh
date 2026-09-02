@@ -128,8 +128,10 @@ cat <<'EOF'
     curl -sS --fail-with-body "${AUTH[@]}" "${BASE}/question?directory=${DIR}"
     ev=$(curl -sS --max-time 2 "${AUTH[@]}" "${BASE}/event?directory=${DIR}" || true)
     echo "$ev" | grep -q 'server.connected'
-    if ! grep -q "Error: Session not found" <(opencode --port "$P2" --hostname 127.0.0.1 --session missing-id 2>&1 || true); then
-      echo "FAIL: invalid --session must exit before HTTP ready with 'Error: Session not found'" >&2
+    # 必须用 ses_ 前缀：SessionID schema 要求 startsWith("ses")，否则只会走
+    # 本地 decode 的 "Invalid session ID"，测不到 HTTP 404 / Session not found。
+    if ! grep -q "Error: Session not found" <(opencode --port "$P2" --hostname 127.0.0.1 --session ses_doesnotexist00000000000000 2>&1 || true); then
+      echo "FAIL: missing --session must reject with 'Error: Session not found'" >&2
       exit 1
     fi
     opencode --port "$P2" --hostname 127.0.0.1 --session "$SID" >/tmp/ocdeck-contract-p2.log 2>&1 &

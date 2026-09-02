@@ -3,7 +3,7 @@
 //
 // 漂移防护策略（§11）：版本号仅告警，激活门禁是能力探测（health + /session/status
 // 结构 + session 列表字段形状；DELETE 形状不做 live 探测，首次真实删除时校验）。
-// 全部端点契约以 OpenCode 1.18.18 源码核验为基线（contract fixture 固化，见 §20），
+// 全部端点契约以 OpenCode 1.18.26 源码核验为基线（contract fixture 固化，见 §20），
 // 漂移只改本包一处。
 //
 // 仅使用标准库（net/http + bufio 手写 SSE 解析）：go.mod 由独立 lane 维护。
@@ -23,6 +23,8 @@ import (
 )
 
 // ContractBaseline 已验证契约区间上限；仅作告警，非门禁；区间检查见 internal/infrastructure/opencode/CONTRACT.md。
+// 1.18.26：scripts/check-opencode-contract.sh v1.18.25→v1.18.26 全锚点核验，23/23 字节一致，
+// ocdeck 使用的端点契约未变。
 const ContractBaseline = "1.18.26"
 
 // ContractMinVersion 已验证契约区间下限；仅作告警，非门禁。
@@ -886,13 +888,22 @@ func parseSessionStatus(raw jsonRawObject) (SessionStatus, error) {
 }
 
 // parseEvent 将 sseRawEvent 解析为 Event envelope（§20：{type, properties}）。
+// 解码使用 json.Decoder + UseNumber 保留数字词法值（json.Number）：properties
+// 的数值消费方（session.error 的 statusCode 无损 int 判定等）不经 float64 往返；
+// 兼容 float64 的既有读取统一走 floatNumber（已适配 json.Number）。
 func parseEvent(ev sseRawEvent) (Event, error) {
 	var e Event
 	if len(ev.data) == 0 {
 		return Event{Type: ev.Type}, nil
 	}
-	if err := json.Unmarshal(ev.data, &e); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(ev.data))
+	dec.UseNumber()
+	if err := dec.Decode(&e); err != nil {
 		return Event{}, fmt.Errorf("opencode: parse sse event: %w", err)
+	}
+	// 尾随数据判定（对齐 json.Unmarshal 的严格性，Decoder 单值解码默认容忍尾随）。
+	if _, err := dec.Token(); err != io.EOF {
+		return Event{}, fmt.Errorf("opencode: parse sse event: trailing data")
 	}
 	if e.Type == "" {
 		e.Type = ev.Type
