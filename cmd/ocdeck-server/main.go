@@ -182,13 +182,14 @@ func run() error {
 	// F12①：收敛→开放序列收口在 diffReviewStartupGate，run() 与 main_test.go 共用同一函数
 	//（测试断言的是生产编排的 fail-closed 语义，而非复制模拟编排）。
 	return diffReviewStartupGate(ctx, tm, func() error {
-		return serveAndShutdown(ctx, tm, cfg, db, bus, aiStore, wd)
+		return serveAndShutdown(ctx, tm, cfg, db, bus, aiStore, wd, diffSvc)
 	})
 }
 
 // serveAndShutdown 执行收敛通过后的启动序列（design.md §5/§10）：
 // Reconcile（失败 fail-closed 拒绝开放 HTTP）→ 后台周期重试 → API 装配与阻塞服务 → 关停序列。
-func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config, db *store.DB, bus *eventbus.Bus, aiStore *ai.Store, wd *process.WatchdogManager) error {
+// diffSvc 注入 API 层（diff-review-workbench D8 路由），须在 RebuildRoutes 前生效。
+func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config, db *store.DB, bus *eventbus.Bus, aiStore *ai.Store, wd *process.WatchdogManager, diffSvc *diffreview.Service) error {
 	// 启动 reconciliation（design.md §5/§10，HTTP 就绪前完成对账）。
 	// Reconcile 失败 MUST 拒绝开放 HTTP（fail-closed）：状态不确定时开放管理面会让用户操作
 	// 建立在错误状态上（会话/DB 失同步，后续操作可能破坏数据安全边界）。
@@ -206,6 +207,8 @@ func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config,
 	// AI 配置 Store 注入 API 层（design.md D7 wiring）：单实例同时供给命名链。
 	// 沿用 SetTaskBackend 位置模式，须在 RebuildRoutes 前生效。
 	srv.SetAIConfigStore(aiStore)
+	// diffreview service 注入 API 层（diff-review-workbench D8 批注/提交/git/file 路由）。
+	srv.SetDiffReviewService(diffSvc)
 	// 全局 oc 配置管理（design.md §13/§21）：~/.config/opencode/ 下 *.json/*.jsonc。
 	ocCfgDir, ocCfgErr := config.DefaultOCConfigDir()
 	if ocCfgErr == nil {
