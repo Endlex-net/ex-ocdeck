@@ -86,28 +86,12 @@ func (m *Manager) Add(ctx context.Context, repoPath, dest, branch, baseRef strin
 // 保守语义：not-found（分支确不存在）→ false；其他 git 错误（仓库损坏/权限等无法判定）
 // 视为"可能存在"（true），避免补偿误删可能存在的分支。
 func gitBranchExists(ctx context.Context, repoPath, branch string) bool {
-	_, err := git.ResolveRef(ctx, repoPath, "refs/heads/"+branch)
-	if err == nil {
+	exists, err := git.RefExists(ctx, repoPath, "refs/heads/"+branch)
+	if err != nil {
+		// 非 not-found 的 git 错误：拿不准时保守视为存在，避免误删。
 		return true
 	}
-	if isRefNotFound(err) {
-		return false
-	}
-	// 非 not-found 的 git 错误：拿不准时保守视为存在，避免误删。
-	return true
-}
-
-// isRefNotFound 判断 ResolveRef 错误是否为"ref 不存在"。
-// git rev-parse --verify 对不存在 ref 返回非零且 stderr 含 "Needed a single revision"
-// 或 "unknown revision"（取决于 git 版本）；此处按常见关键字判定。
-func isRefNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "Needed a single revision") ||
-		strings.Contains(msg, "unknown revision") ||
-		strings.Contains(msg, "bad revision")
+	return exists
 }
 
 // cleanupFailedAdd 回收 Add 失败后可能残留的产物：worktree 目录、分支、worktree metadata。
@@ -221,14 +205,7 @@ func (m *Manager) Remove(ctx context.Context, wtPath string, opts RemoveOpts) er
 // not-found → (false, nil)；其他 git 错误 → (false, err)（不得把所有 git 错误当不存在，
 // 调用方据 err 决策，避免误判分支可创建而走到 worktree add）。
 func (m *Manager) BranchExists(ctx context.Context, repoPath, branch string) (bool, error) {
-	_, err := git.ResolveRef(ctx, repoPath, "refs/heads/"+branch)
-	if err == nil {
-		return true, nil
-	}
-	if isRefNotFound(err) {
-		return false, nil
-	}
-	return false, err
+	return git.RefExists(ctx, repoPath, "refs/heads/"+branch)
 }
 
 // VerifyWorktreeProduct 严格校验 worktree 产物（B1：RetryCreate 幂等跳过 add 的判定依据）。
