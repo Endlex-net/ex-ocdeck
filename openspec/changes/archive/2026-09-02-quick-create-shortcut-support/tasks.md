@@ -7,19 +7,19 @@
 - [x] 1.1 新增 `internal/domain/palette`：Go domain 为 `Config{ Hotkey, TriggerWord, MatchMode string }`（camelCase 仅属 wire DTO）、默认值（`mod+k` / `new` / `exact-then-substring`）与完整校验函数（hotkey 规范串 grammar + mask 冲突矩阵 + 有限拒绝表；triggerWord 空白集合 + 32 code point；matchMode 枚举），错误返回可读原因
 - [x] 1.2 新增 `web/src/fuzzy-match.ts`：`foldForMatch`、`type MatchKind = 'exact' | 'prefix' | 'substring'`、`type MatchResult = { kind: MatchKind; index: number }`、`classifyMatch(name: string, query: string): MatchResult | null`（空查询返回 null，非空命中 index = fold 后 indexOf 下标）、`rankByQuery<T extends { name: string }>(items: readonly T[], query: string): T[]`（空查询返回全部按名称确定序；非空排除不命中；exact > prefix > substring > 位置 > 名称确定序 > 输入顺序兜底；不改输入数组）
 - [x] 1.3 新增 `web/src/hotkey.ts`：`normalizeHotkey(raw): string | null`（仅语法规范化：分段/trim/lowercase/重排；空段或非修饰 token 数 ≠ 1 → null）、`validateCanonicalHotkey(canonical): string | null`（完整冲突矩阵）、`matchHotkey(e, canonical): boolean`（mask 精确匹配 + eventToken：字母 key.toLowerCase()、数字优先 event.code Digit0-9、Numpad 不匹配 digit）、`formatHotkey(canonical): string`（展示映射，含 mod 双平台形式）
-- [x] 1.4 `web/src/palette-focus.ts` 类型扩展：`PaletteFocusId`、`PaletteFocusPayload = { projectName?: undefined; projectID?: undefined } | { projectName: string; projectID?: string }`、`PaletteFocusDetail = { id: PaletteFocusId } & PaletteFocusPayload`（扁平结构，MUST NOT 嵌套 `{id, payload}`）、`PaletteMatchMode = 'exact' | 'exact-then-substring'`、`type PaletteConfig = { hotkey: string; triggerWord: string; matchMode: PaletteMatchMode }`（事件 detail 直接为完整 `PaletteConfig`，MUST NOT 包一层 `{ config }`）、`od:palette-config-changed` 事件常量——本任务仅类型/常量，不改运行时行为
+- [x] 1.4 `web/src/palette-focus.ts` 类型扩展：`PaletteFocusId`、`PaletteFocusPayload = { projectName?: undefined; projectID?: undefined } | { projectName: string; projectID?: string }`、`PaletteFocusDetail = { id: PaletteFocusId } & PaletteFocusPayload`（扁平结构，MUST NOT 嵌套 `{id, payload}`）、`PaletteMatchMode = 'exact' | 'exact-then-substring'`、`type PaletteConfig = { hotkey: string; triggerWord: string; matchMode: PaletteMatchMode }`（4.10 增量扩展第四键 `commandTriggers: Record<PaletteCommandId, string>`）（事件 detail 直接为完整 `PaletteConfig`，MUST NOT 包一层 `{ config }`）、`od:palette-config-changed` 事件常量——本任务仅类型/常量，不改运行时行为
 - [x] 1.5 Lane A 纯函数单测：fuzzy-match（档位优先级、fold 后名称确定序含前缀长度规则、`Afoo`/`aBar`、空查询例外、classifyMatch 空查询 null、index 语义、`İ` 长度变化、不修改输入数组、返回原 item 引用的新数组、非 ASCII UTF-16 顺序、正常/空查询/fallback 三处同一比较器、排序不受 matchMode 影响、顺序/反序输入一致性）、hotkey（normalize/validate/match/format 全矩阵含 `mod+t`/`mod+b`/`meta+shift+t`/`meta+shift+b`/`meta+ctrl+b`/`mod+shift+1`/Numpad/格式展示用例）——须验证在旧实现下失败、新实现下通过
 
 ## 2. Lane B：后端存储与 API（依赖 Lane A，可与 Lane C 并行）
 
 - [x] 2.1 新增 `internal/infrastructure/palette/store.go`（平移 `notify/store.go` 模式）：`LoadStore(dataDir)`、`<dataDir>/palette.json` 0600 原子写、内存快照 + 写互斥、损坏/非法/配置文件不可读 → 降级默认 + 告警且不拒绝启动
-- [x] 2.2 新增 `internal/api/palette_config.go`：`GET /api/v1/palette/config`、`PUT /api/v1/palette/config`；PUT 执行序（完整解码校验 → 临时文件写/关/rename → 快照替换）；错误矩阵：空体/纯空白/语法错误/尾随第二 JSON 值/>1024 字节 → 400 `invalid_input`，顶层非对象/三键缺失/null/类型错误/业务非法 → 422 `invalid_input`，写盘失败 → 500 `internal`；未知附加键忽略；1 KiB 上限不进入校验或写路径；失败不改旧文件/旧快照
+- [x] 2.2 新增 `internal/api/palette_config.go`：`GET /api/v1/palette/config`、`PUT /api/v1/palette/config`；PUT 执行序（完整解码校验 → 临时文件写/关/rename → 快照替换）；错误矩阵：空体/纯空白/语法错误/尾随第二 JSON 值/>4096 字节 → 400 `invalid_input`，顶层非对象/四键缺失/null/类型错误/业务非法 → 422 `invalid_input`，写盘失败 → 500 `internal`；未知附加键忽略；4 KiB 上限不进入校验或写路径；失败不改旧文件/旧快照（上限随四键形状上调）
 - [x] 2.3 接线：`internal/api/server.go` 增加 `Server.paletteConfig` 字段、`SetPaletteConfigStore`、`registerPaletteConfigRoutes` 与注册调用；`cmd/ocdeck-server/main.go` LoadStore + 注入，保证在 RebuildRoutes 前完成
-- [x] 2.4 Go 测试：store（不存在→默认、损坏→降级、配置文件不可读 → 降级默认 + 告警、合法 JSON 但字段非法的配置文件 → 启动降级默认配置 + 告警、原子写、落盘 JSON camelCase 三键精确键名、禁 PascalCase、0600 权限断言）、API（全错误矩阵含合法 JSON 补空白至恰好 1024 字节继续解码并成功（200）/ 1025 字节 400 且超限请求不进入校验/写盘、默认 GET 返回默认配置、PUT 后 GET 返回新配置、未知附加键成功忽略、PUT 成功返回当前生效配置、旧快照不变）、Go 表驱动 domain 校验测试（保留组合、侧栏 ⌘B 冲突、精确空白集合、code point 上限、matchMode 枚举，与 TS hotkey 矩阵同源）、`SetPaletteConfigStore + RebuildRoutes` 接线 smoke test——镜像 `notification_config_test.go` 模式
+- [x] 2.4 Go 测试：store（不存在→默认、损坏→降级、配置文件不可读 → 降级默认 + 告警、合法 JSON 但字段非法的配置文件 → 启动降级默认配置 + 告警、原子写、落盘 JSON camelCase 四键精确键名、禁 PascalCase、0600 权限断言）、API（全错误矩阵含合法 JSON 补空白至恰好 4096 字节继续解码并成功（200）/ 4097 字节 400 且超限请求不进入校验/写盘（上限随四键形状上调）、默认 GET 返回默认配置、PUT 后 GET 返回新配置、未知附加键成功忽略、PUT 成功返回当前生效配置、旧快照不变）、Go 表驱动 domain 校验测试（保留组合、侧栏 ⌘B 冲突、精确空白集合、code point 上限、matchMode 枚举，与 TS hotkey 矩阵同源）、`SetPaletteConfigStore + RebuildRoutes` 接线 smoke test——镜像 `notification_config_test.go` 模式
 
 ## 3. Lane C：前端配置面板（依赖 Lane A，可与 Lane B 并行）
 
-- [x] 3.1 `web/src/api.ts` 增加 `getPaletteConfig` / `putPaletteConfig`（wire camelCase 三键）
+- [x] 3.1 `web/src/api.ts` 增加 `getPaletteConfig` / `putPaletteConfig`（wire camelCase 四键，`commandTriggers` 随 4.10 增量扩展）
 - [x] 3.2 `web/src/router.ts`：`ConfigsTab` 与 `CONFIGS_TABS` 增加 `'palette'`
 - [x] 3.3 新增 `web/src/components/PaletteConfigPanel.tsx`（镜像 NotificationConfigPanel 结构）：不独立 GET（接收 App 下发的 config/loadState/loadError，接口预留由 Lane D 接线）；热键文本录入（raw/canonical 展示）+ 输入框旁只读预览（formatHotkey）+ 前端预校验（normalizeHotkey + validateCanonicalHotkey，本地失败不调用 PUT）；触发词校验（原始字符串非空/空白集合/`Array.from` ≤32，不 trim 不规范化，本地失败不 PUT）；匹配模式二选 radio；加载中禁保存；保存失败展示后端错误原因；PUT 200 后以返回的完整 `PaletteConfig` 直接作为 `detail` 派发 `od:palette-config-changed`（MUST NOT 包 `{ config }`），保存失败 MUST NOT 派发
 - [x] 3.4 `web/src/pages/SettingsPage.tsx`：TABS 增加「命令面板」条目与对应 tabpanel
@@ -34,8 +34,18 @@
 - [x] 4.5 `web/src/components/AppShell.tsx`：仅消费 App 下发的配置 prop，替换 :135/:139 两处 ⌘K 文案（title 与可见徽标）为 `formatHotkey(config.hotkey)` 展示文本
 - [x] 4.6 Lane D 组件测试：CommandPalette 触发词模式（置顶命令、候选排序、Enter 执行、候选点击携带 projectID、零命中 fallback、仅触发词不进入模式、含空格项目名、空余文展示全部项目候选且 MUST NOT 自动预选、同名项目候选 projectID 传递）、独立 `parseQuickCreateQuery` 纯函数单测（非触发词前缀、字面前缀非正则、大小写不敏感、`triggerWord + 空白` 空余文、空白集合边界、余文保留内部空格、`İ` fold 长度变化下原始 UTF-16 切片不越界）、NewTaskPanel 初始化（预选/不预选填过滤词/门禁不绕过/连续 nonce/保留 taskName/空字符串 payload `{ projectName: '' }` 清空项目选择/过滤词但保留 taskName/无 payload 保持全部表单状态/非法 detail）、palette-focus 双通路（实时事件 + pending 跨路由）、register-project-name 回归、App 配置代际（TokenGate 认证后加载、401 后重新认证重载、deferred 乱序、保存后重拉失败保留 PUT 值、GET 失败→PUT 成功清除提示、App 首次挂载且 `authed=true` 时 MUST 开启新代际并发起 palette config GET）、`od:palette-config-changed` 成功派发（`detail` 直接为完整 `PaletteConfig`，MUST NOT 包 `{ config }`）与保存失败 MUST NOT 派发
 
+- [x] 4.7 快速新建模式默认高亮：非空余文且存在命中候选时，默认键盘高亮位于首个项目候选（Enter 携带 `projectID + projectName` 执行快速新建）；空余文、零命中 fallback、无项目快照时默认高亮置顶「新建任务」命令；余文每次变化后按同一规则重置；↑↓/Esc/clamp 行为不变（人工冒烟反馈补充）
+
+- [x] 4.8 缩写档位匹配（人工冒烟二期反馈）：`acronymOf`（`-`/`_`/空白 + camelCase「非 ASCII 大写→ASCII 大写」边界分段、逐段首字符 fold、MUST NOT 先 fold 再分段）；`MatchKind` 增加 `'acronym'`（`index` 固定 `0`）；排序档位 exact > prefix > substring > acronym（缩写档内名称确定序、无位置 tie-break；双命中按更高档计）；不受 matchMode 影响、MUST NOT 参与预选推断；计入命中集合（默认高亮/fallback 规则随之）；纯函数 + 组件测试 + mutation 自检
+
+- [x] 4.9 指令触发词后端：`PaletteCommandId` 枚举与 `Config.CommandTriggers map[string]string`、默认词表（cc/pro/reg + 5 空）、校验矩阵（未知 ID/键不全/值非法/重复/与 triggerWord 相同 → 422）、磁盘迁移（缺键取默认不降级、非法降级告警；旧 `triggerWord=cc/CC/pro/reg` 迁移用例——冲突默认项置空、其余保留）、GET/PUT 四键 wire、请求体上限常量改为 4096 并更新恰好 4096 成功/4097 拒绝边界测试、Go 侧冲突比较 fold 用 `golang.org/x/text/cases` 的 `cases.Lower(language.Und)`（新增依赖，已验证 İ→i\u0307/ΟΣ→ος）、Go 测试 + mutation 自检
+- [x] 4.10 指令触发词设置面板：`PaletteConfig` 第四键类型与 `api.ts`、PaletteConfigPanel「指令触发词」小节（8 行固定列表 + 行内冲突提示 + 本地校验失败不 PUT + draft 含 8 键初始化 + 默认配置（5 空键）加载后不修改直接保存成功）、组件测试 + mutation 自检
+- [x] 4.11 指令触发词解析与模式：CommandPalette 多触发词最长前缀解析（fold 集合 = 全局 + 已启用指令词）、指令模式（唯一条目/默认高亮/忽略余文/Enter 执行含 register-project 聚焦链路/不展示项目候选与任务条目）、App 下发 commandTriggers、仅词无空白不进模式、组件与纯函数测试 + mutation 自检
+
+- [x] 4.12 projects 指令项目参数（人工冒烟反馈）：`pr <项目名>` 非空余文作为项目名查询，复用快速新建候选全套机制（排序/缩写档位/零命中 fallback/默认高亮）；候选 Enter/点击导航 `#/projects#<projectID>` 深链选中；置顶命令 Enter 唯一精确或 exact-then-substring 唯一子串命中时导航该项目深链（缩写不参与推断），否则 `/projects` 不选中；其余 7 个指令词余文忽略不变；组件测试 + mutation 自检
+
 ## 5. Lane E：回归与跨层验证（依赖 Lane B + Lane D）
 
 - [x] 5.1 全量前端测试（vitest）通过；Go scoped 测试通过：`go test ./internal/domain/palette/... ./internal/infrastructure/palette/...` 与 `go test ./internal/api/ -run 'TestPalette|TestSetPalette'`（internal/api 全量中另有 4 个 git 相关测试因 fixture `git init` 未带 `-b` 生成 master、测试期待 main 而失败，与本 change 改动集无交集）；新增行为测试逐一验证「旧实现失败、新实现通过」（mutation 式自检：临时注释放行分支确认测试变红）
-- [ ] 5.2 手动冒烟：⌘K → `new <项目名>` Enter → 面板预选项目 + 光标落任务名；`new zzzz`（零命中）→ 全部项目候选 + Enter 打开面板不预选；设置页改触发词/热键/匹配模式 → 立即生效；`#/configs#palette` 深链直达
+- [x] 5.2 手动冒烟：⌘K → `new <项目名>` Enter → 面板预选项目 + 光标落任务名；`new zzzz`（零命中）→ 全部项目候选 + Enter 打开面板不预选；设置页改触发词/热键/匹配模式 → 立即生效；`#/configs#palette` 深链直达
 - [x] 5.3 回归：现有 `new`（无参数）行为不变；⌘B 侧栏折叠不冲突；既有 palette-focus 链路（register-project-name）正常；路由深链既有行为不变
