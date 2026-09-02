@@ -2,7 +2,7 @@
 //
 // 启动流程：加载配置 + 启动校验 → 打开 SQLite → 启动 HTTP 服务。
 // shutdownPolicy=kill_immediate 时，在任何会话创建之前 SpawnWatchdog（design.md §10）。
-// v1 仅 macOS/Darwin。
+// v1 支持 macOS 与 Linux（含 WSL）。
 package main
 
 import (

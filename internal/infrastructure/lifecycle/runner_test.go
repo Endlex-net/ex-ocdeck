@@ -90,8 +90,11 @@ func TestRunScriptTimeoutKillsProcessGroup(t *testing.T) {
 	logPath := filepath.Join(dir, "init.log")
 	r := New()
 	// 启动一个 sleep 子进程，验证超时后孙子进程也被杀。
+	// argv 用独有的 "sleep 1234"：go test 多包默认并行执行，其他测试二进制
+	// （如 process 包的 tmux 集成测试）会合法持有 live sleep 进程，遗留断言
+	// MUST 按本测试的精确 argv 限定范围，避免误伤并行测试。
 	start := time.Now()
-	err := r.RunScript(context.Background(), dir, nil, "sleep 30 & sleep 30 & wait", logPath, 500*time.Millisecond)
+	err := r.RunScript(context.Background(), dir, nil, "sleep 1234 & sleep 1234 & wait", logPath, 500*time.Millisecond)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected timeout error")
@@ -99,11 +102,41 @@ func TestRunScriptTimeoutKillsProcessGroup(t *testing.T) {
 	if elapsed > 5*time.Second {
 		t.Errorf("timeout took too long: %v (process group may not have been killed)", elapsed)
 	}
-	// 验证无遗留 sleep 进程（进程组应被杀）。
-	out, _ := exec.Command("sh", "-c", "pgrep -f 'sleep 30' || true").Output()
-	if strings.TrimSpace(string(out)) != "" {
-		t.Errorf("leftover sleep processes after timeout: %s", out)
+	// 验证无遗留存活 sleep 进程（进程组应被杀）。
+	// 平台可移植性：① procps pgrep -f 会匹配到探针 wrapper shell 自身 cmdline
+	// （macOS BSD pgrep 无此自匹配），按 argv 精确匹配规避；② SIGKILL 后的进程
+	// 在被 PID 1 reap 前是 zombie（已死），docker 等无 reaping init 的环境下
+	// 长期残留，kill -0/pgrep 都会误判为存活——排除 Z 状态：zombie 已死未被
+	// reap，不算遗留活进程。
+	leftover, err := findLiveByArgs("sleep 1234")
+	if err != nil {
+		t.Fatalf("scan leftover processes: %v", err)
 	}
+	if len(leftover) > 0 {
+		t.Errorf("leftover sleep processes after timeout: %v", leftover)
+	}
+}
+
+// findLiveByArgs 返回 ps 进程表中 args 精确等于 want 且非 zombie 的行。
+// zombie（stat 以 Z 开头）已终止、仅未被父进程 reap，不算存活。
+func findLiveByArgs(want string) ([]string, error) {
+	out, err := exec.Command("ps", "-A", "-o", "stat=,args=").Output()
+	if err != nil {
+		return nil, fmt.Errorf("ps -A -o stat=,args=: %w", err)
+	}
+	var found []string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimRight(line, " \t")
+		if line == "" {
+			continue
+		}
+		stat, rest, _ := strings.Cut(line, " ")
+		args := strings.TrimSpace(rest)
+		if args == want && !strings.HasPrefix(stat, "Z") {
+			found = append(found, line)
+		}
+	}
+	return found, nil
 }
 
 func TestRunScript1MBTruncation(t *testing.T) {

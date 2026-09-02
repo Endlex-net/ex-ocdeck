@@ -624,8 +624,21 @@ func readPidFile(t *testing.T, pidFile string) int {
 	return pid
 }
 
-// processAlive 精确判断单个 PID 是否存活（kill -0）。
+// processAlive 精确判断单个 PID 是否存活（kill -0 + zombie 排除）。
 // 用于 S5：避免全局 pgrep -f "sleep 600" 误匹配其他 lane/用户进程。
+// zombie 不算存活：被 reaper 杀掉的进程 reparent 给 PID 1 后，在 PID 1 不收割
+// 孤儿的环境（docker 容器等）下长期保持 zombie（kill -0 仍返回成功），但其已死
+// 且不可再杀——测试若把 zombie 判活，会对已正确收割的进程误报 still alive。
 func processAlive(pid int) bool {
-	return pid > 0 && exec.Command("kill", "-0", strconv.Itoa(pid)).Run() == nil
+	if pid <= 0 {
+		return false
+	}
+	if exec.Command("kill", "-0", strconv.Itoa(pid)).Run() != nil {
+		return false
+	}
+	out, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return false
+	}
+	return !strings.HasPrefix(strings.TrimSpace(string(out)), "Z")
 }

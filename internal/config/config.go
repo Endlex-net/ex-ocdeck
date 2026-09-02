@@ -121,9 +121,9 @@ func Load(opts Options) (*Config, func(), error) {
 		opts.TmuxProbe = probeTmuxVersion
 	}
 
-	// 平台边界：v1 仅 macOS/Darwin（design.md §10）。
-	if opts.OS.GOOS != "darwin" {
-		return nil, nil, fmt.Errorf("ocdeck v1 only supports macOS/Darwin, current GOOS=%s", opts.OS.GOOS)
+	// 平台边界（design.md §10）：darwin 与 linux（含 WSL）。
+	if opts.OS.GOOS != "darwin" && opts.OS.GOOS != "linux" {
+		return nil, nil, fmt.Errorf("ocdeck only supports macOS/Darwin and Linux, current GOOS=%s", opts.OS.GOOS)
 	}
 
 	token, ok := opts.EnvLookup("OCDECK_TOKEN")
@@ -204,7 +204,7 @@ func Load(opts Options) (*Config, func(), error) {
 	ocVersion, err := opts.OpenCodeProbe()
 	if err != nil {
 		release()
-		return nil, nil, fmt.Errorf("opencode binary check failed: %w", err)
+		return nil, nil, fmt.Errorf("opencode binary check failed: %w（若已安装，多半是服务环境 PATH 不含其目录：在 ~/.config/ocdeck/env 写入完整 PATH= 行后重启）", err)
 	}
 	tmuxVersion, err := opts.TmuxProbe()
 	if err != nil {
@@ -348,11 +348,11 @@ func parsePortRange(s string) (PortRange, error) {
 // 调用方（main）MUST 保证 store.Close() 在 release() 之前执行（defer 为 LIFO，
 // 故 defer release() 先于 defer db.Close() 注册即可）。
 //
-// 平台语义（v1 仅 Darwin/macOS）：
-//   - 使用 golang.org/x/sys/unix.Flock，即 BSD flock(2) on Darwin。
+// 平台语义（v1：macOS/Darwin 与 Linux）：
+//   - 使用 golang.org/x/sys/unix.Flock（两平台均为 flock(2)）。
 //   - LOCK_EX|LOCK_NB：非阻塞独占锁。已被另一进程持有时返回 EWOULDBLOCK
 //     → 映射为"另一个 ocdeck 实例已持锁"的明确错误。
-//   - flock 在 Darwin 上是进程级：进程退出（含崩溃）时内核自动释放，无需 atexit 处理。
+//   - flock 是进程级：进程退出（含崩溃）时内核自动释放，无需 atexit 处理。
 //   - flock 不依赖 NFS，ocdeck v1 仅本地文件系统，不处理 NFS flock 语义差异。
 //   - 未来非 POSIX 平台（如 Windows）需用平台原生独占原语（如 LockFileEx）替代，
 //     封装在 internal/config 内，调用方契约不变。
