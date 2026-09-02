@@ -4,7 +4,7 @@ import { act } from 'react';
 import type { Root } from 'react-dom/client';
 import { App } from '../App';
 import { api, UNAUTHORIZED_EVENT } from '../api';
-import { PALETTE_CONFIG_CHANGED_EVENT, type PaletteConfig } from '../palette-focus';
+import { DEFAULT_COMMAND_TRIGGERS, PALETTE_CONFIG_CHANGED_EVENT, type PaletteConfig } from '../palette-focus';
 import { DEFAULT_PALETTE_CONFIG } from '../components/PaletteConfigPanel';
 import { formatHotkey } from '../hotkey';
 import { mount, flushUI, stubMatchMedia } from './cm-test-env';
@@ -64,12 +64,20 @@ vi.mock('../components/CommandPalette', () => ({
     triggerWord,
     matchMode,
     open,
+    commandTriggers,
   }: {
     triggerWord?: string;
     matchMode?: string;
     open: boolean;
+    commandTriggers?: Record<string, string>;
   }) => (
-    <div data-testid="palette-props" data-open={open ? '1' : '0'} data-trigger={triggerWord} data-mode={matchMode} />
+    <div
+      data-testid="palette-props"
+      data-open={open ? '1' : '0'}
+      data-trigger={triggerWord}
+      data-mode={matchMode}
+      data-cmds={commandTriggers ? JSON.stringify(commandTriggers) : undefined}
+    />
   ),
 }));
 vi.mock('../components/ServerStatusBanner', () => ({ ServerStatusBanner: () => null }));
@@ -190,6 +198,58 @@ describe('App 命令面板配置代际', () => {
     await flushUI();
     expect(getPaletteMock).toHaveBeenCalledTimes(1);
     expect(container.querySelector('[data-testid="palette-props"]')?.getAttribute('data-trigger')).toBe('new');
+  });
+
+  it.each([
+    {
+      name: '旧三键事件（缺 commandTriggers）',
+      detail: { hotkey: 'alt+k', triggerWord: 'stolen', matchMode: 'exact' },
+    },
+    {
+      name: 'commandTriggers 为 null',
+      detail: { hotkey: 'alt+k', triggerWord: 'stolen', matchMode: 'exact', commandTriggers: null },
+    },
+    {
+      name: 'commandTriggers 缺某键（7 键）',
+      detail: {
+        hotkey: 'alt+k',
+        triggerWord: 'stolen',
+        matchMode: 'exact',
+        commandTriggers: Object.fromEntries(Object.entries(DEFAULT_COMMAND_TRIGGERS).slice(0, 7)),
+      },
+    },
+  ])('事件 detail $name：不应用、不 GET', async ({ detail }) => {
+    getPaletteMock.mockResolvedValue(cfg({ triggerWord: 'new' }));
+    const { container } = await renderApp();
+    expect(getPaletteMock).toHaveBeenCalledTimes(1);
+    act(() => {
+      window.dispatchEvent(new CustomEvent(PALETTE_CONFIG_CHANGED_EVENT, { detail }));
+    });
+    await flushUI();
+    expect(getPaletteMock).toHaveBeenCalledTimes(1);
+    const props = container.querySelector('[data-testid="palette-props"]');
+    expect(props?.getAttribute('data-trigger')).toBe('new');
+    expect(props?.getAttribute('data-cmds')).toBe(JSON.stringify(DEFAULT_COMMAND_TRIGGERS));
+  });
+
+  it('GET 返回与配置事件的自定义词表均下发到 CommandPalette props', async () => {
+    const custom = { ...DEFAULT_COMMAND_TRIGGERS, projects: 'goto' };
+    getPaletteMock.mockResolvedValue(cfg({ commandTriggers: custom }));
+    const { container } = await renderApp();
+    const props = () => container.querySelector('[data-testid="palette-props"]');
+    expect(props()?.getAttribute('data-cmds')).toBe(JSON.stringify(custom));
+
+    const evtCustom = { ...DEFAULT_COMMAND_TRIGGERS, 'command-center': 'home' };
+    getPaletteMock.mockRejectedValueOnce(new Error('refetch skipped'));
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(PALETTE_CONFIG_CHANGED_EVENT, {
+          detail: cfg({ commandTriggers: evtCustom }),
+        }),
+      );
+    });
+    await flushUI();
+    expect(props()?.getAttribute('data-cmds')).toBe(JSON.stringify(evtCustom));
   });
 
   it('首次挂载 authed=true 开新代际并发起 GET', async () => {

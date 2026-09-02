@@ -11,7 +11,10 @@ import (
 	"ocdeck/internal/infrastructure/palette"
 )
 
-const paletteConfigPutBodyMax = 1024
+// paletteConfigPutBodyMax 限制 PUT 请求体上限为 4 KiB（spec palette-config
+// 「命令面板配置读写 API」：<=4096 字节继续解码、>4096 返回 400 且不进入
+// 校验/写盘）。
+const paletteConfigPutBodyMax = 4096
 
 func (s *Server) SetPaletteConfigStore(store *palette.Store) {
 	s.paletteConfig = store
@@ -23,9 +26,10 @@ func (s *Server) registerPaletteConfigRoutes(mux *http.ServeMux) {
 }
 
 type paletteConfigDTO struct {
-	Hotkey      string `json:"hotkey"`
-	TriggerWord string `json:"triggerWord"`
-	MatchMode   string `json:"matchMode"`
+	Hotkey          string            `json:"hotkey"`
+	TriggerWord     string            `json:"triggerWord"`
+	MatchMode       string            `json:"matchMode"`
+	CommandTriggers map[string]string `json:"commandTriggers"`
 }
 
 func paletteDTOFromStore(store *palette.Store) paletteConfigDTO {
@@ -34,9 +38,10 @@ func paletteDTOFromStore(store *palette.Store) paletteConfigDTO {
 		cfg = store.Config()
 	}
 	return paletteConfigDTO{
-		Hotkey:      cfg.Hotkey,
-		TriggerWord: cfg.TriggerWord,
-		MatchMode:   cfg.MatchMode,
+		Hotkey:          cfg.Hotkey,
+		TriggerWord:     cfg.TriggerWord,
+		MatchMode:       cfg.MatchMode,
+		CommandTriggers: cfg.CommandTriggers,
 	}
 }
 
@@ -59,7 +64,7 @@ func (s *Server) handlePutPaletteConfig(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
-			writeJSONError(w, http.StatusBadRequest, CodeInvalidInput, "request body exceeds 1024 bytes")
+			writeJSONError(w, http.StatusBadRequest, CodeInvalidInput, "request body exceeds 4096 bytes")
 			return
 		}
 		writeJSONError(w, http.StatusBadRequest, CodeInvalidInput, "invalid request body")
@@ -70,7 +75,8 @@ func (s *Server) handlePutPaletteConfig(w http.ResponseWriter, r *http.Request) 
 		writeJSONError(w, status, CodeInvalidInput, msg)
 		return
 	}
-	if err := cfg.Validate(); err != nil {
+	// Put 内部同参数复验；此处先验以区分 422（校验失败）与 500（写盘失败）。
+	if err := cfg.Validate(palette.FoldForMatch); err != nil {
 		writeJSONError(w, http.StatusUnprocessableEntity, CodeInvalidInput, err.Error())
 		return
 	}

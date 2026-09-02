@@ -14,22 +14,67 @@ const (
 	MaxTriggerCodePts  = 32
 )
 
+// PaletteCommandId 枚举（spec palette-config「命令面板配置读写 API」）。
+const (
+	CommandIDCenter          = "command-center"
+	CommandIDProjects        = "projects"
+	CommandIDSettingsAppear  = "settings-appearance"
+	CommandIDSettingsEnv     = "settings-env"
+	CommandIDSettingsOC      = "settings-opencode"
+	CommandIDSettingsAI      = "settings-ai"
+	CommandIDSettingsPalette = "settings-palette"
+	CommandIDRegisterProj    = "register-project"
+)
+
+var knownCommandIDs = map[string]struct{}{
+	CommandIDCenter:          {},
+	CommandIDProjects:        {},
+	CommandIDSettingsAppear:  {},
+	CommandIDSettingsEnv:     {},
+	CommandIDSettingsOC:      {},
+	CommandIDSettingsAI:      {},
+	CommandIDSettingsPalette: {},
+	CommandIDRegisterProj:    {},
+}
+
 // Config 命令面板配置。磁盘/HTTP camelCase 映射由 adapter 负责，领域层用 Go 导出名。
+// CommandTriggers 键为 PaletteCommandId 枚举（恰 8 键），空串值 = 指令未启用。
 type Config struct {
-	Hotkey      string
-	TriggerWord string
-	MatchMode   string
+	Hotkey          string
+	TriggerWord     string
+	MatchMode       string
+	CommandTriggers map[string]string
+}
+
+// DefaultCommandTriggers 默认指令触发词表：cc/pro/reg + 5 空键。
+func DefaultCommandTriggers() map[string]string {
+	return map[string]string{
+		CommandIDCenter:          "cc",
+		CommandIDProjects:        "pro",
+		CommandIDRegisterProj:    "reg",
+		CommandIDSettingsAppear:  "",
+		CommandIDSettingsEnv:     "",
+		CommandIDSettingsOC:      "",
+		CommandIDSettingsAI:      "",
+		CommandIDSettingsPalette: "",
+	}
 }
 
 func DefaultConfig() Config {
 	return Config{
-		Hotkey:      DefaultHotkey,
-		TriggerWord: DefaultTriggerWord,
-		MatchMode:   MatchModeExactThen,
+		Hotkey:          DefaultHotkey,
+		TriggerWord:     DefaultTriggerWord,
+		MatchMode:       MatchModeExactThen,
+		CommandTriggers: DefaultCommandTriggers(),
 	}
 }
 
-func (c Config) Validate() error {
+// Validate 校验完整配置。fold 为大小写折叠函数，由调用方注入：domain 保持
+// stdlib-only（import_graph_test.go TestDomainStdlibOnly），与前端
+// foldForMatch（ECMAScript toLowerCase）兼容的规范实现 x/text
+// cases.Lower(language.Und) 落在 infrastructure/palette.FoldForMatch，
+// 生产路径必须注入该实现（design D5）。
+func (c Config) Validate(fold func(string) string) error {
 	if err := validateCanonicalHotkey(c.Hotkey); err != nil {
 		return err
 	}
@@ -38,6 +83,37 @@ func (c Config) Validate() error {
 	}
 	if c.MatchMode != MatchModeExact && c.MatchMode != MatchModeExactThen {
 		return fmt.Errorf("matchMode %q must be %q or %q", c.MatchMode, MatchModeExact, MatchModeExactThen)
+	}
+	return validateCommandTriggers(c.CommandTriggers, c.TriggerWord, fold)
+}
+
+// validateCommandTriggers 恰 8 键、键全为已知指令 ID；非空值沿用 triggerWord
+// 字符规则，且按 fold 比较互不重复、不与全局 triggerWord 相同；前缀重叠允许
+// （解析按最长前缀优先）。
+func validateCommandTriggers(triggers map[string]string, globalTrigger string, fold func(string) string) error {
+	if len(triggers) != len(knownCommandIDs) {
+		return fmt.Errorf("commandTriggers must contain exactly %d command IDs, got %d", len(knownCommandIDs), len(triggers))
+	}
+	foldedGlobal := fold(globalTrigger)
+	folded2ID := make(map[string]string, len(triggers))
+	for id, word := range triggers {
+		if _, known := knownCommandIDs[id]; !known {
+			return fmt.Errorf("commandTriggers has unknown command ID %q", id)
+		}
+		if word == "" {
+			continue
+		}
+		if err := validateWordChars(word); err != nil {
+			return fmt.Errorf("commandTriggers[%s]: %w", id, err)
+		}
+		folded := fold(word)
+		if folded == foldedGlobal {
+			return fmt.Errorf("commandTriggers[%s] %q must not equal global triggerWord %q", id, word, globalTrigger)
+		}
+		if prevID, dup := folded2ID[folded]; dup {
+			return fmt.Errorf("commandTriggers[%s] %q duplicates commandTriggers[%s] %q", id, word, prevID, triggers[prevID])
+		}
+		folded2ID[folded] = id
 	}
 	return nil
 }
@@ -146,12 +222,21 @@ func validateTriggerWord(word string) error {
 	if word == "" {
 		return fmt.Errorf("triggerWord must be non-empty")
 	}
+	if err := validateWordChars(word); err != nil {
+		return fmt.Errorf("triggerWord %w", err)
+	}
+	return nil
+}
+
+// validateWordChars 全局触发词与指令触发词非空值共用的字符规则
+// （空白集合 + 32 code point 上限）。
+func validateWordChars(word string) error {
 	if utf8.RuneCountInString(word) > MaxTriggerCodePts {
-		return fmt.Errorf("triggerWord exceeds %d Unicode code points", MaxTriggerCodePts)
+		return fmt.Errorf("exceeds %d Unicode code points", MaxTriggerCodePts)
 	}
 	for _, r := range word {
 		if isECMAScriptSpace(r) {
-			return fmt.Errorf("triggerWord must not contain whitespace")
+			return fmt.Errorf("must not contain whitespace")
 		}
 	}
 	return nil

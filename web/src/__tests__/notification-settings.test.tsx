@@ -4,6 +4,7 @@ import { act } from 'react';
 import { NotificationConfigPanel } from '../components/NotificationConfigPanel';
 import { SettingsPage } from '../pages/SettingsPage';
 import { api, ApiError } from '../api';
+import { DEFAULT_COMMAND_TRIGGERS } from '../palette-focus';
 import type { NotificationConfig } from '../types';
 import { mount, stubMatchMedia, flushUI } from './cm-test-env';
 
@@ -66,7 +67,12 @@ describe('SettingsPage 通知子标签', () => {
     const { container } = mount(
       <SettingsPage
         tab="notifications"
-        paletteConfig={{ hotkey: 'mod+k', triggerWord: 'new', matchMode: 'exact-then-substring' }}
+        paletteConfig={{
+          hotkey: 'mod+k',
+          triggerWord: 'new',
+          matchMode: 'exact-then-substring',
+          commandTriggers: DEFAULT_COMMAND_TRIGGERS,
+        }}
         paletteLoadState="ready"
         paletteLoadError=""
       />,

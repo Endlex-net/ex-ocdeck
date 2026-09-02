@@ -1,8 +1,11 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../api';
 import { formatHotkey, normalizeHotkey, validateCanonicalHotkey } from '../hotkey';
+import { foldForMatch } from '../fuzzy-match';
 import {
+  DEFAULT_COMMAND_TRIGGERS,
   PALETTE_CONFIG_CHANGED_EVENT,
+  type PaletteCommandId,
   type PaletteConfig,
   type PaletteMatchMode,
 } from '../palette-focus';
@@ -13,6 +16,7 @@ export const DEFAULT_PALETTE_CONFIG: PaletteConfig = {
   hotkey: 'mod+k',
   triggerWord: 'new',
   matchMode: 'exact-then-substring',
+  commandTriggers: DEFAULT_COMMAND_TRIGGERS,
 };
 
 const TRIGGER_MAX_CODE_POINTS = 32;
@@ -24,6 +28,17 @@ const MATCH_MODE_ITEMS: { value: PaletteMatchMode; label: string; desc: string }
     label: '精确优先、否则唯一子串',
     desc: '精确匹配优先；无精确命中时取唯一子串匹配',
   },
+];
+
+const COMMAND_ITEMS: { id: PaletteCommandId; label: string }[] = [
+  { id: 'command-center', label: '指挥中心' },
+  { id: 'projects', label: '项目管理' },
+  { id: 'settings-appearance', label: '设置 · 终端外观' },
+  { id: 'settings-env', label: '设置 · 环境变量' },
+  { id: 'settings-opencode', label: '设置 · opencode 配置' },
+  { id: 'settings-ai', label: '设置 · AI 配置' },
+  { id: 'settings-palette', label: '设置 · 命令面板' },
+  { id: 'register-project', label: '注册项目' },
 ];
 
 /** ECMAScript WhiteSpace + LineTerminator（与 Go isECMAScriptSpace 同源，不得用 /\s/）。 */
@@ -48,6 +63,36 @@ function validateTriggerWord(raw: string): string | null {
   return null;
 }
 
+/** 指令触发词行内校验（与 PUT 校验同源）：空字符串 = 未启用，仅非空值参与
+ *  字符校验、fold 去重及与全局 triggerWord 的冲突比较。 */
+function validateCommandTriggers(
+  triggers: Record<PaletteCommandId, string>,
+  globalTriggerWord: string,
+): Partial<Record<PaletteCommandId, string>> {
+  const errors: Partial<Record<PaletteCommandId, string>> = {};
+  const seen: { folded: string; label: string }[] = [];
+  if (globalTriggerWord !== '') {
+    seen.push({ folded: foldForMatch(globalTriggerWord), label: '快速新建触发词' });
+  }
+  for (const { id, label } of COMMAND_ITEMS) {
+    const value = triggers[id];
+    if (value === '') continue; // 空 = 未启用
+    const charErr = validateTriggerWord(value);
+    if (charErr) {
+      errors[id] = charErr;
+      continue;
+    }
+    const folded = foldForMatch(value);
+    const dup = seen.find((s) => s.folded === folded);
+    if (dup) {
+      errors[id] = `与「${dup.label}」重复`;
+      continue;
+    }
+    seen.push({ folded, label });
+  }
+  return errors;
+}
+
 function validateHotkeyDraft(raw: string): { canonical: string } | { error: string } {
   const canonical = normalizeHotkey(raw);
   if (canonical === null) return { error: '热键格式无效' };
@@ -69,6 +114,9 @@ export function PaletteConfigPanel({
   const [hotkey, setHotkey] = useState(source.hotkey);
   const [triggerWord, setTriggerWord] = useState(source.triggerWord);
   const [matchMode, setMatchMode] = useState<PaletteMatchMode>(source.matchMode);
+  const [commandTriggers, setCommandTriggers] = useState<Record<PaletteCommandId, string>>(
+    source.commandTriggers,
+  );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -78,7 +126,11 @@ export function PaletteConfigPanel({
     setHotkey(next.hotkey);
     setTriggerWord(next.triggerWord);
     setMatchMode(next.matchMode);
+    setCommandTriggers(next.commandTriggers);
   }, [config, loadState]);
+
+  const commandErrors = validateCommandTriggers(commandTriggers, triggerWord);
+  const hasCommandErrors = Object.keys(commandErrors).length > 0;
 
   const hotkeyPreview = validateHotkeyDraft(hotkey);
   const preview = 'canonical' in hotkeyPreview ? formatHotkey(hotkeyPreview.canonical) : '';
@@ -100,6 +152,10 @@ export function PaletteConfigPanel({
       setError(hotkeyResult.error);
       return;
     }
+    if (hasCommandErrors) {
+      setError('指令触发词存在校验错误，请修正后重试');
+      return;
+    }
 
     setSaving(true);
     try {
@@ -107,10 +163,12 @@ export function PaletteConfigPanel({
         hotkey: hotkeyResult.canonical,
         triggerWord,
         matchMode,
+        commandTriggers,
       });
       setHotkey(saved.hotkey);
       setTriggerWord(saved.triggerWord);
       setMatchMode(saved.matchMode);
+      setCommandTriggers(saved.commandTriggers);
       setNotice('保存成功，已即时生效');
       window.dispatchEvent(new CustomEvent(PALETTE_CONFIG_CHANGED_EVENT, { detail: saved }));
     } catch (err) {
@@ -203,6 +261,31 @@ export function PaletteConfigPanel({
             </label>
           ))}
           <div className="od-hint">仅影响指挥中心自动预选；候选列表排序不受此选项影响</div>
+        </div>
+
+        <div className="od-field">
+          <span className="od-label">指令触发词</span>
+          {COMMAND_ITEMS.map(({ id, label }) => (
+            <div key={id} style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '4px 0' }}>
+              <span style={{ width: 150, flexShrink: 0, fontSize: '13px' }}>{label}</span>
+              <input
+                className="od-input mono"
+                id={`palette-cmd-${id}`}
+                spellCheck={false}
+                style={{ maxWidth: 200 }}
+                value={commandTriggers[id]}
+                onChange={(e) => setCommandTriggers((s) => ({ ...s, [id]: e.target.value }))}
+              />
+              {commandErrors[id] && (
+                <span className="od-field-error" style={{ fontSize: '12px', color: 'var(--danger, #c0392b)' }}>
+                  {commandErrors[id]}
+                </span>
+              )}
+            </div>
+          ))}
+          <div className="od-hint">
+            命令面板输入「指令触发词 + 空格」后 Enter 直接执行该指令；留空 = 不启用。值之间不可重复、不可与快速新建触发词相同
+          </div>
         </div>
 
         <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 6 }}>

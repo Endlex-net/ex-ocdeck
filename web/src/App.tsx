@@ -17,6 +17,7 @@ import { SettingsPage } from './pages/SettingsPage';
 import { TaskWorkbenchPage } from './pages/TaskWorkbenchPage';
 import { formatHotkey, matchHotkey } from './hotkey';
 import {
+  DEFAULT_COMMAND_TRIGGERS,
   emitPaletteFocus,
   PALETTE_CONFIG_CHANGED_EVENT,
   type PaletteConfig,
@@ -59,11 +60,21 @@ function useNotificationStream(authed: boolean): void {
 function isPaletteConfigDetail(raw: unknown): raw is PaletteConfig {
   if (raw == null || typeof raw !== 'object') return false;
   const rec = raw as Record<string, unknown>;
-  return (
-    typeof rec.hotkey === 'string' &&
-    typeof rec.triggerWord === 'string' &&
-    (rec.matchMode === 'exact' || rec.matchMode === 'exact-then-substring')
-  );
+  if (
+    typeof rec.hotkey !== 'string' ||
+    typeof rec.triggerWord !== 'string' ||
+    (rec.matchMode !== 'exact' && rec.matchMode !== 'exact-then-substring')
+  ) {
+    return false;
+  }
+  // commandTriggers 必须恰含默认词表对应的 8 个指令键且值均为字符串：
+  // 缺失（旧三键事件）/null/键不全/值非法一律拒绝，避免下游解引用抛异常
+  const triggers = rec.commandTriggers;
+  if (triggers == null || typeof triggers !== 'object' || Array.isArray(triggers)) return false;
+  const triggerRec = triggers as Record<string, unknown>;
+  const ids = Object.keys(DEFAULT_COMMAND_TRIGGERS);
+  const keys = Object.keys(triggerRec);
+  return keys.length === ids.length && ids.every((id) => typeof triggerRec[id] === 'string');
 }
 
 export function App() {
@@ -220,6 +231,7 @@ export function App() {
         onClose={() => setPaletteOpen(false)}
         triggerWord={paletteConfig.triggerWord}
         matchMode={paletteConfig.matchMode}
+        commandTriggers={paletteConfig.commandTriggers}
         onNewTask={(payload?: PaletteFocusPayload) => {
           // 导航指挥中心 + od:palette-focus：展开内联创建并聚焦任务名
           // （design: ocdeck-palette.js + command-center.html:328-330）

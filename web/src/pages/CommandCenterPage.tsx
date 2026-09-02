@@ -180,7 +180,11 @@ export function resolveNewTaskInit(
     return { action: 'apply', selected: exactHits[0], projectQuery: exactHits[0].name };
   }
   if (matchMode === 'exact-then-substring' && exactHits.length === 0) {
-    const subHits = snapshot.filter((p) => classifyMatch(p.name, projectName) !== null);
+    // 缩写档位（acronym）MUST NOT 参与预选推断（tasks 4.8）：命中集合只认 exact/prefix/substring
+    const subHits = snapshot.filter((p) => {
+      const m = classifyMatch(p.name, projectName);
+      return m !== null && m.kind !== 'acronym';
+    });
     if (subHits.length === 1) {
       return { action: 'apply', selected: subHits[0], projectQuery: subHits[0].name };
     }

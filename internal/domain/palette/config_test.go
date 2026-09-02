@@ -1,17 +1,29 @@
 package palette
 
 import (
+	"maps"
 	"strings"
 	"testing"
 	"unicode/utf8"
 )
+
+// testFold 域内用例注入的折叠替身：本文件用例均为 Latin-1/ASCII 可表达；
+// 真实 foldForMatch 语义（İ → i\u0307、Greek final sigma）由
+// infrastructure/palette 的 FoldForMatch 测试与 api 端到端 422 用例锁定。
+var testFold = strings.ToLower
 
 func TestDefaultConfig(t *testing.T) {
 	c := DefaultConfig()
 	if c.Hotkey != "mod+k" || c.TriggerWord != "new" || c.MatchMode != MatchModeExactThen {
 		t.Fatalf("default config mismatch: %+v", c)
 	}
-	if err := c.Validate(); err != nil {
+	if !maps.Equal(c.CommandTriggers, DefaultCommandTriggers()) {
+		t.Fatalf("default command triggers mismatch: %v", c.CommandTriggers)
+	}
+	if len(c.CommandTriggers) != 8 {
+		t.Fatalf("default command triggers must have 8 keys, got %d", len(c.CommandTriggers))
+	}
+	if err := c.Validate(testFold); err != nil {
 		t.Fatalf("default config must validate: %v", err)
 	}
 }
@@ -55,7 +67,7 @@ func TestHotkeyValidateMatrix(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := DefaultConfig()
 			c.Hotkey = tc.hotkey
-			err := c.Validate()
+			err := c.Validate(testFold)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("Validate() hotkey=%q err=%v wantErr=%v", tc.hotkey, err, tc.wantErr)
 			}
@@ -88,12 +100,58 @@ func TestConfigValidate(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.cfg.Validate()
+			err := tc.cfg.Validate(testFold)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("Validate() err=%v wantErr=%v", err, tc.wantErr)
 			}
 			if tc.name == "32 code points" && utf8.RuneCountInString(tc.cfg.TriggerWord) != 32 {
 				t.Fatalf("fixture length")
+			}
+		})
+	}
+}
+
+// TestCommandTriggersValidate 校验矩阵：恰 8 键、未知 ID 拒绝、非空值沿用
+// triggerWord 字符规则、非空值 fold 去重、不可与全局 triggerWord 相同（fold
+// 比较）；前缀重叠允许（spec palette-config「命令面板配置读写 API」）。
+func TestCommandTriggersValidate(t *testing.T) {
+	// withDefaults 以自定义 triggerWord（create，不与默认词表冲突）为基底。
+	withTriggers := func(f func(triggers map[string]string)) Config {
+		c := DefaultConfig()
+		c.TriggerWord = "create"
+		f(c.CommandTriggers)
+		return c
+	}
+	cases := []struct {
+		name    string
+		cfg     Config
+		wantErr bool
+	}{
+		{"defaults valid", withTriggers(func(map[string]string) {}), false},
+		{"nil map", func() Config {
+			c := DefaultConfig()
+			c.TriggerWord = "create"
+			c.CommandTriggers = nil
+			return c
+		}(), true},
+		{"missing key", withTriggers(func(t map[string]string) { delete(t, "settings-ai") }), true},
+		{"unknown ID replaces known key", withTriggers(func(t map[string]string) { delete(t, "settings-ai"); t["unknown-cmd"] = "x" }), true},
+		{"extra 9th key", withTriggers(func(t map[string]string) { t["unknown-cmd"] = "x" }), true},
+		{"value whitespace", withTriggers(func(t map[string]string) { t["projects"] = "p r" }), true},
+		{"value NBSP", withTriggers(func(t map[string]string) { t["projects"] = "p\u00a0r" }), true},
+		{"value 33 code points", withTriggers(func(t map[string]string) { t["projects"] = strings.Repeat("你", 33) }), true},
+		{"value 32 code points", withTriggers(func(t map[string]string) { t["projects"] = strings.Repeat("你", 32) }), false},
+		{"dup exact", withTriggers(func(t map[string]string) { t["projects"] = "cc" }), true},
+		{"dup fold Ä/ä", withTriggers(func(t map[string]string) { t["projects"] = "ä"; t["command-center"] = "Ä" }), true},
+		{"equals global triggerWord exact", withTriggers(func(t map[string]string) { t["projects"] = "create" }), true},
+		{"equals global triggerWord fold", withTriggers(func(t map[string]string) { t["projects"] = "CREATE" }), true},
+		{"prefix overlap allowed", withTriggers(func(t map[string]string) { t["projects"] = "ccx"; t["command-center"] = "cc" }), false},
+		{"multiple empty values allowed", withTriggers(func(t map[string]string) { t["projects"] = ""; t["register-project"] = "" }), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.cfg.Validate(testFold); (err != nil) != tc.wantErr {
+				t.Fatalf("Validate() err=%v wantErr=%v", err, tc.wantErr)
 			}
 		})
 	}

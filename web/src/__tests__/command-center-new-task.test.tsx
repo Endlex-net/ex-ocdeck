@@ -195,6 +195,32 @@ describe('CommandCenterPage 快速新建初始化', () => {
     expect(api.createTask).toHaveBeenCalledWith('p2', 'task-a', 'main');
   });
 
+  it('acronym 命中不触发预选，按填过滤词处理（MUST NOT 参与预选推断）', async () => {
+    storeProjects = [proj('g1', 'go-ai-agent-app')];
+    const { container } = renderPage(<CommandCenterPage matchMode="exact-then-substring" />);
+    act(() => {
+      emitPaletteFocus('new-task-name', { projectName: 'gaaa' });
+    });
+    await flushUI();
+    // 不预选：输入框保持原余文（预选会显示项目名），且无 repo 基准分支字段
+    expect(projectInput(container).value).toBe('gaaa');
+    expect(
+      [...container.querySelectorAll('#cc-new-task-panel label')].some((l) => l.textContent === '基准分支'),
+    ).toBe(false);
+    expect(submitBtn(container).disabled).toBe(true);
+  });
+
+  it('prefix 命中仍预选（exact-then-substring）', async () => {
+    const { container } = renderPage(<CommandCenterPage matchMode="exact-then-substring" />);
+    act(() => {
+      emitPaletteFocus('new-task-name', { projectName: 'oc' });
+    });
+    await flushUI();
+    expect(projectInput(container).value).toBe('ocdeck');
+    await fillTaskAndSubmit(container);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main');
+  });
+
   it('预选后任务名为空，提交按钮禁用且不发起创建', async () => {
     const { container } = renderPage();
     act(() => {

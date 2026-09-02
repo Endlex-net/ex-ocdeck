@@ -20,10 +20,34 @@ export type PaletteFocusDetail = { id: PaletteFocusId } & PaletteFocusPayload;
 
 export type PaletteMatchMode = 'exact' | 'exact-then-substring';
 
+/** 指令触发词可绑定的面板指令 ID（恰 8 个，与静态入口 + 注册项目操作一一对应）。 */
+export type PaletteCommandId =
+  | 'command-center'
+  | 'projects'
+  | 'settings-appearance'
+  | 'settings-env'
+  | 'settings-opencode'
+  | 'settings-ai'
+  | 'settings-palette'
+  | 'register-project';
+
 export type PaletteConfig = {
   hotkey: string;
   triggerWord: string;
   matchMode: PaletteMatchMode;
+  commandTriggers: Record<PaletteCommandId, string>;
+};
+
+/** 指令触发词默认词表：cc/pro/reg 默认启用，设置类 5 键默认空字符串（空 = 未启用）。 */
+export const DEFAULT_COMMAND_TRIGGERS: Record<PaletteCommandId, string> = {
+  'command-center': 'cc',
+  projects: 'pro',
+  'settings-appearance': '',
+  'settings-env': '',
+  'settings-opencode': '',
+  'settings-ai': '',
+  'settings-palette': '',
+  'register-project': 'reg',
 };
 
 type Pending = { id: PaletteFocusId; payload: PaletteFocusPayload };

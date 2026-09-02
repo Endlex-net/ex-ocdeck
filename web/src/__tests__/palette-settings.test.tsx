@@ -4,7 +4,12 @@ import { act } from 'react';
 import { DEFAULT_PALETTE_CONFIG, PaletteConfigPanel } from '../components/PaletteConfigPanel';
 import { SettingsPage } from '../pages/SettingsPage';
 import { api, ApiError } from '../api';
-import { PALETTE_CONFIG_CHANGED_EVENT, type PaletteConfig } from '../palette-focus';
+import {
+  DEFAULT_COMMAND_TRIGGERS,
+  PALETTE_CONFIG_CHANGED_EVENT,
+  type PaletteCommandId,
+  type PaletteConfig,
+} from '../palette-focus';
 import { resolveRoute } from '../router';
 import { mount, stubMatchMedia, flushUI } from './cm-test-env';
 
@@ -33,12 +38,22 @@ const getConfigMock = vi.mocked(api.getPaletteConfig);
 const putConfigMock = vi.mocked(api.putPaletteConfig);
 
 function baseConfig(over: Partial<PaletteConfig> = {}): PaletteConfig {
+  const { commandTriggers, ...rest } = over;
   return {
     hotkey: 'mod+k',
     triggerWord: 'new',
     matchMode: 'exact-then-substring',
-    ...over,
+    commandTriggers: commandTriggers ?? DEFAULT_COMMAND_TRIGGERS,
+    ...rest,
   };
+}
+
+function customTriggers(over: Partial<Record<PaletteCommandId, string>> = {}): Record<PaletteCommandId, string> {
+  return { ...DEFAULT_COMMAND_TRIGGERS, ...over };
+}
+
+function cmdInput(container: HTMLElement, id: PaletteCommandId): HTMLInputElement {
+  return container.querySelector<HTMLInputElement>(`#palette-cmd-${id}`)!;
 }
 
 function setInputValue(el: HTMLInputElement, value: string) {
@@ -184,7 +199,89 @@ describe('PaletteConfigPanel', () => {
       hotkey: 'mod+k',
       triggerWord: 'new',
       matchMode: 'exact-then-substring',
+      commandTriggers: DEFAULT_COMMAND_TRIGGERS,
     });
+  });
+
+  it('指令触发词小节固定 8 行并渲染默认词表（cc/pro/reg + 5 空键）', () => {
+    const { container } = renderPanel();
+    const inputs = [...container.querySelectorAll<HTMLInputElement>('input[id^="palette-cmd-"]')];
+    expect(inputs).toHaveLength(8);
+    expect(cmdInput(container, 'command-center').value).toBe('cc');
+    expect(cmdInput(container, 'projects').value).toBe('pro');
+    expect(cmdInput(container, 'register-project').value).toBe('reg');
+    for (const id of ['settings-appearance', 'settings-env', 'settings-opencode', 'settings-ai', 'settings-palette'] as const) {
+      expect(cmdInput(container, id).value).toBe('');
+    }
+  });
+
+  it('draft 以 canonical 词表初始化（非默认 8 键全部入框）', () => {
+    const triggers = customTriggers({
+      'command-center': 'home',
+      'settings-appearance': 'look',
+      'register-project': '',
+    });
+    const { container } = renderPanel({ config: baseConfig({ commandTriggers: triggers }) });
+    expect(cmdInput(container, 'command-center').value).toBe('home');
+    expect(cmdInput(container, 'settings-appearance').value).toBe('look');
+    expect(cmdInput(container, 'register-project').value).toBe('');
+    expect(cmdInput(container, 'projects').value).toBe('pro');
+  });
+
+  it('非空值 fold 重复（cc/CC）行内提示且 MUST NOT 调用 PUT', async () => {
+    const { container } = renderPanel();
+    await act(async () => {
+      setInputValue(cmdInput(container, 'projects'), 'CC');
+    });
+    expect(container.textContent).toContain('与「指挥中心」重复');
+    await submitForm(container);
+    expect(putConfigMock).not.toHaveBeenCalled();
+  });
+
+  it('指令词与全局 triggerWord fold 相同行内提示且 MUST NOT 调用 PUT', async () => {
+    const { container } = renderPanel();
+    await act(async () => {
+      setInputValue(cmdInput(container, 'command-center'), 'NEW');
+    });
+    expect(container.textContent).toContain('与「快速新建触发词」重复');
+    await submitForm(container);
+    expect(putConfigMock).not.toHaveBeenCalled();
+  });
+
+  it('指令词字符规则（含空白）行内提示且 MUST NOT 调用 PUT', async () => {
+    const { container } = renderPanel();
+    await act(async () => {
+      setInputValue(cmdInput(container, 'projects'), 'a b');
+    });
+    expect(cmdInput(container, 'projects').closest('div')?.textContent).toContain('触发词不能包含空白字符');
+    await submitForm(container);
+    expect(putConfigMock).not.toHaveBeenCalled();
+  });
+
+  it('默认配置（5 空键）不修改直接保存成功且 PUT 携带默认词表', async () => {
+    putConfigMock.mockResolvedValue(baseConfig());
+    const { container } = renderPanel();
+    await submitForm(container);
+    expect(putConfigMock).toHaveBeenCalledTimes(1);
+    expect(putConfigMock.mock.calls[0][0].commandTriggers).toEqual(DEFAULT_COMMAND_TRIGGERS);
+    expect(container.textContent).toContain('保存成功');
+  });
+
+  it('修改指令词保存成功后 PUT 携带新词表且事件 detail 为四键', async () => {
+    const saved = baseConfig({ commandTriggers: customTriggers({ 'command-center': 'go' }) });
+    putConfigMock.mockResolvedValue(saved);
+    const { container } = renderPanel();
+    await act(async () => {
+      setInputValue(cmdInput(container, 'command-center'), 'go');
+    });
+    const changed = vi.fn();
+    window.addEventListener(PALETTE_CONFIG_CHANGED_EVENT, changed);
+    await submitForm(container);
+    window.removeEventListener(PALETTE_CONFIG_CHANGED_EVENT, changed);
+    expect(putConfigMock).toHaveBeenCalledTimes(1);
+    expect(putConfigMock.mock.calls[0][0].commandTriggers['command-center']).toBe('go');
+    expect(changed.mock.calls[0][0].detail).toEqual(saved);
+    expect(cmdInput(container, 'command-center').value).toBe('go');
   });
 
   it('K+Shift+Mod 规范化为 mod+shift+k 后 PUT', async () => {
