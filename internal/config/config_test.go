@@ -83,11 +83,15 @@ func TestLoad_DefaultPersist(t *testing.T) {
 	}
 }
 
-func TestLoad_GOOSNonDarwinRejected(t *testing.T) {
-	_, _, err := Load(Options{
+func TestLoad_GOOSLinuxAccepted(t *testing.T) {
+	dir := t.TempDir()
+	cfg, release, err := Load(Options{
 		EnvLookup: func(key string) (string, bool) {
-			if key == "OCDECK_TOKEN" {
+			switch key {
+			case "OCDECK_TOKEN":
 				return "secret", true
+			case "OCDECK_DATA_DIR":
+				return dir, true
 			}
 			return "", false
 		},
@@ -95,8 +99,29 @@ func TestLoad_GOOSNonDarwinRejected(t *testing.T) {
 		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
 		TmuxProbe:     func() (string, error) { return "tmux 3.4", nil },
 	})
+	if err != nil {
+		t.Fatalf("unexpected error for linux GOOS: %v", err)
+	}
+	defer release()
+	if cfg.Token != "secret" {
+		t.Errorf("token mismatch")
+	}
+}
+
+func TestLoad_GOOSUnsupportedRejected(t *testing.T) {
+	_, _, err := Load(Options{
+		EnvLookup: func(key string) (string, bool) {
+			if key == "OCDECK_TOKEN" {
+				return "secret", true
+			}
+			return "", false
+		},
+		OS:            OSInfo{GOOS: "windows"},
+		OpenCodeProbe: func() (string, error) { return ContractBaseline, nil },
+		TmuxProbe:     func() (string, error) { return "tmux 3.4", nil },
+	})
 	if err == nil {
-		t.Fatal("expected error for non-darwin GOOS")
+		t.Fatal("expected error for unsupported GOOS (windows)")
 	}
 }
 
