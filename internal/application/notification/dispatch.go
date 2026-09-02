@@ -128,6 +128,16 @@ func resolveOneChannel(ch notification.Channel, cfg notification.Config) (notifi
 			return notification.ResolvedChannel{}, false
 		}
 		return notification.ResolvedChannel{Channel: ch}, true
+	case "wecom":
+		if !cfg.Channels.Wecom.Enabled || cfg.Channels.Wecom.URL == "" {
+			return notification.ResolvedChannel{}, false
+		}
+		return notification.ResolvedChannel{
+			Channel: ch,
+			Config: notification.ChannelConfig{
+				Endpoint: cfg.Channels.Wecom.URL,
+			},
+		}, true
 	default:
 		return notification.ResolvedChannel{}, false
 	}

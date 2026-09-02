@@ -2,9 +2,11 @@
 // design D5/D7/D8/D11；spec「通知配置读写 API」「测试通知」）。
 //
 // GET/PUT /api/v1/notification/config：GET 与 PUT 请求体 JSON 同形（仅 bark 令牌
-// 字段名 token_masked / token 差异、load_error 只读仅损坏时出现）；掩码复用
-// notify.MaskToken；PUT 委托 Store.Put 完成「token 合并 → 校验 → 原子写 → 快照
-// 替换」全序列（写锁串行化，last-writer-wins）。
+// 字段名 token_masked / token、wecom 字段名 url_masked / url 差异、load_error
+// 只读仅损坏时出现）；掩码复用 notify.MaskToken 与 notify.MaskWecomURL；PUT
+// 不再在 handler 预校验，委托 Store.Put 完成「bark token / wecom url 合并 →
+// 校验 → 原子写 → 快照替换」全序列（Put 校验失败返回 *ConfigValidationError →
+// 422，写盘失败 → 500）。
 // POST /api/v1/notification/test：store 快照读取、总开关 422、baseURL 解析后
 // 委托 NotificationTester（*application/notification.Notifier 结构性满足）。
 package api
@@ -67,9 +69,11 @@ func (s *Server) handleGetNotificationConfig(w http.ResponseWriter, r *http.Requ
 }
 
 // handlePutNotificationConfig PUT /api/v1/notification/config（spec「通知配置
-// 读写 API」）：非法 JSON → 400；缺必填键/null/业务校验失败 → 422；写文件
-// 失败 → 500 且旧内存快照不变；成功 → 200 与 GET 同形响应（含 token_masked、
-// 不含 load_error）。
+// 读写 API」）：非法 JSON → 400；缺必填键/null → 422（schema 解码，非业务校验）；
+// 业务校验失败（经 Put 返回 *ConfigValidationError）→ 422；写文件失败 → 500 且
+// 旧内存快照不变；成功 → 200 与 GET 同形响应（含 token_masked、url_masked、
+// 不含 load_error）。业务校验 MUST 发生在 token/url 掩码合并之后（见 Store.Put），
+// handler MUST NOT 在 Put 前调用 cfg.Validate()（掩码占位会被当非法 URL 打成 422）。
 func (s *Server) handlePutNotificationConfig(w http.ResponseWriter, r *http.Request) {
 	if s.notifyStore == nil {
 		writeJSONError(w, http.StatusInternalServerError, CodeInvalidState, "notification store not configured")
@@ -91,11 +95,12 @@ func (s *Server) handlePutNotificationConfig(w http.ResponseWriter, r *http.Requ
 		writeJSONError(w, http.StatusUnprocessableEntity, CodeInvalidInput, err.Error())
 		return
 	}
-	if err := cfg.Validate(); err != nil {
-		writeJSONError(w, http.StatusUnprocessableEntity, CodeInvalidInput, err.Error())
-		return
-	}
 	if err := s.notifyStore.Put(cfg); err != nil {
+		var validationErr *notify.ConfigValidationError
+		if errors.As(err, &validationErr) {
+			writeJSONError(w, http.StatusUnprocessableEntity, CodeInvalidInput, err.Error())
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, CodeInternal, "save notification config failed")
 		return
 	}
@@ -171,10 +176,16 @@ type notificationBarkDTO struct {
 	TokenMasked string `json:"token_masked"`
 }
 
+type notificationWecomDTO struct {
+	Enabled   bool   `json:"enabled"`
+	URLMasked string `json:"url_masked"`
+}
+
 type notificationChannelsDTO struct {
 	Web   domainnotification.WebChannelConfig   `json:"web"`
 	Bark  notificationBarkDTO                   `json:"bark"`
 	Macos domainnotification.MacosChannelConfig `json:"macos"`
+	Wecom notificationWecomDTO                  `json:"wecom"`
 }
 
 type notificationConfigDTO struct {
@@ -204,6 +215,10 @@ func buildNotificationConfigDTOFromState(st notify.StoreState) notificationConfi
 				TokenMasked: notify.MaskToken(st.Config.Channels.Bark.Token),
 			},
 			Macos: st.Config.Channels.Macos,
+			Wecom: notificationWecomDTO{
+				Enabled:   st.Config.Channels.Wecom.Enabled,
+				URLMasked: notify.MaskWecomURL(st.Config.Channels.Wecom.URL),
+			},
 		},
 		LLMSummary: st.Config.LLMSummary,
 		BaseURL:    st.Config.BaseURL,

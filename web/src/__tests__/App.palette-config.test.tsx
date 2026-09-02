@@ -22,6 +22,7 @@ vi.mock('../api', () => ({
           web: { enabled: false },
           bark: { enabled: false, endpoint: '', token_masked: '' },
           macos: { enabled: false },
+          wecom: { enabled: false, url_masked: '' },
         },
         llm_summary: false,
         base_url: '',

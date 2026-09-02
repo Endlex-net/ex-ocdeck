@@ -83,6 +83,7 @@ function cfg(over: Partial<NotificationConfig> = {}): NotificationConfig {
       web: { enabled: true },
       bark: { enabled: false, endpoint: '', token_masked: '' },
       macos: { enabled: false },
+      wecom: { enabled: false, url_masked: '' },
     },
     llm_summary: false,
     base_url: '',

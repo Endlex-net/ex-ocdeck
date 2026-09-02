@@ -4,9 +4,10 @@ import { emitNotificationConfigChanged } from '../notifications';
 import type { NotificationCategories, NotificationTestResult } from '../types';
 
 /* ============================ 通知配置子标签（task-notifications D12） ============================
- * 总开关 / 五类别开关 / 空闲阈值 / 三渠道参数（bark endpoint+token、web 权限状态与申请入口）/
+ * 总开关 / 五类别开关 / 空闲阈值 / 四渠道参数（bark endpoint+token、wecom webhook URL、web 权限状态与申请入口）/
  * llm_summary / base_url（附 Bark 提示）/ 保存 / 测试通知 / load_error 展示。
- * token 仅保存用户新输入、绝不回显明文（GET 的 token_masked 只作提示），留空保持不变（服务端语义）。 */
+ * token 与 wecom URL 仅保存用户新输入、绝不回显明文（GET 的 token_masked/url_masked 只作提示），
+ * 留空保持不变（服务端语义）。 */
 
 /** 五类别：key 与后端 DTO 字段一致。 */
 const CATEGORY_ITEMS: { key: keyof NotificationCategories; label: string; desc: string }[] = [
@@ -44,6 +45,9 @@ export function NotificationConfigPanel() {
   const [barkToken, setBarkToken] = useState(''); // 仅保存用户新输入，绝不回显明文
   const [tokenMasked, setTokenMasked] = useState('');
   const [macosEnabled, setMacosEnabled] = useState(false);
+  const [wecomEnabled, setWecomEnabled] = useState(false);
+  const [wecomURL, setWecomURL] = useState(''); // 仅保存用户新输入，绝不回显明文
+  const [wecomURLMasked, setWecomURLMasked] = useState('');
   const [llmSummary, setLlmSummary] = useState(false);
   const [baseUrl, setBaseUrl] = useState('');
 
@@ -67,6 +71,8 @@ export function NotificationConfigPanel() {
         setBarkEndpoint(res.channels.bark.endpoint);
         setTokenMasked(res.channels.bark.token_masked ?? '');
         setMacosEnabled(res.channels.macos.enabled);
+        setWecomEnabled(res.channels.wecom.enabled);
+        setWecomURLMasked(res.channels.wecom.url_masked ?? '');
         setLlmSummary(res.llm_summary);
         setBaseUrl(res.base_url);
         setError('');
@@ -107,6 +113,7 @@ export function NotificationConfigPanel() {
           web: { enabled: webEnabled },
           bark: { enabled: barkEnabled, endpoint: barkEndpoint.trim(), token: barkToken },
           macos: { enabled: macosEnabled },
+          wecom: { enabled: wecomEnabled, url: wecomURL },
         },
         llm_summary: llmSummary,
         base_url: baseUrl.trim(),
@@ -114,6 +121,8 @@ export function NotificationConfigPanel() {
       setLoadError(res.load_error ?? '');
       setTokenMasked(res.channels.bark.token_masked ?? '');
       setBarkToken('');
+      setWecomURLMasked(res.channels.wecom.url_masked ?? '');
+      setWecomURL('');
       setNotice('保存成功，已即时生效');
       emitNotificationConfigChanged();
     } catch (err) {
@@ -281,6 +290,26 @@ export function NotificationConfigPanel() {
           <div className="od-hint">
             macOS 渠道需服务端运行在 Darwin 且安装 terminal-notifier 或 osascript；启用即投递
           </div>
+
+          <label style={{ display: 'block', margin: '4px 0' }}>
+            <input type="checkbox" checked={wecomEnabled} onChange={(e) => setWecomEnabled(e.target.checked)} />{' '}
+            企业微信群机器人（wecom）
+          </label>
+          {wecomEnabled && (
+            <div style={{ margin: '6px 0 10px 22px' }}>
+              <input
+                className="od-input mono"
+                type="password"
+                autoComplete="new-password"
+                spellCheck={false}
+                style={{ maxWidth: 420 }}
+                placeholder={wecomURLMasked ? `${wecomURLMasked}（留空保持不变）` : '粘贴完整 webhook URL'}
+                value={wecomURL}
+                onChange={(e) => setWecomURL(e.target.value)}
+              />
+              <div className="od-hint">webhook URL 仅保存新输入，绝不回显明文；留空保持不变（服务端语义）</div>
+            </div>
+          )}
         </div>
 
         <div className="od-field">

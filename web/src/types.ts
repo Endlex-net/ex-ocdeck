@@ -254,11 +254,19 @@ export interface NotificationBarkChannel {
   token_masked?: string;
 }
 
+/** 通知配置 wecom 渠道（GET 为 url_masked 必填，PUT 提交 url）。
+ *  完整 webhook URL 整体按密钥保护，url_masked 仅为 `***` 或空串，MUST NOT 回显原文。 */
+export interface NotificationWecomChannel {
+  enabled: boolean;
+  url_masked: string;
+}
+
 /** 通知配置 channels 结构。 */
 export interface NotificationChannels {
   web: { enabled: boolean };
   bark: NotificationBarkChannel;
   macos: { enabled: boolean };
+  wecom: NotificationWecomChannel;
 }
 
 /** GET /api/v1/notification/config 响应（token_masked 形态）。
@@ -273,7 +281,8 @@ export interface NotificationConfig {
   load_error?: string;
 }
 
-/** PUT /api/v1/notification/config 请求体：bark 令牌字段名为 token（非 token_masked）。 */
+/** PUT /api/v1/notification/config 请求体：bark 令牌字段名为 token（非 token_masked），
+ *  wecom webhook 字段名为 url（非 url_masked）。 */
 export interface NotificationConfigPut {
   enabled: boolean;
   categories: NotificationCategories;
@@ -282,6 +291,7 @@ export interface NotificationConfigPut {
     web: { enabled: boolean };
     bark: { enabled: boolean; endpoint: string; token: string };
     macos: { enabled: boolean };
+    wecom: { enabled: boolean; url: string };
   };
   llm_summary: boolean;
   base_url: string;
