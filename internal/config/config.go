@@ -1,7 +1,9 @@
 // Package config 负责服务端配置加载与启动期校验（design.md §10/§11/§14）。
 //
-// v1 仅通过环境变量配置（OCDECK_TOKEN / OCDECK_SHUTDOWN_POLICY 等），
-// 配置文件方案留待后续阶段。运行时不可变。
+// v1 通过环境变量配置（OCDECK_TOKEN / OCDECK_SHUTDOWN_POLICY 等）。
+// 启动时 main 先把 env-file 注入进程环境（PATH 无条件覆盖，其余键仅补缺），
+// 供子进程继承；Load 在 EnvLookup 为空时再读一次同一文件作配置回退。
+// 路径：OCDECK_ENV_FILE 非空用它，否则 ~/.config/ocdeck/env。运行时不可变。
 package config
 
 import (
@@ -90,10 +92,9 @@ type Options struct {
 	TmuxProbe     func() (string, error)
 }
 
-// DefaultOptions 生产默认：读 os.Getenv、真实 exec 探测。
+// DefaultOptions 生产默认：EnvLookup 留空，由 Load 叠 env-file 后回退 os.LookupEnv；真实 exec 探测。
 func DefaultOptions() Options {
 	return Options{
-		EnvLookup:     os.LookupEnv,
 		OS:            OSInfo{GOOS: runtime.GOOS},
 		OpenCodeProbe: probeOpenCodeVersion,
 		TmuxProbe:     probeTmuxVersion,
@@ -104,7 +105,11 @@ func DefaultOptions() Options {
 // 调用方 MUST 在进程退出前调用 release（design.md §10）。
 func Load(opts Options) (*Config, func(), error) {
 	if opts.EnvLookup == nil {
-		opts.EnvLookup = os.LookupEnv
+		fileVals, err := LoadEnvFile()
+		if err != nil {
+			return nil, nil, err
+		}
+		opts.EnvLookup = lookupEnvThenFile(fileVals)
 	}
 	if opts.OS.GOOS == "" {
 		opts.OS.GOOS = runtime.GOOS
@@ -227,6 +232,84 @@ func Load(opts Options) (*Config, func(), error) {
 		log.Printf("warning: opencode version %s outside verified contract range [%s, %s]; ocdeck may behave unexpectedly (activation is gated by capability probe, not version)", ocVersion, opencode.ContractMinVersion, ContractBaseline)
 	}
 	return cfg, release, nil
+}
+
+func lookupEnvThenFile(fileVals map[string]string) EnvLookup {
+	return func(key string) (string, bool) {
+		if v, ok := os.LookupEnv(key); ok {
+			return v, true
+		}
+		v, ok := fileVals[key]
+		return v, ok
+	}
+}
+
+// LoadEnvFile 读取 env-file。文件不存在返回空 map；其它读失败带路径上下文。
+// MUST NOT 在日志中输出任何 value。
+func LoadEnvFile() (map[string]string, error) {
+	path, err := envFilePath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read env file %s: %w", path, err)
+	}
+	return parseEnvFile(string(data)), nil
+}
+
+// ApplyEnvFile 把 env-file 写入进程环境，供 brew services / launchd 下的子进程继承。
+// PATH 若出现在文件中则无条件覆盖；其它键仅在 os.LookupEnv 未命中时写入。
+func ApplyEnvFile() error {
+	vals, err := LoadEnvFile()
+	if err != nil {
+		return err
+	}
+	for key, val := range vals {
+		if key != "PATH" {
+			if _, ok := os.LookupEnv(key); ok {
+				continue
+			}
+		}
+		if err := os.Setenv(key, val); err != nil {
+			return fmt.Errorf("set env %s from env file: %w", key, err)
+		}
+	}
+	return nil
+}
+
+func envFilePath() (string, error) {
+	if p, ok := os.LookupEnv("OCDECK_ENV_FILE"); ok && p != "" {
+		return p, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home dir for default env file: %w", err)
+	}
+	return filepath.Join(home, ".config", "ocdeck", "env"), nil
+}
+
+func parseEnvFile(content string) map[string]string {
+	out := make(map[string]string)
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		out[key] = strings.TrimSpace(val)
+	}
+	return out
 }
 
 func parseShutdownPolicy(s string) (ShutdownPolicy, error) {

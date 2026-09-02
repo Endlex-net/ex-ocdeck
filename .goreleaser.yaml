@@ -1,0 +1,32 @@
+# goreleaser release --snapshot --clean：本地产物 dist/ocdeck_{os}_{arch}.tar.gz
+# 正式发布由 CI 跑 goreleaser release --clean，只发 GitHub Release。
+# Formula 由 scripts/update-tap.sh 推送到 Endlex-net/homebrew-tap。
+version: 2
+
+project_name: ocdeck
+
+before:
+  hooks:
+    - sh -c "cd web && pnpm install --frozen-lockfile && pnpm build"
+
+builds:
+  - id: ocdeck-server
+    main: ./cmd/ocdeck-server
+    binary: ocdeck-server
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    name_template: ocdeck_{{.Os}}_{{.Arch}}
+
+checksum:
+  name_template: checksums.txt
