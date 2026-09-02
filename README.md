@@ -84,6 +84,8 @@ systemctl --user enable --now ocdeck
 journalctl --user -u ocdeck -f
 ```
 
+若服务启动报找不到 `opencode` / `tmux`（如 `executable file not found in $PATH`）：systemd 服务环境的 `PATH` 只有系统目录，而这类工具常装在用户目录（如 `~/.opencode/bin`）。确认 `~/.config/ocdeck/env` 的 `PATH=` 行包含其所在目录（完整字面值，不支持 `$PATH` 展开），修改后执行 `systemctl --user restart ocdeck`。`install-linux.sh` 生成的 env 文件会自动写入该行。
+
 #### WSL2
 
 - WSL2 需启用 systemd 后才能用上述自启方式：在 `/etc/wsl.conf` 写入

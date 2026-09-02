@@ -204,7 +204,7 @@ func Load(opts Options) (*Config, func(), error) {
 	ocVersion, err := opts.OpenCodeProbe()
 	if err != nil {
 		release()
-		return nil, nil, fmt.Errorf("opencode binary check failed: %w", err)
+		return nil, nil, fmt.Errorf("opencode binary check failed: %w（若已安装，多半是服务环境 PATH 不含其目录：在 ~/.config/ocdeck/env 写入完整 PATH= 行后重启）", err)
 	}
 	tmuxVersion, err := opts.TmuxProbe()
 	if err != nil {
