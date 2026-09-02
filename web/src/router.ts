@@ -46,7 +46,7 @@ export function navigate(path: string, replace = false, env: NavigateEnv = defau
 }
 
 /** 设置页子标签。 */
-export type ConfigsTab = 'appearance' | 'env' | 'opencode' | 'ai' | 'notifications';
+export type ConfigsTab = 'appearance' | 'env' | 'opencode' | 'ai' | 'notifications' | 'palette';
 
 const CONFIGS_TABS: ReadonlySet<string> = new Set([
   'appearance',
@@ -54,6 +54,7 @@ const CONFIGS_TABS: ReadonlySet<string> = new Set([
   'opencode',
   'ai',
   'notifications',
+  'palette',
 ]);
 
 export function isConfigsTab(v: unknown): v is ConfigsTab {

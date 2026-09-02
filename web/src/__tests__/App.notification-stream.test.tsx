@@ -20,6 +20,9 @@ import { mount, flushUI, stubMatchMedia } from './cm-test-env';
 vi.mock('../api', () => ({
   api: {
     getNotificationConfig: vi.fn(),
+    getPaletteConfig: vi.fn(() =>
+      Promise.resolve({ hotkey: 'mod+k', triggerWord: 'new', matchMode: 'exact-then-substring' }),
+    ),
   },
   getToken: vi.fn(() => 'fake-token'),
   UNAUTHORIZED_EVENT: 'od:unauthorized',

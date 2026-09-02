@@ -16,6 +16,7 @@ import (
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/ai"
 	"ocdeck/internal/infrastructure/notify"
+	"ocdeck/internal/infrastructure/palette"
 	storepkg "ocdeck/internal/infrastructure/store"
 )
 
@@ -31,6 +32,7 @@ type Server struct {
 	lifecycleCfgs   LifecycleConfigStore
 	ocCfgs          OCConfigService
 	aiConfig        *ai.Store
+	paletteConfig   *palette.Store
 	eventSubscriber EventSubscriber
 	httpSrv         *http.Server
 
@@ -187,6 +189,7 @@ func (s *Server) registerRoutes() {
 	s.registerOCConfigRoutes(apiMux)        // 全局 oc 配置管理（design.md §13/§21）
 	s.registerAIConfigRoutes(apiMux)        // 全局 AI provider 配置（design.md D6）
 	s.registerNotificationRoutes(apiMux)    // 通知配置/测试通知/SSE 流（task-notifications D7）
+	s.registerPaletteConfigRoutes(apiMux)   // 命令面板配置（quick-create-shortcut-support D6）
 
 	// /api/v1 前缀统一挂认证中间件（design.md §14/§21）。
 	// 已认证请求的未知路由/方法返回统一 JSON 404/405（design.md §21 错误结构）。

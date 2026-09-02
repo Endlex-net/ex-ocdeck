@@ -28,6 +28,7 @@ import {
   PALETTE_FOCUS_EVENT,
   clearPendingPaletteFocus,
   consumePendingPaletteFocus,
+  readPaletteFocusDetail,
 } from '../palette-focus';
 import {
   BranchIcon,
@@ -724,10 +725,10 @@ export function ProjectsManagePage() {
       setFocusRegisterNonce((n) => n + 1);
       clearPendingPaletteFocus('register-project-name');
     };
-    if (consumePendingPaletteFocus('register-project-name')) openAndFocus();
+    if (consumePendingPaletteFocus('register-project-name') !== null) openAndFocus();
     const onPaletteFocus = (e: Event) => {
-      const id = (e as CustomEvent<{ id?: string }>).detail?.id;
-      if (id !== 'register-project-name') return;
+      const parsed = readPaletteFocusDetail((e as CustomEvent).detail);
+      if (!parsed || parsed.id !== 'register-project-name') return;
       openAndFocus();
     };
     document.addEventListener(PALETTE_FOCUS_EVENT, onPaletteFocus);

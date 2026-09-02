@@ -1,3 +1,4 @@
+import type { PaletteConfig } from './palette-focus';
 import type {
   ActiveSessionItem,
   AIConfig,
@@ -250,4 +251,8 @@ export const api = {
     request<NotificationConfig>('PUT', '/notification/config', body),
   /** 测试通知：向全部已启用且已配置渠道投递，逐渠道报告结果。总开关关闭时 422。 */
   testNotification: () => request<{ results: NotificationTestResult[] }>('POST', '/notification/test'),
+
+  /** 命令面板配置：GET/PUT 均为 camelCase 三键 {hotkey, triggerWord, matchMode}。 */
+  getPaletteConfig: () => request<PaletteConfig>('GET', '/palette/config'),
+  putPaletteConfig: (body: PaletteConfig) => request<PaletteConfig>('PUT', '/palette/config', body),
 };

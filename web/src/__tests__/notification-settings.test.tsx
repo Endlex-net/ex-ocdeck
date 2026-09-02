@@ -63,7 +63,14 @@ beforeEach(() => {
 describe('SettingsPage 通知子标签', () => {
   it('tab=notifications 渲染通知面板', async () => {
     getConfigMock.mockResolvedValue(baseConfig());
-    const { container } = mount(<SettingsPage tab="notifications" />);
+    const { container } = mount(
+      <SettingsPage
+        tab="notifications"
+        paletteConfig={{ hotkey: 'mod+k', triggerWord: 'new', matchMode: 'exact-then-substring' }}
+        paletteLoadState="ready"
+        paletteLoadError=""
+      />,
+    );
     await flushUI();
     expect(container.querySelector('#panel-notifications')).not.toBeNull();
     expect(container.textContent).toContain('任务通知');
