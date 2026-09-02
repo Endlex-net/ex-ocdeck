@@ -40,13 +40,21 @@ export interface AppShellProps {
   onToggleTheme: () => void;
   /** 当前主题偏好，决定切换按钮图标。 */
   themePref: 'system' | 'light' | 'dark';
+  /** 命令面板热键展示文案（App 用 formatHotkey 下发）。 */
+  paletteHotkeyLabel: string;
 }
 
 /** 全局应用壳层（design.md D1 + spec web-ui-shell）：
  *  左侧导航脊柱（品牌区/指挥中心顶层项/任务组/管理组/底栏）+ 内容区。
  *  未认证时 App 不渲染壳层（仅 TokenGate）。ServerStatusBanner 由 App 在壳层内渲染。
  *  ⌘B 折叠为 60px 图标轨，localStorage 持久化，≥768px 生效。 */
-export function AppShell({ children, onOpenPalette, onToggleTheme, themePref }: AppShellProps) {
+export function AppShell({
+  children,
+  onOpenPalette,
+  onToggleTheme,
+  themePref,
+  paletteHotkeyLabel,
+}: AppShellProps) {
   const route = useHashRoute();
   const { projects } = useProjects();
 
@@ -132,11 +140,11 @@ export function AppShell({ children, onOpenPalette, onToggleTheme, themePref }: 
             className="od-sidebar-cmdk"
             type="button"
             onClick={onOpenPalette}
-            title="命令面板（⌘K）"
+            title={`命令面板（${paletteHotkeyLabel}）`}
           >
             <SearchIcon />
             <span className="od-cmdk-label">命令面板</span>
-            <span className="od-palette-kbd">⌘K</span>
+            <span className="od-palette-kbd">{paletteHotkeyLabel}</span>
           </button>
           <span className="od-side-addr" title="本地服务 · 单用户模式">
             {location.host || '127.0.0.1'}

@@ -4,6 +4,7 @@ import { act } from 'react';
 import { NotificationConfigPanel } from '../components/NotificationConfigPanel';
 import { SettingsPage } from '../pages/SettingsPage';
 import { api, ApiError } from '../api';
+import { DEFAULT_COMMAND_TRIGGERS } from '../palette-focus';
 import type { NotificationConfig } from '../types';
 import { mount, stubMatchMedia, flushUI } from './cm-test-env';
 
@@ -63,7 +64,19 @@ beforeEach(() => {
 describe('SettingsPage 通知子标签', () => {
   it('tab=notifications 渲染通知面板', async () => {
     getConfigMock.mockResolvedValue(baseConfig());
-    const { container } = mount(<SettingsPage tab="notifications" />);
+    const { container } = mount(
+      <SettingsPage
+        tab="notifications"
+        paletteConfig={{
+          hotkey: 'mod+k',
+          triggerWord: 'new',
+          matchMode: 'exact-then-substring',
+          commandTriggers: DEFAULT_COMMAND_TRIGGERS,
+        }}
+        paletteLoadState="ready"
+        paletteLoadError=""
+      />,
+    );
     await flushUI();
     expect(container.querySelector('#panel-notifications')).not.toBeNull();
     expect(container.textContent).toContain('任务通知');

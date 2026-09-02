@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { navigate } from '../router';
 import { useProjects, useProjectsRefresh } from '../hooks';
@@ -25,10 +25,14 @@ import {
   type MergedTask,
 } from './command-center-selector';
 import { createErrorMessage } from '../hooks';
+import { classifyMatch } from '../fuzzy-match';
 import {
   PALETTE_FOCUS_EVENT,
   clearPendingPaletteFocus,
   consumePendingPaletteFocus,
+  readPaletteFocusDetail,
+  type PaletteFocusPayload,
+  type PaletteMatchMode,
 } from '../palette-focus';
 import './command-center.css';
 
@@ -155,10 +159,47 @@ export function sectionBodyMode(
   return 'none';
 }
 
-export function CommandCenterPage() {
+export type NewTaskInitResult =
+  | { action: 'keep' }
+  | { action: 'apply'; selected: Project | null; projectQuery: string };
+
+/** 按信号到达时的项目快照解析初始化意图；MUST NOT 在后续加载中重试。 */
+export function resolveNewTaskInit(
+  payload: PaletteFocusPayload,
+  snapshot: readonly Project[],
+  matchMode: PaletteMatchMode,
+): NewTaskInitResult {
+  if (!('projectName' in payload) || payload.projectName === undefined) return { action: 'keep' };
+  const projectName = payload.projectName;
+  if (payload.projectID) {
+    const byID = snapshot.find((p) => p.id === payload.projectID);
+    if (byID) return { action: 'apply', selected: byID, projectQuery: byID.name };
+  }
+  const exactHits = snapshot.filter((p) => classifyMatch(p.name, projectName)?.kind === 'exact');
+  if (exactHits.length === 1) {
+    return { action: 'apply', selected: exactHits[0], projectQuery: exactHits[0].name };
+  }
+  if (matchMode === 'exact-then-substring' && exactHits.length === 0) {
+    // 缩写档位（acronym）MUST NOT 参与预选推断（tasks 4.8）：命中集合只认 exact/prefix/substring
+    const subHits = snapshot.filter((p) => {
+      const m = classifyMatch(p.name, projectName);
+      return m !== null && m.kind !== 'acronym';
+    });
+    if (subHits.length === 1) {
+      return { action: 'apply', selected: subHits[0], projectQuery: subHits[0].name };
+    }
+  }
+  return { action: 'apply', selected: null, projectQuery: projectName };
+}
+
+export function CommandCenterPage({ matchMode = 'exact-then-substring' }: { matchMode?: PaletteMatchMode } = {}) {
   // 共享 projects store（design.md D4：侧栏、指挥中心同一数据源，MUST NOT 自行轮询 /projects）
   const { projects, initialized: projectsInit, error: storeError } = useProjects();
   const refresh = useProjectsRefresh();
+  const projectsRef = useRef(projects);
+  projectsRef.current = projects;
+  const matchModeRef = useRef(matchMode);
+  matchModeRef.current = matchMode;
 
   // 本页 tasks/active SSE 订阅（design D5）：mount 订阅 / unmount close；帧驱动整表替换
   const [snap, setSnap] = useState<SessionsSnapshot>(EMPTY);
@@ -223,22 +264,34 @@ export function CommandCenterPage() {
   const [logTarget, setLogTarget] = useState<{ title: string; fetchLog: () => Promise<string> } | null>(null);
   // 新建任务面板展开状态（按钮常驻页头，面板作为页头之后的同级内容展开/收起）
   const [newTaskOpen, setNewTaskOpen] = useState(false);
-  // 命令面板「新建任务」：展开后聚焦任务名（od:palette-focus detail.id=new-task-name）
-  const [focusTaskNameNonce, setFocusTaskNameNonce] = useState(0);
+  // 命令面板初始化意图：递增 nonce；无 payload 为 keep（只展开聚焦）。
+  const [newTaskInit, setNewTaskInit] = useState<{ nonce: number; result: NewTaskInitResult }>({
+    nonce: 0,
+    result: { action: 'keep' },
+  });
+
+  const applyPaletteNewTask = (payload: PaletteFocusPayload) => {
+    // 快照必须在信号到达（listener 同步执行）时读取：functional updater 可能被 React
+    // 延迟到 render 阶段，那时 ref 已是同批次更新后的值，违反「只按到达时快照判定」。
+    const result = resolveNewTaskInit(payload, projectsRef.current, matchModeRef.current);
+    setNewTaskOpen(true);
+    setNewTaskInit((s) => ({ nonce: s.nonce + 1, result }));
+    clearPendingPaletteFocus('new-task-name');
+  };
+
+  const closeNewTask = () => {
+    setNewTaskOpen(false);
+    setNewTaskInit({ nonce: 0, result: { action: 'keep' } });
+  };
 
   // 对齐 design 源 ocdeck-palette.js + command-center.html:328-330
   useEffect(() => {
-    const openAndFocus = () => {
-      setNewTaskOpen(true);
-      setFocusTaskNameNonce((n) => n + 1);
-      clearPendingPaletteFocus('new-task-name');
-    };
-    // 跨路由：mount 时消费在途 pending（navigate 后 listener 尚未注册的竞态）
-    if (consumePendingPaletteFocus('new-task-name')) openAndFocus();
+    const pending = consumePendingPaletteFocus('new-task-name');
+    if (pending !== null) applyPaletteNewTask(pending);
     const onPaletteFocus = (e: Event) => {
-      const id = (e as CustomEvent<{ id?: string }>).detail?.id;
-      if (id !== 'new-task-name') return;
-      openAndFocus();
+      const parsed = readPaletteFocusDetail((e as CustomEvent).detail);
+      if (!parsed || parsed.id !== 'new-task-name') return;
+      applyPaletteNewTask(parsed.payload);
     };
     document.addEventListener(PALETTE_FOCUS_EVENT, onPaletteFocus);
     return () => document.removeEventListener(PALETTE_FOCUS_EVENT, onPaletteFocus);
@@ -262,7 +315,14 @@ export function CommandCenterPage() {
           <span className="cc-poll-status">{connStatus}</span>
           <button
             className="od-btn od-btn-primary"
-            onClick={() => setNewTaskOpen((v) => !v)}
+            onClick={() => {
+              if (newTaskOpen) {
+                closeNewTask();
+                return;
+              }
+              setNewTaskInit({ nonce: 0, result: { action: 'keep' } });
+              setNewTaskOpen(true);
+            }}
             aria-expanded={newTaskOpen}
             aria-controls="cc-new-task-panel"
           >
@@ -277,8 +337,9 @@ export function CommandCenterPage() {
           projects={projects}
           refresh={refresh}
           storeError={storeError}
-          onClose={() => setNewTaskOpen(false)}
-          focusTaskNameNonce={focusTaskNameNonce}
+          onClose={closeNewTask}
+          initNonce={newTaskInit.nonce}
+          initResult={newTaskInit.result}
         />
       )}
 
@@ -678,14 +739,16 @@ function NewTaskPanel({
   refresh,
   storeError,
   onClose,
-  focusTaskNameNonce = 0,
+  initNonce = 0,
+  initResult = { action: 'keep' },
 }: {
   projects: Project[];
   refresh: () => Promise<void>;
   storeError: string;
   onClose: () => void;
-  /** 命令面板触发展开后递增，用于聚焦任务名输入（new-task-name）。 */
-  focusTaskNameNonce?: number;
+  /** 命令面板触发展开后递增；每个新 nonce 应用项目状态并聚焦任务名。 */
+  initNonce?: number;
+  initResult?: NewTaskInitResult;
 }) {
   const [projectQuery, setProjectQuery] = useState('');
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
@@ -701,6 +764,7 @@ function NewTaskPanel({
   const projInputId = useId();
   const branchInputId = useId();
   const taskNameRef = useRef<HTMLInputElement>(null);
+  const focusedNonceRef = useRef<number | null>(null);
   // 代际防陈旧写回 + 最新选择 ref（异步闭包读最新值而非闭包捕获值）
   const projGenRef = useRef(0);
   const selectedProjectRef = useRef<Project | null>(null);
@@ -708,10 +772,30 @@ function NewTaskPanel({
   // 当前正在刷新的项目 ID：finally 仅清自身项目的 refreshing，避免清错新项目
   const refreshingProjectIdRef = useRef<string | null>(null);
 
-  // 面板挂载或 palette-focus 触发后聚焦任务名（design: taskName / data-od-id=new-task-name）
-  useEffect(() => {
-    requestAnimationFrame(() => taskNameRef.current?.focus());
-  }, [focusTaskNameNonce]);
+  const consumeFocus = (nonce: number) => {
+    if (focusedNonceRef.current === nonce) return;
+    taskNameRef.current?.focus();
+    focusedNonceRef.current = nonce;
+  };
+
+  // 仅随 nonce 应用：快速新建替换项目相关状态、MUST 保留 taskName；keep 不改表单。
+  // apply 分支只落状态，聚焦交由下方消费 effect；keep 与首次挂载在此直接消费——
+  // 两处重复消费被 focusedNonceRef 幂等吸收。
+  useLayoutEffect(() => {
+    if (initNonce > 0 && initResult.action === 'apply') {
+      setSelectedProject(initResult.selected);
+      setProjectQuery(initResult.projectQuery);
+      return;
+    }
+    consumeFocus(initNonce);
+  }, [initNonce]);
+
+  // 每个 nonce 恰好聚焦一次；不绑定 branches。nonce 直接驱动消费（相同 payload 的
+  // apply 因同值 setState 被 React 跳过时，仍随 nonce 变化聚焦）；手动改项目时 nonce
+  // 已消费，不抢焦。
+  useLayoutEffect(() => {
+    consumeFocus(initNonce);
+  }, [initNonce, selectedProject, projectQuery]);
 
   const isDir = selectedProject?.kind === 'dir';
   const filteredProjects = useMemo(() => {

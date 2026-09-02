@@ -25,6 +25,7 @@ import (
 	"ocdeck/internal/infrastructure/eventbus"
 	"ocdeck/internal/infrastructure/lifecycle"
 	"ocdeck/internal/infrastructure/notify"
+	"ocdeck/internal/infrastructure/palette"
 	"ocdeck/internal/infrastructure/process"
 	sqlite "ocdeck/internal/infrastructure/sqlite"
 	"ocdeck/internal/infrastructure/store"
@@ -196,6 +197,7 @@ func run() error {
 	})
 	srv.SetNotificationStore(notifyStore)
 	srv.SetNotificationTester(notifier)
+	srv.SetPaletteConfigStore(palette.LoadStore(cfg.DataDir))
 
 	srv.RebuildRoutes()
 	if wd != nil {

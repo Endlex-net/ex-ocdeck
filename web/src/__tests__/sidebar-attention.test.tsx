@@ -46,7 +46,12 @@ function makeProjects(attentionCount: number, agentStatus = 'busy'): Project[] {
 
 function renderShell() {
   return mount(
-    <AppShell onOpenPalette={() => {}} onToggleTheme={() => {}} themePref="system">
+    <AppShell
+      onOpenPalette={() => {}}
+      onToggleTheme={() => {}}
+      themePref="system"
+      paletteHotkeyLabel="⌘K / Ctrl+K"
+    >
       <div />
     </AppShell>,
   );
