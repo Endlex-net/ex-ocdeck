@@ -38,10 +38,12 @@ ANCHORS=(
   packages/opencode/src/cli/tui/validate-session.ts
   packages/opencode/src/cli/cmd/tui.ts
   packages/opencode/src/cli/tui/worker.ts
+  # diff-review-workbench 新增锚点：prompt_async 提交通道
+  packages/opencode/src/session/prompt.ts
 )
 
-if [[ ${#ANCHORS[@]} -ne 23 ]]; then
-  echo "expected 23 contract anchors, got ${#ANCHORS[@]}" >&2
+if [[ ${#ANCHORS[@]} -ne 24 ]]; then
+  echo "expected 24 contract anchors, got ${#ANCHORS[@]}" >&2
   exit 2
 fi
 
@@ -144,6 +146,32 @@ cat <<'EOF'
     [[ "$ready2" == "1" ]]
     curl -sS --fail-with-body "${AUTH[@]}" "${BASE2}/session?directory=${DIR}&limit=20" | grep -q "$SID"
     curl -sS --fail-with-body "${AUTH[@]}" -X DELETE "${BASE}/session/${SID}?directory=${DIR}"
+    # diff-review-workbench：/doc 能力探测 + prompt_async 端点形状（精确断言）
+    # /doc 无 Auth（已配置密码）→ 401
+    code=$(curl -sS -o /dev/null -w '%{http_code}' "${BASE}/doc")
+    [[ "$code" == "401" ]]
+    DOC=$(curl -sS --fail-with-body "${AUTH[@]}" "${BASE}/doc")
+    echo "$DOC" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+p = d["paths"]["/session/{sessionID}/prompt_async"]
+assert p["post"]["operationId"] == "session.prompt_async", "operationId mismatch"
+# sessionID 路径参数 pattern ^ses（Schema.isStartsWith("ses") → ^ses）
+sid_param = next(x for x in p["post"].get("parameters", []) if x.get("name") == "sessionID")
+assert sid_param["schema"]["pattern"] == "^ses", f"sessionID pattern: {sid_param['schema'].get('pattern')}"
+# messageID requestBody schema pattern ^msg（Schema.isStartsWith("msg") → ^msg）
+req_schema = p["post"]["requestBody"]["content"]["application/json"]["schema"]
+mid = req_schema["properties"]["messageID"]
+assert mid["pattern"] == "^msg", f"messageID pattern: {mid.get('pattern')}"
+print("doc prompt_async ok (opId, ^ses, ^msg)")
+'
+    # 不满足 sessionID pattern 的 id（如 missing-session，无 ses 前缀）→ 500（参数校验异常）
+    code=$(curl -sS -o /dev/null -w '%{http_code}' "${AUTH[@]}" -X POST "${BASE}/session/missing-session/prompt_async?directory=${DIR}" -H 'Content-Type: application/json' -d '{"messageID":"msg_test","parts":[{"type":"text","text":"probe"}]}')
+    [[ "$code" == "500" ]]
+    # 格式合法但不存在 session id（如 ses_does_not_exist，含 ses 前缀）→ 404
+    code=$(curl -sS -o /dev/null -w '%{http_code}' "${AUTH[@]}" -X POST "${BASE}/session/ses_does_not_exist/prompt_async?directory=${DIR}" -H 'Content-Type: application/json' -d '{"messageID":"msg_test","parts":[{"type":"text","text":"probe"}]}')
+    [[ "$code" == "404" ]]
+    echo "doc + prompt_async shape ok"
 EOF
 
 if [[ "$failed" -ne 0 ]]; then

@@ -107,6 +107,10 @@ func (c *portHealthOC) ListQuestions(ctx context.Context, dir string) ([]opencod
 	return nil, opencode.ErrCapabilityUnsupported
 }
 
+func (c *portHealthOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
+	return opencode.PromptResult{Kind: opencode.ResultPreSendFailure, Detail: "portHealthOC: prompt_async not supported"}
+}
+
 // newPortRetryManager 构造一个 Manager，其 ocFactory 在 failPort 上 Health 失败、其他端口成功。
 // 用于 E1 端口重试测试。probeErr 传入 Probe 返回错误（默认 nil=成功）。
 func newPortRetryManager(t *testing.T, store TaskStore, proc ProcessBackend, failPort int, probeErr error) *Manager {
@@ -165,6 +169,9 @@ func (c *readyOCWrap) ListPermissions(ctx context.Context, dir string) ([]openco
 }
 func (c *readyOCWrap) ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error) {
 	return c.inner.ListQuestions(ctx, dir)
+}
+func (c *readyOCWrap) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
+	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text)
 }
 
 // --- E1: 端口重写三处一致 ---

@@ -80,6 +80,9 @@ func (c *blockingPermOC) SessionStatus(ctx context.Context, dir string) (map[str
 func (c *blockingPermOC) SubscribeEvents(ctx context.Context, dir string, onEvent func(opencode.Event), onReconnect func()) error {
 	return c.inner.SubscribeEvents(ctx, dir, onEvent, onReconnect)
 }
+func (c *blockingPermOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
+	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text)
+}
 
 // blockingBothOC 同时阻塞 ListPermissions 与 ListQuestions，各自 entered 信号独立。
 // 用于验证 degraded 后台重试两类型并发启动（任一释放前两者均已进入 REST）。
@@ -133,6 +136,9 @@ func (c *blockingBothOC) SessionStatus(ctx context.Context, dir string) (map[str
 }
 func (c *blockingBothOC) SubscribeEvents(ctx context.Context, dir string, onEvent func(opencode.Event), onReconnect func()) error {
 	return c.inner.SubscribeEvents(ctx, dir, onEvent, onReconnect)
+}
+func (c *blockingBothOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
+	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text)
 }
 
 // --- pending 生命周期 ---

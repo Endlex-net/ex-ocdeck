@@ -1149,10 +1149,17 @@ type mockOC struct {
 	listPermissionsErr    error
 	listQuestionsResult   []opencode.QuestionRequest
 	listQuestionsErr      error
+	// promptAsyncResult 控制 PromptAsync 返回（D1 diff-review-workbench）。
+	promptAsyncResult opencode.PromptResult
 }
 
 func newMockOC(healthOK bool) *mockOC {
-	return &mockOC{healthOK: healthOK, onReadyCh: make(chan struct{}, 1), deleteErrByID: map[string]error{}}
+	return &mockOC{
+		healthOK:           healthOK,
+		onReadyCh:          make(chan struct{}, 1),
+		deleteErrByID:      map[string]error{},
+		promptAsyncResult:  opencode.PromptResult{Kind: opencode.ResultPreSendFailure, Detail: "mockOC: prompt_async not configured"},
+	}
 }
 
 func (c *mockOC) Health(ctx context.Context) (opencode.HealthResponse, error) {
@@ -1261,6 +1268,11 @@ func (c *mockOC) ListQuestions(ctx context.Context, dir string) ([]opencode.Ques
 	return out, nil
 }
 
+// PromptAsync 返回预置的 PromptResult（newMockOC 默认 pre_send_failure，design.md D1）。
+func (c *mockOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
+	return c.promptAsyncResult
+}
+
 // --- test manager builder ---
 
 func newTestManager(t *testing.T, store TaskStore, proc ProcessBackend, wt WorktreeBackend, oc OCClient) *Manager {
@@ -1319,4 +1331,7 @@ func (c *readyOC) ListPermissions(ctx context.Context, dir string) ([]opencode.P
 }
 func (c *readyOC) ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error) {
 	return c.inner.ListQuestions(ctx, dir)
+}
+func (c *readyOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
+	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text)
 }

@@ -59,6 +59,10 @@ func (c *alwaysUnhealthyOC) ListQuestions(ctx context.Context, dir string) ([]op
 	return nil, opencode.ErrCapabilityUnsupported
 }
 
+func (c *alwaysUnhealthyOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
+	return opencode.PromptResult{Kind: opencode.ResultPreSendFailure, Detail: "alwaysUnhealthyOC: prompt_async not supported"}
+}
+
 // healthThenProbeOC：Health 就绪；Probe 返回注入错误。
 type healthThenProbeOC struct {
 	probeErr error
@@ -95,6 +99,10 @@ func (c *healthThenProbeOC) ListPermissions(ctx context.Context, dir string) ([]
 }
 func (c *healthThenProbeOC) ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error) {
 	return nil, opencode.ErrCapabilityUnsupported
+}
+
+func (c *healthThenProbeOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
+	return opencode.PromptResult{Kind: opencode.ResultPreSendFailure, Detail: "healthThenProbeOC: prompt_async not supported"}
 }
 
 func newServeRetryManager(t *testing.T, store TaskStore, proc ProcessBackend, oc OCClient, pr config.PortRange) *Manager {

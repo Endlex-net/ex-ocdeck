@@ -23,7 +23,7 @@ import (
 )
 
 // ContractBaseline 已验证契约区间上限；仅作告警，非门禁；区间检查见 internal/infrastructure/opencode/CONTRACT.md。
-const ContractBaseline = "1.18.18"
+const ContractBaseline = "1.18.26"
 
 // ContractMinVersion 已验证契约区间下限；仅作告警，非门禁。
 const ContractMinVersion = "1.18.14"
