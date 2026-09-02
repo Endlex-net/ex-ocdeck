@@ -39,6 +39,22 @@ brew install ocdeck
 
 ### Linux / WSL
 
+一键安装（确定最新 Release → 下载并校验 → 安装到 `~/.local/bin` → 生成 env 文件 → 尝试配置 systemd 自启）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Endlex-net/ex-ocdeck/main/scripts/install-linux.sh | bash
+```
+
+升级到最新版（已安装版本与目标一致时跳过下载；服务运行中会自动 restart）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Endlex-net/ex-ocdeck/main/scripts/install-linux.sh | bash -s -- upgrade
+```
+
+两种子命令都可用 `OCDECK_VERSION=vX.Y.Z` 环境变量（或 `bash -s -- install --version vX.Y.Z` 参数）指定版本，可升可降。
+
+以下手动步骤作为替代方案：
+
 从 [Releases](https://github.com/Endlex-net/ex-ocdeck/releases) 下载对应架构的压缩包：`x86_64` 主机选 `ocdeck_linux_amd64.tar.gz`，`aarch64` 主机选 `ocdeck_linux_arm64.tar.gz`（可用 `uname -m` 确认架构）。
 
 ```bash
