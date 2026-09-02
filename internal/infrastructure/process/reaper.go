@@ -28,8 +28,10 @@ type psProvider interface {
 	ProcessIdentity(ctx context.Context, pid int) (startTime string, pgid int, err error)
 	// Kill 发送信号给 pid。PID 不存在视为幂等成功；EPERM 报错。
 	Kill(pid int, sig string) error
-	// Alive 探测 pid 是否存活（kill -0 语义）。
-	// EPERM（进程存在但无权限发信号）MUST 视为存活；命令缺失视为存活失败（保守）。
+	// Alive 探测 pid 是否存活。
+	// zombie（已终止、未被父进程 reap）MUST 视为已死：SIGKILL 后被 init 收养
+	// 的进程在 PID 1 不收割的环境（docker 容器、CI runner）下长期残留进程表
+	// 条目，若按 kill -0 判活，reaper 会把已正确收割的进程永远误报为 survivor。
 	Alive(pid int) bool
 }
 
@@ -42,7 +44,8 @@ type procEntry struct {
 	ppid int
 }
 
-// darwinPSProvider 是 Darwin 平台的 ps 实现（design.md §10 v1 仅 Darwin）。
+// darwinPSProvider 是基于 POSIX ps(1)/kill(1) 的实现，macOS 与 Linux 通用
+// （design.md §10 v1 以 Darwin 为主目标；ps/kill 语义差异见各方法注释）。
 type darwinPSProvider struct{}
 
 func (darwinPSProvider) AllProcTree(ctx context.Context) ([]procEntry, error) {
@@ -121,24 +124,19 @@ func (darwinPSProvider) Kill(pid int, sig string) error {
 }
 
 func (darwinPSProvider) Alive(pid int) bool {
-	// kill -0 探测：进程存在返回 nil；不存在返回 ESRCH（exit 1, "no such process"）；
-	// 无权限返回 EPERM（exit 1, "Operation not permitted"）——EPERM 表示进程存在
-	// 但无权限发信号，MUST 视为存活。命令缺失（kill 不在 PATH）视为存活失败（保守，
-	// 避免误判已死而跳过收割）。
-	cmd := exec.Command("kill", "-0", strconv.Itoa(pid))
-	err := cmd.Run()
-	if err == nil {
-		return true
+	// 以 ps stat= 判存活而非 kill -0：kill -0 对 zombie（已终止、未被父进程
+	// reap）返回成功，会把已收割进程误判为存活——SIGKILL 后被 init 收养的
+	// 进程在 PID 1 不收割的环境（docker 容器、CI runner）下长期保持 zombie，
+	// zombie 对信号无反应，MUST 视为已死。
+	// 进程不存在时 ps 退出非零；ps stat 列对他户进程可见（不受信号权限影响，
+	// 原 kill -0 的 EPERM 判活场景照常覆盖）。探测命令失败视为存活失败
+	//（与原 kill -0 缺命令行为一致）。
+	out, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return false
 	}
-	var ee *exec.ExitError
-	if errors.As(err, &ee) && ee.Stderr != nil {
-		low := strings.ToLower(string(ee.Stderr))
-		if strings.Contains(low, "operation not permitted") {
-			// EPERM：进程存在但无权限——视为存活。
-			return true
-		}
-	}
-	return false
+	stat := strings.TrimSpace(string(out))
+	return stat != "" && !strings.HasPrefix(stat, "Z")
 }
 
 // ticketPayload 是 cleanup ticket 的包内编码结构（MUST NOT 出本包）。
