@@ -196,8 +196,8 @@ else
 OCDECK_TOKEN=${token}
 # 服务环境 PATH（完整字面值，不支持 \$ 展开）；systemd 服务据此定位 opencode/tmux 等工具
 PATH=${service_path}
-# 固定监听端口；建议取消注释，否则由 OCDECK_SERVE_PORT_RANGE 自动探测（默认 50000-50999）
-#OCDECK_LISTEN_PORT=7474
+# 固定监听端口（默认 7474）；注释掉则改由 OCDECK_SERVE_PORT_RANGE 自动探测（默认 50000-50999）
+OCDECK_LISTEN_PORT=7474
 EOF
   )
   info "已生成 ${ENV_FILE}（权限 0600），随机 OCDECK_TOKEN 与 PATH 行已写入"
@@ -254,7 +254,7 @@ if [ "$service_mode" = "systemd" ]; then
 else
   info "手动启动：${BIN_DIR}/ocdeck-server"
 fi
-info "访问：    http://127.0.0.1:7474（需取消 ${ENV_FILE} 中 OCDECK_LISTEN_PORT=7474 的注释；保持注释时由 OCDECK_SERVE_PORT_RANGE 自动探测，默认 50000-50999）"
+info "访问：    http://127.0.0.1:7474（固定端口已默认启用；如需自动探测端口，注释 ${ENV_FILE} 中 OCDECK_LISTEN_PORT 行，由 OCDECK_SERVE_PORT_RANGE 50000-50999 探测）"
 info "Token：   ${ENV_FILE} 中的 OCDECK_TOKEN"
 info "PATH：    服务环境 PATH 取自 ${ENV_FILE} 的 PATH= 行（如服务报找不到命令，检查该行是否含其所在目录）"
 info "卸载：    systemctl --user disable --now ocdeck; rm -f ${BIN_DIR}/ocdeck-server ${UNIT_FILE}（数据目录 ~/.ocdeck 保留，可自行删除）"
