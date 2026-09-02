@@ -160,9 +160,33 @@ esac
 
 # ---------- env 文件 ----------
 
+# 服务环境 PATH：以当前 shell 的 PATH 为基础，确保含 opencode 所在目录与 ~/.local/bin。
+# env 文件按字面值读取（config.parseEnvFile 不做 $ 展开），必须写入完整路径；
+# server 启动时用该行无条件覆盖服务进程 PATH（config.ApplyEnvFile），从而让
+# systemd 服务（默认 PATH 只有系统目录）也能找到 opencode/tmux 等用户目录下的工具。
+service_path="$PATH"
+if command -v opencode >/dev/null 2>&1; then
+  opencode_dir="$(dirname "$(command -v opencode)")"
+  case ":$service_path:" in
+    *":$opencode_dir:"*) ;;
+    *) service_path="${opencode_dir}:${service_path}" ;;
+  esac
+fi
+case ":$service_path:" in
+  *":$BIN_DIR:"*) ;;
+  *) service_path="${BIN_DIR}:${service_path}" ;;
+esac
+
 mkdir -p "$(dirname "$ENV_FILE")"
 if [ -f "$ENV_FILE" ]; then
   info "env 文件已存在，沿用 ${ENV_FILE}"
+  if grep -q '^PATH=' "$ENV_FILE"; then
+    # 已有 PATH= 行视为用户显式配置，不改动
+    info "已存在 PATH= 行，保持不动（用户显式配置优先）"
+  else
+    printf '\n# 服务环境 PATH（install-linux.sh 追加；完整字面值，不支持 $ 展开）\nPATH=%s\n' "$service_path" >> "$ENV_FILE"
+    info "已追加 PATH= 行（systemd 服务默认 PATH 不含 ~/.opencode/bin 等用户目录，服务据此行定位 opencode/tmux）"
+  fi
 else
   # 随机 token：/dev/urandom + tr/cut，不依赖 openssl（LC_ALL=C 保证按字节处理）
   token="$(head -c 256 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9' | cut -c 1-32)"
@@ -170,11 +194,13 @@ else
     cat > "$ENV_FILE" <<EOF
 # ocdeck 配置文件（KEY=VALUE，# 开头为注释），全部变量见 README「配置」章节
 OCDECK_TOKEN=${token}
+# 服务环境 PATH（完整字面值，不支持 \$ 展开）；systemd 服务据此定位 opencode/tmux 等工具
+PATH=${service_path}
 # 固定监听端口；建议取消注释，否则由 OCDECK_SERVE_PORT_RANGE 自动探测（默认 50000-50999）
 #OCDECK_LISTEN_PORT=7474
 EOF
   )
-  info "已生成 ${ENV_FILE}（权限 0600），随机 OCDECK_TOKEN 已写入"
+  info "已生成 ${ENV_FILE}（权限 0600），随机 OCDECK_TOKEN 与 PATH 行已写入"
 fi
 
 # ---------- systemd ----------
@@ -230,4 +256,5 @@ else
 fi
 info "访问：    http://127.0.0.1:7474（需取消 ${ENV_FILE} 中 OCDECK_LISTEN_PORT=7474 的注释；保持注释时由 OCDECK_SERVE_PORT_RANGE 自动探测，默认 50000-50999）"
 info "Token：   ${ENV_FILE} 中的 OCDECK_TOKEN"
+info "PATH：    服务环境 PATH 取自 ${ENV_FILE} 的 PATH= 行（如服务报找不到命令，检查该行是否含其所在目录）"
 info "卸载：    systemctl --user disable --now ocdeck; rm -f ${BIN_DIR}/ocdeck-server ${UNIT_FILE}（数据目录 ~/.ocdeck 保留，可自行删除）"
