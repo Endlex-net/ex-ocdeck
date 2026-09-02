@@ -180,6 +180,78 @@ func TestResolveRef_OptionInjectionRejected(t *testing.T) {
 	}
 }
 
+func TestRefExists_Existing(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	exists, err := RefExists(ctx, repo, "refs/heads/main")
+	if err != nil {
+		t.Fatalf("RefExists main: %v", err)
+	}
+	if !exists {
+		t.Error("refs/heads/main should exist")
+	}
+}
+
+func TestRefExists_Missing(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	exists, err := RefExists(ctx, repo, "refs/heads/definitely-missing")
+	if err != nil {
+		t.Fatalf("RefExists missing: %v", err)
+	}
+	if exists {
+		t.Error("missing ref should be (false, nil)")
+	}
+}
+
+func TestRefExists_NotARepo(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	exists, err := RefExists(ctx, dir, "refs/heads/main")
+	if err == nil {
+		t.Fatal("non-git dir should error, not (false, nil)")
+	}
+	if exists {
+		t.Error("non-git dir must not report exists=true")
+	}
+}
+
+func TestRefExists_EmptyRef(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	if _, err := RefExists(ctx, repo, ""); err == nil {
+		t.Fatal("empty ref should error")
+	}
+}
+
+func TestRefExists_OptionInjectionRejected(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	// --head 是 show-ref 的真实选项；无 --end-of-options 时 git 报 "--verify requires a
+	// reference"（exit 128）。有 --end-of-options 时按字面 ref 处理，missing → (false, nil)。
+	exists, err := RefExists(ctx, repo, "--head")
+	if err != nil {
+		t.Fatalf("option-looking ref should be treated as a literal ref, not an option: %v", err)
+	}
+	if exists {
+		t.Error("--head as literal ref should not exist")
+	}
+}
+
+func TestRefExists_MissingIndependentOfLocale(t *testing.T) {
+	repo := newTestRepo(t)
+	t.Setenv("LANG", "zh_CN.UTF-8")
+	t.Setenv("LC_ALL", "zh_CN.UTF-8")
+	ctx := context.Background()
+	exists, err := RefExists(ctx, repo, "refs/heads/definitely-missing")
+	if err != nil {
+		t.Fatalf("RefExists under zh_CN: %v", err)
+	}
+	if exists {
+		t.Error("missing ref should be (false, nil) regardless of locale")
+	}
+}
+
 func TestDeleteBranch_Idempotent(t *testing.T) {
 	repo := newTestRepo(t)
 	ctx := context.Background()
