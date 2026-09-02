@@ -343,16 +343,23 @@ func readBlobSide(ctx context.Context, dir, blobOID, mode string) (SideContent, 
 	return finalizeSideContent(out, mode), nil
 }
 
-// finalizeSideContent 应用内容上限与二进制嗅探：超 FileContentMaxBytes → 有界前缀 +
-// Truncated=true；IsBinary 仅由嗅探派生，不影响 Truncated 取值。mode 为 120000/160000
-// 的侧（链接目标/commit OID 文本）MUST NOT 参与嗅探（其内容天然为文本）。
+// finalizeSideContent 应用二进制嗅探与截断标志，MUST NOT 预截断原始字节内容
+//（specs/git-operations「文件 diff 查看」单侧内容处理管线唯一顺序：raw bytes → NUL 嗅探 →
+// ToValidUTF8 → rune 边界 524288）。NUL 嗅探在完整 raw 上执行以定 IsBinary；
+// Truncated 仅表示原始读取超 FileContentMaxBytes，内容裁短（ToValidUTF8 + rune 边界）
+// 由调用方核心 helper 完成（internal/task.gitDiffLocked）。旧实现先按 524288 原始字节截断
+// 再嗅探，会在多字节 rune 跨界处截成残片，经 ToValidUTF8 产生额外 U+FFFD——与唯一管线相反。
+//
+// 本函数返回的 Content 为完整 raw（可能超过 FileContentMaxBytes，上限为 execOutputLimit
+// 或工作区有界读取 FileContentMaxBytes+1），由调用方做 rune-safe 裁短。mode 为
+// 120000/160000 的侧（链接目标/commit OID 文本）MUST NOT 参与嗅探（其内容天然为文本）。
 func finalizeSideContent(content, mode string) SideContent {
 	sc := SideContent{Content: content, Exists: true, Mode: mode}
 	if len(sc.Content) > FileContentMaxBytes {
-		sc.Content = sc.Content[:FileContentMaxBytes]
 		sc.Truncated = true
 	}
 	if mode != modeSymlink && mode != modeGitlink {
+		// NUL 嗅探在完整 raw 上执行（对齐 git 启发式：前 binarySniffBytes 字节含 NUL）。
 		sc.IsBinary = contentIsBinary(sc.Content)
 	}
 	return sc

@@ -432,16 +432,25 @@ func TestActivate_LastPortFail_ReverseCleanup(t *testing.T) {
 type failAfterSubscribeOC struct {
 	*mockOC
 	entered sync.Once
+	mu      sync.Mutex
 	subbed  bool
 }
 
 func (c *failAfterSubscribeOC) SubscribeEvents(ctx context.Context, dir string, onEvent func(opencode.Event), onReconnect func()) error {
-	c.entered.Do(func() { c.subbed = true })
+	// subbed 由 SSE goroutine 写、Activate 主流程的 Health 读，持锁同步（-race 要求）。
+	c.entered.Do(func() {
+		c.mu.Lock()
+		c.subbed = true
+		c.mu.Unlock()
+	})
 	return c.mockOC.SubscribeEvents(ctx, dir, onEvent, onReconnect)
 }
 
 func (c *failAfterSubscribeOC) Health(ctx context.Context) (opencode.HealthResponse, error) {
-	if c.subbed {
+	c.mu.Lock()
+	subbed := c.subbed
+	c.mu.Unlock()
+	if subbed {
 		return opencode.HealthResponse{}, errors.New("final health failed")
 	}
 	return c.mockOC.Health(ctx)

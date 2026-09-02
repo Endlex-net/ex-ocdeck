@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"ocdeck/internal/api"
+	"ocdeck/internal/application/diffreview"
 	apptask "ocdeck/internal/application/task"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/ai"
@@ -130,12 +131,45 @@ func run() error {
 		DebtStore:       adapter,         // R7：orphan tickets 持久化跨重启恢复（design.md §10）
 		LifecycleRunner: lifecycle.New(), // design.md §7.1：init/pre-delete 脚本与 inherit
 		LogDir:          cfg.DataDir + "/logs",
-		Namer:           namer, // ai-worktree-naming：Create 经 LLM 提炼分支 slug，未配置时内部回退 Slugify
+		Namer:           namer,        // ai-worktree-naming：Create 经 LLM 提炼分支 slug，未配置时内部回退 Slugify
 		Lifecycle:       lifecycleSvc, // P1.4.4：Get/List/Archive/Restore 委托
 	})
 	// 注入 Manager 生命周期 context（design.md §4：SSE/退出监视挂进程 ctx，非 HTTP request ctx）。
 	tm.SetLifecycleCtx(ctx)
 
+	// diff-review-workbench composition root（design.md D9/F1）。
+	// 在 Reconcile/启动调度/HTTP 开放前构造 diffreview service 并注入 Manager。
+	// 五个 consumer-owned ports（DiffReviewRepository/TaskScopePort 在 store 包，
+	// PromptPort/DiffSourcePort/RuntimePort 在 task 层）+ FileEditPort（task 层）。
+	diffRepo := store.NewDiffReviewRepoAdapter(db.Queries)
+	diffScope := store.NewTaskScopeAdapter(db.Queries)
+	diffPrompt := task.NewPromptPortAdapter(tm)
+	diffSource := task.NewDiffSourcePortAdapter(tm)
+	diffRuntime := task.NewRuntimePortAdapter(tm)
+	diffFileEdit := task.NewFileEditPortAdapter(tm)
+	diffSvc := diffreview.New(diffreview.Options{
+		Repo:     diffRepo,
+		Scope:    diffScope,
+		Prompt:   diffPrompt,
+		Diff:     diffSource,
+		Runtime:  diffRuntime,
+		FileEdit: diffFileEdit,
+	})
+	tm.SetDiffReviewService(diffSvc)
+
+	// 服务启动全局收敛（design.md D2 重启恢复① + F1）。
+	// MUST 在 Reconcile/启动调度/HTTP 开放前执行：单事务 sending→delivery_unknown + 固定 error。
+	// 写库失败 fail-closed：不开放 API/调度器。未注入 diffreview.Service → no-op。
+	// F12①：收敛→开放序列收口在 diffReviewStartupGate，run() 与 main_test.go 共用同一函数
+	//（测试断言的是生产编排的 fail-closed 语义，而非复制模拟编排）。
+	return diffReviewStartupGate(ctx, tm, func() error {
+		return serveAndShutdown(ctx, tm, cfg, db, bus, aiStore, wd)
+	})
+}
+
+// serveAndShutdown 执行收敛通过后的启动序列（design.md §5/§10）：
+// Reconcile（失败 fail-closed 拒绝开放 HTTP）→ 后台周期重试 → API 装配与阻塞服务 → 关停序列。
+func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config, db *store.DB, bus *eventbus.Bus, aiStore *ai.Store, wd *process.WatchdogManager) error {
 	// 启动 reconciliation（design.md §5/§10，HTTP 就绪前完成对账）。
 	// Reconcile 失败 MUST 拒绝开放 HTTP（fail-closed）：状态不确定时开放管理面会让用户操作
 	// 建立在错误状态上（会话/DB 失同步，后续操作可能破坏数据安全边界）。
@@ -206,6 +240,22 @@ func run() error {
 		return shutdownErr
 	}
 	return serveErr
+}
+
+// diffReviewStartupGate 启动收敛门禁（design.md D2 重启恢复① + F1/F12①）：
+// 开放 API/调度器前执行 ConvergeDiffReviewOnStartup（单事务 sending→delivery_unknown），
+// 收敛写库失败 → fail-closed 拒绝启动（MUST NOT 调用 open，不开放 API/调度器）；
+// 收敛成功 → 调用 open 并透传其返回错误。
+func diffReviewStartupGate(ctx context.Context, converger startupConverger, open func() error) error {
+	if _, err := converger.ConvergeDiffReviewOnStartup(ctx); err != nil {
+		return fmt.Errorf("converge diff review on startup: %w", err)
+	}
+	return open()
+}
+
+// startupConverger 收敛门禁依赖的最小端口（task.Manager 与 store.DiffReviewRepoAdapter 均满足）。
+type startupConverger interface {
+	ConvergeDiffReviewOnStartup(ctx context.Context) (int64, error)
 }
 
 // spawnWatchdog 构造并启动 watchdog 子进程（design.md §10）。

@@ -167,4 +167,7 @@ type GitDiffDTO struct {
 	NewMode    string `json:"newMode"`
 	IsBinary   bool   `json:"isBinary"`
 	Truncated  bool   `json:"truncated"`
+	// OldTruncated/NewTruncated 为单侧截断标志（F9 stale 逐侧判定用，内部字段，不参与 JSON 输出）。
+	OldTruncated bool `json:"-"`
+	NewTruncated bool `json:"-"`
 }

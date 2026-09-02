@@ -590,6 +590,9 @@ func (m *Manager) setRuntime(taskID string, rt *taskRuntime) {
 	// G3-7：token 代际变化即时唤醒恢复退避复核（新 runtime 注册 → 旧 incident
 	// trigger 失效，不得等满退避 timer 才发现）。
 	m.wakeRecoveryIncident(taskID)
+	// D2/3.8：runtime ready 后启动本任务 diff review 调度器（随 runtime 生命周期）。
+	// 能力首探（D1 事件模型①）由调度器首轮 ProbeCapability 触发（缓存缺失即探测）。
+	m.StartDiffReviewSchedulerForTask(m.lifeCtx, taskID)
 }
 
 // clearRuntime 移除任务的运行时并停止其 SSE/退出监视。
@@ -606,6 +609,8 @@ func (m *Manager) clearRuntime(taskID string) {
 		rt.clearAgentStatus()
 		rt.stopAll()
 	}
+	// D2/3.8：runtime 移除后停止本任务 diff review 调度器（随 runtime 生命周期）。
+	m.StopDiffReviewSchedulerForTask(taskID)
 	m.wakeRecoveryIncident(taskID)
 }
 
@@ -852,6 +857,9 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 			killErr = fmt.Errorf("%w; persist orphan debts: %v", killErr, err)
 		}
 	}
+	// D2/3.8：停全部 diff review 调度器 goroutine 并 join（随 Manager Shutdown）。
+	// 在 stopAndJoinAllRuntimes 前执行，避免调度器在 runtime 清理后仍访问已关资源。
+	m.JoinAllDiffReviewSchedulers()
 	// 停全部活跃 runtime 的 SSE/watch goroutine 并 join（G：防可写已关资源）。
 	// persist 模式会话保留（tmux 持有），但 in-process 监视 goroutine 必须停。
 	m.stopAndJoinAllRuntimes()

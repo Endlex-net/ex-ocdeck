@@ -152,6 +152,9 @@ func (c *overflowOC) ListQuestions(ctx context.Context, dir string) ([]opencode.
 func (c *overflowOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
 	return opencode.PromptResult{Kind: opencode.ResultPreSendFailure, Detail: "overflowOC: prompt_async not supported"}
 }
+func (c *overflowOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
+	return opencode.CapabilityUnknown
+}
 
 // TestAllocatePort_RotationCursor 验证端口轮转游标（B5）：连续分配不每次从头扫。
 func TestAllocatePort_RotationCursor(t *testing.T) {

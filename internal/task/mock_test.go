@@ -1151,6 +1151,9 @@ type mockOC struct {
 	listQuestionsErr      error
 	// promptAsyncResult 控制 PromptAsync 返回（D1 diff-review-workbench）。
 	promptAsyncResult opencode.PromptResult
+	// probePromptAsyncResult 控制 ProbePromptAsyncCapability 返回（D1 能力探测）。
+	// 默认 CapabilityUnknown（newMockOC 不预置，零值即 unknown），测试按需覆写。
+	probePromptAsyncResult opencode.CapabilityState
 }
 
 func newMockOC(healthOK bool) *mockOC {
@@ -1273,6 +1276,11 @@ func (c *mockOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, tex
 	return c.promptAsyncResult
 }
 
+// ProbePromptAsyncCapability 返回预置的能力状态（默认 CapabilityUnknown，design.md D1）。
+func (c *mockOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
+	return c.probePromptAsyncResult
+}
+
 // --- test manager builder ---
 
 func newTestManager(t *testing.T, store TaskStore, proc ProcessBackend, wt WorktreeBackend, oc OCClient) *Manager {
@@ -1334,4 +1342,7 @@ func (c *readyOC) ListQuestions(ctx context.Context, dir string) ([]opencode.Que
 }
 func (c *readyOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
 	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text)
+}
+func (c *readyOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
+	return c.inner.ProbePromptAsyncCapability(ctx)
 }
