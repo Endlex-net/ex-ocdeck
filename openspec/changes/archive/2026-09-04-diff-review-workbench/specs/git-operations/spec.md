@@ -1,26 +1,8 @@
-# Git Operations Specification
+# Delta Spec: git-operations
 
-## Purpose
-在 Web 端提供任务 worktree 的状态查看、diff 渲染、提交与推送能力，全部经本机 git CLI 执行并保障并发与命令注入安全。
+本 delta 为 `git-operations` 增加 diff 页面的「查看/编辑」两模式与文件直接编辑能力。
 
-## Requirements
-
-### Requirement: 工作区状态查询
-系统 SHALL 提供任务 worktree 的 git 状态查询（基于 `git status --porcelain=v2 -z -uall`），展示已暂存/未暂存/未跟踪文件及增删行数统计（`git diff --numstat [--cached]`）。变更文件数 MUST 有上限（默认 10000），超限返回明确错误而非截断。
-
-未跟踪（untracked）文件的行数统计 SHALL 按文件实际行数计入 additions（deletions=0）：行计数语义与 git 一致（`count('\n')`，末行无换行符时 +1）；所有 regular file MUST 始终执行二进制嗅探（前 8000 字节含 NUL → 标记 IsBinary 且不计行），嗅探不受行计数预算约束；非 regular file（symlink/fifo 等）MUST 跳过；行计数读取受容量保护——单文件超过 16MB 或全部 untracked 文本读取累计超过 64MB（按实际读取字节计）时 MUST 跳过相应文件的行计数（additions 保持 0，IsBinary 仍正确标记，视为容量保护而非失败）；文件读取 IO 错误 MUST 返回明确错误（含文件路径与操作上下文），MUST NOT 静默置零；唯一例外：status 快照后文件被并发删除（ENOENT）属正常竞态，MUST 跳过该文件计数且不视为错误（代码中须注释区分 ENOENT 竞态跳过与其他 IO 错误）。
-
-#### Scenario: 查看任务改动
-- **WHEN** 用户在任务的 git 面板请求状态
-- **THEN** 系统返回文件级状态列表与增删行数
-
-#### Scenario: 未跟踪新文件显示行数
-- **WHEN** worktree 中新增一个 100 行的未跟踪文本文件
-- **THEN** 状态列表中该文件 additions=100、deletions=0
-
-#### Scenario: 未跟踪二进制文件
-- **WHEN** worktree 中新增一个未跟踪的二进制文件
-- **THEN** 该文件标记 IsBinary，不计入行数统计
+## MODIFIED Requirements
 
 ### Requirement: 文件 diff 查看
 系统 SHALL 提供任务 worktree 单文件的两侧版本内容查询，供前端 CodeMirror merge 视图渲染。端点与请求参数形态不变（`GET /api/v1/tasks/{id}/git/diff?ref=&path=&untracked=`）；响应承载旧侧内容、新侧内容、两侧存在性标记、两侧 git mode、二进制标记与截断标记。
@@ -149,6 +131,8 @@ diff 视图 SHALL 使用 CodeMirror 6 merge 组件渲染文件两侧版本内容
 - **WHEN** 用户打开文件 diff 且未显式进入编辑模式
 - **THEN** 视图为查看模式，内容只读
 
+## ADDED Requirements
+
 ### Requirement: diff 文件直接编辑
 diff 视图 SHALL 提供查看与编辑两种模式，默认查看模式；编辑模式 MUST 由用户显式进入。编辑模式下用户 MUST 可直接修改新侧（工作区）内容；修改 SHALL 实时生效（无保存按钮、无脏状态概念），写回工作区文件。查看模式承担批注手势；编辑模式 MUST NOT 提供批注手势。
 
@@ -217,50 +201,3 @@ agent 会话忙时 MUST 仍允许进入编辑模式，但编辑区 MUST 显示�
 #### Scenario: 还原需确认
 - **WHEN** 用户点击还原入口
 - **THEN** 系统先请求用户明确确认，确认前不执行还原
-
-### Requirement: 提交改动
-系统 SHALL 支持在任务 worktree 上执行 commit：用户选择要提交的文件（或全部）并输入 commit message。系统 MUST 使用本机 git CLI 执行，保持与用户环境一致（含 hooks、签名）。
-
-#### Scenario: 提交全部改动
-- **WHEN** 用户输入 commit message 并提交
-- **THEN** 系统在 worktree 中执行 stage + commit 并返回结果
-
-#### Scenario: commit hook 失败
-- **WHEN** commit 被 git hook 拒绝
-- **THEN** 系统将 git 的错误输出原样展示给用户
-
-### Requirement: 推送分支
-系统 SHALL 支持将任务分支 push 到远端（含首次 push 时设置 upstream）。系统 MUST NOT 自动 force-push。
-
-#### Scenario: 首次推送
-- **WHEN** 用户对未推送过的任务分支执行 push
-- **THEN** 系统执行 `git push -u origin <branch>` 并返回结果
-
-#### Scenario: 推送被拒绝
-- **WHEN** push 被远端拒绝（non-fast-forward 等）
-- **THEN** 系统展示 git 错误，不自动采取任何补救动作
-
-### Requirement: git 操作串行化
-对同一项目仓库的 worktree 增删等仓库级写操作 SHALL 经每 repo 锁串行执行，避免并发 git 锁冲突；status/diff 等只读操作 MUST NOT 进入写队列。
-
-#### Scenario: 并发创建任务
-- **WHEN** 用户同时创建多个任务
-- **THEN** worktree 创建操作排队串行执行，全部成功
-
-### Requirement: git 执行安全约束
-系统 SHALL 以固定命令白名单 + argv 数组调用 git CLI，MUST NOT 拼接 shell 字符串。分支名 MUST 经 `git check-ref-format` 校验。全部 git 命令 MUST 支持 context 取消，stdout/stderr 有界读取。
-
-#### Scenario: 非法分支名
-- **WHEN** 任务名称生成的分支名不合法
-- **THEN** 创建被拒绝并提示修正任务名称
-
-### Requirement: 纯目录项目任务的 git 操作降级
-对 `kind=dir` 项目的任务，任务级 git 操作（status/diff/commit/push）SHALL 统一拒绝并返回明确错误（invalid_input，消息说明该项目为纯目录类型、非 git 仓库），MUST NOT 对任务目录执行任何 git 命令，MUST NOT 尝试探测目录内的子仓库。Web UI SHALL 对 dir 项目的任务隐藏 git 面板入口（status/diff/commit/push），不展示分支名。
-
-#### Scenario: dir 任务请求 git 状态
-- **WHEN** 对 `kind=dir` 项目的任务调用 git status/diff/commit/push 任一 API
-- **THEN** 系统返回 invalid_input 错误，明确说明纯目录项目不支持 git 操作，且未执行任何 git 命令
-
-#### Scenario: dir 任务的 UI 降级
-- **WHEN** 用户在 Web UI 打开 dir 项目的任务
-- **THEN** git 面板入口不可见，任务不显示分支名；项目列表/详情显示项目类型标识
