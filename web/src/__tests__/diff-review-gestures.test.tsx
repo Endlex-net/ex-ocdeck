@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { act, useState } from 'react';
+import { readFileSync } from 'node:fs';
 import { EditorView } from '@codemirror/view';
 import DiffViewer from '../components/diff/DiffViewer';
 import { ApiError } from '../api';
@@ -84,7 +85,8 @@ function renderViewer(over: {
   onRefreshDiff?: () => Promise<void>;
   editIO?: { read: ReturnType<typeof vi.fn>; write: ReturnType<typeof vi.fn> };
   agentBusy?: boolean;
-  modeOverride?: 'unified' | 'side-by-side';
+  /** undefined = 测试缺省 unified；null = 无覆盖（走组件默认形态选择）；'side-by-side' = 并排。 */
+  modeOverride?: 'unified' | 'side-by-side' | null;
 }) {
   const onModeChange = vi.fn();
   const onWrapChange = vi.fn();
@@ -100,7 +102,7 @@ function renderViewer(over: {
       onLocateAnnotations={over.onLocateAnnotations ?? (() => {})}
       onRefreshDiff={over.onRefreshDiff}
       editIO={over.editIO}
-      modeOverride={over.modeOverride ?? 'unified'}
+      modeOverride={over.modeOverride === undefined ? 'unified' : over.modeOverride}
       onModeChange={onModeChange}
       wrapOverride={false}
       onWrapChange={onWrapChange}
@@ -570,6 +572,137 @@ describe('行内标记（聚合、悬停摘要、点击定位、三元组隔离�
       annotations: [makeAnn({ side: 'old', startLine: 2, endLine: 2, comment: '旧侧批注' })],
     });
     await until(() => container.querySelector('.cm-annotationDot') !== null);
+    unmount();
+  });
+});
+
+describe('单侧存在文件：并排空侧坍缩铺满（修正 1：语义仍是并排 MergeView，不是默认切单列）', () => {
+  beforeEach(() => stubMatchMedia(false)); // 宽屏：无缺省 override 时默认并排
+
+  const pureNew = () =>
+    makeDiff({
+      oldExists: false,
+      oldContent: '',
+      oldMode: '',
+      newContent: 'fresh 1\nfresh 2\nfresh 3\n',
+      newMode: '100644',
+    });
+  const pureGone = () =>
+    makeDiff({
+      oldExists: true,
+      oldContent: 'gone 1\ngone 2\n',
+      newExists: false,
+      newContent: '',
+      newMode: '',
+    });
+
+  it('纯新文件宽屏无 override：并排双实例 + a 侧坍缩标记（cm-merge-a 存在但被坍缩）', async () => {
+    const { container, unmount } = renderViewer({ diff: pureNew(), modeOverride: null });
+    // 语义仍是并排 MergeView：两个编辑器实例都建（空侧坍缩为 0 宽不可见，非不渲染）
+    await until(() => editorViews(container).length === 2);
+    expect(container.querySelector('.cm-merge-a')).not.toBeNull();
+    expect(container.querySelector('.cm-merge-b')).not.toBeNull();
+    expect(container.querySelector('.diff-collapse-a')).not.toBeNull();
+    expect(container.querySelector('.diff-collapse-b')).toBeNull();
+    // 空 a 侧文档为空；新侧内容正常呈现
+    expect(container.textContent).toContain('fresh 1');
+    unmount();
+  });
+
+  it('纯删除文件：对称坍缩（b 侧坍缩标记，a 侧铺满）', async () => {
+    const { container, unmount } = renderViewer({ diff: pureGone(), modeOverride: null });
+    await until(() => editorViews(container).length === 2);
+    expect(container.querySelector('.diff-collapse-b')).not.toBeNull();
+    expect(container.querySelector('.diff-collapse-a')).toBeNull();
+    expect(container.textContent).toContain('gone 1');
+    unmount();
+  });
+
+  it('CSS：坍缩侧 wrapper 0 宽隐藏（flex:0 0 0 + visibility:hidden），存在侧 flexGrow 铺满', () => {
+    const css = readFileSync('src/legacy-components.css', 'utf8');
+    const block = css.match(/\.diff-collapse-a[^{]*\{([^}]*)\}/);
+    expect(block, 'diff-collapse 规则存在').toBeTruthy();
+    expect(block![0]).toContain('.cm-mergeViewEditor');
+    expect(block![1]).toMatch(/flex:\s*0 0 0/);
+    expect(block![1]).toMatch(/visibility:\s*hidden/);
+  });
+
+  it('override 语义：手动切单列=unified 单编辑器无坍缩；手动切并排=坍缩铺满（override 恒优先）', async () => {
+    // 用户手动切「单列」→ unifiedMergeView，无坍缩标记
+    const uni = renderViewer({ diff: pureNew(), modeOverride: 'unified' });
+    await until(() => editorViews(uni.container).length === 1);
+    expect(uni.container.querySelector('.cm-merge-b')).not.toBeNull();
+    expect(uni.container.querySelector('.cm-merge-a')).toBeNull();
+    expect(uni.container.querySelector('.diff-collapse-a')).toBeNull();
+    uni.unmount();
+    // 用户手动切「并排」→ 单侧不存在时呈现坍缩铺满（不再渲染可见双栏空半）
+    const side = renderViewer({ diff: pureNew(), modeOverride: 'side-by-side' });
+    await until(() => editorViews(side.container).length === 2);
+    expect(side.container.querySelector('.diff-collapse-a')).not.toBeNull();
+    side.unmount();
+  });
+
+  it('坍缩铺满下批注手势可用（b 侧框选 → side=new、快照取自 newContent）', async () => {
+    const onCreateAnnotation = vi.fn(async (_input: AnnotationCreateInput) => {});
+    const { container, unmount } = renderViewer({
+      diff: pureNew(),
+      modeOverride: null,
+      onCreateAnnotation,
+    });
+    await until(() => editorViews(container).length === 2);
+    const view = EditorView.findFromDOM(
+      container.querySelector<HTMLElement>('.cm-merge-b .cm-content')!,
+    )!;
+    expect(view).toBeTruthy();
+    act(() => {
+      view.dispatch({
+        selection: { anchor: view.state.doc.line(2).from, head: view.state.doc.line(2).to },
+      });
+      container
+        .querySelectorAll('.cm-merge-b .cm-line')[1]
+        .dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    });
+    expect(container.querySelector('.ann-inline')).toBeTruthy();
+    await submitDraftWith(container, '新文件批注');
+    expect(onCreateAnnotation).toHaveBeenCalledTimes(1);
+    expect(onCreateAnnotation.mock.calls[0][0]).toMatchObject({
+      side: 'new',
+      startLine: 2,
+      endLine: 2,
+      comment: '新文件批注',
+    });
+    expect(onCreateAnnotation.mock.calls[0][0].snapshot).toContain('fresh 2');
+    unmount();
+  });
+
+  it('坍缩铺满下编辑模式可用（资格 eligible → 进入编辑、b 侧内容可写）', async () => {
+    const io = { read: vi.fn(), write: vi.fn() };
+    io.read.mockResolvedValue({
+      editable: true,
+      content: 'fresh 1\nfresh 2\nfresh 3\n',
+      baseHash: 'h0',
+      lineEnding: 'lf',
+      hasBom: false,
+      mode: '0644',
+    } satisfies FileEditRead);
+    io.write.mockResolvedValue({ baseHash: 'h1' });
+    const { container, unmount } = renderViewer({
+      diff: pureNew(),
+      modeOverride: null,
+      editIO: io,
+    });
+    await until(() => editorViews(container).length === 2);
+    await clickEdit(container);
+    // 编辑目标为可写编辑器（b 侧）；坍缩的 a 侧始终只读
+    const view = editorViews(container).find(
+      (v) => v.contentDOM.getAttribute('contenteditable') === 'true',
+    )!;
+    expect(view).toBeTruthy();
+    act(() => {
+      view.dispatch({ changes: { from: view.state.doc.length, insert: 'added\n' } });
+    });
+    await until(() => io.write.mock.calls.length > 0);
+    expect(io.write.mock.calls[0][0].content).toContain('added');
     unmount();
   });
 });

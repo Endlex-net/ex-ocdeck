@@ -24,6 +24,7 @@ import {
   setCandidateEffect,
   setInlineRegionEffect,
   sideMarkerMap,
+  syncInlineHostWidth,
   unifiedMarkerMap,
   type AnnotationGesture,
 } from './annotation-ext';
@@ -181,9 +182,18 @@ export default function DiffViewer({
   const [restoreBusy, setRestoreBusy] = useState(false);
 
   const state = deriveDiffState(diff);
+  const singleSided = diff.oldExists !== diff.newExists;
+  // 形态选择保持用户语义：null = 未选择（按视口默认）；单侧存在不再默认切单列——
+  // 并排形态下空侧坍缩铺满（见 collapseSide），视觉像单列但语义仍是并排 MergeView。
   const mode: DiffViewMode =
     modeOverride ??
     (window.matchMedia('(max-width: 1024px)').matches ? 'unified' : 'side-by-side');
+  /* 单侧存在（纯新增/纯删除）+ 并排：不存在侧坍缩为零宽不可见，存在侧编辑器铺满全宽。
+     MergeView 无单侧配置面（merge 包恒建 a/b 两 EditorView），坍缩走 CSS（diff-collapse-*）：
+     空侧 wrapper flex:0 0 0 + visibility:hidden——保留高度测量维持 merge 对齐计算，
+     但不可见不占宽、不可交互不成为焦点目标；手势/编辑/内联批注区全走既有并排路径。 */
+  const collapseSide: 'a' | 'b' | null =
+    mode === 'side-by-side' && singleSided ? (diff.oldExists ? 'b' : 'a') : null;
   // mode 变更横幅独立叠加（spec：两侧均存在且 mode 不同；可与 merge 视图或状态提示同时出现）
   const modeChanged = diff.oldExists && diff.newExists && diff.oldMode !== diff.newMode;
 
@@ -248,6 +258,27 @@ export default function DiffViewer({
       host,
     });
   };
+
+  /* 不换行长行修复：批注区宿主宽度跟随 scroller 可视宽度（而非内容宽度），
+   * 配合 .ann-inline-host 的 sticky left:0，保证取消/发布按钮恒在可视区右缘内。
+   * 窗口 resize / gutter 宽度变化（行数位数增长）时经 ResizeObserver 重量。 */
+  useEffect(() => {
+    if (!draft) return;
+    const view = editorsRef.current[draft.editorKey];
+    if (!view) return;
+    const host = draft.host;
+    const sync = () => syncInlineHostWidth(view, host);
+    sync();
+    const observer = new ResizeObserver(sync);
+    observer.observe(view.scrollDOM);
+    const gutters = view.scrollDOM.querySelector('.cm-gutters');
+    if (gutters) observer.observe(gutters);
+    return () => {
+      observer.disconnect();
+      host.style.width = '';
+      host.style.left = '';
+    };
+  }, [draft]);
 
   const submitDraft = async () => {
     // fail-closed：仅查看模式可提交批注（F7：草稿不得带入编辑模式）
@@ -833,7 +864,10 @@ export default function DiffViewer({
               </span>
             </div>
           )}
-          <div ref={containerRef} className="diff-editor" />
+          <div
+            ref={containerRef}
+            className={collapseSide ? `diff-editor diff-collapse-${collapseSide}` : 'diff-editor'}
+          />
           {/* 批注 6：内联批注区（参考 GitLab 变更评论）——portal 挂进 CM block widget 宿主，
               在该侧最后选中行下方切开，随编辑器滚动，无悬浮浮层 */}
           {draft &&

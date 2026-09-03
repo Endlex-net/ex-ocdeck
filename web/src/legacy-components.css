@@ -1116,6 +1116,15 @@ select.input {
   padding: 10px 0 24px;
 }
 
+/* 单侧存在（纯新增/纯删除）并排形态的空侧坍缩：wrapper 0 宽 + 隐藏，存在侧 flexGrow 铺满全宽。
+   语义仍是并排 MergeView（手势/编辑/内联批注区走并排路径）；空侧 EditorView 实例保留
+   （merge 对齐需要高度测量），但 0 宽不可见、不可交互、不进 Tab 焦点序。 */
+.diff-collapse-a .cm-mergeViewEditor:has(> .cm-editor.cm-merge-a),
+.diff-collapse-b .cm-mergeViewEditor:has(> .cm-editor.cm-merge-b) {
+  flex: 0 0 0;
+  visibility: hidden;
+}
+
 /* 并排（.cm-mergeView 容器）与单列（单个 .cm-editor）统一外框 */
 .diff-editor > .cm-mergeView,
 .diff-editor > .cm-editor {
@@ -1637,6 +1646,13 @@ select.input {
 .ann-inline-host {
   display: block;
   cursor: default;
+  /* 不换行长行：宿主在 .cm-content 内容流内宽度跟随最长行，横向滚动会把卡片推出视口。
+     sticky 把卡片钉在可视区内（left 偏移与宽度由 syncInlineHostWidth 量测 scroller 可视宽 /
+     gutters 宽后内联设置，钉在内容区左缘、避开 sticky gutters；未设置时回退默认块级宽度
+     ——换行场景内容宽即可视宽，行为不变） */
+  position: sticky;
+  left: 0;
+  box-sizing: border-box;
 }
 
 .ann-inline {

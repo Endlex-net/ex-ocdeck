@@ -71,8 +71,8 @@ export function GitPanel({
   const [diffError, setDiffError] = useState('');
   // 用户 diff 形态选择（DR1）：null = 未选择（按视口默认）；跨文件切换与 resize 保留，面板卸载丢弃。
   const [modeOverride, setModeOverride] = useState<DiffViewMode | null>(null);
-  // 换行开关（design D6）：默认关（横向滚动）；生命周期与 modeOverride 一致（跨文件/视口保留，卸载丢弃）。
-  const [wrapOverride, setWrapOverride] = useState(false);
+  // 换行开关：默认开（长行默认换行展示）；用户可手动切不换行，生命周期与 modeOverride 一致（跨文件/视口保留，卸载丢弃）。
+  const [wrapOverride, setWrapOverride] = useState(true);
   // 批注 3：编辑/查看模式偏好提升到三元组 key 之外——切文件保持模式（新文件经完整资格预取/门禁）
   const [editModePreferred, setEditModePreferred] = useState(false);
   // openDiff 请求序号：仅最新请求可写 diff/diffError/diffLoading（I2 乱序防护）

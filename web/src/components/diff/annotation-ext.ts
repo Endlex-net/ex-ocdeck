@@ -219,6 +219,29 @@ const inlineRegionField = StateField.define<DecorationSet>({
 
 export const inlineRegionExtension: Extension = inlineRegionField;
 
+/**
+ * 不换行长行修复：内联批注区宿主嵌在 .cm-content 内容流内，块级宽度跟随内容宽度
+ * （不换行时 = 最长行，远超可视宽度），横向滚动会把卡片右缘（取消/发布按钮）推出视口。
+ * 这里把宿主宽度钉到 scroller 可视宽度（clientWidth 减去 gutters 等左侧静态偏移），
+ * 配合 CSS `position: sticky; left: 0` 让卡片横向滚动时整体钉在可视区内。
+ * jsdom 等无真实布局环境量到 0 → 清除内联宽度，回退默认块级行为（换行场景不受影响）。
+ */
+export function syncInlineHostWidth(view: EditorView, host: HTMLElement): void {
+  const scroller = view.scrollDOM;
+  // content 相对 scroller 内容原点的静态左偏移（gutters 宽度）：
+  // 渲染 rect 已含 scrollLeft 平移，加回即得静态偏移
+  const left =
+    view.contentDOM.getBoundingClientRect().left -
+    scroller.getBoundingClientRect().left +
+    scroller.scrollLeft -
+    scroller.clientLeft;
+  const width = scroller.clientWidth - Math.max(0, left);
+  host.style.width = width > 0 ? `${width}px` : '';
+  // sticky 偏移 = gutters 静态宽度：卡片钉在内容区左缘（而非滚到 scroller 左缘被
+  // sticky gutters 遮住左边条/输入区）
+  host.style.left = width > 0 && left > 0 ? `${left}px` : '';
+}
+
 // ---------- 手势捕获 ----------
 
 /** unified 视图删除行（.cm-deletedLine widget）→ 旧侧行号（经 chunks 映射，spec side 映射规则）。 */
