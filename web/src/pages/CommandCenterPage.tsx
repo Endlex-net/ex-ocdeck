@@ -26,6 +26,7 @@ import {
 } from './command-center-selector';
 import { createErrorMessage } from '../hooks';
 import { classifyMatch } from '../fuzzy-match';
+import { rankBranchOptions } from './command-center-branch-rank';
 import {
   PALETTE_FOCUS_EVENT,
   clearPendingPaletteFocus,
@@ -69,13 +70,16 @@ export function shouldAcceptBranchResult(
   return gen === currentGen && currentProjectId === projectId;
 }
 
-/** 纯函数：finally 是否应清 refreshing 标志。
- *  仅当本次刷新仍是当前刷新项目时清；否则已由项目切换 effect 重置（避免清错新项目）。 */
+/** 纯函数：finally 是否应释放本次刷新所有权（单飞锁 + refreshing 指示）。
+ *  仅当记录的刷新项目与代际均属本次刷新时释放；否则所有权已转移给新刷新或已被项目切换 effect 重置，
+ *  旧请求的 finally 不得代清（避免释放新项目的单飞锁允许并发刷新）。 */
 export function shouldClearRefreshing(
   refreshingProjectId: string | null,
+  refreshingGen: number,
   thisProjectId: string,
+  thisGen: number,
 ): boolean {
-  return refreshingProjectId === thisProjectId;
+  return refreshingProjectId === thisProjectId && refreshingGen === thisGen;
 }
 
 /**
@@ -733,7 +737,8 @@ function relTimeMs(ms: number): string {
 // ==================== 内联新建任务面板 ====================
 
 /** 内联新建任务面板：项目可过滤下拉 + 任务名 + 基准分支（repo）+ 刷新远端分支 + dir 警告。
- *  提交门禁：有效项目 ID + 非空任务名才可 POST；偏离已选清除 ID；base_ref 仅 repo；在途防重复。 */
+ *  提交门禁：有效项目 ID + 非空任务名 + repo 分支列表 ready 才可 POST；偏离已选清除 ID；
+ *  base_ref 仅 repo 且取过滤排序首项；在途防重复。 */
 function NewTaskPanel({
   projects,
   refresh,
@@ -755,7 +760,10 @@ function NewTaskPanel({
   const [projListOpen, setProjListOpen] = useState(false);
   const [taskName, setTaskName] = useState('');
   const [baseRef, setBaseRef] = useState('');
-  const [branches, setBranches] = useState<string[]>([]);
+  // D9 分支列表状态机：idle|loading|ready|error，与 lastSuccessfulBranches 正交。
+  // 仅 ready 计算提交候选；loading/error 禁止提交；dir 项目无此状态机（恒 idle）。
+  const [branchPhase, setBranchPhase] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [lastSuccessfulBranches, setLastSuccessfulBranches] = useState<string[]>([]);
   const [branchesError, setBranchesError] = useState('');
   const [branchListOpen, setBranchListOpen] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -769,8 +777,10 @@ function NewTaskPanel({
   const projGenRef = useRef(0);
   const selectedProjectRef = useRef<Project | null>(null);
   const refreshInFlightRef = useRef(false);
-  // 当前正在刷新的项目 ID：finally 仅清自身项目的 refreshing，避免清错新项目
+  // 刷新所有权（项目 ID + 代际）：finally 仅在项目与代际均匹配时释放单飞锁与 refreshing，
+  // 避免跨项目竞态下旧请求的 finally 释放新刷新的单飞锁（允许并发刷新）
   const refreshingProjectIdRef = useRef<string | null>(null);
+  const refreshingGenRef = useRef(0);
 
   const consumeFocus = (nonce: number) => {
     if (focusedNonceRef.current === nonce) return;
@@ -803,33 +813,43 @@ function NewTaskPanel({
     return q ? projects.filter((p) => p.name.toLowerCase().includes(q)) : projects;
   }, [projects, projectQuery]);
 
-  // 选中项目时加载分支（repo 项目）。
+  // 选中项目时加载分支（repo 项目）：loading + 初次 GET；成功（含空数组）→ ready 并写入
+  // lastSuccessfulBranches；失败 → error（无历史则列表为空）。
   // 任何选择变化（含切到 dir/清空）都推进代际，使此前未完成的 listBranches/refreshBranches 失效。
   useEffect(() => {
     // 推进代际（清空/切到 dir 也推进，使在途异步响应失效）
     ++projGenRef.current;
     selectedProjectRef.current = selectedProject;
-    // 切换项目时重置刷新中状态（与旧项目解耦，避免 B 永久处于刷新中）
+    // 切换项目时重置刷新状态（与旧项目解耦，避免 B 永久处于刷新中，并释放旧刷新所有权）
     setRefreshing(false);
     refreshInFlightRef.current = false;
     refreshingProjectIdRef.current = null;
+    refreshingGenRef.current = 0;
     if (!selectedProject || selectedProject.kind === 'dir') {
-      setBranches([]);
+      // 切走 repo → idle 并清空最近成功列表
+      setBranchPhase('idle');
+      setLastSuccessfulBranches([]);
       setBaseRef('');
       return;
     }
     setBaseRef(selectedProject.default_branch);
     setBranchesError('');
+    setBranchPhase('loading');
+    setLastSuccessfulBranches([]);
     const gen = projGenRef.current;
     api
       .listBranches(selectedProject.id)
       .then((bs) => {
-        if (shouldAcceptBranchResult(gen, projGenRef.current, selectedProject.id, selectedProjectRef.current?.id ?? null))
-          setBranches(bs);
+        if (shouldAcceptBranchResult(gen, projGenRef.current, selectedProject.id, selectedProjectRef.current?.id ?? null)) {
+          setLastSuccessfulBranches(bs);
+          setBranchPhase('ready');
+        }
       })
       .catch((err) => {
-        if (shouldAcceptBranchResult(gen, projGenRef.current, selectedProject.id, selectedProjectRef.current?.id ?? null))
+        if (shouldAcceptBranchResult(gen, projGenRef.current, selectedProject.id, selectedProjectRef.current?.id ?? null)) {
           setBranchesError(err instanceof ApiError ? `[${err.code}] ${err.message}` : '获取分支列表失败');
+          setBranchPhase('error');
+        }
       });
   }, [selectedProject]);
 
@@ -840,21 +860,31 @@ function NewTaskPanel({
     const gen = ++projGenRef.current;
     const projectId = selectedProject.id;
     refreshingProjectIdRef.current = projectId;
+    refreshingGenRef.current = gen;
     setRefreshing(true);
     setBranchesError('');
+    // refresh 在途进入 loading 禁止提交；不清空 lastSuccessfulBranches（保留 stale 展示）
+    setBranchPhase('loading');
     try {
       const bs = await api.refreshBranches(projectId);
       // 校验代际未变且当前选择仍是同一项目（ref 读最新值，不用闭包捕获值）
-      if (shouldAcceptBranchResult(gen, projGenRef.current, projectId, selectedProjectRef.current?.id ?? null))
-        setBranches(bs);
+      if (shouldAcceptBranchResult(gen, projGenRef.current, projectId, selectedProjectRef.current?.id ?? null)) {
+        setLastSuccessfulBranches(bs);
+        setBranchPhase('ready');
+      }
     } catch (err) {
-      if (gen === projGenRef.current)
+      if (shouldAcceptBranchResult(gen, projGenRef.current, projectId, selectedProjectRef.current?.id ?? null)) {
         setBranchesError(err instanceof ApiError ? `[${err.code}] ${err.message}` : '刷新远端分支失败');
+        // 保留最近一次 ready 数据作 stale 展示并标注「本地快照未刷新」；stale 不参与提交
+        setBranchPhase('error');
+      }
     } finally {
-      refreshInFlightRef.current = false;
-      // 仅当本次刷新仍是当前刷新项目时清 refreshing；否则已由项目切换 effect 重置
-      if (shouldClearRefreshing(refreshingProjectIdRef.current, projectId)) {
+      // 仅当本次刷新仍持有刷新所有权（项目与代际均匹配）时释放单飞锁与刷新指示；
+      // 否则所有权已转移新刷新或已被项目切换 effect 重置，不得代清
+      if (shouldClearRefreshing(refreshingProjectIdRef.current, refreshingGenRef.current, projectId, gen)) {
+        refreshInFlightRef.current = false;
         refreshingProjectIdRef.current = null;
+        refreshingGenRef.current = 0;
         setRefreshing(false);
       }
     }
@@ -866,17 +896,34 @@ function NewTaskPanel({
     if (selectedProject && v !== selectedProject.name) setSelectedProject(null);
   };
 
-  const branchOptions = useMemo(() => {
-    const base = branches.length > 0 ? branches : selectedProject ? [selectedProject.default_branch] : [];
-    return baseRef && !base.includes(baseRef) ? [baseRef, ...base] : base;
-  }, [branches, selectedProject, baseRef]);
-
-  const filteredBranches = useMemo(() => {
+  // stale 展示列表：loading/error 时保留最近成功列表仅供下拉展示（初次加载/失败为空），不参与提交
+  const staleBranches = useMemo(() => {
     const q = baseRef.trim().toLowerCase();
-    return q ? branchOptions.filter((b) => b.toLowerCase().includes(q)) : branchOptions;
-  }, [branchOptions, baseRef]);
+    return q ? lastSuccessfulBranches.filter((b) => b.toLowerCase().includes(q)) : lastSuccessfulBranches;
+  }, [lastSuccessfulBranches, baseRef]);
 
-  const canSubmit = !!selectedProject && taskName.trim() !== '' && !creating && !refreshing;
+  // 提交候选（D2/D9）：仅 ready 计算——成功空列表回退 default_branch（loading/error 不得回退）；
+  // normalizedInput 非空且不在基础候选（大小写敏感 includes）时前置 synthetic；过滤后按 D2 排序。
+  // stale MUST NOT 进入本列表（提交唯一来源 base_ref = filteredBranches[0]）。
+  const filteredBranches = useMemo(() => {
+    if (branchPhase !== 'ready') return [];
+    const normalizedInput = baseRef.trim();
+    const base = lastSuccessfulBranches.length
+      ? lastSuccessfulBranches
+      : selectedProject?.default_branch
+        ? [selectedProject.default_branch]
+        : [];
+    const candidates =
+      normalizedInput && !base.includes(normalizedInput) ? [normalizedInput, ...base] : base;
+    const q = normalizedInput.toLowerCase();
+    const filtered = q ? candidates.filter((b) => b.toLowerCase().includes(q)) : candidates;
+    return rankBranchOptions(filtered, q);
+  }, [branchPhase, lastSuccessfulBranches, selectedProject, baseRef]);
+  // 下拉展示项：ready 用提交候选；loading/error 展示 stale
+  const branchListItems = branchPhase === 'ready' ? filteredBranches : staleBranches;
+
+  // 门禁（D3/D9）：repo 另须分支列表 ready；loading/error（含 refresh 在途）禁止提交
+  const canSubmit = !!selectedProject && taskName.trim() !== '' && !creating && (isDir || branchPhase === 'ready');
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -885,7 +932,7 @@ function NewTaskPanel({
     setMutError('');
     const proj = selectedProject;
     try {
-      const t = await api.createTask(proj.id, taskName.trim(), isDir ? undefined : baseRef || undefined);
+      const t = await api.createTask(proj.id, taskName.trim(), isDir ? undefined : filteredBranches[0] || undefined);
       setTaskName('');
       // mutation 成功：跳转工作台（from=home）+ trailing refresh（失败静默，store error 通道承担）
       navigate(`/task/${t.id}?from=home`);
@@ -964,11 +1011,12 @@ function NewTaskPanel({
             {branchListOpen && (
               <div className="cc-combo-list open" role="listbox">
                 {refreshing && <div className="cc-combo-empty">刷新中…</div>}
-                {filteredBranches.map((b) => (
+                {branchListItems.map((b) => (
                   <button
                     key={b}
                     type="button"
-                    className={`cc-combo-item${b === baseRef ? ' hl' : ''}`}
+                    // 高亮过滤排序首项（与提交值 filteredBranches[0] 一致）；列表为空时无高亮
+                    className={`cc-combo-item${b === branchListItems[0] ? ' hl' : ''}`}
                     onMouseDown={(e) => e.preventDefault()}
                     onClick={() => {
                       setBaseRef(b);
@@ -989,6 +1037,9 @@ function NewTaskPanel({
               </div>
             )}
             {branchesError && <div className="error-line cc-field-error">{branchesError}</div>}
+            {branchPhase === 'error' && lastSuccessfulBranches.length > 0 && (
+              <div className="error-line cc-field-error">本地快照未刷新</div>
+            )}
           </div>
         )}
 

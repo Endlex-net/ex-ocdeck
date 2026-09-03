@@ -22,7 +22,7 @@ import (
 func TestTypedRuntimeEvent_ServeInfraErrorSuspended(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	proc.sessions[serveSessionName("t1")] = true
 	proc.sessions[tuiSessionName("t1")] = true
