@@ -4,6 +4,7 @@ package diffreview
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"testing"
 )
@@ -18,11 +19,14 @@ type mockRepo struct {
 	createErr   error
 	// 错误注入（3.11 编排测试用）。
 	casErr           error
-	casMatched       bool // casMatched=true 时 CAS 强制返回 matched=false（模拟 CAS 失配）
+	casErrOnTo       string // 非空时仅 CAS 目标状态等于该值才返回 casErr（F1：只让终态 CAS 失败）
+	casMatched       bool   // casMatched=true 时 CAS 强制返回 matched=false（模拟 CAS 失配）
 	sentCleanupErr   error
 	sentCleanupFail  bool // true 时 sent cleanup 返回 matched=false（模拟事务失败 → delivery_unknown）
 	convergeErr      error
 	getSubmissionErr error
+	// getSubmissionCalls 记录 GetDiffReviewSubmission 调用次数（G4：断言创建成功后不再读回）。
+	getSubmissionCalls int
 	// promptCalls 记录 PromptAsync 调用（供 messageID 复用断言）——在 mockPrompt 中记录。
 }
 
@@ -35,9 +39,9 @@ func newMockRepo() *mockRepo {
 	}
 }
 
-func (r *mockRepo) CreateDiffAnnotation(ctx context.Context, in CreateDiffAnnotationInput) error {
+func (r *mockRepo) CreateDiffAnnotation(ctx context.Context, in CreateDiffAnnotationInput) (DiffAnnotationRecord, error) {
 	if r.createErr != nil {
-		return r.createErr
+		return DiffAnnotationRecord{}, r.createErr
 	}
 	rec := DiffAnnotationRecord{
 		ID: in.ID, TaskID: in.TaskID, Path: in.Path, Side: in.Side, Ref: in.Ref, Untracked: in.Untracked,
@@ -46,7 +50,7 @@ func (r *mockRepo) CreateDiffAnnotation(ctx context.Context, in CreateDiffAnnota
 		Revision: 1, CreatedAt: 100, UpdatedAt: 100,
 	}
 	r.annotations[in.ID] = rec
-	return nil
+	return rec, nil
 }
 func (r *mockRepo) UpdateDiffAnnotationComment(ctx context.Context, id, comment string) (CommentUpdateResult, error) {
 	rec, ok := r.annotations[id]
@@ -54,12 +58,12 @@ func (r *mockRepo) UpdateDiffAnnotationComment(ctx context.Context, id, comment 
 		return CommentUpdateResult{Matched: false, Revision: 0}, nil
 	}
 	if rec.Comment == comment {
-		return CommentUpdateResult{Matched: true, Changed: false, Revision: rec.Revision}, nil
+		return CommentUpdateResult{Matched: true, Changed: false, Revision: rec.Revision, Record: rec}, nil
 	}
 	rec.Revision++
 	rec.Comment = comment
 	r.annotations[id] = rec
-	return CommentUpdateResult{Matched: true, Changed: true, Revision: rec.Revision}, nil
+	return CommentUpdateResult{Matched: true, Changed: true, Revision: rec.Revision, Record: rec}, nil
 }
 func (r *mockRepo) DeleteDiffAnnotation(ctx context.Context, id string) (int, error) {
 	if _, ok := r.annotations[id]; !ok {
@@ -84,13 +88,14 @@ func (r *mockRepo) GetDiffAnnotation(ctx context.Context, id string) (DiffAnnota
 	}
 	return rec, nil
 }
-func (r *mockRepo) CreateDiffReviewSubmission(ctx context.Context, in CreateDiffReviewSubmissionInput) error {
+func (r *mockRepo) CreateDiffReviewSubmission(ctx context.Context, in CreateDiffReviewSubmissionInput) (DiffReviewSubmissionRecord, error) {
 	sub := in.Submission
 	sub.Seq = r.nextSeq
 	r.nextSeq++
+	sub.CreatedAt = 100
 	r.submissions[sub.ID] = sub
 	r.items[sub.ID] = in.Items
-	return nil
+	return sub, nil
 }
 func (r *mockRepo) ListDiffReviewQueue(ctx context.Context, taskID string) ([]DiffReviewSubmissionRecord, error) {
 	var out []DiffReviewSubmissionRecord
@@ -119,10 +124,55 @@ func (r *mockRepo) ListDiffReviewFailures(ctx context.Context, taskID string) ([
 	}
 	return out, nil
 }
+func (r *mockRepo) ListDiffReviewSubmissionPartitions(ctx context.Context, taskID string) (SubmissionPartitions, error) {
+	var queue, history, failures []SubmissionView
+	for _, s := range r.submissions {
+		if s.TaskID != taskID {
+			continue
+		}
+		items := r.items[s.ID]
+		if items == nil {
+			items = []DiffReviewSubmissionItemRecord{}
+		}
+		v := SubmissionView{Submission: s, Items: items}
+		switch s.Status {
+		case "queued", "sending":
+			queue = append(queue, v)
+		case "sent":
+			history = append(history, v)
+		case "failed", "delivery_unknown":
+			failures = append(failures, v)
+		}
+	}
+	sort.SliceStable(queue, func(i, j int) bool { return queue[i].Submission.Seq < queue[j].Submission.Seq })
+	sort.SliceStable(history, func(i, j int) bool {
+		if history[i].Submission.SentAt != history[j].Submission.SentAt {
+			return history[i].Submission.SentAt > history[j].Submission.SentAt
+		}
+		return history[i].Submission.Seq > history[j].Submission.Seq
+	})
+	sort.SliceStable(failures, func(i, j int) bool {
+		if failures[i].Submission.CreatedAt != failures[j].Submission.CreatedAt {
+			return failures[i].Submission.CreatedAt > failures[j].Submission.CreatedAt
+		}
+		return failures[i].Submission.Seq > failures[j].Submission.Seq
+	})
+	if queue == nil {
+		queue = []SubmissionView{}
+	}
+	if history == nil {
+		history = []SubmissionView{}
+	}
+	if failures == nil {
+		failures = []SubmissionView{}
+	}
+	return SubmissionPartitions{Queue: queue, History: history, Failures: failures}, nil
+}
 func (r *mockRepo) ListDiffReviewSubmissionItems(ctx context.Context, submissionID string) ([]DiffReviewSubmissionItemRecord, error) {
 	return r.items[submissionID], nil
 }
 func (r *mockRepo) GetDiffReviewSubmission(ctx context.Context, id string) (DiffReviewSubmissionRecord, error) {
+	r.getSubmissionCalls++
 	if r.getSubmissionErr != nil {
 		return DiffReviewSubmissionRecord{}, r.getSubmissionErr
 	}
@@ -133,7 +183,7 @@ func (r *mockRepo) GetDiffReviewSubmission(ctx context.Context, id string) (Diff
 	return s, nil
 }
 func (r *mockRepo) CASDiffReviewSubmission(ctx context.Context, id, from, to, errorText string) (bool, error) {
-	if r.casErr != nil {
+	if r.casErr != nil && (r.casErrOnTo == "" || r.casErrOnTo == to) {
 		return false, r.casErr
 	}
 	if r.casMatched {
@@ -209,6 +259,9 @@ func (r *mockRepo) ConvergeDiffReviewOnStartup(ctx context.Context) (int64, erro
 
 var errNotFound = errors.New("not found")
 
+// errInjected 通用注入错误（F1 终态 CAS 失败注入等）。
+var errInjected = errors.New("injected")
+
 type mockScope struct {
 	kind  string
 	found bool
@@ -274,6 +327,9 @@ type mockRuntime struct {
 	sessErrOn        int // 0=never error; N=error on Nth call (1-based)
 	sessCalls        int
 	invalidateCalled bool
+	// F3：invalidate 携带的版本记录与 Snapshot 调用计数（验证 fencing 用构造期捕获版本、不读 DB）。
+	invalidateVersions []string
+	snapshotCalls      int
 	// F3: GetSession 结果（默认 found）与 setUnsupported 调用追踪。
 	getSessionResult     GetSessionResult
 	getSessionCalled     bool
@@ -281,6 +337,7 @@ type mockRuntime struct {
 }
 
 func (r *mockRuntime) Snapshot(ctx context.Context, taskID string) (RuntimeSnapshot, error) {
+	r.snapshotCalls++
 	return r.snap, nil
 }
 func (r *mockRuntime) SessionStatus(ctx context.Context, taskID, sessionID string) (SessionStatus, error) {
@@ -304,6 +361,7 @@ func (r *mockRuntime) ProbeCapability(ctx context.Context, taskID string) (Capab
 }
 func (r *mockRuntime) InvalidateCapability(ctx context.Context, taskID, instVersion string) {
 	r.invalidateCalled = true
+	r.invalidateVersions = append(r.invalidateVersions, instVersion)
 }
 func (r *mockRuntime) GetSession(ctx context.Context, taskID, sessionID string) (GetSessionResult, error) {
 	r.getSessionCalled = true

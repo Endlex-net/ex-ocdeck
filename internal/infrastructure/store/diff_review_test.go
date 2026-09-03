@@ -36,7 +36,7 @@ func createTestAnnotation(t *testing.T, db *DB, id, taskID string) DiffAnnotatio
 		StartLine: 1, EndLine: 3, SnapshotStartLine: 1, Snapshot: "line1\nline2\nline3\n",
 		SnapshotLineCount: 3, Comment: "c-" + id,
 	}
-	if err := db.CreateDiffAnnotation(ctx, r); err != nil {
+	if _, err := db.CreateDiffAnnotation(ctx, r); err != nil {
 		t.Fatalf("create annotation %s: %v", id, err)
 	}
 	got, err := db.GetDiffAnnotation(ctx, id)
@@ -66,7 +66,7 @@ func createQueuedSubmissionWithItems(t *testing.T, db *DB, subID, taskID, msgID 
 		ID: subID, TaskID: taskID, Status: DiffReviewStatusQueued,
 		TargetSessionID: "sess-1", MessageID: msgID, Note: "n", Payload: "p", Truncated: false,
 	}
-	if err := db.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
+	if _, err := db.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
 		Submission: sub,
 		Items:      items,
 	}); err != nil {
@@ -330,7 +330,7 @@ func TestCreateDiffReviewSubmission_MessageIDUniqueCollision(t *testing.T) {
 		ID: "s2", TaskID: "t1", Status: DiffReviewStatusQueued,
 		TargetSessionID: "sess-1", MessageID: dupMsg, Note: "n", Payload: "p2",
 	}
-	err := db.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
+	_, err := db.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
 		Submission: sub2,
 		Items:      nil,
 	})
@@ -356,7 +356,7 @@ func TestCreateDiffReviewSubmission_IDUniqueCollision(t *testing.T) {
 		ID: "s1", TaskID: "t1", Status: DiffReviewStatusQueued,
 		TargetSessionID: "sess-1", MessageID: "msg_s2", Note: "n", Payload: "p2",
 	}
-	err := db.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
+	_, err := db.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
 		Submission: sub2,
 		Items:      nil,
 	})
@@ -384,7 +384,7 @@ func TestCreateDiffReviewSubmission_RevisionConflictZeroPersist(t *testing.T) {
 		TargetSessionID: "sess-1", MessageID: "msg_s1", Note: "n", Payload: "p",
 	}
 	// item 携带 annotation_revision=1，但批注已被编辑为 revision=2 → 复核从 item 派生，conflict。
-	err := db.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
+	_, err := db.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
 		Submission: sub,
 		Items: []DiffReviewSubmissionItemRow{{AnnotationID: a.ID, AnnotationRevision: 1, Path: a.Path, Side: a.Side, Snapshot: a.Snapshot, Comment: a.Comment}},
 	})
@@ -415,7 +415,7 @@ func TestCreateDiffReviewSubmission_RevisionConflictAnnotationDeleted(t *testing
 		ID: "s1", TaskID: "t1", Status: DiffReviewStatusQueued,
 		TargetSessionID: "sess-1", MessageID: "msg_s1", Note: "n", Payload: "p",
 	}
-	err := db.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
+	_, err := db.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
 		Submission: sub,
 		Items: []DiffReviewSubmissionItemRow{{AnnotationID: a.ID, AnnotationRevision: 1, Path: a.Path, Side: a.Side, Snapshot: a.Snapshot, Comment: a.Comment}},
 	})
@@ -773,7 +773,7 @@ func TestDiffAnnotation_CRUDAndRevisionIncrement(t *testing.T) {
 		StartLine: 2, EndLine: 4, SnapshotStartLine: 1, Snapshot: "x\ny\nz\n",
 		SnapshotLineCount: 3, Comment: "first",
 	}
-	if err := db.CreateDiffAnnotation(ctx, r); err != nil {
+	if _, err := db.CreateDiffAnnotation(ctx, r); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	got, _ := db.GetDiffAnnotation(ctx, "a1")
@@ -814,7 +814,7 @@ func TestDiffAnnotation_CRUDAndRevisionIncrement(t *testing.T) {
 	}
 
 	// 列表按 created_at ASC、id ASC（同秒时 id 字典序决胜）。
-	_ = db.CreateDiffAnnotation(ctx, DiffAnnotationRow{
+	_, _ = db.CreateDiffAnnotation(ctx, DiffAnnotationRow{
 		ID: "a0", TaskID: "t1", Path: "b.go", Side: "old", StartLine: 1, EndLine: 1,
 		SnapshotStartLine: 1, Snapshot: "s\n", SnapshotLineCount: 1, Comment: "x",
 	})
@@ -949,7 +949,7 @@ func TestCompleteDiffReviewSentCleanup_DistinctSnapshotRevisionsNoMisDelete(t *t
 		{AnnotationID: "a1", AnnotationRevision: 1, Path: a1.Path, Side: a1.Side, Snapshot: a1.Snapshot, Comment: a1.Comment},
 		{AnnotationID: "a2", AnnotationRevision: 2, Path: a2Edit.Path, Side: a2Edit.Side, Snapshot: a2Edit.Snapshot, Comment: a2Edit.Comment},
 	}
-	if err := db.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{Submission: sub, Items: items}); err != nil {
+	if _, err := db.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{Submission: sub, Items: items}); err != nil {
 		t.Fatalf("create submission: %v", err)
 	}
 	// 抢占 sending。
@@ -1145,7 +1145,7 @@ func TestCreateDiffReviewSubmission_StaleItemMustConflict(t *testing.T) {
 		TargetSessionID: "sess-1", MessageID: "msg_s1", Note: "n", Payload: "p",
 	}
 	// item 携带 stale revision=1（当前 rev=2）→ 复核从 item 派生 → conflict。
-	err := db.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
+	_, err := db.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
 		Submission: sub,
 		Items: []DiffReviewSubmissionItemRow{
 			{AnnotationID: a.ID, AnnotationRevision: 1, Path: a.Path, Side: a.Side, Snapshot: a.Snapshot, Comment: a.Comment},
@@ -1227,5 +1227,148 @@ func TestUpdateDiffAnnotationComment_ConcurrentRevisionBelongsToOwnWrite(t *test
 	got, _ := db.GetDiffAnnotation(ctx, a.ID)
 	if got.Revision != goroutines*writes+1 {
 		t.Errorf("final revision=%d want %d", got.Revision, goroutines*writes+1)
+	}
+}
+
+// TestCreateDiffReviewSubmission_ReturningMatchesGet（G4）：
+// CreateDiffReviewSubmission 的 RETURNING 返回记录与立即 Get 的完整结果一致：
+// Seq > 0（AUTOINCREMENT）、CreatedAt > 0、SentAt 为 NULL；且该记录立即出现在分区列表中
+//（证明返回发生在 commit 之后，无需也不允许二次读回补全）。
+func TestCreateDiffReviewSubmission_ReturningMatchesGet(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	seedDiffReviewTask(t, db, "t1")
+	createTestAnnotation(t, db, "a1", "t1")
+
+	stored, err := db.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
+		Submission: DiffReviewSubmissionRow{
+			ID: "s1", TaskID: "t1", Status: DiffReviewStatusQueued,
+			TargetSessionID: "sess-1", MessageID: "msg_s1", Note: "n", Payload: "p",
+		},
+		Items: []DiffReviewSubmissionItemRow{{
+			AnnotationID: "a1", AnnotationRevision: 1, Path: "a.go", Side: "new",
+			StartLine: 1, EndLine: 1, SnapshotStartLine: 1, Snapshot: "x\n", Comment: "c",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if stored.Seq <= 0 {
+		t.Errorf("Seq = %d, want > 0", stored.Seq)
+	}
+	if stored.CreatedAt <= 0 {
+		t.Errorf("CreatedAt = %d, want > 0", stored.CreatedAt)
+	}
+	if stored.SentAt.Valid {
+		t.Errorf("SentAt = %v, want NULL", stored.SentAt)
+	}
+	if stored.Status != DiffReviewStatusQueued || stored.ID != "s1" || stored.MessageID != "msg_s1" {
+		t.Errorf("stored row fields mismatch: %+v", stored)
+	}
+	// 与立即 Get 的完整结果一致。
+	got, err := db.GetDiffReviewSubmission(ctx, "s1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got != stored {
+		t.Errorf("get row = %+v, want same as returned %+v", got, stored)
+	}
+	// 立即出现在分区列表的 queue 分区（同一记录）。
+	parts, err := db.ListDiffReviewSubmissionPartitions(ctx, "t1")
+	if err != nil {
+		t.Fatalf("partitions: %v", err)
+	}
+	if len(parts.Queue) != 1 || parts.Queue[0].Submission != stored {
+		t.Errorf("queue partition = %+v, want [returned row]", parts.Queue)
+	}
+	// 空分区非 nil。
+	if parts.History == nil || parts.Failures == nil {
+		t.Error("empty partitions must be non-nil")
+	}
+}
+
+// TestListDiffReviewSubmissionPartitions_SingleConsistentSnapshot 验证 F4 分区一致读：
+// 同一 submission 只出现在一个分区、items 与 submission 同行快照、
+// 排序契约（queue seq ASC / history sent_at DESC,seq DESC / failures created_at DESC,seq DESC）、
+// 空分区返回非 nil 空切片。
+func TestListDiffReviewSubmissionPartitions_SingleConsistentSnapshot(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	seedDiffReviewTask(t, db, "t1")
+	a1 := createTestAnnotation(t, db, "a1", "t1")
+	a2 := createTestAnnotation(t, db, "a2", "t1")
+
+	subQueued := createQueuedSubmissionWithItems(t, db, "s-q", "t1", "msg_sq", []DiffAnnotationRow{a1})
+	subFailed := createQueuedSubmissionWithItems(t, db, "s-f", "t1", "msg_sf", []DiffAnnotationRow{a2})
+	subSent := createQueuedSubmissionWithItems(t, db, "s-s", "t1", "msg_ss", []DiffAnnotationRow{a1, a2})
+	subUnknown := createQueuedSubmissionWithItems(t, db, "s-u", "t1", "msg_su", []DiffAnnotationRow{a2})
+
+	// s-f：queued→failed；s-s：queued→sending→sent（唯一路径：清理事务）；
+	// s-u：queued→sending→delivery_unknown。
+	if ok, err := db.CASDiffReviewSubmission(ctx, subFailed.ID, DiffReviewStatusQueued, DiffReviewStatusFailed, "boom"); err != nil || !ok {
+		t.Fatalf("CAS s-f failed: ok=%v err=%v", ok, err)
+	}
+	if ok, err := db.CASDiffReviewSubmission(ctx, subSent.ID, DiffReviewStatusQueued, DiffReviewStatusSending, ""); err != nil || !ok {
+		t.Fatalf("CAS s-s sending: ok=%v err=%v", ok, err)
+	}
+	if ok, err := db.CompleteDiffReviewSentCleanup(ctx, subSent.ID); err != nil || !ok {
+		t.Fatalf("sent cleanup s-s: ok=%v err=%v", ok, err)
+	}
+	if ok, err := db.CASDiffReviewSubmission(ctx, subUnknown.ID, DiffReviewStatusQueued, DiffReviewStatusSending, ""); err != nil || !ok {
+		t.Fatalf("CAS s-u sending: ok=%v err=%v", ok, err)
+	}
+	if ok, err := db.CASDiffReviewSubmission(ctx, subUnknown.ID, DiffReviewStatusSending, DiffReviewStatusDeliveryUnknown, "unknown"); err != nil || !ok {
+		t.Fatalf("CAS s-u unknown: ok=%v err=%v", ok, err)
+	}
+
+	parts, err := db.ListDiffReviewSubmissionPartitions(ctx, "t1")
+	if err != nil {
+		t.Fatalf("ListDiffReviewSubmissionPartitions: %v", err)
+	}
+	if parts.Queue == nil || parts.History == nil || parts.Failures == nil {
+		t.Fatal("partitions 分区必须非 nil（wire 空数组而非 null）")
+	}
+	// 分区归属唯一：queue=[s-q]，history=[s-s]，failures 含 s-f 与 s-u。
+	if len(parts.Queue) != 1 || parts.Queue[0].Submission.ID != subQueued.ID {
+		t.Fatalf("queue = %+v, want only s-q", parts.Queue)
+	}
+	if len(parts.Queue[0].Items) != 1 || parts.Queue[0].Items[0].AnnotationID != a1.ID {
+		t.Fatalf("queue items = %+v, want a1 快照", parts.Queue[0].Items)
+	}
+	if len(parts.History) != 1 || parts.History[0].Submission.ID != subSent.ID {
+		t.Fatalf("history = %+v, want only s-s", parts.History)
+	}
+	if len(parts.History[0].Items) != 2 {
+		t.Fatalf("history items len = %d, want 2", len(parts.History[0].Items))
+	}
+	if len(parts.Failures) != 2 {
+		t.Fatalf("failures len = %d, want 2 (s-f, s-u)", len(parts.Failures))
+	}
+	seen := map[string]string{}
+	for _, v := range parts.Queue {
+		seen[v.Submission.ID] = "queue"
+	}
+	for _, v := range parts.History {
+		seen[v.Submission.ID] = "history"
+	}
+	for _, v := range parts.Failures {
+		seen[v.Submission.ID] = "failures"
+	}
+	if len(seen) != 4 {
+		t.Fatalf("同一 submission 出现在多个分区或丢失：seen=%v", seen)
+	}
+	// failures 排序：created_at DESC（同秒）→ seq DESC，即 s-u（seq 更大）在前。
+	if parts.Failures[0].Submission.ID != subUnknown.ID || parts.Failures[1].Submission.ID != subFailed.ID {
+		t.Fatalf("failures order = [%s %s], want [s-u s-f]（created_at DESC,seq DESC）",
+			parts.Failures[0].Submission.ID, parts.Failures[1].Submission.ID)
+	}
+	// 空任务（无任何提交，查询仅按 task_id 过滤，无需 seed）：三分区均非 nil 空切片。
+	empty, err := db.ListDiffReviewSubmissionPartitions(ctx, "t-empty")
+	if err != nil {
+		t.Fatalf("empty partitions: %v", err)
+	}
+	if empty.Queue == nil || empty.History == nil || empty.Failures == nil ||
+		len(empty.Queue) != 0 || len(empty.History) != 0 || len(empty.Failures) != 0 {
+		t.Fatalf("empty partitions = %+v, want 非 nil 空切片", empty)
 	}
 }

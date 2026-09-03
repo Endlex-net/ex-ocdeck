@@ -37,6 +37,13 @@ type SubmissionView struct {
 	Items      []DiffReviewSubmissionItemRecord
 }
 
+// SubmissionPartitions 为任务三分区一致快照（同一 store 读事务）。
+type SubmissionPartitions struct {
+	Queue    []SubmissionView
+	History  []SubmissionView
+	Failures []SubmissionView
+}
+
 // CreateSubmission 创建提交（design.md D2 准入 + D7 组装 + 单事务落库）。
 //
 // 准入顺序（全部满足才落库，否则 invalid_state/invalid_input/conflict，零副作用）。
@@ -140,54 +147,42 @@ func (s *Service) CreateSubmission(ctx context.Context, req CreateSubmissionRequ
 		Truncated:       result.Truncated,
 		Error:           "",
 	}
-	if err := s.repo.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
+	// G1：INSERT...RETURNING 返回完整记录（含 seq/created_at），不得在事务提交后再做必需的
+	// 二次读取——读回失败会让客户端把已存在的 queued submission 当作创建失败并重试，
+	// 产生第二条 submission/messageID（messageID 非幂等键，两条都可能投递给 agent）。
+	stored, err := s.repo.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
 		Submission: sub,
 		Items:      items,
-	}); err != nil {
-		return DiffReviewSubmissionRecord{}, nil, err
-	}
-	// 读回以获得 seq/created_at。
-	stored, err := s.repo.GetDiffReviewSubmission(ctx, submissionID)
+	})
 	if err != nil {
 		return DiffReviewSubmissionRecord{}, nil, err
 	}
 	return stored, items, nil
 }
 
-// ListQueue 列出任务队列（queued/sending 按 seq 升序）+ items。
-func (s *Service) ListQueue(ctx context.Context, taskID string) ([]SubmissionView, error) {
+// ListSubmissionPartitions 列出任务三分区一致快照（design.md D8）。
+// 单一 store 读事务：同一 submission 只出现在一个分区，且 items 与 submission 同行快照。
+func (s *Service) ListSubmissionPartitions(ctx context.Context, taskID string) (SubmissionPartitions, error) {
 	if err := s.checkTaskScope(ctx, taskID); err != nil {
-		return nil, err
+		return SubmissionPartitions{}, err
 	}
-	subs, err := s.repo.ListDiffReviewQueue(ctx, taskID)
+	parts, err := s.repo.ListDiffReviewSubmissionPartitions(ctx, taskID)
 	if err != nil {
-		return nil, err
+		return SubmissionPartitions{}, err
 	}
-	return s.fillItems(ctx, subs)
+	return SubmissionPartitions{
+		Queue:    emptyViews(parts.Queue),
+		History:  emptyViews(parts.History),
+		Failures: emptyViews(parts.Failures),
+	}, nil
 }
 
-// ListHistory 列出任务历史（sent 按 sent_at DESC seq DESC）+ items。
-func (s *Service) ListHistory(ctx context.Context, taskID string) ([]SubmissionView, error) {
-	if err := s.checkTaskScope(ctx, taskID); err != nil {
-		return nil, err
+// emptyViews 保证分区切片非 nil（wire 空数组而非 null）。
+func emptyViews(views []SubmissionView) []SubmissionView {
+	if views == nil {
+		return []SubmissionView{}
 	}
-	subs, err := s.repo.ListDiffReviewHistory(ctx, taskID)
-	if err != nil {
-		return nil, err
-	}
-	return s.fillItems(ctx, subs)
-}
-
-// ListFailures 列出任务失败（failed/delivery_unknown 按 created_at DESC seq DESC）+ items。
-func (s *Service) ListFailures(ctx context.Context, taskID string) ([]SubmissionView, error) {
-	if err := s.checkTaskScope(ctx, taskID); err != nil {
-		return nil, err
-	}
-	subs, err := s.repo.ListDiffReviewFailures(ctx, taskID)
-	if err != nil {
-		return nil, err
-	}
-	return s.fillItems(ctx, subs)
+	return views
 }
 
 // CancelSubmission 撤回提交（仅 queued，design.md D2/spec 排队中撤回）。
@@ -250,19 +245,6 @@ func (s *Service) DeleteSubmission(ctx context.Context, taskID, submissionID str
 		return ErrInvalidState
 	}
 	return nil
-}
-
-// fillItems 为每个 submission 填充 items 快照。
-func (s *Service) fillItems(ctx context.Context, subs []DiffReviewSubmissionRecord) ([]SubmissionView, error) {
-	views := make([]SubmissionView, len(subs))
-	for i, sub := range subs {
-		items, err := s.repo.ListDiffReviewSubmissionItems(ctx, sub.ID)
-		if err != nil {
-			return nil, err
-		}
-		views[i] = SubmissionView{Submission: sub, Items: items}
-	}
-	return views, nil
 }
 
 // validateSubmissionRequest 执行 CreateSubmission 的纯领域校验（F8/D8：无副作用、无 port 调用，

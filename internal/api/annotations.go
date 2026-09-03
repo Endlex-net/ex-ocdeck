@@ -301,7 +301,7 @@ func (s *Server) handleCreateAnnotation(w http.ResponseWriter, r *http.Request) 
 		writeApiError(w, ae)
 		return
 	}
-	rec, err := s.diffreview.CreateAnnotation(r.Context(), diffreview.CreateDiffAnnotationInput{
+	view, err := s.diffreview.CreateAnnotation(r.Context(), diffreview.CreateDiffAnnotationInput{
 		ID:                newID(),
 		TaskID:            taskID,
 		Path:              req.Path,
@@ -319,7 +319,9 @@ func (s *Server) handleCreateAnnotation(w http.ResponseWriter, r *http.Request) 
 		writeApiError(w, mapDiffReviewErr(err))
 		return
 	}
-	writeJSONBody(w, http.StatusCreated, newAnnotationDTO(rec, false))
+	// F12：service 直接返回真实 Annotation 视图（含 stale，由已取得的 rec 计算）；
+	// 不得在写成功后再读持久层（避免 mutation 成功但响应 500 致客户端重试重复创建）。
+	writeJSONBody(w, http.StatusCreated, newAnnotationDTO(view.DiffAnnotationRecord, view.Stale))
 }
 
 // handleUpdateAnnotationComment PATCH /api/v1/tasks/{id}/annotations/{aid}（512KiB）。
@@ -331,12 +333,14 @@ func (s *Server) handleUpdateAnnotationComment(w http.ResponseWriter, r *http.Re
 		writeApiError(w, ae)
 		return
 	}
-	rec, err := s.diffreview.UpdateComment(r.Context(), taskID, annotationID, req.Comment)
+	view, err := s.diffreview.UpdateComment(r.Context(), taskID, annotationID, req.Comment)
 	if err != nil {
 		writeApiError(w, mapDiffReviewErr(err))
 		return
 	}
-	writeJSONBody(w, http.StatusOK, newAnnotationDTO(rec, false))
+	// F12：service 直接返回真实 Annotation 视图（含 stale，由已取得的 rec 计算），
+	// 不写成功后再读持久层。
+	writeJSONBody(w, http.StatusOK, newAnnotationDTO(view.DiffAnnotationRecord, view.Stale))
 }
 
 // handleDeleteAnnotation DELETE /api/v1/tasks/{id}/annotations/{aid}（204）。
@@ -382,29 +386,20 @@ type submissionsListResponse struct {
 }
 
 // handleListSubmissions GET /api/v1/tasks/{id}/annotation-submissions。
-// queue=queued/sending 按 seq ASC；history=sent 按 sent_at DESC,seq DESC；
-// failures=failed/delivery_unknown 按 created_at DESC,seq DESC（秒级同秒以 seq 决胜）。
+// 单一用例返回一致快照（同一 SQLite 读事务）：queue=queued/sending 按 seq ASC；
+// history=sent 按 sent_at DESC,seq DESC；failures=failed/delivery_unknown 按
+// created_at DESC,seq DESC（秒级同秒以 seq 决胜）。同一 submission 只出现在一个分区。
 func (s *Server) handleListSubmissions(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
-	queue, err := s.diffreview.ListQueue(r.Context(), taskID)
-	if err != nil {
-		writeApiError(w, mapDiffReviewErr(err))
-		return
-	}
-	history, err := s.diffreview.ListHistory(r.Context(), taskID)
-	if err != nil {
-		writeApiError(w, mapDiffReviewErr(err))
-		return
-	}
-	failures, err := s.diffreview.ListFailures(r.Context(), taskID)
+	parts, err := s.diffreview.ListSubmissionPartitions(r.Context(), taskID)
 	if err != nil {
 		writeApiError(w, mapDiffReviewErr(err))
 		return
 	}
 	writeJSONBody(w, http.StatusOK, submissionsListResponse{
-		Queue:    newSubmissionDTOs(queue),
-		History:  newSubmissionDTOs(history),
-		Failures: newSubmissionDTOs(failures),
+		Queue:    newSubmissionDTOs(parts.Queue),
+		History:  newSubmissionDTOs(parts.History),
+		Failures: newSubmissionDTOs(parts.Failures),
 	})
 }
 

@@ -8,6 +8,7 @@ import type {
   Annotation,
   AnnotationCreateInput,
   FileEditRead,
+  FileEditReadEditable,
   FileEditWriteInput,
   FileEditWriteResult,
   GitDiffResult,
@@ -137,11 +138,21 @@ export default function DiffViewer({
   const [bubbleError, setBubbleError] = useState('');
   const [crossSideHint, setCrossSideHint] = useState('');
 
-  // 编辑模式：view（查看）→ checking（GET 编辑读取中）→ edit
-  const [editPhase, setEditPhase] = useState<'view' | 'checking' | 'edit'>('view');
-  /** 持久资格拒绝（GET editable=false）：禁用入口直至 diff 刷新（F6/F8）。 */
+  // 编辑模式：view（查看）→ edit
+  const [editPhase, setEditPhase] = useState<'view' | 'edit'>('view');
+  /** F7：编辑资格态（按视图三元组预取 GET 编辑读取）——仅 eligible 提供编辑命令；
+   *  denied=服务端持久拒绝（editable=false，显示原因不提供命令）；
+   *  error=瞬时请求错误（提示 + 重试入口）。deniedReason/enterError 双态语义沿用。 */
+  const [eligibility, setEligibility] = useState<'checking' | 'eligible' | 'denied' | 'error'>(
+    'checking',
+  );
+  /** eligible 时的 GET 结果：进入编辑直接复用为编辑基线（不重复 GET）。 */
+  const firstReadRef = useRef<FileEditReadEditable | null>(null);
+  /** F10：资格请求代际——仅最新代际的响应可提交状态（旧响应丢弃）。 */
+  const eligibilitySeq = useRef(0);
+  /** 持久资格拒绝（GET editable=false）：不提供编辑命令，直至 diff 刷新重新判定。 */
   const [deniedReason, setDeniedReason] = useState('');
-  /** 瞬时进入失败（网络/任务锁等）：提示可重试，不禁用入口（F8）。 */
+  /** 瞬时资格请求失败（网络/任务锁等）：提示 + 重试，不写资格态（F8）。 */
   const [enterError, setEnterError] = useState('');
   /** F3：退出事务进行中（flush + 刷新 diff），编辑器只读锁定、操作禁用。 */
   const [exiting, setExiting] = useState(false);
@@ -279,32 +290,55 @@ export default function DiffViewer({
 
   // ---------- 编辑模式 ----------
 
-  const enterEdit = async () => {
-    if (!editIO || !gate.ok || editPhase !== 'view') return;
-    closeBubble(); // F7：进入编辑前关闭批注气泡与候选高亮（编辑模式无批注手势）
-    setCrossSideHint('');
-    setEditPhase('checking');
+  /** F7：资格预取（进入编辑前完成服务端判定）。eligible 结果缓存为编辑基线。
+   *  F10：代际防护——effect 可因 diff/editIO 变化重复启动，旧代际响应一律丢弃。 */
+  const checkEligibility = async () => {
+    if (!editIO) return;
+    const seq = ++eligibilitySeq.current;
+    setEligibility('checking');
     setDeniedReason('');
     setEnterError('');
+    firstReadRef.current = null;
     try {
       const r = await editIO.read();
+      if (seq !== eligibilitySeq.current) return; // 已有更新请求，丢弃本响应
       if (!r.editable) {
-        setDeniedReason(r.reason); // F6：资格拒绝持久生效，直至 diff 刷新（下方 effect 重置）
-        setEditPhase('view');
+        setEligibility('denied');
+        setDeniedReason(r.reason);
         return;
       }
-      sessionRef.current = new EditSession({
-        path,
-        firstRead: r,
-        io: editIO,
-        onChange: () => setSessionTick((t) => t + 1),
-      });
-      setEditPhase('edit');
+      firstReadRef.current = r;
+      setEligibility('eligible');
     } catch (err) {
-      // F8：瞬时请求错误（网络/任务锁冲突等）不写资格态——提示但允许直接重试
+      if (seq !== eligibilitySeq.current) return;
+      setEligibility('error');
       setEnterError(err instanceof Error ? err.message : '读取文件失败');
-      setEditPhase('view');
     }
+  };
+
+  // F7：按视图身份预取资格（diff 刷新/视图变化即重新判定，资格拒绝随之作废）
+  useEffect(() => {
+    if (!editIO || !gate.ok || state.kind !== 'merge') return;
+    void checkEligibility();
+    return () => {
+      eligibilitySeq.current++; // effect 重跑/卸载：作废旧代际在途请求
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editIO, gate.ok, state.kind, diff]);
+
+  /** 进入编辑：仅 eligible 可入；复用预取 GET 结果作为编辑基线（不重复 GET）。 */
+  const enterEdit = () => {
+    const firstRead = firstReadRef.current;
+    if (!editIO || editPhase !== 'view' || eligibility !== 'eligible' || !firstRead) return;
+    closeBubble(); // F7(旧)：进入编辑前关闭批注气泡与候选高亮（编辑模式无批注手势）
+    setCrossSideHint('');
+    sessionRef.current = new EditSession({
+      path,
+      firstRead,
+      io: editIO,
+      onChange: () => setSessionTick((t) => t + 1),
+    });
+    setEditPhase('edit');
   };
 
   /** 退出事务开始：新侧编辑器切只读过渡态（session 保留，输入不会静默丢失）。 */
@@ -319,7 +353,7 @@ export default function DiffViewer({
 
   const exitEdit = async () => {
     const s = sessionRef.current;
-    if (!s || exiting) return;
+    if (!s || exiting || discardBusyRef.current) return; // discard 在途：退出被拒（按钮已禁用）
     setExiting(true);
     exitingRef.current = true;
     setExitError('');
@@ -356,11 +390,77 @@ export default function DiffViewer({
     await sessionRef.current?.retry();
   };
 
+  /** F11：discard 在途锁（state 驱动按钮禁用，ref 防重入）。 */
+  const [discardBusy, setDiscardBusy] = useState(false);
+  const discardBusyRef = useRef(false);
+
   const discardChanges = async () => {
     const s = sessionRef.current;
-    if (!s) return;
-    const content = await s.discard();
-    if (content !== null) setDocEpoch((e) => e + 1); // 重建编辑器为服务端内容
+    if (!s || !editIO || discardBusyRef.current) return; // 重入拒绝
+    discardBusyRef.current = true;
+    setDiscardBusy(true);
+    lockEditors(true); // F11：discard 在途期间编辑器只读过渡态（输入不得被服务端内容覆盖）
+    try {
+      // F8/F11：discard 返回完整新读取 + 编辑代际栅栏
+      const res = await s.discard();
+      if (res === null) {
+        lockEditors(false); // 重读请求失败：保持阻塞态，可重试
+        return;
+      }
+      if (sessionRef.current !== s) {
+        lockEditors(false); // F11：session 已被替换，迟到结果丢弃
+        return;
+      }
+      const { read: r, editedDuring } = res;
+      if (r.editable && editedDuring) {
+        // F11：discard 等待期间有新编辑——保留用户文本，以新 session（新冻结元数据）补发，
+        // MUST NOT 用服务端内容覆盖；旧 session 不 flush 销毁（补发唯一 owner 是新 session）
+        const preserved = s.latest;
+        s.dispose({ flush: false });
+        sessionRef.current = null;
+        firstReadRef.current = r;
+        const ns = new EditSession({
+          path,
+          firstRead: r,
+          io: editIO,
+          onChange: () => setSessionTick((t) => t + 1),
+        });
+        sessionRef.current = ns;
+        ns.onEdit(preserved); // 新基线排程补发
+        setEligibility('eligible');
+        setDocEpoch((e) => e + 1); // 重建编辑器显示 preserved（新实例未锁）
+        return;
+      }
+      // 无在途编辑：旧 session 无未确认内容，常规销毁
+      s.dispose();
+      sessionRef.current = null;
+      if (r.editable) {
+        // 以完整新读取创建新 session（新冻结元数据 + 新基线），编辑器重建为服务端内容
+        firstReadRef.current = r;
+        sessionRef.current = new EditSession({
+          path,
+          firstRead: r,
+          io: editIO,
+          onChange: () => setSessionTick((t) => t + 1),
+        });
+        setEligibility('eligible');
+        setDocEpoch((e) => e + 1);
+      } else {
+        // 安全退出路径：文件已不可编辑 → 回查看模式并显示原因（用户不被困在编辑态）
+        try {
+          await onRefreshDiff?.();
+        } catch {
+          /* 工具栏刷新可补救 */
+        }
+        setEligibility('denied');
+        setDeniedReason(r.reason);
+        setEditPhase('view');
+        setRestoreArmed(false);
+      }
+    } finally {
+      discardBusyRef.current = false;
+      setDiscardBusy(false);
+    }
   };
 
   const restoreSnapshot = async () => {
@@ -378,15 +478,10 @@ export default function DiffViewer({
     }
   };
 
-  // F6：GET editable=false 的拒绝理由与瞬时进入错误随 diff 刷新（重新拉取原始内容）而作废
-  useEffect(() => {
-    setDeniedReason('');
-    setEnterError('');
-  }, [diff]);
-
   // 离开守卫注册：GitPanel 切换文件前调用
   useEffect(() => {
     onRegisterLeaveGuard?.(async () => {
+      if (discardBusyRef.current) return false; // F11：discard 在途拒绝切换（无双 session 窗口）
       const s = sessionRef.current;
       if (!s) return true;
       return s.canLeave();
@@ -443,8 +538,8 @@ export default function DiffViewer({
         ...wrapExt,
         ...langExt,
         editLockCompartment.current.of(
-          // F9：退出事务期间的任何重建（形态/换行/prop 变化）仍以只读锁态初始化
-          exitingRef.current
+          // F9/F18：退出或 discard 事务期间的任何重建（形态/换行/prop 变化）仍以只读锁态初始化
+          exitingRef.current || discardBusyRef.current
             ? [EditorView.editable.of(false), EditorState.readOnly.of(true)]
             : [],
         ),
@@ -541,7 +636,7 @@ export default function DiffViewer({
               type="button"
               className="btn btn-small btn-ghost"
               aria-pressed={mode === 'unified'}
-              disabled={exiting}
+              disabled={exiting || discardBusy}
               onClick={() => onModeChange('unified')}
             >
               单列
@@ -550,7 +645,7 @@ export default function DiffViewer({
               type="button"
               className="btn btn-small btn-ghost"
               aria-pressed={mode === 'side-by-side'}
-              disabled={exiting}
+              disabled={exiting || discardBusy}
               onClick={() => onModeChange('side-by-side')}
             >
               并排
@@ -559,28 +654,46 @@ export default function DiffViewer({
               type="button"
               className="btn btn-small btn-ghost"
               aria-pressed={wrapOverride}
-              disabled={exiting}
+              disabled={exiting || discardBusy}
               onClick={() => onWrapChange(!wrapOverride)}
             >
               换行
             </button>
             <span className="header-spacer" />
-            {editIO && editPhase === 'view' && (
+            {editIO && editPhase === 'view' && !gate.ok && (
               <button
                 type="button"
                 className="btn btn-small btn-ghost"
-                disabled={!gate.ok || deniedReason !== ''}
-                title={
-                  !gate.ok ? gate.reason : deniedReason !== '' ? deniedReason : '直接编辑工作区文件'
-                }
-                onClick={() => void enterEdit()}
+                disabled
+                title={gate.reason}
               >
                 编辑
               </button>
             )}
-            {editIO && editPhase === 'checking' && (
+            {/* F7：仅 eligible 提供编辑命令；denied 不提供命令（原因见下方提示条） */}
+            {editIO && editPhase === 'view' && gate.ok && eligibility === 'eligible' && (
+              <button
+                type="button"
+                className="btn btn-small btn-ghost"
+                title="直接编辑工作区文件"
+                onClick={enterEdit}
+              >
+                编辑
+              </button>
+            )}
+            {editIO && editPhase === 'view' && gate.ok && eligibility === 'checking' && (
               <button type="button" className="btn btn-small btn-ghost" disabled>
                 检查中…
+              </button>
+            )}
+            {editIO && editPhase === 'view' && gate.ok && eligibility === 'error' && (
+              <button
+                type="button"
+                className="btn btn-small btn-ghost"
+                title={enterError}
+                onClick={() => void checkEligibility()}
+              >
+                重试
               </button>
             )}
             {editPhase === 'edit' && session && (
@@ -592,7 +705,7 @@ export default function DiffViewer({
                   <button
                     type="button"
                     className="btn btn-small btn-ghost"
-                    disabled={exiting}
+                    disabled={exiting || discardBusy}
                     title="恢复到本次编辑会话开始前的内容（仅本次会话内有效）"
                     onClick={() => setRestoreArmed(true)}
                   >
@@ -604,7 +717,7 @@ export default function DiffViewer({
                     <button
                       type="button"
                       className="btn btn-small"
-                      disabled={restoreBusy || exiting}
+                      disabled={restoreBusy || exiting || discardBusy}
                       onClick={() => void restoreSnapshot()}
                     >
                       {restoreBusy ? '还原中…' : '确认还原'}
@@ -612,7 +725,7 @@ export default function DiffViewer({
                     <button
                       type="button"
                       className="btn btn-small btn-ghost"
-                      disabled={exiting}
+                      disabled={exiting || discardBusy}
                       onClick={() => setRestoreArmed(false)}
                     >
                       取消
@@ -622,7 +735,7 @@ export default function DiffViewer({
                 <button
                   type="button"
                   className="btn btn-small btn-ghost"
-                  disabled={exiting}
+                  disabled={exiting || discardBusy}
                   onClick={() => void exitEdit()}
                 >
                   {exiting ? '退出中…' : '退出编辑'}
@@ -665,6 +778,7 @@ export default function DiffViewer({
                 <button
                   type="button"
                   className="btn btn-small"
+                  disabled={discardBusy}
                   onClick={() => void retrySave()}
                 >
                   重试保存
@@ -672,9 +786,10 @@ export default function DiffViewer({
                 <button
                   type="button"
                   className="btn btn-small btn-ghost"
+                  disabled={discardBusy}
                   onClick={() => void discardChanges()}
                 >
-                  放弃本地改动
+                  {discardBusy ? '放弃中…' : '放弃本地改动'}
                 </button>
               </span>
             </div>

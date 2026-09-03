@@ -122,6 +122,31 @@ async function submitBubbleWith(container: HTMLElement, comment: string) {
   });
 }
 
+/** F7：等待资格预取完成、编辑命令出现（eligible）。 */
+async function waitEditEntry(container: HTMLElement) {
+  await until(() =>
+    [...container.querySelectorAll<HTMLButtonElement>('button')].some(
+      (b) => b.textContent === '编辑' && !b.disabled,
+    ),
+  );
+}
+
+/** 点击编辑命令进入编辑模式（含资格等待）。 */
+async function clickEdit(container: HTMLElement) {
+  await waitEditEntry(container);
+  act(() => {
+    [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find((b) => b.textContent === '编辑')!
+      .click();
+  });
+  await until(
+    () =>
+      [...container.querySelectorAll('.cm-content')].some(
+        (el) => el.getAttribute('contenteditable') === 'true',
+      ),
+  );
+}
+
 describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
   beforeEach(() => stubMatchMedia(false));
 
@@ -559,7 +584,7 @@ describe('编辑入口门禁（tasks 5.3）', () => {
     g.unmount();
   });
 
-  it('GET editable=false：入口禁用并展示服务端原因（F6：不可无限重复点击）', async () => {
+  it('GET editable=false：预取即判定，不提供编辑命令并展示服务端原因（F7）', async () => {
     const io = editIO();
     const notEditable: FileEditRead = {
       editable: false,
@@ -569,20 +594,16 @@ describe('编辑入口门禁（tasks 5.3）', () => {
     io.read.mockResolvedValue(notEditable);
     const { container, unmount } = renderViewer({ editIO: io });
     await until(() => container.querySelectorAll('.cm-editor').length > 0);
-    const btn = [...container.querySelectorAll<HTMLButtonElement>('button')].find(
-      (b) => b.textContent === '编辑',
-    )!;
-    expect(btn.disabled).toBe(false);
-    act(() => btn.click());
+    // 资格预取自动执行，无需点击即展示原因
     await until(() => container.textContent?.includes('换行风格混杂') ?? false);
-    // 资格拒绝后入口禁用，重复点击不再触发 GET（checking→view 往返重建按钮，需重新查询）
-    const btn2 = [...container.querySelectorAll<HTMLButtonElement>('button')].find(
-      (b) => b.textContent === '编辑',
-    )!;
-    expect(btn2.disabled).toBe(true);
-    act(() => btn2.click());
-    await flushUI();
     expect(io.read).toHaveBeenCalledTimes(1);
+    // 不提供可用的编辑命令
+    const hasEnabledEdit = [...container.querySelectorAll<HTMLButtonElement>('button')].some(
+      (b) => b.textContent === '编辑' && !b.disabled,
+    );
+    expect(hasEnabledEdit).toBe(false);
+    await flushUI();
+    expect(io.read).toHaveBeenCalledTimes(1); // 无重复 GET
     // 仍在查看模式（只读）
     for (const el of container.querySelectorAll('.cm-content')) {
       expect(el.getAttribute('contenteditable')).toBe('false');
@@ -590,7 +611,67 @@ describe('编辑入口门禁（tasks 5.3）', () => {
     unmount();
   });
 
-  it('F6：diff 刷新后资格拒绝作废，编辑入口重新开放', async () => {
+  it('F10：资格请求乱序——慢 edible 旧响应不得覆盖较新的 denied', async () => {
+    const io = editIO();
+    let resolveA!: (r: FileEditRead) => void;
+    io.read
+      .mockImplementationOnce(
+        () =>
+          new Promise<FileEditRead>((res) => {
+            resolveA = res;
+          }),
+      )
+      .mockResolvedValue({
+        editable: false,
+        reasonCode: 'mixed_line_endings',
+        reason: '换行风格混杂',
+      } satisfies FileEditRead);
+    const { container, root, unmount } = renderViewer({ editIO: io });
+    await until(() => container.querySelectorAll('.cm-editor').length > 0);
+    expect(io.read).toHaveBeenCalledTimes(1); // 请求 A 在途
+    // diff 变化触发请求 B（快，denied）
+    const onModeChange = vi.fn();
+    const onWrapChange = vi.fn();
+    act(() =>
+      root.render(
+        <DiffViewer
+          diff={makeDiff({ newContent: 'const a = 1;\nconst b = 222;\nconst c = 3;\nconst d = 4;\n' })}
+          path="a.ts"
+          sourceRef=""
+          untracked={false}
+          annotations={[]}
+          onCreateAnnotation={async () => {}}
+          editIO={io}
+          modeOverride="unified"
+          onModeChange={onModeChange}
+          wrapOverride={false}
+          onWrapChange={onWrapChange}
+        />,
+      ),
+    );
+    await until(() => container.textContent?.includes('换行风格混杂') ?? false);
+    // 旧代际 A 迟到（editable=true）——必须被丢弃，状态保持 denied
+    await act(async () => {
+      resolveA({
+        editable: true,
+        content: 'x\n',
+        baseHash: 'h0',
+        lineEnding: 'lf',
+        hasBom: false,
+        mode: '0644',
+      } satisfies FileEditRead);
+    });
+    await flushUI();
+    expect(container.textContent).toContain('换行风格混杂');
+    expect(
+      [...container.querySelectorAll<HTMLButtonElement>('button')].some(
+        (b) => b.textContent === '编辑' && !b.disabled,
+      ),
+    ).toBe(false);
+    unmount();
+  });
+
+  it('F7：diff 刷新后自动重新判定资格，入口重新开放', async () => {
     const io = editIO();
     io.read.mockResolvedValue({
       editable: false,
@@ -599,16 +680,8 @@ describe('编辑入口门禁（tasks 5.3）', () => {
     } satisfies FileEditRead);
     const { container, root, unmount } = renderViewer({ editIO: io });
     await until(() => container.querySelectorAll('.cm-editor').length > 0);
-    const btn = [...container.querySelectorAll<HTMLButtonElement>('button')].find(
-      (b) => b.textContent === '编辑',
-    )!;
-    act(() => btn.click());
     await until(() => container.textContent?.includes('文件只读') ?? false);
-    const btn2 = [...container.querySelectorAll<HTMLButtonElement>('button')].find(
-      (b) => b.textContent === '编辑',
-    )!;
-    expect(btn2.disabled).toBe(true);
-    // diff prop 刷新（退出编辑/手动刷新路径）→ 拒绝理由重置，可重新尝试
+    // diff prop 刷新（退出编辑/手动刷新路径）→ 自动重新 GET 判定
     io.read.mockResolvedValue({
       editable: true,
       content: 'x\n',
@@ -636,12 +709,14 @@ describe('编辑入口门禁（tasks 5.3）', () => {
         />,
       ),
     );
-    await flushUI();
-    const btn3 = [...container.querySelectorAll<HTMLButtonElement>('button')].find(
-      (b) => b.textContent === '编辑',
-    )!;
-    expect(btn3.disabled).toBe(false);
+    // 资格转 eligible：编辑命令出现，拒绝理由清除
+    await until(() =>
+      [...container.querySelectorAll<HTMLButtonElement>('button')].some(
+        (b) => b.textContent === '编辑' && !b.disabled,
+      ),
+    );
     expect(container.textContent).not.toContain('文件只读');
+    expect(io.read).toHaveBeenCalledTimes(2);
     unmount();
   });
 });
@@ -664,6 +739,12 @@ describe('编辑模式（进入/写回/横幅）', () => {
     io.write.mockResolvedValue({ baseHash: 'h1' });
     const mounted = renderViewer({ editIO: io, agentBusy });
     await until(() => editorViews(mounted.container).length > 0);
+    // F7：资格预取完成后才提供编辑命令
+    await until(() =>
+      [...mounted.container.querySelectorAll<HTMLButtonElement>('button')].some(
+        (b) => b.textContent === '编辑' && !b.disabled,
+      ),
+    );
     const btn = [...mounted.container.querySelectorAll<HTMLButtonElement>('button')].find(
       (b) => b.textContent === '编辑',
     )!;
@@ -739,6 +820,303 @@ describe('编辑模式（进入/写回/横幅）', () => {
     unmount();
   });
 
+  it('F8：外部元数据变化后放弃 → 新 session 携带新冻结 mode，后续写用新基线', async () => {
+    const io = { read: vi.fn(), write: vi.fn() };
+    const { container, unmount } = await enterEdit(io);
+    io.write.mockRejectedValueOnce(new ApiError(409, 'conflict', '冲突'));
+    // 外部 chmod：重读返回新 mode/基线
+    io.read.mockResolvedValueOnce({
+      editable: true,
+      content: 'srv\n',
+      baseHash: 'hS',
+      lineEnding: 'lf',
+      hasBom: false,
+      mode: '0755',
+    } satisfies FileEditRead);
+    const view = editorViews(container)[0];
+    act(() => {
+      view.dispatch({ changes: { from: 0, insert: 'mine\n' } });
+    });
+    await until(() => container.querySelector('.edit-conflict-bar') !== null, 6000);
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>('button')]
+        .find((b) => b.textContent === '放弃本地改动')!
+        .click();
+    });
+    // 新 session 重建编辑器为服务端内容，冲突解除
+    await until(() => editorViews(container)[0].state.doc.toString() === 'srv\n');
+    expect(container.querySelector('.edit-conflict-bar')).toBeNull();
+    // 后续编辑的写回携带新冻结元数据与新基线
+    const v2 = editorViews(container)[0];
+    act(() => {
+      v2.dispatch({ changes: { from: v2.state.doc.length, insert: 'x\n' } });
+    });
+    await until(() => io.write.mock.calls.length >= 2, 6000);
+    const last = io.write.mock.calls[io.write.mock.calls.length - 1][0] as FileEditWriteInput;
+    expect(last).toMatchObject({ content: 'srv\nx\n', baseHash: 'hS', baseMode: '0755' });
+    unmount();
+  });
+
+  it('F8：放弃时文件已不可编辑 → 安全退出编辑态并显示原因（不被困住）', async () => {
+    const io = { read: vi.fn(), write: vi.fn() };
+    const { container, unmount } = await enterEdit(io);
+    io.write.mockRejectedValueOnce(new ApiError(409, 'conflict', '冲突'));
+    io.read.mockResolvedValueOnce({
+      editable: false,
+      reasonCode: 'read_only',
+      reason: '文件只读',
+    } satisfies FileEditRead);
+    const view = editorViews(container)[0];
+    act(() => {
+      view.dispatch({ changes: { from: 0, insert: 'mine\n' } });
+    });
+    await until(() => container.querySelector('.edit-conflict-bar') !== null, 6000);
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>('button')]
+        .find((b) => b.textContent === '放弃本地改动')!
+        .click();
+    });
+    // 安全退出：回查看模式（只读）、冲突横幅消失、显示原因、无编辑命令
+    await until(() => container.textContent?.includes('文件只读') ?? false);
+    expect(container.querySelector('.edit-conflict-bar')).toBeNull();
+    expect(container.textContent).not.toContain('退出编辑');
+    for (const el of container.querySelectorAll('.cm-content')) {
+      expect(el.getAttribute('contenteditable')).toBe('false');
+    }
+    expect(
+      [...container.querySelectorAll<HTMLButtonElement>('button')].some(
+        (b) => b.textContent === '编辑' && !b.disabled,
+      ),
+    ).toBe(false);
+    unmount();
+  });
+
+  it('F11：discard 在途期间重入被拒——迟到第二次不得清掉新 session', async () => {
+    const io = { read: vi.fn(), write: vi.fn() };
+    const { container, unmount } = await enterEdit(io);
+    io.write.mockRejectedValueOnce(new ApiError(409, 'conflict', '冲突'));
+    const view = editorViews(container)[0];
+    act(() => {
+      view.dispatch({ changes: { from: 0, insert: 'mine\n' } });
+    });
+    await until(() => container.querySelector('.edit-conflict-bar') !== null, 6000);
+    // 第一次 discard：重读挂起（在途）
+    let resolveDiscard!: (r: FileEditRead) => void;
+    io.read.mockImplementationOnce(
+      () =>
+        new Promise<FileEditRead>((res) => {
+          resolveDiscard = res;
+        }),
+    );
+    const readsBefore = io.read.mock.calls.length;
+    act(() => {
+      [...container.querySelectorAll<HTMLButtonElement>('button')]
+        .find((b) => b.textContent === '放弃本地改动')!
+        .click();
+    });
+    // 在途期间按钮禁用，第二次点击被拒绝（不产生第二次重读）
+    await until(() => container.textContent?.includes('放弃中…') ?? false);
+    act(() => {
+      [...container.querySelectorAll<HTMLButtonElement>('button')]
+        .find((b) => b.textContent === '放弃中…')!
+        .click();
+    });
+    expect(io.read.mock.calls.length).toBe(readsBefore + 1);
+    // 第一次完成：新 session 建立
+    await act(async () => {
+      resolveDiscard({
+        editable: true,
+        content: 'srv\n',
+        baseHash: 'hS',
+        lineEnding: 'crlf',
+        hasBom: false,
+        mode: '0644',
+      } satisfies FileEditRead);
+    });
+    await until(() => editorViews(container)[0].state.doc.toString() === 'srv\n');
+    expect(container.querySelector('.edit-conflict-bar')).toBeNull();
+    // 新 session 的编辑不丢失：写回以新基线正常进行
+    const v2 = editorViews(container)[0];
+    act(() => {
+      v2.dispatch({ changes: { from: v2.state.doc.length, insert: 'n\n' } });
+    });
+    await until(() => io.write.mock.calls.length >= 2, 6000);
+    const last = io.write.mock.calls[io.write.mock.calls.length - 1][0] as FileEditWriteInput;
+    expect(last).toMatchObject({ content: 'srv\nn\n', baseHash: 'hS' });
+    expect(
+      [...container.querySelectorAll('.cm-content')].some(
+        (el) => el.getAttribute('contenteditable') === 'true',
+      ),
+    ).toBe(true);
+    unmount();
+  });
+
+  it('F11：延迟 discard 期间继续输入 → 输入不被覆盖，恰好一次补发且携带新 metadata', async () => {
+    const io = { read: vi.fn(), write: vi.fn() };
+    const { container, unmount } = await enterEdit(io); // 旧 session：crlf/0644/h0
+    io.write.mockRejectedValueOnce(new ApiError(409, 'conflict', '冲突'));
+    io.write.mockResolvedValue({ baseHash: 'h2' });
+    const view = editorViews(container)[0];
+    act(() => {
+      view.dispatch({ changes: { from: 0, insert: 'mine\n' } });
+    });
+    await until(() => container.querySelector('.edit-conflict-bar') !== null, 6000);
+    let resolveDiscard!: (r: FileEditRead) => void;
+    io.read.mockImplementationOnce(
+      () =>
+        new Promise<FileEditRead>((res) => {
+          resolveDiscard = res;
+        }),
+    );
+    act(() => {
+      [...container.querySelectorAll<HTMLButtonElement>('button')]
+        .find((b) => b.textContent === '放弃本地改动')!
+        .click();
+    });
+    await until(() => container.textContent?.includes('放弃中…') ?? false);
+    // discard 在途：编辑器已锁只读过渡态
+    for (const el of container.querySelectorAll('.cm-content')) {
+      expect(el.getAttribute('contenteditable')).toBe('false');
+    }
+    // 代际栅栏路径（程序化事务绕过 UI 锁的残余窗口）：GET 返回前又有新输入
+    act(() => {
+      view.dispatch({ changes: { from: view.state.doc.length, insert: 'late\n' } });
+    });
+    await act(async () => {
+      resolveDiscard({
+        editable: true,
+        content: 'srv\n',
+        baseHash: 'hS',
+        lineEnding: 'lf',
+        hasBom: false,
+        mode: '0755',
+      } satisfies FileEditRead);
+    });
+    // 补发唯一 owner 是新 session：总写数恰好 2（冲突写 + 一次补发），旧 session 零额外写
+    await until(() => io.write.mock.calls.length === 2, 6000);
+    await flushUI();
+    expect(io.write.mock.calls.length).toBe(2);
+    const patch = io.write.mock.calls[1][0] as FileEditWriteInput;
+    expect(patch.content).toContain('late\n'); // 用户输入保留，不被 'srv\n' 覆盖
+    expect(patch).toMatchObject({ baseHash: 'hS', baseMode: '0755', lineEnding: 'lf' }); // 新冻结 metadata
+    expect(editorViews(container)[0].state.doc.toString()).toContain('late\n');
+    // 下一次编辑使用补发响应返回的新 hash
+    const v2 = editorViews(container)[0];
+    act(() => {
+      v2.dispatch({ changes: { from: v2.state.doc.length, insert: 'next\n' } });
+    });
+    await until(() => io.write.mock.calls.length === 3, 6000);
+    expect(io.write.mock.calls[2][0]).toMatchObject({ baseHash: 'h2', baseMode: '0755' });
+    unmount();
+  });
+
+  it('F18：discard 在途禁用形态/换行控件，强制重建后编辑器仍为只读锁态', async () => {
+    const io = { read: vi.fn(), write: vi.fn() };
+    io.read.mockResolvedValue(editableRead);
+    io.write.mockResolvedValue({ baseHash: 'h1' });
+    let setWrapExt: (b: boolean) => void = () => {};
+    function StatefulViewer() {
+      const [wrap, setWrap] = useState(false);
+      setWrapExt = setWrap;
+      return (
+        <DiffViewer
+          diff={makeDiff({})}
+          path="a.ts"
+          sourceRef=""
+          untracked={false}
+          annotations={[]}
+          onCreateAnnotation={async () => {}}
+          editIO={io}
+          modeOverride="unified"
+          onModeChange={() => {}}
+          wrapOverride={wrap}
+          onWrapChange={setWrap}
+        />
+      );
+    }
+    const { container, unmount } = mount(<StatefulViewer />);
+    await until(() => editorViews(container).length > 0);
+    await clickEdit(container);
+    // 制造 409 阻塞后发起 discard（重读挂起）
+    io.write.mockRejectedValueOnce(new ApiError(409, 'conflict', '冲突'));
+    act(() => {
+      editorViews(container)[0].dispatch({ changes: { from: 0, insert: 'mine\n' } });
+    });
+    await until(() => container.querySelector('.edit-conflict-bar') !== null, 6000);
+    io.read.mockImplementationOnce(() => new Promise<FileEditRead>(() => {}));
+    act(() => {
+      [...container.querySelectorAll<HTMLButtonElement>('button')]
+        .find((b) => b.textContent === '放弃本地改动')!
+        .click();
+    });
+    await until(() => container.textContent?.includes('放弃中…') ?? false);
+    // 三控件禁用
+    for (const label of ['单列', '并排', '换行']) {
+      const btn = [...container.querySelectorAll<HTMLButtonElement>('button')].find(
+        (b) => b.textContent === label,
+      )!;
+      expect(btn.disabled).toBe(true);
+    }
+    // 外部强制触发重建（换行 prop 变化）：新编辑器仍须为只读锁态
+    act(() => setWrapExt(true));
+    await until(() => editorViews(container).length > 0);
+    for (const el of container.querySelectorAll('.cm-content')) {
+      expect(el.getAttribute('contenteditable')).toBe('false');
+    }
+    unmount();
+  });
+
+  it('F11：discard 与 exit 并发——discard 在途时退出被拒，无双 session 无丢写', async () => {
+    const io = { read: vi.fn(), write: vi.fn() };
+    const { container, unmount } = await enterEdit(io);
+    io.write.mockRejectedValueOnce(new ApiError(409, 'conflict', '冲突'));
+    const view = editorViews(container)[0];
+    act(() => {
+      view.dispatch({ changes: { from: 0, insert: 'mine\n' } });
+    });
+    await until(() => container.querySelector('.edit-conflict-bar') !== null, 6000);
+    let resolveDiscard!: (r: FileEditRead) => void;
+    io.read.mockImplementationOnce(
+      () =>
+        new Promise<FileEditRead>((res) => {
+          resolveDiscard = res;
+        }),
+    );
+    act(() => {
+      [...container.querySelectorAll<HTMLButtonElement>('button')]
+        .find((b) => b.textContent === '放弃本地改动')!
+        .click();
+    });
+    await until(() => container.textContent?.includes('放弃中…') ?? false);
+    // discard 在途：退出按钮禁用，点击无效（仍处编辑模式）
+    const exitBtn = [...container.querySelectorAll<HTMLButtonElement>('button')].find(
+      (b) => b.textContent === '退出编辑',
+    )!;
+    expect(exitBtn.disabled).toBe(true);
+    act(() => exitBtn.click());
+    await flushUI();
+    expect(container.textContent).toContain('放弃中…'); // 仍在 discard 流程，未退出
+    // discard 完成：唯一新 session 建立，可继续编辑写回
+    await act(async () => {
+      resolveDiscard({
+        editable: true,
+        content: 'srv\n',
+        baseHash: 'hS',
+        lineEnding: 'crlf',
+        hasBom: false,
+        mode: '0644',
+      } satisfies FileEditRead);
+    });
+    await until(() => editorViews(container)[0].state.doc.toString() === 'srv\n');
+    expect(editorViews(container).length).toBe(1);
+    const v2 = editorViews(container)[0];
+    act(() => {
+      v2.dispatch({ changes: { from: v2.state.doc.length, insert: 'n\n' } });
+    });
+    await until(() => io.write.mock.calls.length >= 2, 6000);
+    unmount();
+  });
+
   it('还原入口：确认后以快照写回', async () => {
     const io = { read: vi.fn(), write: vi.fn() };
     const { container, unmount } = await enterEdit(io);
@@ -789,17 +1167,7 @@ describe('编辑模式（进入/写回/横幅）', () => {
     const onRefreshDiff = vi.fn(async () => {});
     const mounted = renderViewer({ editIO: io, onRefreshDiff });
     await until(() => editorViews(mounted.container).length > 0);
-    act(() => {
-      [...mounted.container.querySelectorAll<HTMLButtonElement>('button')]
-        .find((b) => b.textContent === '编辑')!
-        .click();
-    });
-    await until(
-      () =>
-        [...mounted.container.querySelectorAll('.cm-content')].some(
-          (el) => el.getAttribute('contenteditable') === 'true',
-        ),
-    );
+    await clickEdit(mounted.container);
     await act(async () => {
       [...mounted.container.querySelectorAll<HTMLButtonElement>('button')]
         .find((b) => b.textContent === '退出编辑')!
@@ -830,17 +1198,7 @@ describe('编辑模式（进入/写回/横幅）', () => {
     );
     const mounted = renderViewer({ editIO: io, onRefreshDiff });
     await until(() => editorViews(mounted.container).length > 0);
-    act(() => {
-      [...mounted.container.querySelectorAll<HTMLButtonElement>('button')]
-        .find((b) => b.textContent === '编辑')!
-        .click();
-    });
-    await until(
-      () =>
-        [...mounted.container.querySelectorAll('.cm-content')].some(
-          (el) => el.getAttribute('contenteditable') === 'true',
-        ),
-    );
+    await clickEdit(mounted.container);
     // 点击进入编辑退出事务但不释放刷新
     act(() => {
       [...mounted.container.querySelectorAll<HTMLButtonElement>('button')]
@@ -873,17 +1231,7 @@ describe('编辑模式（进入/写回/横幅）', () => {
       .mockResolvedValue(undefined);
     const mounted = renderViewer({ editIO: io, onRefreshDiff });
     await until(() => editorViews(mounted.container).length > 0);
-    act(() => {
-      [...mounted.container.querySelectorAll<HTMLButtonElement>('button')]
-        .find((b) => b.textContent === '编辑')!
-        .click();
-    });
-    await until(
-      () =>
-        [...mounted.container.querySelectorAll('.cm-content')].some(
-          (el) => el.getAttribute('contenteditable') === 'true',
-        ),
-    );
+    await clickEdit(mounted.container);
     await act(async () => {
       [...mounted.container.querySelectorAll<HTMLButtonElement>('button')]
         .find((b) => b.textContent === '退出编辑')!
@@ -942,17 +1290,7 @@ describe('编辑模式（进入/写回/横幅）', () => {
     }
     const { container, unmount } = mount(<StatefulViewer />);
     await until(() => editorViews(container).length > 0);
-    act(() => {
-      [...container.querySelectorAll<HTMLButtonElement>('button')]
-        .find((b) => b.textContent === '编辑')!
-        .click();
-    });
-    await until(
-      () =>
-        [...container.querySelectorAll('.cm-content')].some(
-          (el) => el.getAttribute('contenteditable') === 'true',
-        ),
-    );
+    await clickEdit(container);
     await act(async () => {
       [...container.querySelectorAll<HTMLButtonElement>('button')]
         .find((b) => b.textContent === '退出编辑')!
@@ -1011,17 +1349,7 @@ describe('编辑模式（进入/写回/横幅）', () => {
     }
     const { container, unmount } = mount(<StatefulViewer />);
     await until(() => editorViews(container).length > 0);
-    act(() => {
-      [...container.querySelectorAll<HTMLButtonElement>('button')]
-        .find((b) => b.textContent === '编辑')!
-        .click();
-    });
-    await until(
-      () =>
-        [...container.querySelectorAll('.cm-content')].some(
-          (el) => el.getAttribute('contenteditable') === 'true',
-        ),
-    );
+    await clickEdit(container);
     // 进入退出事务，刷新挂起
     act(() => {
       [...container.querySelectorAll<HTMLButtonElement>('button')]
@@ -1058,21 +1386,39 @@ describe('编辑模式（进入/写回/横幅）', () => {
     unmount();
   });
 
-  it('F8：进入编辑的瞬时请求错误可重试（不写资格态、不禁用入口）', async () => {
+  it('F8：资格预取的瞬时请求错误可重试（不写资格态、提示 + 重试入口）', async () => {
     const io = { read: vi.fn(), write: vi.fn() };
     io.read.mockRejectedValueOnce(new Error('network down')).mockResolvedValue(editableRead);
     io.write.mockResolvedValue({ baseHash: 'h1' });
     const { container, unmount } = renderViewer({ editIO: io });
     await until(() => container.querySelectorAll('.cm-editor').length > 0);
-    const editBtn = () =>
-      [...container.querySelectorAll<HTMLButtonElement>('button')].find(
-        (b) => b.textContent === '编辑',
-      )!;
-    act(() => editBtn().click());
+    // 预取失败：提示 + 重试入口，无编辑命令
     await until(() => container.textContent?.includes('进入编辑失败') ?? false);
-    // 入口保持可用，直接重试成功进入编辑
-    expect(editBtn().disabled).toBe(false);
-    act(() => editBtn().click());
+    expect(
+      [...container.querySelectorAll<HTMLButtonElement>('button')].some(
+        (b) => b.textContent === '编辑' && !b.disabled,
+      ),
+    ).toBe(false);
+    // 重试成功 → eligible，编辑命令出现
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>('button')]
+        .find((b) => b.textContent === '重试')!
+        .click();
+      await Promise.resolve();
+    });
+    await until(() =>
+      [...container.querySelectorAll<HTMLButtonElement>('button')].some(
+        (b) => b.textContent === '编辑' && !b.disabled,
+      ),
+    );
+    expect(io.read).toHaveBeenCalledTimes(2);
+    expect(container.textContent).not.toContain('进入编辑失败');
+    // 点击进入编辑（复用预取结果，不再 GET）
+    act(() => {
+      [...container.querySelectorAll<HTMLButtonElement>('button')]
+        .find((b) => b.textContent === '编辑')!
+        .click();
+    });
     await until(
       () =>
         [...container.querySelectorAll('.cm-content')].some(
@@ -1080,7 +1426,6 @@ describe('编辑模式（进入/写回/横幅）', () => {
         ),
     );
     expect(io.read).toHaveBeenCalledTimes(2);
-    expect(container.textContent).not.toContain('进入编辑失败');
     unmount();
   });
 
@@ -1101,7 +1446,12 @@ describe('编辑模式（进入/写回/横幅）', () => {
     });
     expect(container.querySelector('.ann-bubble')).toBeTruthy();
     expect(container.querySelector('.cm-annotationCandidate')).toBeTruthy();
-    // 不提交气泡，直接进入编辑
+    // 不提交气泡，直接进入编辑（先等资格预取完成）
+    await until(() =>
+      [...container.querySelectorAll<HTMLButtonElement>('button')].some(
+        (b) => b.textContent === '编辑' && !b.disabled,
+      ),
+    );
     act(() => {
       [...container.querySelectorAll<HTMLButtonElement>('button')]
         .find((b) => b.textContent === '编辑')!

@@ -774,14 +774,14 @@ type revisionCheckingRepo struct {
 	*mockRepo
 }
 
-func (r *revisionCheckingRepo) CreateDiffReviewSubmission(ctx context.Context, in CreateDiffReviewSubmissionInput) error {
+func (r *revisionCheckingRepo) CreateDiffReviewSubmission(ctx context.Context, in CreateDiffReviewSubmissionInput) (DiffReviewSubmissionRecord, error) {
 	for _, it := range in.Items {
 		ann, ok := r.annotations[it.AnnotationID]
 		if !ok {
-			return ErrRevisionConflict
+			return DiffReviewSubmissionRecord{}, ErrRevisionConflict
 		}
 		if ann.Revision != it.AnnotationRevision {
-			return ErrRevisionConflict
+			return DiffReviewSubmissionRecord{}, ErrRevisionConflict
 		}
 	}
 	return r.mockRepo.CreateDiffReviewSubmission(ctx, in)
@@ -924,7 +924,7 @@ type createBarrierRepo struct {
 	mu      sync.Mutex
 }
 
-func (b *createBarrierRepo) CreateDiffReviewSubmission(ctx context.Context, in CreateDiffReviewSubmissionInput) error {
+func (b *createBarrierRepo) CreateDiffReviewSubmission(ctx context.Context, in CreateDiffReviewSubmissionInput) (DiffReviewSubmissionRecord, error) {
 	b.mu.Lock()
 	if !b.called {
 		b.called = true

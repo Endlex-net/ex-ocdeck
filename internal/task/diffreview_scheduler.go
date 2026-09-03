@@ -3,7 +3,9 @@
 // 归属（D2/D9）：Manager 内每任务一个调度循环，随 runtime 启动、Shutdown join。
 // 本文件实现：
 //   - SchedulerCallbacks（LockTask = tryLockTask，与生命周期操作互斥）。
-//   - 调度器随 setRuntime 启动、随 clearRuntime 停止。
+//   - 调度器随 active 提交启动、随 clearRuntime 停止（F3 三个真实启动点：
+//     activation 的 commitRuntimeReady CAS 后、reconcile 提交 active 后、suspend 修复
+//     回 active CAS 后；setRuntime 不再是启动点，避免首探抢跑非 active task）。
 //   - Manager Shutdown join 全部调度器 goroutine。
 //   - 3.8 重启恢复：服务启动收敛（ConvergeOnStartup）+ runtime 启动恢复本任务 queued。
 //
@@ -77,7 +79,10 @@ func (c *schedulerCallbacks) LockTask(ctx context.Context, taskID string) (func(
 
 // StartDiffReviewSchedulerForTask 为指定任务启动调度器 goroutine（design.md D2：随 runtime 启动）。
 // 幂等：已有调度器在运行则 no-op。未注入 diffreview.Service 则 no-op。
-// 由 setRuntime 路径调用（runtime ready 后接管本任务 queued 队列）。
+// 由 commitRuntimeReady（active CAS 提交后）、reconcile（提交 active 后）与 suspend 修复
+// （回 active CAS 后）调用（F3/F14：MUST NOT 在 ready 提交前启动——提前启动会让 eager 首探
+// 抢跑，taskOcClient 拒绝非 active task）。构造调度器时捕获当前 runtime 的 instVersion
+// （能力缓存 fencing 用；runtime 替换时本调度器随 clearRuntime 停止，新调度器以新版本构造）。
 func (m *Manager) StartDiffReviewSchedulerForTask(ctx context.Context, taskID string) {
 	svc := m.getDiffReviewService()
 	if svc == nil {
@@ -89,12 +94,18 @@ func (m *Manager) StartDiffReviewSchedulerForTask(ctx context.Context, taskID st
 	if _, running := sc.handles[taskID]; running {
 		return
 	}
+	// 捕获当前 runtime instVersion（F3：响应后 fencing 直接使用该版本，不临时读 DB）。
+	instVer := ""
+	if rt := m.getRuntime(taskID); rt != nil {
+		instVer = string(rt.instVersion)
+	}
 	schedCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	sched := diffreview.NewScheduler(diffreview.SchedulerOptions{
-		Service:   svc,
-		Callbacks: &schedulerCallbacks{m: m},
-		TaskID:    taskID,
+		Service:     svc,
+		Callbacks:   &schedulerCallbacks{m: m},
+		TaskID:      taskID,
+		InstVersion: instVer,
 	})
 	sc.wg.Add(1)
 	go func() {

@@ -90,18 +90,38 @@ type DiffReviewSubmissionItemRow struct {
 	Comment            string
 }
 
-// CreateDiffAnnotation 插入批注行（revision 初始为 1）。created_at/updated_at 用 nowUnix。
-func (q *Queries) CreateDiffAnnotation(ctx context.Context, r DiffAnnotationRow) error {
+// DiffReviewSubmissionWithItems 是分区快照中的一条提交及其 items。
+// Items 始终非 nil（可为空切片）。
+type DiffReviewSubmissionWithItems struct {
+	Submission DiffReviewSubmissionRow
+	Items      []DiffReviewSubmissionItemRow
+}
+
+// DiffReviewSubmissionPartitions 是任务三分区的一致快照（同一 SQLite 读事务）。
+// 排序契约（design.md D8）：queue seq ASC；history sent_at DESC, seq DESC；
+// failures created_at DESC, seq DESC。
+type DiffReviewSubmissionPartitions struct {
+	Queue    []DiffReviewSubmissionWithItems
+	History  []DiffReviewSubmissionWithItems
+	Failures []DiffReviewSubmissionWithItems
+}
+
+// CreateDiffAnnotation 插入批注行（revision 初始为 1）并以 RETURNING 返回完整行。
+// created_at/updated_at 用 nowUnix。F12：INSERT 与行读取必须在同一语句完成——调用方
+// 不得在写入提交后再做必需的二次读取（避免写成功但响应失败致客户端重试重复创建）。
+func (q *Queries) CreateDiffAnnotation(ctx context.Context, r DiffAnnotationRow) (DiffAnnotationRow, error) {
 	now := nowUnix()
-	_, err := q.db.ExecContext(ctx,
+	row := q.db.QueryRowContext(ctx,
 		`INSERT INTO diff_annotations
 		   (id, task_id, path, side, ref, untracked, start_line, end_line,
 		    snapshot_start_line, snapshot, snapshot_line_count, comment, revision, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 RETURNING id, task_id, path, side, ref, untracked, start_line, end_line,
+		           snapshot_start_line, snapshot, snapshot_line_count, comment, revision, created_at, updated_at`,
 		r.ID, r.TaskID, r.Path, r.Side, r.Ref, boolToInt(r.Untracked),
 		r.StartLine, r.EndLine, r.SnapshotStartLine, r.Snapshot, r.SnapshotLineCount,
 		r.Comment, 1, now, now)
-	return err
+	return scanDiffAnnotationRow(row)
 }
 
 // DiffAnnotationCommentUpdate 表达编辑评论写入的三态结果。
@@ -109,6 +129,7 @@ func (q *Queries) CreateDiffAnnotation(ctx context.Context, r DiffAnnotationRow)
 //   - Matched: WHERE 命中行（id 存在）。
 //   - Changed: 命中行且评论发生真实变更（同值命中时 Changed=false，revision 不递增）。
 //   - Revision: 真实变更后的新 revision（>0）；同值命中时为命中行当前 revision；未命中时为 0。
+//   - Row: 命中行的完整记录（F12：RETURNING/同事务 SELECT 取得，调用方不得再二次读取）。
 //
 // 同值原子 no-op：SQL WHERE 排除同值（comment != ?），仅真实变更才递增 revision 与 updated_at。
 // 调用方据此区分「不存在」「同值无变化」「已更新」（D3：每次实变才 +1）。
@@ -116,6 +137,7 @@ type DiffAnnotationCommentUpdate struct {
 	Matched  bool
 	Changed  bool
 	Revision int
+	Row      DiffAnnotationRow
 }
 
 // UpdateDiffAnnotationComment 更新批注评论，仅真实变更（comment != 当前值）才 revision 严格 +1（D3：每次实变 +1）。
@@ -123,30 +145,32 @@ type DiffAnnotationCommentUpdate struct {
 // 行不存在 → Matched=false, Changed=false, Revision=0（调用方按 not_found 处理）。
 // updated_at 用 nowUnix（秒级，同秒实变不推进不影响 revision 比对）。
 //
-// 分类过程在 runTx 单事务内完成：真实变更用 UPDATE ... RETURNING revision 直接获取本次实变的
-// 新 revision（保证返回值属于本次写入，不受并发更新/删除影响）；RETURNING 无行命中时在同一事务内
-// SELECT 区分同值（行存在）与不存在。SQLite 单写者事务保证原子性。
+// 分类过程在 runTx 单事务内完成：真实变更用 UPDATE ... RETURNING 全列直接获取本次实变后的
+// 完整行（F12：返回值属于本次写入，调用方不得在提交后再做必需的二次读取）；RETURNING 无行命中时
+// 在同一事务内 SELECT 全列区分同值（行存在）与不存在。SQLite 单写者事务保证原子性。
 func (q *Queries) UpdateDiffAnnotationComment(ctx context.Context, id, comment string) (DiffAnnotationCommentUpdate, error) {
 	now := nowUnix()
 	return runTx(ctx, q, func(qx *Queries) (DiffAnnotationCommentUpdate, error) {
-		// 真实变更：WHERE 排除同值，RETURNING 直接返回本次实变后的 revision。
-		var rev int
-		err := qx.db.QueryRowContext(ctx,
+		// 真实变更：WHERE 排除同值，RETURNING 直接返回本次实变后的完整行。
+		row := qx.db.QueryRowContext(ctx,
 			`UPDATE diff_annotations
 			    SET comment = ?, revision = revision + 1, updated_at = ?
 			 WHERE id = ? AND comment != ?
-			 RETURNING revision`,
-			comment, now, id, comment).Scan(&rev)
+			 RETURNING id, task_id, path, side, ref, untracked, start_line, end_line,
+			           snapshot_start_line, snapshot, snapshot_line_count, comment, revision, created_at, updated_at`,
+			comment, now, id, comment)
+		updated, err := scanDiffAnnotationRow(row)
 		if err == nil {
-			return DiffAnnotationCommentUpdate{Matched: true, Changed: true, Revision: rev}, nil
+			return DiffAnnotationCommentUpdate{Matched: true, Changed: true, Revision: updated.Revision, Row: updated}, nil
 		}
 		if err != sql.ErrNoRows {
 			return DiffAnnotationCommentUpdate{}, err
 		}
-		// RETURNING 无行命中：行不存在 或 同值命中。在同一事务内 SELECT 区分。
-		var curRev int
-		serr := qx.db.QueryRowContext(ctx,
-			`SELECT revision FROM diff_annotations WHERE id = ?`, id).Scan(&curRev)
+		// RETURNING 无行命中：行不存在 或 同值命中。在同一事务内 SELECT 全列区分。
+		cur, serr := scanDiffAnnotationRow(qx.db.QueryRowContext(ctx,
+			`SELECT id, task_id, path, side, ref, untracked, start_line, end_line,
+			        snapshot_start_line, snapshot, snapshot_line_count, comment, revision, created_at, updated_at
+			 FROM diff_annotations WHERE id = ?`, id))
 		if serr == sql.ErrNoRows {
 			return DiffAnnotationCommentUpdate{Matched: false, Changed: false, Revision: 0}, nil
 		}
@@ -154,7 +178,7 @@ func (q *Queries) UpdateDiffAnnotationComment(ctx context.Context, id, comment s
 			return DiffAnnotationCommentUpdate{}, serr
 		}
 		// 行存在但同值 → Matched=true, Changed=false, Revision=当前值。
-		return DiffAnnotationCommentUpdate{Matched: true, Changed: false, Revision: curRev}, nil
+		return DiffAnnotationCommentUpdate{Matched: true, Changed: false, Revision: cur.Revision, Row: cur}, nil
 	})
 }
 
@@ -214,14 +238,17 @@ var ErrDiffReviewRevisionConflict = errors.New("store: diff review submission re
 // 并在事务内按每个 item 的 annotation_id+revision 复核活动批注版本（D2 落库条）。
 // 复核失败 → ErrDiffReviewRevisionConflict，整事务回滚（零落库）。
 // message_id UNIQUE 碰撞 → 底层 sqlite 错误透传（调用方按约束冲突处理）。
-func (q *Queries) CreateDiffReviewSubmission(ctx context.Context, in CreateDiffReviewSubmissionInput) error {
+// G1：INSERT...RETURNING seq, created_at 返回完整行——调用方不得在事务提交后再做必需的
+// 二次读取（避免写成功但响应失败致客户端重试产生第二条 submission/重复投递）。
+func (q *Queries) CreateDiffReviewSubmission(ctx context.Context, in CreateDiffReviewSubmissionInput) (DiffReviewSubmissionRow, error) {
 	if in.Submission.Status != DiffReviewStatusQueued {
-		return fmt.Errorf("store: create diff review submission requires status=%q, got %q",
+		return DiffReviewSubmissionRow{}, fmt.Errorf("store: create diff review submission requires status=%q, got %q",
 			DiffReviewStatusQueued, in.Submission.Status)
 	}
 	if in.Submission.ID == "" || in.Submission.TaskID == "" || in.Submission.MessageID == "" {
-		return fmt.Errorf("store: create diff review submission requires id/task_id/message_id")
+		return DiffReviewSubmissionRow{}, fmt.Errorf("store: create diff review submission requires id/task_id/message_id")
 	}
+	var stored DiffReviewSubmissionRow
 	txErr := withTxQueries(ctx, q.db, func(qx *Queries) error {
 		// 事务内复核：逐条 SELECT 当前活动批注 revision，与 item 快照 revision 比对。
 		// 不区分「不存在」与「revision 不符」——统一视为 conflict（D2）。
@@ -240,13 +267,14 @@ func (q *Queries) CreateDiffReviewSubmission(ctx context.Context, in CreateDiffR
 			}
 		}
 		now := nowUnix()
-		if _, err := qx.db.ExecContext(ctx,
+		if err := qx.db.QueryRowContext(ctx,
 			`INSERT INTO diff_review_submissions
 			   (id, task_id, status, target_session_id, message_id, note, payload, truncated, error, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 RETURNING seq, created_at`,
 			in.Submission.ID, in.Submission.TaskID, in.Submission.Status,
 			in.Submission.TargetSessionID, in.Submission.MessageID, in.Submission.Note,
-			in.Submission.Payload, boolToInt(in.Submission.Truncated), "", now); err != nil {
+			in.Submission.Payload, boolToInt(in.Submission.Truncated), "", now).Scan(&stored.Seq, &stored.CreatedAt); err != nil {
 			return err
 		}
 		for _, it := range in.Items {
@@ -263,7 +291,20 @@ func (q *Queries) CreateDiffReviewSubmission(ctx context.Context, in CreateDiffR
 		}
 		return nil
 	})
-	return txErr
+	if txErr != nil {
+		return DiffReviewSubmissionRow{}, txErr
+	}
+	// RETURNING 已取 seq/created_at；其余字段与输入一致（status=queued、error=""、sent_at NULL）。
+	stored.ID = in.Submission.ID
+	stored.TaskID = in.Submission.TaskID
+	stored.Status = in.Submission.Status
+	stored.TargetSessionID = in.Submission.TargetSessionID
+	stored.MessageID = in.Submission.MessageID
+	stored.Note = in.Submission.Note
+	stored.Payload = in.Submission.Payload
+	stored.Truncated = in.Submission.Truncated
+	stored.Error = ""
+	return stored, nil
 }
 
 // ListDiffReviewQueue 列出任务下队列中的提交（queued + sending），按 seq ASC（FIFO 唯一依据，D2）。
@@ -311,6 +352,108 @@ func (q *Queries) ListDiffReviewFailures(ctx context.Context, taskID string) ([]
 	}
 	defer rows.Close()
 	return scanDiffReviewSubmissionRows(rows)
+}
+
+// ListDiffReviewSubmissionPartitions 在同一 SQLite 读事务内读取任务三分区 submissions 与 items。
+// 保证同一 submission 不会同时出现在多个分区，且每条提交带该快照时刻的 items。
+func (q *Queries) ListDiffReviewSubmissionPartitions(ctx context.Context, taskID string) (DiffReviewSubmissionPartitions, error) {
+	return runTx(ctx, q, func(qx *Queries) (DiffReviewSubmissionPartitions, error) {
+		subs, err := qx.listDiffReviewSubmissionsByTask(ctx, taskID)
+		if err != nil {
+			return DiffReviewSubmissionPartitions{}, err
+		}
+		itemsBySub, err := qx.listDiffReviewSubmissionItemsByTask(ctx, taskID)
+		if err != nil {
+			return DiffReviewSubmissionPartitions{}, err
+		}
+		out := DiffReviewSubmissionPartitions{
+			Queue:    make([]DiffReviewSubmissionWithItems, 0),
+			History:  make([]DiffReviewSubmissionWithItems, 0),
+			Failures: make([]DiffReviewSubmissionWithItems, 0),
+		}
+		for _, sub := range subs {
+			items := itemsBySub[sub.ID]
+			if items == nil {
+				items = []DiffReviewSubmissionItemRow{}
+			}
+			view := DiffReviewSubmissionWithItems{Submission: sub, Items: items}
+			switch sub.Status {
+			case DiffReviewStatusQueued, DiffReviewStatusSending:
+				out.Queue = append(out.Queue, view)
+			case DiffReviewStatusSent:
+				out.History = append(out.History, view)
+			case DiffReviewStatusFailed, DiffReviewStatusDeliveryUnknown:
+				out.Failures = append(out.Failures, view)
+			}
+		}
+		return out, nil
+	})
+}
+
+// listDiffReviewSubmissionsByTask 读取任务全部提交，按分区排序键一次排好：
+// queue（queued/sending）seq ASC；history（sent）sent_at DESC, seq DESC；
+// failures（failed/delivery_unknown）created_at DESC, seq DESC。
+func (q *Queries) listDiffReviewSubmissionsByTask(ctx context.Context, taskID string) ([]DiffReviewSubmissionRow, error) {
+	rows, err := q.db.QueryContext(ctx,
+		`SELECT seq, id, task_id, status, target_session_id, message_id, note, payload, truncated, error, created_at, sent_at
+		 FROM diff_review_submissions
+		 WHERE task_id = ?
+		 ORDER BY CASE status
+		            WHEN ? THEN 0
+		            WHEN ? THEN 0
+		            WHEN ? THEN 1
+		            WHEN ? THEN 2
+		            WHEN ? THEN 2
+		            ELSE 3
+		          END,
+		          CASE WHEN status IN (?, ?) THEN seq END ASC,
+		          CASE WHEN status = ? THEN sent_at END DESC,
+		          CASE WHEN status = ? THEN seq END DESC,
+		          CASE WHEN status IN (?, ?) THEN created_at END DESC,
+		          CASE WHEN status IN (?, ?) THEN seq END DESC`,
+		taskID,
+		DiffReviewStatusQueued, DiffReviewStatusSending,
+		DiffReviewStatusSent,
+		DiffReviewStatusFailed, DiffReviewStatusDeliveryUnknown,
+		DiffReviewStatusQueued, DiffReviewStatusSending,
+		DiffReviewStatusSent, DiffReviewStatusSent,
+		DiffReviewStatusFailed, DiffReviewStatusDeliveryUnknown,
+		DiffReviewStatusFailed, DiffReviewStatusDeliveryUnknown)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanDiffReviewSubmissionRows(rows)
+}
+
+// listDiffReviewSubmissionItemsByTask 读取任务全部提交快照条目，按 submission_id、annotation_id ASC。
+func (q *Queries) listDiffReviewSubmissionItemsByTask(ctx context.Context, taskID string) (map[string][]DiffReviewSubmissionItemRow, error) {
+	rows, err := q.db.QueryContext(ctx,
+		`SELECT i.submission_id, i.annotation_id, i.annotation_revision, i.path, i.side, i.ref, i.untracked,
+		        i.start_line, i.end_line, i.snapshot_start_line, i.snapshot, i.comment
+		 FROM diff_review_submission_items i
+		 INNER JOIN diff_review_submissions s ON s.id = i.submission_id
+		 WHERE s.task_id = ?
+		 ORDER BY i.submission_id ASC, i.annotation_id ASC`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]DiffReviewSubmissionItemRow{}
+	for rows.Next() {
+		var r DiffReviewSubmissionItemRow
+		var untracked int
+		if err := rows.Scan(&r.SubmissionID, &r.AnnotationID, &r.AnnotationRevision, &r.Path, &r.Side,
+			&r.Ref, &untracked, &r.StartLine, &r.EndLine, &r.SnapshotStartLine, &r.Snapshot, &r.Comment); err != nil {
+			return nil, err
+		}
+		r.Untracked = untracked != 0
+		out[r.SubmissionID] = append(out[r.SubmissionID], r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ListDiffReviewSubmissionItems 列出某提交的全部不可变快照条目（按 annotation_id ASC 稳定排序）。

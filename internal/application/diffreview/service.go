@@ -144,6 +144,8 @@ type CommentUpdateResult struct {
 	Matched  bool
 	Changed  bool
 	Revision int
+	// Record 为命中行的完整记录（F12：RETURNING/同事务 SELECT 取得；Matched=false 时为零值）。
+	Record DiffAnnotationRecord
 }
 
 // ErrRevisionConflict 复核失败（事务内批注 revision 已变化或被删除），
@@ -158,22 +160,28 @@ var ErrRevisionConflict = errors.New("diffreview: submission revision conflict")
 //     ListDiffAnnotationsByTask / GetDiffAnnotation
 //   - 提交创建：CreateDiffReviewSubmission（单事务 + items 快照 + revision 复核）
 //   - 队列/分区：ListDiffReviewQueue / ListDiffReviewHistory / ListDiffReviewFailures /
-//     ListDiffReviewSubmissionItems / GetDiffReviewSubmission
+//     ListDiffReviewSubmissionItems / ListDiffReviewSubmissionPartitions / GetDiffReviewSubmission
 //   - CAS/清理：CASDiffReviewSubmission / CompleteDiffReviewSentCleanup /
 //     CancelDiffReviewSubmission / DeleteDiffReviewSubmission
 //   - 启动收敛：ConvergeDiffReviewOnStartup
 type DiffReviewRepository interface {
-	CreateDiffAnnotation(ctx context.Context, in CreateDiffAnnotationInput) error
+	// CreateDiffAnnotation 插入批注并返回完整行（F12：INSERT...RETURNING 同一语句，
+	// 调用方不得在写入提交后再做必需的二次读取）。
+	CreateDiffAnnotation(ctx context.Context, in CreateDiffAnnotationInput) (DiffAnnotationRecord, error)
 	UpdateDiffAnnotationComment(ctx context.Context, id, comment string) (CommentUpdateResult, error)
 	DeleteDiffAnnotation(ctx context.Context, id string) (int, error)
 	ListDiffAnnotationsByTask(ctx context.Context, taskID string) ([]DiffAnnotationRecord, error)
 	GetDiffAnnotation(ctx context.Context, id string) (DiffAnnotationRecord, error)
 
-	CreateDiffReviewSubmission(ctx context.Context, in CreateDiffReviewSubmissionInput) error
+	// CreateDiffReviewSubmission 单事务创建提交并返回完整记录（G1：INSERT...RETURNING
+	// seq/created_at，调用方不得在事务提交后再做必需的二次读取——避免写成功但响应失败
+	// 致客户端重试产生第二条 submission/重复投递）。
+	CreateDiffReviewSubmission(ctx context.Context, in CreateDiffReviewSubmissionInput) (DiffReviewSubmissionRecord, error)
 	ListDiffReviewQueue(ctx context.Context, taskID string) ([]DiffReviewSubmissionRecord, error)
 	ListDiffReviewHistory(ctx context.Context, taskID string) ([]DiffReviewSubmissionRecord, error)
 	ListDiffReviewFailures(ctx context.Context, taskID string) ([]DiffReviewSubmissionRecord, error)
 	ListDiffReviewSubmissionItems(ctx context.Context, submissionID string) ([]DiffReviewSubmissionItemRecord, error)
+	ListDiffReviewSubmissionPartitions(ctx context.Context, taskID string) (SubmissionPartitions, error)
 	GetDiffReviewSubmission(ctx context.Context, id string) (DiffReviewSubmissionRecord, error)
 
 	CASDiffReviewSubmission(ctx context.Context, id, from, to, errorText string) (bool, error)

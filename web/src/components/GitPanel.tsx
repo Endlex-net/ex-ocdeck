@@ -241,6 +241,20 @@ export function GitPanel({
 
   const groups = useMemo(() => groupFiles(status?.files ?? []), [status]);
 
+  /** F10：editIO memo——按真实依赖（taskID + 当前视图路径）稳定引用，
+   *  避免 GitPanel 每次 render 产生新对象导致 DiffViewer 资格预取反复重启。 */
+  const editIO = useMemo(
+    () =>
+      selFile
+        ? {
+            read: () => api.gitFileRead(taskID, selFile.path),
+            write: (input: Parameters<typeof api.gitFileWrite>[1]) =>
+              api.gitFileWrite(taskID, input),
+          }
+        : undefined,
+    [taskID, selFile],
+  );
+
   return (
     <div className="git-panel">
       <div className="git-side">
@@ -385,10 +399,7 @@ export function GitPanel({
                     leaveGuard.current = fn;
                   }}
                   onRefreshDiff={refreshDiff}
-                  editIO={{
-                    read: () => api.gitFileRead(taskID, selFile.path),
-                    write: (input) => api.gitFileWrite(taskID, input),
-                  }}
+                  editIO={editIO}
                   modeOverride={modeOverride}
                   onModeChange={setModeOverride}
                   wrapOverride={wrapOverride}

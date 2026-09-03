@@ -37,6 +37,13 @@ export interface EditSessionOptions {
 const defaultIsConflict = (err: unknown): boolean =>
   err instanceof ApiError && (err.status === 409 || err.code === 'conflict');
 
+/** discard 结果（F11 双栅栏）：read 为重读判别联合；editedDuring=等待 GET 期间收到新编辑。 */
+export interface DiscardResult {
+  read: FileEditRead;
+  /** true = latest 为用户在途输入（已保留，MUST NOT 用服务端内容覆盖/重建编辑器）。 */
+  editedDuring: boolean;
+}
+
 export class EditSession {
   readonly path: string;
   readonly frozenLineEnding: LineEnding;
@@ -69,6 +76,8 @@ export class EditSession {
   private restoreLock = false;
   /** 还原事务期间是否发生过编辑（事件标志，F2：编辑后撤销回原值也算编辑，不得按字符串比较漏判）。 */
   private restoreEdited = false;
+  /** F11：编辑代际——discard 等待 GET 期间是否收到新编辑的判定栅栏（事件计数，非字符串比较）。 */
+  private editSeq = 0;
 
   constructor(opts: EditSessionOptions) {
     this.path = opts.path;
@@ -89,6 +98,7 @@ export class EditSession {
   /** 编辑器文档变更入口。blocked 态与还原写事务期间暂停自动写回（内容仍记录，待后续补发/用户决策）。 */
   onEdit(text: string): void {
     this.latest = text;
+    this.editSeq++;
     if (this.restoreLock) {
       this.restoreEdited = true;
       this.emit();
@@ -122,27 +132,39 @@ export class EditSession {
     await this.flush();
   }
 
-  /** 显式放弃本地改动：重读文件，编辑器重置为服务端内容；返回新内容（失败返回 null）。
+  /** 显式放弃本地改动：重读文件并返回完整结果（F8/F11）。
+   *  - editable=true 且无新编辑：latest 归位服务端内容，返回 editedDuring=false；
+   *  - editable=true 但有新编辑：保留 latest（调用方按 restoreEdited 语义以新基线补发），
+   *    本 session 不自行用旧冻结元数据写回；
+   *  - editable=false：返回不可编辑分支，调用方必须提供安全退出路径（不得困住用户）；
+   *  - null：重读请求本身失败，调用方保持现状可重试。
    *  经统一串行链执行（F10：不得在还原/写在途期间并发重读改写基线）。 */
-  async discard(): Promise<string | null> {
+  async discard(): Promise<DiscardResult | null> {
     return this.serialized(async () => {
       this.clearTimer();
+      const seqAtStart = this.editSeq; // F11 栅栏一：记录发起时编辑代际
       let r: FileEditRead;
       try {
         r = await this.io.read();
       } catch {
         return null;
       }
-      if (!r.editable) return null;
-      this.latest = r.content;
+      const editedDuring = this.editSeq !== seqAtStart;
+      if (!r.editable) return { read: r, editedDuring };
       this.sentContent = r.content;
       this.confirmedContent = r.content;
       this.baseHash = r.baseHash;
-      this.status = 'clean';
-      this.blockedReason = '';
       this.restoreEdited = false;
+      this.blockedReason = '';
+      if (editedDuring) {
+        // 保留 latest（用户在途输入）；调用方负责以新 session/新冻结元数据补发
+        this.status = 'pending';
+      } else {
+        this.latest = r.content;
+        this.status = 'clean';
+      }
       this.emit();
-      return r.content;
+      return { read: r, editedDuring };
     });
   }
 
@@ -211,9 +233,12 @@ export class EditSession {
     return this.status !== 'blocked';
   }
 
-  /** F11：卸载/销毁前尽力 flush——清 debounce 计时器后立即泵出未确认内容（非阻塞态）。 */
-  dispose(): void {
+  /** 卸载/销毁前尽力 flush（默认）——清 debounce 计时器后立即泵出未确认内容（非阻塞态）。
+   *  flush:false = 明确的不 flush 销毁（F11：editedDuring 换 session 场景，补发唯一 owner 是新
+   *  session，旧 session 不得携带旧冻结 lineEnding/mode 再写）。 */
+  dispose(options?: { flush?: boolean }): void {
     this.clearTimer();
+    if (options?.flush === false) return;
     if (this.status !== 'blocked' && this.latest !== this.confirmedContent) {
       void this.pump();
     }

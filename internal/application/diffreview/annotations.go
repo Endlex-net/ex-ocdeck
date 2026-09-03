@@ -32,23 +32,22 @@ type AnnotationView struct {
 //
 // comment 空白拒绝（spec「未输入任何评论不留存」后端侧落实，F8）；UpdateComment 仍单独
 // 在 PATCH 时拒绝空白（同校验）。
-func (s *Service) CreateAnnotation(ctx context.Context, in CreateDiffAnnotationInput) (DiffAnnotationRecord, error) {
+func (s *Service) CreateAnnotation(ctx context.Context, in CreateDiffAnnotationInput) (AnnotationView, error) {
 	// F8：纯领域校验先于任何 port 调用（D8 共用校验：纯 DTO 校验置于 port 调用前）。
 	if err := validateAnnotationInput(in); err != nil {
-		return DiffAnnotationRecord{}, err
+		return AnnotationView{}, err
 	}
 	if err := s.checkTaskScope(ctx, in.TaskID); err != nil {
-		return DiffAnnotationRecord{}, err
+		return AnnotationView{}, err
 	}
-	if err := s.repo.CreateDiffAnnotation(ctx, in); err != nil {
-		return DiffAnnotationRecord{}, err
-	}
-	// store 原语 CreateDiffAnnotation 不回写行；读回以获得 revision(=1)/created_at/updated_at。
-	rec, err := s.repo.GetDiffAnnotation(ctx, in.ID)
+	rec, err := s.repo.CreateDiffAnnotation(ctx, in)
 	if err != nil {
-		return DiffAnnotationRecord{}, err
+		return AnnotationView{}, err
 	}
-	return rec, nil
+	// F12：INSERT...RETURNING 已返回完整行，直接用已取得的 rec 计算 stale 返回视图
+	// （不得在写成功后再经 scope/DB 二次读取，避免 mutation 已成功但响应 500 导致客户端
+	// 重试产生重复批注）。
+	return AnnotationView{DiffAnnotationRecord: rec, Stale: s.computeStale(ctx, in.TaskID, rec)}, nil
 }
 
 // ListAnnotations 列出任务全部活动批注并惰性计算 stale（design.md D4 + spec 批注锚定状态）。
@@ -90,37 +89,39 @@ func (s *Service) ListAnnotations(ctx context.Context, taskID string) ([]Annotat
 // F4：单记录操作先做归属校验。先 GetDiffAnnotation 取行，校验 rec.TaskID==taskID
 // （归属不符统一 not_found，不泄露跨任务批注存在性）；归属不符零副作用（不写评论）。
 // F8：comment 空白与 65536-byte 上限为纯 DTO 校验，先于 port 调用（D8 共用校验置于 port 调用前）。
-func (s *Service) UpdateComment(ctx context.Context, taskID, annotationID, comment string) (DiffAnnotationRecord, error) {
+// F12：直接用已取得的 rec 计算 stale 返回视图（不得写成功后再二次读取持久层）。
+func (s *Service) UpdateComment(ctx context.Context, taskID, annotationID, comment string) (AnnotationView, error) {
 	if strings.TrimSpace(comment) == "" {
-		return DiffAnnotationRecord{}, ErrEmptyComment
+		return AnnotationView{}, ErrEmptyComment
 	}
 	// F8/D8：comment UTF-8 decoded bytes ≤65536。
 	if len(comment) > maxTextFieldBytes {
-		return DiffAnnotationRecord{}, ErrFieldTooLarge
+		return AnnotationView{}, ErrFieldTooLarge
 	}
 	if err := s.checkTaskScope(ctx, taskID); err != nil {
-		return DiffAnnotationRecord{}, err
+		return AnnotationView{}, err
 	}
 	// F4：归属校验。先取行确认属于本任务，归属不符统一 not_found（零写副作用）。
 	rec, err := s.repo.GetDiffAnnotation(ctx, annotationID)
 	if err != nil {
-		return DiffAnnotationRecord{}, err
+		return AnnotationView{}, err
 	}
 	if rec.TaskID != taskID {
-		return DiffAnnotationRecord{}, ErrAnnotationNotFound
+		return AnnotationView{}, ErrAnnotationNotFound
 	}
 	res, err := s.repo.UpdateDiffAnnotationComment(ctx, annotationID, comment)
 	if err != nil {
-		return DiffAnnotationRecord{}, err
+		return AnnotationView{}, err
 	}
 	if !res.Matched {
-		return DiffAnnotationRecord{}, ErrAnnotationNotFound
+		return AnnotationView{}, ErrAnnotationNotFound
 	}
 	if !res.Changed {
-		// 同值命中：revision 不变，返回当前行。
-		return s.repo.GetDiffAnnotation(ctx, annotationID)
+		// 同值命中：revision 不变，返回当前行（RETURNING/同事务 SELECT 已含完整行，无需再读）。
+		return AnnotationView{DiffAnnotationRecord: res.Record, Stale: s.computeStale(ctx, taskID, res.Record)}, nil
 	}
-	return s.repo.GetDiffAnnotation(ctx, annotationID)
+	// F12：UPDATE...RETURNING 已返回本次实变的完整行，不得再二次读取持久层。
+	return AnnotationView{DiffAnnotationRecord: res.Record, Stale: s.computeStale(ctx, taskID, res.Record)}, nil
 }
 
 // DeleteAnnotation 删除批注（spec 删除批注无撤回）。affected=0 视为 not_found。

@@ -173,6 +173,36 @@ func TestCreateSubmissionSuccess(t *testing.T) {
 	}
 }
 
+// TestCreateSubmissionNoReadBackAfterCreate（G4）：创建成功后 service MUST NOT 再读回——
+// GetDiffReviewSubmission 注入必然失败且计数必须为 0；创建仍成功且返回记录含 seq/createdAt。
+// （G1 窗口：写成功但读回失败会让客户端把已存在的 queued submission 当作创建失败并重试，
+// 产生第二条 submission/messageID 重复投递。）
+func TestCreateSubmissionNoReadBackAfterCreate(t *testing.T) {
+	repo := newMockRepo()
+	repo.annotations["a1"] = DiffAnnotationRecord{
+		ID: "a1", TaskID: "t1", Path: "f.go", Side: "new", StartLine: 1, EndLine: 1,
+		SnapshotStartLine: 1, SnapshotLineCount: 1, Snapshot: "x\n", Comment: "c", Revision: 1, CreatedAt: 100,
+	}
+	repo.getSubmissionErr = errInjected // 任何 Get 必然失败：若 service 读回，创建必然报错。
+	svc := newSubmissionTestService(repo, &mockDiff{result: DiffSourceResult{NewContent: "x\n", NewExists: true, NewMode: "100644"}}, &mockPrompt{})
+	sub, _, err := svc.CreateSubmission(context.Background(), CreateSubmissionRequest{
+		TaskID:      "t1",
+		Annotations: []SubmissionItemRequest{{ID: "a1", Revision: 1}},
+	})
+	if err != nil {
+		t.Fatalf("CreateSubmission must succeed without read-back: %v", err)
+	}
+	if repo.getSubmissionCalls != 0 {
+		t.Fatalf("GetDiffReviewSubmission must not be called after create, got %d", repo.getSubmissionCalls)
+	}
+	if sub.Seq <= 0 || sub.CreatedAt <= 0 {
+		t.Errorf("returned record must carry seq/createdAt from RETURNING: %+v", sub)
+	}
+	if sub.SentAt != 0 {
+		t.Errorf("SentAt must be zero for queued, got %d", sub.SentAt)
+	}
+}
+
 // TestCreateSubmissionBatchPriorityCrossTaskOverMissing 验证批次混合错误优先级：
 // 跨任务 id + 缺失 id 同批，恒 invalid_input（与数组顺序无关）。
 func TestCreateSubmissionBatchPriorityCrossTaskOverMissing(t *testing.T) {

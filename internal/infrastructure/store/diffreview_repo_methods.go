@@ -75,9 +75,9 @@ func itemRowToRecord(r DiffReviewSubmissionItemRow) diffreview.DiffReviewSubmiss
 	}
 }
 
-// CreateDiffAnnotation 调 store 原语 CreateDiffAnnotation（revision 初始 1，store 写入时间戳）。
-func (a *DiffReviewRepoAdapter) CreateDiffAnnotation(ctx context.Context, in diffreview.CreateDiffAnnotationInput) error {
-	return a.q.CreateDiffAnnotation(ctx, DiffAnnotationRow{
+// CreateDiffAnnotation 调 store 原语 CreateDiffAnnotation（revision 初始 1，INSERT...RETURNING 返回完整行）。
+func (a *DiffReviewRepoAdapter) CreateDiffAnnotation(ctx context.Context, in diffreview.CreateDiffAnnotationInput) (diffreview.DiffAnnotationRecord, error) {
+	row, err := a.q.CreateDiffAnnotation(ctx, DiffAnnotationRow{
 		ID:                in.ID,
 		TaskID:            in.TaskID,
 		Path:              in.Path,
@@ -91,15 +91,19 @@ func (a *DiffReviewRepoAdapter) CreateDiffAnnotation(ctx context.Context, in dif
 		SnapshotLineCount: in.SnapshotLineCount,
 		Comment:           in.Comment,
 	})
+	if err != nil {
+		return diffreview.DiffAnnotationRecord{}, err
+	}
+	return annotationRowToRecord(row), nil
 }
 
-// UpdateDiffAnnotationComment 调 store 原语三态结果，透传不改语义。
+// UpdateDiffAnnotationComment 调 store 原语三态结果（含完整行），透传不改语义。
 func (a *DiffReviewRepoAdapter) UpdateDiffAnnotationComment(ctx context.Context, id, comment string) (diffreview.CommentUpdateResult, error) {
 	u, err := a.q.UpdateDiffAnnotationComment(ctx, id, comment)
 	if err != nil {
 		return diffreview.CommentUpdateResult{}, err
 	}
-	return diffreview.CommentUpdateResult{Matched: u.Matched, Changed: u.Changed, Revision: u.Revision}, nil
+	return diffreview.CommentUpdateResult{Matched: u.Matched, Changed: u.Changed, Revision: u.Revision, Record: annotationRowToRecord(u.Row)}, nil
 }
 
 // DeleteDiffAnnotation 调 store 原语，返回 affected（0=行不存在，幂等成功）。
@@ -133,10 +137,11 @@ func (a *DiffReviewRepoAdapter) GetDiffAnnotation(ctx context.Context, id string
 	return annotationRowToRecord(r), nil
 }
 
-// CreateDiffReviewSubmission 调 store 原语（单事务 + items 快照 + revision 复核）。
+// CreateDiffReviewSubmission 调 store 原语（单事务 + items 快照 + revision 复核 + RETURNING 完整行）。
 // F6：store 事务内 revision 复核 sentinel ErrDiffReviewRevisionConflict 映射为
 // diffreview.ErrRevisionConflict（domain 错误），真实竞态返回 conflict(409)。
-func (a *DiffReviewRepoAdapter) CreateDiffReviewSubmission(ctx context.Context, in diffreview.CreateDiffReviewSubmissionInput) error {
+// G1：store 返回 INSERT...RETURNING 的完整行（含 seq/created_at），调用方不再二次读取。
+func (a *DiffReviewRepoAdapter) CreateDiffReviewSubmission(ctx context.Context, in diffreview.CreateDiffReviewSubmissionInput) (diffreview.DiffReviewSubmissionRecord, error) {
 	items := make([]DiffReviewSubmissionItemRow, len(in.Items))
 	for i, it := range in.Items {
 		items[i] = DiffReviewSubmissionItemRow{
@@ -154,7 +159,7 @@ func (a *DiffReviewRepoAdapter) CreateDiffReviewSubmission(ctx context.Context, 
 			Comment:            it.Comment,
 		}
 	}
-	err := a.q.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
+	stored, err := a.q.CreateDiffReviewSubmission(ctx, CreateDiffReviewSubmissionInput{
 		Submission: DiffReviewSubmissionRow{
 			Seq:             in.Submission.Seq,
 			ID:              in.Submission.ID,
@@ -173,11 +178,11 @@ func (a *DiffReviewRepoAdapter) CreateDiffReviewSubmission(ctx context.Context, 
 	if err != nil {
 		// F6：事务内 revision 复核 sentinel 映射为 domain ErrRevisionConflict。
 		if errors.Is(err, ErrDiffReviewRevisionConflict) {
-			return diffreview.ErrRevisionConflict
+			return diffreview.DiffReviewSubmissionRecord{}, diffreview.ErrRevisionConflict
 		}
-		return err
+		return diffreview.DiffReviewSubmissionRecord{}, err
 	}
-	return nil
+	return submissionRowToRecord(stored), nil
 }
 
 // ListDiffReviewQueue 调 store 原语，映射行→domain 记录。
@@ -217,6 +222,32 @@ func (a *DiffReviewRepoAdapter) ListDiffReviewFailures(ctx context.Context, task
 		out[i] = submissionRowToRecord(r)
 	}
 	return out, nil
+}
+
+// ListDiffReviewSubmissionPartitions 调 store 原语（同一 SQLite 读事务的一致快照），
+// 映射行→domain 记录；排序契约（queue seq ASC / history sent_at DESC,seq DESC /
+// failures created_at DESC,seq DESC）由 store 查询保证，adapter 不重排。
+func (a *DiffReviewRepoAdapter) ListDiffReviewSubmissionPartitions(ctx context.Context, taskID string) (diffreview.SubmissionPartitions, error) {
+	parts, err := a.q.ListDiffReviewSubmissionPartitions(ctx, taskID)
+	if err != nil {
+		return diffreview.SubmissionPartitions{}, err
+	}
+	mapViews := func(rows []DiffReviewSubmissionWithItems) []diffreview.SubmissionView {
+		out := make([]diffreview.SubmissionView, len(rows))
+		for i, r := range rows {
+			items := make([]diffreview.DiffReviewSubmissionItemRecord, len(r.Items))
+			for j, it := range r.Items {
+				items[j] = itemRowToRecord(it)
+			}
+			out[i] = diffreview.SubmissionView{Submission: submissionRowToRecord(r.Submission), Items: items}
+		}
+		return out
+	}
+	return diffreview.SubmissionPartitions{
+		Queue:    mapViews(parts.Queue),
+		History:  mapViews(parts.History),
+		Failures: mapViews(parts.Failures),
+	}, nil
 }
 
 // ListDiffReviewSubmissionItems 调 store 原语，映射行→domain 记录。

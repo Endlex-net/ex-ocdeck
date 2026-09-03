@@ -20,6 +20,7 @@ package diffreview
 import (
 	"context"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -46,19 +47,33 @@ type SchedulerOptions struct {
 	InstVersion string // 当前 runtime instVersion（能力缓存 fencing 用）
 }
 
-// Scheduler 为单任务调度循环（design.md D2）。
-type Scheduler struct {
-	svc    *Service
-	cb     SchedulerCallbacks
-	taskID string
+// terminalIntent 为发送后未落库的终态意图（F1：只重试终态落库、绝不重发 HTTP）。
+// 发送后终态 CAS 暂时失败时保存，后续 tick 重试；CAS mismatch 时校验实际状态，
+// 已是终态则清除。errMsg 保证非空（D1：failed/delivery_unknown error 必非空）。
+type terminalIntent struct {
+	id     string
+	to     string // failed | delivery_unknown
+	errMsg string
 }
 
-// NewScheduler 构造单任务调度器。
+// Scheduler 为单任务调度循环（design.md D2）。
+type Scheduler struct {
+	svc         *Service
+	cb          SchedulerCallbacks
+	taskID      string
+	instVersion string // 构造时捕获的 runtime instVersion（能力缓存 fencing 用，F3）
+	pending     *terminalIntent
+}
+
+// NewScheduler 构造单任务调度器。opts.InstVersion MUST 为构造时对应 runtime 的
+// instVersion（能力失效/置 unsupported 的 fencing 版本；runtime 替换时旧调度器随
+// clearRuntime 停止、新调度器以新版本构造，因此构造期捕获即正确）。
 func NewScheduler(opts SchedulerOptions) *Scheduler {
 	return &Scheduler{
-		svc:    opts.Service,
-		cb:     opts.Callbacks,
-		taskID: opts.TaskID,
+		svc:         opts.Service,
+		cb:          opts.Callbacks,
+		taskID:      opts.TaskID,
+		instVersion: opts.InstVersion,
 	}
 }
 
@@ -86,6 +101,9 @@ func (sch *Scheduler) tick(ctx context.Context) {
 	}
 	defer unlock()
 
+	// F1：先重试上轮未落库的终态 intent（只落库，绝不重发 HTTP）。
+	sch.retryPending(ctx)
+
 	subs, err := sch.svc.repo.ListDiffReviewQueue(ctx, sch.taskID)
 	if err != nil {
 		return
@@ -101,7 +119,12 @@ func (sch *Scheduler) tick(ctx context.Context) {
 // processHead 处理队首提交：能力门禁→CAS→发送→状态映射。
 func (sch *Scheduler) processHead(ctx context.Context, sub DiffReviewSubmissionRecord) {
 	if sub.Status != "queued" {
-		// sending 行（重启恢复前残留或并发）跳过——重启收敛已处理，正常态 sending 由本调度器持有。
+		// sending 行：本调度器持有 intent 的由 tick 的 retryPending 重试；
+		// 无本地 intent 的 sending（调度器替换/恢复遗留，发送结果未知）→ 按 D2 收敛为
+		// delivery_unknown（F1：进程内调度器替换不得让队首永久卡 sending）。
+		if sub.Status == "sending" && (sch.pending == nil || sch.pending.id != sub.ID) {
+			sch.persistTerminal(ctx, sub.ID, "delivery_unknown", "delivery unknown: scheduler restarted")
+		}
 		return
 	}
 
@@ -159,12 +182,54 @@ func (sch *Scheduler) sendAndMap(ctx context.Context, sub DiffReviewSubmissionRe
 		// pre_send_failure → 重试（MUST NOT 标 delivery_unknown）。
 	}
 	if outcome.Kind == PromptOutcomePreSendFailure {
-		// 耗尽 → failed（error 记录 Detail）。
-		sch.svc.repo.CASDiffReviewSubmission(ctx, sub.ID, "sending", "failed", outcome.Detail)
+		// 耗尽 → failed（error 记录 Detail；空 Detail 由 persistTerminal 兜底非空）。
+		sch.persistTerminal(ctx, sub.ID, "failed", outcome.Detail)
 		return
 	}
 
 	sch.mapOutcome(ctx, sub, outcome)
+}
+
+// persistTerminal 记录发送后终态 intent 并立即尝试落库（F1）。
+// 落库暂时失败时 intent 保留，后续 tick 由 retryPending 重试（绝不重发 HTTP）；
+// errMsg 经 nonEmptyTerminalError 兜底，保证 failed/delivery_unknown error 必非空（F2/D1）。
+func (sch *Scheduler) persistTerminal(ctx context.Context, id, to, errMsg string) {
+	sch.pending = &terminalIntent{id: id, to: to, errMsg: nonEmptyTerminalError(errMsg)}
+	sch.retryPending(ctx)
+}
+
+// retryPending 重试挂起的终态 intent（F1）。
+// CAS mismatch 时校验记录实际状态：已是终态（非 sending）→ 清除 intent；
+// 仍 sending → 保留 intent 下轮重试。error 一律保留 intent。
+func (sch *Scheduler) retryPending(ctx context.Context) {
+	p := sch.pending
+	if p == nil {
+		return
+	}
+	matched, err := sch.svc.repo.CASDiffReviewSubmission(ctx, p.id, "sending", p.to, p.errMsg)
+	if err != nil {
+		return // 保留 intent 下轮重试。
+	}
+	if matched {
+		sch.pending = nil
+		return
+	}
+	// CAS mismatch：确认实际状态，已是终态则清除 intent。
+	rec, gerr := sch.svc.repo.GetDiffReviewSubmission(ctx, p.id)
+	if gerr != nil {
+		return
+	}
+	if rec.Status != "sending" {
+		sch.pending = nil
+	}
+}
+
+// nonEmptyTerminalError 兜底终态 error 非空（F2/D1：failed/delivery_unknown error 必非空）。
+func nonEmptyTerminalError(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "terminal error: empty detail"
+	}
+	return s
 }
 
 // mapOutcome 按 D1 错误矩阵映射 PromptOutcome → 状态转移。
@@ -172,17 +237,17 @@ func (sch *Scheduler) mapOutcome(ctx context.Context, sub DiffReviewSubmissionRe
 	switch outcome.Kind {
 	case PromptOutcomeAccepted:
 		// 204 → sent 清理事务（sending→sent + 按 id+revision 删批注）。
-		// 事务失败 → delivery_unknown（agent 已收，绝不重发，D2）。
+		// 事务失败/未命中 → delivery_unknown intent（D2：agent 已收，绝不重发；
+		// F1：delivery_unknown 的落库本身暂时失败时 intent 保留，下轮重试）。
 		matched, err := sch.svc.repo.CompleteDiffReviewSentCleanup(ctx, sub.ID)
 		if err != nil || !matched {
-			// sent 本地事务失败 → delivery_unknown（D2）。
-			sch.svc.repo.CASDiffReviewSubmission(ctx, sub.ID, "sending", "delivery_unknown", "delivery unknown: sent cleanup failed")
+			sch.persistTerminal(ctx, sub.ID, "delivery_unknown", "delivery unknown: sent cleanup failed")
 		}
 	case PromptOutcomeHTTPResponse:
 		sch.mapHTTPResponse(ctx, sub, outcome)
 	case PromptOutcomeTransportUnknown:
 		// 网络错误/超时/断连 → delivery_unknown（MUST NOT 自动重投，D1）。
-		sch.svc.repo.CASDiffReviewSubmission(ctx, sub.ID, "sending", "delivery_unknown", "delivery unknown: "+outcome.Detail)
+		sch.persistTerminal(ctx, sub.ID, "delivery_unknown", "delivery unknown: "+outcome.Detail)
 	}
 }
 
@@ -191,15 +256,16 @@ func (sch *Scheduler) mapHTTPResponse(ctx context.Context, sub DiffReviewSubmiss
 	code := outcome.StatusCode
 	switch {
 	case code == 400:
-		// 400 → failed（error 记录响应体）+ 能力复核（置 unknown 复探，D1 事件模型④）。
+		// 400 → failed（error 记录响应体，"http 400: " 前缀保证空 body 时 error 非空，F2）
+		// + 能力复核（置 unknown 复探，D1 事件模型④）。
 		// F16：先持久化终态 CAS，再触发 Probe（probe 只更新缓存，最高阻塞 5s 不应阻塞终态落库；
 		// 复探期间 ctx 取消时终态已落库，不会残留 sending 被启动收敛误转 delivery_unknown）。
 		sch.svc.rt.InvalidateCapability(ctx, sub.TaskID, sch.currentInstVersion())
-		sch.svc.repo.CASDiffReviewSubmission(ctx, sub.ID, "sending", "failed", truncateErrorMessage(outcome.Body, 400))
+		sch.persistTerminal(ctx, sub.ID, "failed", "http 400: "+truncateErrorMessage(outcome.Body, 400))
 		_, _ = sch.svc.rt.ProbeCapability(ctx, sub.TaskID)
 	case code == 401:
 		// 401 → failed，MUST NOT 重试（D1）。
-		sch.svc.repo.CASDiffReviewSubmission(ctx, sub.ID, "sending", "failed", "unauthorized: "+truncateErrorMessage(outcome.Body, 400))
+		sch.persistTerminal(ctx, sub.ID, "failed", "unauthorized: "+truncateErrorMessage(outcome.Body, 400))
 	case code == 404:
 		// 404 → GetSession 穷尽分流（D1）。
 		sch.map404(ctx, sub, outcome)
@@ -207,11 +273,11 @@ func (sch *Scheduler) mapHTTPResponse(ctx context.Context, sub DiffReviewSubmiss
 		// 意外 2xx（200/201/202）→ delivery_unknown + 能力置 unknown 复探（D1 事件模型④）。
 		// F16：先持久化终态 CAS，再触发 Probe（终态落库优先于复探）。
 		sch.svc.rt.InvalidateCapability(ctx, sub.TaskID, sch.currentInstVersion())
-		sch.svc.repo.CASDiffReviewSubmission(ctx, sub.ID, "sending", "delivery_unknown", "delivery unknown: unexpected 2xx "+itoa(code))
+		sch.persistTerminal(ctx, sub.ID, "delivery_unknown", "delivery unknown: unexpected 2xx "+itoa(code))
 		_, _ = sch.svc.rt.ProbeCapability(ctx, sub.TaskID)
 	default:
 		// 其他非 2xx → failed，error 记录状态码与响应体。
-		sch.svc.repo.CASDiffReviewSubmission(ctx, sub.ID, "sending", "failed", "http "+itoa(code)+": "+truncateErrorMessage(outcome.Body, 400))
+		sch.persistTerminal(ctx, sub.ID, "failed", "http "+itoa(code)+": "+truncateErrorMessage(outcome.Body, 400))
 	}
 }
 
@@ -228,10 +294,10 @@ func (sch *Scheduler) map404(ctx context.Context, sub DiffReviewSubmissionRecord
 	case GetSessionFound:
 		// 会话存在 → 端点不支持：能力转 unsupported（零重投）+ failed 固定 error。
 		sch.svc.rt.SetCapabilityUnsupported(ctx, sub.TaskID, sch.currentInstVersion())
-		sch.svc.repo.CASDiffReviewSubmission(ctx, sub.ID, "sending", "failed", "capability unsupported: prompt_async")
+		sch.persistTerminal(ctx, sub.ID, "failed", "capability unsupported: prompt_async")
 	case GetSessionMissing:
 		// 会话明确不存在 → failed invalid_state。
-		sch.svc.repo.CASDiffReviewSubmission(ctx, sub.ID, "sending", "failed", "invalid_state: target session not found")
+		sch.persistTerminal(ctx, sub.ID, "failed", "invalid_state: target session not found")
 	default:
 		// 其余一切（未知）→ failed + 能力置 unknown 触发复探（D1）。
 		sch.svc.rt.InvalidateCapability(ctx, sub.TaskID, sch.currentInstVersion())
@@ -239,18 +305,15 @@ func (sch *Scheduler) map404(ctx context.Context, sub DiffReviewSubmissionRecord
 		if res.Detail != "" {
 			errMsg = "404 probe unknown: " + res.Detail
 		}
-		sch.svc.repo.CASDiffReviewSubmission(ctx, sub.ID, "sending", "failed", truncateErrorMessage(errMsg, 400))
+		sch.persistTerminal(ctx, sub.ID, "failed", truncateErrorMessage(errMsg, 400))
 	}
 }
 
-// currentInstVersion 返回当前 runtime instVersion（能力缓存 fencing 用）。
-// 调度器构造时未持久化 instVersion（runtime 可能替换），每次从 Snapshot 取。
+// currentInstVersion 返回构造时捕获的 runtime instVersion（能力缓存 fencing 用，F3）。
+// 不在此处临时读 DB（Snapshot 失败曾致版本失效静默 no-op）；runtime 替换时旧调度器
+// 随 clearRuntime 停止、新调度器以新版本构造，捕获值在整个生命周期内有效。
 func (sch *Scheduler) currentInstVersion() string {
-	snap, err := sch.svc.rt.Snapshot(context.Background(), sch.taskID)
-	if err != nil || !snap.HasRuntime {
-		return ""
-	}
-	return snap.InstVersion
+	return sch.instVersion
 }
 
 // truncateErrorMessage 截断错误消息到 maxBytes 字节的 rune-safe 前缀。

@@ -590,9 +590,10 @@ func (m *Manager) setRuntime(taskID string, rt *taskRuntime) {
 	// G3-7：token 代际变化即时唤醒恢复退避复核（新 runtime 注册 → 旧 incident
 	// trigger 失效，不得等满退避 timer 才发现）。
 	m.wakeRecoveryIncident(taskID)
-	// D2/3.8：runtime ready 后启动本任务 diff review 调度器（随 runtime 生命周期）。
-	// 能力首探（D1 事件模型①）由调度器首轮 ProbeCapability 触发（缓存缺失即探测）。
-	m.StartDiffReviewSchedulerForTask(m.lifeCtx, taskID)
+	// 注意（F3）：diff review 调度器 MUST NOT 在此启动——setRuntime 发生在 active
+	// 提交之前（commitRuntimeReady/reconcile/suspend-repair），提前启动会让首探抢跑
+	//（taskOcClient 拒绝非 active task）。启动点由三处 active 提交后的调用方负责：
+	// commitRuntimeReady CAS 后、reconcile 提交 active 后、suspend 修复回 active CAS 后。
 }
 
 // clearRuntime 移除任务的运行时并停止其 SSE/退出监视。

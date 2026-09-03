@@ -156,20 +156,108 @@ describe('409 阻塞', () => {
     s.dispose();
   });
 
-  it('显式放弃：重读服务端内容并重置基线', async () => {
+  it('显式放弃：重读服务端内容并返回完整新读取（含新冻结元数据，F8）', async () => {
     const io = makeIO();
     io.writeImpl.mockRejectedValueOnce(conflictErr);
-    io.readQueue.push(makeRead('server-side\n', { baseHash: 'hS' }));
+    io.readQueue.push(
+      makeRead('server-side\n', { baseHash: 'hS', mode: '0755', lineEnding: 'crlf', hasBom: true }),
+    );
     const s = makeSession(io);
     s.onEdit('v1\n');
     await s.flush();
     expect(s.status).toBe('blocked');
-    const content = await s.discard();
-    expect(content).toBe('server-side\n');
+    const res = await s.discard();
+    // 返回完整 editable 分支：调用方据此结束旧 session 并以新元数据创建新 session
+    expect(res?.editedDuring).toBe(false);
+    expect(res?.read).toMatchObject({
+      editable: true,
+      content: 'server-side\n',
+      baseHash: 'hS',
+      mode: '0755',
+      lineEnding: 'crlf',
+      hasBom: true,
+    });
     expect(s.latest).toBe('server-side\n');
     expect(s.baseHash).toBe('hS');
     expect(s.status).toBe('clean');
     s.dispose();
+  });
+
+  it('F8：放弃时文件已不可编辑 → 返回 denied 分支（不返回 null 困住用户）', async () => {
+    const io = makeIO();
+    io.writeImpl.mockRejectedValueOnce(conflictErr);
+    io.readQueue.push({
+      editable: false,
+      reasonCode: 'read_only',
+      reason: '文件只读',
+    });
+    const s = makeSession(io);
+    s.onEdit('v1\n');
+    await s.flush();
+    expect(s.status).toBe('blocked');
+    const res = await s.discard();
+    expect(res?.read).toMatchObject({ editable: false, reasonCode: 'read_only' });
+    s.dispose();
+  });
+
+  it('F11：discard 等待 GET 期间收到新编辑 → 保留 latest 并标记 editedDuring，不覆盖', async () => {
+    const io = makeIO();
+    io.writeImpl.mockRejectedValueOnce(conflictErr);
+    let resolveRead!: () => void;
+    io.readImpl.mockImplementationOnce(
+      () =>
+        new Promise<FileEditRead>((res) => {
+          resolveRead = () => res(makeRead('server-side\n', { baseHash: 'hS' }));
+        }),
+    );
+    const s = makeSession(io);
+    s.onEdit('v1\n');
+    await s.flush();
+    expect(s.status).toBe('blocked');
+    const dp = s.discard();
+    await sleep(1);
+    // GET 在途期间的新编辑（F11 栅栏：不得被服务端内容覆盖）
+    s.onEdit('v2\n');
+    resolveRead();
+    const res = await dp;
+    expect(res?.editedDuring).toBe(true);
+    expect(s.latest).toBe('v2\n'); // 用户输入保留
+    expect(s.baseHash).toBe('hS'); // 新基线已采用（供调用方补发）
+    expect(s.status).toBe('pending'); // 不写回（旧冻结元数据不可信，由调用方换 session 补发）
+    expect(io.writes).toHaveLength(1);
+    s.dispose();
+  });
+
+  it('F11：dispose({flush:false}) 不泵出未确认内容（换 session 场景唯一补发 owner）', async () => {
+    const io = makeIO();
+    io.writeImpl.mockRejectedValueOnce(conflictErr);
+    let resolveRead!: () => void;
+    io.readImpl.mockImplementationOnce(
+      () =>
+        new Promise<FileEditRead>((res) => {
+          resolveRead = () => res(makeRead('server-side\n', { baseHash: 'hS' }));
+        }),
+    );
+    const s = makeSession(io);
+    s.onEdit('v1\n');
+    await s.flush();
+    expect(s.status).toBe('blocked');
+    const dp = s.discard();
+    await sleep(1); // 等 discard 事务取得链并记录代际
+    s.onEdit('v2\n'); // GET 在途期间编辑（editSeq 栅栏）
+    resolveRead();
+    const res = await dp;
+    expect(res?.editedDuring).toBe(true);
+    s.dispose({ flush: false }); // 旧 session 不得再写（新 session 负责补发）
+    await sleep(30);
+    expect(io.writes).toHaveLength(1); // 仅最初的冲突写，无旧 session 补发
+    // 对照：默认 dispose 仍尽力 flush（F11 卸载路径语义不变）
+    const io2 = makeIO();
+    const s2 = makeSession(io2);
+    s2.onEdit('x\n');
+    s2.dispose();
+    await sleep(30);
+    expect(io2.writes.map((w) => w.content)).toEqual(['x\n']);
   });
 });
 

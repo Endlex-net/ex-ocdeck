@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 
@@ -117,8 +118,8 @@ func newFakeDiffReviewRepo() *fakeDiffReviewRepo {
 	}
 }
 
-func (r *fakeDiffReviewRepo) CreateDiffAnnotation(ctx context.Context, in diffreview.CreateDiffAnnotationInput) error {
-	r.annotations[in.ID] = diffreview.DiffAnnotationRecord{
+func (r *fakeDiffReviewRepo) CreateDiffAnnotation(ctx context.Context, in diffreview.CreateDiffAnnotationInput) (diffreview.DiffAnnotationRecord, error) {
+	rec := diffreview.DiffAnnotationRecord{
 		ID:                in.ID,
 		TaskID:            in.TaskID,
 		Path:              in.Path,
@@ -135,7 +136,8 @@ func (r *fakeDiffReviewRepo) CreateDiffAnnotation(ctx context.Context, in diffre
 		CreatedAt:         1720000000,
 		UpdatedAt:         1720000000,
 	}
-	return nil
+	r.annotations[in.ID] = rec
+	return rec, nil
 }
 
 func (r *fakeDiffReviewRepo) GetDiffAnnotation(ctx context.Context, id string) (diffreview.DiffAnnotationRecord, error) {
@@ -164,13 +166,13 @@ func (r *fakeDiffReviewRepo) UpdateDiffAnnotationComment(ctx context.Context, id
 		return diffreview.CommentUpdateResult{}, diffreview.ErrAnnotationNotFound
 	}
 	if rec.Comment == comment {
-		return diffreview.CommentUpdateResult{Matched: true, Changed: false, Revision: rec.Revision}, nil
+		return diffreview.CommentUpdateResult{Matched: true, Changed: false, Revision: rec.Revision, Record: rec}, nil
 	}
 	rec.Comment = comment
 	rec.Revision++
 	rec.UpdatedAt++
 	r.annotations[id] = rec
-	return diffreview.CommentUpdateResult{Matched: true, Changed: true, Revision: rec.Revision}, nil
+	return diffreview.CommentUpdateResult{Matched: true, Changed: true, Revision: rec.Revision, Record: rec}, nil
 }
 
 func (r *fakeDiffReviewRepo) DeleteDiffAnnotation(ctx context.Context, id string) (int, error) {
@@ -181,17 +183,17 @@ func (r *fakeDiffReviewRepo) DeleteDiffAnnotation(ctx context.Context, id string
 	return 1, nil
 }
 
-func (r *fakeDiffReviewRepo) CreateDiffReviewSubmission(ctx context.Context, in diffreview.CreateDiffReviewSubmissionInput) error {
+func (r *fakeDiffReviewRepo) CreateDiffReviewSubmission(ctx context.Context, in diffreview.CreateDiffReviewSubmissionInput) (diffreview.DiffReviewSubmissionRecord, error) {
 	r.createSubmissionCalls++
 	if r.createSubErr != nil {
-		return r.createSubErr
+		return diffreview.DiffReviewSubmissionRecord{}, r.createSubErr
 	}
 	r.seq++
 	sub := in.Submission
 	sub.Seq = r.seq
 	sub.CreatedAt = 1720000100
 	r.submissions[sub.ID] = sub
-	return nil
+	return sub, nil
 }
 
 func (r *fakeDiffReviewRepo) GetDiffReviewSubmission(ctx context.Context, id string) (diffreview.DiffReviewSubmissionRecord, error) {
@@ -232,6 +234,47 @@ func (r *fakeDiffReviewRepo) ListDiffReviewFailures(ctx context.Context, taskID 
 
 func (r *fakeDiffReviewRepo) ListDiffReviewSubmissionItems(ctx context.Context, submissionID string) ([]diffreview.DiffReviewSubmissionItemRecord, error) {
 	return nil, nil
+}
+
+func (r *fakeDiffReviewRepo) ListDiffReviewSubmissionPartitions(ctx context.Context, taskID string) (diffreview.SubmissionPartitions, error) {
+	var queue, history, failures []diffreview.SubmissionView
+	for _, rec := range r.submissions {
+		if rec.TaskID != taskID {
+			continue
+		}
+		v := diffreview.SubmissionView{Submission: rec, Items: []diffreview.DiffReviewSubmissionItemRecord{}}
+		switch rec.Status {
+		case "queued", "sending":
+			queue = append(queue, v)
+		case "sent":
+			history = append(history, v)
+		case "failed", "delivery_unknown":
+			failures = append(failures, v)
+		}
+	}
+	sort.SliceStable(queue, func(i, j int) bool { return queue[i].Submission.Seq < queue[j].Submission.Seq })
+	sort.SliceStable(history, func(i, j int) bool {
+		if history[i].Submission.SentAt != history[j].Submission.SentAt {
+			return history[i].Submission.SentAt > history[j].Submission.SentAt
+		}
+		return history[i].Submission.Seq > history[j].Submission.Seq
+	})
+	sort.SliceStable(failures, func(i, j int) bool {
+		if failures[i].Submission.CreatedAt != failures[j].Submission.CreatedAt {
+			return failures[i].Submission.CreatedAt > failures[j].Submission.CreatedAt
+		}
+		return failures[i].Submission.Seq > failures[j].Submission.Seq
+	})
+	if queue == nil {
+		queue = []diffreview.SubmissionView{}
+	}
+	if history == nil {
+		history = []diffreview.SubmissionView{}
+	}
+	if failures == nil {
+		failures = []diffreview.SubmissionView{}
+	}
+	return diffreview.SubmissionPartitions{Queue: queue, History: history, Failures: failures}, nil
 }
 
 func (r *fakeDiffReviewRepo) CancelDiffReviewSubmission(ctx context.Context, id string) (bool, error) {
@@ -859,6 +902,39 @@ func keysOf(m map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestAnnotationPatch_StaleWireTrue F9：已漂移批注的 PATCH 响应必须返回真实 stale=true
+// （不得硬编码 false）。创建时 diff 与 snapshot 一致（active），随后 diff 变化再 PATCH。
+func TestAnnotationPatch_StaleWireTrue(t *testing.T) {
+	s, f := newDiffReviewAPIServer(t)
+	resp, body := doDiffReviewReq(t, s, "POST", "/api/v1/tasks/t1/annotations", validAnnotationBody("first"))
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status = %d; body=%s", resp.StatusCode, body)
+	}
+	var created annotationDTO
+	if err := json.Unmarshal([]byte(body), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Stale {
+		t.Fatalf("created stale = true, want false (diff 与 snapshot 一致)")
+	}
+	// diff 新侧内容变化 → 同一批注窗口不再匹配 snapshot → stale。
+	f.diff.readResult.NewContent = "changed\n"
+	resp, body = doDiffReviewReq(t, s, "PATCH", "/api/v1/tasks/t1/annotations/"+created.ID, `{"comment":"second"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("patch status = %d; body=%s", resp.StatusCode, body)
+	}
+	var updated annotationDTO
+	if err := json.Unmarshal([]byte(body), &updated); err != nil {
+		t.Fatal(err)
+	}
+	if !updated.Stale {
+		t.Fatalf("patched stale = false, want true（F9：PATCH 响应必须返回真实 stale）")
+	}
+	if updated.Comment != "second" || updated.Revision != 2 {
+		t.Fatalf("patched = %+v, want comment=second revision=2", updated)
+	}
 }
 
 func TestSubmissionCreateAndPartitions_WireShape(t *testing.T) {

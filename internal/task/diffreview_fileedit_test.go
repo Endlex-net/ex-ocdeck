@@ -14,10 +14,14 @@ package task
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 
 	"ocdeck/internal/application/diffreview"
 )
@@ -704,6 +708,430 @@ func assertNoTempFile(t *testing.T, dir string) {
 	for _, e := range entries {
 		if strings.HasPrefix(e.Name(), ".ocdeck-fileedit-") {
 			t.Fatalf("temp file leaked: %s", e.Name())
+		}
+	}
+}
+
+// TestFileEdit_Write_ParentDirDisappears_InvalidStateNoSystemTemp（F6）：
+// 父目录在步骤 6 前竞态消失 → invalid_state，且临时文件 MUST NOT 落系统临时目录
+// （空 dir 传给 os.CreateTemp 会用系统默认临时目录，违反同目录临时文件契约）。
+func TestFileEdit_Write_ParentDirDisappears_InvalidStateNoSystemTemp(t *testing.T) {
+	dir := t.TempDir()
+	initTestGitRepo(t, dir)
+	content := "hello\n"
+	writeFileInRepo(t, dir, "sub/f.txt", content, 0o644)
+	_, adapter := newFileEditManager(t, dir)
+
+	baseHash := diffreview.SHA256Hex([]byte(content))
+
+	// 记录系统临时目录中已有的 .ocdeck-fileedit-* 基线。
+	sysTemp := os.TempDir()
+	beforeEntries, _ := os.ReadDir(sysTemp)
+	before := map[string]bool{}
+	for _, e := range beforeEntries {
+		before[e.Name()] = true
+	}
+
+	// 注入 hook：步骤 6 父目录解析前删除整个 sub 目录（模拟父目录竞态消失）。
+	prevHook := preTempWriteHook
+	preTempWriteHook = func(tgt string) {
+		_ = os.RemoveAll(filepath.Dir(tgt))
+	}
+	defer func() { preTempWriteHook = prevHook }()
+
+	req := diffreview.FileEditWriteRequest{
+		Path: "sub/f.txt", Content: "new\n", BaseHash: baseHash,
+		LineEnding: diffreview.LineEndingLF, BaseMode: "0644",
+	}
+	_, err := adapter.Write(context.Background(), "t1", req)
+	if !isOpErrCode(err, codeInvalidState) {
+		t.Fatalf("parent dir disappeared: err=%v want codeInvalidState", err)
+	}
+	// 系统临时目录零新增 .ocdeck-fileedit-* 残留。
+	afterEntries, _ := os.ReadDir(sysTemp)
+	for _, e := range afterEntries {
+		if strings.HasPrefix(e.Name(), ".ocdeck-fileedit-") && !before[e.Name()] {
+			t.Fatalf("temp file leaked into system temp dir: %s", e.Name())
+		}
+	}
+}
+
+// TestFileEdit_Write_TargetGrewBeyondLimit_Conflict（F5）：
+// 目标文件外部增长超 512KiB → 有界读取拒绝（conflict），文件不被修改，无临时文件残留。
+func TestFileEdit_Write_TargetGrewBeyondLimit_Conflict(t *testing.T) {
+	dir := t.TempDir()
+	initTestGitRepo(t, dir)
+	// 磁盘上直接造 >512KiB 的文件（模拟基线读取后外部增长）。
+	big := strings.Repeat("x", diffreview.FileEditMaxBytes+1)
+	writeFileInRepo(t, dir, "f.txt", big, 0o644)
+	_, adapter := newFileEditManager(t, dir)
+
+	req := diffreview.FileEditWriteRequest{
+		Path: "f.txt", Content: "new\n", BaseHash: diffreview.SHA256Hex([]byte("whatever")),
+		LineEnding: diffreview.LineEndingLF, BaseMode: "0644",
+	}
+	_, err := adapter.Write(context.Background(), "t1", req)
+	if !isOpErrCode(err, codeConflict) {
+		t.Fatalf("grew beyond limit: err=%v want codeConflict", err)
+	}
+	got, _ := os.ReadFile(filepath.Join(dir, "f.txt"))
+	if len(got) != len(big) {
+		t.Fatalf("file modified: len=%d want %d", len(got), len(big))
+	}
+	assertNoTempFile(t, dir)
+}
+
+// TestFileEdit_Write_FinalCheckGrewBeyondLimit_Conflict（F5 终检同样有界）：
+// 临时文件写入后、终检前目标被外部增长到超 512KiB → 终检 conflict + 临时文件清理。
+func TestFileEdit_Write_FinalCheckGrewBeyondLimit_Conflict(t *testing.T) {
+	dir := t.TempDir()
+	initTestGitRepo(t, dir)
+	content := "hello\n"
+	writeFileInRepo(t, dir, "f.txt", content, 0o644)
+	_, adapter := newFileEditManager(t, dir)
+
+	baseHash := diffreview.SHA256Hex([]byte(content))
+
+	prevHook := preFinalCheckHook
+	preFinalCheckHook = func(tgt string) {
+		f, _ := os.OpenFile(tgt, os.O_APPEND|os.O_WRONLY, 0)
+		if f != nil {
+			_, _ = f.WriteString(strings.Repeat("y", diffreview.FileEditMaxBytes+1))
+			_ = f.Close()
+		}
+	}
+	defer func() { preFinalCheckHook = prevHook }()
+
+	req := diffreview.FileEditWriteRequest{
+		Path: "f.txt", Content: "new\n", BaseHash: baseHash,
+		LineEnding: diffreview.LineEndingLF, BaseMode: "0644",
+	}
+	_, err := adapter.Write(context.Background(), "t1", req)
+	if !isOpErrCode(err, codeConflict) {
+		t.Fatalf("final check grew beyond limit: err=%v want codeConflict", err)
+	}
+	assertNoTempFile(t, dir)
+}
+
+// TestReadBaselineBytes_SymlinkReplaced_NoFollow（F13）：
+// 目标被替换为指向 regular file 的 symlink → O_NOFOLLOW 拒绝（ELOOP），按阶段映射
+// 初检 invalid_state / 终检 conflict，MUST NOT 跟随读取链接目标内容。
+func TestReadBaselineBytes_SymlinkReplaced_NoFollow(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real.txt")
+	if err := os.WriteFile(real, []byte("secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "f.txt")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	dirFd := openTestDirFd(t, dir)
+
+	data, _, err := readBaselineBytesAt(dirFd, "f.txt", "f.txt", checkPhaseInitial)
+	if err == nil {
+		t.Fatalf("symlink target should be rejected, got data=%q", data)
+	}
+	if !isOpErrCode(err, codeInvalidState) {
+		t.Fatalf("initial phase symlink: err=%v want codeInvalidState", err)
+	}
+
+	_, _, err = readBaselineBytesAt(dirFd, "f.txt", "f.txt", checkPhaseFinal)
+	if !isOpErrCode(err, codeConflict) {
+		t.Fatalf("final phase symlink: err=%v want codeConflict", err)
+	}
+}
+
+// TestReadBaselineBytes_SocketReplaced_NotRegular（F13）：
+// 目标被替换为 unix socket → openat 阶段即拒绝（EOPNOTSUPP/ENXIO），按阶段映射（不阻塞）。
+func TestReadBaselineBytes_SocketReplaced_NotRegular(t *testing.T) {
+	// macOS unix socket 路径上限 104 字符，t.TempDir() 过长，用 /tmp 短路径。
+	sockDir, err := os.MkdirTemp("/tmp", "rb*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(sockDir)
+	ln, err := net.Listen("unix", filepath.Join(sockDir, "s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	dirFd := openTestDirFd(t, sockDir)
+
+	_, _, err = readBaselineBytesAt(dirFd, "s", "f.txt", checkPhaseInitial)
+	if !isOpErrCode(err, codeInvalidState) {
+		t.Fatalf("initial phase socket: err=%v want codeInvalidState", err)
+	}
+	_, _, err = readBaselineBytesAt(dirFd, "s", "f.txt", checkPhaseFinal)
+	if !isOpErrCode(err, codeConflict) {
+		t.Fatalf("final phase socket: err=%v want codeConflict", err)
+	}
+}
+
+// openTestDirFd 以生产同款 flags 打开目录 FD 并注册关闭（供 readBaselineBytesAt 单测）。
+func openTestDirFd(t *testing.T, dir string) int {
+	t.Helper()
+	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { unix.Close(fd) })
+	return fd
+}
+
+// TestReadRawFile_LeafSymlinkSwap_NoFollow（G2/G3）：
+// leaf 在 Lstat+禁锢校验之后、open 之前被替换为指向 worktree 外的 symlink——
+// openat O_NOFOLLOW 拒绝（ELOOP）→ not_regular，MUST NOT 读到外部内容。
+// 旧 Lstat→os.Open(targetReal) 实现会跟随新 symlink 读到外部内容（测试在旧实现下失败）。
+func TestReadRawFile_LeafSymlinkSwap_NoFollow(t *testing.T) {
+	dir := t.TempDir()
+	initTestGitRepo(t, dir)
+	// 先是正常 regular 文件（通过初始 Lstat/禁锢）。
+	writeFileInRepo(t, dir, "f.txt", "legit\n", 0o644)
+	// worktree 外的秘密文件（symlink 目标），绝不能被读出。
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("outside-secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 注入 hook：禁锢校验后、open 前把 f.txt 替换为指向 secret 的 symlink。
+	prevHook := readRawPostConfineHook
+	readRawPostConfineHook = func(tgt string) {
+		_ = os.Remove(tgt)
+		_ = os.Symlink(secret, tgt)
+	}
+	defer func() { readRawPostConfineHook = prevHook }()
+
+	got, err := readRawFile(dir, "f.txt")
+	if err == nil {
+		t.Fatalf("swapped symlink target must be rejected, got %+v", got)
+	}
+	var rawErr *diffreview.FileEditReadRawError
+	if !errors.As(err, &rawErr) || !rawErr.NotRegular {
+		t.Fatalf("err=%v want *FileEditReadRawError{NotRegular:true}", err)
+	}
+	if got.Exists || len(got.Bytes) != 0 {
+		t.Fatalf("must not follow swapped symlink to outside content: %+v", got)
+	}
+}
+
+// TestReadRawFile_IntermediateDirSymlinkSwap_Rejected（G2/G3）：
+// 中间目录在禁锢校验之后、父目录 walk 之前被替换为指向 worktree 外的 symlink——
+// 拒绝（逃逸或 not_regular），MUST NOT 读到外部目录内容。
+// 旧实现 os.Open(targetReal) 会跟随新 symlink 读到外部目录内容（测试在旧实现下失败）。
+func TestReadRawFile_IntermediateDirSymlinkSwap_Rejected(t *testing.T) {
+	dir := t.TempDir()
+	initTestGitRepo(t, dir)
+	// 先是正常目录与文件（通过初始 Lstat/禁锢）。
+	writeFileInRepo(t, dir, "sub/f.txt", "legit\n", 0o644)
+	// worktree 外目录（symlink 目标），内含同名文件，绝不能被读出。
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "f.txt"), []byte("outside-content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 注入 hook：禁锢校验后把 sub 替换为指向 outside 的 symlink。
+	prevHook := readRawPostConfineHook
+	readRawPostConfineHook = func(tgt string) {
+		sub := filepath.Dir(tgt)
+		_ = os.RemoveAll(sub)
+		_ = os.Symlink(outside, sub)
+	}
+	defer func() { readRawPostConfineHook = prevHook }()
+
+	got, err := readRawFile(dir, "sub/f.txt")
+	if err == nil {
+		t.Fatalf("swapped intermediate symlink dir must be rejected, got %+v", got)
+	}
+	// 可能命中禁锢逃逸（invalid_input）或 not_regular（walk 拒绝）——两者均为安全拒绝，
+	// 关键是不得返回外部内容。
+	if got.Exists || len(got.Bytes) != 0 {
+		t.Fatalf("must not read outside content via swapped intermediate symlink: %+v", got)
+	}
+}
+
+// TestReadRawFile_ModeAndBytesFromSameObject（G2/G3 基线一致性）：
+// Lstat 之后、open 之前内容与 mode 都被外部修改——读取必须返回同一对象的新 bytes+新 mode
+// （旧实现 bytes 来自新对象、mode 来自 Lstat 旧对象：测试在旧实现下 mode 断言失败）。
+func TestReadRawFile_ModeAndBytesFromSameObject(t *testing.T) {
+	dir := t.TempDir()
+	initTestGitRepo(t, dir)
+	writeFileInRepo(t, dir, "f.txt", "old-content\n", 0o644)
+
+	// 注入 hook：Lstat+禁锢后重写文件内容并改 mode。
+	prevHook := readRawPostConfineHook
+	readRawPostConfineHook = func(tgt string) {
+		_ = os.WriteFile(tgt, []byte("new-content\n"), 0o640)
+		_ = os.Chmod(tgt, 0o640)
+	}
+	defer func() { readRawPostConfineHook = prevHook }()
+
+	got, err := readRawFile(dir, "f.txt")
+	if err != nil {
+		t.Fatalf("readRawFile: %v", err)
+	}
+	if !got.Exists || string(got.Bytes) != "new-content\n" {
+		t.Fatalf("bytes: %q want %q", got.Bytes, "new-content\n")
+	}
+	// mode 必须来自同一 FD fstat（新对象 0640），不是 Lstat 旧值 0644。
+	if got.Mode != 0o640 {
+		t.Fatalf("mode: %o want 640 (from same FD as bytes)", got.Mode)
+	}
+}
+
+// TestFileEdit_Write_ParentSymlinkSwapAfterResolve_Conflict（F15）：
+// dirFd 打开后、终检前中间目录被改名移走并在原位建指向外部目录的 symlink——终检前置
+// 身份比对（重新安全解析当前请求父路径 + dev/ino 比对）检出替换 → conflict，
+// 临时文件清理，外部目录零创建、零逃逸。
+func TestFileEdit_Write_ParentSymlinkSwapAfterResolve_Conflict(t *testing.T) {
+	dir := t.TempDir()
+	initTestGitRepo(t, dir)
+	content := "hello\n"
+	writeFileInRepo(t, dir, "sub/f.txt", content, 0o644)
+	_, adapter := newFileEditManager(t, dir)
+	baseHash := diffreview.SHA256Hex([]byte(content))
+
+	// 外部诱饵目录（symlink 目标，位于 worktree 外），绝不能被写入。
+	decoy := t.TempDir()
+
+	// 注入 hook：临时文件写入后、终检前（此时 dirFd 已打开）把 sub 改名移走并在原位建
+	// 指向 decoy 的 symlink。终检身份比对重新解析 sub → 逃逸/替换 → conflict。
+	subOld := filepath.Join(dir, "sub-moved")
+	prevHook := preFinalCheckHook
+	preFinalCheckHook = func(tgt string) {
+		sub := filepath.Dir(tgt)
+		_ = os.Rename(sub, subOld)
+		_ = os.Symlink(decoy, sub)
+	}
+	defer func() { preFinalCheckHook = prevHook }()
+
+	req := diffreview.FileEditWriteRequest{
+		Path: "sub/f.txt", Content: "new\n", BaseHash: baseHash,
+		LineEnding: diffreview.LineEndingLF, BaseMode: "0644",
+	}
+	_, err := adapter.Write(context.Background(), "t1", req)
+	if !isOpErrCode(err, codeConflict) {
+		t.Fatalf("parent dir replaced: err=%v want codeConflict", err)
+	}
+	// 原目录实体内容不被修改（写未发生）。
+	got, rerr := os.ReadFile(filepath.Join(subOld, "f.txt"))
+	if rerr != nil || string(got) != content {
+		t.Fatalf("original file must be unmodified: %q err=%v", got, rerr)
+	}
+	// decoy 内零创建（无逃逸）、零临时文件泄漏。
+	if _, serr := os.Lstat(filepath.Join(decoy, "f.txt")); !os.IsNotExist(serr) {
+		t.Fatalf("escape: file created in symlink target decoy: %v", serr)
+	}
+	entries, _ := os.ReadDir(decoy)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".ocdeck-fileedit-") {
+			t.Fatalf("temp file leaked into decoy: %s", e.Name())
+		}
+	}
+	// 移走的目录内无临时文件泄漏（cleanup 经 dirFd unlinkat）。
+	entriesOld, _ := os.ReadDir(subOld)
+	for _, e := range entriesOld {
+		if strings.HasPrefix(e.Name(), ".ocdeck-fileedit-") {
+			t.Fatalf("temp file leaked into moved dir: %s", e.Name())
+		}
+	}
+}
+
+// TestWalkOpenatDir_SymlinkComponentRejected（F15）：逐组件 O_NOFOLLOW walk——
+// rel 中组件为 symlink 即 ELOOP 拒绝；组件消失即 ENOENT。
+func TestWalkOpenatDir_SymlinkComponentRejected(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	if err := os.MkdirAll(filepath.Join(real, "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	rootFd := openTestDirFd(t, dir)
+
+	// symlink 组件 → ELOOP(linux) 或 ENOTDIR(darwin openat O_DIRECTORY 语义)。
+	if fd, err := walkOpenatDir(rootFd, "link"); err == nil {
+		unix.Close(fd)
+		t.Fatal("symlink component should be rejected")
+	} else if !errors.Is(err, syscall.ELOOP) && !errors.Is(err, syscall.ENOTDIR) {
+		t.Fatalf("err=%v want ELOOP or ENOTDIR", err)
+	}
+	// 消失组件 → ENOENT。
+	if fd, err := walkOpenatDir(rootFd, "missing/sub"); err == nil {
+		unix.Close(fd)
+		t.Fatal("missing component should fail with ENOENT")
+	} else if !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("err=%v want ENOENT", err)
+	}
+	// 正常路径可达且 "." 返回可用 FD。
+	fd, err := walkOpenatDir(rootFd, "real/x")
+	if err != nil {
+		t.Fatalf("real path walk: %v", err)
+	}
+	unix.Close(fd)
+	fd, err = walkOpenatDir(rootFd, ".")
+	if err != nil {
+		t.Fatalf("dot walk: %v", err)
+	}
+	// F19：返回 FD 必须带 FD_CLOEXEC（F_DUPFD_CLOEXEC）。
+	flags, ferr := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+	if ferr != nil {
+		t.Fatalf("get fd flags: %v", ferr)
+	}
+	if flags&unix.FD_CLOEXEC == 0 {
+		t.Fatal("walked dir fd must have FD_CLOEXEC")
+	}
+	unix.Close(fd)
+}
+
+// TestFileEdit_Write_RootReplacedAfterResolve_Conflict（F17）：
+// dirFd 打开后、终检前 worktree root 被改名移走并在原位建指向外部目录的 symlink——
+// 终检前置重新安全打开 root 并比对 root dev:ino → conflict；外部目录零创建、零逃逸。
+func TestFileEdit_Write_RootReplacedAfterResolve_Conflict(t *testing.T) {
+	dir := t.TempDir()
+	initTestGitRepo(t, dir)
+	content := "hello\n"
+	writeFileInRepo(t, dir, "f.txt", content, 0o644)
+	_, adapter := newFileEditManager(t, dir)
+	baseHash := diffreview.SHA256Hex([]byte(content))
+
+	// 外部诱饵 root（symlink 目标），绝不能被写入。
+	decoyRoot := t.TempDir()
+	movedRoot := dir + "-moved"
+
+	prevHook := preFinalCheckHook
+	preFinalCheckHook = func(tgt string) {
+		// worktree root 改名移走 + 原位建指向 decoyRoot 的 symlink。
+		_ = os.Rename(dir, movedRoot)
+		_ = os.Symlink(decoyRoot, dir)
+	}
+	defer func() { preFinalCheckHook = prevHook }()
+	// 测试结束恢复目录名（TempDir 清理不受 rename 影响，但后续断言需要路径稳定）。
+	defer func() {
+		_ = os.Remove(dir)
+		_ = os.Rename(movedRoot, dir)
+	}()
+
+	req := diffreview.FileEditWriteRequest{
+		Path: "f.txt", Content: "new\n", BaseHash: baseHash,
+		LineEnding: diffreview.LineEndingLF, BaseMode: "0644",
+	}
+	_, err := adapter.Write(context.Background(), "t1", req)
+	if !isOpErrCode(err, codeConflict) {
+		t.Fatalf("worktree root replaced: err=%v want codeConflict", err)
+	}
+	// 原 root 实体内容不被修改。
+	got, rerr := os.ReadFile(filepath.Join(movedRoot, "f.txt"))
+	if rerr != nil || string(got) != content {
+		t.Fatalf("original file must be unmodified: %q err=%v", got, rerr)
+	}
+	// decoyRoot 内零创建、零临时文件泄漏。
+	entries, _ := os.ReadDir(decoyRoot)
+	for _, e := range entries {
+		if e.Name() == "f.txt" || strings.HasPrefix(e.Name(), ".ocdeck-fileedit-") {
+			t.Fatalf("escape into decoy root: %s", e.Name())
 		}
 	}
 }
