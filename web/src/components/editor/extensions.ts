@@ -27,14 +27,18 @@ export const readOnlyExtensions: Extension[] = [
   syntaxHighlighting(classHighlighter),
 ];
 
-/** 编辑器主题：颜色/字体全部跟随 design-system.css 设计变量，明暗主题经变量自动切换。 */
+/** 编辑器主题：颜色/字体全部跟随 design-system.css 设计变量，明暗主题经变量自动切换。
+ *  光标：CM 基座主题为 `.cm-cursor` 硬编码黑色 border-left（深色覆盖仅在其自带 dark 主题下
+ *  生效，本主题未声明 dark）——暗色模式下光标不可见。此处经 --editor-caret 变量显式接管。 */
 export const editorTheme: Extension = EditorView.theme({
   '&': {
     color: 'var(--fg)',
     backgroundColor: 'var(--bg)',
     fontFamily: 'var(--font-mono)',
     fontSize: '12px',
+    caretColor: 'var(--editor-caret)',
   },
+  '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--editor-caret)' },
   '.cm-gutters': {
     backgroundColor: 'var(--surface)',
     color: 'var(--muted)',
