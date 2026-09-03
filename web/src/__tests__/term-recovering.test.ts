@@ -15,7 +15,7 @@ vi.mock('../terminal/session-coordination', () => ({
   createLockOrchestrator: vi.fn((deps: unknown) => {
     const d = deps as { lock(): void; blur(): void; unlockSilently(): void; focus(): void; attachGestures(): void; detachGestures(): void };
     return {
-      onAuthOk: (_coarse: boolean, onAuthed: () => void) => onAuthed(),
+      onAuthOk: (_lockEnabled: boolean, onAuthed: () => void) => onAuthed(),
       onPointerChange: () => {},
       lock: () => { d.lock(); d.blur(); },
       unlock: () => { d.unlockSilently(); d.focus(); },
@@ -58,6 +58,8 @@ vi.mock('../terminal/preferences', () => ({
   loadTermPrefs: vi.fn(() => ({})),
   resolveFontFamily: vi.fn(() => 'monospace'),
   resolveFontSize: vi.fn(() => 13),
+  loadMobileMode: vi.fn(() => 'auto'),
+  loadMobileCaps: vi.fn(() => ({ version: 1, lock: true, gestures: true, keyboardAvoid: true })),
   TERM_PREFS_CHANGED: 'ocdeck-term-prefs-changed',
 }));
 vi.mock('../api', () => ({

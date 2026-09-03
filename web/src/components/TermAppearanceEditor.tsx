@@ -61,15 +61,13 @@ export function TermAppearanceEditor() {
   const handleReset = () => {
     setError('');
     setSaved(false);
-    try {
-      clearTermPrefs();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '清除失败');
-      return;
-    }
-    setFontFamily('');
-    setFontSize('');
-    window.dispatchEvent(new CustomEvent(TERM_PREFS_CHANGED));
+    // clearTermPrefs 内部按删除成功情况恰好派发一次 TERM_PREFS_CHANGED（全败不派发），
+    // 调用方不再自行派发；按实际存储重载 UI（部分失败时已清除项不再回显）。
+    const { failedKeys } = clearTermPrefs();
+    const prefs = loadTermPrefs();
+    setFontFamily(prefs.fontFamily ?? '');
+    setFontSize(prefs.fontSize !== undefined ? String(prefs.fontSize) : '');
+    if (failedKeys.length > 0) setError('部分偏好未清除，可重试');
   };
 
   return (

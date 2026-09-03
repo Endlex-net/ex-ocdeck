@@ -8,7 +8,7 @@
  * 顺序契约（design D5）：
  * - lock()：先门禁置位（deps.lock）再 term.blur，防 blur 的 \x1b[O 在门禁生效前泄漏。
  * - unlock()（公共，按钮可信手势栈）：移除锁 + term.focus 唤起虚拟键盘。
- * - onAuthOk(coarse)：coarse 时 MUST 先 lock 再暴露 authed/connected（onAuthed 回调）。
+ * - onAuthOk(lockEnabled)：锁定能力启用时 MUST 先 lock 再暴露 authed/connected（onAuthed 回调）。
  * - onPointerChange：转 coarse → lock + attach 手势层；转 fine → detach 手势层 +
  *   unlockSilently（MUST NOT focus，主动 focus 会注入 \x1b[I focus-in 序列）。
  */
@@ -40,10 +40,12 @@ export interface LockOrchestrator {
    */
   unlock(): void;
   /**
-   * auth_ok 顺序：coarse 时先 lock，再暴露 authed/connected（onAuthed 回调）。
-   * 非 coarse 时直接暴露。任何 WS 连接建立/auth_ok（含重连、Tab 切换）→ coarse 强制 LOCKED。
+   * auth_ok 顺序：锁定能力启用（首参为 appliedCaps.lock 布尔，非 pointer 粗细）时先 lock，
+   * 再暴露 authed/connected（onAuthed 回调）。未启用时直接暴露。
+   * 任何 WS 连接建立/auth_ok（含重连、Tab 切换）→ 锁定能力启用即强制 LOCKED
+   * （mobile-terminal-mode-settings design D3：边沿保护唯一例外）。
    */
-  onAuthOk(coarse: boolean, onAuthed: () => void): void;
+  onAuthOk(lockEnabled: boolean, onAuthed: () => void): void;
   /**
    * pointer 类型动态变化重评估（design D5）：
    * - 转 coarse：lock + attach 手势层。
@@ -69,10 +71,10 @@ export function createLockOrchestrator(deps: LockOrchestratorDeps): LockOrchestr
       deps.unlockSilently();
       deps.focus();
     },
-    onAuthOk(coarse, onAuthed) {
+    onAuthOk(lockEnabled, onAuthed) {
       if (disposed) return;
-      // coarse 强制 LOCKED，必须先于 authed/connected 暴露与回调，防门禁未就绪窗口泄漏。
-      if (coarse) {
+      // 锁定能力启用即强制 LOCKED，必须先于 authed/connected 暴露与回调，防门禁未就绪窗口泄漏。
+      if (lockEnabled) {
         deps.lock();
         deps.blur();
       }
