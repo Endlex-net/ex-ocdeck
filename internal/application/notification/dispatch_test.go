@@ -3,7 +3,9 @@
 package notification
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"strings"
 	"testing"
 	"time"
@@ -539,5 +541,125 @@ func TestDispatch_MacosUnavailableSkipped(t *testing.T) {
 	}
 	if macos.callCount() != 0 {
 		t.Fatalf("shared skip must not Send macos, calls=%d", macos.callCount())
+	}
+}
+
+// TestDispatch_WecomEnabledButURLEmptySkipped wecom 开关开但 url 空 → 未配置，
+// skipped 且零 Send（spec「企业微信渠道」未配置判定）。
+func TestDispatch_WecomEnabledButURLEmptySkipped(t *testing.T) {
+	wecom := &fakeChannel{name: "wecom", caps: 0}
+	web := &fakeChannel{name: "web", caps: notification.CapReplace}
+	ft := newFakeTasks(activeSnap("t1", "构建服务", "idle"))
+	fc := &fakeCfgStore{cfg: testConfig()}
+	cfg := testConfig()
+	cfg.Channels.Wecom.Enabled = true
+	cfg.Channels.Wecom.URL = ""
+	fc.set(cfg)
+	clk := newFakeClock()
+	n := newTestNotifier(ft, &fakeLister{ids: []string{"t1"}}, fc,
+		[]notification.Channel{wecom, web},
+		func(string) (string, error) { return "http://127.0.0.1:7777", nil }, clk)
+
+	ctx := context.Background()
+	n.handleEvent(ctx, runStatusEvent("t1", "busy", "idle", true))
+	clk.add(60 * time.Second)
+	n.scan(ctx)
+	waitDispatch(n)
+
+	if wecom.callCount() != 0 {
+		t.Fatalf("wecom enabled but url empty must be skipped, calls=%d", wecom.callCount())
+	}
+	if web.callCount() != 1 {
+		t.Fatalf("web must still deliver, calls=%d", web.callCount())
+	}
+}
+
+// TestDispatch_WecomAndWebBothDeliver wecom 与 web 同时启用且已配置 → 各自投递。
+func TestDispatch_WecomAndWebBothDeliver(t *testing.T) {
+	wecom := &fakeChannel{name: "wecom", caps: 0}
+	web := &fakeChannel{name: "web", caps: notification.CapReplace}
+	ft := newFakeTasks(activeSnap("t1", "构建服务", "idle"))
+	fc := &fakeCfgStore{cfg: testConfig()}
+	cfg := testConfig()
+	cfg.Channels.Bark.Enabled = false
+	cfg.Channels.Wecom.Enabled = true
+	cfg.Channels.Wecom.URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test"
+	fc.set(cfg)
+	clk := newFakeClock()
+	n := newTestNotifier(ft, &fakeLister{ids: []string{"t1"}}, fc,
+		[]notification.Channel{wecom, web},
+		func(string) (string, error) { return "http://127.0.0.1:7777", nil }, clk)
+
+	ctx := context.Background()
+	n.handleEvent(ctx, runStatusEvent("t1", "busy", "idle", true))
+	clk.add(60 * time.Second)
+	n.scan(ctx)
+	waitDispatch(n)
+
+	if wecom.callCount() != 1 || web.callCount() != 1 {
+		t.Fatalf("both wecom and web must deliver once: wecom=%d web=%d", wecom.callCount(), web.callCount())
+	}
+	if got := wecom.configs[0].Endpoint; got != "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test" {
+		t.Fatalf("wecom endpoint must be the full webhook URL, got %q", got)
+	}
+	if got := wecom.configs[0].Token; got != "" {
+		t.Fatalf("wecom token must be empty, got %q", got)
+	}
+}
+
+// TestDispatch_WecomFailureLogOmitsSecrets 失败投递走 dispatch.go:168 的
+// log.Printf；日志 MUST 含渠道失败前缀，MUST NOT 含 webhook URL、Intent.Body
+// 或响应原文。fakeChannel 失败时 Err 为固定 "scripted failure"，Config.Endpoint
+// 与 Intent.Body 含泄露标记——若生产日志误打印 plan/cfg/Intent 正文，本测试 MUST 失败。
+func TestDispatch_WecomFailureLogOmitsSecrets(t *testing.T) {
+	const (
+		urlMarker      = "wecom-log-leak-key-xyz"
+		bodyMarker     = "leak-check-body-marker"
+		responseMarker = "raw-response-marker-xyz"
+	)
+	wecom := &fakeChannel{name: "wecom", caps: 0, fail: true}
+	ft := newFakeTasks(activeSnap("t1", "构建服务", "idle"))
+	fc := &fakeCfgStore{cfg: testConfig()}
+	cfg := testConfig()
+	cfg.Channels.Bark.Enabled = false
+	cfg.Channels.Web.Enabled = false
+	cfg.Channels.Wecom.Enabled = true
+	cfg.Channels.Wecom.URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=" + urlMarker
+	fc.set(cfg)
+	clk := newFakeClock()
+	n := newTestNotifier(ft, &fakeLister{ids: []string{"t1"}}, fc,
+		[]notification.Channel{wecom},
+		func(string) (string, error) { return "http://127.0.0.1:7777", nil }, clk)
+
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(prev)
+
+	ctx := context.Background()
+	n.handleEvent(ctx, runStatusEvent("t1", "busy", "idle", true))
+	clk.add(60 * time.Second)
+	n.scan(ctx)
+	waitDispatch(n)
+
+	if wecom.callCount() != 1 {
+		t.Fatalf("wecom must be attempted once, calls=%d", wecom.callCount())
+	}
+	sent := wecom.sent()[0]
+	endpoint := wecom.configs[0].Endpoint
+	if !strings.Contains(endpoint, urlMarker) {
+		t.Fatalf("prereq: Send must receive webhook URL containing marker, got %q", endpoint)
+	}
+	if sent.Body == "" {
+		t.Fatal("prereq: sent Intent.Body must be non-empty")
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "notify: channel wecom failed") {
+		t.Fatalf("expected dispatch failure log, got %q", logged)
+	}
+	for _, secret := range []string{urlMarker, bodyMarker, responseMarker, endpoint, sent.Body, sent.URL} {
+		if secret != "" && strings.Contains(logged, secret) {
+			t.Fatalf("dispatch log MUST NOT contain %q: %q", secret, logged)
+		}
 	}
 }

@@ -69,8 +69,10 @@ const (
 )
 
 // ChannelConfig 渠道投递配置（design D4：候选判定时从配置快照固化，经 DispatchPlan
-// 下发；渠道实现 MUST NOT 自行读取配置存储）。当前仅 bark 使用（endpoint 为剔除
-// 尾部 '/' 后的推送端点、token 为 device key）；web/macos 无配置字段。
+// 下发；渠道实现 MUST NOT 自行读取配置 Store）。当前仅 bark 与 wecom 使用：
+// bark —— endpoint 为剔除尾部 '/' 后的推送端点、token 为 device key；
+// wecom —— endpoint 为用户粘贴的完整 webhook URL（含 query，原样作为 POST 目标）、
+// token 留空；web/macos 无配置字段。
 type ChannelConfig struct {
 	Endpoint string
 	Token    string

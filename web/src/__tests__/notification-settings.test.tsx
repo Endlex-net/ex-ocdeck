@@ -43,6 +43,7 @@ function baseConfig(over: Partial<NotificationConfig> = {}): NotificationConfig 
       web: { enabled: false },
       bark: { enabled: false, endpoint: 'https://api.day.app', token_masked: '' },
       macos: { enabled: false },
+      wecom: { enabled: false, url_masked: '' },
     },
     llm_summary: false,
     base_url: '',
@@ -94,6 +95,7 @@ describe('NotificationConfigPanel', () => {
           web: { enabled: true },
           bark: { enabled: true, endpoint: 'https://bark.local', token_masked: 'bark***' },
           macos: { enabled: true },
+          wecom: { enabled: false, url_masked: '' },
         },
         llm_summary: true,
       }),
@@ -107,6 +109,94 @@ describe('NotificationConfigPanel', () => {
     // token_masked 只出现在 bark token 输入 placeholder（不回显明文）。
     const tokenInput = [...container.querySelectorAll('input')].find((i) => i.type === 'password')!;
     expect(tokenInput.placeholder).toContain('bark***');
+  });
+
+  it('wecom URL 输入为密码型 + 已配置 placeholder 为 ***（留空保持不变）', async () => {
+    getConfigMock.mockResolvedValue(
+      baseConfig({
+        channels: {
+          web: { enabled: false },
+          bark: { enabled: false, endpoint: '', token_masked: '' },
+          macos: { enabled: false },
+          wecom: { enabled: true, url_masked: '***' },
+        },
+      }),
+    );
+    const { container } = await renderPanel();
+    const wecomInputs = [...container.querySelectorAll('input')].filter((i) => i.type === 'password');
+    // wecom 与 bark 均启用时存在两个密码输入；wecom 输入 autoComplete=new-password。
+    const wecomInput = wecomInputs.find((i) => i.placeholder.includes('留空保持不变') && i.placeholder.includes('***'));
+    expect(wecomInput).toBeDefined();
+    expect(wecomInput?.getAttribute('autocomplete')).toBe('new-password');
+    // 未配置时 placeholder 为粘贴提示。
+    getConfigMock.mockResolvedValue(
+      baseConfig({
+        channels: {
+          web: { enabled: false },
+          bark: { enabled: false, endpoint: '', token_masked: '' },
+          macos: { enabled: false },
+          wecom: { enabled: true, url_masked: '' },
+        },
+      }),
+    );
+    const second = await renderPanel();
+    const wecomInputs2 = [...second.container.querySelectorAll('input')].filter((i) => i.type === 'password');
+    const wecomInput2 = wecomInputs2.find((i) => i.placeholder.includes('webhook'));
+    expect(wecomInput2).toBeDefined();
+  });
+
+  it('wecom 保存提交 PUT 使用 channels.wecom.url；成功后清空输入并刷新 url_masked', async () => {
+    // 初始 GET url_masked 为空（未配置）→ 输入框 placeholder 为粘贴提示，不含
+    // 留空保持不变。保存响应 url_masked 为 ***（已配置）→ 成功后必须刷新 placeholder
+    // 为 ***（留空保持不变）。若生产忘记 setWecomURLMasked(res.channels.wecom.url_masked)，
+    // placeholder 仍为粘贴提示，本测试 MUST 失败。
+    getConfigMock.mockResolvedValue(
+      baseConfig({
+        channels: {
+          web: { enabled: false },
+          bark: { enabled: false, endpoint: 'https://api.day.app', token_masked: '' },
+          macos: { enabled: false },
+          wecom: { enabled: true, url_masked: '' },
+        },
+      }),
+    );
+    saveConfigMock.mockResolvedValue(
+      baseConfig({
+        channels: {
+          web: { enabled: false },
+          bark: { enabled: false, endpoint: 'https://api.day.app', token_masked: '' },
+          macos: { enabled: false },
+          wecom: { enabled: true, url_masked: '***' },
+        },
+      }),
+    );
+    const { container } = await renderPanel();
+    // 初始未配置：placeholder 为粘贴提示，不含留空保持不变。
+    const wecomInputBefore = [...container.querySelectorAll('input')].filter(
+      (i) => i.type === 'password' && i.placeholder.includes('webhook'),
+    )[0];
+    expect(wecomInputBefore).toBeDefined();
+    expect(wecomInputBefore.placeholder).not.toContain('留空保持不变');
+    // 用户输入新 URL。
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+      setter.call(wecomInputBefore, 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=new');
+      wecomInputBefore.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => {
+      container.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    });
+    await flushUI();
+    expect(saveConfigMock).toHaveBeenCalledTimes(1);
+    const body = saveConfigMock.mock.calls[0][0];
+    expect(body.channels.wecom.url).toBe('https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=new');
+    // 保存成功后输入清空、placeholder 刷新为已配置提示（***（留空保持不变））。
+    const wecomInputAfter = [...container.querySelectorAll('input')].filter(
+      (i) => i.type === 'password',
+    )[0];
+    expect(wecomInputAfter.value).toBe('');
+    expect(wecomInputAfter.placeholder).toContain('***');
+    expect(wecomInputAfter.placeholder).toContain('留空保持不变');
   });
 
   it('GET 返回 load_error 时界面展示', async () => {
@@ -125,7 +215,7 @@ describe('NotificationConfigPanel', () => {
       } else {
         (globalThis as Record<string, unknown>).Notification = { permission: state, requestPermission: vi.fn() };
       }
-      getConfigMock.mockResolvedValue(baseConfig({ channels: { web: { enabled: true }, bark: { enabled: false, endpoint: '', token_masked: '' }, macos: { enabled: false } } }));
+      getConfigMock.mockResolvedValue(baseConfig({ channels: { web: { enabled: true }, bark: { enabled: false, endpoint: '', token_masked: '' }, macos: { enabled: false }, wecom: { enabled: false, url_masked: '' } } }));
       const { container } = await renderPanel();
       if (state === 'granted') {
         expect(container.textContent).toContain('浏览器通知权限：已授权');
@@ -146,6 +236,7 @@ describe('NotificationConfigPanel', () => {
           web: { enabled: false },
           bark: { enabled: true, endpoint: 'https://api.day.app', token_masked: 'bark***' },
           macos: { enabled: false },
+          wecom: { enabled: false, url_masked: '' },
         },
       }),
     );
@@ -237,6 +328,7 @@ describe('NotificationConfigPanel', () => {
           web: { enabled: true },
           bark: { enabled: false, endpoint: '', token_masked: '' },
           macos: { enabled: false },
+          wecom: { enabled: false, url_masked: '' },
         },
       }),
     );

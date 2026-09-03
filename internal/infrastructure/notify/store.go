@@ -104,11 +104,12 @@ func (s *Store) LoadError() error {
 	return nil
 }
 
-// Put 保存配置：bark token 合并（空串或含 "***" 的掩码值保留已存储原 token）→
-// 校验 → 原子写文件 → 快照替换。校验失败或写文件失败返回 error 并保持旧快照不变。
-// 全过程在写锁内串行，并发 PUT 按锁获得顺序 last-writer-wins，内存与磁盘最终一致。
-// 旧快照为 loadErr 态（损坏不可读）时无已存储 token 可合并，按空处理、不因此拒绝
-// 保存（spec「通知配置读写 API」token 语义）。
+// Put 保存配置：bark token 与 wecom url 合并（空串或含 "***" 的掩码值保留
+// 已存储原值）→ 校验 → 原子写文件 → 快照替换。校验失败或写文件失败返回 error 并
+// 保持旧快照不变。全过程在写锁内串行，并发 PUT 按锁获得顺序 last-writer-wins，
+// 内存与磁盘最终一致。旧快照为 loadErr 态（损坏不可读）时无已存储值可合并，按空
+// 处理、不因此拒绝保存（spec「通知配置读写 API」token/url 语义）。
+// 校验失败返回 *ConfigValidationError（handler 据此 422），写文件失败保持普通 error。
 func (s *Store) Put(incoming notification.Config) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -118,8 +119,11 @@ func (s *Store) Put(incoming notification.Config) error {
 	if tok := merged.Channels.Bark.Token; tok == "" || strings.Contains(tok, "***") {
 		merged.Channels.Bark.Token = prevStoredToken(prev)
 	}
+	if u := merged.Channels.Wecom.URL; u == "" || strings.Contains(u, "***") {
+		merged.Channels.Wecom.URL = prevStoredWecomURL(prev)
+	}
 	if err := merged.Validate(); err != nil {
-		return err
+		return &ConfigValidationError{Err: err}
 	}
 	if err := saveConfigFile(s.dataDir, merged); err != nil {
 		return err
@@ -129,6 +133,14 @@ func (s *Store) Put(incoming notification.Config) error {
 	return nil
 }
 
+// ConfigValidationError Put 路径业务校验失败的可识别包装（spec「通知配置读写 API」：
+// handler MUST 能区分校验失败 422 与写盘失败 500）。Error() 委托内层校验文案，
+// 原样回传 422 body；Unwrap 支持 errors.Is/As 解包。
+type ConfigValidationError struct{ Err error }
+
+func (e *ConfigValidationError) Error() string { return e.Err.Error() }
+func (e *ConfigValidationError) Unwrap() error { return e.Err }
+
 // prevStoredToken 从旧快照提取 bark token 用于合并；旧快照为 loadErr 态时
 // 损坏文件不可信，按无已存储 token 处理。
 func prevStoredToken(prev *snapshot) string {
@@ -136,6 +148,15 @@ func prevStoredToken(prev *snapshot) string {
 		return ""
 	}
 	return prev.cfg.Channels.Bark.Token
+}
+
+// prevStoredWecomURL 从旧快照提取 wecom webhook URL 用于合并；旧快照为 loadErr
+// 态时损坏文件不可信，按无已存储 URL 处理。
+func prevStoredWecomURL(prev *snapshot) string {
+	if prev == nil || prev.loadErr != nil {
+		return ""
+	}
+	return prev.cfg.Channels.Wecom.URL
 }
 
 // loadConfigFile 读取并解码 <dataDir>/notification.json。文件不存在 →
@@ -183,6 +204,7 @@ type wireChannels struct {
 	Web   *wireWeb   `json:"web"`
 	Bark  *wireBark  `json:"bark"`
 	Macos *wireMacos `json:"macos"`
+	Wecom *wireWecom `json:"wecom"`
 }
 
 type wireWeb struct {
@@ -197,6 +219,15 @@ type wireBark struct {
 
 type wireMacos struct {
 	Enabled *bool `json:"enabled"`
+}
+
+// wireWecom wecom 渠道 wire DTO（spec「通知配置存储」兼容规则）：对象缺失或为
+// null → enabled=false、url=""；对象在场时嵌套键缺失或 null 各自独立取默认
+// （enabled 缺/null → false；url 缺/null → ""）。因此 wecom 不列入必填 checks，
+// 缺键填充在 toConfig 组装处完成。类型不匹配仍随 json.Unmarshal 失败 → 损坏。
+type wireWecom struct {
+	Enabled *bool   `json:"enabled"`
+	URL     *string `json:"url"`
 }
 
 // DecodeConfig 从 JSON 字节解码通知配置，强制磁盘 schema 的必填键存在性（缺键或
@@ -256,10 +287,28 @@ func (w *wireConfig) toConfig() (notification.Config, error) {
 			Web:   notification.WebChannelConfig{Enabled: *w.Channels.Web.Enabled},
 			Bark:  notification.BarkChannelConfig{Enabled: *w.Channels.Bark.Enabled, Endpoint: *w.Channels.Bark.Endpoint, Token: *w.Channels.Bark.Token},
 			Macos: notification.MacosChannelConfig{Enabled: *w.Channels.Macos.Enabled},
+			Wecom: buildWecomChannelConfig(w.Channels.Wecom),
 		},
 		LLMSummary: *w.LLMSummary,
 		BaseURL:    *w.BaseURL,
 	}, nil
+}
+
+// buildWecomChannelConfig 按 spec「通知配置存储」兼容规则填充 wecom 配置：
+// 对象缺失或为 nil → 两字段默认（enabled=false、url=""）；对象在场时嵌套键
+// 缺失或为 nil 各自独立取默认。已校验非 nil 的字段直接解引用。
+func buildWecomChannelConfig(w *wireWecom) notification.WecomChannelConfig {
+	if w == nil {
+		return notification.WecomChannelConfig{}
+	}
+	cfg := notification.WecomChannelConfig{}
+	if w.Enabled != nil {
+		cfg.Enabled = *w.Enabled
+	}
+	if w.URL != nil {
+		cfg.URL = *w.URL
+	}
+	return cfg
 }
 
 // saveConfigFile 原子写入 notification.json，权限 0600（spec「通知配置存储」）。
@@ -307,4 +356,15 @@ func MaskToken(token string) string {
 		return "***"
 	}
 	return token[:4] + "***"
+}
+
+// MaskWecomURL wecom webhook URL 掩码规则（spec「通知配置读写 API」：无 URL 为
+// 空串；非空 URL MUST 固定为 `***`）。MUST NOT 复用 MaskToken（其回显前 4 字符
+// 会泄漏 `http`/`https` 前缀）。完整 webhook URL 整体按密钥保护，MUST NOT 回显
+// 任何原文片段。
+func MaskWecomURL(url string) string {
+	if url == "" {
+		return ""
+	}
+	return "***"
 }
