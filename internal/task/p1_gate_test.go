@@ -667,12 +667,12 @@ func TestReopenAttach_ConcurrentIdempotentReuse(t *testing.T) {
 // active + 会话缺失 → typed recovering + 异步触发恢复；恢复收敛后 runtime 在位 →
 // 返回 -runtime terminal id，再调用幂等复用。
 // 旧语义（重建独立 TUI 会话）已随单进程化移除；本测试同步等待后台恢复 goroutine
-//（Phase 4 起 ReopenAttach 对缺失 runtime 异步 ensureRecoveryFromAttach）收敛后再
+// （Phase 4 起 ReopenAttach 对缺失 runtime 异步 ensureRecoveryFromAttach）收敛后再
 // 断言——不得在恢复未结束时直接改 mockProc 字段（-race 下与后台 goroutine 竞争）。
 func TestReopenAttach_RecreatesMissingTUI(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	m.SetLifecycleCtx(context.Background())

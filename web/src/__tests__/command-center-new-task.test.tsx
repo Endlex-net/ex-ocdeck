@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { act } from 'react';
 import type { Root } from 'react-dom/client';
 import { CommandCenterPage } from '../pages/CommandCenterPage';
-import { api } from '../api';
+import { api, ApiError } from '../api';
 import {
   emitPaletteFocus,
   __resetPaletteFocusForTest,
@@ -29,8 +29,10 @@ vi.mock('../api', () => ({
     refreshBranches: vi.fn(async () => ['main']),
     createTask: vi.fn(),
   },
+  // 与 api.ts 真实签名同形（status, code, message），避免测试替身参数错位
   ApiError: class ApiError extends Error {
     constructor(
+      public status: number,
       public code: string,
       message: string,
     ) {
@@ -42,8 +44,8 @@ vi.mock('../api', () => ({
 vi.mock('../hooks', () => ({
   useProjects: () => ({ projects: storeProjects, initialized: true, error: '' }),
   useProjectsRefresh: () => vi.fn(async () => {}),
-  createErrorMessage: (_prefix: string, err: unknown) =>
-    err instanceof Error ? err.message : String(err),
+  // 与 hooks.ts createErrorMessage(err) 同签名：非 ApiError 落入通用分支
+  createErrorMessage: (err: unknown) => (err instanceof Error ? err.message : String(err)),
 }));
 
 function proj(id: string, name: string, over: Partial<Project> = {}): Project {
@@ -63,6 +65,10 @@ function proj(id: string, name: string, over: Partial<Project> = {}): Project {
 
 function projectInput(container: HTMLElement) {
   return container.querySelector<HTMLInputElement>('input[role="combobox"]')!;
+}
+
+function branchInput(container: HTMLElement) {
+  return container.querySelectorAll<HTMLInputElement>('input[role="combobox"]')[1]!;
 }
 
 function taskInput(container: HTMLElement) {
@@ -87,6 +93,11 @@ async function fillTaskAndSubmit(container: HTMLElement, name = 'task-a') {
     setInput(taskInput(container), name);
   });
   expect(submitBtn(container).disabled).toBe(false);
+  await dispatchSubmit(container);
+}
+
+// 浏览器中任务名框 Enter 与创建按钮点击都触发 form submit；jsdom 以 submit 事件等价驱动
+async function dispatchSubmit(container: HTMLElement) {
   await act(async () => {
     container
       .querySelector('#cc-new-task-panel form')!
@@ -104,6 +115,8 @@ beforeEach(() => {
   vi.mocked(api.createTask).mockReset();
   vi.mocked(api.listBranches).mockReset();
   vi.mocked(api.listBranches).mockResolvedValue(['main']);
+  vi.mocked(api.refreshBranches).mockReset();
+  vi.mocked(api.refreshBranches).mockResolvedValue(['main']);
 });
 
 afterEach(async () => {
@@ -457,5 +470,287 @@ describe('CommandCenterPage 快速新建初始化', () => {
     expect(taskFocuses()).toBe(2);
     expect(document.activeElement).toBe(taskInput(container));
     focusSpy.mockRestore();
+  });
+});
+
+describe('CommandCenterPage 基准分支排序与分支列表状态机（task-base-branch-context）', () => {
+  it('预填 main 且存在 origin/main 时点创建提交 origin/main（远端同名优先）', async () => {
+    vi.mocked(api.listBranches).mockResolvedValue(['main', 'origin/main']);
+    const { container } = renderPage();
+    act(() => {
+      emitPaletteFocus('new-task-name', { projectName: 'ocdeck', projectID: 'p1' });
+    });
+    await flushUI();
+    expect(branchInput(container).value).toBe('main');
+    await fillTaskAndSubmit(container);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main');
+  });
+
+  it('任务名框 Enter 与创建按钮同路径：提交过滤首项', async () => {
+    vi.mocked(api.listBranches).mockResolvedValue(['main', 'origin/main']);
+    const { container } = renderPage();
+    act(() => {
+      emitPaletteFocus('new-task-name', { projectName: 'ocdeck', projectID: 'p1' });
+    });
+    await flushUI();
+    await act(async () => {
+      setInput(taskInput(container), 'task-a');
+    });
+    await dispatchSubmit(container);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main');
+  });
+
+  it('synthetic 候选排第一时提交 normalizedInput（trim 首尾空白）', async () => {
+    vi.mocked(api.listBranches).mockResolvedValue(['main', 'develop']);
+    const { container } = renderPage();
+    act(() => {
+      emitPaletteFocus('new-task-name', { projectName: 'ocdeck', projectID: 'p1' });
+    });
+    await flushUI();
+    await act(async () => {
+      setInput(branchInput(container), '  feature-x  ');
+    });
+    await fillTaskAndSubmit(container);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'feature-x');
+  });
+
+  it('synthetic 只参与排序不保证第一：输入 main 时提交 origin/main', async () => {
+    vi.mocked(api.listBranches).mockResolvedValue(['origin/main']);
+    const { container } = renderPage();
+    act(() => {
+      emitPaletteFocus('new-task-name', { projectName: 'ocdeck', projectID: 'p1' });
+    });
+    await flushUI();
+    await act(async () => {
+      setInput(branchInput(container), 'main');
+    });
+    await fillTaskAndSubmit(container);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main');
+  });
+
+  it('dir 项目提交不携带 base_ref', async () => {
+    storeProjects = [proj('d1', 'plain', { kind: 'dir' })];
+    const { container } = renderPage();
+    act(() => {
+      emitPaletteFocus('new-task-name', { projectName: 'plain', projectID: 'd1' });
+    });
+    await flushUI();
+    // dir 无基准分支字段（仅项目一个 combobox）
+    expect(container.querySelectorAll('input[role="combobox"]').length).toBe(1);
+    await fillTaskAndSubmit(container);
+    expect(api.createTask).toHaveBeenCalledWith('d1', 'task-a', undefined);
+  });
+
+  it('初次加载在途：提交禁用且不发起 POST；ready 后提交过滤首项', async () => {
+    let resolveBranches!: (v: string[]) => void;
+    vi.mocked(api.listBranches).mockImplementation(
+      () =>
+        new Promise<string[]>((res) => {
+          resolveBranches = res;
+        }),
+    );
+    const { container } = renderPage();
+    act(() => {
+      emitPaletteFocus('new-task-name', { projectName: 'ocdeck', projectID: 'p1' });
+    });
+    await flushUI(); // 初次 GET 仍在途
+    await act(async () => {
+      setInput(taskInput(container), 'task-a');
+    });
+    expect(submitBtn(container).disabled).toBe(true);
+    await dispatchSubmit(container);
+    expect(api.createTask).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveBranches(['main', 'origin/main']);
+    });
+    await flushUI();
+    expect(submitBtn(container).disabled).toBe(false);
+    await dispatchSubmit(container);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main');
+  });
+
+  it('初次加载失败：列表为空、禁止提交、不发起 POST', async () => {
+    vi.mocked(api.listBranches).mockRejectedValue(new Error('boom'));
+    const { container } = renderPage();
+    act(() => {
+      emitPaletteFocus('new-task-name', { projectName: 'ocdeck', projectID: 'p1' });
+    });
+    await flushUI();
+    expect(container.textContent).toContain('获取分支列表失败');
+    // 打开分支下拉确认列表为空（error 且无历史 → 无选项，仅刷新入口）
+    await act(async () => {
+      branchInput(container).focus();
+    });
+    expect(container.querySelectorAll('.cc-combo-item').length).toBe(0);
+    await act(async () => {
+      setInput(taskInput(container), 'task-a');
+    });
+    expect(submitBtn(container).disabled).toBe(true);
+    await dispatchSubmit(container);
+    expect(api.createTask).not.toHaveBeenCalled();
+  });
+
+  it('refresh 失败保留 stale 列表并标注「本地快照未刷新」且禁止提交；重试成功恢复提交', async () => {
+    vi.mocked(api.listBranches).mockResolvedValue(['main', 'origin/main']);
+    const { container } = renderPage();
+    act(() => {
+      emitPaletteFocus('new-task-name', { projectName: 'ocdeck', projectID: 'p1' });
+    });
+    await flushUI();
+    await act(async () => {
+      setInput(taskInput(container), 'task-a');
+    });
+    expect(submitBtn(container).disabled).toBe(false);
+
+    const refreshBtn = () =>
+      [...container.querySelectorAll('button')].find((b) => b.textContent?.includes('刷新远端分支'))!;
+    await act(async () => {
+      branchInput(container).focus();
+    });
+    expect(refreshBtn()).toBeTruthy();
+
+    // 刷新失败：stale 列表仍展示 + 「本地快照未刷新」 + 禁止提交、不发起 POST
+    vi.mocked(api.refreshBranches).mockRejectedValue(new Error('boom'));
+    await act(async () => {
+      refreshBtn().click();
+    });
+    await flushUI();
+    expect(container.textContent).toContain('本地快照未刷新');
+    expect(
+      [...container.querySelectorAll('.cc-combo-item')].some((b) => b.textContent === 'origin/main'),
+    ).toBe(true);
+    expect(submitBtn(container).disabled).toBe(true);
+    await dispatchSubmit(container);
+    expect(api.createTask).not.toHaveBeenCalled();
+
+    // 重试成功：ready 恢复提交，且使用刷新后的过滤首项
+    vi.mocked(api.refreshBranches).mockResolvedValue(['develop', 'main', 'origin/main']);
+    await act(async () => {
+      refreshBtn().click();
+    });
+    await flushUI();
+    expect(submitBtn(container).disabled).toBe(false);
+    await dispatchSubmit(container);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main');
+  });
+
+  it('成功空列表回退 default_branch：提交 base_ref=main', async () => {
+    vi.mocked(api.listBranches).mockResolvedValue([]);
+    const { container } = renderPage();
+    act(() => {
+      emitPaletteFocus('new-task-name', { projectName: 'ocdeck', projectID: 'p1' });
+    });
+    await flushUI();
+    await fillTaskAndSubmit(container);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main');
+  });
+
+  it('候选全空时省略 base_ref：服务端 invalid_input 后页面展示创建失败', async () => {
+    storeProjects = [proj('p1', 'ocdeck', { default_branch: '' })];
+    vi.mocked(api.listBranches).mockResolvedValue([]);
+    vi.mocked(api.createTask).mockRejectedValue(new ApiError(400, 'invalid_input', '基准分支不能为空'));
+    const { container } = renderPage();
+    act(() => {
+      emitPaletteFocus('new-task-name', { projectName: 'ocdeck', projectID: 'p1' });
+    });
+    await flushUI();
+    // ready 可提交，但候选全空 → base_ref 省略（api 层 falsy 省略字段）
+    await act(async () => {
+      setInput(taskInput(container), 'task-a');
+    });
+    expect(submitBtn(container).disabled).toBe(false);
+    await dispatchSubmit(container);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', undefined);
+    expect(container.textContent).toContain('基准分支不能为空');
+  });
+
+  it('跨项目刷新竞态：A 旧刷新晚于 B 新刷新完成，不清 B 的刷新指示也不释放单飞锁', async () => {
+    vi.mocked(api.listBranches).mockResolvedValue(['main']);
+    const { container } = renderPage();
+    act(() => {
+      emitPaletteFocus('new-task-name', { projectName: 'ocdeck', projectID: 'p1' });
+    });
+    await flushUI();
+
+    const refreshBtn = () =>
+      [...container.querySelectorAll('button')].find((b) => b.textContent?.includes('刷新远端分支'))!;
+    let resolveA!: (v: string[]) => void;
+    vi.mocked(api.refreshBranches).mockImplementationOnce(
+      () =>
+        new Promise<string[]>((res) => {
+          resolveA = res;
+        }),
+    );
+    await act(async () => {
+      branchInput(container).focus();
+    });
+    await act(async () => {
+      refreshBtn().click();
+    });
+    await flushUI();
+    expect(api.refreshBranches).toHaveBeenCalledTimes(1);
+
+    // 切到 B（effect 重置刷新状态与所有权）并发起 B 的刷新（在途）
+    act(() => {
+      emitPaletteFocus('new-task-name', { projectName: 'other', projectID: 'p2' });
+    });
+    await flushUI();
+    let resolveB!: (v: string[]) => void;
+    vi.mocked(api.refreshBranches).mockImplementationOnce(
+      () =>
+        new Promise<string[]>((res) => {
+          resolveB = res;
+        }),
+    );
+    await act(async () => {
+      branchInput(container).focus();
+    });
+    await act(async () => {
+      refreshBtn().click();
+    });
+    await flushUI();
+    expect(api.refreshBranches).toHaveBeenCalledTimes(2);
+    expect(container.textContent).toContain('刷新中…');
+
+    // A 旧请求此时才完成：不得清 B 的刷新指示、不得释放 B 的单飞锁
+    await act(async () => {
+      resolveA(['main', 'origin/main']);
+    });
+    await flushUI();
+    expect(container.textContent).toContain('刷新中…');
+    await act(async () => {
+      refreshBtn().click();
+    });
+    await flushUI();
+    expect(api.refreshBranches).toHaveBeenCalledTimes(2); // B 仍在途，未被旧 finally 释放
+
+    // B 完成：ready + 刷新指示清除 + 提交恢复
+    await act(async () => {
+      resolveB(['develop', 'main']);
+    });
+    await flushUI();
+    expect(container.textContent).not.toContain('刷新中…');
+    await act(async () => {
+      setInput(taskInput(container), 'task-a');
+    });
+    await dispatchSubmit(container);
+    expect(api.createTask).toHaveBeenCalledWith('p2', 'task-a', 'main');
+  });
+
+  it('下拉高亮过滤排序首项：输入 main 时高亮 origin/main 而非输入精确等值项', async () => {
+    vi.mocked(api.listBranches).mockResolvedValue(['main', 'origin/main']);
+    const { container } = renderPage();
+    act(() => {
+      emitPaletteFocus('new-task-name', { projectName: 'ocdeck', projectID: 'p1' });
+    });
+    await flushUI();
+    // 预填 main，打开下拉：D2 排序后首项为 origin/main，高亮应随首项而非 baseRef 精确匹配
+    await act(async () => {
+      branchInput(container).focus();
+    });
+    const hl = () => container.querySelector('.cc-combo-item.hl');
+    expect(hl()).not.toBeNull();
+    expect(hl()!.textContent).toBe('origin/main');
   });
 });

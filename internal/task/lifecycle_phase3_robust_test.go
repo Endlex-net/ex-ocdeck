@@ -128,7 +128,7 @@ func TestShutdown_WaitsRunnerWG_BlockingMock(t *testing.T) {
 	runner := newBlockingLifecycleRunner()
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 
-	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusPending}
+	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusPending}
 	m.startInitRunner("t1")
 	if !runner.waitStarted(2 * time.Second) {
 		t.Fatalf("RunScript did not start")
@@ -182,7 +182,7 @@ func TestShutdown_PreDeleteWG_HeldUntilFinalize(t *testing.T) {
 	runner := newBlockingLifecycleRunner()
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 	tid := "t1"
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, InitStatus: InitStatusNone}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusNone}
 
 	// 步骤 1：以可取消 request ctx 启动 Delete（异步，pre-delete 脚本将阻塞在 runnerCtx 上）。
 	reqCtx, reqCancel := context.WithCancel(context.Background())
@@ -381,7 +381,7 @@ func TestRerunInitVsActivate_MutexSerialized_Deterministic(t *testing.T) {
 		runner := newGatedLifecycleRunner(gate)
 		m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 		tid := "t1"
-		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusSucceeded}
+		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusSucceeded}
 
 		// 串行调用：RerunInit 同步返回（claim → running → 解锁 → 异步脚本阻塞在 gate 上）。
 		rerunRow, rerunErr := m.RerunInit(context.Background(), tid)
@@ -427,7 +427,7 @@ func TestRerunInitVsActivate_MutexSerialized_Deterministic(t *testing.T) {
 		runner := newGatedLifecycleRunner(nil) // 立即完成。
 		m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 		tid := "t1"
-		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusSucceeded}
+		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusSucceeded}
 
 		rerunRow, rerunErr := m.RerunInit(context.Background(), tid)
 		if rerunErr != nil {
@@ -467,7 +467,7 @@ func TestRerunInitVsActivate_MutexSerialized_Deterministic(t *testing.T) {
 		runner := newGatedLifecycleRunner(nil)
 		m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 		tid := "t1"
-		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusSucceeded}
+		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusSucceeded}
 
 		// Activate 先执行：succeeded → 放行 → active。
 		actErr := m.Activate(context.Background(), tid)
@@ -508,7 +508,7 @@ func TestRerunInitVsDelete_MutexSerialized_Deterministic(t *testing.T) {
 		runner := newGatedLifecycleRunner(gate)
 		m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 		tid := "t1"
-		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, InitStatus: InitStatusFailed}
+		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusFailed}
 
 		rerunRow, rerunErr := m.RerunInit(context.Background(), tid)
 		if rerunErr != nil {
@@ -558,7 +558,7 @@ func TestRerunInitVsDelete_MutexSerialized_Deterministic(t *testing.T) {
 		runner := newGatedLifecycleRunner(nil) // 立即完成。
 		m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 		tid := "t1"
-		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, InitStatus: InitStatusFailed}
+		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusFailed}
 
 		rerunRow, rerunErr := m.RerunInit(context.Background(), tid)
 		if rerunErr != nil {
@@ -596,7 +596,7 @@ func TestRerunInitVsDelete_MutexSerialized_Deterministic(t *testing.T) {
 		runner := newGatedLifecycleRunner(nil)
 		m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 		tid := "t1"
-		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, InitStatus: InitStatusFailed}
+		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusFailed}
 
 		// Delete 先执行：succeeded/failed → 不在 init 拒绝集 → 删除成功。
 		delErr := m.Delete(context.Background(), tid, DeleteNormal, false)
@@ -631,7 +631,7 @@ func TestRerunInitVsArchive_MutexSerialized_Deterministic(t *testing.T) {
 		runner := newGatedLifecycleRunner(gate)
 		m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 		tid := "t1"
-		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusSucceeded}
+		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusSucceeded}
 
 		rerunRow, rerunErr := m.RerunInit(context.Background(), tid)
 		if rerunErr != nil {
@@ -675,7 +675,7 @@ func TestRerunInitVsArchive_MutexSerialized_Deterministic(t *testing.T) {
 		runner := newGatedLifecycleRunner(nil) // 立即完成。
 		m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 		tid := "t1"
-		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusSucceeded}
+		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusSucceeded}
 
 		rerunRow, rerunErr := m.RerunInit(context.Background(), tid)
 		if rerunErr != nil {
@@ -714,7 +714,7 @@ func TestRerunInitVsArchive_MutexSerialized_Deterministic(t *testing.T) {
 		runner := newGatedLifecycleRunner(nil)
 		m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 		tid := "t1"
-		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusSucceeded}
+		store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusSucceeded}
 
 		// Archive 先执行：succeeded → 不在 init 拒绝集 → 归档成功。
 		archErr := m.Archive(context.Background(), tid)
@@ -892,7 +892,7 @@ func TestRerunInitVsActivate_Overlap_Concurrent(t *testing.T) {
 	runner := newGatedLifecycleRunner(nil) // 异步脚本立即完成（claim 释放后收敛 succeeded）
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 	tid := "t1"
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusFailed}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusFailed}
 
 	// 并发启动 RerunInit（异步）：claim 后阻塞在 ClaimInitRerun 临界区（持锁）。
 	rerunDone := make(chan error, 1)
@@ -969,7 +969,7 @@ func TestRerunInitVsDelete_Overlap_Concurrent(t *testing.T) {
 	runner := newGatedLifecycleRunner(nil)
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 	tid := "t1"
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, InitStatus: InitStatusFailed}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusFailed}
 
 	rerunDone := make(chan error, 1)
 	go func() {
@@ -1041,7 +1041,7 @@ func TestRerunInitVsArchive_Overlap_Concurrent(t *testing.T) {
 	runner := newGatedLifecycleRunner(nil)
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 	tid := "t1"
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusFailed}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusFailed}
 
 	rerunDone := make(chan error, 1)
 	go func() {
@@ -1103,7 +1103,7 @@ func TestActivateVsRerunInit_Overlap_Reverse(t *testing.T) {
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 	tid := "t1"
 	// init_status=succeeded 让 Activate 通过 init 门禁到达 UpdateTaskStatusConditional。
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusSucceeded}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusSucceeded}
 
 	// 并发启动 Activate（异步）：suspended→activating CAS 阻塞在 commitBlockingStore（持锁）。
 	actDone := make(chan error, 1)
@@ -1159,7 +1159,7 @@ func TestDeleteVsRerunInit_Overlap_Reverse(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 	tid := "t1"
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, InitStatus: InitStatusFailed}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusFailed}
 
 	delDone := make(chan error, 1)
 	go func() {
@@ -1211,7 +1211,7 @@ func TestArchiveVsRerunInit_Overlap_Reverse(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 	tid := "t1"
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusFailed}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusFailed}
 
 	archDone := make(chan error, 1)
 	go func() {
@@ -1263,7 +1263,7 @@ func TestRerunInitVsActivate_Overlap_BothOK(t *testing.T) {
 	runner := newGatedLifecycleRunner(nil) // 脚本立即完成
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 	tid := "t1"
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusFailed}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusFailed}
 
 	rerunDone := make(chan error, 1)
 	go func() {
@@ -1319,7 +1319,7 @@ func TestRerunInit_ClaimInitRerun_StoreError_ReleasesWG(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 	tid := "t1"
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusFailed}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusFailed}
 	_, err := m.RerunInit(context.Background(), tid)
 	if err == nil {
 		t.Fatalf("RerunInit must fail when ClaimInitRerun store errors")
@@ -1367,7 +1367,7 @@ func TestRerunInit_ClaimInitRerun_CASRowsZero_ShutdownNotHang(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 	tid := "t1"
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusFailed}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusFailed}
 	_, err := m.RerunInit(context.Background(), tid)
 	if err == nil {
 		t.Fatalf("RerunInit must fail with conflict when ClaimInitRerun CAS rows=0")
@@ -1408,7 +1408,7 @@ func TestInitRunner_FinishInitRun_BlockingGate_WGNotReleased(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 	tid := "t1"
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusPending}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusPending}
 	m.startInitRunner(tid)
 	// 等待脚本执行完成（mockLifecycleRunner 立即返回）。
 	waitForScriptCalls(t, runner, 1, 2*time.Second)
@@ -1480,7 +1480,7 @@ func TestDelete_BlockingDeleteTask_PreDeleteTokenHeld(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 	tid := "t1"
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, InitStatus: InitStatusNone}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusNone}
 
 	delDone := make(chan error, 1)
 	go func() {
@@ -1560,7 +1560,7 @@ func TestRerunInit_ClaimInitRerun_CASRowsZero(t *testing.T) {
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 	tid := "t1"
 	// 门禁通过（suspended+failed），但 ClaimInitRerun 返回 rows=0（模拟并发已 claim）。
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusFailed}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusFailed}
 	_, err := m.RerunInit(context.Background(), tid)
 	if err == nil {
 		t.Fatalf("RerunInit must fail with conflict when ClaimInitRerun CAS rows=0")
@@ -1597,7 +1597,7 @@ func TestRerunInit_ReturnsRunningRow(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 	tid := "t1"
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusFailed}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusFailed}
 	row, err := m.RerunInit(context.Background(), tid)
 	if err != nil {
 		t.Fatalf("RerunInit: %v", err)
@@ -1692,7 +1692,7 @@ func TestReconcile_Order_ConvergeBeforeRestore(t *testing.T) {
 	wt := newMockWorktree()
 	oc := newMockOC(true)
 	m := newLifecycleTestManager(t, store, proc, wt, oc, &mockLifecycleRunner{})
-	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt1", InitStatus: InitStatusRunning}
+	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt1", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusRunning}
 	if err := m.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -1830,7 +1830,7 @@ func TestPreDelete_StatNonENOENT_DeletionFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 	wtPath := filepath.Join(parentFile, "worktree") // parent 是文件 → Stat 子路径返回 ENOTDIR
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, InitStatus: InitStatusNone}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusNone}
 	err := m.Delete(context.Background(), tid, DeleteNormal, false)
 	if err == nil {
 		t.Fatalf("Delete must fail on Stat ENOTDIR")
@@ -1860,7 +1860,7 @@ func TestPreDelete_AdmissionFail_NoWorktreeRemove(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 	tid := "t1"
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, InitStatus: InitStatusNone}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusNone}
 
 	// 触发真实 Shutdown 流程使 gate 关闭（shutdownStarted=true，runnerCtx 取消并置空）。
 	// Shutdown 完成后（无 runner 运行，WG 立即完成），gate 保持关闭。
@@ -1909,7 +1909,7 @@ func TestPreDelete_WtRemoveSuccessDBFail_RetryConverges(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 	tid := "t1"
-	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, InitStatus: InitStatusNone}
+	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusNone}
 	// 首次 Delete：pre-delete 成功，wt.Remove 成功，DeleteTask 失败 → deletion_failed。
 	err := m.Delete(context.Background(), tid, DeleteNormal, false)
 	if err == nil {
@@ -1969,7 +1969,7 @@ func TestSignalCtxEarlyCancel_DoesNotAffectRunnerCtx(t *testing.T) {
 	m.SetLifecycleCtx(sigCtx)
 
 	// 启动 InitRunner：脚本入场后阻塞在 runnerCtx 上（blockingLifecycleRunner 未 release）。
-	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusPending}
+	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusPending}
 	m.startInitRunner("t1")
 	if !runner.waitStarted(2 * time.Second) {
 		t.Fatalf("InitRunner RunScript did not start")
@@ -2019,10 +2019,10 @@ func TestAdmissionAfterSyncExit_ReleasesExactlyOnce(t *testing.T) {
 	}{
 		{"taskNotFound", func(s *mockStore) {}, true},
 		{"wrongStatus", func(s *mockStore) {
-			s.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusActive, WorktreePath: "/wt", InitStatus: InitStatusFailed}
+			s.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusActive, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusFailed}
 		}, true},
 		{"wrongInitStatus", func(s *mockStore) {
-			s.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", InitStatus: InitStatusNone}
+			s.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusNone}
 		}, true},
 	}
 	for _, c := range cases {

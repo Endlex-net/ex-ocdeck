@@ -475,7 +475,8 @@ func TestP1_EnvReservedNamespace_CoversAllOCDECK(t *testing.T) {
 }
 
 // TestP1_EnvSnapshot_InjectsAllLifecycleVars（FIX7）：
-// mergeEnvSnapshot MUST 注入五个生命周期变量。
+// mergeEnvSnapshot 对 repo 任务 MUST 注入七个生命周期变量
+// （原五个 + task-base-branch-context 的 BASE/HEAD）。
 func TestP1_EnvSnapshot_InjectsAllLifecycleVars(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
@@ -486,11 +487,13 @@ func TestP1_EnvSnapshot_InjectsAllLifecycleVars(t *testing.T) {
 		t.Fatalf("mergeEnvSnapshot: %v", err)
 	}
 	want := map[string]string{
-		"OCDECK_SERVE_PORT":   "50001",
-		"OCDECK_TASK_ID":      "t1",
-		"OCDECK_TASK_NAME":    "my task",
-		"OCDECK_TASK_PATH":    "/data/worktrees/p1/t1",
-		"OCDECK_PROJECT_PATH": "/repo",
+		"OCDECK_SERVE_PORT":       "50001",
+		"OCDECK_TASK_ID":          "t1",
+		"OCDECK_TASK_NAME":        "my task",
+		"OCDECK_TASK_PATH":        "/data/worktrees/p1/t1",
+		"OCDECK_PROJECT_PATH":     "/repo",
+		"OCDECK_TASK_BASE_BRANCH": "main",
+		"OCDECK_TASK_HEAD_BRANCH": "ocdeck/my-task",
 	}
 	for k, v := range want {
 		if got := merged[k]; got != v {

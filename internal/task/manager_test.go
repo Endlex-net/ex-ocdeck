@@ -14,19 +14,24 @@ import (
 )
 
 // seedProjectTask 在 mockStore 中创建项目与挂起任务。
+// repo fixture 默认带 Branch 与 BaseRef=refs/heads/main（task-base-branch-context 2.1：
+// 会到达 layerEnvSnapshot 的正常 repo fixture 必须满足 D5 校验；异常路径再显式覆盖）。
 func seedSuspendedTask(s *mockStore, taskID, projectID string) TaskRow {
 	s.seedProject(ProjectRow{ID: projectID, Name: "p", Path: "/repo", DefaultBranch: "main"})
 	t := TaskRow{ID: taskID, ProjectID: projectID, Name: "my task", Branch: "ocdeck/my-task",
-		Status: StatusSuspended, WorktreePath: "/data/worktrees/" + projectID + "/" + taskID}
+		BaseRef: "refs/heads/main",
+		Status:  StatusSuspended, WorktreePath: "/data/worktrees/" + projectID + "/" + taskID}
 	s.tasks[taskID] = t
 	return t
 }
 
 // seedActiveTask 在 mockStore 中创建项目与活跃任务（2.8 agentStatus 测试用）。
+// repo fixture 默认带 Branch 与 BaseRef=refs/heads/main（同 seedSuspendedTask）。
 func seedActiveTask(s *mockStore, taskID, projectID string) TaskRow {
 	s.seedProject(ProjectRow{ID: projectID, Name: "p", Path: "/repo", DefaultBranch: "main"})
 	t := TaskRow{ID: taskID, ProjectID: projectID, Name: "my task", Branch: "ocdeck/my-task",
-		Status: StatusActive, WorktreePath: "/data/worktrees/" + projectID + "/" + taskID}
+		BaseRef: "refs/heads/main",
+		Status:  StatusActive, WorktreePath: "/data/worktrees/" + projectID + "/" + taskID}
 	s.tasks[taskID] = t
 	return t
 }
@@ -71,12 +76,12 @@ func TestCreate_WorktreeFail_CreationFailed(t *testing.T) {
 
 func TestSlugify(t *testing.T) {
 	cases := map[string]string{
-		"My Task":   "my-task",
-		"  a  b  ":  "a-b",
-		"foo__bar":   "foo-bar",
-		"---x---":    "x",
-		"":          "task",
-		"UPPER":     "upper",
+		"My Task":  "my-task",
+		"  a  b  ": "a-b",
+		"foo__bar": "foo-bar",
+		"---x---":  "x",
+		"":         "task",
+		"UPPER":    "upper",
 	}
 	for in, want := range cases {
 		if got := Slugify(in); got != want {
@@ -354,7 +359,12 @@ func TestKeyedMutex_ConcurrentCreate(t *testing.T) {
 func TestServeExit_HandlerSuspended(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(t *TaskRow) { t.Status = StatusActive })
+	store.mutTask("t1", func(t *TaskRow) {
+		t.Status = StatusActive
+		// D8：Recovery attempt 前加载持久化快照——手动 seed 的 active 行需带合法快照。
+		b, _ := encodeEnvSnapshot(envSnapshot{Vars: map[string]string{"OCDECK_TASK_ID": "t1"}})
+		t.EnvSnapshot = b
+	})
 	proc := newMockProc()
 	proc.sessions[serveSessionName("t1")] = true
 	proc.sessions[tuiSessionName("t1")] = true

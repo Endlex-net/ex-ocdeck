@@ -262,7 +262,7 @@ func TestReopenAttach_NoRegistryTriggersRecovery(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
 	// 直接构造：active、无 runtime 注册、无任何会话（rt==nil 的 G4-1 窗口）。
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	m.SetLifecycleCtx(context.Background())
@@ -286,7 +286,7 @@ func TestReopenAttach_NoRegistryTriggersRecovery(t *testing.T) {
 func TestRecovery_WatcherAndAttachConcurrent_SingleIncident(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	// 删除 runtime 会话（进程消失），注册表 runtime 保留（watcher token 可用）。
 	proc.sessions[runtimeSessionName("t1")] = true

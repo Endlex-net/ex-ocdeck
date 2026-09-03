@@ -33,9 +33,11 @@ var envBaselineKeys = []string{
 // 也不进持久化快照与 shell env（内部变量仅注入 serve/TUI）。OPENCODE_SERVER_PASSWORD
 // 为 role-specific secret，MUST NOT 进入持久化快照与 shell env。
 //
-// env-management spec 要求注入五个生命周期变量：OCDECK_TASK_ID、OCDECK_TASK_NAME、
-// OCDECK_TASK_PATH、OCDECK_PROJECT_PATH、OCDECK_SERVE_PORT。保留命名空间覆盖全部
-// OCDECK_* 前缀（用户 env 注入任何 OCDECK_* 均被忽略并提示，不只个别 key）。
+// env-management spec 要求注入生命周期变量：OCDECK_TASK_ID、OCDECK_TASK_NAME、
+// OCDECK_TASK_PATH、OCDECK_PROJECT_PATH、OCDECK_SERVE_PORT，repo 任务另注入
+// OCDECK_TASK_BASE_BRANCH / OCDECK_TASK_HEAD_BRANCH（layerEnvSnapshot，前缀规则覆盖，
+// 不入本字面量）。保留命名空间覆盖全部 OCDECK_* 前缀（用户 env 注入任何 OCDECK_*
+// 均被忽略并提示，不只个别 key）。
 var envReservedKeys = map[string]bool{
 	"OPENCODE_SERVER_PASSWORD": true,
 	"OCDECK_SERVE_PORT":        true,
@@ -80,6 +82,18 @@ func (m *Manager) mergeEnvSnapshot(ctx context.Context, row TaskRow, port int) (
 		return nil, &persistEnvSnapshotError{err: err}
 	}
 	return merged, nil
+}
+
+// baseBranchShortName 将落库的全限定 base_ref 剥前缀得到分支短名（task-base-branch-context D5）。
+// refs/heads/<name> / refs/remotes/<name>（<name> 非空）→ (<name>, true)；
+// 其它前缀、空值、或前缀后为空 → ("", false)。纯字符串前缀剥除，不调 git。
+func baseBranchShortName(fullRef string) (string, bool) {
+	for _, prefix := range []string{"refs/heads/", "refs/remotes/"} {
+		if name, ok := strings.CutPrefix(fullRef, prefix); ok && name != "" {
+			return name, true
+		}
+	}
+	return "", false
 }
 
 // layerEnvSnapshot 合并 env 层叠快照（design.md §2 合并优先级 + §7.3 抽取点）。
@@ -161,10 +175,33 @@ func (m *Manager) layerEnvSnapshot(ctx context.Context, row TaskRow) (map[string
 	merged["OCDECK_TASK_NAME"] = row.Name
 	merged["OCDECK_TASK_PATH"] = row.WorktreePath
 	merged["OCDECK_PROJECT_PATH"] = proj.Path
+	// 生命周期分支变量（task-base-branch-context D4/D5）：repo 注入 BASE/HEAD 短名；
+	// dir 强制不注入两键（键不存在，即使脏数据有 base_ref/branch）；未知 kind fail-closed，
+	// 不得按 dir 静默缺键。layerEnvSnapshot MUST 自检 kind：init/pre_delete 直接调用本函数，
+	// 不经过 Activate 入口的 alignModeForKind 门禁。repo 异常行返回 error：调用方 MUST NOT
+	// 持久化新快照、MUST NOT 创建进程。
+	switch proj.Kind {
+	case ProjectKindRepo:
+		if row.Branch == "" {
+			return nil, fmt.Errorf("task %s: repo task missing branch for lifecycle env", row.ID)
+		}
+		base, ok := baseBranchShortName(row.BaseRef)
+		if !ok {
+			return nil, fmt.Errorf("task %s: base_ref %q is not refs/heads/<name> or refs/remotes/<name>", row.ID, row.BaseRef)
+		}
+		merged["OCDECK_TASK_BASE_BRANCH"] = base
+		merged["OCDECK_TASK_HEAD_BRANCH"] = row.Branch
+	case ProjectKindDir:
+		// dir：两键不存在（不注入空串）。
+	default:
+		return nil, fmt.Errorf("task %s: unknown project kind %q for lifecycle env", row.ID, proj.Kind)
+	}
 	return merged, nil
 }
 
-// loadEnvSnapshot 从 DB 读回持久化的 env 快照（persist 恢复用，design.md §2）。
+// loadEnvSnapshot 从 DB 读回持久化的 env 快照（CreateShell / persist 恢复 / Recovery 共用，design.md §2）。
+// 快照缺失、JSON 非法、vars 缺失或为 null 均为不可自愈的坏快照 → 普通 error（D8）；
+// MUST 拒绝 vars == nil，MUST NOT 返回 nil map。
 func (m *Manager) loadEnvSnapshot(row TaskRow) (map[string]string, error) {
 	if !row.EnvSnapshot.Valid || row.EnvSnapshot.String == "" {
 		return nil, fmt.Errorf("env snapshot missing for task %s", row.ID)
@@ -172,6 +209,9 @@ func (m *Manager) loadEnvSnapshot(row TaskRow) (map[string]string, error) {
 	var snap envSnapshot
 	if err := json.Unmarshal([]byte(row.EnvSnapshot.String), &snap); err != nil {
 		return nil, fmt.Errorf("unmarshal env snapshot: %w", err)
+	}
+	if snap.Vars == nil {
+		return nil, fmt.Errorf("env snapshot vars missing for task %s", row.ID)
 	}
 	return snap.Vars, nil
 }
