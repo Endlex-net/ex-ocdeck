@@ -28,8 +28,10 @@ export const readOnlyExtensions: Extension[] = [
 ];
 
 /** 编辑器主题：颜色/字体全部跟随 design-system.css 设计变量，明暗主题经变量自动切换。
- *  光标：CM 基座主题为 `.cm-cursor` 硬编码黑色 border-left（深色覆盖仅在其自带 dark 主题下
- *  生效，本主题未声明 dark）——暗色模式下光标不可见。此处经 --editor-caret 变量显式接管。 */
+ *  光标：CM 基座主题为 `.cm-cursor` 硬编码黑色 border-left，且 `&light .cm-content` 硬编码
+ *  `caret-color: black`（本主题未声明 dark，编辑器恒带 light 标记类 → 该规则直击 .cm-content，
+ *  继承自根级的 caret-color 一律输给它）。diff 编辑模式未挂 drawSelection（无 .cm-cursor 元素），
+ *  光标走原生 caret——必须在 .cm-content 上显式接管（同级特异性，本主题后挂载胜出）。 */
 export const editorTheme: Extension = EditorView.theme({
   '&': {
     color: 'var(--fg)',
@@ -38,6 +40,7 @@ export const editorTheme: Extension = EditorView.theme({
     fontSize: '12px',
     caretColor: 'var(--editor-caret)',
   },
+  '.cm-content': { caretColor: 'var(--editor-caret)' },
   '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--editor-caret)' },
   '.cm-gutters': {
     backgroundColor: 'var(--surface)',

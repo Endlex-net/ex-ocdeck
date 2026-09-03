@@ -113,6 +113,8 @@ describe('editorTheme 光标接管', () => {
     expect(styleText).toContain('--editor-caret');
     expect(styleText).toContain('caret-color');
     expect(styleText).toMatch(/\.cm-cursor[^{]*\{[^}]*border-left-color:\s*var\(--editor-caret\)/);
+    // 原生 caret 路径（无 drawSelection）：基座 &light .cm-content{caret-color:black} 必须被接管
+    expect(styleText).toMatch(/\.cm-content[^{]*\{[^}]*caret-color:\s*var\(--editor-caret\)/);
     view.destroy();
     unmount();
   });
