@@ -131,7 +131,12 @@ func startRecoveryFromActive(t *testing.T, store TaskStore, proc ProcessBackend,
 
 func seedActiveForRecovery(store *mockStore) {
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	store.mutTask("t1", func(r *TaskRow) {
+		r.Status = StatusActive
+		// D8：Recovery attempt 前加载持久化快照——active fixture 需带合法快照。
+		b, _ := encodeEnvSnapshot(envSnapshot{Vars: map[string]string{"OCDECK_TASK_ID": "t1"}})
+		r.EnvSnapshot = b
+	})
 }
 
 // TestRecovery_AnchoredSessionArgvAndListCheck 验证 G5-3①：有锚定时启动 argv 带

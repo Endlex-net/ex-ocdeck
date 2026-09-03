@@ -2,6 +2,7 @@ package notify
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -344,7 +345,8 @@ func mutateRawConfig(t *testing.T, action string, keyPath string) string {
 }
 
 // fullConfigJSON 一份含全部必填键的合法配置原文（掩码合并语义不影响解码）。
-const fullConfigJSON = `{"enabled":true,"categories":{"question":true,"permission":true,"idle":true,"retry":true,"error":true},"idle_timeout_seconds":120,"channels":{"web":{"enabled":false},"bark":{"enabled":true,"endpoint":"https://api.day.app","token":"bark-token-123456"},"macos":{"enabled":false}},"llm_summary":false,"base_url":""}`
+// 含 wecom 键（wecom 非必填，但加入基础以便 mutateRawConfig 生成 wecom 嵌套键变体）。
+const fullConfigJSON = `{"enabled":true,"categories":{"question":true,"permission":true,"idle":true,"retry":true,"error":true},"idle_timeout_seconds":120,"channels":{"web":{"enabled":false},"bark":{"enabled":true,"endpoint":"https://api.day.app","token":"bark-token-123456"},"macos":{"enabled":false},"wecom":{"enabled":false,"url":""}},"llm_summary":false,"base_url":""}`
 
 // TestLoadStore_MissingOrNullRequiredKeys 每个必填键缺失或为 null → 视为损坏：
 // 默认配置 + loadErr，不拒绝启动（spec「通知配置存储」字段均为必填键）。
@@ -426,5 +428,238 @@ func TestMaskedTokenNotPlaintext(t *testing.T) {
 	token := "super-secret-bark-token"
 	if masked := MaskToken(token); strings.Contains(masked, token) {
 		t.Fatalf("masked token leaks plaintext: %q", masked)
+	}
+}
+
+// --- wecom 存储 ---
+
+// threeChannelConfigJSON 升级前的三渠道合法配置（无 channels.wecom）。
+const threeChannelConfigJSON = `{"enabled":true,"categories":{"question":true,"permission":true,"idle":true,"retry":true,"error":true},"idle_timeout_seconds":120,"channels":{"web":{"enabled":false},"bark":{"enabled":true,"endpoint":"https://api.day.app","token":"bark-token-123456"},"macos":{"enabled":false}},"llm_summary":false,"base_url":""}`
+
+// TestLoadStore_OldThreeChannelJSON_NoWecom 旧三渠道 JSON 无 wecom 键 → 加载成功、
+// wecom 默认关闭且 url 空（spec「通知配置存储」兼容规则）。
+func TestLoadStore_OldThreeChannelJSON_NoWecom(t *testing.T) {
+	dataDir := t.TempDir()
+	writeRawNotificationConfig(t, dataDir, threeChannelConfigJSON)
+	s := LoadStore(dataDir)
+	st := s.State()
+	if st.LoadErr != nil {
+		t.Fatalf("old 3-channel JSON must load without error, got %v", st.LoadErr)
+	}
+	if st.Config.Channels.Wecom.Enabled || st.Config.Channels.Wecom.URL != "" {
+		t.Fatalf("wecom must default off with empty url, got %+v", st.Config.Channels.Wecom)
+	}
+}
+
+// TestLoadStore_WecomObjectMissingOrNullLegal wecom 对象缺失或为 null 均合法，
+// 两字段取默认（spec 兼容规则）。
+func TestLoadStore_WecomObjectMissingOrNullLegal(t *testing.T) {
+	for _, action := range []string{"delete", "null"} {
+		t.Run(action+" channels.wecom", func(t *testing.T) {
+			dataDir := t.TempDir()
+			writeRawNotificationConfig(t, dataDir, mutateRawConfig(t, action, "channels.wecom"))
+			s := LoadStore(dataDir)
+			st := s.State()
+			if st.LoadErr != nil {
+				t.Fatalf("missing/null wecom object must be legal, got %v", st.LoadErr)
+			}
+			if st.Config.Channels.Wecom.Enabled || st.Config.Channels.Wecom.URL != "" {
+				t.Fatalf("wecom must default off/empty, got %+v", st.Config.Channels.Wecom)
+			}
+		})
+	}
+}
+
+// TestLoadStore_WecomNestedKeyMissingOrNullLegal wecom 对象在场时嵌套 enabled
+// 或 url 各自缺失/null 均合法、独立取默认（spec 兼容规则）。用非默认 seed
+// （enabled=true、url=非空）证明「缺失/null 的键取默认」独立作用于另一个键：
+// 删 enabled → Enabled=false 且 URL 保留；删 url → URL="" 且 Enabled 保留。
+// 若有人把整个 wecom 对象置空，此测试 MUST 失败。
+const wecomNonDefaultConfigJSON = `{"enabled":true,"categories":{"question":true,"permission":true,"idle":true,"retry":true,"error":true},"idle_timeout_seconds":120,"channels":{"web":{"enabled":false},"bark":{"enabled":false,"endpoint":"https://api.day.app","token":""},"macos":{"enabled":false},"wecom":{"enabled":true,"url":"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=keep-me"}},"llm_summary":false,"base_url":""}`
+
+func TestLoadStore_WecomNestedKeyMissingOrNullLegal(t *testing.T) {
+	cases := []struct {
+		key         string
+		action      string
+		wantEnabled bool
+		wantURL     string
+	}{
+		{"channels.wecom.enabled", "delete", false, "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=keep-me"},
+		{"channels.wecom.enabled", "null", false, "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=keep-me"},
+		{"channels.wecom.url", "delete", true, ""},
+		{"channels.wecom.url", "null", true, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.action+" "+tc.key, func(t *testing.T) {
+			dataDir := t.TempDir()
+			writeRawNotificationConfig(t, dataDir, mutateRawConfigOn(t, wecomNonDefaultConfigJSON, tc.action, tc.key))
+			s := LoadStore(dataDir)
+			st := s.State()
+			if st.LoadErr != nil {
+				t.Fatalf("nested %s %s must be legal, got %v", tc.action, tc.key, st.LoadErr)
+			}
+			if got := st.Config.Channels.Wecom.Enabled; got != tc.wantEnabled {
+				t.Fatalf("wecom.Enabled = %v, want %v (independent default fill)", got, tc.wantEnabled)
+			}
+			if got := st.Config.Channels.Wecom.URL; got != tc.wantURL {
+				t.Fatalf("wecom.URL = %q, want %q (independent fill preserves sibling)", got, tc.wantURL)
+			}
+		})
+	}
+}
+
+// mutateRawConfigOn 对指定基础 JSON 按点分路径删除或置 null 键，返回变体 JSON。
+func mutateRawConfigOn(t *testing.T, baseJSON, action, keyPath string) string {
+	t.Helper()
+	var root map[string]interface{}
+	if err := json.Unmarshal([]byte(baseJSON), &root); err != nil {
+		t.Fatalf("base json: %v", err)
+	}
+	segs := strings.Split(keyPath, ".")
+	m := root
+	for _, s := range segs[:len(segs)-1] {
+		next, ok := m[s].(map[string]interface{})
+		if !ok {
+			t.Fatalf("path %q: segment %q not an object", keyPath, s)
+		}
+		m = next
+	}
+	last := segs[len(segs)-1]
+	switch action {
+	case "delete":
+		delete(m, last)
+	case "null":
+		m[last] = nil
+	default:
+		t.Fatalf("unknown action %q", action)
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		t.Fatalf("marshal variant: %v", err)
+	}
+	return string(out)
+}
+
+// TestLoadStore_WecomTypeMismatchLoadErr wecom 在场但字段类型不匹配仍损坏。
+func TestLoadStore_WecomTypeMismatchLoadErr(t *testing.T) {
+	dataDir := t.TempDir()
+	// wecom.enabled 为字符串而非 bool → json.Unmarshal 失败。
+	writeRawNotificationConfig(t, dataDir, `{"enabled":true,"categories":{"question":true,"permission":true,"idle":true,"retry":true,"error":true},"idle_timeout_seconds":120,"channels":{"web":{"enabled":false},"bark":{"enabled":false,"endpoint":"https://api.day.app","token":""},"macos":{"enabled":false},"wecom":{"enabled":"yes","url":""}},"llm_summary":false,"base_url":""}`)
+	s := LoadStore(dataDir)
+	if s.State().LoadErr == nil {
+		t.Fatal("wecom type mismatch must set loadErr")
+	}
+}
+
+// fullConfigJSONWithWecom 含 wecom 的完整合法配置原文。
+const fullConfigJSONWithWecom = `{"enabled":true,"categories":{"question":true,"permission":true,"idle":true,"retry":true,"error":true},"idle_timeout_seconds":120,"channels":{"web":{"enabled":false},"bark":{"enabled":true,"endpoint":"https://api.day.app","token":"bark-token-123456"},"macos":{"enabled":false},"wecom":{"enabled":true,"url":"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret-wecom-key"}},"llm_summary":false,"base_url":""}`
+
+// TestLoadStore_WecomPresentLoads wecom 在场且类型正确 → 正常加载、字段保持。
+func TestLoadStore_WecomPresentLoads(t *testing.T) {
+	dataDir := t.TempDir()
+	writeRawNotificationConfig(t, dataDir, fullConfigJSONWithWecom)
+	s := LoadStore(dataDir)
+	st := s.State()
+	if st.LoadErr != nil {
+		t.Fatalf("load err: %v", st.LoadErr)
+	}
+	if !st.Config.Channels.Wecom.Enabled || st.Config.Channels.Wecom.URL != "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret-wecom-key" {
+		t.Fatalf("wecom fields mismatch: %+v", st.Config.Channels.Wecom)
+	}
+}
+
+// TestPut_WecomURLMerge 掩码/空 URL 保留已存储原值；新明文 URL 替换。
+func TestPut_WecomURLMerge(t *testing.T) {
+	s := LoadStore(t.TempDir())
+	old := notification.DefaultConfig()
+	old.Channels.Wecom.Enabled = true
+	old.Channels.Wecom.URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=orig-wecom-key"
+	if err := s.Put(old); err != nil {
+		t.Fatalf("seed put: %v", err)
+	}
+
+	masked := old
+	masked.Channels.Wecom.URL = "wecom***"
+	if err := s.Put(masked); err != nil {
+		t.Fatalf("put masked url: %v", err)
+	}
+	if got := s.State().Config.Channels.Wecom.URL; got != old.Channels.Wecom.URL {
+		t.Fatalf("masked url must preserve stored url, got %q want %q", got, old.Channels.Wecom.URL)
+	}
+
+	empty := old
+	empty.Channels.Wecom.URL = ""
+	if err := s.Put(empty); err != nil {
+		t.Fatalf("put empty url: %v", err)
+	}
+	if got := s.State().Config.Channels.Wecom.URL; got != old.Channels.Wecom.URL {
+		t.Fatalf("empty url must preserve stored url, got %q want %q", got, old.Channels.Wecom.URL)
+	}
+
+	refreshed := old
+	refreshed.Channels.Wecom.URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=new-wecom-key"
+	if err := s.Put(refreshed); err != nil {
+		t.Fatalf("put new url: %v", err)
+	}
+	if got := s.State().Config.Channels.Wecom.URL; got != "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=new-wecom-key" {
+		t.Fatalf("new plaintext url must replace stored url, got %q", got)
+	}
+}
+
+// TestPut_MaskedWecomURLNoStoredNotRejected 无已存储 URL（损坏态不可恢复）时
+// 掩码提交按空处理、不拒绝保存（spec url 语义）。
+func TestPut_MaskedWecomURLNoStoredNotRejected(t *testing.T) {
+	dataDir := t.TempDir()
+	writeRawNotificationConfig(t, dataDir, "garbage")
+	s := LoadStore(dataDir)
+	incoming := notification.DefaultConfig()
+	incoming.Enabled = true
+	incoming.Channels.Wecom.Enabled = true
+	incoming.Channels.Wecom.URL = "***"
+	if err := s.Put(incoming); err != nil {
+		t.Fatalf("masked url without stored url must not be rejected: %v", err)
+	}
+	if got := s.State().Config.Channels.Wecom.URL; got != "" {
+		t.Fatalf("url must be empty when nothing stored, got %q", got)
+	}
+}
+
+// TestPut_WecomURLInvalidReturnsConfigValidationError 校验失败返回
+// *ConfigValidationError（handler 据此 422）。
+func TestPut_WecomURLInvalidReturnsConfigValidationError(t *testing.T) {
+	s := LoadStore(t.TempDir())
+	incoming := notification.DefaultConfig()
+	incoming.Channels.Wecom.URL = "http://not-https.example.com"
+	err := s.Put(incoming)
+	if err == nil {
+		t.Fatal("invalid wecom url must be rejected")
+	}
+	var vErr *ConfigValidationError
+	if !errors.As(err, &vErr) {
+		t.Fatalf("reject must return *ConfigValidationError, got %T: %v", err, err)
+	}
+}
+
+// --- wecom 掩码 ---
+
+// TestMaskWecomURL 掩码规则（spec「通知配置读写 API」）：空串 → 空串；非空 → `***`。
+func TestMaskWecomURL(t *testing.T) {
+	cases := []struct{ url, want string }{
+		{"", ""},
+		{"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc", "***"},
+		{"short", "***"},
+	}
+	for _, c := range cases {
+		if got := MaskWecomURL(c.url); got != c.want {
+			t.Errorf("MaskWecomURL(%q) = %q, want %q", c.url, got, c.want)
+		}
+	}
+}
+
+// TestMaskedWecomURLNotPlaintext 掩码输出 MUST NOT 含完整 URL 明文。
+func TestMaskedWecomURLNotPlaintext(t *testing.T) {
+	u := "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret-key"
+	if masked := MaskWecomURL(u); strings.Contains(masked, u) {
+		t.Fatalf("masked url leaks plaintext: %q", masked)
 	}
 }

@@ -32,6 +32,17 @@ func waitStatusAny(t *testing.T, store TaskStore, taskID string, timeout time.Du
 	return row.Status
 }
 
+// markActiveWithSnapshot 将任务置为 active 并写入合法持久化快照（D8 fixture 约定）：
+// Recovery 在 permit/backoff/attempt 之前加载持久化快照，手动 seed 的 active 行必须带
+// 可加载快照，否则会走坏快照终态而非预期恢复路径。
+func markActiveWithSnapshot(store *mockStore, taskID string) {
+	store.mutTask(taskID, func(r *TaskRow) {
+		r.Status = StatusActive
+		b, _ := encodeEnvSnapshot(envSnapshot{Vars: map[string]string{"OCDECK_TASK_ID": taskID}})
+		r.EnvSnapshot = b
+	})
+}
+
 func TestEnsureRecovery_IdempotentDualTrigger(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
@@ -67,7 +78,7 @@ func TestEnsureRecovery_IdempotentDualTrigger(t *testing.T) {
 func TestEnsureRecovery_BudgetExhaustedSuspends(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
@@ -339,7 +350,7 @@ func TestIsRecoveryTerminal_TypedStages(t *testing.T) {
 func TestEnsureRecovery_UnknownKindZeroSideEffects(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	store.seedProject(ProjectRow{ID: "p1", Name: "proj", Path: "/tmp/p1", Kind: "weird"})
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
@@ -584,7 +595,7 @@ func TestCompleteRecoveryFailure_Dispositions(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newMockStore()
 			seedSuspendedTask(store, "t1", "p1")
-			store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+			markActiveWithSnapshot(store, "t1")
 			proc := newMockProc()
 			m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 			rt := m.newRuntime("t1")
@@ -687,7 +698,7 @@ func TestReplayRecoveryDebts_CompleteDebt(t *testing.T) {
 	}
 
 	// CAS mismatch：任务已非 activating → 服从 DB 最新状态，仅清 debt。
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	if err := store.UpsertRecoveryDebt(context.Background(), RecoveryDebtRow{
 		TaskID: "t1", Phase: recoveryDebtPhaseComplete, Tickets: "[]",
 		Cause: "stale", CreatedAt: 2,
@@ -712,7 +723,7 @@ func TestReplayRecoveryDebts_CompleteDebt(t *testing.T) {
 func TestRecoveryBackoff_CancelledByShutdown(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
@@ -901,7 +912,7 @@ func TestRecoveryRotation_RetryableDebtBlocksNewSession(t *testing.T) {
 func TestRecoveryNoAnchor_DualStartPermits(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
@@ -933,7 +944,7 @@ func TestRecoveryNoAnchor_DualStartPermits(t *testing.T) {
 func TestRecoveryNoAnchor_SecondPermitWindowExhaustedKeepsAnchor(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
@@ -969,7 +980,7 @@ func TestRecoveryNoAnchor_SecondPermitWindowExhaustedKeepsAnchor(t *testing.T) {
 func TestRecoveryBackoff_CancelledByStateWrite(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
@@ -1005,7 +1016,7 @@ func TestRecoveryBackoff_CancelledByStateWrite(t *testing.T) {
 func TestRecoveryBackoff_CancelledByForeignRuntime(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
@@ -1111,7 +1122,7 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 func TestEnsureRecovery_ShutdownBarrierInLockWait(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
@@ -1158,7 +1169,7 @@ func TestEnsureRecovery_ShutdownBarrierInLockWait(t *testing.T) {
 func TestCompleteRecoveryFailure_IntentFirstRetained(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
@@ -1202,7 +1213,7 @@ func TestCompleteRecoveryFailure_IntentFirstRetained(t *testing.T) {
 func TestRecoveryDebtFallbackFlush(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
@@ -1285,7 +1296,7 @@ func TestReplayHandledCleanupForRecovery_PersistsDebt(t *testing.T) {
 func TestRecoveryDebts_MultiPendingFullPayload(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
@@ -1700,7 +1711,7 @@ func TestWaitRecoveryBackoff_PreExistingInvalidation(t *testing.T) {
 func TestRecoveryBackoff_CancelledByDebtReplayComplete(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
@@ -1778,7 +1789,7 @@ func TestShutdown_JoinsFallbackAndOrphanErrors(t *testing.T) {
 func TestRecoveryTerminalCleanupBetweenAttempts_FreezesNewSession(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
@@ -1945,7 +1956,7 @@ func TestActivate_RejectsUncleanedRecoveryDebt(t *testing.T) {
 func TestEnsureRecovery_RejectsUncleanedRecoveryDebt(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
@@ -2108,7 +2119,7 @@ func TestWaitRecoveryBackoff_TimerExpiryRecheckNotLost(t *testing.T) {
 func TestActivate_AroundLiveIncident_ConvergesSafely(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	m.SetLifecycleCtx(context.Background())
@@ -2155,7 +2166,7 @@ func TestRecoveryDebtCleanup_SingleClearPoint(t *testing.T) {
 	// 场景 A：completeRecoveryFailure 全流程（budget 耗尽终态）。
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")

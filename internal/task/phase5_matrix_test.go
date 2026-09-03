@@ -140,7 +140,7 @@ func (p *envCaptureProc) NewSession(spec process.SessionSpec) error {
 func TestRecovery_FreshPasswordPerCreate(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	markActiveWithSnapshot(store, "t1")
 	proc := &envCaptureProc{mockProc: newMockProc()}
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
@@ -244,7 +244,7 @@ func TestShutdown_UnknownDispositionRetainsRetryableDebt(t *testing.T) {
 
 // TestShutdown_ContradictoryCleanRetainsRetryableDebt 验证 G5-6：Shutdown 调用链
 // 对 DispositionClean+SessionKilled=false 不得走旧 raw `Disposition != clean` 旁路
-//（该条件把矛盾 clean 当成功）；必须返回未净并保留 retryable kill_failed debt。
+// （该条件把矛盾 clean 当成功）；必须返回未净并保留 retryable kill_failed debt。
 func TestShutdown_ContradictoryCleanRetainsRetryableDebt(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
@@ -363,7 +363,7 @@ func TestRetryOrphanSessions_ContradictoryCleanRetainsDebt(t *testing.T) {
 // 错误（G5-5：命中 commitRuntimeReady 注册前探活，不伤 waitServeReady 的第 1 次）。
 type commitHasErrProc struct {
 	*mockProc
-	created      bool
+	created       bool
 	postCreateHas int
 }
 
@@ -450,6 +450,9 @@ func TestRecovery_CommitProbeHasSessionError_ReapFailedTicketsPersisted(t *testi
 	store.mutTask("t1", func(r *TaskRow) {
 		r.Status = StatusActive
 		r.AnchorSessionID = sql.NullString{String: "sess-existing", Valid: true}
+		// D8：Recovery attempt 前加载持久化快照——active fixture 需带合法快照。
+		b, _ := encodeEnvSnapshot(envSnapshot{Vars: map[string]string{"OCDECK_TASK_ID": "t1"}})
+		r.EnvSnapshot = b
 	})
 	inner := newMockProc()
 	name := runtimeSessionName("t1")

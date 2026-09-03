@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 
@@ -517,7 +518,22 @@ func (m *Manager) runRecoveryIncident(ctx context.Context, taskID string, trigge
 			m.completeRecoveryFailure(incCtx, taskID, trigger, inc, err, lastPendings)
 			return
 		}
-		attemptErr := m.runRecoveryAttempt(incCtx, taskID, trigger, mode, inc)
+		// D8 同代重拉：在 attempt（含 permit 与 backoff）之前从持久化快照加载同代 env。
+		// 坏快照不可自愈：包装为 typed 终态走下方既有终态分派——零 permit、零 backoff、
+		// 零 persist/进程副作用；ctx 取消经错误链被取消分支先行接住，语义不变。
+		row, gerr := m.store.GetTask(incCtx, taskID)
+		var env map[string]string
+		if gerr == nil {
+			env, gerr = m.loadEnvSnapshot(row)
+		} else {
+			gerr = fmt.Errorf("get task for env snapshot: %w", gerr)
+		}
+		var attemptErr error
+		if gerr != nil {
+			attemptErr = &recoveryTerminalError{err: newOpErr(codeInternal, gerr)}
+		} else {
+			attemptErr = m.runRecoveryAttempt(incCtx, taskID, trigger, mode, inc, env)
+		}
 		if attemptErr == nil {
 			return
 		}
@@ -677,9 +693,11 @@ func (m *Manager) recoveryPrelude(ctx context.Context, taskID string, trigger ru
 }
 
 // runRecoveryAttempt 可重复进程 attempt（D3/G3-4 原子序列：permit/backoff → 端口 →
-// env 持久化 → 新密码 → NewSession → 健康+探测 → D5 bootstrap → 成功提交）。
+// env 快照更新持久化 → 新密码 → NewSession → 健康+探测 → D5 bootstrap → 成功提交）。
 // inc 承载 attempt-owned 进程标记（G3-7）：NewSession 前 claim，提交/回退确定后 release。
-func (m *Manager) runRecoveryAttempt(ctx context.Context, taskID string, trigger runtime.InstVersion, mode AlignMode, inc *recoveryIncident) error {
+// env 是 runRecoveryIncident 在 permit 之前已校验的同代快照（D8）：本函数仅覆盖
+// OCDECK_SERVE_PORT 后持久化，MUST NOT 调用 layerEnvSnapshot/mergeEnvSnapshot 重分层。
+func (m *Manager) runRecoveryAttempt(ctx context.Context, taskID string, trigger runtime.InstVersion, mode AlignMode, inc *recoveryIncident, env map[string]string) error {
 	if err := m.checkRecoveryContinuable(ctx, taskID, trigger); err != nil {
 		return err
 	}
@@ -704,9 +722,10 @@ func (m *Manager) runRecoveryAttempt(ctx context.Context, taskID string, trigger
 	if aerr != nil {
 		return &portAllocationError{err: newOpErr(codeConflict, aerr)}
 	}
-	env, merr := m.mergeEnvSnapshot(ctx, row, port)
-	if merr != nil {
-		return newOpErr(codeInternal, merr)
+	// D8 同代快照：仅覆盖 OCDECK_SERVE_PORT 后持久化，不重算用户 env 与生命周期变量。
+	env["OCDECK_SERVE_PORT"] = strconv.Itoa(port)
+	if perr := m.persistEnvSnapshot(ctx, taskID, env); perr != nil {
+		return newOpErr(codeInternal, &persistEnvSnapshotError{err: perr})
 	}
 
 	runtimeName := runtimeSessionName(taskID)

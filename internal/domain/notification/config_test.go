@@ -2,6 +2,7 @@ package notification
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -19,11 +20,14 @@ func TestDefaultConfig(t *testing.T) {
 		t.Fatalf("default categories must be all-on: %+v", cats)
 	}
 	ch := c.Channels
-	if ch.Web.Enabled || ch.Macos.Enabled || ch.Bark.Enabled {
+	if ch.Web.Enabled || ch.Macos.Enabled || ch.Bark.Enabled || ch.Wecom.Enabled {
 		t.Fatalf("default channels must be all-off: %+v", ch)
 	}
 	if ch.Bark.Endpoint != "https://api.day.app" || ch.Bark.Token != "" {
 		t.Fatalf("default bark endpoint/token mismatch: %+v", ch.Bark)
+	}
+	if ch.Wecom.URL != "" {
+		t.Fatalf("default wecom url must be empty, got %q", ch.Wecom.URL)
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("default config must validate: %v", err)
@@ -73,6 +77,22 @@ func TestConfigValidate(t *testing.T) {
 		{"base_url empty fragment marker rejected", mut(func(c *Config) { c.BaseURL = "https://example.com#" }), true},
 		{"base_url port-only authority rejected", mut(func(c *Config) { c.BaseURL = "http://:9000" }), true},
 		{"base_url no scheme", mut(func(c *Config) { c.BaseURL = "//example.com" }), true},
+
+		{"wecom empty ok", mut(func(c *Config) { c.Channels.Wecom.URL = "" }), false},
+		{"wecom full webhook url ok", mut(func(c *Config) {
+			c.Channels.Wecom.URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc-123"
+		}), false},
+		{"wecom https with query only ok", mut(func(c *Config) { c.Channels.Wecom.URL = "https://h.example.com?" }), false},
+		{"wecom https root path with query ok", mut(func(c *Config) {
+			c.Channels.Wecom.URL = "https://h.example.com/?key=x"
+		}), false},
+		{"wecom http rejected", mut(func(c *Config) { c.Channels.Wecom.URL = "http://h.example.com" }), true},
+		{"wecom ftp rejected", mut(func(c *Config) { c.Channels.Wecom.URL = "ftp://h.example.com" }), true},
+		{"wecom empty host rejected", mut(func(c *Config) { c.Channels.Wecom.URL = "https://" }), true},
+		{"wecom userinfo rejected", mut(func(c *Config) { c.Channels.Wecom.URL = "https://u:p@h.example.com" }), true},
+		{"wecom fragment rejected", mut(func(c *Config) { c.Channels.Wecom.URL = "https://h.example.com#frag" }), true},
+		{"wecom empty fragment marker rejected", mut(func(c *Config) { c.Channels.Wecom.URL = "https://h.example.com#" }), true},
+		{"wecom opaque rejected", mut(func(c *Config) { c.Channels.Wecom.URL = "mailto:a@b" }), true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -112,7 +132,7 @@ func TestConfigJSONShape(t *testing.T) {
 	if err := json.Unmarshal(m["channels"], &channels); err != nil {
 		t.Fatalf("unmarshal channels: %v", err)
 	}
-	for _, k := range []string{"web", "bark", "macos"} {
+	for _, k := range []string{"web", "bark", "macos", "wecom"} {
 		if _, ok := channels[k]; !ok {
 			t.Errorf("missing channels key %q", k)
 		}
@@ -124,6 +144,15 @@ func TestConfigJSONShape(t *testing.T) {
 	for _, k := range []string{"enabled", "endpoint", "token"} {
 		if _, ok := bark[k]; !ok {
 			t.Errorf("missing bark key %q", k)
+		}
+	}
+	var wecom map[string]json.RawMessage
+	if err := json.Unmarshal(channels["wecom"], &wecom); err != nil {
+		t.Fatalf("unmarshal wecom: %v", err)
+	}
+	for _, k := range []string{"enabled", "url"} {
+		if _, ok := wecom[k]; !ok {
+			t.Errorf("missing wecom key %q", k)
 		}
 	}
 }
@@ -157,5 +186,47 @@ func TestConfigUnmarshalUnknownFieldsIgnored(t *testing.T) {
 	}
 	if !c.Enabled || c.IdleTimeoutSeconds != 120 || !c.Channels.Web.Enabled || c.Categories.Error || c.Channels.Bark.Token != "tok" {
 		t.Fatalf("known fields mismatch after unknown-field decode: %+v", c)
+	}
+}
+
+// TestValidateWecomURL_NoLeak 校验错误信息 MUST NOT 包含 URL 原文（spec「企业微信
+// 渠道」/design D3：PUT 422 原样回传校验文案，原文不得泄漏）。其中 parse 失败分支
+// （config.go validateWecomURL：url.Parse 失败 → `invalid wecom url: invalid url`，
+// 不 %w 包装）必须单独覆盖——parse error 常含原文。
+func TestValidateWecomURL_NoLeak(t *testing.T) {
+	const secret = "secret-key-do-not-leak"
+	cases := []struct {
+		name     string
+		raw      string
+		wantSubs string // 错误文案必须包含的固定 reason（用于锁定走对分支）
+	}{
+		{"http rejected", "http://" + secret + ".example.com", "scheme must be https"},
+		{"userinfo rejected", "https://u:" + secret + "@h.example.com", "userinfo not allowed"},
+		{"fragment rejected", "https://h.example.com#" + secret, "fragment not allowed"},
+		{"ftp rejected", "ftp://" + secret + ".example.com", "scheme must be https"},
+		{"opaque rejected", "mailto:" + secret + "@h.example.com", "must be a hierarchical https URL"},
+		// parse 失败：未闭合的方括号 host 使 url.Parse 报错，进入 validateWecomURL
+		// 首个分支（config.go：返回 `invalid wecom url: invalid url`，不 %w 包装，
+		// 不含原文）。net/http 的 NewRequest 也会拒绝此形态。
+		{"parse failure", "http://[" + secret, "invalid url"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := DefaultConfig()
+			c.Channels.Wecom.URL = tc.raw
+			err := c.Validate()
+			if err == nil {
+				t.Fatalf("expected error for %q", tc.raw)
+			}
+			if !strings.Contains(err.Error(), tc.wantSubs) {
+				t.Fatalf("error %q must contain reason %q", err.Error(), tc.wantSubs)
+			}
+			if strings.Contains(err.Error(), tc.raw) {
+				t.Fatalf("error MUST NOT contain raw URL: err=%q url=%q", err.Error(), tc.raw)
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("error MUST NOT contain secret fragment: err=%q url=%q", err.Error(), tc.raw)
+			}
+		})
 	}
 }
