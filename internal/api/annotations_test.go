@@ -822,22 +822,20 @@ func TestSubmissionLifecycle_Errors(t *testing.T) {
 	}
 }
 
-// mapDiffReviewErr 对 adapter 层 *application.OpError 的透传分支（diff 读取失败 → git_error）。
-func TestSubmissionErrors_DiffSourceOpErrorPassthrough(t *testing.T) {
+// payload 组装不读取 diff（design.md D7 现行契约：不附加相关 diff/Context 段）：
+// diff 来源读取失败不再阻断提交，有效批次仍 201 落库。
+func TestSubmission_PayloadAssemblyIgnoresDiffSourceError(t *testing.T) {
 	s, f := newDiffReviewAPIServer(t)
-	repo, diffSrc := f.repo, f.diff
+	repo := f.repo
 	seedAnnotation(t, repo, "a1", "t1", 1)
-	diffSrc.readErr = &application.OpError{Code: "git_error", Err: errors.New("git diff failed")}
+	f.diff.readErr = &application.OpError{Code: "git_error", Err: errors.New("git diff failed")}
 	resp, body := doDiffReviewReq(t, s, "POST", "/api/v1/tasks/t1/annotation-submissions",
 		`{"annotations":[{"id":"a1","revision":1}],"note":"n"}`)
-	if resp.StatusCode != http.StatusUnprocessableEntity {
-		t.Fatalf("status = %d, want 422; body=%s", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (payload assembly must not read diff); body=%s", resp.StatusCode, body)
 	}
-	if code := errCodeOf(t, body); code != "git_error" {
-		t.Fatalf("code = %q, want git_error", code)
-	}
-	if len(repo.submissions) != 0 {
-		t.Fatalf("diff read failure must not persist, got %d submissions", len(repo.submissions))
+	if len(repo.submissions) != 1 {
+		t.Fatalf("submission should persist despite diff source error, got %d", len(repo.submissions))
 	}
 }
 

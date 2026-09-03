@@ -21,6 +21,7 @@ type mockRepo struct {
 	casErr           error
 	casErrOnTo       string // 非空时仅 CAS 目标状态等于该值才返回 casErr（F1：只让终态 CAS 失败）
 	casMatched       bool   // casMatched=true 时 CAS 强制返回 matched=false（模拟 CAS 失配）
+	listItemsErr     error  // 非空时 ListDiffReviewSubmissionItems 返回该错误（批注 7：发送前收集文件路径失败）
 	sentCleanupErr   error
 	sentCleanupFail  bool // true 时 sent cleanup 返回 matched=false（模拟事务失败 → delivery_unknown）
 	convergeErr      error
@@ -169,6 +170,9 @@ func (r *mockRepo) ListDiffReviewSubmissionPartitions(ctx context.Context, taskI
 	return SubmissionPartitions{Queue: queue, History: history, Failures: failures}, nil
 }
 func (r *mockRepo) ListDiffReviewSubmissionItems(ctx context.Context, submissionID string) ([]DiffReviewSubmissionItemRecord, error) {
+	if r.listItemsErr != nil {
+		return nil, r.listItemsErr
+	}
 	return r.items[submissionID], nil
 }
 func (r *mockRepo) GetDiffReviewSubmission(ctx context.Context, id string) (DiffReviewSubmissionRecord, error) {
@@ -389,11 +393,12 @@ type promptCall struct {
 	SessionID string
 	MessageID string
 	Text      string
+	Files     []string
 }
 
-func (p *mockPrompt) PromptAsync(ctx context.Context, taskID, sessionID, messageID, text string) PromptOutcome {
+func (p *mockPrompt) PromptAsync(ctx context.Context, taskID, sessionID, messageID, text string, files []string) PromptOutcome {
 	p.callMu.Lock()
-	p.promptCalls = append(p.promptCalls, promptCall{TaskID: taskID, SessionID: sessionID, MessageID: messageID, Text: text})
+	p.promptCalls = append(p.promptCalls, promptCall{TaskID: taskID, SessionID: sessionID, MessageID: messageID, Text: text, Files: append([]string{}, files...)})
 	p.callMu.Unlock()
 	return p.outcome
 }

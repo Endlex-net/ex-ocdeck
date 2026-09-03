@@ -20,14 +20,14 @@ func TestOCClient_PromptAsync_InterfaceCompliance(t *testing.T) {
 		Kind:       opencode.ResultAccepted,
 		StatusCode: 204,
 	}
-	got := oc.PromptAsync(context.Background(), "/wt", "sess-1", "msg_x", "t")
+	got := oc.PromptAsync(context.Background(), "/wt", "sess-1", "msg_x", "t", nil)
 	if got.Kind != opencode.ResultAccepted || got.StatusCode != 204 {
 		t.Fatalf("PromptAsync: %+v", got)
 	}
 
 	// readyOC 委托：确认透传到 inner。
 	wrap := &readyOC{inner: oc}
-	got2 := wrap.PromptAsync(context.Background(), "/wt", "sess-1", "msg_x", "t")
+	got2 := wrap.PromptAsync(context.Background(), "/wt", "sess-1", "msg_x", "t", nil)
 	if got2.Kind != opencode.ResultAccepted {
 		t.Fatalf("readyOC delegate: %+v", got2)
 	}
@@ -44,7 +44,7 @@ func TestOCClient_PromptAsync_MockDefaults(t *testing.T) {
 		&overflowOC{},
 	}
 	for i, s := range stubs {
-		got := s.PromptAsync(context.Background(), "/wt", "s", "msg_x", "t")
+		got := s.PromptAsync(context.Background(), "/wt", "s", "msg_x", "t", nil)
 		if got.Kind != opencode.ResultPreSendFailure {
 			t.Fatalf("stub[%d] (%T): kind %v want pre_send_failure", i, s, got.Kind)
 		}
@@ -60,13 +60,13 @@ func TestOCClient_PromptAsync_BlockingDelegates(t *testing.T) {
 	inner.promptAsyncResult = opencode.PromptResult{Kind: opencode.ResultHTTPResponse, StatusCode: 400, Body: "bad"}
 
 	perm := &blockingPermOC{inner: inner}
-	got := perm.PromptAsync(context.Background(), "/wt", "s", "msg_x", "t")
+	got := perm.PromptAsync(context.Background(), "/wt", "s", "msg_x", "t", nil)
 	if got.Kind != opencode.ResultHTTPResponse || got.StatusCode != 400 {
 		t.Fatalf("blockingPermOC delegate: %+v", got)
 	}
 
 	both := &blockingBothOC{inner: inner}
-	got2 := both.PromptAsync(context.Background(), "/wt", "s", "msg_x", "t")
+	got2 := both.PromptAsync(context.Background(), "/wt", "s", "msg_x", "t", nil)
 	if got2.Kind != opencode.ResultHTTPResponse {
 		t.Fatalf("blockingBothOC delegate: %+v", got2)
 	}

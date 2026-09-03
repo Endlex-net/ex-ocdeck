@@ -363,6 +363,56 @@ func TestSchedulerInstVersionCapturedUsedForFencing(t *testing.T) {
 	}
 }
 
+// TestSchedulerFilesFromItemsDedupOrdered（批注 7）：发送时 mockPrompt 收到的 files
+// == items 的去重保序 path 列表；accepted → sent 正常清理。
+func TestSchedulerFilesFromItemsDedupOrdered(t *testing.T) {
+	repo := newMockRepo()
+	repo.submissions["s1"] = DiffReviewSubmissionRecord{ID: "s1", TaskID: "t1", Status: "queued", TargetSessionID: "sess1"}
+	repo.items["s1"] = []DiffReviewSubmissionItemRecord{
+		{AnnotationID: "a1", Path: "b.go"},
+		{AnnotationID: "a2", Path: "a.go"},
+		{AnnotationID: "a3", Path: "b.go"},
+	}
+	rt := &mockRuntime{probeCap: CapabilitySupported, sessStat: SessionStatusIdle}
+	prompt := &mockPrompt{outcome: PromptOutcome{Kind: PromptOutcomeAccepted, StatusCode: 204}}
+	svc := newSchedulerTestService(repo, rt, prompt)
+	sch := NewScheduler(SchedulerOptions{Service: svc, Callbacks: &mockCallbacks{}, TaskID: "t1"})
+	sch.tick(context.Background())
+	if repo.submissions["s1"].Status != "sent" {
+		t.Fatalf("accepted should become sent, got %s", repo.submissions["s1"].Status)
+	}
+	if n := len(prompt.promptCalls); n != 1 {
+		t.Fatalf("PromptAsync should be called once, got %d", n)
+	}
+	got := prompt.promptCalls[0].Files
+	if len(got) != 2 || got[0] != "b.go" || got[1] != "a.go" {
+		t.Fatalf("files should be items paths deduped keeping order, got %v want [b.go a.go]", got)
+	}
+}
+
+// TestSchedulerItemsReadFailureFailedWithoutSend（批注 7）：items 读取失败 → submission failed
+// 且 error="read submission items failed"，MUST NOT 调用 PromptAsync。
+func TestSchedulerItemsReadFailureFailedWithoutSend(t *testing.T) {
+	repo := newMockRepo()
+	repo.submissions["s1"] = DiffReviewSubmissionRecord{ID: "s1", TaskID: "t1", Status: "queued", TargetSessionID: "sess1"}
+	repo.listItemsErr = errInjected
+	rt := &mockRuntime{probeCap: CapabilitySupported, sessStat: SessionStatusIdle}
+	prompt := &mockPrompt{outcome: PromptOutcome{Kind: PromptOutcomeAccepted, StatusCode: 204}}
+	svc := newSchedulerTestService(repo, rt, prompt)
+	sch := NewScheduler(SchedulerOptions{Service: svc, Callbacks: &mockCallbacks{}, TaskID: "t1"})
+	sch.tick(context.Background())
+	rec := repo.submissions["s1"]
+	if rec.Status != "failed" {
+		t.Fatalf("items read failure should fail submission, got %s", rec.Status)
+	}
+	if rec.Error != "read submission items failed" {
+		t.Fatalf("error should be fixed text, got %q", rec.Error)
+	}
+	if n := len(prompt.promptCalls); n != 0 {
+		t.Fatalf("PromptAsync must not be called, got %d", n)
+	}
+}
+
 // TestSchedulerOrphanSendingConvergedToDeliveryUnknown（F1 生命周期）：
 // 新调度器（无本地 intent）遇到残留 sending 队首 → 按 D2 收敛为 delivery_unknown，
 // 不调 PromptAsync（绝不重发），error 非空。

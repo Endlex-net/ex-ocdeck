@@ -59,7 +59,7 @@ func (c *alwaysUnhealthyOC) ListQuestions(ctx context.Context, dir string) ([]op
 	return nil, opencode.ErrCapabilityUnsupported
 }
 
-func (c *alwaysUnhealthyOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
+func (c *alwaysUnhealthyOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []opencode.PromptFilePart) opencode.PromptResult {
 	return opencode.PromptResult{Kind: opencode.ResultPreSendFailure, Detail: "alwaysUnhealthyOC: prompt_async not supported"}
 }
 func (c *alwaysUnhealthyOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
@@ -104,7 +104,7 @@ func (c *healthThenProbeOC) ListQuestions(ctx context.Context, dir string) ([]op
 	return nil, opencode.ErrCapabilityUnsupported
 }
 
-func (c *healthThenProbeOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
+func (c *healthThenProbeOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []opencode.PromptFilePart) opencode.PromptResult {
 	return opencode.PromptResult{Kind: opencode.ResultPreSendFailure, Detail: "healthThenProbeOC: prompt_async not supported"}
 }
 func (c *healthThenProbeOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {

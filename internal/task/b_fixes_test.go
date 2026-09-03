@@ -149,7 +149,7 @@ func (c *overflowOC) ListQuestions(ctx context.Context, dir string) ([]opencode.
 	return nil, opencode.ErrCapabilityUnsupported
 }
 
-func (c *overflowOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
+func (c *overflowOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []opencode.PromptFilePart) opencode.PromptResult {
 	return opencode.PromptResult{Kind: opencode.ResultPreSendFailure, Detail: "overflowOC: prompt_async not supported"}
 }
 func (c *overflowOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {

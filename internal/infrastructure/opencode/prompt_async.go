@@ -42,20 +42,34 @@ type PromptResult struct {
 }
 
 // promptAsyncBody 是 POST /session/{sessionID}/prompt_async 的请求体（design.md D1）。
-// 仅 messageID + parts[{type:"text",text}]，无其他字段。messageID 透传不重写。
+// messageID 透传不重写；parts = [text part] + 可选 file parts（批注 7：引用 worktree 文件）。
 type promptAsyncBody struct {
-	MessageID string             `json:"messageID"`
-	Parts     []promptAsyncPart   `json:"parts"`
+	MessageID string            `json:"messageID"`
+	Parts     []promptAsyncPart `json:"parts"`
 }
 
+// promptAsyncPart 覆盖 text 与 file 两种 part（omitempty 区分，schema 各自字段子集）。
 type promptAsyncPart struct {
-	Type string `json:"type"` // 固定 "text"
-	Text string `json:"text"`
+	Type     string `json:"type"` // "text" | "file"
+	Text     string `json:"text,omitempty"`
+	Mime     string `json:"mime,omitempty"`
+	Filename string `json:"filename,omitempty"`
+	URL      string `json:"url,omitempty"`
+}
+
+// PromptFilePart 描述随 prompt 一起引用的文件（契约见 anomalyco/opencode FilePartInput）：
+// URL 为 file:// 绝对路径 URI（服务端从本机文件系统读取）；Mime 文本文件用 "text/plain"
+// （服务端经 read 工具把内容注入 agent 上下文）；Filename 为展示用 basename。
+type PromptFilePart struct {
+	URL      string
+	Mime     string
+	Filename string
 }
 
 // PromptAsync 投递一条 text prompt 到目标 session 的异步队列（design.md D1）。
 // 端点 POST /session/{sessionID}/prompt_async?directory=<dir>，Basic Auth，
-// body {"messageID":..., "parts":[{"type":"text","text":...}]}。
+// body {"messageID":..., "parts":[{"type":"text","text":...}, ...file parts]}。
+// files 为空时行为与原契约一致（仅 text part）。
 //
 // 返回 transport DTO（不返回 error）：分类规则（唯一）：
 //   - marshal/NewRequest 失败 → ResultPreSendFailure（Detail=错误文本）
@@ -66,14 +80,19 @@ type promptAsyncPart struct {
 //     （StatusCode/Body 携带实际值）
 //
 // messageID 编码契约由调用方负责（"msg_" + 去连字符小写 UUID hex），本方法透传不重写。
-func (c *Client) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) PromptResult {
+func (c *Client) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []PromptFilePart) PromptResult {
 	q := url.Values{}
 	q.Set("directory", dir)
 	reqURL := c.baseURL + "/session/" + url.PathEscape(sessionID) + "/prompt_async?" + q.Encode()
 
+	parts := make([]promptAsyncPart, 0, len(files)+1)
+	parts = append(parts, promptAsyncPart{Type: "text", Text: text})
+	for _, f := range files {
+		parts = append(parts, promptAsyncPart{Type: "file", Mime: f.Mime, Filename: f.Filename, URL: f.URL})
+	}
 	body, err := json.Marshal(promptAsyncBody{
 		MessageID: messageID,
-		Parts:     []promptAsyncPart{{Type: "text", Text: text}},
+		Parts:     parts,
 	})
 	if err != nil {
 		return PromptResult{Kind: ResultPreSendFailure, Detail: fmt.Sprintf("opencode: prompt_async: marshal body: %v", err)}

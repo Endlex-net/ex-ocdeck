@@ -164,8 +164,8 @@ func (c *countingProbeOC) ListPermissions(ctx context.Context, dir string) ([]op
 func (c *countingProbeOC) ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error) {
 	return c.inner.ListQuestions(ctx, dir)
 }
-func (c *countingProbeOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
-	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text)
+func (c *countingProbeOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []opencode.PromptFilePart) opencode.PromptResult {
+	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text, files)
 }
 func (c *countingProbeOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
 	atomic.AddInt32(c.probeCalls, 1)
@@ -274,8 +274,8 @@ func TestPromptPortAdapterDualTaskRoutingIsolation(t *testing.T) {
 	m.setRuntime("t2", m.newRuntime("t2"))
 
 	adapter := NewPromptPortAdapter(m)
-	adapter.PromptAsync(context.Background(), "t1", "sess1", "msg1", "text1")
-	adapter.PromptAsync(context.Background(), "t2", "sess2", "msg2", "text2")
+	adapter.PromptAsync(context.Background(), "t1", "sess1", "msg1", "text1", nil)
+	adapter.PromptAsync(context.Background(), "t2", "sess2", "msg2", "text2", nil)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -322,11 +322,11 @@ func (c *dirCaptureOC) ListPermissions(ctx context.Context, dir string) ([]openc
 func (c *dirCaptureOC) ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error) {
 	return c.inner.ListQuestions(ctx, dir)
 }
-func (c *dirCaptureOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
+func (c *dirCaptureOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []opencode.PromptFilePart) opencode.PromptResult {
 	c.mu.Lock()
 	*c.dirs = append(*c.dirs, dir)
 	c.mu.Unlock()
-	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text)
+	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text, files)
 }
 func (c *dirCaptureOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
 	return c.inner.ProbePromptAsyncCapability(ctx)
@@ -341,7 +341,7 @@ func TestPromptPortAdapterRuntimeUnavailablePreSendFailure(t *testing.T) {
 	seedSuspendedTask(store, "t1", "p1") // 非 active → taskOcClient ok=false
 	m := newTestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
 	adapter := NewPromptPortAdapter(m)
-	outcome := adapter.PromptAsync(context.Background(), "t1", "sess1", "msg1", "text1")
+	outcome := adapter.PromptAsync(context.Background(), "t1", "sess1", "msg1", "text1", nil)
 	if outcome.Kind != diffreview.PromptOutcomePreSendFailure {
 		t.Errorf("ok=false should be pre_send_failure, got %v", outcome.Kind)
 	}
@@ -883,6 +883,78 @@ func TestCapabilityProbeWaiterCacheReadRaceWithInvalidation(t *testing.T) {
 		t.Errorf("F17: should probe exactly twice (seed + leader), got %d probe calls", n)
 	}
 	// -race 下无 DATA RACE 即通过（F17 修复后 waiter 经持锁 readCapCache 读）。
+}
+
+// --- file parts（批注 7：PromptPortAdapter 构造 file part） ---
+
+// filesCaptureOC 包装 mockOC，记录 PromptAsync 收到的 files 参数。
+// 嵌入 *mockOC 以满足 OCClient 接口（其余方法透传 mockOC）。
+type filesCaptureOC struct {
+	*mockOC
+	calls *[][]opencode.PromptFilePart
+	mu    *sync.Mutex
+}
+
+func (c *filesCaptureOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []opencode.PromptFilePart) opencode.PromptResult {
+	c.mu.Lock()
+	*c.calls = append(*c.calls, files)
+	c.mu.Unlock()
+	return c.promptAsyncResult
+}
+
+// TestPromptPortAdapterFileParts 验证批注 7：存在的 regular 文件构造出 file part
+//（url 为 file:// + worktree 拼接路径、mime text/plain、filename 为 basename）；
+// 缺失/非 regular（目录）文件被跳过，发送仍进行。
+func TestPromptPortAdapterFileParts(t *testing.T) {
+	dir := t.TempDir()
+	initTestGitRepo(t, dir)
+	// 存在的 regular 文件（名字含空格，覆盖逐段 PathEscape）；另备一个目录（非 regular）。
+	writeFileInRepo(t, dir, "note file.txt", "hello\n", 0o644)
+	if err := os.MkdirAll(filepath.Join(dir, "subdir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store := newMockStore()
+	seedActiveTask(store, "t1", "p1")
+	store.mutTask("t1", func(r *TaskRow) { r.WorktreePath = dir })
+	proc := newMockProc()
+	setProcServeEnv(proc, "t1")
+	var calls [][]opencode.PromptFilePart
+	var mu sync.Mutex
+	oc := newMockOC(true)
+	oc.promptAsyncResult = opencode.PromptResult{Kind: opencode.ResultAccepted}
+	wrap := &filesCaptureOC{mockOC: oc, calls: &calls, mu: &mu}
+	factory := func(port int, password string, opts opencode.Options) OCClient { return wrap }
+	m := newTestManagerWithFactory(t, store, proc, newMockWorktree(), factory)
+	m.setRuntime("t1", m.newRuntime("t1"))
+
+	adapter := NewPromptPortAdapter(m)
+	outcome := adapter.PromptAsync(context.Background(), "t1", "sess1", "msg1", "text1",
+		[]string{"note file.txt", "missing.txt", "subdir"})
+	if outcome.Kind != diffreview.PromptOutcomeAccepted {
+		t.Fatalf("send should proceed despite skips, got kind %v detail %q", outcome.Kind, outcome.Detail)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("PromptAsync should be called once, got %d", len(calls))
+	}
+	parts := calls[0]
+	if len(parts) != 1 {
+		t.Fatalf("missing.txt and subdir should be skipped, got %d parts: %+v", len(parts), parts)
+	}
+	p := parts[0]
+	if p.Mime != "text/plain" {
+		t.Errorf("mime should be text/plain, got %q", p.Mime)
+	}
+	if p.Filename != "note file.txt" {
+		t.Errorf("filename should be basename, got %q", p.Filename)
+	}
+	// 空格逐段 PathEscape 为 %20；其余段在临时目录路径下无需转义。
+	wantURL := "file://" + filepath.Join(dir, "note%20file.txt")
+	if p.URL != wantURL {
+		t.Errorf("url = %q, want %q", p.URL, wantURL)
+	}
 }
 
 // --- errScope / 辅助：确保 errors import 被使用 ---

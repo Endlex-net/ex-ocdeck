@@ -171,11 +171,29 @@ func (sch *Scheduler) processHead(ctx context.Context, sub DiffReviewSubmissionR
 }
 
 // sendAndMap 发送 PromptAsync 并按 PromptOutcome 状态映射（design.md D1 错误矩阵 + D2 发送）。
+// files（批注 7）：发送前读取 submission items 收集去重文件路径（保持 items 顺序），
+// 随 payload 一并引用给 agent（文件缺失由 adapter 跳过，不影响投递）。
 func (sch *Scheduler) sendAndMap(ctx context.Context, sub DiffReviewSubmissionRecord) {
+	// 收集引用文件路径（去重，保持 items 顺序）。读取失败视为确定性失败 → failed
+	// （不重投、不留 sending；items 与 submission 同事务写入，缺失即数据异常）。
+	files := []string{}
+	items, err := sch.svc.repo.ListDiffReviewSubmissionItems(ctx, sub.ID)
+	if err != nil {
+		sch.persistTerminal(ctx, sub.ID, "failed", "read submission items failed")
+		return
+	}
+	seen := map[string]bool{}
+	for _, it := range items {
+		if !seen[it.Path] {
+			seen[it.Path] = true
+			files = append(files, it.Path)
+		}
+	}
+
 	// 准备重试 ≤3（pre_send_failure 耗尽 failed）。
 	var outcome PromptOutcome
 	for attempt := 0; attempt < maxPreSendRetries; attempt++ {
-		outcome = sch.svc.prompt.PromptAsync(ctx, sub.TaskID, sub.TargetSessionID, sub.MessageID, sub.Payload)
+		outcome = sch.svc.prompt.PromptAsync(ctx, sub.TaskID, sub.TargetSessionID, sub.MessageID, sub.Payload, files)
 		if outcome.Kind != PromptOutcomePreSendFailure {
 			break
 		}

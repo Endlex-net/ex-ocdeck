@@ -198,7 +198,7 @@ type DiffReviewRepository interface {
 // 保证多任务投递路由隔离。adapter 获取失败（ok=false）→ PromptOutcome{Kind: pre_send_failure,
 // Detail: "runtime client unavailable"}（design.md D1 adapter 获取失败唯一规则）。
 type PromptPort interface {
-	PromptAsync(ctx context.Context, taskID, sessionID, messageID, text string) PromptOutcome
+	PromptAsync(ctx context.Context, taskID, sessionID, messageID, text string, files []string) PromptOutcome
 }
 
 // DiffSource 表达单个 diff 来源的内容读取请求（design.md D9，GitDiff 核心 helper 的能力面）。

@@ -1272,7 +1272,7 @@ func (c *mockOC) ListQuestions(ctx context.Context, dir string) ([]opencode.Ques
 }
 
 // PromptAsync 返回预置的 PromptResult（newMockOC 默认 pre_send_failure，design.md D1）。
-func (c *mockOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
+func (c *mockOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []opencode.PromptFilePart) opencode.PromptResult {
 	return c.promptAsyncResult
 }
 
@@ -1340,8 +1340,8 @@ func (c *readyOC) ListPermissions(ctx context.Context, dir string) ([]opencode.P
 func (c *readyOC) ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error) {
 	return c.inner.ListQuestions(ctx, dir)
 }
-func (c *readyOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
-	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text)
+func (c *readyOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []opencode.PromptFilePart) opencode.PromptResult {
+	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text, files)
 }
 func (c *readyOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
 	return c.inner.ProbePromptAsyncCapability(ctx)

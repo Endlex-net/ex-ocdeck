@@ -80,8 +80,8 @@ func (c *blockingPermOC) SessionStatus(ctx context.Context, dir string) (map[str
 func (c *blockingPermOC) SubscribeEvents(ctx context.Context, dir string, onEvent func(opencode.Event), onReconnect func()) error {
 	return c.inner.SubscribeEvents(ctx, dir, onEvent, onReconnect)
 }
-func (c *blockingPermOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
-	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text)
+func (c *blockingPermOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []opencode.PromptFilePart) opencode.PromptResult {
+	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text, files)
 }
 func (c *blockingPermOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
 	return c.inner.ProbePromptAsyncCapability(ctx)
@@ -140,8 +140,8 @@ func (c *blockingBothOC) SessionStatus(ctx context.Context, dir string) (map[str
 func (c *blockingBothOC) SubscribeEvents(ctx context.Context, dir string, onEvent func(opencode.Event), onReconnect func()) error {
 	return c.inner.SubscribeEvents(ctx, dir, onEvent, onReconnect)
 }
-func (c *blockingBothOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
-	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text)
+func (c *blockingBothOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []opencode.PromptFilePart) opencode.PromptResult {
+	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text, files)
 }
 func (c *blockingBothOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
 	return c.inner.ProbePromptAsyncCapability(ctx)

@@ -107,7 +107,7 @@ func (c *portHealthOC) ListQuestions(ctx context.Context, dir string) ([]opencod
 	return nil, opencode.ErrCapabilityUnsupported
 }
 
-func (c *portHealthOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
+func (c *portHealthOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []opencode.PromptFilePart) opencode.PromptResult {
 	return opencode.PromptResult{Kind: opencode.ResultPreSendFailure, Detail: "portHealthOC: prompt_async not supported"}
 }
 func (c *portHealthOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
@@ -173,8 +173,8 @@ func (c *readyOCWrap) ListPermissions(ctx context.Context, dir string) ([]openco
 func (c *readyOCWrap) ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error) {
 	return c.inner.ListQuestions(ctx, dir)
 }
-func (c *readyOCWrap) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult {
-	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text)
+func (c *readyOCWrap) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []opencode.PromptFilePart) opencode.PromptResult {
+	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text, files)
 }
 func (c *readyOCWrap) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
 	return c.inner.ProbePromptAsyncCapability(ctx)

@@ -14,6 +14,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"ocdeck/internal/application/diffreview"
 	"ocdeck/internal/infrastructure/git"
@@ -42,7 +46,10 @@ var _ diffreview.PromptPort = (*PromptPortAdapter)(nil)
 // Detail: "runtime client unavailable"}（design.md D1 adapter 获取失败唯一规则，MUST NOT 标 delivery_unknown）。
 // 成功获取 client 后调用 OCClient.PromptAsync（返回 opencode.PromptResult transport DTO），
 // 逐字段映射为 diffreview.PromptOutcome。
-func (a *PromptPortAdapter) PromptAsync(ctx context.Context, taskID, sessionID, messageID, text string) diffreview.PromptOutcome {
+// files（批注 7）：批注涉及的 worktree 相对路径（已去重），逐一构造 file part——
+// file:// 绝对路径 URI + mime "text/plain" + basename；发送前 os.Stat 校验，
+// 不存在/非 regular 的文件跳过（避免 agent 收到 "Read tool failed to read" 错误文本）。
+func (a *PromptPortAdapter) PromptAsync(ctx context.Context, taskID, sessionID, messageID, text string, files []string) diffreview.PromptOutcome {
 	oc, dir, ok := a.m.taskOcClient(ctx, taskID)
 	if !ok {
 		return diffreview.PromptOutcome{
@@ -50,8 +57,31 @@ func (a *PromptPortAdapter) PromptAsync(ctx context.Context, taskID, sessionID, 
 			Detail: "runtime client unavailable",
 		}
 	}
-	res := oc.PromptAsync(ctx, dir, sessionID, messageID, text)
+	parts := make([]opencode.PromptFilePart, 0, len(files))
+	for _, rel := range files {
+		abs := filepath.Join(dir, rel)
+		st, serr := os.Stat(abs)
+		if serr != nil || !st.Mode().IsRegular() {
+			continue // 跳过缺失/非 regular 文件（批注快照已在 payload 中，不影响提交语义）
+		}
+		parts = append(parts, opencode.PromptFilePart{
+			URL:      fileURLForPath(abs),
+			Mime:     "text/plain",
+			Filename: filepath.Base(rel),
+		})
+	}
+	res := oc.PromptAsync(ctx, dir, sessionID, messageID, text, parts)
 	return mapPromptResult(res)
+}
+
+// fileURLForPath 构造 file:// 绝对路径 URI（anomalyco/opencode FilePartInput 契约：
+// fileURLToPath 解码为本地绝对路径；路径段逐段 PathEscape，保持 '/' 分隔）。
+func fileURLForPath(abs string) string {
+	segs := strings.Split(abs, "/")
+	for i, s := range segs {
+		segs[i] = url.PathEscape(s)
+	}
+	return "file://" + strings.Join(segs, "/")
 }
 
 // mapPromptResult 将 opencode.PromptResult（transport DTO）逐字段映射为 diffreview.PromptOutcome（domain 类型）。

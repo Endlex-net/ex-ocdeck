@@ -110,21 +110,9 @@ func (s *Service) CreateSubmission(ctx context.Context, req CreateSubmissionRequ
 		return DiffReviewSubmissionRecord{}, nil, err
 	}
 
-	// 7. payload 组装（D7 逐字公式 + 有界单遍算法，F5：单次任务锁内逐来源读取）。
-	// diffReadAll 经 DiffSourcePort.ReadLocked 在单个任务锁作用域内逐来源读取核心 helper gitDiffLocked，
-	// 回调内完成格式化与有界 builder 写入（组装全程持锁，禁止递归加锁）。
-	diffReadAll := func(srcs []sourceTriple, onSource func(src sourceTriple, result DiffSourceResult, err error) error) error {
-		diffSrcs := make([]DiffSource, len(srcs))
-		for i, s := range srcs {
-			diffSrcs[i] = DiffSource{Ref: s.Ref, Path: s.Path, Untracked: s.Untracked}
-		}
-		cb := func(src DiffSource, result DiffSourceResult, err error) error {
-			t := sourceTriple{Ref: src.Ref, Path: src.Path, Untracked: src.Untracked}
-			return onSource(t, result, err)
-		}
-		return s.diff.ReadLocked(ctx, req.TaskID, diffSrcs, cb)
-	}
-	result, err := assemblePayloadFromAnnotationsLocked(selected, req.Note, diffReadAll)
+	// 7. payload 组装（批注快照即完整内容：不读取 diff、不附加相关 diff/Context 段，
+	// 行号高效格式 Q(path):start-end，用户决策）。
+	result, err := assemblePayloadFromAnnotations(selected, req.Note)
 	if err != nil {
 		return DiffReviewSubmissionRecord{}, nil, err
 	}

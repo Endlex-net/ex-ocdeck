@@ -94,7 +94,7 @@ type OCClient interface {
 	// 返回 transport DTO（不返回 error）；签名与 *opencode.Client 逐字一致。
 	// adapter 获取失败（taskOcClient ok=false）由 PromptPort 返回 pre_send_failure（D1），
 	// 不属于本接口的职责。
-	PromptAsync(ctx context.Context, dir, sessionID, messageID, text string) opencode.PromptResult
+	PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []opencode.PromptFilePart) opencode.PromptResult
 	// ProbePromptAsyncCapability 探测目标 serve 是否支持 prompt_async（design.md D1）。
 	// GET /doc 结构化解析，返回 supported/unsupported/unknown 三值。
 	// 签名与 *opencode.Client 逐字一致；adapter 在 RuntimePort.ProbeCapability 复用。

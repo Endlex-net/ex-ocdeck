@@ -47,7 +47,7 @@ func TestPromptAsync_Accepted_204(t *testing.T) {
 	defer srv.Close()
 	c := newTestClient(t, srv, "pw")
 
-	res := c.PromptAsync(context.Background(), "/wt", "sess-1", "msg_abc123", "hello")
+	res := c.PromptAsync(context.Background(), "/wt", "sess-1", "msg_abc123", "hello", nil)
 	if res.Kind != ResultAccepted {
 		t.Fatalf("kind: %v", res.Kind)
 	}
@@ -71,7 +71,7 @@ func TestPromptAsync_HTTPResponse_Unexpected2xx(t *testing.T) {
 		var body promptAsyncBody
 		srv := httptest.NewServer(promptAsyncHandler(t, code, &body))
 		c := newTestClient(t, srv, "pw")
-		res := c.PromptAsync(context.Background(), "/wt", "sess-1", "msg_x", "t")
+		res := c.PromptAsync(context.Background(), "/wt", "sess-1", "msg_x", "t", nil)
 		srv.Close()
 		if res.Kind != ResultHTTPResponse {
 			t.Fatalf("code=%d kind: %v", code, res.Kind)
@@ -93,7 +93,7 @@ func TestPromptAsync_HTTPResponse_4xx(t *testing.T) {
 		var body promptAsyncBody
 		srv := httptest.NewServer(promptAsyncHandler(t, code, &body))
 		c := newTestClient(t, srv, "pw")
-		res := c.PromptAsync(context.Background(), "/wt", "sess-1", "msg_x", "t")
+		res := c.PromptAsync(context.Background(), "/wt", "sess-1", "msg_x", "t", nil)
 		srv.Close()
 		if res.Kind != ResultHTTPResponse {
 			t.Fatalf("code=%d kind: %v", code, res.Kind)
@@ -110,7 +110,7 @@ func TestPromptAsync_TransportUnknown_DoError(t *testing.T) {
 	srv.Close()
 	c := newTestClient(t, srv, "pw")
 
-	res := c.PromptAsync(context.Background(), "/wt", "sess-1", "msg_x", "t")
+	res := c.PromptAsync(context.Background(), "/wt", "sess-1", "msg_x", "t", nil)
 	if res.Kind != ResultTransportUnknown {
 		t.Fatalf("kind: %v", res.Kind)
 	}
@@ -137,7 +137,7 @@ func TestPromptAsync_TransportUnknown_CtxCancelled(t *testing.T) {
 	go func() {
 		cancel()
 	}()
-	res := c.PromptAsync(ctx, "/wt", "sess-1", "msg_x", "t")
+	res := c.PromptAsync(ctx, "/wt", "sess-1", "msg_x", "t", nil)
 	if res.Kind != ResultTransportUnknown {
 		t.Fatalf("kind: %v", res.Kind)
 	}
@@ -153,7 +153,7 @@ func TestPromptAsync_PreSendFailure_NewRequest(t *testing.T) {
 	// 控制字符使 URL 解析失败（http.NewRequest 拒绝），稳定触发 pre_send_failure。
 	c.baseURL = "http://127.0.0.1:0\x00"
 
-	res := c.PromptAsync(context.Background(), "/wt", "sess-1", "msg_x", "t")
+	res := c.PromptAsync(context.Background(), "/wt", "sess-1", "msg_x", "t", nil)
 	if res.Kind != ResultPreSendFailure {
 		t.Fatalf("kind: %v want pre_send_failure", res.Kind)
 	}
@@ -178,7 +178,7 @@ func TestPromptAsync_MessageID_Passthrough(t *testing.T) {
 	defer srv.Close()
 	c := newTestClient(t, srv, "pw")
 
-	_ = c.PromptAsync(context.Background(), "/wt", "sess-1", mid, "text")
+	_ = c.PromptAsync(context.Background(), "/wt", "sess-1", mid, "text", nil)
 	if body.MessageID != mid {
 		t.Fatalf("messageID not passed through: got %q want %q", body.MessageID, mid)
 	}
@@ -213,6 +213,55 @@ func mustMarshalPromptBody(t *testing.T, b promptAsyncBody) []byte {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+// ---- file parts（批注 7：随 prompt 引用 worktree 文件） ----
+
+// TestPromptAsync_FileParts 验证携带 files 时 parts = text part + 逐 file part
+//（file part 字段形态契约：type/mime/filename/url，url 为 file:// 绝对路径 URI）。
+func TestPromptAsync_FileParts(t *testing.T) {
+	var body promptAsyncBody
+	srv := httptest.NewServer(promptAsyncHandler(t, http.StatusNoContent, &body))
+	defer srv.Close()
+	c := newTestClient(t, srv, "pw")
+
+	files := []PromptFilePart{
+		{URL: "file:///wt/a%20b.txt", Mime: "text/plain", Filename: "a b.txt"},
+		{URL: "file:///wt/c.go", Mime: "text/plain", Filename: "c.go"},
+	}
+	res := c.PromptAsync(context.Background(), "/wt", "sess-1", "msg_x", "review text", files)
+	if res.Kind != ResultAccepted {
+		t.Fatalf("kind: %v", res.Kind)
+	}
+	if len(body.Parts) != 3 {
+		t.Fatalf("parts should be text + 2 file parts, got %d", len(body.Parts))
+	}
+	if body.Parts[0].Type != "text" || body.Parts[0].Text != "review text" {
+		t.Fatalf("first part should be the text part: %+v", body.Parts[0])
+	}
+	want := []promptAsyncPart{
+		{Type: "file", Mime: "text/plain", Filename: "a b.txt", URL: "file:///wt/a%20b.txt"},
+		{Type: "file", Mime: "text/plain", Filename: "c.go", URL: "file:///wt/c.go"},
+	}
+	for i, w := range want {
+		if got := body.Parts[i+1]; got != w {
+			t.Fatalf("file part %d: got %+v want %+v", i, got, w)
+		}
+	}
+}
+
+// TestPromptAsync_NoFiles_NoFilePart 验证 files 为 nil 或空 slice 时 body 仅含 text part（无 file part）。
+func TestPromptAsync_NoFiles_NoFilePart(t *testing.T) {
+	for name, files := range map[string][]PromptFilePart{"nil": nil, "empty": {}} {
+		var body promptAsyncBody
+		srv := httptest.NewServer(promptAsyncHandler(t, http.StatusNoContent, &body))
+		c := newTestClient(t, srv, "pw")
+		_ = c.PromptAsync(context.Background(), "/wt", "sess-1", "msg_x", "t", files)
+		srv.Close()
+		if len(body.Parts) != 1 || body.Parts[0].Type != "text" {
+			t.Fatalf("%s: parts should be exactly one text part: %+v", name, body.Parts)
+		}
+	}
 }
 
 // ---- /doc 能力探测解析（design.md D1 三值矩阵） ----
