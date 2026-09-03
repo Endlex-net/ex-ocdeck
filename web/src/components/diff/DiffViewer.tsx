@@ -431,6 +431,7 @@ export default function DiffViewer({
                 unified: side === 'unified',
                 side: side === 'old' ? 'old' : 'new',
                 onGesture: (g) => openGesture(side === 'unified' ? 'u' : side === 'old' ? 'a' : 'b', g),
+                onCrossSide: () => setCrossSideHint('选区跨越两侧，请改为单侧选择。'),
               }),
             ]
           : []),

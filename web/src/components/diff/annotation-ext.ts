@@ -205,40 +205,69 @@ function deletedLineIndex(el: Element): number {
   return 0;
 }
 
+/** F15：跨编辑器拖拽标记——document 级捕获监听先于目标编辑器的 view.dom mouseup 触发，
+ *  标记后目标编辑器跳过本次 mouseup（含其旧选区回退）。 */
+const crossSideMarked = new WeakSet<MouseEvent>();
+
 /**
- * 查看模式批注手势（tasks 5.2）：
+ * 查看模式批注手势（tasks 5.2，spec「框选段落+点击行双支持」）：
  * - 行号 gutter 点击 → 单行批注（unified 恒 new 侧；并排按编辑器所在侧）；
- * - 拖选（非空选区）→ 行范围批注；选区天然不跨侧（每编辑器独立），跨侧映射在上层防御；
- * - unified 下点击 .cm-deletedLine → 旧侧单行批注。
+ * - 普通代码行单击 → 单行批注；拖选（非空选区）→ 行范围批注；
+ * - unified 删除行（.cm-deletedLine）→ old 侧：单击单行、拖拽多行范围（块内行序）；
+ * - 混合侧选择（删除块 ↔ 普通内容互相拖拽、并排跨编辑器 A 按下 B 释放）→ onCrossSide
+ *   拒绝提示，不产生批注（spec「跨侧不创建并提示」）。
  *
  * 注意：EditorView.domEventHandlers 挂在 contentDOM 上，gutter 在其之外、删除块是
- * DeletionWidget（ignoreEvent 吞掉事件）——这两类点击永远到不了编辑器级 handler。
- * 因此 mousedown 手势用 view.dom 捕获阶段监听（ViewPlugin），mouseup 拖选仍走编辑器级。
+ * DeletionWidget（ignoreEvent 吞掉事件）——这两类事件永远到不了编辑器级 handler。
+ * 因此手势统一用 view.dom 捕获阶段监听（ViewPlugin）+ 拖拽起点跟踪；
+ * 跨编辑器释放经 ownerDocument 级监听协调（F15：CM 自身也把拖选 mouseup 挂在 ownerDocument）。
  */
 export function annotationGestures(opts: {
   unified: boolean;
   side: DiffSide;
   onGesture: (g: AnnotationGesture) => void;
+  /** 混合侧选区拒绝提示（不产生批注）。 */
+  onCrossSide?: () => void;
 }): Extension {
-  const captureClicks = ViewPlugin.define((view) => {
+  const captureGestures = ViewPlugin.define((view) => {
+    /** 拖拽起点：old=删除块内按下（记旧侧行号）；内容侧按下记行号（无则 null 回退选区）。 */
+    let dragStart: { kind: 'old' | 'content'; line: number | null } | null = null;
+    /** F14：mousedown 已触发批注（行号单击）的序列，mouseup 不再回退旧选区。 */
+    let firedOnDown = false;
+    const contentSide: DiffSide = opts.unified ? 'new' : opts.side;
+
+    const fire = (side: DiffSide, startLine: number, endLine: number, e: MouseEvent) =>
+      opts.onGesture({ side, startLine, endLine, x: e.clientX, y: e.clientY });
+
+    const deletedLineOf = (target: HTMLElement): { el: Element; line: number } | null => {
+      const el = target.closest('.cm-deletedLine');
+      if (!el) return null;
+      const line = oldLineForDeleted(view, el);
+      return line === null ? null : { el, line };
+    };
+
+    /** 指针所在内容行行号（DOM 反推，选区在 jsdom/怪异指针路径下不可靠时的主依据）。 */
+    const contentLineOf = (target: HTMLElement): number | null => {
+      const lineEl = target.closest('.cm-line');
+      if (!lineEl) return null;
+      try {
+        return view.state.doc.lineAt(view.posAtDOM(lineEl, 0)).number;
+      } catch {
+        return null; // 目标不在文档内（装饰/widget）
+      }
+    };
+
     const onMouseDown = (event: MouseEvent) => {
       const target = event.target as HTMLElement | null;
+      dragStart = null;
+      firedOnDown = false;
       if (!target) return;
       if (target.closest('.cm-annotationGutter')) return; // 标记 gutter 自有定位逻辑
       if (opts.unified) {
-        const deleted = target.closest('.cm-deletedLine');
-        if (deleted) {
-          const ln = oldLineForDeleted(view, deleted);
-          if (ln !== null) {
-            opts.onGesture({
-              side: 'old',
-              startLine: ln,
-              endLine: ln,
-              x: event.clientX,
-              y: event.clientY,
-            });
-            event.preventDefault();
-          }
+        const del = deletedLineOf(target);
+        if (del) {
+          dragStart = { kind: 'old', line: del.line };
+          event.preventDefault(); // 删除块是 widget，阻止其内文本选择
           return;
         }
       }
@@ -247,42 +276,89 @@ export function annotationGestures(opts: {
         // 行号元素文本即行号（默认 formatNumber=String），不依赖布局几何（jsdom 友好）
         const ln = Number.parseInt((gutterEl.textContent ?? '').trim(), 10);
         if (Number.isInteger(ln) && ln >= 1 && ln <= view.state.doc.lines) {
-          opts.onGesture({
-            side: opts.unified ? 'new' : opts.side,
-            startLine: ln,
-            endLine: ln,
-            x: event.clientX,
-            y: event.clientY,
-          });
+          fire(contentSide, ln, ln, event);
+          firedOnDown = true;
           event.preventDefault();
         }
+        return;
+      }
+      if (target.closest('.cm-content')) {
+        dragStart = { kind: 'content', line: contentLineOf(target) };
       }
     };
+
+    const onMouseUp = (event: MouseEvent) => {
+      if (crossSideMarked.has(event)) return; // F15：已被起点编辑器的 document 级监听判为跨侧
+      const start = dragStart;
+      dragStart = null;
+      const fired = firedOnDown;
+      firedOnDown = false;
+      const target = event.target as HTMLElement | null;
+      if (!target) return;
+      const upDel = opts.unified ? deletedLineOf(target) : null;
+      if (start?.kind === 'old' && start.line !== null) {
+        // 旧侧起手：落在删除块 → 单行或范围；落在普通内容 → 混合侧拒绝
+        if (upDel) {
+          fire('old', Math.min(start.line, upDel.line), Math.max(start.line, upDel.line), event);
+        } else if (target.closest('.cm-content')) {
+          opts.onCrossSide?.();
+        }
+        return;
+      }
+      if (upDel) {
+        // 内容侧起手（或无起手）落在删除块 → 混合侧拒绝
+        if (start?.kind === 'content') opts.onCrossSide?.();
+        return;
+      }
+      // F14：mousedown 已开批注的序列、gutter/标记等已明确处理的目标——不回退旧选区
+      if (fired) return;
+      if (target.closest('.cm-gutters')) return;
+      // F16：合法目标白名单——mouseup 必须落在真实内容行才允许回退/指针映射；
+      // .cm-mergeSpacer/.cm-gap/.cm-collapsedLines 等非行 widget 一律不产生批注（不再枚举黑名单）
+      if (!target.closest('.cm-line')) return;
+      // 内容侧：按下/抬起行号都可得时以指针真实路径为准（单击=同行单行，跨行=范围）
+      if (start?.kind === 'content') {
+        if (start.line === null) return; // 在非行内容（对齐空白/间隙 widget）按下 → 不回退
+        const upLine = contentLineOf(target);
+        if (upLine !== null) {
+          fire(contentSide, Math.min(start.line, upLine), Math.max(start.line, upLine), event);
+        }
+        return; // 抬起行不可判定 → 不回退
+      }
+      // 无 mousedown 起手（键盘/程序化选区）且落在真实行 → 回退到 CM 选区
+      const sel = view.state.selection.main;
+      if (!sel.empty) {
+        const from = view.state.doc.lineAt(sel.from);
+        const to = view.state.doc.lineAt(sel.to);
+        fire(contentSide, from.number, to.number, event);
+      }
+    };
+
+    /** F15：document 级 mouseup——释放在本编辑器之外时收尾：落在另一编辑器 = 跨侧拒绝并标记事件。 */
+    const onDocMouseUp = (event: MouseEvent) => {
+      if (!dragStart) return; // 无进行中拖拽
+      const target = event.target as HTMLElement | null;
+      if (target && view.dom.contains(target)) return; // 本编辑器释放，由 onMouseUp 处理
+      dragStart = null;
+      firedOnDown = false;
+      if (target?.closest('.cm-editor')) {
+        crossSideMarked.add(event);
+        opts.onCrossSide?.();
+      }
+    };
+
+    const doc = view.dom.ownerDocument;
     view.dom.addEventListener('mousedown', onMouseDown, true);
+    view.dom.addEventListener('mouseup', onMouseUp, true);
+    doc.addEventListener('mouseup', onDocMouseUp, true);
     return {
       destroy() {
         view.dom.removeEventListener('mousedown', onMouseDown, true);
+        view.dom.removeEventListener('mouseup', onMouseUp, true);
+        doc.removeEventListener('mouseup', onDocMouseUp, true);
       },
     };
   });
 
-  return [
-    captureClicks,
-    EditorView.domEventHandlers({
-      mouseup(event, view) {
-        const sel = view.state.selection.main;
-        if (sel.empty) return false;
-        const from = view.state.doc.lineAt(sel.from);
-        const to = view.state.doc.lineAt(sel.to);
-        opts.onGesture({
-          side: opts.unified ? 'new' : opts.side,
-          startLine: from.number,
-          endLine: to.number,
-          x: event.clientX,
-          y: event.clientY,
-        });
-        return false; // 不拦截默认选区行为
-      },
-    }),
-  ];
+  return [captureGestures];
 }

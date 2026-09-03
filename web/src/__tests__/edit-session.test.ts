@@ -415,4 +415,111 @@ describe('还原', () => {
     expect(s.status).toBe('clean');
     s.dispose();
   });
+
+  it('F13：普通写在途时 restore() 排队——排队窗口内的编辑置标志，不被快照覆盖', async () => {
+    const io = makeIO();
+    let resolveW1!: (v: { baseHash: string }) => void;
+    io.writeImpl.mockImplementationOnce(
+      () =>
+        new Promise((res) => {
+          resolveW1 = res;
+        }),
+    );
+    const s = makeSession(io, makeRead('orig\n'));
+    s.onEdit('w1\n');
+    const flushP = s.flush(); // w1 写在途但未完成
+    await sleep(1);
+    expect(io.writes).toHaveLength(1);
+    const rp = s.restore(); // 排队等待 w1——锁在调用时即生效
+    s.onEdit('w2\n'); // 排队窗口内编辑：MUST 只置标志，不得走普通 pump
+    resolveW1({ baseHash: 'hX' });
+    await flushP;
+    const shown = await rp;
+    // w2 不得被快照覆盖：最终保留并以最新基线补发
+    expect(s.latest).toBe('w2\n');
+    expect(shown).toBe('w2\n');
+    const seq = io.writes.map((w) => w.content);
+    expect(seq[0]).toBe('w1\n');
+    expect(seq).toContain('orig\n'); // 快照写发生
+    expect(seq[seq.length - 1]).toBe('w2\n'); // 最后一次写是补发 w2
+    expect(s.status).toBe('clean');
+    s.dispose();
+  });
+});
+
+describe('还原事务的单在途与离开屏障（F10）', () => {
+  /** 包装 io.write 统计并发在途数。 */
+  function withConcurrencyProbe(io: ReturnType<typeof makeIO>) {
+    let inFlight = 0;
+    const probe = { max: 0 };
+    const orig = io.write;
+    io.write = async (input: FileEditWriteInput) => {
+      inFlight++;
+      probe.max = Math.max(probe.max, inFlight);
+      try {
+        return await orig(input);
+      } finally {
+        inFlight--;
+      }
+    };
+    return probe;
+  }
+
+  it('还原在途时 canLeave 等待还原事务完成，全程最大并发写 = 1', async () => {
+    const io = makeIO();
+    const probe = withConcurrencyProbe(io);
+    const s = makeSession(io, makeRead('orig\n'));
+    s.onEdit('v1\n');
+    await s.flush();
+    let resolveRestore!: (v: { baseHash: string }) => void;
+    io.writeImpl.mockImplementationOnce(
+      () =>
+        new Promise((res) => {
+          resolveRestore = res;
+        }),
+    );
+    const rp = s.restore();
+    await sleep(1);
+    expect(io.writes).toHaveLength(2); // v1 + 快照写在途
+    // 还原在途期间调用 canLeave（退出/切文件路径）——必须阻塞等待
+    let left = false;
+    const lp = s.canLeave().then((ok) => {
+      left = true;
+      return ok;
+    });
+    await sleep(20);
+    expect(left).toBe(false);
+    resolveRestore({ baseHash: 'hR' });
+    expect(await lp).toBe(true);
+    expect(await rp).toBe('orig\n');
+    expect(probe.max).toBe(1);
+    s.dispose();
+  });
+
+  it('还原期间编辑后离开：补发与还原串行，无并发写', async () => {
+    const io = makeIO();
+    const probe = withConcurrencyProbe(io);
+    const s = makeSession(io, makeRead('orig\n'));
+    s.onEdit('v1\n');
+    await s.flush();
+    let resolveRestore!: (v: { baseHash: string }) => void;
+    io.writeImpl.mockImplementationOnce(
+      () =>
+        new Promise((res) => {
+          resolveRestore = res;
+        }),
+    );
+    const rp = s.restore();
+    await sleep(1);
+    s.onEdit('v2\n'); // 还原在途期间编辑
+    const lp = s.canLeave();
+    await sleep(10);
+    resolveRestore({ baseHash: 'hR' });
+    expect(await rp).toBe('v2\n');
+    expect(await lp).toBe(true);
+    // 快照写 → 补发 v2，串行
+    expect(io.writes.map((w) => w.content)).toEqual(['v1\n', 'orig\n', 'v2\n']);
+    expect(probe.max).toBe(1);
+    s.dispose();
+  });
 });

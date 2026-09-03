@@ -79,8 +79,11 @@ export function GitPanel({
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [capability, setCapability] = useState<SubmitCapability>({ state: 'unknown', reason: '' });
   const [highlightIDs, setHighlightIDs] = useState<Set<string>>(new Set());
-  // 编辑模式离开守卫（DiffViewer 注册）：切换文件前 flush 并等待在途写；阻塞未解决 → 拒绝切换
+  // 编辑模式离开守卫（DiffViewer 注册）：切换文件/视图消失前 flush 并等待在途写；阻塞未解决 → 拒绝
   const leaveGuard = useRef<(() => Promise<boolean>) | null>(null);
+  // loadStatus 是 async，setState updater 内不能 await——用 ref 拿当前 selFile
+  const selFileRef = useRef(selFile);
+  selFileRef.current = selFile;
 
   const loadAnnotations = async () => {
     try {
@@ -102,17 +105,25 @@ export function GitPanel({
       setSelected((prev) =>
         prev === null ? null : new Set(s.files.filter((f) => prev.has(f.path)).map((f) => f.path)),
       );
-      // 选中视图已消失时清掉 diff 视图（按三元组核对：路径 + 来源组）
-      setSelFile((prev) => {
-        if (!prev) return prev;
+      // 选中视图已消失时清掉 diff 视图（按三元组核对：路径 + 来源组）。
+      // F11：清除前必须过同一离开事务（flush + 等待在途写），否则 debounce 内最新文本静默丢失；
+      // 阻塞未解决时保留视图（status 照更新），由冲突横幅引导用户处理。
+      const cur = selFileRef.current;
+      if (cur) {
         const stillThere = groupFiles(s.files).some(
           (g) =>
-            g.ref === prev.ref &&
-            g.untracked === prev.untracked &&
-            g.files.some((f) => f.path === prev.path),
+            g.ref === cur.ref &&
+            g.untracked === cur.untracked &&
+            g.files.some((f) => f.path === cur.path),
         );
-        return stillThere ? prev : null;
-      });
+        if (!stillThere) {
+          const guardOk = leaveGuard.current ? await leaveGuard.current() : true;
+          if (guardOk) {
+            setSelFile(null);
+            setDiff(null);
+          }
+        }
+      }
     } catch (err) {
       setLoadError(err instanceof ApiError ? err.message : '加载 git 状态失败');
     } finally {

@@ -63,6 +63,8 @@ export class EditSession {
   private readonly emit: () => void;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private pumpPromise: Promise<void> | null = null;
+  /** F10：统一串行链——pump 写与还原事务全部经此链，任意时刻至多一个写请求在途。 */
+  private txChain: Promise<void> = Promise.resolve();
   /** 还原写事务进行中：onEdit 只记录 latest 不调度（还原纳入同一串行时序，防止并发写）。 */
   private restoreLock = false;
   /** 还原事务期间是否发生过编辑（事件标志，F2：编辑后撤销回原值也算编辑，不得按字符串比较漏判）。 */
@@ -120,26 +122,28 @@ export class EditSession {
     await this.flush();
   }
 
-  /** 显式放弃本地改动：重读文件，编辑器重置为服务端内容；返回新内容（失败返回 null）。 */
+  /** 显式放弃本地改动：重读文件，编辑器重置为服务端内容；返回新内容（失败返回 null）。
+   *  经统一串行链执行（F10：不得在还原/写在途期间并发重读改写基线）。 */
   async discard(): Promise<string | null> {
-    this.clearTimer();
-    if (this.pumpPromise) await this.pumpPromise; // join 在途
-    let r: FileEditRead;
-    try {
-      r = await this.io.read();
-    } catch {
-      return null;
-    }
-    if (!r.editable) return null;
-    this.latest = r.content;
-    this.sentContent = r.content;
-    this.confirmedContent = r.content;
-    this.baseHash = r.baseHash;
-    this.status = 'clean';
-    this.blockedReason = '';
-    this.restoreEdited = false;
-    this.emit();
-    return r.content;
+    return this.serialized(async () => {
+      this.clearTimer();
+      let r: FileEditRead;
+      try {
+        r = await this.io.read();
+      } catch {
+        return null;
+      }
+      if (!r.editable) return null;
+      this.latest = r.content;
+      this.sentContent = r.content;
+      this.confirmedContent = r.content;
+      this.baseHash = r.baseHash;
+      this.status = 'clean';
+      this.blockedReason = '';
+      this.restoreEdited = false;
+      this.emit();
+      return r.content;
+    });
   }
 
   /**
@@ -148,12 +152,24 @@ export class EditSession {
    * F2：restoreLock 覆盖整个「初始 flush + 还原写」事务——期间任何编辑（含编辑后
    * 撤销回原值）只置 restoreEdited 标志不调度；快照写成功后若标志置位，MUST NOT
    * 用快照覆盖 latest，未确认部分立即以新基线补发。
+   *  F10：整个还原事务（初始 flush + 快照写 + 补发）经统一串行链执行，
+   *  canLeave() 经 txChain 感知并等待；任意时刻至多一个写请求在途。
+   *  F13：restoreLock/restoreEdited 在调用 restore() 时即启用——排队等待前序事务
+   *  的窗口内收到的编辑同样只置事件标志，MUST NOT 走普通 pump 后被快照覆盖。
    */
   async restore(): Promise<string | null> {
     this.restoreLock = true;
     this.restoreEdited = false;
     try {
-      await this.flush();
+      return await this.serialized(() => this.restoreTx());
+    } finally {
+      this.restoreLock = false; // 排队取消/blocked/失败/异常所有出口统一释放
+    }
+  }
+
+  private async restoreTx(): Promise<string | null> {
+    try {
+      await this.flushInTx();
       if (this.status === 'blocked') return null;
       if (
         !this.restoreEdited &&
@@ -169,7 +185,7 @@ export class EditSession {
         if (this.latest !== this.confirmedContent) {
           this.status = 'pending';
           this.emit();
-          await this.flush();
+          await this.flushInTx();
           // flush 可能在补发中遇冲突转 blocked（TS 控制流不跨 await 追踪字段突变，显式读取）
           const after = this.status as EditSessionStatus;
           if (after === 'blocked') return null;
@@ -184,21 +200,52 @@ export class EditSession {
       this.emit();
       return this.snapshot;
     } finally {
-      this.restoreLock = false; // 所有 blocked/失败/异常出口统一释放
+      /* restoreLock 由外层 restore() 释放 */
     }
   }
 
-  /** 离开守卫：flush 后仍有未解决阻塞 → 不允许切换文件/退出编辑。 */
+  /** 离开守卫：flush + 等待在途事务（含还原）后仍有未解决阻塞 → 不允许切换文件/退出编辑。 */
   async canLeave(): Promise<boolean> {
     await this.flush();
+    await this.txChain; // 还原事务在途时等待其完成（含补发）
     return this.status !== 'blocked';
   }
 
+  /** F11：卸载/销毁前尽力 flush——清 debounce 计时器后立即泵出未确认内容（非阻塞态）。 */
   dispose(): void {
     this.clearTimer();
+    if (this.status !== 'blocked' && this.latest !== this.confirmedContent) {
+      void this.pump();
+    }
   }
 
   // ---------- 内部 ----------
+
+  /** F10：统一串行执行器——同一时刻至多一段事务在途。
+   *  事务内不得再调 flush/pump（会自等待）：事务内的补写一律走 run() 直执行（flushInTx）。 */
+  private async serialized<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this.txChain;
+    let release!: () => void;
+    this.txChain = new Promise<void>((res) => {
+      release = res;
+    });
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  /** 事务内的 flush 等价物：直接跑 run() 循环（不碰串行链）。 */
+  private async flushInTx(): Promise<void> {
+    this.clearTimer();
+    for (;;) {
+      // eslint-disable-next-line no-await-in-loop
+      await this.run();
+      if (this.status === 'blocked' || this.latest === this.confirmedContent) return;
+    }
+  }
 
   private schedule(): void {
     this.clearTimer();
@@ -215,10 +262,10 @@ export class EditSession {
     }
   }
 
-  /** 单在途泵：同一时刻至多一个写请求；在途期间的编辑合并为 latest，响应后补发。 */
+  /** 单在途泵：写请求经统一串行链，任意时刻至多一个在途；在途期间的编辑合并为 latest，响应后补发。 */
   private pump(): Promise<void> {
     if (!this.pumpPromise) {
-      this.pumpPromise = this.run().finally(() => {
+      this.pumpPromise = this.serialized(() => this.run()).finally(() => {
         this.pumpPromise = null;
       });
     }
