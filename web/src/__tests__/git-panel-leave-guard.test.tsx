@@ -187,3 +187,143 @@ describe('F11：loadStatus 清视图前过离开守卫', () => {
     unmount();
   });
 });
+
+/* ============================ 批注 3：编辑/查看模式跨文件保持 ============================ */
+
+const entryB: GitFileEntry = { ...entry, path: 'b.ts' };
+
+function makeDiffFor(path: string): GitDiffResult {
+  return {
+    oldContent: `${path}-old\n`,
+    newContent: `${path}-new\n`,
+    oldExists: true,
+    newExists: true,
+    oldMode: '100644',
+    newMode: '100644',
+    isBinary: false,
+    truncated: false,
+  };
+}
+
+function clickFile(container: HTMLElement, path: string) {
+  const el = [...container.querySelectorAll<HTMLElement>('.git-file-path')].find(
+    (x) => x.textContent === path,
+  )!;
+  expect(el, `文件 ${path} 在列表中`).toBeTruthy();
+  act(() => el.click());
+}
+
+const isEditing = (container: HTMLElement) =>
+  [...container.querySelectorAll('.cm-content')].some(
+    (el) => el.getAttribute('contenteditable') === 'true',
+  );
+
+describe('批注 3：编辑/查看模式跨文件保持', () => {
+  beforeEach(() => {
+    gitStatusMock.mockResolvedValue({ branch: 'main', files: [entry, entryB] });
+    gitDiffMock.mockImplementation(async (_t: string, _ref: string, path: string) =>
+      makeDiffFor(path),
+    );
+    gitFileReadMock.mockImplementation(async (_t: string, path: string) => ({
+      editable: true as const,
+      content: `${path} content\n`,
+      baseHash: `h-${path}`,
+      lineEnding: 'lf' as const,
+      hasBom: false,
+      mode: '0644',
+    }));
+  });
+
+  it('编辑模式切到可编辑文件 → 新文件自动进入编辑（免再选）', async () => {
+    const { container, unmount } = mount(<GitPanel taskID="t1" active />);
+    await until(() => container.querySelector('.git-file-path') !== null);
+    clickFile(container, 'a.ts');
+    await until(() => container.querySelector('.cm-editor') !== null);
+    // 切单列后进入编辑
+    act(() => {
+      [...container.querySelectorAll<HTMLButtonElement>('button')]
+        .find((b) => b.textContent === '单列')!
+        .click();
+    });
+    await until(
+      () =>
+        [...container.querySelectorAll<HTMLButtonElement>('button')].some(
+          (b) => b.textContent === '编辑' && !b.disabled,
+        ),
+    );
+    act(() => {
+      [...container.querySelectorAll<HTMLButtonElement>('button')]
+        .find((b) => b.textContent === '编辑')!
+        .click();
+    });
+    await until(() => isEditing(container));
+    // 切到 b.ts：无未确认编辑 → leaveGuard 放行 → 新视图自动进入编辑
+    clickFile(container, 'b.ts');
+    await until(() => container.querySelector('.git-diff-header')?.textContent?.includes('b.ts') ?? false);
+    await until(() => isEditing(container));
+    // b.ts 走了自己的资格预取与基线
+    expect(gitFileReadMock.mock.calls.some((c) => c[1] === 'b.ts')).toBe(true);
+    expect(container.textContent).toContain('退出编辑'); // 编辑工具栏在场
+    unmount();
+  });
+
+  it('编辑模式切到不可编辑文件 → 落回查看并显示原因', async () => {
+    const { container, unmount } = mount(<GitPanel taskID="t1" active />);
+    await until(() => container.querySelector('.git-file-path') !== null);
+    clickFile(container, 'a.ts');
+    await until(() => container.querySelector('.cm-editor') !== null);
+    act(() => {
+      [...container.querySelectorAll<HTMLButtonElement>('button')]
+        .find((b) => b.textContent === '单列')!
+        .click();
+    });
+    await until(
+      () =>
+        [...container.querySelectorAll<HTMLButtonElement>('button')].some(
+          (b) => b.textContent === '编辑' && !b.disabled,
+        ),
+    );
+    act(() => {
+      [...container.querySelectorAll<HTMLButtonElement>('button')]
+        .find((b) => b.textContent === '编辑')!
+        .click();
+    });
+    await until(() => isEditing(container));
+    // b.ts 不可编辑
+    gitFileReadMock.mockImplementation(async (_t: string, path: string) =>
+      path === 'b.ts'
+        ? { editable: false as const, reasonCode: 'binary' as const, reason: '二进制文件不可编辑' }
+        : {
+            editable: true as const,
+            content: `${path} content\n`,
+            baseHash: `h-${path}`,
+            lineEnding: 'lf' as const,
+            hasBom: false,
+            mode: '0644',
+          },
+    );
+    clickFile(container, 'b.ts');
+    await until(() => container.textContent?.includes('二进制文件不可编辑') ?? false);
+    expect(isEditing(container)).toBe(false);
+    // 无可用编辑命令
+    expect(
+      [...container.querySelectorAll<HTMLButtonElement>('button')].some(
+        (b) => b.textContent === '编辑' && !b.disabled,
+      ),
+    ).toBe(false);
+    unmount();
+  });
+
+  it('查看模式切文件 → 保持查看', async () => {
+    const { container, unmount } = mount(<GitPanel taskID="t1" active />);
+    await until(() => container.querySelector('.git-file-path') !== null);
+    clickFile(container, 'a.ts');
+    await until(() => container.querySelector('.cm-editor') !== null);
+    expect(isEditing(container)).toBe(false);
+    clickFile(container, 'b.ts');
+    await until(() => container.querySelector('.git-diff-header')?.textContent?.includes('b.ts') ?? false);
+    await flushUI();
+    expect(isEditing(container)).toBe(false);
+    unmount();
+  });
+});

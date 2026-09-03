@@ -4,6 +4,7 @@ import {
   EditorView,
   GutterMarker,
   ViewPlugin,
+  WidgetType,
   gutter,
   type DecorationSet,
 } from '@codemirror/view';
@@ -14,13 +15,11 @@ import type { Annotation, DiffSide } from '../../types';
  * 查看模式：gutter 弱标记（同行聚合带数量，悬停摘要，点击定位）+ 选区候选高亮 + 手势捕获。
  * 标记按 (path, ref, untracked) 三元组 + side 在上层过滤后传入；本模块只认行号映射。 */
 
-/** 一次批注手势：单侧连续行范围（1-based 闭区间）+ 指针坐标（气泡锚点）。 */
+/** 一次批注手势：单侧连续行范围（1-based 闭区间）。 */
 export interface AnnotationGesture {
   side: DiffSide;
   startLine: number;
   endLine: number;
-  x: number;
-  y: number;
 }
 
 // ---------- 行号 → 批注聚合 ----------
@@ -170,6 +169,56 @@ const candidateField = StateField.define<DecorationSet>({
 
 export const annotationCandidateExtension: Extension = candidateField;
 
+// ---------- 内联批注区（批注 6：参考 GitLab，在最后选中行下方切开内联卡片，替代悬浮气泡） ----------
+
+/** 打开/关闭内联批注区：line=1-based 目标行（区域插入该行下方）；host 由调用方持有（React portal 挂载点）。 */
+export const setInlineRegionEffect = StateEffect.define<{ line: number; host: HTMLElement } | null>();
+
+class InlineRegionWidget extends WidgetType {
+  constructor(readonly host: HTMLElement) {
+    super();
+  }
+  override eq(other: InlineRegionWidget): boolean {
+    return other.host === this.host;
+  }
+  override toDOM(): HTMLElement {
+    this.host.classList.add('ann-inline-host');
+    return this.host;
+  }
+  override get estimatedHeight(): number {
+    return 140;
+  }
+  // 不覆盖 ignoreEvent：默认全部忽略 = 编辑器不拦截 widget 内事件，
+  // textarea/按钮等表单控件获得原生交互（覆盖为 false 反而会让编辑器抢事件）
+}
+
+const inlineRegionField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(deco, tr) {
+    deco = deco.map(tr.changes);
+    for (const e of tr.effects) {
+      if (e.is(setInlineRegionEffect)) {
+        if (e.value) {
+          const line = Math.min(Math.max(1, e.value.line), tr.state.doc.lines);
+          deco = Decoration.set([
+            Decoration.widget({
+              widget: new InlineRegionWidget(e.value.host),
+              side: 1, // 目标行之后
+              block: true,
+            }).range(tr.state.doc.line(line).to),
+          ]);
+        } else {
+          deco = Decoration.none;
+        }
+      }
+    }
+    return deco;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
+
+export const inlineRegionExtension: Extension = inlineRegionField;
+
 // ---------- 手势捕获 ----------
 
 /** unified 视图删除行（.cm-deletedLine widget）→ 旧侧行号（经 chunks 映射，spec side 映射规则）。 */
@@ -236,8 +285,8 @@ export function annotationGestures(opts: {
     let firedOnDown = false;
     const contentSide: DiffSide = opts.unified ? 'new' : opts.side;
 
-    const fire = (side: DiffSide, startLine: number, endLine: number, e: MouseEvent) =>
-      opts.onGesture({ side, startLine, endLine, x: e.clientX, y: e.clientY });
+    const fire = (side: DiffSide, startLine: number, endLine: number) =>
+      opts.onGesture({ side, startLine, endLine });
 
     const deletedLineOf = (target: HTMLElement): { el: Element; line: number } | null => {
       const el = target.closest('.cm-deletedLine');
@@ -276,7 +325,7 @@ export function annotationGestures(opts: {
         // 行号元素文本即行号（默认 formatNumber=String），不依赖布局几何（jsdom 友好）
         const ln = Number.parseInt((gutterEl.textContent ?? '').trim(), 10);
         if (Number.isInteger(ln) && ln >= 1 && ln <= view.state.doc.lines) {
-          fire(contentSide, ln, ln, event);
+          fire(contentSide, ln, ln);
           firedOnDown = true;
           event.preventDefault();
         }
@@ -299,7 +348,7 @@ export function annotationGestures(opts: {
       if (start?.kind === 'old' && start.line !== null) {
         // 旧侧起手：落在删除块 → 单行或范围；落在普通内容 → 混合侧拒绝
         if (upDel) {
-          fire('old', Math.min(start.line, upDel.line), Math.max(start.line, upDel.line), event);
+          fire('old', Math.min(start.line, upDel.line), Math.max(start.line, upDel.line));
         } else if (target.closest('.cm-content')) {
           opts.onCrossSide?.();
         }
@@ -321,7 +370,7 @@ export function annotationGestures(opts: {
         if (start.line === null) return; // 在非行内容（对齐空白/间隙 widget）按下 → 不回退
         const upLine = contentLineOf(target);
         if (upLine !== null) {
-          fire(contentSide, Math.min(start.line, upLine), Math.max(start.line, upLine), event);
+          fire(contentSide, Math.min(start.line, upLine), Math.max(start.line, upLine));
         }
         return; // 抬起行不可判定 → 不回退
       }
@@ -330,7 +379,7 @@ export function annotationGestures(opts: {
       if (!sel.empty) {
         const from = view.state.doc.lineAt(sel.from);
         const to = view.state.doc.lineAt(sel.to);
-        fire(contentSide, from.number, to.number, event);
+        fire(contentSide, from.number, to.number);
       }
     };
 

@@ -73,6 +73,8 @@ export function GitPanel({
   const [modeOverride, setModeOverride] = useState<DiffViewMode | null>(null);
   // 换行开关（design D6）：默认关（横向滚动）；生命周期与 modeOverride 一致（跨文件/视口保留，卸载丢弃）。
   const [wrapOverride, setWrapOverride] = useState(false);
+  // 批注 3：编辑/查看模式偏好提升到三元组 key 之外——切文件保持模式（新文件经完整资格预取/门禁）
+  const [editModePreferred, setEditModePreferred] = useState(false);
   // openDiff 请求序号：仅最新请求可写 diff/diffError/diffLoading（I2 乱序防护）
   const diffReqSeq = useRef(0);
   // diff review：批注/提交能力/列表定位高亮
@@ -400,6 +402,8 @@ export function GitPanel({
                   }}
                   onRefreshDiff={refreshDiff}
                   editIO={editIO}
+                  editModePreferred={editModePreferred}
+                  onEditModeChange={setEditModePreferred}
                   modeOverride={modeOverride}
                   onModeChange={setModeOverride}
                   wrapOverride={wrapOverride}

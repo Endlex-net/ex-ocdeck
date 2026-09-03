@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Compartment, EditorState, Text, type Extension } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import { MergeView, unifiedMergeView } from '@codemirror/merge';
@@ -7,6 +8,7 @@ import { loadLanguage } from '../editor/language';
 import type {
   Annotation,
   AnnotationCreateInput,
+  DiffSide,
   FileEditRead,
   FileEditReadEditable,
   FileEditWriteInput,
@@ -17,8 +19,10 @@ import {
   annotationCandidateExtension,
   annotationGestures,
   annotationGutter,
+  inlineRegionExtension,
   setAnnotationsEffect,
   setCandidateEffect,
+  setInlineRegionEffect,
   sideMarkerMap,
   unifiedMarkerMap,
   type AnnotationGesture,
@@ -62,6 +66,12 @@ interface DiffViewerProps {
   onRefreshDiff?: () => Promise<void>;
   /** 编辑读写端点；未提供则无编辑入口。 */
   editIO?: EditIO;
+  /** 批注 3：编辑模式偏好提升到 key 之外（GitPanel）——切文件不丢编辑/查看模式。
+   *  true 时本视图资格 eligible 即自动进入编辑（仍走完整预取/门禁/冻结 metadata 流程）；
+   *  不可编辑文件自然落回查看并显示原因。 */
+  editModePreferred?: boolean;
+  /** 模式变更回调（进入/退出编辑时同步给 GitPanel 持久偏好）。 */
+  onEditModeChange?: (editing: boolean) => void;
   modeOverride: DiffViewMode | null;
   onModeChange: (mode: DiffViewMode) => void;
   wrapOverride: boolean;
@@ -103,10 +113,14 @@ function deriveDiffState(diff: GitDiffResult): DiffState {
   return { kind: 'merge' };
 }
 
-interface BubbleState extends AnnotationGesture {
+interface InlineDraftState {
   editorKey: 'a' | 'b' | 'u';
+  side: DiffSide;
+  startLine: number;
+  endLine: number;
+  /** 内联批注区的宿主节点（React portal 挂载点，插入最后选中行下方的 CM block widget）。 */
+  host: HTMLDivElement;
 }
-
 /** 单文件 diff 渲染 + 查看模式批注手势 + 编辑模式写回（diff-review-workbench tasks 5.2/5.3）。 */
 export default function DiffViewer({
   diff,
@@ -120,6 +134,8 @@ export default function DiffViewer({
   onRegisterLeaveGuard,
   onRefreshDiff,
   editIO,
+  editModePreferred = false,
+  onEditModeChange,
   modeOverride,
   onModeChange,
   wrapOverride,
@@ -132,10 +148,10 @@ export default function DiffViewer({
   /** F3：退出事务期间经 compartment 把新侧编辑器切只读过渡态（保留 session 直至刷新完成）。 */
   const editLockCompartment = useRef(new Compartment());
 
-  const [bubble, setBubble] = useState<BubbleState | null>(null);
-  const [bubbleComment, setBubbleComment] = useState('');
-  const [bubbleBusy, setBubbleBusy] = useState(false);
-  const [bubbleError, setBubbleError] = useState('');
+  const [draft, setDraft] = useState<InlineDraftState | null>(null);
+  const [draftComment, setDraftComment] = useState('');
+  const [draftBusy, setDraftBusy] = useState(false);
+  const [draftError, setDraftError] = useState('');
   const [crossSideHint, setCrossSideHint] = useState('');
 
   // 编辑模式：view（查看）→ edit
@@ -184,15 +200,17 @@ export default function DiffViewer({
 
   const clearCandidates = () => {
     for (const v of Object.values(editorsRef.current)) {
-      v?.dispatch({ effects: setCandidateEffect.of(null) });
+      v?.dispatch({
+        effects: [setCandidateEffect.of(null), setInlineRegionEffect.of(null)],
+      });
     }
   };
 
-  const closeBubble = () => {
-    setBubble(null);
-    setBubbleComment('');
-    setBubbleError('');
-    setBubbleBusy(false);
+  const closeDraft = () => {
+    setDraft(null);
+    setDraftComment('');
+    setDraftError('');
+    setDraftBusy(false);
     clearCandidates();
   };
 
@@ -204,15 +222,15 @@ export default function DiffViewer({
       return;
     }
     setCrossSideHint('');
-    // 气泡 fixed 定位：钳制在视口内，避免贴边溢出（气泡宽 300px）
-    const x = Math.max(8, Math.min(g.x, window.innerWidth - 316));
-    const y = Math.max(8, Math.min(g.y, window.innerHeight - 200));
-    setBubble({ ...g, editorKey, x, y });
-    setBubbleComment('');
-    setBubbleError('');
-    // 选区候选高亮（空行范围 from==to 时回退到前一行，mark decoration 不允许空区间）
+    setDraftComment('');
+    setDraftError('');
+    // 批注 6：内联批注区插入最后选中行下方（CM block widget），随滚动自然移动
     const v = editorsRef.current[editorKey];
+    const host = document.createElement('div');
     if (v) {
+      const line = Math.min(Math.max(1, g.endLine), v.state.doc.lines);
+      v.dispatch({ effects: setInlineRegionEffect.of({ line, host }) });
+      // 选区候选高亮（空行范围 from==to 时回退到前一行，mark decoration 不允许空区间）
       const s = Math.min(Math.max(1, g.startLine), v.state.doc.lines);
       const e = Math.min(Math.max(s, g.endLine), v.state.doc.lines);
       let from = v.state.doc.line(s).from;
@@ -222,39 +240,46 @@ export default function DiffViewer({
         v.dispatch({ effects: setCandidateEffect.of({ from, to }) });
       }
     }
+    setDraft({
+      editorKey,
+      side: g.side,
+      startLine: g.startLine,
+      endLine: g.endLine,
+      host,
+    });
   };
 
-  const submitBubble = async () => {
-    // fail-closed：仅查看模式可提交批注（F7：气泡不得带入编辑模式）
-    if (!bubble || !onCreateAnnotation || editPhase !== 'view') {
-      if (editPhase !== 'view') closeBubble();
+  const submitDraft = async () => {
+    // fail-closed：仅查看模式可提交批注（F7：草稿不得带入编辑模式）
+    if (!draft || !onCreateAnnotation || editPhase !== 'view') {
+      if (editPhase !== 'view') closeDraft();
       return;
     }
     // 空评论丢弃（spec：未输入任何评论的批注不留存）
-    if (!bubbleComment.trim()) {
-      closeBubble();
+    if (!draftComment.trim()) {
+      closeDraft();
       return;
     }
-    setBubbleBusy(true);
-    setBubbleError('');
+    setDraftBusy(true);
+    setDraftError('');
     try {
-      const win = buildSnapshot(sideContent(diff, bubble.side), bubble.startLine, bubble.endLine);
+      const win = buildSnapshot(sideContent(diff, draft.side), draft.startLine, draft.endLine);
       await onCreateAnnotation({
         path,
-        side: bubble.side,
+        side: draft.side,
         ref: sourceRef,
         untracked,
-        startLine: bubble.startLine,
-        endLine: bubble.endLine,
+        startLine: draft.startLine,
+        endLine: draft.endLine,
         snapshotStartLine: win.snapshotStartLine,
         snapshotLineCount: win.snapshotLineCount,
         snapshot: win.snapshot,
-        comment: bubbleComment,
+        comment: draftComment,
       });
-      closeBubble();
+      closeDraft();
     } catch (err) {
-      setBubbleError(err instanceof Error ? err.message : '创建批注失败');
-      setBubbleBusy(false);
+      setDraftError(err instanceof Error ? err.message : '创建批注失败');
+      setDraftBusy(false);
     }
   };
 
@@ -330,7 +355,7 @@ export default function DiffViewer({
   const enterEdit = () => {
     const firstRead = firstReadRef.current;
     if (!editIO || editPhase !== 'view' || eligibility !== 'eligible' || !firstRead) return;
-    closeBubble(); // F7(旧)：进入编辑前关闭批注气泡与候选高亮（编辑模式无批注手势）
+    closeDraft(); // F7(旧)：进入编辑前关闭内联批注区与候选高亮（编辑模式无批注手势）
     setCrossSideHint('');
     sessionRef.current = new EditSession({
       path,
@@ -339,7 +364,16 @@ export default function DiffViewer({
       onChange: () => setSessionTick((t) => t + 1),
     });
     setEditPhase('edit');
+    onEditModeChange?.(true); // 批注 3：编辑偏好同步到 GitPanel（跨文件保持）
   };
+
+  // 批注 3：编辑偏好为 true 且本视图资格 eligible → 自动进入编辑（切文件免再选）
+  useEffect(() => {
+    if (editModePreferred && editPhase === 'view' && eligibility === 'eligible') {
+      enterEdit();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editModePreferred, editPhase, eligibility]);
 
   /** 退出事务开始：新侧编辑器切只读过渡态（session 保留，输入不会静默丢失）。 */
   const lockEditors = (locked: boolean) => {
@@ -384,6 +418,7 @@ export default function DiffViewer({
     setRestoreArmed(false);
     setExiting(false);
     exitingRef.current = false;
+    onEditModeChange?.(false); // 批注 3：显式退出 → 偏好回查看
   };
 
   const retrySave = async () => {
@@ -498,6 +533,9 @@ export default function DiffViewer({
 
   useEffect(() => {
     if (state.kind !== 'merge' || !containerRef.current) return;
+    // 批注 6：编辑器销毁-重建时关闭内联批注区——宿主 block widget 随旧编辑器销毁，
+    // 草稿锚点无法跨重建保留（进入编辑前 enterEdit 已先行关闭，此处覆盖形态/换行切换）
+    closeDraft();
     const container = containerRef.current;
     let destroyed = false;
     let view: MergeView | EditorView | null = null;
@@ -519,6 +557,7 @@ export default function DiffViewer({
         ...wrapExt,
         ...langExt,
         annotationCandidateExtension,
+        inlineRegionExtension,
         ...(onCreateAnnotation
           ? [
               annotationGutter((ids) => onLocateAnnotations?.(ids)),
@@ -795,46 +834,64 @@ export default function DiffViewer({
             </div>
           )}
           <div ref={containerRef} className="diff-editor" />
-          {bubble && editPhase === 'view' && (
-            <div
-              className="ann-bubble"
-              style={{ left: bubble.x, top: bubble.y }}
-              onKeyDown={(e) => {
-                if (e.key === 'Escape') closeBubble();
-              }}
-            >
-              <div className="ann-bubble-title">
-                批注 · {bubble.side === 'old' ? '旧侧' : '新侧'} L{bubble.startLine}
-                {bubble.endLine > bubble.startLine ? `-${bubble.endLine}` : ''}
-              </div>
-              <textarea
-                className="input ann-bubble-input"
-                autoFocus
-                rows={3}
-                placeholder="评论（留空关闭则丢弃）"
-                value={bubbleComment}
-                onChange={(e) => setBubbleComment(e.target.value)}
-              />
-              {bubbleError && <div className="error-line">{bubbleError}</div>}
-              <div className="ann-bubble-actions">
-                <button
-                  type="button"
-                  className="btn btn-small btn-ghost"
-                  onClick={closeBubble}
-                >
-                  取消
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-small btn-primary"
-                  disabled={bubbleBusy}
-                  onClick={() => void submitBubble()}
-                >
-                  {bubbleBusy ? '添加中…' : '添加批注'}
-                </button>
-              </div>
-            </div>
-          )}
+          {/* 批注 6：内联批注区（参考 GitLab 变更评论）——portal 挂进 CM block widget 宿主，
+              在该侧最后选中行下方切开，随编辑器滚动，无悬浮浮层 */}
+          {draft &&
+            editPhase === 'view' &&
+            createPortal(
+              <div
+                className="ann-inline"
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') closeDraft();
+                }}
+              >
+                <div className="ann-inline-head">
+                  <span className="ann-inline-title">发布评论</span>
+                  <span className="ann-inline-side">
+                    {draft.side === 'old' ? '旧侧' : '新侧'}
+                  </span>
+                </div>
+                <textarea
+                  className="input ann-inline-input"
+                  autoFocus
+                  rows={3}
+                  placeholder="添加此更改的上下文"
+                  value={draftComment}
+                  onChange={(e) => setDraftComment(e.target.value)}
+                  onKeyDown={(e) => {
+                    // 批注 4：⌘/Ctrl+Enter 快速提交（与点击同语义，空评论仍丢弃）；Esc 由外层关闭
+                    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                      e.preventDefault();
+                      void submitDraft();
+                    }
+                  }}
+                />
+                {draftError && <div className="error-line">{draftError}</div>}
+                <div className="ann-inline-actions">
+                  <span className="ann-inline-range">
+                    第 {draft.startLine}
+                    {draft.endLine > draft.startLine ? `-${draft.endLine}` : ''} 行
+                  </span>
+                  <span className="ann-inline-hint">⌘/Ctrl+Enter 提交 · Esc 取消</span>
+                  <button
+                    type="button"
+                    className="btn btn-small btn-ghost"
+                    onClick={closeDraft}
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-small btn-primary"
+                    disabled={draftBusy}
+                    onClick={() => void submitDraft()}
+                  >
+                    {draftBusy ? '发布中…' : '发布评论'}
+                  </button>
+                </div>
+              </div>,
+              draft.host,
+            )}
         </>
       )}
     </div>

@@ -1248,6 +1248,45 @@ select.input {
   color: color-mix(in oklch, var(--success) 80%, var(--fg));
 }
 
+/* markdown 结构化标记（classHighlighter 实测类名；全部走设计系统变量派生） */
+.tok-heading {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.tok-strong {
+  font-weight: 600;
+}
+
+.tok-emphasis {
+  font-style: italic;
+}
+
+.tok-strikethrough {
+  text-decoration: line-through;
+}
+
+.tok-link {
+  color: var(--accent);
+}
+
+.tok-url {
+  color: var(--muted);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklch, var(--muted) 45%, transparent);
+}
+
+.tok-quote {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.tok-monospace {
+  background: var(--surface);
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
 /* ---------- 工作台页头「⋯」溢出菜单（design task-workbench.html wb-overflow） ----------
    桌面与窄屏同一入口，故不放在窄屏 media query 内。限定 .workbench 作用域。 */
 .workbench .header-overflow {
@@ -1587,43 +1626,78 @@ select.input {
   background: var(--warn);
 }
 
-/* 批注候选选区高亮（框选后气泡打开期间） */
+/* 批注候选选区高亮（框选后内联批注区打开期间） */
 .cm-annotationCandidate {
   background: var(--accent-soft);
   outline: 1px dashed color-mix(in oklch, var(--accent) 45%, var(--border));
 }
 
-/* 批注输入气泡 */
-.ann-bubble {
-  position: fixed;
-  z-index: 80;
-  width: 300px;
-  background: var(--bg);
-  border: 1px solid var(--border-strong);
-  border-radius: 6px;
-  box-shadow: var(--shadow-pop);
-  padding: 8px;
+/* 内联批注区（批注 6，参考 GitLab 变更评论）：最后选中行下方切开的内嵌卡片。
+   嵌在 CM block widget 里随编辑器滚动——低存在感边框、无浮层阴影、不遮挡其他行 */
+.ann-inline-host {
+  display: block;
+  cursor: default;
+}
+
+.ann-inline {
+  margin: 2px 0 4px;
+  padding: 8px 10px;
   display: flex;
   flex-direction: column;
   gap: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  border-radius: 6px;
+  /* 宿主继承 .cm-content 的等宽字体与 pre 排版，卡片恢复 UI 字体与正常空白折叠 */
+  font-family: var(--font-ui);
+  white-space: normal;
 }
 
-.ann-bubble-title {
+.ann-inline-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.ann-inline-title {
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ann-inline-side {
   color: var(--muted);
   font-size: 11px;
 }
 
-.ann-bubble-input {
+.ann-inline-input {
   width: 100%;
   min-width: 0;
   resize: vertical;
   font-size: 12px;
 }
 
-.ann-bubble-actions {
+.ann-inline-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
   gap: 6px;
+}
+
+/* 行范围标签（低存在感，左侧占位） */
+.ann-inline-range {
+  margin-right: auto;
+  color: var(--muted);
+  font-size: 11px;
+  user-select: none;
+}
+
+/* 快捷键提示（低存在感） */
+.ann-inline-hint {
+  color: var(--muted);
+  font-size: 10px;
+  user-select: none;
 }
 
 /* 批注列表面板：低存在感，嵌于 git 侧栏 */

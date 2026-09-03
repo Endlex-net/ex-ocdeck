@@ -109,12 +109,12 @@ function renderViewer(over: {
   return { ...mounted, onModeChange, onWrapChange };
 }
 
-async function submitBubbleWith(container: HTMLElement, comment: string) {
-  const ta = container.querySelector<HTMLTextAreaElement>('.ann-bubble-input');
-  expect(ta, '批注气泡已打开').toBeTruthy();
+async function submitDraftWith(container: HTMLElement, comment: string) {
+  const ta = container.querySelector<HTMLTextAreaElement>('.ann-inline-input');
+  expect(ta, '内联批注区已打开').toBeTruthy();
   if (comment) setNativeValue(ta!, comment);
-  const btn = [...container.querySelectorAll<HTMLButtonElement>('.ann-bubble-actions button')].find(
-    (b) => b.textContent?.includes('添加批注'),
+  const btn = [...container.querySelectorAll<HTMLButtonElement>('.ann-inline-actions button')].find(
+    (b) => b.textContent?.includes('发布评论'),
   )!;
   await act(async () => {
     btn.click();
@@ -150,7 +150,7 @@ async function clickEdit(container: HTMLElement) {
 describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
   beforeEach(() => stubMatchMedia(false));
 
-  it('unified 拖选新侧行 → 气泡 → 提交：side=new、行范围、快照取自原始侧内容并保留 \\r', async () => {
+  it('unified 拖选新侧行 → 内联批注区 → 提交：side=new、行范围、快照取自原始侧内容并保留 \\r', async () => {
     const onCreateAnnotation = vi.fn(async (_input: AnnotationCreateInput) => {});
     const { container, unmount } = renderViewer({
       diff: makeDiff({
@@ -170,11 +170,14 @@ describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
         .querySelectorAll('.cm-line')[3]
         .dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     });
-    expect(container.querySelector('.ann-bubble')).toBeTruthy();
-    expect(container.textContent).toContain('新侧 L3-4');
+    expect(container.querySelector('.ann-inline')).toBeTruthy();
+    // 批注 6：内联批注区嵌在编辑器内容里（block widget），不是悬浮浮层
+    expect(container.querySelector('.cm-content .ann-inline')).toBeTruthy();
+    expect(container.textContent).toContain('发布评论');
+    expect(container.textContent).toContain('第 3-4 行');
     // 候选选区高亮
     expect(container.querySelector('.cm-annotationCandidate')).toBeTruthy();
-    await submitBubbleWith(container, '这里改成 22 有问题');
+    await submitDraftWith(container, '这里改成 22 有问题');
     expect(onCreateAnnotation).toHaveBeenCalledTimes(1);
     const input = onCreateAnnotation.mock.calls[0][0];
     expect(input).toMatchObject({
@@ -190,8 +193,8 @@ describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
     expect(input.snapshot).toBe('l1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6\r\nl7\r');
     expect(input.snapshotStartLine).toBe(1);
     expect(input.snapshotLineCount).toBe(7);
-    // 提交后气泡关闭、候选高亮清除
-    expect(container.querySelector('.ann-bubble')).toBeNull();
+    // 提交后内联批注区移除、候选高亮清除
+    expect(container.querySelector('.ann-inline')).toBeNull();
     expect(container.querySelector('.cm-annotationCandidate')).toBeNull();
     unmount();
   });
@@ -207,9 +210,52 @@ describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
         .querySelector('.cm-line')!
         .dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     });
-    await submitBubbleWith(container, '   ');
+    await submitDraftWith(container, '   ');
     expect(onCreateAnnotation).not.toHaveBeenCalled();
-    expect(container.querySelector('.ann-bubble')).toBeNull();
+    expect(container.querySelector('.ann-inline')).toBeNull();
+    unmount();
+  });
+
+  it('批注 4：内联批注区 ⌘/Ctrl+Enter 快捷提交；Esc 关闭；空评论快捷键同样丢弃', async () => {
+    const onCreateAnnotation = vi.fn(async (_input: AnnotationCreateInput) => {});
+    const { container, unmount } = renderViewer({ onCreateAnnotation });
+    await until(() => editorViews(container).length === 1);
+    const openDraft = () => {
+      const view = editorViews(container)[0];
+      act(() => {
+        view.dispatch({ selection: { anchor: 0, head: view.state.doc.line(1).to } });
+        container
+          .querySelector('.cm-line')!
+          .dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      });
+      expect(container.querySelector('.ann-inline')).toBeTruthy();
+      return container.querySelector<HTMLTextAreaElement>('.ann-inline-input')!;
+    };
+    // 空评论 + ⌘Enter → 丢弃
+    let ta = openDraft();
+    act(() => {
+      ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', metaKey: true, bubbles: true }));
+    });
+    expect(onCreateAnnotation).not.toHaveBeenCalled();
+    expect(container.querySelector('.ann-inline')).toBeNull();
+    // 有评论 + Esc → 关闭不提交
+    ta = openDraft();
+    setNativeValue(ta, '按 Esc');
+    act(() => {
+      ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    });
+    expect(onCreateAnnotation).not.toHaveBeenCalled();
+    expect(container.querySelector('.ann-inline')).toBeNull();
+    // 有评论 + Ctrl+Enter → 提交（与点击同语义）
+    ta = openDraft();
+    setNativeValue(ta, '快捷键评论');
+    await act(async () => {
+      ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true }));
+      await Promise.resolve();
+    });
+    expect(onCreateAnnotation).toHaveBeenCalledTimes(1);
+    expect(onCreateAnnotation.mock.calls[0][0].comment).toBe('快捷键评论');
+    expect(container.querySelector('.ann-inline')).toBeNull();
     unmount();
   });
 
@@ -229,8 +275,9 @@ describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
         .querySelectorAll('.cm-merge-a .cm-line')[1]
         .dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     });
-    expect(container.textContent).toContain('旧侧 L2');
-    await submitBubbleWith(container, '旧侧评论');
+    expect(container.textContent).toContain('旧侧');
+    expect(container.textContent).toContain('第 2 行');
+    await submitDraftWith(container, '旧侧评论');
     expect(onCreateAnnotation.mock.calls[0][0]).toMatchObject({
       side: 'old',
       startLine: 2,
@@ -252,8 +299,8 @@ describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
       deleted.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
       deleted.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     });
-    expect(container.querySelector('.ann-bubble')).toBeTruthy();
-    expect(container.textContent).toContain('旧侧 L3');
+    expect(container.querySelector('.ann-inline')).toBeTruthy();
+    expect(container.textContent).toContain('第 3 行');
     unmount();
   });
 
@@ -269,8 +316,8 @@ describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
       dels[0].dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); // del1
       dels[1].dispatchEvent(new MouseEvent('mouseup', { bubbles: true })); // del2
     });
-    expect(container.textContent).toContain('旧侧 L2-3');
-    await submitBubbleWith(container, '删除的两行都有问题');
+    expect(container.textContent).toContain('第 2-3 行');
+    await submitDraftWith(container, '删除的两行都有问题');
     expect(onCreateAnnotation.mock.calls[0][0]).toMatchObject({
       side: 'old',
       startLine: 2,
@@ -294,14 +341,14 @@ describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
       line.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     });
     expect(container.textContent).toContain('选区跨越两侧');
-    expect(container.querySelector('.ann-bubble')).toBeNull();
+    expect(container.querySelector('.ann-inline')).toBeNull();
     // 普通内容拖到删除块
     act(() => {
       line.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
       deleted.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     });
     expect(onCreateAnnotation).not.toHaveBeenCalled();
-    expect(container.querySelector('.ann-bubble')).toBeNull();
+    expect(container.querySelector('.ann-inline')).toBeNull();
     unmount();
   });
 
@@ -314,9 +361,9 @@ describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
       line.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
       line.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     });
-    expect(container.querySelector('.ann-bubble')).toBeTruthy();
-    expect(container.textContent).toContain('新侧 L2');
-    await submitBubbleWith(container, '单击行批注');
+    expect(container.querySelector('.ann-inline')).toBeTruthy();
+    expect(container.textContent).toContain('第 2 行');
+    await submitDraftWith(container, '单击行批注');
     expect(onCreateAnnotation.mock.calls[0][0]).toMatchObject({
       side: 'new',
       startLine: 2,
@@ -344,13 +391,13 @@ describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
       gutterEl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
       gutterEl.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     });
-    // 气泡必须是行号单击的 L4 单行，不是旧选区 L1-3/L1-4
-    expect(container.textContent).toContain('批注 · 新侧 L4');
-    expect(container.textContent).not.toContain('L1-');
+    // 内联批注区必须是行号单击的 L4 单行，不是旧选区 L1-3/L1-4
+    expect(container.textContent).toContain('第 4 行');
+    expect(container.textContent).not.toContain('第 1-');
     unmount();
   });
 
-  it('F14：点击批注标记（gutter widget）+ 旧选区 → 只定位不开新气泡', async () => {
+  it('F14：点击批注标记（gutter widget）+ 旧选区 → 只定位不开新批注区', async () => {
     const onCreateAnnotation = vi.fn(async (_input: AnnotationCreateInput) => {});
     const onLocateAnnotations = vi.fn();
     const { container, unmount } = renderViewer({
@@ -371,7 +418,7 @@ describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
       dot.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     });
     expect(onLocateAnnotations).toHaveBeenCalledWith(['ann-1']);
-    expect(container.querySelector('.ann-bubble')).toBeNull(); // 未被旧选区误开批注
+    expect(container.querySelector('.ann-inline')).toBeNull(); // 未被旧选区误开批注
     unmount();
   });
 
@@ -391,12 +438,12 @@ describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
       bLine.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     });
     expect(container.textContent).toContain('选区跨越两侧');
-    expect(container.querySelector('.ann-bubble')).toBeNull();
+    expect(container.querySelector('.ann-inline')).toBeNull();
     expect(onCreateAnnotation).not.toHaveBeenCalled();
     unmount();
   });
 
-  it('F16：点击并排对齐空白区（.cm-mergeSpacer）+ 残留选区 → 零新气泡零创建', async () => {
+  it('F16：点击并排对齐空白区（.cm-mergeSpacer）+ 残留选区 → 零新批注区零创建', async () => {
     const onCreateAnnotation = vi.fn(async (_input: AnnotationCreateInput) => {});
     const { container, unmount } = renderViewer({
       modeOverride: 'side-by-side',
@@ -416,7 +463,7 @@ describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
       spacer.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
       spacer.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     });
-    expect(container.querySelector('.ann-bubble')).toBeNull();
+    expect(container.querySelector('.ann-inline')).toBeNull();
     expect(onCreateAnnotation).not.toHaveBeenCalled();
     unmount();
   });
@@ -436,7 +483,7 @@ describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
       view.contentDOM.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
       view.contentDOM.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     });
-    expect(container.querySelector('.ann-bubble')).toBeNull();
+    expect(container.querySelector('.ann-inline')).toBeNull();
     expect(onCreateAnnotation).not.toHaveBeenCalled();
     unmount();
   });
@@ -452,8 +499,8 @@ describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
     act(() => {
       gutterEl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
     });
-    expect(container.textContent).toContain('新侧 L2');
-    await submitBubbleWith(container, '行号批注');
+    expect(container.textContent).toContain('第 2 行');
+    await submitDraftWith(container, '行号批注');
     expect(onCreateAnnotation.mock.calls[0][0]).toMatchObject({
       side: 'new',
       startLine: 2,
@@ -472,7 +519,7 @@ describe('查看模式批注手势（框选/点击 + 快照构造）', () => {
     act(() => {
       aGutterEl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
     });
-    expect(sb.container.textContent).toContain('旧侧 L2');
+    expect(sb.container.textContent).toContain('第 2 行');
     sb.unmount();
   });
 });
@@ -1309,7 +1356,7 @@ describe('编辑模式（进入/写回/横幅）', () => {
         .querySelector('.cm-line')!
         .dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     });
-    await submitBubbleWith(container, '新内容批注');
+    await submitDraftWith(container, '新内容批注');
     expect(onCreateAnnotation).toHaveBeenCalledTimes(1);
     expect(onCreateAnnotation.mock.calls[0][0].snapshot).toContain('fresh-line1');
     expect(onCreateAnnotation.mock.calls[0][0].snapshot).not.toContain('old-line1');
@@ -1429,7 +1476,7 @@ describe('编辑模式（进入/写回/横幅）', () => {
     unmount();
   });
 
-  it('F7：先开批注气泡再进入编辑 → 气泡与候选高亮关闭，编辑模式无气泡渲染', async () => {
+  it('F7：先开内联批注区再进入编辑 → 批注区与候选高亮关闭，编辑模式无批注区渲染', async () => {
     const io = { read: vi.fn(), write: vi.fn() };
     const onCreateAnnotation = vi.fn(async (_input: AnnotationCreateInput) => {});
     io.read.mockResolvedValue(editableRead);
@@ -1437,16 +1484,16 @@ describe('编辑模式（进入/写回/横幅）', () => {
     const { container, unmount } = renderViewer({ editIO: io, onCreateAnnotation });
     await until(() => editorViews(container).length > 0);
     const view = editorViews(container)[0];
-    // 查看模式框选打开气泡
+    // 查看模式框选打开内联批注区
     act(() => {
       view.dispatch({ selection: { anchor: 0, head: view.state.doc.line(1).to } });
       container
         .querySelector('.cm-line')!
         .dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     });
-    expect(container.querySelector('.ann-bubble')).toBeTruthy();
+    expect(container.querySelector('.ann-inline')).toBeTruthy();
     expect(container.querySelector('.cm-annotationCandidate')).toBeTruthy();
-    // 不提交气泡，直接进入编辑（先等资格预取完成）
+    // 不提交草稿，直接进入编辑（先等资格预取完成）
     await until(() =>
       [...container.querySelectorAll<HTMLButtonElement>('button')].some(
         (b) => b.textContent === '编辑' && !b.disabled,
@@ -1463,7 +1510,7 @@ describe('编辑模式（进入/写回/横幅）', () => {
           (el) => el.getAttribute('contenteditable') === 'true',
         ),
     );
-    expect(container.querySelector('.ann-bubble')).toBeNull();
+    expect(container.querySelector('.ann-inline')).toBeNull();
     expect(container.querySelector('.cm-annotationCandidate')).toBeNull();
     expect(onCreateAnnotation).not.toHaveBeenCalled();
     unmount();
