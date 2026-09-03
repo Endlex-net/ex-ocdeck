@@ -481,17 +481,21 @@ describe('shouldAcceptBranchResult 代际+项目 ID 校验', () => {
   });
 });
 
-describe('shouldClearRefreshing finally 清刷新标志', () => {
-  it('本次刷新仍是当前刷新项目 → 清', () => {
-    expect(shouldClearRefreshing('A', 'A')).toBe(true);
+describe('shouldClearRefreshing finally 释放刷新所有权（项目+代际）', () => {
+  it('本次刷新仍持有所有权（项目与代际均匹配）→ 释放', () => {
+    expect(shouldClearRefreshing('A', 3, 'A', 3)).toBe(true);
   });
 
-  it('已切到新项目（当前刷新项目非本次）→ 不清（由 effect 重置）', () => {
-    expect(shouldClearRefreshing('B', 'A')).toBe(false);
+  it('已切到新项目（所有权属新刷新/被 effect 重置）→ 不释放', () => {
+    expect(shouldClearRefreshing('B', 5, 'A', 3)).toBe(false);
   });
 
-  it('当前无刷新项目（已被 effect 清空）→ 不清', () => {
-    expect(shouldClearRefreshing(null, 'A')).toBe(false);
+  it('同项目但代际已推进（所有权被新一轮持有）→ 不释放', () => {
+    expect(shouldClearRefreshing('A', 4, 'A', 3)).toBe(false);
+  });
+
+  it('当前无刷新所有权（已被 effect 清空）→ 不释放', () => {
+    expect(shouldClearRefreshing(null, 0, 'A', 3)).toBe(false);
   });
 });
 
