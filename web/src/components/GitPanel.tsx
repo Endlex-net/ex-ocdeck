@@ -1,8 +1,16 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
-import type { GitDiffResult, GitFileEntry, GitStatus } from '../types';
+import type {
+  Annotation,
+  AnnotationCreateInput,
+  GitDiffResult,
+  GitFileEntry,
+  GitStatus,
+  SubmitCapability,
+} from '../types';
 import type { DiffViewMode } from './diff/DiffViewer';
 import { BranchIcon } from '../icons';
+import { ReviewPanel } from './ReviewPanel';
 
 // 编辑器代码（CodeMirror 及语言包）整 chunk 懒加载，与主 bundle 分离（design D8）。
 const DiffViewerLazy = lazy(() => import('./diff/DiffViewer'));
@@ -32,8 +40,18 @@ function groupFiles(files: GitFileEntry[]): FileGroup[] {
   return groups.filter((g) => g.files.length > 0);
 }
 
-/** 任务工作台 git 面板（design.md 2.6）：status 分组 + CodeMirror merge diff 渲染 + commit/push。 */
-export function GitPanel({ taskID, active }: { taskID: string; active: boolean }) {
+/** 任务工作台 git 面板（design.md 2.6）：status 分组 + CodeMirror merge diff 渲染 + commit/push
+ *  + diff review 批注/提交（diff-review-workbench tasks 5.4）。 */
+export function GitPanel({
+  taskID,
+  active,
+  agentBusy = false,
+}: {
+  taskID: string;
+  active: boolean;
+  /** agent 会话 busy/retry（design D6 编辑警告横幅）。 */
+  agentBusy?: boolean;
+}) {
   const [status, setStatus] = useState<GitStatus | null>(null);
   const [loadError, setLoadError] = useState('');
   const [refreshing, setRefreshing] = useState(false);
@@ -44,7 +62,10 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
   const [pushing, setPushing] = useState(false);
   const [opError, setOpError] = useState(''); // git stderr 原样透传，保留换行
   const [opResult, setOpResult] = useState('');
-  const [selFile, setSelFile] = useState<{ path: string; ref: string } | null>(null);
+  // selFile 为视图身份三元组（design D8）：同路径 staged/unstaged/untracked 是不同视图
+  const [selFile, setSelFile] = useState<{ path: string; ref: string; untracked: boolean } | null>(
+    null,
+  );
   const [diff, setDiff] = useState<GitDiffResult | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
   const [diffError, setDiffError] = useState('');
@@ -54,6 +75,22 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
   const [wrapOverride, setWrapOverride] = useState(false);
   // openDiff 请求序号：仅最新请求可写 diff/diffError/diffLoading（I2 乱序防护）
   const diffReqSeq = useRef(0);
+  // diff review：批注/提交能力/列表定位高亮
+  const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  const [capability, setCapability] = useState<SubmitCapability>({ state: 'unknown', reason: '' });
+  const [highlightIDs, setHighlightIDs] = useState<Set<string>>(new Set());
+  // 编辑模式离开守卫（DiffViewer 注册）：切换文件前 flush 并等待在途写；阻塞未解决 → 拒绝切换
+  const leaveGuard = useRef<(() => Promise<boolean>) | null>(null);
+
+  const loadAnnotations = async () => {
+    try {
+      const r = await api.listAnnotations(taskID);
+      setAnnotations(r.annotations);
+      setCapability(r.submitCapability);
+    } catch {
+      /* 批注列表失败不阻断 git 面板 */
+    }
+  };
 
   const loadStatus = async () => {
     setRefreshing(true);
@@ -65,8 +102,17 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
       setSelected((prev) =>
         prev === null ? null : new Set(s.files.filter((f) => prev.has(f.path)).map((f) => f.path)),
       );
-      // 选中文件已消失时清掉 diff 视图
-      setSelFile((prev) => (prev && !s.files.some((f) => f.path === prev.path) ? null : prev));
+      // 选中视图已消失时清掉 diff 视图（按三元组核对：路径 + 来源组）
+      setSelFile((prev) => {
+        if (!prev) return prev;
+        const stillThere = groupFiles(s.files).some(
+          (g) =>
+            g.ref === prev.ref &&
+            g.untracked === prev.untracked &&
+            g.files.some((f) => f.path === prev.path),
+        );
+        return stillThere ? prev : null;
+      });
     } catch (err) {
       setLoadError(err instanceof ApiError ? err.message : '加载 git 状态失败');
     } finally {
@@ -76,7 +122,10 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
 
   // 面板激活时加载一次；不做自动轮询，避免打断勾选与 diff 阅读
   useEffect(() => {
-    if (active) void loadStatus();
+    if (active) {
+      void loadStatus();
+      void loadAnnotations();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, taskID]);
 
@@ -94,9 +143,11 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
   };
 
   const openDiff = async (path: string, ref: string, untracked: boolean) => {
+    // 编辑模式离开守卫：flush 并等待在途写；冲突阻塞未解决时拒绝切换（D5 前端写协议）
+    if (leaveGuard.current && !(await leaveGuard.current())) return;
     // 乱序防护（I2）：快速切换文件时，晚到的旧响应不得覆盖最新选中文件的 diff 状态
     const reqID = ++diffReqSeq.current;
-    setSelFile({ path, ref });
+    setSelFile({ path, ref, untracked });
     setDiff(null);
     setDiffError('');
     setDiffLoading(true);
@@ -110,6 +161,36 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
     } finally {
       if (reqID === diffReqSeq.current) setDiffLoading(false);
     }
+  };
+
+  const createAnnotation = async (input: AnnotationCreateInput) => {
+    await api.createAnnotation(taskID, input);
+    await loadAnnotations();
+  };
+
+  /** 退出编辑模式前刷新当前视图的原始 diff（F3：查看模式与批注快照不得停留在编辑前内容）。
+   *  走 gitDiff 端点拿八字段原始侧内容，MUST NOT 用编辑 GET 的规范化文本替代。失败抛错由调用方决定。 */
+  const refreshDiff = async () => {
+    const cur = selFile;
+    if (!cur) return;
+    const reqID = ++diffReqSeq.current;
+    const result = await api.gitDiff(taskID, cur.ref, cur.path, cur.untracked);
+    if (reqID !== diffReqSeq.current) return;
+    setDiff(result);
+  };
+
+  /** 工具栏刷新：status 与当前 diff 一起刷（否则查看模式停留在旧内容，批注立即漂移）。 */
+  const refreshAll = async () => {
+    await loadStatus();
+    try {
+      await refreshDiff();
+    } catch (err) {
+      setDiffError(err instanceof ApiError ? err.message : '刷新 diff 失败');
+    }
+  };
+
+  const locateAnnotations = (ids: string[]) => {
+    setHighlightIDs(new Set(ids));
   };
 
   const commit = async () => {
@@ -160,7 +241,7 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
           <button
             className="btn btn-small btn-ghost"
             disabled={refreshing}
-            onClick={() => void loadStatus()}
+            onClick={() => void refreshAll()}
           >
             {refreshing ? '刷新中…' : '刷新'}
           </button>
@@ -186,7 +267,13 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
               {g.files.map((f) => (
                 <div
                   key={`${g.key}:${f.path}`}
-                  className={`git-file ${selFile?.path === f.path ? 'git-file-active' : ''}`}
+                  className={`git-file ${
+                    selFile?.path === f.path &&
+                    selFile.ref === g.ref &&
+                    selFile.untracked === g.untracked
+                      ? 'git-file-active'
+                      : ''
+                  }`}
                 >
                   <input
                     type="checkbox"
@@ -214,6 +301,14 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
             </div>
           ))}
         </div>
+
+        <ReviewPanel
+          taskID={taskID}
+          annotations={annotations}
+          capability={capability}
+          onChanged={loadAnnotations}
+          highlightIDs={highlightIDs}
+        />
 
         <div className="git-commit-box">
           <div className="git-commit-meta">
@@ -265,8 +360,24 @@ export function GitPanel({ taskID, active }: { taskID: string; active: boolean }
             {!diffLoading && !diffError && diff && (
               <Suspense fallback={<div className="empty">加载 diff 视图…</div>}>
                 <DiffViewerLazy
+                  // 三元组作为 key：切换视图即重建（编辑会话/批注手势随视图隔离）
+                  key={`${selFile.path}|${selFile.ref}|${selFile.untracked ? 'u' : ''}`}
                   diff={diff}
                   path={selFile.path}
+                  sourceRef={selFile.ref}
+                  untracked={selFile.untracked}
+                  annotations={annotations}
+                  agentBusy={agentBusy}
+                  onCreateAnnotation={createAnnotation}
+                  onLocateAnnotations={locateAnnotations}
+                  onRegisterLeaveGuard={(fn) => {
+                    leaveGuard.current = fn;
+                  }}
+                  onRefreshDiff={refreshDiff}
+                  editIO={{
+                    read: () => api.gitFileRead(taskID, selFile.path),
+                    write: (input) => api.gitFileWrite(taskID, input),
+                  }}
                   modeOverride={modeOverride}
                   onModeChange={setModeOverride}
                   wrapOverride={wrapOverride}
