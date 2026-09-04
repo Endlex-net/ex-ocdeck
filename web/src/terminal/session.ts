@@ -3,11 +3,14 @@ import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { clearToken, getToken, wsURL, UNAUTHORIZED_EVENT } from '../api';
 import {
+  loadMobileCaps,
+  loadMobileMode,
   loadTermPrefs,
   resolveFontFamily,
   resolveFontSize,
   type TermPreferences,
 } from './preferences';
+import { DEFAULT_CAPS, resolveMobileCaps, type EffectiveCaps } from './mobile-mode';
 import { readCurrentTermTheme, resolveXtermTheme, watchTermTheme } from './theme';
 import { createLockController, type LockController } from './lock';
 import { attachTouchGestures, type GestureHandle } from './touch-gestures';
@@ -34,6 +37,10 @@ export type TermConnState =
 
 const encoder = new TextEncoder();
 
+/** 键盘避让收缩阈值（CSS px，mobile-terminal-mode-settings design D4）：
+ * iOS/iPadOS 虚拟键盘 250px+，Safari 工具栏/地址栏伸缩通常 <100px。写死常量，不做设置项。 */
+const KEYBOARD_SHRINK_THRESHOLD = 100;
+
 /**
  * TermSession 封装 xterm.js + 终端 WS 的生命周期：
  * - 首帧 auth+尺寸握手（服务端 5s 超时）；
@@ -44,10 +51,11 @@ const encoder = new TextEncoder();
  * - 容器尺寸变化（ResizeObserver）时 fit 并同步尺寸到服务端。
  * 重连后屏幕由服务端 tmux 恢复，前端不做本地缓冲。
  *
- * 移动端适配（design D4/D5/D8）：
+ * 移动端适配（design D4/D5/D8 + mobile-terminal-mode-settings design D3/D4）：
  * - 统一输入门禁覆盖 onData + onBinary 双出口；
- * - coarse 设备默认锁定（overlay 拦截 + term.blur），可显式解锁；
- * - pointer 类型动态变化重评估（fine 自动解锁，coarse 强制锁定）；
+ * - 锁定/手势/键盘避让启用由本机「移动端模式」偏好驱动
+ *   （auto=coarse 自适配、on=子开关、off=全停用），经 applyMobileCaps 做状态边沿迁移
+ *   （能力未变 MUST NOT 触碰锁定状态与焦点；每次 WS auth_ok 为唯一强制回锁例外）；
  * - 锁定状态唯一所有者，对外暴露 lock()/unlock()/isLocked/onLockChange。
  */
 export class TermSession {
@@ -72,6 +80,9 @@ export class TermSession {
   private readonly syntheticGate: SyntheticGate = createSyntheticGate();
   private pointerCoarse = false;
   private pointerMql: MediaQueryList | null = null;
+  /** 当前生效能力（mobile-terminal-mode-settings design D3）：null=构造首调前。
+   * 偏好不缓存字段，每次 applyMobileCaps 重新读取，仅缓存上一次生效结果用于边沿判定。 */
+  private appliedCaps: EffectiveCaps | null = null;
   private readonly lockChangeCallbacks = new Set<(locked: boolean) => void>();
   /** 应用主题订阅退订（终端配色跟随主题，dispose 时退订防泄漏）。 */
   private unwatchTermTheme: (() => void) | null = null;
@@ -162,14 +173,11 @@ export class TermSession {
       detachGestures: () => this.detachGestures(),
     });
 
-    // pointer 类型检测：coarse → 默认锁定；fine → 恒解锁无锁定 UI。
-    // 仅外接键盘不改变 pointer 语义（matchMedia('pointer') 描述主指针设备）。
+    // pointer 类型检测：matchMedia('pointer') 描述主指针设备；
+    // 仅外接键盘不改变 pointer 语义。
     this.pointerCoarse = this.detectPointerCoarse();
-    if (this.pointerCoarse) {
-      // 初始无焦点，无需 blur；直接置门禁标志 + 挂手势层。
-      this.lockController.lock();
-      this.attachGestures();
-    }
+    // 移动端模式能力落地（design D3 构造首调：prev===null，按 next 落地初始状态）。
+    this.applyMobileCaps();
     if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
       this.pointerMql = window.matchMedia('(pointer: coarse)');
       this.pointerMql.addEventListener('change', this.onPointerChange);
@@ -217,9 +225,10 @@ export class TermSession {
           const msg = JSON.parse(ev.data) as { type?: string };
           if (msg.type === 'auth_ok') {
             debugMark('odterm:auth-ok');
-            // 任何 WS 连接建立/auth_ok（含重连、Tab 切换）→ coarse 强制 LOCKED。
+            // 任何 WS 连接建立/auth_ok（含重连、Tab 切换）→ 锁定能力启用即强制 LOCKED
+            // （design D3：边沿保护的唯一例外，入参为 appliedCaps.lock 而非 pointerCoarse）。
             // 必须先于 authed/connected 状态暴露与任何外部回调/fit，防门禁未就绪窗口泄漏。
-            this.lockOrchestrator.onAuthOk(this.pointerCoarse, () => {
+            this.lockOrchestrator.onAuthOk(this.appliedCaps?.lock === true, () => {
               this.authed = true;
               this.retry = 0;
               this.setState('connected');
@@ -383,6 +392,59 @@ export class TermSession {
     this.term.options.fontFamily = resolveFontFamily(prefs);
     this.term.options.fontSize = resolveFontSize(prefs);
     this.scheduleFit();
+    // 偏好变更触发移动端能力重评估（TERM_PREFS_CHANGED 监听方 TerminalView 调用本方法，
+    // mobile-terminal-mode-settings design D3 触发点之一）。
+    this.applyMobileCaps();
+  }
+
+  /**
+   * 移动端模式能力边沿迁移（mobile-terminal-mode-settings design D3，唯一迁移入口）。
+   * 每次判定重新读取偏好（不缓存）；仅 mode==='on' 才读子开关（判别式加载，auto/off
+   * 传 DEFAULT_CAPS 占位、不发起 caps 读取）。
+   * - prev===null（构造首调）：按 next 落地初始状态；
+   * - sameCaps：no-op，MUST NOT 触碰锁定状态与焦点（保护用户手动解锁）；
+   * - lock false→true：lockOrchestrator.lock()（门禁先置位再 blur）；
+   *   true→false：lockController.unlock()（silent unlock，MUST NOT focus）；
+   * - gestures 边沿 attach/detach；keyboardAvoid false→true 走既有 shouldListen 判定，
+   *   true→false：detach listener + 清 wrap maxHeight + refit。
+   */
+  private applyMobileCaps(): void {
+    const mode = loadMobileMode();
+    const caps = mode === 'on' ? loadMobileCaps() : DEFAULT_CAPS;
+    const next = resolveMobileCaps(mode, caps, this.pointerCoarse);
+    const prev = this.appliedCaps;
+    this.appliedCaps = next;
+    if (prev === null) {
+      // 构造首调：按 next 落地（等价原 coarse 直判构造，统一走 orchestrator lock 路径）。
+      if (next.lock) this.lockOrchestrator.lock(); // 门禁先置位再 blur
+      if (next.gestures) this.attachGestures();
+      this.updateVisualViewportListener(); // shouldListen 含 keyboardAvoid 判定
+      return;
+    }
+    if (prev.lock === next.lock && prev.gestures === next.gestures && prev.keyboardAvoid === next.keyboardAvoid) {
+      return;
+    }
+    if (next.lock !== prev.lock) {
+      if (next.lock) {
+        this.lockOrchestrator.lock();
+      } else {
+        // 系统级解锁：仅移除锁，MUST NOT focus（防 \x1b[I focus-in 序列注入）。
+        this.lockController.unlock();
+      }
+    }
+    if (next.gestures !== prev.gestures) {
+      if (next.gestures) this.attachGestures();
+      else this.detachGestures();
+    }
+    if (next.keyboardAvoid !== prev.keyboardAvoid) {
+      if (next.keyboardAvoid) {
+        this.updateVisualViewportListener();
+      } else {
+        this.detachVisualViewportListener();
+        this.wrap.style.maxHeight = '';
+        this.fitNow();
+      }
+    }
   }
 
   private scheduleFit(): void {
@@ -435,7 +497,8 @@ export class TermSession {
     return this.term.element ?? (this.host.querySelector('.xterm') as HTMLElement);
   }
 
-  /** attach 触控手势层（仅 coarse pointer 启用）。重复 attach 前先 dispose 旧实例。 */
+  /** attach 触控手势层（由移动端模式偏好驱动，mobile-terminal-mode-settings D2/D3）。
+   * 重复 attach 前先 dispose 旧实例。 */
   private attachGestures(): void {
     if (this.gestures) return;
     this.gestures = attachTouchGestures({
@@ -483,15 +546,20 @@ export class TermSession {
   }
 
   /**
-   * visualViewport 键盘适配（design D6）：UNLOCKED 且 textarea 聚焦时监听 resize+scroll（rAF 去抖），
-   * 按 max(0, vv.offsetTop + vv.height - wrap.getBoundingClientRect().top) 设 wrap maxHeight → fitNow → WS resize。
-   * blur/锁定/卸载移除内联样式并 refit；visualViewport API 缺失跳过。
+   * visualViewport 键盘适配（design D6 + mobile-terminal-mode-settings D4）：
+   * 键盘避让启用（appliedCaps.keyboardAvoid）且 UNLOCKED 且 textarea 聚焦时监听 resize+scroll（rAF 去抖），
+   * 仅视口明显压缩（shrink ≥ KEYBOARD_SHRINK_THRESHOLD）才按
+   * max(0, vv.offsetTop + vv.height - wrap top) 设 wrap maxHeight → fitNow → WS resize。
+   * blur/锁定/避让关闭/卸载移除内联样式并 refit；visualViewport API 缺失跳过。
    */
   private updateVisualViewportListener(): void {
     const vv = typeof window !== 'undefined' ? window.visualViewport : undefined;
     if (!vv) return;
     const shouldListen =
-      !this.disposed && !this.lockController.isLocked() && this.term.textarea === document.activeElement;
+      !this.disposed &&
+      this.appliedCaps?.keyboardAvoid === true &&
+      !this.lockController.isLocked() &&
+      this.term.textarea === document.activeElement;
     if (shouldListen && !this.vvResizeHandler) {
       this.vvResizeHandler = () => this.scheduleVvFit();
       this.vvScrollHandler = () => this.scheduleVvFit();
@@ -532,13 +600,23 @@ export class TermSession {
     });
   }
 
+  /**
+   * 键盘避让阈值启发式（mobile-terminal-mode-settings design D4）：
+   * 每次先清 inline maxHeight 测自然布局（基线 MUST NOT 被自身写入的高度污染），
+   * shrink = rect.bottom - (vv.offsetTop + vv.height)；达阈值才写回目标 maxHeight，
+   * 否则恢复全高（工具栏抖动/键盘收起共用同一路径）；仅目标值变化时 fitNow。
+   */
   private fitForViewport(): void {
     const vv = window.visualViewport;
     if (!vv || this.disposed) return;
-    const top = this.wrap.getBoundingClientRect().top;
+    const prevMax = this.wrap.style.maxHeight;
+    this.wrap.style.maxHeight = '';
+    const rect = this.wrap.getBoundingClientRect();
     const visibleBottom = vv.offsetTop + vv.height;
-    this.wrap.style.maxHeight = Math.max(0, visibleBottom - top) + 'px';
-    this.fitNow();
+    const shrink = rect.bottom - visibleBottom;
+    const target = shrink >= KEYBOARD_SHRINK_THRESHOLD ? Math.max(0, visibleBottom - rect.top) + 'px' : '';
+    this.wrap.style.maxHeight = target;
+    if (target !== prevMax) this.fitNow();
   }
 
   private detectPointerCoarse(): boolean {
@@ -547,12 +625,13 @@ export class TermSession {
   }
 
   /**
-   * pointer 类型动态变化重评估（design D5）：委托 LockOrchestrator。
-   * 转 coarse → lock + attach 手势层；转 fine → detach 手势层 + unlockSilently（不 focus）。
-   * 仅外接键盘不改变 pointer，不触发本回调。
+   * pointer 类型动态变化（mobile-terminal-mode-settings design D3 触发点）：
+   * 更新 pointerCoarse 后走 applyMobileCaps 边沿迁移，**替换**原 lockOrchestrator.onPointerChange
+   * 委托（两条迁移路径不得并存）。auto 模式迁移结果与既有语义逐点等价
+   * （coarse→lock+手势，fine→detach 手势+silent unlock）；on/off 模式 caps 与 coarse 无关，天然幂等。
    */
   private onPointerChange = (ev: MediaQueryListEvent): void => {
     this.pointerCoarse = ev.matches;
-    this.lockOrchestrator.onPointerChange(ev.matches);
+    this.applyMobileCaps();
   };
 }

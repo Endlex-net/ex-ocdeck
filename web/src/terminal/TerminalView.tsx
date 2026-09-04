@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { TermSession, type TermConnState } from './session';
-import { loadTermPrefs, TERM_PREFS_CHANGED } from './preferences';
+import { DEFAULT_CAPS, resolveMobileCaps } from './mobile-mode';
+import {
+  loadMobileCaps,
+  loadMobileMode,
+  loadTermPrefs,
+  TERM_PREFS_CHANGED,
+} from './preferences';
 import { debugMark } from '../debug';
 import { useMediaQuery } from '../hooks';
 import '@xterm/xterm/css/xterm.css';
@@ -36,8 +42,28 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
   const onStateRef = useRef(onState);
   onStateRef.current = onState;
 
-  // 按钮可见性 = 视图侧 coarse pointer（与 session 锁状态正交）。
+  // 按钮可见性 = 生效能力 caps.lock（mobile-terminal-mode-settings D3）：由
+  // mode +（仅 on 时）caps + coarse pointer 经 resolveMobileCaps 统一判定，
+  // 随模式/指针/偏好变更即时刷新，与 session 锁状态正交。
   const coarsePointer = useMediaQuery('(pointer: coarse)');
+  const [lockCap, setLockCap] = useState<boolean>(() => {
+    const mode = loadMobileMode();
+    return resolveMobileCaps(mode, mode === 'on' ? loadMobileCaps() : DEFAULT_CAPS, coarsePointer).lock;
+  });
+
+  useEffect(() => {
+    const refresh = () => {
+      const mode = loadMobileMode();
+      setLockCap(resolveMobileCaps(mode, mode === 'on' ? loadMobileCaps() : DEFAULT_CAPS, coarsePointer).lock);
+    };
+    refresh(); // coarsePointer 变化时以新 pointer 状态重算
+    window.addEventListener(TERM_PREFS_CHANGED, refresh);
+    window.addEventListener('storage', refresh);
+    return () => {
+      window.removeEventListener(TERM_PREFS_CHANGED, refresh);
+      window.removeEventListener('storage', refresh);
+    };
+  }, [coarsePointer]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -86,7 +112,7 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
   return (
     <div className="terminal-wrap" ref={wrapRef}>
       <div className="terminal-host" ref={hostRef} />
-      {coarsePointer && (
+      {lockCap && (
         <button
           type="button"
           className="terminal-lock-button"

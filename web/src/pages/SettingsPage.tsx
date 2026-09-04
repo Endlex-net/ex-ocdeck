@@ -6,6 +6,14 @@ import { PaletteConfigPanel, type PaletteConfigLoadState } from '../components/P
 import { TermAppearanceEditor } from '../components/TermAppearanceEditor';
 import type { PaletteConfig } from '../palette-focus';
 import { navigate, type ConfigsTab } from '../router';
+import type { MobileCaps, MobileMode } from '../terminal/mobile-mode';
+import {
+  loadMobileCaps,
+  loadMobileMode,
+  saveMobileCaps,
+  saveMobileMode,
+  TERM_PREFS_CHANGED,
+} from '../terminal/preferences';
 import { useTheme, type ThemePreference } from '../hooks';
 import type { OcConfigContent, OcConfigInfo } from '../types';
 import './settings.css';
@@ -133,8 +141,64 @@ export function SettingsPage({
 }
 
 /* ============================ 终端外观子标签 ============================ */
+const MOBILE_MODE_OPTIONS: { value: MobileMode; label: string }[] = [
+  { value: 'auto', label: '自动' },
+  { value: 'on', label: '开启' },
+  { value: 'off', label: '关闭' },
+];
+
+const MOBILE_MODE_HINT: Record<MobileMode, string> = {
+  auto: '触屏设备自动启用锁定/手势，键盘避让保持默认',
+  on: '所有设备按下方子开关强制启用',
+  off: '完全按桌面终端处理（含不收缩避让键盘）',
+};
+
 function AppearancePanel() {
   const { preference, setPreference } = useTheme();
+
+  // 判别式加载（spec「自动模式不展示不读取子开关」）：仅 mode 为 on 时读 caps key。
+  const [mobile, setMobile] = useState<{ mode: MobileMode; caps: MobileCaps | null }>(() => {
+    const mode = loadMobileMode();
+    return { mode, caps: mode === 'on' ? loadMobileCaps() : null };
+  });
+  const [mobileError, setMobileError] = useState('');
+
+  // 外部变更（恢复默认等）后按实际存储判别式重载收敛。
+  useEffect(() => {
+    const reload = () => {
+      const mode = loadMobileMode();
+      setMobile({ mode, caps: mode === 'on' ? loadMobileCaps() : null });
+    };
+    window.addEventListener(TERM_PREFS_CHANGED, reload);
+    return () => window.removeEventListener(TERM_PREFS_CHANGED, reload);
+  }, []);
+
+  const selectMobileMode = (mode: MobileMode) => {
+    setMobileError('');
+    try {
+      saveMobileMode(mode);
+    } catch (err) {
+      setMobileError(err instanceof Error ? err.message : '保存失败');
+      return;
+    }
+    setMobile({ mode, caps: mode === 'on' ? loadMobileCaps() : null });
+  };
+
+  // 子开关统一走一次完整 caps JSON 写入；锁定开 → 手势同事务强制开（避免只能看不能滚）。
+  const setMobileCap = (patch: Partial<MobileCaps>) => {
+    const caps = mobile.caps;
+    if (!caps) return;
+    const next: MobileCaps = { ...caps, ...patch };
+    if (next.lock) next.gestures = true;
+    setMobileError('');
+    try {
+      saveMobileCaps(next);
+    } catch (err) {
+      setMobileError(err instanceof Error ? err.message : '保存失败');
+      return;
+    }
+    setMobile({ mode: mobile.mode, caps: next });
+  };
 
   return (
     <section className="od-card">
@@ -163,6 +227,67 @@ function AppearancePanel() {
           ))}
         </div>
         <div className="od-hint">默认跟随系统；终端配色随主题翻转（亮色主题 = 浅色终端）</div>
+      </div>
+      <div className="od-field">
+        <span className="od-label" id="mobileModeSegLabel">
+          移动端模式
+        </span>
+        <div
+          className="seg"
+          role="group"
+          aria-labelledby="mobileModeSegLabel"
+        >
+          {MOBILE_MODE_OPTIONS.map((opt) => (
+            <button
+              key={opt.value}
+              type="button"
+              className={mobile.mode === opt.value ? 'on' : ''}
+              aria-pressed={mobile.mode === opt.value}
+              onClick={() => selectMobileMode(opt.value)}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+        <div className="od-hint">{MOBILE_MODE_HINT[mobile.mode]}</div>
+        {mobile.mode === 'on' && mobile.caps && (
+          <>
+            <label htmlFor="mobile-cap-lock" style={{ display: 'block', margin: '4px 0' }}>
+              <input
+                type="checkbox"
+                id="mobile-cap-lock"
+                checked={mobile.caps.lock}
+                onChange={(e) => setMobileCap({ lock: e.target.checked })}
+              />{' '}
+              终端锁定
+            </label>
+            <div className="od-hint">接外接键盘时关闭可避免锁定遮挡输入</div>
+            <label htmlFor="mobile-cap-gestures" style={{ display: 'block', margin: '4px 0' }}>
+              <input
+                type="checkbox"
+                id="mobile-cap-gestures"
+                checked={mobile.caps.lock || mobile.caps.gestures}
+                disabled={mobile.caps.lock}
+                onChange={(e) => setMobileCap({ gestures: e.target.checked })}
+              />{' '}
+              触控手势
+            </label>
+            {mobile.caps.lock && (
+              <div className="od-hint">锁定开启时手势保持开启，否则终端无法滚动</div>
+            )}
+            <label htmlFor="mobile-cap-avoid" style={{ display: 'block', margin: '4px 0' }}>
+              <input
+                type="checkbox"
+                id="mobile-cap-avoid"
+                checked={mobile.caps.keyboardAvoid}
+                onChange={(e) => setMobileCap({ keyboardAvoid: e.target.checked })}
+              />{' '}
+              键盘避让
+            </label>
+            <div className="od-hint">虚拟键盘弹出时收缩终端视口避免遮挡</div>
+          </>
+        )}
+        {mobileError && <div className="error-line">{mobileError}</div>}
       </div>
       <TermAppearanceEditor />
     </section>

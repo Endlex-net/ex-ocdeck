@@ -108,7 +108,7 @@ describe('createLockOrchestrator（session 状态机协调）', () => {
     expect(deps.calls.indexOf('unlockSilently')).toBeLessThan(deps.calls.indexOf('focus'));
   });
 
-  it('onAuthOk(coarse=true)：lock 先于 authed/connected 暴露（onAuthed 回调）', () => {
+  it('onAuthOk(lockEnabled=true)：lock 先于 authed/connected 暴露（onAuthed 回调）', () => {
     const deps = spyDeps();
     const o = createLockOrchestrator(deps);
     let lockCallsAtAuthed = -1;

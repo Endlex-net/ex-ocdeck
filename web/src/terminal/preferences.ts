@@ -1,8 +1,12 @@
 /**
- * 终端外观偏好（design.md D2）：localStorage 持久化 + 校验。
+ * 终端外观偏好（design.md D2）与移动端模式偏好（mobile-terminal-mode-settings design.md D1）：
+ * localStorage 持久化 + 校验。
  * 默认字体栈追加 CJK 回退，使中文在常见浏览器环境正常渲染。
  * 读取侧遇到损坏/非法数据只回退默认，MUST NOT 改写 localStorage。
+ * 写入侧 setItem 全成功才派发 TERM_PREFS_CHANGED，失败向上抛出、不派发。
  */
+
+import { DEFAULT_CAPS, type MobileCaps, type MobileMode } from './mobile-mode';
 
 export interface TermPreferences {
   fontFamily?: string; // trim 后非空才存在
@@ -15,6 +19,8 @@ export const DEFAULT_FONT_SIZE = 13;
 
 export const FONT_FAMILY_KEY = 'ocdeck.terminal.fontFamily';
 export const FONT_SIZE_KEY = 'ocdeck.terminal.fontSize';
+export const MOBILE_MODE_KEY = 'ocdeck.terminal.mobileMode';
+export const MOBILE_CAPS_KEY = 'ocdeck.terminal.mobileCaps';
 export const TERM_PREFS_CHANGED = 'ocdeck-term-prefs-changed'; // window CustomEvent 名
 
 /** 整数且 8<=v<=32，否则 null；禁止 parseInt（会接受 "13px"）。 */
@@ -82,8 +88,72 @@ export function saveTermPrefs(p: TermPreferences): void {
   }
 }
 
-/** 清除两个偏好 key。 */
-export function clearTermPrefs(): void {
-  localStorage.removeItem(FONT_FAMILY_KEY);
-  localStorage.removeItem(FONT_SIZE_KEY);
+/** 清除全部终端偏好 key（多 key 删除无法原子化）。 */
+export function clearTermPrefs(): { failedKeys: string[] } {
+  const failedKeys: string[] = [];
+  let removedCount = 0;
+  for (const key of [FONT_FAMILY_KEY, FONT_SIZE_KEY, MOBILE_MODE_KEY, MOBILE_CAPS_KEY]) {
+    try {
+      localStorage.removeItem(key);
+      removedCount++;
+    } catch {
+      failedKeys.push(key);
+    }
+  }
+  // 至少一项删除成功才派发，恰好一次；全部失败不派发。
+  if (removedCount > 0) window.dispatchEvent(new CustomEvent(TERM_PREFS_CHANGED));
+  return { failedKeys };
+}
+
+/**
+ * 读取移动端模式（只读 mode key；「auto/off 不得读 caps key」是调用方约束）。
+ * 非法值/读取异常回退 auto，不改写 localStorage。
+ */
+export function loadMobileMode(): MobileMode {
+  try {
+    const raw = localStorage.getItem(MOBILE_MODE_KEY);
+    if (raw === 'auto' || raw === 'on' || raw === 'off') return raw;
+  } catch {
+    /* localStorage 不可用时按默认处理 */
+  }
+  return 'auto';
+}
+
+/**
+ * 读取子开关记录（只读 caps key）。
+ * JSON 损坏/缺字段/字段类型错误/version 未知/读取异常 → 整项回默认，不改写 localStorage。
+ */
+export function loadMobileCaps(): MobileCaps {
+  try {
+    const raw = localStorage.getItem(MOBILE_CAPS_KEY);
+    if (raw !== null) {
+      const parsed: unknown = JSON.parse(raw);
+      if (
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        (parsed as { version?: unknown }).version === 1 &&
+        typeof (parsed as { lock?: unknown }).lock === 'boolean' &&
+        typeof (parsed as { gestures?: unknown }).gestures === 'boolean' &&
+        typeof (parsed as { keyboardAvoid?: unknown }).keyboardAvoid === 'boolean'
+      ) {
+        const caps = parsed as { lock: boolean; gestures: boolean; keyboardAvoid: boolean };
+        return { version: 1, lock: caps.lock, gestures: caps.gestures, keyboardAvoid: caps.keyboardAvoid };
+      }
+    }
+  } catch {
+    /* JSON 损坏/localStorage 不可用：整项回默认 */
+  }
+  return DEFAULT_CAPS;
+}
+
+/** 保存移动端模式：只写 mode key（模式切换不触碰 caps）。失败向上抛出、不派发。 */
+export function saveMobileMode(mode: MobileMode): void {
+  localStorage.setItem(MOBILE_MODE_KEY, mode);
+  window.dispatchEvent(new CustomEvent(TERM_PREFS_CHANGED));
+}
+
+/** 保存子开关：一次性写完整 caps JSON（含「锁定开 → 手势强制开」的同事务提交）。失败向上抛出、不派发。 */
+export function saveMobileCaps(caps: MobileCaps): void {
+  localStorage.setItem(MOBILE_CAPS_KEY, JSON.stringify(caps));
+  window.dispatchEvent(new CustomEvent(TERM_PREFS_CHANGED));
 }
