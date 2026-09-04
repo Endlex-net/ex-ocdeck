@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestShellQuote(t *testing.T) {
@@ -135,10 +136,10 @@ func TestNewSession_RejectsLegacySuffix(t *testing.T) {
 
 func TestParseSessionName(t *testing.T) {
 	cases := []struct {
-		name       string
-		taskID     string
-		suffix     string
-		ok         bool
+		name   string
+		taskID string
+		suffix string
+		ok     bool
 	}{
 		{"ocdeck-abc123-runtime", "abc123", "runtime", true},
 		{"ocdeck-abc123-serve", "abc123", "serve", true},
@@ -202,7 +203,7 @@ func TestValidateEnvKey(t *testing.T) {
 		{"", false},
 		{"1abc", false}, // 数字开头
 		{"A B", false},  // 空格
-		{"A=B", false},   // = 非法
+		{"A=B", false},  // = 非法
 	}
 	for _, c := range cases {
 		err := validateEnvKey(c.key)
@@ -619,4 +620,281 @@ func TestDefaultBaseEnv_LocaleDefault(t *testing.T) {
 	if has(got, "LC_ALL=") {
 		t.Errorf("case e: empty LC_ALL= should not be passed through, got %v", got)
 	}
+}
+
+func TestParseTmuxVersion(t *testing.T) {
+	cases := []struct {
+		in        string
+		major     int
+		minor     int
+		ok        bool
+		atLeast37 bool
+	}{
+		{"tmux 3.4", 3, 4, true, false},
+		{"tmux 3.5a", 3, 5, true, false},
+		{"tmux 3.7", 3, 7, true, true},
+		{"tmux 3.6a", 3, 6, true, false},
+		{"tmux 4.0", 4, 0, true, true},
+		{"tmux next-3.4", 0, 0, false, false},
+		{"bogus", 0, 0, false, false},
+		{"tmux", 0, 0, false, false},
+	}
+	for _, c := range cases {
+		maj, min, ok := parseTmuxVersion(c.in)
+		if maj != c.major || min != c.minor || ok != c.ok {
+			t.Errorf("parseTmuxVersion(%q) = %d,%d,%v; want %d,%d,%v", c.in, maj, min, ok, c.major, c.minor, c.ok)
+		}
+		if got := tmuxVersionAtLeast(c.in, 3, 7); got != c.atLeast37 {
+			t.Errorf("tmuxVersionAtLeast(%q, 3, 7) = %v, want %v", c.in, got, c.atLeast37)
+		}
+	}
+}
+
+// newClipboardMockManager 构造带记录 execTmuxFn 的 Manager：
+// -V 应答 version（空串表示 tmux -V 失败）；failArgs 中列出的每个 set-option
+// （如 {"get-clipboard","off"}）返回错误；noServer 时 set-option 返回
+// "无 server"错误；其余调用成功。
+func newClipboardMockManager(version string, failArgs [][]string, noServer bool, calls *[][]string) *Manager {
+	return &Manager{
+		execTmuxFn: func(_ context.Context, args ...string) (string, string, error) {
+			cp := append([]string(nil), args...)
+			*calls = append(*calls, cp)
+			if len(args) == 1 && args[0] == "-V" {
+				if version == "" {
+					return "", "boom", &tmuxCmdError{sub: args, stderr: "boom", err: errors.New("exit 1")}
+				}
+				return version + "\n", "", nil
+			}
+			for _, fa := range failArgs {
+				if equalArgs(cp, append([]string{"set-option", "-s"}, fa...)) {
+					return "", "permission denied", &tmuxCmdError{sub: args, stderr: "permission denied", err: errors.New("exit 1")}
+				}
+			}
+			if noServer && len(args) > 0 && args[0] == "set-option" {
+				return "", "no server running", &tmuxCmdError{
+					sub:    args,
+					stderr: "no server running on /tmp/tmux-0/ocdeck",
+					err:    errors.New("exit 1"),
+				}
+			}
+			return "", "", nil
+		},
+	}
+}
+
+// optCalls 提取记录中的 set-option 调用序列。
+func optCalls(calls [][]string) [][]string {
+	var out [][]string
+	for _, c := range calls {
+		if len(c) > 0 && c[0] == "set-option" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// clipboardExternal = set-option -s set-clipboard external（fail-closed 目标态）。
+var clipboardExternal = []string{"set-option", "-s", "set-clipboard", "external"}
+
+// TestEnsureServerOptions_FailClosedMatrix 验证 fail-closed 语义：
+// 只有 tmux >= 3.7 且 get-clipboard off 成功才置 set-clipboard on；
+// 其余场景保持/恢复 external（3.2–3.6 的 get-clipboard 默认 buffer，
+// on + buffer 会跨任务泄露 paste buffer），恢复失败 MUST 作为错误返回。
+func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
+	// 版本不足（含可解析的 3.5a）或无法解析 → 只置 external，恢复成功时返回 nil。
+	for _, v := range []string{"tmux 3.2", "tmux 3.4", "tmux 3.5a", "tmux 3.6a", "tmux next-3.4", "bogus", "tmux"} {
+		t.Run("below/unparsable "+v, func(t *testing.T) {
+			var calls [][]string
+			m := newClipboardMockManager(v, nil, false, &calls)
+			if err := m.EnsureServerOptions(); err != nil {
+				t.Fatalf("err = %v, want nil (feature unavailable is not an error)", err)
+			}
+			opts := optCalls(calls)
+			if len(opts) != 1 || !equalArgs(opts[0], clipboardExternal) {
+				t.Fatalf("set-option calls = %v, want exactly [set-clipboard external]", opts)
+			}
+		})
+	}
+
+	t.Run("tmux -V error", func(t *testing.T) {
+		var calls [][]string
+		m := newClipboardMockManager("", nil, false, &calls)
+		if err := m.EnsureServerOptions(); err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		opts := optCalls(calls)
+		if len(opts) != 1 || !equalArgs(opts[0], clipboardExternal) {
+			t.Fatalf("set-option calls = %v, want exactly [set-clipboard external]", opts)
+		}
+	})
+
+	t.Run("3.7 happy path order", func(t *testing.T) {
+		var calls [][]string
+		m := newClipboardMockManager("tmux 3.7c", nil, false, &calls)
+		if err := m.EnsureServerOptions(); err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		opts := optCalls(calls)
+		wantGetOff := []string{"set-option", "-s", "get-clipboard", "off"}
+		wantClipOn := []string{"set-option", "-s", "set-clipboard", "on"}
+		if len(opts) != 2 || !equalArgs(opts[0], wantGetOff) || !equalArgs(opts[1], wantClipOn) {
+			t.Fatalf("set-option calls = %v, want [get-clipboard off, set-clipboard on] in that order", opts)
+		}
+	})
+
+	t.Run("3.7 get-clipboard off fails restores external", func(t *testing.T) {
+		var calls [][]string
+		m := newClipboardMockManager("tmux 3.7", [][]string{{"get-clipboard", "off"}}, false, &calls)
+		err := m.EnsureServerOptions()
+		if err == nil {
+			t.Fatal("want error when get-clipboard off fails")
+		}
+		opts := optCalls(calls)
+		if len(opts) != 2 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) || !equalArgs(opts[1], clipboardExternal) {
+			t.Fatalf("set-option calls = %v, want [get-clipboard off, set-clipboard external]", opts)
+		}
+	})
+
+	t.Run("below 3.7 restore external fails surfaces error", func(t *testing.T) {
+		var calls [][]string
+		m := newClipboardMockManager("tmux 3.6a", [][]string{{"set-clipboard", "external"}}, false, &calls)
+		err := m.EnsureServerOptions()
+		// 恢复失败 MUST NOT 被吞掉：server 可能遗留 on + get-clipboard buffer。
+		if err == nil {
+			t.Fatal("want error when restore set-clipboard external fails")
+		}
+		if !strings.Contains(err.Error(), "set-clipboard external") {
+			t.Errorf("err = %v, want mention restore set-clipboard external", err)
+		}
+		opts := optCalls(calls)
+		if len(opts) != 1 || !equalArgs(opts[0], clipboardExternal) {
+			t.Fatalf("set-option calls = %v, want exactly [set-clipboard external]", opts)
+		}
+	})
+
+	t.Run("3.7 get-clipboard and restore both fail combines errors", func(t *testing.T) {
+		var calls [][]string
+		m := newClipboardMockManager("tmux 3.7", [][]string{{"get-clipboard", "off"}, {"set-clipboard", "external"}}, false, &calls)
+		err := m.EnsureServerOptions()
+		if err == nil {
+			t.Fatal("want error when both get-clipboard off and restore fail")
+		}
+		// 两段失败都要出现在返回错误里，且 errors.Join 保留两条 unwrap 链
+		// （errors.As 能穿透到原始 tmuxCmdError，而非只有 restore 段）。
+		if !strings.Contains(err.Error(), "get-clipboard") || !strings.Contains(err.Error(), "restore set-clipboard external") {
+			t.Errorf("err = %v, want mention both get-clipboard failure and restore failure", err)
+		}
+		var ce *tmuxCmdError
+		if !errors.As(err, &ce) {
+			t.Errorf("errors.As tmuxCmdError failed; original unwrap chain lost (err=%v)", err)
+		}
+		opts := optCalls(calls)
+		if len(opts) != 2 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) || !equalArgs(opts[1], clipboardExternal) {
+			t.Fatalf("set-option calls = %v, want [get-clipboard off, set-clipboard external]", opts)
+		}
+	})
+
+	t.Run("3.7 set-clipboard on fails after get-clipboard off state safe", func(t *testing.T) {
+		var calls [][]string
+		m := newClipboardMockManager("tmux 3.7", [][]string{{"set-clipboard", "on"}}, false, &calls)
+		err := m.EnsureServerOptions()
+		if err == nil {
+			t.Fatal("want error when set-clipboard on fails")
+		}
+		opts := optCalls(calls)
+		// 状态安全：get-clipboard off 已生效，set-clipboard on 失败不会留下 on+buffer，
+		// MUST NOT 额外触发 restore external。
+		if len(opts) != 2 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) || !equalArgs(opts[1], []string{"set-option", "-s", "set-clipboard", "on"}) {
+			t.Fatalf("set-option calls = %v, want exactly [get-clipboard off, set-clipboard on]", opts)
+		}
+	})
+
+	// 版本检查耗尽共享 ctx deadline 的场景：tmux -V 阻塞到 ctx 到期，补救 set-option
+	// 若复用该 ctx 必然带着已过期的 deadline；fresh ctx 应给出未来的 deadline。
+	t.Run("remediation uses fresh context after version deadline exhausted", func(t *testing.T) {
+		type callRec struct {
+			head     string
+			deadline time.Time
+		}
+		var recs []callRec
+		m := &Manager{
+			execTmuxFn: func(ctx context.Context, args ...string) (string, string, error) {
+				rec := callRec{head: args[0]}
+				if dl, ok := ctx.Deadline(); ok {
+					rec.deadline = dl
+				}
+				recs = append(recs, rec)
+				if len(args) == 1 && args[0] == "-V" {
+					<-ctx.Done() // 模拟 tmux -V 吃满整个版本检查 ctx
+					return "", "deadline exceeded", &tmuxCmdError{sub: args, stderr: "context deadline exceeded", err: ctx.Err()}
+				}
+				return "", "", nil
+			},
+		}
+		if err := m.EnsureServerOptions(); err != nil {
+			t.Fatalf("err = %v, want nil (remediation succeeds with fresh ctx)", err)
+		}
+		if len(recs) < 2 {
+			t.Fatalf("calls = %v, want at least [-V, set-option]", recs)
+		}
+		versionDl := recs[0].deadline
+		remediationDl := recs[len(recs)-1].deadline
+		if remediationDl.IsZero() {
+			t.Fatal("remediation call has no deadline")
+		}
+		// 复用旧 ctx 时 remediation deadline 已过期（== versionDl，且此刻已成过去）。
+		if !remediationDl.After(time.Now()) {
+			t.Fatalf("remediation deadline %v not in the future; version ctx deadline was %v (shared ctx?)", remediationDl, versionDl)
+		}
+		if !remediationDl.After(versionDl) {
+			t.Fatalf("remediation deadline %v must be re-issued after version deadline %v", remediationDl, versionDl)
+		}
+	})
+
+	t.Run("no server", func(t *testing.T) {
+		var calls [][]string
+		m := newClipboardMockManager("tmux 3.7", nil, true, &calls)
+		err := m.EnsureServerOptions()
+		if !errors.Is(err, ErrNoTmuxServer) {
+			t.Fatalf("err = %v, want ErrNoTmuxServer", err)
+		}
+		opts := optCalls(calls)
+		// 无 server 时无遗留状态可补救，MUST NOT 再尝试恢复 external。
+		if len(opts) != 1 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) {
+			t.Fatalf("set-option calls = %v, want exactly [get-clipboard off]", opts)
+		}
+	})
+}
+
+func TestNewSession_EnsureServerOptionsBestEffort(t *testing.T) {
+	var calls [][]string
+	// get-clipboard off 失败 → EnsureServerOptions 返回错误；NewSession 只记日志不失败。
+	m := newClipboardMockManager("tmux 3.7", [][]string{{"get-clipboard", "off"}}, false, &calls)
+	err := m.NewSession(SessionSpec{
+		Name:    "ocdeck-task1-runtime",
+		Dir:     "/tmp",
+		CmdArgv: []string{"sleep", "1"},
+	})
+	if err != nil {
+		t.Fatalf("NewSession should succeed when EnsureServerOptions fails: %v", err)
+	}
+	if len(calls) < 2 || calls[0][0] != "new-session" {
+		t.Fatalf("expected new-session then clipboard options, got %v", calls)
+	}
+	opts := optCalls(calls)
+	if len(opts) == 0 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) {
+		t.Errorf("first set-option = %v, want get-clipboard off (fail-closed order), all=%v", opts, calls)
+	}
+}
+
+func equalArgs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

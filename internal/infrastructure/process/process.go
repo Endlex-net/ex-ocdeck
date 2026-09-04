@@ -6,6 +6,12 @@
 // 执行（仅最小基础集），会话 env 经 `-e KEY=VALUE` argv 显式注入，防止 tmux
 // server 全局环境后门（design.md §2 exec env 清洗不变量）。
 //
+// `-f /dev/null` 使 set-clipboard 默认为 external，pane OSC 52 不会转到 attach
+// 客户端；EnsureServerOptions fail-closed 地启用转发：仅 tmux >= 3.7 且先关闭
+// get-clipboard 后才置 set-clipboard on；否则保持/恢复 external（3.2–3.6 下
+// get-clipboard 默认 buffer，开启会致跨任务 paste buffer 泄露）。不启用
+// allow-passthrough（3.3+ 才有，最低仍是 3.2）。
+//
 // 进程身份（pid+startTime）MUST NOT 出本包：对外 notice/接口一律使用 opaque
 // cleanup ticket 字符串，包内编码 pid+startTime+pgid。
 package process
@@ -14,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -502,7 +509,137 @@ func (m *Manager) NewSession(spec SessionSpec) error {
 		return fmt.Errorf("process: NewSession %s: %w", spec.Name, err)
 	}
 	_ = stderr
+	// 会话创建会拉起 tmux server；此时再设 server option，避免无 server 时
+	// set-option 自己起一个空 server。剪贴板为 best-effort，失败只记日志。
+	if optErr := m.EnsureServerOptions(); optErr != nil {
+		log.Printf("process: EnsureServerOptions after NewSession %s: %v", spec.Name, optErr)
+	}
 	return nil
+}
+
+// EnsureServerOptions 幂等设置专属 tmux server 的剪贴板选项，fail-closed 语义：
+// 只有确认安全（get-clipboard 已关）才允许 set-clipboard on，否则 server 保持/
+// 恢复 set-clipboard external。tmux 3.2–3.6 的 get-clipboard 默认 buffer——若在
+// 其上开启 set-clipboard on，pane 发 OSC 52 查询会拿到全 server 共享的 paste
+// buffer，造成跨任务剪贴板泄露。
+//
+// tmux >= 3.7：先 set-option -s get-clipboard off，成功后才 set-clipboard on；
+// get-clipboard off 失败则不启用并恢复 external；恢复也失败时两段错误合并返回，
+// 不得吞掉恢复失败（否则可能遗留 on + buffer 的泄露组合）。
+// <3.7（含 3.5a 等可解析版本）、next-3.x 等无法解析、或 tmux -V 失败：特性不可用，
+// 主动置 external（补救先前可能设置的 on）；恢复失败同样作为错误返回。调用方
+// （NewSession/reconcile）对 EnsureServerOptions 一律 best-effort 记日志，不阻断。
+// ErrNoTmuxServer 是唯一例外：无 server 即无遗留状态，无需补救。
+func (m *Manager) EnsureServerOptions() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	version := m.tmuxVersion(ctx)
+	if !tmuxVersionAtLeast(version, 3, 7) {
+		// 特性不可用：MUST 恢复/保持 external；恢复失败向上暴露（调用方记日志可见）。
+		// 补救用独立 fresh ctx——版本检查可能已耗尽共享 ctx 的 deadline。
+		rerr := m.setClipboardExternalFreshCtx()
+		if rerr != nil {
+			log.Printf("process: clipboard forwarding requires tmux >= 3.7 (got %q); restore set-clipboard external failed: %v", version, rerr)
+		} else {
+			log.Printf("process: clipboard forwarding requires tmux >= 3.7 (got %q), set-clipboard kept external", version)
+		}
+		return rerr
+	}
+	// >=3.7：先关 get-clipboard，成功后才开 set-clipboard on，中间不留不安全窗口。
+	if err := m.setClipboardServerOption(ctx, "get-clipboard", "off"); err != nil {
+		if errors.Is(err, ErrNoTmuxServer) {
+			return err
+		}
+		// 先前调用可能已把 set-clipboard 置 on；失败恢复 external 保证 fail-closed，
+		// 恢复失败与原错误合并返回（errors.Join 保留两条 unwrap 链），不得吞掉。
+		if rerr := m.setClipboardExternalFreshCtx(); rerr != nil {
+			return errors.Join(err, fmt.Errorf("restore set-clipboard external: %w", rerr))
+		}
+		return err
+	}
+	return m.setClipboardServerOption(ctx, "set-clipboard", "on")
+}
+
+// setClipboardExternalFreshCtx 以独立 fresh ctx 恢复 set-clipboard external：
+// 版本检查（tmux -V）可能已耗尽共享 ctx 的 deadline，补救 MUST 不依赖它。
+// "无 server" 原样返回 ErrNoTmuxServer（无遗留状态，无需补救）。
+func (m *Manager) setClipboardExternalFreshCtx() error {
+	rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer rcancel()
+	return m.setClipboardServerOption(rctx, "set-clipboard", "external")
+}
+
+// setClipboardServerOption 设置 server 级剪贴板选项（幂等）；
+// "无 server" 映射为 ErrNoTmuxServer，供调用方区分空运行时。
+func (m *Manager) setClipboardServerOption(ctx context.Context, option, value string) error {
+	_, _, err := m.execTmux(ctx, "set-option", "-s", option, value)
+	if err == nil {
+		return nil
+	}
+	var ce *tmuxCmdError
+	if errors.As(err, &ce) && isNoServerExit(ce) {
+		return ErrNoTmuxServer
+	}
+	return fmt.Errorf("process: EnsureServerOptions set-option -s %s %s: %w", option, value, err)
+}
+
+// tmuxVersion 读 `tmux -V`。MUST 不经 -L/-f：带 socket 的 -V 可能被当成子命令，
+// 且会多打一枪专属 server（短命会话刚退出时尤其危险）。
+func (m *Manager) tmuxVersion(ctx context.Context) string {
+	if m.execTmuxFn != nil {
+		stdout, _, err := m.execTmuxFn(ctx, "-V")
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(stdout)
+	}
+	cmd := exec.CommandContext(ctx, "tmux", "-V")
+	cmd.Env = m.tmuxExecEnv()
+	stdout, _, err := runBounded(ctx, cmd, []string{"-V"})
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(stdout)
+}
+
+// parseTmuxVersion 解析 `tmux -V` 输出（如 "tmux 3.4"、"tmux 3.5a"）。
+// next-3.x 或无法解析时 ok=false。
+func parseTmuxVersion(s string) (major, minor int, ok bool) {
+	fields := strings.Fields(s)
+	if len(fields) < 2 {
+		return 0, 0, false
+	}
+	ver := strings.TrimPrefix(fields[1], "v")
+	parts := strings.SplitN(ver, ".", 3)
+	if len(parts) < 2 {
+		return 0, 0, false
+	}
+	major, err1 := strconv.Atoi(digitsPrefix(parts[0]))
+	minor, err2 := strconv.Atoi(digitsPrefix(parts[1]))
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return major, minor, true
+}
+
+func digitsPrefix(s string) string {
+	for i, c := range s {
+		if c < '0' || c > '9' {
+			return s[:i]
+		}
+	}
+	return s
+}
+
+func tmuxVersionAtLeast(version string, major, minor int) bool {
+	maj, min, ok := parseTmuxVersion(version)
+	if !ok {
+		return false
+	}
+	if maj != major {
+		return maj > major
+	}
+	return min >= minor
 }
 
 // ErrNoTmuxServer 表示专属 tmux server 未启动（无任何会话）。

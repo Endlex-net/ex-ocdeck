@@ -114,6 +114,7 @@ const termInstance = {
   options: {} as Record<string, unknown>,
   modes: { mouseTrackingMode: 'none' as const },
   buffer: { active: { type: 'normal' as const } },
+  parser: { registerOscHandler: vi.fn(() => ({ dispose: vi.fn() })) },
 };
 vi.mock('@xterm/xterm', () => ({
   Terminal: vi.fn(() => termInstance),
@@ -1567,5 +1568,54 @@ describe('TermSession adapter → blur-DEL 组合（lock 先门禁后 blur）', 
     } finally {
       (globalThis as { WebSocket: unknown }).WebSocket = savedWs;
     }
+  });
+});
+
+/* ============================ OSC 52 clipboard 接线 ============================ */
+
+describe('OSC 52 clipboard 接线', () => {
+  it('构造时注册 osc 52 handler；handler 同步返回 true 并把合法 payload 转发为明文', async () => {
+    env.matchMediaMatches = false;
+    const { TermSession } = await import('../terminal/session');
+    const forwarded: string[] = [];
+    const session = new TermSession({} as HTMLElement, fakeWrap(), '/ws/x', () => {}, (t) => forwarded.push(t));
+
+    expect(termInstance.parser.registerOscHandler).toHaveBeenCalledWith(52, expect.any(Function));
+    // vi.fn 无参签名，元组取值需经 unknown 断言（handler 实际为 (data) => boolean）
+    const handler = (termInstance.parser.registerOscHandler.mock.calls as unknown as [number, (data: string) => boolean][])[0][1];
+
+    // 合法 c; payload → 转发解码明文，handler 同步返回 true（不返回 Promise）
+    expect(handler('c;SGVsbG8=')).toBe(true);
+    expect(forwarded).toEqual(['Hello']);
+    session.dispose();
+  });
+
+  it('读请求 c;? / 非 c / 非法 payload：消费但不转发、绝不回写终端', async () => {
+    env.matchMediaMatches = false;
+    const { TermSession } = await import('../terminal/session');
+    const forwarded: string[] = [];
+    const session = new TermSession({} as HTMLElement, fakeWrap(), '/ws/x', () => {}, (t) => forwarded.push(t));
+    const handler = (termInstance.parser.registerOscHandler.mock.calls as unknown as [number, (data: string) => boolean][])[0][1];
+
+    expect(handler('c;?')).toBe(true);
+    expect(handler('p;SGVsbG8=')).toBe(true);
+    expect(handler('c;!!!!')).toBe(true);
+    expect(handler('c;')).toBe(true);
+    expect(forwarded).toEqual([]);
+    // 防外泄关键：读请求不得触发任何 term.input / 数据回写
+    expect(termInstance.input).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it('dispose 时注销 osc 52 handler', async () => {
+    env.matchMediaMatches = false;
+    const { TermSession } = await import('../terminal/session');
+    const session = new TermSession({} as HTMLElement, fakeWrap(), '/ws/x', () => {});
+    const disposable = termInstance.parser.registerOscHandler.mock.results[0].value as {
+      dispose: ReturnType<typeof vi.fn>;
+    };
+    expect(disposable.dispose).not.toHaveBeenCalled();
+    session.dispose();
+    expect(disposable.dispose).toHaveBeenCalledTimes(1);
   });
 });
