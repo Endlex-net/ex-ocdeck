@@ -690,12 +690,28 @@ func readPtyUntil(t *testing.T, p interface {
 	}
 }
 
+// requireTmux37 为依赖"set-clipboard on 已生效"的 OSC52 转发集成测试做版本门控：
+// fail-closed 语义下 tmux < 3.7（含版本无法解析、tmux -V 失败）不启用转发，
+// 断言无从谈起，直接 skip（理由注明需 tmux >= 3.7）。复用包内 tmuxVersionAtLeast。
+func requireTmux37(t *testing.T) {
+	t.Helper()
+	out, err := exec.Command("tmux", "-V").Output()
+	version := strings.TrimSpace(string(out))
+	if err != nil {
+		t.Skipf("skipping: OSC52 forwarding requires tmux >= 3.7; tmux -V failed: %v", err)
+	}
+	if !tmuxVersionAtLeast(version, 3, 7) {
+		t.Skipf("skipping: OSC52 forwarding requires tmux >= 3.7, got %q", version)
+	}
+}
+
 // TestNewSession_ForwardsOSC52ToAttachClient 验证 set-clipboard on 后，pane 发出的
 // 原始 OSC 52 会转到 attach 客户端（-f /dev/null 默认 external 会丢弃）。
 func TestNewSession_ForwardsOSC52ToAttachClient(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping tmux integration test in -short mode")
 	}
+	requireTmux37(t)
 	m := newTestManager(t)
 	setAttachTermClipboard(m)
 	defer cleanupTmux(t, m)
@@ -742,6 +758,7 @@ func TestEnsureServerOptions_OSC52OnceWithPassthroughWrapper(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping tmux integration test in -short mode")
 	}
+	requireTmux37(t)
 	const (
 		osc52Payload = "]52;c;dGVzdA=="
 		sentinel     = "OCDECK-CLIP-SENTINEL"
