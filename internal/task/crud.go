@@ -60,14 +60,6 @@ func (m *Manager) writeCommitCreated(ctx context.Context, id, expectedStatus, in
 	return m.store.CommitCreated(ctx, id, expectedStatus, initStatus)
 }
 
-// writeDeleteMode 写入 delete_mode（Retry deletion_failed 重入）。
-func (m *Manager) writeDeleteMode(ctx context.Context, id, mode string) (application.MutationResult, error) {
-	if m.lifecycle != nil {
-		return m.lifecycle.SetDeleteMode(ctx, id, ocdecktask.DeleteMode(mode))
-	}
-	return m.store.SetTaskDeleteMode(ctx, id, mode)
-}
-
 // writeEnvSnapshot 写入 env_snapshot（Activate 合并快照持久化与补偿清空）。
 func (m *Manager) writeEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) (application.MutationResult, error) {
 	if m.lifecycle != nil {
@@ -110,6 +102,16 @@ func (m *Manager) writeBeginDeleteIntent(ctx context.Context, id, mode string, f
 		return m.lifecycle.BeginDeleteIntent(ctx, id, ocdecktask.DeleteMode(mode), statuses)
 	}
 	return m.store.BeginDeleteIntent(ctx, id, mode, fromStatuses)
+}
+
+// writeRetryDeleteIntent 写入删除重入意图（Retry 专用，deletion_failed → deleting）：
+// delete_mode + status + last_error=NULL 单事务原子生效（评审 C-F3：意图提交即发布状态事件，
+// stale 错误 MUST 随意图清空；首删入口 writeBeginDeleteIntent 不清 last_error，行为逐字保持）。
+func (m *Manager) writeRetryDeleteIntent(ctx context.Context, id, mode string) (application.TransitionResult, error) {
+	if m.lifecycle != nil {
+		return m.lifecycle.BeginRetryDeleteIntent(ctx, id, ocdecktask.DeleteMode(mode))
+	}
+	return m.store.BeginRetryDeleteIntent(ctx, id, mode)
 }
 
 // writeDeleteTask 删除任务行（级联剩余会话；commit 先发 session.deleted 再 task.deleted）。
@@ -502,14 +504,18 @@ func (m *Manager) Retry(ctx context.Context, taskID string, confirmDirty bool) e
 			return newOpErr(codeInternal, rerr)
 		}
 		// B8：delete_mode 不得被 Normal 重试覆盖；按持久化 delete_mode 重入。
-		// 先置 deleting 再执行（deletion_failed → deleting，design.md §19/§8）。
-		// 在有效模式校验通过后转换，保证非法组合零副作用（状态不变）。
+		// deletion_failed → deleting 复用 Retry 专用原子意图写入（writeRetryDeleteIntent：
+		// delete_mode + status=deleting + last_error=NULL 单事务，design.md §19/§8，评审 C-F3）。
+		// 在有效模式校验通过后写入，保证非法组合零副作用（状态不变）。CAS 未命中（行已并发
+		// 迁出 deletion_failed，如被外部收敛）MUST 在任何 dirty/进程/删除副作用前终止，与
+		// 首次 Delete 的意图未命中处理对齐（conflict，delete.go Delete 入口）。
 		if row.Status == StatusDeletionFailed {
-			if _, err := m.writeDeleteMode(ctx, row.ID, string(mode)); err != nil {
-				return newOpErr(codeInternal, err)
+			updated, ierr := m.writeRetryDeleteIntent(ctx, row.ID, string(mode))
+			if ierr != nil {
+				return newOpErr(codeInternal, ierr)
 			}
-			if _, err := m.writeStatus(ctx, row.ID, StatusDeleting, sql.NullString{}); err != nil {
-				return newOpErr(codeInternal, err)
+			if !updated.Matched {
+				return newOpErr(codeConflict, fmt.Errorf("task %s not in deletable state", taskID))
 			}
 		}
 		var preflightDirty map[string]struct{}
@@ -523,14 +529,18 @@ func (m *Manager) Retry(ctx context.Context, taskID string, confirmDirty bool) e
 			// 判定当前 dirty 集合，不得当空集强删用户数据。
 			snap, derr := m.wt.DirtyFiles(ctx, row.WorktreePath)
 			if derr != nil {
-				le := sql.NullString{String: fmt.Errorf("retry: preflight dirty snapshot: %w", derr).Error(), Valid: true}
-				_, _ = m.writeStatus(ctx, row.ID, StatusDeletionFailed, le)
-				return newOpErr(codeGitError, fmt.Errorf("retry: preflight dirty snapshot: %w", derr))
+				orig := newOpErr(codeGitError, fmt.Errorf("retry: preflight dirty snapshot: %w", derr))
+				if ferr := m.finalizeDeletionFailed(row.ID, orig.Error()); ferr != nil {
+					return newOpErr(codeInternal, errors.Join(orig, ferr))
+				}
+				return orig
 			}
 			if len(snap) > 0 && !confirmDirty {
-				le := sql.NullString{String: "retry: worktree has dirty files; confirm deletion again", Valid: true}
-				_, _ = m.writeStatus(ctx, row.ID, StatusDeletionFailed, le)
-				return newOpErr(codeConflict, errors.New("worktree: retry delete has dirty files; confirm deletion again with confirmDirty=true"))
+				orig := newOpErr(codeConflict, errors.New("worktree: retry delete has dirty files; confirm deletion again with confirmDirty=true"))
+				if ferr := m.finalizeDeletionFailed(row.ID, "retry: worktree has dirty files; confirm deletion again"); ferr != nil {
+					return newOpErr(codeInternal, errors.Join(orig, ferr))
+				}
+				return orig
 			}
 			preflightDirty = snap
 		case TaskModeLocalPath:

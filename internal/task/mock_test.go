@@ -409,6 +409,25 @@ func (s *mockStore) BeginDeleteIntent(ctx context.Context, id, mode string, from
 	return application.TransitionResult{}, nil
 }
 
+// BeginRetryDeleteIntent 镜像 store SQL 语义（评审 C-F3）：仅 deletion_failed 命中，
+// 原子写 delete_mode + status=deleting + last_error=NULL。
+func (s *mockStore) BeginRetryDeleteIntent(ctx context.Context, id, mode string) (application.TransitionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.tasks[id]
+	if !ok {
+		return application.TransitionResult{}, fmt.Errorf("not found")
+	}
+	if t.Status != StatusDeletionFailed {
+		return application.TransitionResult{}, nil
+	}
+	t.Status = StatusDeleting
+	t.DeleteMode = sql.NullString{String: mode, Valid: true}
+	t.LastError = sql.NullString{}
+	s.tasks[id] = t
+	return application.TransitionResult{MutationResult: application.MutationResult{Matched: true, Changed: true}}, nil
+}
+
 func (s *mockStore) ArchiveTask(ctx context.Context, id string) (application.TransitionResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -37,6 +37,9 @@ type TaskStore interface {
 	UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error)
 	SetTaskDeleteMode(ctx context.Context, id, mode string) (application.MutationResult, error)
 	BeginDeleteIntent(ctx context.Context, id, mode string, fromStatuses []string) (application.TransitionResult, error)
+	// BeginRetryDeleteIntent deletion_failed 重入意图（Retry 专用）：原子写 delete_mode +
+	// status=deleting + last_error=NULL（评审 C-F3）。
+	BeginRetryDeleteIntent(ctx context.Context, id, mode string) (application.TransitionResult, error)
 	ArchiveTask(ctx context.Context, id string) (application.TransitionResult, error)
 	RestoreTask(ctx context.Context, id string) (application.TransitionResult, error)
 	DeleteTask(ctx context.Context, id string) (application.DeleteResult, error)

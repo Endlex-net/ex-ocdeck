@@ -108,27 +108,48 @@ func (c *sseSpyOC) subscribeCount() int {
 }
 
 // traceDeleteStore 统计删除链路全部写路径调用（5.2 非法组合零副作用边界断言）。
+// updateStatusErr/statusMatchedOverride/deleteTaskErr 支持注入落账写失败、CAS miss 与
+// DB 删除失败（I-F1 落账可靠性测试）。
 type traceDeleteStore struct {
 	*mockStore
-	mu               sync.Mutex
-	statusWrites     int // UpdateTaskStatus + UpdateTaskStatusConditional（含 deleteResume 落账）
-	beginIntents     int // BeginDeleteIntent
-	deleteModeWrites int // SetTaskDeleteMode
-	rowDeletes       int // DeleteTask
-	sessionDeletes   int // DeleteTaskSession
+	mu                    sync.Mutex
+	statusWrites          int // UpdateTaskStatus + UpdateTaskStatusConditional（含 deleteResume 落账）
+	beginIntents          int // BeginDeleteIntent
+	deleteModeWrites      int // SetTaskDeleteMode
+	rowDeletes            int // DeleteTask
+	sessionDeletes        int // DeleteTaskSession
+	updateStatusErr       error
+	statusMatchedOverride *bool
+	deleteTaskErr         error
 }
 
 func (s *traceDeleteStore) UpdateTaskStatus(ctx context.Context, id, status string, le sql.NullString) (application.TransitionResult, error) {
 	s.mu.Lock()
 	s.statusWrites++
+	injectErr := s.updateStatusErr
+	matched := s.statusMatchedOverride == nil || *s.statusMatchedOverride
 	s.mu.Unlock()
+	if injectErr != nil {
+		return application.TransitionResult{}, injectErr
+	}
+	if !matched {
+		return application.TransitionResult{}, nil
+	}
 	return s.mockStore.UpdateTaskStatus(ctx, id, status, le)
 }
 
 func (s *traceDeleteStore) UpdateTaskStatusConditional(ctx context.Context, id, from, to string, le sql.NullString) (application.TransitionResult, error) {
 	s.mu.Lock()
 	s.statusWrites++
+	injectErr := s.updateStatusErr
+	matched := s.statusMatchedOverride == nil || *s.statusMatchedOverride
 	s.mu.Unlock()
+	if injectErr != nil {
+		return application.TransitionResult{}, injectErr
+	}
+	if !matched {
+		return application.TransitionResult{}, nil
+	}
 	return s.mockStore.UpdateTaskStatusConditional(ctx, id, from, to, le)
 }
 
@@ -149,7 +170,11 @@ func (s *traceDeleteStore) SetTaskDeleteMode(ctx context.Context, id, mode strin
 func (s *traceDeleteStore) DeleteTask(ctx context.Context, id string) (application.DeleteResult, error) {
 	s.mu.Lock()
 	s.rowDeletes++
+	injectErr := s.deleteTaskErr
 	s.mu.Unlock()
+	if injectErr != nil {
+		return application.DeleteResult{}, injectErr
+	}
 	return s.mockStore.DeleteTask(ctx, id)
 }
 
@@ -160,12 +185,14 @@ func (s *traceDeleteStore) DeleteTaskSession(ctx context.Context, taskID, sessio
 	return s.mockStore.DeleteTaskSession(ctx, taskID, sessionID)
 }
 
-// traceDeleteProc 统计进程创建/kill 调用（零进程副作用断言）。
+// traceDeleteProc 统计进程创建/kill 调用（零进程副作用断言）；lists 计数 ListSessions
+// （I-F2 CreateShell 零枚举断言）。
 type traceDeleteProc struct {
 	*mockProc
 	mu    sync.Mutex
 	kills int
 	news  int
+	lists int
 }
 
 func (p *traceDeleteProc) NewSession(spec process.SessionSpec) error {
@@ -180,6 +207,13 @@ func (p *traceDeleteProc) KillSession(name string) (process.KillResult, error) {
 	p.kills++
 	p.mu.Unlock()
 	return p.mockProc.KillSession(name)
+}
+
+func (p *traceDeleteProc) ListSessions() ([]string, error) {
+	p.mu.Lock()
+	p.lists++
+	p.mu.Unlock()
+	return p.mockProc.ListSessions()
 }
 
 // traceDeleteOC 统计 oc 会话创建/删除调用（零 oc 副作用断言）。
@@ -241,7 +275,7 @@ func seedDeleteBoundary(t *testing.T, store *traceDeleteStore, proc *traceDelete
 }
 
 // assertDeleteBoundaryUntouched 断言删除链路零写零调用且素材原样保留
-//（wantStatusWrites 为允许的状态写次数：首次 Delete/Retry 为 0，deleteResume 落账为 1；
+// （wantStatusWrites 为允许的状态写次数：首次 Delete/Retry 为 0，deleteResume 落账为 1；
 // wantNotice 为预置的 cleanup debt JSON——retryDebtGate 不得消费）。
 func assertDeleteBoundaryUntouched(t *testing.T, store *traceDeleteStore, proc *traceDeleteProc, oc *traceDeleteOC, runner *mockLifecycleRunner, taskID string, wantStatusWrites int, wantStatus string, wantNotice sql.NullString) {
 	t.Helper()
@@ -1437,7 +1471,7 @@ func TestIllegalCombo_RuntimeEntries_FailClosed(t *testing.T) {
 }
 
 // TestReconcile_IllegalCombo_ObservabilityFailClosed 扩充非法 Reconcile 的观测面
-//（reconcile_mode_gate_test.go 的 P1 矩阵只观察状态与进程）：align 零调用（capture store）、
+// （reconcile_mode_gate_test.go 的 P1 矩阵只观察状态与进程）：align 零调用（capture store）、
 // SSE 零订阅（spy）、预置 anchor 不变、runtime 注册表不变。active 任务 + 存活健康 runtime
 // 使 persist 矩阵的 resume 分支真实可达——若非法组合被错误放行，SSE/align 探针立即非零。
 func TestReconcile_IllegalCombo_ObservabilityFailClosed(t *testing.T) {
@@ -1662,5 +1696,260 @@ func TestGitOps_IllegalCombo_FailClosed(t *testing.T) {
 
 	if _, err := m.GitStatus(context.Background(), "t1"); !isOpErrCode(err, codeInternal) {
 		t.Fatalf("GitStatus dir+worktree: err = %v, want internal", err)
+	}
+}
+
+// --- I-F1：删除流程失败出口落账可靠性（Section 7 评审） ---
+
+// cancelSensitiveStatusStore 模拟真实 store 的 UpdateTaskStatus/UpdateTaskStatusConditional
+// 响应 ctx 取消（ExecContext 语义）：ctx 已取消时返回 ctx.Err()——验证落账走非取消有界 ctx 后
+// 仍能在取消的 request ctx 下落 deletion_failed。
+type cancelSensitiveStatusStore struct {
+	*traceDeleteStore
+}
+
+func (s *cancelSensitiveStatusStore) UpdateTaskStatus(ctx context.Context, id, status string, le sql.NullString) (application.TransitionResult, error) {
+	if err := ctx.Err(); err != nil {
+		return application.TransitionResult{}, err
+	}
+	return s.traceDeleteStore.UpdateTaskStatus(ctx, id, status, le)
+}
+
+func (s *cancelSensitiveStatusStore) UpdateTaskStatusConditional(ctx context.Context, id, from, to string, le sql.NullString) (application.TransitionResult, error) {
+	if err := ctx.Err(); err != nil {
+		return application.TransitionResult{}, err
+	}
+	return s.traceDeleteStore.UpdateTaskStatusConditional(ctx, id, from, to, le)
+}
+
+// TestDelete_LocalPath_FinalizeReliability local-path 删除序列失败出口的落账可靠性：
+// 任一步骤失败（oc session 删除 / pre-delete 脚本 / DB 删除）均可靠落 deletion_failed；
+// 落账自身写失败或 CAS miss 时返回 internal 且 errors.Join 保留原始错误，行停留 deleting
+// 不伪造收敛；落账成功时保持既有返回码映射（process_error/invalid_state/internal）。
+func TestDelete_LocalPath_FinalizeReliability(t *testing.T) {
+	resetLifecycleCfgMock()
+	// 种子 suspended 行：Delete 入口内完成意图提交（BeginDeleteIntent），随后序列失败
+	// 触发各落账出口（与生产调用形态一致，guard 亦不拦截）。
+	seedDeletingLocalPath := func(t *testing.T, projDir string) *traceDeleteStore {
+		t.Helper()
+		store := newMockStore()
+		seedLocalPathRepoTask(store, "t1", "p1", projDir)
+		return &traceDeleteStore{mockStore: store}
+	}
+
+	t.Run("oc_session_delete_fail_finalize_write_fail_joins", func(t *testing.T) {
+		projDir := t.TempDir()
+		tstore := seedDeletingLocalPath(t, projDir)
+		// owned session + 无密码 env 的存活 runtime：deleteOCSessions 走「恢复密码失败」出口。
+		_ = tstore.UpsertTaskSession(context.Background(), SessionRow{TaskID: "t1", SessionID: "sess-owned"})
+		proc := &traceDeleteProc{mockProc: newMockProc()}
+		proc.sessions[runtimeSessionName("t1")] = true
+		oc := newMockOC(true)
+		oc.deleteErr = errors.New("oc delete boom")
+		tstore.updateStatusErr = errors.New("db write failed")
+		m := newTestManager(t, tstore, proc, newMockWorktree(), oc)
+
+		err := m.Delete(context.Background(), "t1", DeleteNormal, false)
+		if err == nil || !isOpErrCode(err, codeInternal) {
+			t.Fatalf("err = %v, want internal（落账失败升级）", err)
+		}
+		for _, want := range []string{"recover serve password", "db write failed"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err = %v, want contain %q（errors.Join 保留原错误与落账错误）", err, want)
+			}
+		}
+		row, _ := tstore.GetTask(context.Background(), "t1")
+		if row.Status != StatusDeleting {
+			t.Errorf("status = %s, want unchanged deleting（落账失败不得伪造收敛）", row.Status)
+		}
+	})
+	t.Run("oc_session_delete_fail_finalize_ok_keeps_mapping", func(t *testing.T) {
+		projDir := t.TempDir()
+		tstore := seedDeletingLocalPath(t, projDir)
+		_ = tstore.UpsertTaskSession(context.Background(), SessionRow{TaskID: "t1", SessionID: "sess-owned"})
+		proc := &traceDeleteProc{mockProc: newMockProc()}
+		proc.sessions[runtimeSessionName("t1")] = true
+		oc := newMockOC(true)
+		oc.deleteErr = errors.New("oc delete boom")
+		m := newTestManager(t, tstore, proc, newMockWorktree(), oc)
+
+		err := m.Delete(context.Background(), "t1", DeleteNormal, false)
+		// 落账成功：既有返回码映射不变（process_error），状态可靠落 deletion_failed。
+		if err == nil || !isOpErrCode(err, codeProcessError) {
+			t.Fatalf("err = %v, want process_error（落账成功保持既有映射）", err)
+		}
+		assertStatus(t, tstore, "t1", StatusDeletionFailed)
+		lastErrorContains(t, tstore, "t1", "delete oc sessions")
+	})
+	t.Run("pre_delete_fail_finalize_write_fail_joins", func(t *testing.T) {
+		projDir := t.TempDir()
+		tstore := seedDeletingLocalPath(t, projDir)
+		seedLifecycleConfig(tstore, "p1", "", "", "echo predelete")
+		runner := &mockLifecycleRunner{runScriptErr: errors.New("predelete boom")}
+		tstore.updateStatusErr = errors.New("db write failed")
+		m := newLifecycleTestManager(t, tstore, &traceDeleteProc{mockProc: newMockProc()},
+			wrapPanicWorktree(newMockWorktree()), newMockOC(true), runner)
+
+		err := m.Delete(context.Background(), "t1", DeleteNormal, false)
+		if err == nil || !isOpErrCode(err, codeInternal) {
+			t.Fatalf("err = %v, want internal", err)
+		}
+		for _, want := range []string{"pre-delete:", "db write failed"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err = %v, want contain %q", err, want)
+			}
+		}
+		row, _ := tstore.GetTask(context.Background(), "t1")
+		if row.Status != StatusDeleting {
+			t.Errorf("status = %s, want unchanged deleting", row.Status)
+		}
+	})
+	t.Run("pre_delete_fail_finalize_ok_keeps_mapping", func(t *testing.T) {
+		projDir := t.TempDir()
+		tstore := seedDeletingLocalPath(t, projDir)
+		seedLifecycleConfig(tstore, "p1", "", "", "echo predelete")
+		runner := &mockLifecycleRunner{runScriptErr: errors.New("predelete boom")}
+		m := newLifecycleTestManager(t, tstore, &traceDeleteProc{mockProc: newMockProc()},
+			wrapPanicWorktree(newMockWorktree()), newMockOC(true), runner)
+
+		err := m.Delete(context.Background(), "t1", DeleteNormal, false)
+		if err == nil || !isOpErrCode(err, codeInvalidState) {
+			t.Fatalf("err = %v, want invalid_state（落账成功保持既有映射）", err)
+		}
+		assertStatus(t, tstore, "t1", StatusDeletionFailed)
+		lastErrorContains(t, tstore, "t1", "pre-delete:")
+	})
+	t.Run("db_delete_fail_finalize_ok", func(t *testing.T) {
+		projDir := t.TempDir()
+		tstore := seedDeletingLocalPath(t, projDir)
+		tstore.deleteTaskErr = errors.New("db delete boom")
+		m := newTestManager(t, tstore, &traceDeleteProc{mockProc: newMockProc()}, newMockWorktree(), newMockOC(true))
+
+		err := m.Delete(context.Background(), "t1", DeleteNormal, false)
+		if err == nil || !isOpErrCode(err, codeInternal) {
+			t.Fatalf("err = %v, want internal（DB 删除失败既有映射）", err)
+		}
+		assertStatus(t, tstore, "t1", StatusDeletionFailed)
+		lastErrorContains(t, tstore, "t1", "delete db row")
+	})
+	t.Run("db_delete_fail_finalize_write_fail_joins", func(t *testing.T) {
+		projDir := t.TempDir()
+		tstore := seedDeletingLocalPath(t, projDir)
+		tstore.deleteTaskErr = errors.New("db delete boom")
+		tstore.updateStatusErr = errors.New("db write failed")
+		m := newTestManager(t, tstore, &traceDeleteProc{mockProc: newMockProc()}, newMockWorktree(), newMockOC(true))
+
+		err := m.Delete(context.Background(), "t1", DeleteNormal, false)
+		if err == nil || !isOpErrCode(err, codeInternal) {
+			t.Fatalf("err = %v, want internal", err)
+		}
+		for _, want := range []string{"delete db row", "db write failed"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err = %v, want contain %q", err, want)
+			}
+		}
+		row, _ := tstore.GetTask(context.Background(), "t1")
+		if row.Status != StatusDeleting {
+			t.Errorf("status = %s, want unchanged deleting", row.Status)
+		}
+	})
+	t.Run("db_delete_fail_finalize_cas_miss", func(t *testing.T) {
+		projDir := t.TempDir()
+		tstore := seedDeletingLocalPath(t, projDir)
+		tstore.deleteTaskErr = errors.New("db delete boom")
+		no := false
+		tstore.statusMatchedOverride = &no
+		m := newTestManager(t, tstore, &traceDeleteProc{mockProc: newMockProc()}, newMockWorktree(), newMockOC(true))
+
+		err := m.Delete(context.Background(), "t1", DeleteNormal, false)
+		if err == nil || !isOpErrCode(err, codeInternal) {
+			t.Fatalf("err = %v, want internal（CAS miss = 落账失败）", err)
+		}
+		if !strings.Contains(err.Error(), "CAS not matched") {
+			t.Errorf("err = %v, want CAS not matched context", err)
+		}
+	})
+	t.Run("finalize_lands_on_canceled_request_ctx", func(t *testing.T) {
+		projDir := t.TempDir()
+		base := seedDeletingLocalPath(t, projDir)
+		// owned session + 有效密码/端口的存活 runtime → oc.DeleteSession 真实执行并失败。
+		_ = base.UpsertTaskSession(context.Background(), SessionRow{TaskID: "t1", SessionID: "sess-owned"})
+		proc := &traceDeleteProc{mockProc: newMockProc()}
+		proc.sessions[runtimeSessionName("t1")] = true
+		proc.envValues[runtimeSessionName("t1")] = map[string]string{
+			"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
+		}
+		oc := newMockOC(true)
+		oc.deleteErr = errors.New("oc delete boom")
+		cstore := &cancelSensitiveStatusStore{traceDeleteStore: base}
+		m := newTestManager(t, cstore, proc, newMockWorktree(), oc)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := m.Delete(ctx, "t1", DeleteNormal, false)
+		if err == nil {
+			t.Fatal("Delete with oc failure: want error, got nil")
+		}
+		// 落账 MUST 用非取消有界 ctx：request ctx 已取消仍可靠落 deletion_failed
+		// （旧实现用可取消 request ctx 且忽略写错误，行停留 deleting——本断言 RED）。
+		assertStatus(t, base, "t1", StatusDeletionFailed)
+		lastErrorContains(t, base, "t1", "delete oc sessions")
+	})
+}
+
+// --- I-F2：CreateShell 副作用前模式解析（Section 7 评审） ---
+
+// TestCreateShell_IllegalCombo_FailClosed 非法 kind/mode 组合下 CreateShell 在任何
+// process 查询/创建副作用前拒绝：shell 枚举（ListSessions）、NewSession、runtime
+// 注册表全部零副作用（与 ReopenAttach 同口径，D2 全入口覆盖）。
+func TestCreateShell_IllegalCombo_FailClosed(t *testing.T) {
+	cases := []struct {
+		name string
+		kind string
+		mode string
+	}{
+		{"dir+worktree", ProjectKindDir, TaskModeWorktree},
+		{"repo+unknown mode", ProjectKindRepo, "bogus"},
+		{"unknown kind", "weird", TaskModeWorktree},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newMockStore()
+			defaultBranch := ""
+			if tc.kind == ProjectKindRepo {
+				defaultBranch = "main"
+			}
+			store.seedProject(ProjectRow{ID: "p1", Name: "p", Path: "/repo", DefaultBranch: defaultBranch, Kind: tc.kind})
+			snap, _ := encodeEnvSnapshot(envSnapshot{Vars: map[string]string{"OCDECK_TASK_ID": "t1"}})
+			store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Name: "task",
+				Status: StatusActive, WorktreePath: "/wt", InitStatus: InitStatusNone,
+				EnvSnapshot: snap, Mode: tc.mode}
+			tstore := &traceDeleteStore{mockStore: store}
+			proc := &traceDeleteProc{mockProc: newMockProc()}
+			m := newTestManager(t, tstore, proc, newMockWorktree(), newMockOC(true))
+			rt := m.newRuntime("t1")
+			m.setRuntime("t1", rt)
+			regBefore := runtimeRegistrySnapshot(m, "t1")
+
+			tid, err := m.CreateShell(context.Background(), "t1")
+			if err == nil || !isOpErrCode(err, codeInternal) {
+				t.Fatalf("CreateShell = (%q, %v), want internal", tid, err)
+			}
+			if tid != "" {
+				t.Errorf("terminal id = %q, want empty", tid)
+			}
+			if proc.lists != 0 {
+				t.Errorf("ListSessions calls = %d, want 0（shell 枚举前拒绝）", proc.lists)
+			}
+			if proc.news != 0 {
+				t.Errorf("NewSession calls = %d, want 0（不得创建进程）", proc.news)
+			}
+			if regAfter := runtimeRegistrySnapshot(m, "t1"); regAfter != regBefore {
+				t.Errorf("runtime registry = %s, want unchanged %s", regAfter, regBefore)
+			}
+			if len(proc.sessions) != 0 {
+				t.Errorf("sessions = %v, want none created", proc.sessions)
+			}
+		})
 	}
 }

@@ -15,12 +15,16 @@ package task
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/process"
 )
@@ -572,4 +576,175 @@ func TestRetry_RepoDirtyGate_UnchangedRegression(t *testing.T) {
 		t.Fatalf("repo Retry with dirty and no confirmDirty MUST be rejected; err=%v", err)
 	}
 	assertStatus(t, store, "t1", StatusDeletionFailed)
+}
+
+// --- 评审 C-F2：Retry deletion_failed 意图写入原子化 + 未命中零副作用 ---
+
+// retryIntentMissStore 模拟 GetTask 读取后、意图写入前，行状态已被并发迁出
+// deletion_failed（评审 C-F2：Retry 意图写 CAS 未命中必须在任何副作用前终止）。
+type retryIntentMissStore struct {
+	*traceDeleteStore
+}
+
+func (s *retryIntentMissStore) BeginRetryDeleteIntent(ctx context.Context, id, mode string) (application.TransitionResult, error) {
+	// 并发收敛：状态离开 deletion_failed，真实 CAS（守卫 deletion_failed）未命中。
+	s.mutTask(id, func(r *TaskRow) { r.Status = StatusSuspended })
+	return s.traceDeleteStore.BeginRetryDeleteIntent(ctx, id, mode)
+}
+
+// countingDirtyWorktree 统计 DirtyFiles 调用次数（意图未命中断言零 dirty 快照探测）。
+type countingDirtyWorktree struct {
+	*mockWorktree
+	mu         sync.Mutex
+	dirtyCalls int
+}
+
+func (w *countingDirtyWorktree) DirtyFiles(ctx context.Context, wtPath string) (map[string]struct{}, error) {
+	w.mu.Lock()
+	w.dirtyCalls++
+	w.mu.Unlock()
+	return w.mockWorktree.DirtyFiles(ctx, wtPath)
+}
+
+func (w *countingDirtyWorktree) dirtyCallsCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.dirtyCalls
+}
+
+// countingDeleteOC 统计 DeleteSession 调用次数（意图未命中断言零 OC 副作用）。
+type countingDeleteOC struct {
+	OCClient
+	mu          sync.Mutex
+	deleteCalls int
+}
+
+func (c *countingDeleteOC) DeleteSession(ctx context.Context, dir, id string) error {
+	c.mu.Lock()
+	c.deleteCalls++
+	c.mu.Unlock()
+	return c.OCClient.DeleteSession(ctx, dir, id)
+}
+
+func (c *countingDeleteOC) deleteCallsCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deleteCalls
+}
+
+// captureRetryIntentStore 捕获意图写入后的行快照（评审 C-F3：意图提交即发布状态事件，
+// 详情/项目页据此重组装——此刻行 MUST 已无残留 last_error）。
+type captureRetryIntentStore struct {
+	*mockStore
+	mu       sync.Mutex
+	captured *TaskRow
+}
+
+func (s *captureRetryIntentStore) BeginRetryDeleteIntent(ctx context.Context, id, mode string) (application.TransitionResult, error) {
+	res, err := s.mockStore.BeginRetryDeleteIntent(ctx, id, mode)
+	if err == nil && res.Matched {
+		if row, gerr := s.mockStore.GetTask(ctx, id); gerr == nil {
+			s.mu.Lock()
+			cp := row
+			s.captured = &cp
+			s.mu.Unlock()
+		}
+	}
+	return res, err
+}
+
+// TestRetry_DeletionFailed_IntentClearsLastError 验证删除重入意图提交时原子清空 last_error
+// （评审 C-F3）：意图提交即发布状态事件，deleting 行 MUST 已无过期错误；后续 DirtyFiles 失败
+// 经 finalize 落新错误，stale 错误不得存活。
+func TestRetry_DeletionFailed_IntentClearsLastError(t *testing.T) {
+	base := newMockStore()
+	seedSuspendedTask(base, "t1", "p1") // repo worktree 任务
+	base.mutTask("t1", func(r *TaskRow) {
+		r.Status = StatusDeletionFailed
+		r.LastError = sql.NullString{String: "stale: previous delete failed", Valid: true}
+		r.DeleteMode = sql.NullString{String: string(DeleteNormal), Valid: true}
+	})
+	cstore := &captureRetryIntentStore{mockStore: base}
+	wt := newMockWorktree()
+	wt.dirtyErr = errors.New("git status failed")
+	m := newTestManager(t, cstore, newMockProc(), wt, newMockOC(true))
+
+	err := m.Retry(context.Background(), "t1", false)
+	if err == nil || !isOpErrCode(err, codeGitError) {
+		t.Fatalf("Retry = %v, want git_error（DirtyFiles 失败使意图提交后的行状态可观测）", err)
+	}
+	cstore.mu.Lock()
+	snap := cstore.captured
+	cstore.mu.Unlock()
+	if snap == nil {
+		t.Fatal("retry intent must have been captured")
+	}
+	if snap.Status != StatusDeleting {
+		t.Errorf("captured status = %s, want deleting", snap.Status)
+	}
+	if snap.LastError.Valid {
+		t.Errorf("captured last_error = %q, want empty（意图提交原子清空 stale 错误，评审 C-F3）", snap.LastError.String)
+	}
+	// finalize 落新错误后旧错误不得存活。
+	row, _ := base.GetTask(context.Background(), "t1")
+	if !row.LastError.Valid || strings.Contains(row.LastError.String, "stale") {
+		t.Errorf("final last_error = %v, want new git error without stale message", row.LastError)
+	}
+}
+
+// TestRetry_DeletionFailed_IntentMissZeroSideEffects 验证 deletion_failed 重试的原子意图
+// 写入 CAS 未命中（行已并发迁出 deletion_failed）时返回 conflict（与首次 Delete 意图未命中
+// 一致），且 DirtyFiles、进程（kill/new）、OC、worktree Remove、DB 行删除全部零副作用
+// （评审 C-F2：旧实现两次无条件写忽略 Matched，未命中仍进入 DirtyFiles 与删除副作用序列）。
+func TestRetry_DeletionFailed_IntentMissZeroSideEffects(t *testing.T) {
+	base := newMockStore()
+	seedSuspendedTask(base, "t1", "p1") // repo worktree 任务
+	// 模拟前次删除失败落账：deletion_failed + delete_mode=force（B8：不得被 Normal 重试覆盖）。
+	_, _ = base.SetTaskDeleteMode(context.Background(), "t1", string(DeleteForce))
+	base.mutTask("t1", func(r *TaskRow) { r.Status = StatusDeletionFailed })
+	// owned session + 存活 runtime（带密码/端口 env）：旧实现会进入 deleteOCSessions 触达 OC。
+	_ = base.UpsertTaskSession(context.Background(), SessionRow{TaskID: "t1", SessionID: "sess-owned"})
+	proc := &traceDeleteProc{mockProc: newMockProc()}
+	proc.sessions[runtimeSessionName("t1")] = true
+	proc.envValues[runtimeSessionName("t1")] = map[string]string{
+		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
+	}
+	tstore := &retryIntentMissStore{traceDeleteStore: &traceDeleteStore{mockStore: base}}
+	wt := &countingDirtyWorktree{mockWorktree: newMockWorktree()}
+	oc := &countingDeleteOC{OCClient: newMockOC(true)}
+	m := newTestManager(t, tstore, proc, wt, oc)
+
+	err := m.Retry(context.Background(), "t1", false)
+	if err == nil || !isOpErrCode(err, codeConflict) {
+		t.Fatalf("Retry intent miss: err = %v, want conflict（与首次 Delete 意图未命中一致）", err)
+	}
+	if calls := wt.dirtyCallsCount(); calls != 0 {
+		t.Errorf("DirtyFiles calls = %d, want 0（副作用前终止）", calls)
+	}
+	if proc.kills != 0 || proc.news != 0 {
+		t.Errorf("proc kills/news = %d/%d, want 0/0（副作用前终止）", proc.kills, proc.news)
+	}
+	if calls := oc.deleteCallsCount(); calls != 0 {
+		t.Errorf("oc.DeleteSession calls = %d, want 0（副作用前终止）", calls)
+	}
+	if calls := wt.mockWorktree.removeCalls(); calls != 0 {
+		t.Errorf("wt.Remove calls = %d, want 0", calls)
+	}
+	if tstore.rowDeletes != 0 {
+		t.Errorf("DeleteTask calls = %d, want 0", tstore.rowDeletes)
+	}
+	if tstore.sessionDeletes != 0 {
+		t.Errorf("DeleteTaskSession calls = %d, want 0", tstore.sessionDeletes)
+	}
+	// 行仍在：CAS 未命中不迁移状态、不覆盖并发收敛结果与持久化 delete_mode（B8）。
+	row, gerr := tstore.GetTask(context.Background(), "t1")
+	if gerr != nil {
+		t.Fatalf("task row must still exist after intent miss: %v", gerr)
+	}
+	if row.Status != StatusSuspended {
+		t.Errorf("status = %s, want suspended（并发收敛结果不被覆盖）", row.Status)
+	}
+	if !row.DeleteMode.Valid || row.DeleteMode.String != string(DeleteForce) {
+		t.Errorf("delete_mode = %v, want force（意图未命中不得覆盖 delete_mode）", row.DeleteMode)
+	}
 }

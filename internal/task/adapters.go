@@ -113,6 +113,9 @@ func (a *StoreAdapter) BeginDeleteIntent(ctx context.Context, id, mode string, f
 	}
 	return a.db.BeginDeleteIntent(ctx, id, ocdecktask.DeleteMode(mode), fs)
 }
+func (a *StoreAdapter) BeginRetryDeleteIntent(ctx context.Context, id, mode string) (application.TransitionResult, error) {
+	return a.db.BeginRetryDeleteIntent(ctx, id, ocdecktask.DeleteMode(mode))
+}
 func (a *StoreAdapter) ArchiveTask(ctx context.Context, id string) (application.TransitionResult, error) {
 	return a.db.ArchiveTask(ctx, id)
 }

@@ -82,6 +82,11 @@ func (a *Adapter) BeginDeleteIntent(ctx context.Context, id string, mode ocdeckt
 	return a.db.BeginDeleteIntent(ctx, id, mode, fromStatuses)
 }
 
+// BeginRetryDeleteIntent 委托 store.BeginRetryDeleteIntent（Retry 专用：原子清空 last_error）。
+func (a *Adapter) BeginRetryDeleteIntent(ctx context.Context, id string, mode ocdecktask.DeleteMode) (application.TransitionResult, error) {
+	return a.db.BeginRetryDeleteIntent(ctx, id, mode)
+}
+
 // ArchiveTask 委托 store.ArchiveTask。
 func (a *Adapter) ArchiveTask(ctx context.Context, id string) (application.TransitionResult, error) {
 	return a.db.ArchiveTask(ctx, id)

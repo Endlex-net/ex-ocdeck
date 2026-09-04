@@ -145,7 +145,7 @@ func (m *Manager) deleteResume(ctx context.Context, row TaskRow, mode DeleteMode
 		// 落账用非取消有界 ctx 并检查错误与 CAS（P1-F2）：落账失败时行停留 deleting，
 		// MUST 将落账错误与原始解析错误一并返回供调用方感知，MUST NOT 吞错。
 		if ferr := m.finalizeDeletionFailed(taskID, rerr.Error()); ferr != nil {
-			return newOpErr(codeInternal, fmt.Errorf("%w; %v", rerr, ferr))
+			return newOpErr(codeInternal, errors.Join(rerr, ferr))
 		}
 		return newOpErr(codeInternal, rerr)
 	}
@@ -159,14 +159,15 @@ func (m *Manager) deleteResume(ctx context.Context, row TaskRow, mode DeleteMode
 // 非取消 ctx（design.md §6.1）：request ctx 取消/Shutdown 时 UpdateTaskStatus 真实响应取消，
 // 会留下 deleting 无落账。使用 context.Background() + finishDeletionCtxTimeout。
 //
-// 返回落账结果供调用方检查（P1-F2）：写错误或 CAS 未命中（行不在 deleting）时返回错误——
-// 落账失败意味着行停留 deleting，调用方 MUST 决定是否与原始失败原因一并传播；
-// 既有调用点（repo/dir 序列的 finalizeOnFail 闭包等）忽略返回值时行为与现状一致。
+// 落账为 CAS 条件写（deleting → deletion_failed）：行已并发迁出 deleting（被其他 actor 收敛/
+// 删除）时返回未命中错误，MUST NOT 无条件覆盖已收敛状态。返回落账结果供调用方检查（P1-F2）：
+// 写错误或 CAS 未命中时返回错误，调用方 MUST 检查返回错误并与原始失败原因一并传播
+// （errors.Join 保留双方，I-F1）。
 func (m *Manager) finalizeDeletionFailed(taskID, lastError string) error {
 	finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), finishDeletionCtxTimeout)
 	defer finalizeCancel()
 	le := sql.NullString{String: lastError, Valid: true}
-	updated, err := m.writeStatus(finalizeCtx, taskID, StatusDeletionFailed, le)
+	updated, err := m.writeStatusConditional(finalizeCtx, taskID, StatusDeleting, StatusDeletionFailed, le)
 	if err != nil {
 		return fmt.Errorf("finalize deletion_failed for task %s: %w", taskID, err)
 	}
@@ -183,8 +184,13 @@ func (m *Manager) finalizeDeletionFailed(taskID, lastError string) error {
 func (m *Manager) retryDebtGate(ctx context.Context, taskID string, notice sql.NullString) error {
 	entries, perr := parseNotices(notice)
 	if perr != nil {
-		_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, sql.NullString{String: "notice json corrupted", Valid: true})
-		return newOpErr(codeConflict, fmt.Errorf("task %s notice corrupted: %w", taskID, perr))
+		// I-F1：删除意图提交后的失败出口统一可靠落账（非取消有界 ctx + 检查写错误与 CAS）；
+		// 落账失败 → internal 且 errors.Join 保留原错误。下同。
+		orig := newOpErr(codeConflict, fmt.Errorf("task %s notice corrupted: %w", taskID, perr))
+		if ferr := m.finalizeDeletionFailed(taskID, "notice json corrupted"); ferr != nil {
+			return newOpErr(codeInternal, errors.Join(orig, ferr))
+		}
+		return orig
 	}
 	if !hasDebtTickets(entries) {
 		return nil
@@ -198,8 +204,11 @@ func (m *Manager) retryDebtGate(ctx context.Context, taskID string, notice sql.N
 		if cerr := m.casWriteNotices(ctx, taskID, remaining); cerr != nil {
 			le = fmt.Sprintf("%s; cas write notices: %v", le, cerr)
 		}
-		_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, sql.NullString{String: le, Valid: true})
-		return newOpErr(codeProcessError, derr)
+		orig := newOpErr(codeProcessError, derr)
+		if ferr := m.finalizeDeletionFailed(taskID, le); ferr != nil {
+			return newOpErr(codeInternal, errors.Join(orig, ferr))
+		}
+		return orig
 	}
 	// retryable 已清但仍有 degraded/overflow 时 MUST NOT 阻止 Delete（仅 retryable 阻止，
 	// design.md §8/§19）。remaining 中的 degraded/overflow 项 CAS 写回后随删除流程丢弃（非逃逸进程 debt）。
@@ -210,8 +219,11 @@ func (m *Manager) retryDebtGate(ctx context.Context, taskID string, notice sql.N
 		if cerr := m.casWriteNotices(ctx, taskID, remaining); cerr != nil {
 			le = fmt.Sprintf("cleanup debt not converged; cas write notices: %v", cerr)
 		}
-		_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, sql.NullString{String: le, Valid: true})
-		return newOpErr(codeConflict, fmt.Errorf("task %s has uncleaned cleanup debt", taskID))
+		orig := newOpErr(codeConflict, fmt.Errorf("task %s has uncleaned cleanup debt", taskID))
+		if ferr := m.finalizeDeletionFailed(taskID, le); ferr != nil {
+			return newOpErr(codeInternal, errors.Join(orig, ferr))
+		}
+		return orig
 	}
 	return nil
 }
@@ -230,17 +242,21 @@ func (m *Manager) deleteResumeRepo(ctx context.Context, row TaskRow, mode Delete
 	// ③ 删 oc sessions（逐个，404 幂等落账）。Force 跳过 ③。
 	if mode != DeleteForce {
 		if err := m.deleteOCSessions(ctx, row); err != nil {
-			le := sql.NullString{String: fmt.Errorf("delete oc sessions: %w", err).Error(), Valid: true}
-			_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, le)
-			return newOpErr(codeProcessError, err)
+			orig := newOpErr(codeProcessError, err)
+			if ferr := m.finalizeDeletionFailed(taskID, fmt.Errorf("delete oc sessions: %w", err).Error()); ferr != nil {
+				return newOpErr(codeInternal, errors.Join(orig, ferr))
+			}
+			return orig
 		}
 	}
 
 	// ④ KillSession 残余会话（若有）。
 	if err := m.killResidualSessions(ctx, taskID); err != nil {
-		le := sql.NullString{String: err.Error(), Valid: true}
-		_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, le)
-		return newOpErr(codeProcessError, err)
+		orig := newOpErr(codeProcessError, err)
+		if ferr := m.finalizeDeletionFailed(taskID, err.Error()); ferr != nil {
+			return newOpErr(codeInternal, errors.Join(orig, ferr))
+		}
+		return orig
 	}
 
 	// ⑤ 删 worktree + ⑥ 删本地分支。
@@ -248,9 +264,11 @@ func (m *Manager) deleteResumeRepo(ctx context.Context, row TaskRow, mode Delete
 	// （否则 tickets 随 CASCADE 丢失、worktree 残留）：落 deletion_failed + last_error。
 	proj, err := m.store.GetProject(ctx, row.ProjectID)
 	if err != nil {
-		le := sql.NullString{String: fmt.Errorf("get project for worktree removal: %w", err).Error(), Valid: true}
-		_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, le)
-		return newOpErr(codeNotFound, fmt.Errorf("project not found for worktree removal: %w", err))
+		orig := newOpErr(codeNotFound, fmt.Errorf("project not found for worktree removal: %w", err))
+		if ferr := m.finalizeDeletionFailed(taskID, fmt.Errorf("get project for worktree removal: %w", err).Error()); ferr != nil {
+			return newOpErr(codeInternal, errors.Join(orig, ferr))
+		}
+		return orig
 	}
 	// B7c：二次 dirty 门禁——preflight 通过后，oc session/kill 残余会话期间若新产生 dirty
 	// （快照中不存在的条目）未经确认，不得删（design.md §19）。
@@ -258,15 +276,19 @@ func (m *Manager) deleteResumeRepo(ctx context.Context, row TaskRow, mode Delete
 	if preflightDirty != nil {
 		currentDirty, derr := m.wt.DirtyFiles(ctx, row.WorktreePath)
 		if derr != nil {
-			le := sql.NullString{String: fmt.Errorf("second dirty gate: %w", derr).Error(), Valid: true}
-			_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, le)
-			return newOpErr(codeGitError, fmt.Errorf("second dirty gate: %w", derr))
+			orig := newOpErr(codeGitError, fmt.Errorf("second dirty gate: %w", derr))
+			if ferr := m.finalizeDeletionFailed(taskID, orig.Error()); ferr != nil {
+				return newOpErr(codeInternal, errors.Join(orig, ferr))
+			}
+			return orig
 		}
 		for f := range currentDirty {
 			if _, ok := preflightDirty[f]; !ok {
-				le := sql.NullString{String: "new dirty files after preflight; confirm deletion again", Valid: true}
-				_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, le)
-				return newOpErr(codeConflict, errors.New("worktree: new dirty files after preflight; confirm deletion again with confirmDirty=true"))
+				orig := newOpErr(codeConflict, errors.New("worktree: new dirty files after preflight; confirm deletion again with confirmDirty=true"))
+				if ferr := m.finalizeDeletionFailed(taskID, "new dirty files after preflight; confirm deletion again"); ferr != nil {
+					return newOpErr(codeInternal, errors.Join(orig, ferr))
+				}
+				return orig
 			}
 		}
 	}
@@ -280,11 +302,13 @@ func (m *Manager) deleteResumeRepo(ctx context.Context, row TaskRow, mode Delete
 	if mode != DeleteForce {
 		rel, perr := m.runPreDeleteHook(row)
 		if perr != nil {
-			// token 覆盖范围内的落账 MUST 用非取消 ctx（design.md §6.1）：
-			// request ctx 取消/Shutdown 时 UpdateTaskStatus 真实响应取消，会留下 deleting 无落账。
-			m.finalizeDeletionFailed(taskID, perr.Error())
+			// I-F1：检查落账结果——落账失败时行停留 deleting，MUST 与原始失败原因一并返回。
+			ferr := m.finalizeDeletionFailed(taskID, perr.Error())
 			if rel != nil {
 				rel()
+			}
+			if ferr != nil {
+				return newOpErr(codeInternal, errors.Join(perr, ferr))
 			}
 			return newOpErr(codeInvalidState, perr)
 		}
@@ -296,8 +320,9 @@ func (m *Manager) deleteResumeRepo(ctx context.Context, row TaskRow, mode Delete
 	if preDeleteRelease != nil {
 		defer preDeleteRelease()
 	}
-	finalizeOnFail := func(lastError string) {
-		m.finalizeDeletionFailed(taskID, lastError)
+	// finalizeOnFail 可靠落账闭包（I-F1）：返回落账错误，调用方 join 后升级 internal。
+	finalizeOnFail := func(lastError string) error {
+		return m.finalizeDeletionFailed(taskID, lastError)
 	}
 
 	if err := m.wt.Remove(ctx, row.WorktreePath, worktreeRemoveOpts{
@@ -305,13 +330,19 @@ func (m *Manager) deleteResumeRepo(ctx context.Context, row TaskRow, mode Delete
 		Branch:     row.Branch,
 		ForceDirty: true, // 删除已确认（前置 + 二次门禁通过），TaskManager 层强制清理
 	}); err != nil {
-		finalizeOnFail(fmt.Errorf("worktree remove: %w", err).Error())
+		orig := fmt.Errorf("worktree remove: %w", err)
+		if ferr := finalizeOnFail(orig.Error()); ferr != nil {
+			return newOpErr(codeInternal, errors.Join(orig, ferr))
+		}
 		return newOpErr(codeGitError, err)
 	}
 
 	// ⑨ 删 DB 行（提交点）。
 	if _, err := m.writeDeleteTask(ctx, taskID); err != nil {
-		finalizeOnFail(fmt.Errorf("delete db row: %w", err).Error())
+		orig := fmt.Errorf("delete db row: %w", err)
+		if ferr := finalizeOnFail(orig.Error()); ferr != nil {
+			return newOpErr(codeInternal, errors.Join(orig, ferr))
+		}
 		return newOpErr(codeInternal, err)
 	}
 	// 提交点：defer preDeleteRelease() 已保证释放（§6.1：持有到 DB 行删除成功）。
@@ -348,17 +379,21 @@ func (m *Manager) deleteResumeDir(ctx context.Context, row TaskRow, mode DeleteM
 	// Force 跳过 ③（与 repo force 一致）。
 	if mode != DeleteForce {
 		if err := m.deleteOCSessions(ctx, row); err != nil {
-			le := sql.NullString{String: fmt.Errorf("delete oc sessions: %w", err).Error(), Valid: true}
-			_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, le)
-			return newOpErr(codeProcessError, err)
+			orig := newOpErr(codeProcessError, err)
+			if ferr := m.finalizeDeletionFailed(taskID, fmt.Errorf("delete oc sessions: %w", err).Error()); ferr != nil {
+				return newOpErr(codeInternal, errors.Join(orig, ferr))
+			}
+			return orig
 		}
 	}
 
 	// ④ KillSession 残余会话（若有）。
 	if err := m.killResidualSessions(ctx, taskID); err != nil {
-		le := sql.NullString{String: err.Error(), Valid: true}
-		_, _ = m.writeStatus(ctx, taskID, StatusDeletionFailed, le)
-		return newOpErr(codeProcessError, err)
+		orig := newOpErr(codeProcessError, err)
+		if ferr := m.finalizeDeletionFailed(taskID, err.Error()); ferr != nil {
+			return newOpErr(codeInternal, errors.Join(orig, ferr))
+		}
+		return orig
 	}
 
 	// ⑥ pre-delete 脚本挂点（dir：cwd=项目目录即 row.WorktreePath，design.md §6.1/D3）。
@@ -369,10 +404,13 @@ func (m *Manager) deleteResumeDir(ctx context.Context, row TaskRow, mode DeleteM
 	if mode != DeleteForce {
 		rel, perr := m.runPreDeleteHook(row)
 		if perr != nil {
-			// token 覆盖范围内的落账 MUST 用非取消 ctx（design.md §6.1）。
-			m.finalizeDeletionFailed(taskID, perr.Error())
+			// I-F1：检查落账结果——落账失败时行停留 deleting，MUST 与原始失败原因一并返回。
+			ferr := m.finalizeDeletionFailed(taskID, perr.Error())
 			if rel != nil {
 				rel()
+			}
+			if ferr != nil {
+				return newOpErr(codeInternal, errors.Join(perr, ferr))
 			}
 			return newOpErr(codeInvalidState, perr)
 		}
@@ -384,13 +422,17 @@ func (m *Manager) deleteResumeDir(ctx context.Context, row TaskRow, mode DeleteM
 	if preDeleteRelease != nil {
 		defer preDeleteRelease()
 	}
-	finalizeOnFail := func(lastError string) {
-		m.finalizeDeletionFailed(taskID, lastError)
+	// finalizeOnFail 可靠落账闭包（I-F1）：返回落账错误，调用方 join 后升级 internal。
+	finalizeOnFail := func(lastError string) error {
+		return m.finalizeDeletionFailed(taskID, lastError)
 	}
 
 	// ⑨ 删 DB 行（提交点）。dir 不 wt.Remove——用户目录零写删（pre-delete 脚本为唯一例外）。
 	if _, err := m.writeDeleteTask(ctx, taskID); err != nil {
-		finalizeOnFail(fmt.Errorf("delete db row: %w", err).Error())
+		orig := fmt.Errorf("delete db row: %w", err)
+		if ferr := finalizeOnFail(orig.Error()); ferr != nil {
+			return newOpErr(codeInternal, errors.Join(orig, ferr))
+		}
 		return newOpErr(codeInternal, err)
 	}
 	// 提交点：defer preDeleteRelease() 已保证释放（§6.1：持有到 DB 行删除成功）。

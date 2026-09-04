@@ -77,7 +77,8 @@ func TestReconcile_IllegalModeCombo_FailClosedZeroSideEffects(t *testing.T) {
 
 // --- P1-F2：deleteResume 解析失败落账可靠（design.md D2 重入路径分层） ---
 
-// finalizeFailStore 包装 mockStore：可注入 UpdateTaskStatus 写失败 / CAS 未命中。
+// finalizeFailStore 包装 mockStore：可注入 UpdateTaskStatus/UpdateTaskStatusConditional
+// 写失败 / CAS 未命中。
 type finalizeFailStore struct {
 	*mockStore
 	updateStatusErr error
@@ -92,6 +93,16 @@ func (s *finalizeFailStore) UpdateTaskStatus(ctx context.Context, id, status str
 		return application.TransitionResult{MutationResult: application.MutationResult{Matched: *s.matchedOverride, Changed: *s.matchedOverride}}, nil
 	}
 	return s.mockStore.UpdateTaskStatus(ctx, id, status, lastError)
+}
+
+func (s *finalizeFailStore) UpdateTaskStatusConditional(ctx context.Context, id, from, to string, lastError sql.NullString) (application.TransitionResult, error) {
+	if s.updateStatusErr != nil {
+		return application.TransitionResult{}, s.updateStatusErr
+	}
+	if s.matchedOverride != nil {
+		return application.TransitionResult{MutationResult: application.MutationResult{Matched: *s.matchedOverride, Changed: *s.matchedOverride}}, nil
+	}
+	return s.mockStore.UpdateTaskStatusConditional(ctx, id, from, to, lastError)
 }
 
 // newIllegalDeleteResumeManager 构造 dir+worktree 非法组合的 deleting 任务（已提交删除意图）。
@@ -133,7 +144,8 @@ func TestDeleteResume_IllegalCombo_CanceledCtxStillFinalizes(t *testing.T) {
 // 同时包含原始解析错误与落账错误（MUST NOT 吞错），行停留 deleting。
 func TestDeleteResume_IllegalCombo_WriteFailure_PropagatesBoth(t *testing.T) {
 	m, store := newIllegalDeleteResumeManager(t)
-	store.updateStatusErr = errors.New("db write failed")
+	writeSentinel := errors.New("db write failed")
+	store.updateStatusErr = writeSentinel
 
 	row := store.tasks["t1"]
 	err := m.deleteResume(context.Background(), row, DeleteNormal, nil)
@@ -142,6 +154,9 @@ func TestDeleteResume_IllegalCombo_WriteFailure_PropagatesBoth(t *testing.T) {
 	}
 	if OpErrorCode(err) != codeInternal {
 		t.Errorf("error code = %q, want internal", OpErrorCode(err))
+	}
+	if !errors.Is(err, writeSentinel) {
+		t.Errorf("error chain missing finalize write error (errors.Is sentinel): %v", err)
 	}
 	msg := err.Error()
 	if !strings.Contains(msg, "must not use mode") || !strings.Contains(msg, "finalize deletion_failed") || !strings.Contains(msg, "db write failed") {
@@ -169,6 +184,29 @@ func TestDeleteResume_IllegalCombo_CASMiss_ReportsFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "CAS not matched") {
 		t.Errorf("error = %q, want CAS-not-matched finalize failure", err.Error())
+	}
+}
+
+// TestFinalizeDeletionFailed_MovedOutDeleting_NoOverwrite 验证落账为 CAS 条件写
+// （deleting → deletion_failed，评审 C-F1）：行状态已迁出 deleting（并发收敛）时落账
+// 返回未命中错误，且 MUST NOT 无条件覆盖已收敛状态与 last_error。
+func TestFinalizeDeletionFailed_MovedOutDeleting_NoOverwrite(t *testing.T) {
+	store := newMockStore()
+	store.seedProject(ProjectRow{ID: "pdir", Name: "d", Path: "/proj", DefaultBranch: "", Kind: ProjectKindDir})
+	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "pdir", Name: "task", Branch: "",
+		Status: StatusDeleting, WorktreePath: "/proj", Mode: TaskModeWorktree}
+	m := newTestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
+
+	// 并发收敛：行状态已离开 deleting（模拟其他 actor 已完成收敛）。
+	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusSuspended })
+
+	if err := m.finalizeDeletionFailed("t1", "boom"); err == nil {
+		t.Fatal("finalizeDeletionFailed with moved-out status: want CAS miss error, got nil")
+	}
+	// 已收敛状态不得被覆盖，last_error 不得写入。
+	assertStatus(t, store, "t1", StatusSuspended)
+	if row := store.tasks["t1"]; row.LastError.Valid {
+		t.Errorf("last_error = %q, want unset（CAS 未命中不得写列）", row.LastError.String)
 	}
 }
 

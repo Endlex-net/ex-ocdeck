@@ -163,7 +163,7 @@ func TestShutdown_WaitsRunnerWG_BlockingMock(t *testing.T) {
 //  2. 等待 pre-delete 脚本入场（<-startedCh，RunScript 已被调用，阻塞在 runnerCtx 上）；
 //  3. 此时 cancel request ctx → 断言脚本仍阻塞（ctxCanceled==false），证明入场与执行路径用的是 runnerCtx 而非 request ctx；
 //  4. 触发 Shutdown（cancel runnerCtx）→ 脚本收到取消返回 ctx.Err()；
-//  5. 脚本返回后 deleteResume 进入 finalizeOnFail → UpdateTaskStatus 阻塞在 finalizeGate 上；
+//  5. 脚本返回后 deleteResume 进入 finalizeOnFail → UpdateTaskStatusConditional 阻塞在 finalizeGate 上；
 //  6. finalize 用 Background+5s ctx（非 request ctx）落账成功 → last_error 保持 "pre-delete:" 前缀；
 //  7. 落账完成后 WG 释放、Shutdown 返回。
 //
@@ -240,9 +240,9 @@ func TestShutdown_PreDeleteWG_HeldUntilFinalize(t *testing.T) {
 		}
 	}
 
-	// 步骤 5：脚本返回后 deleteResume 进入 finalizeOnFail → UpdateTaskStatus 阻塞在 finalizeGate 上。
+	// 步骤 5：脚本返回后 deleteResume 进入 finalizeOnFail → CAS 条件写阻塞在 finalizeGate 上。
 	if !store.waitFinalizeEntered(2 * time.Second) {
-		t.Fatalf("finalize UpdateTaskStatus did not start (script may not have returned yet)")
+		t.Fatalf("finalize UpdateTaskStatusConditional did not start (script may not have returned yet)")
 	}
 
 	// 步骤 6：Shutdown MUST NOT 返回（WG 仍持有，finalize 闸门未放行）。
@@ -254,7 +254,7 @@ func TestShutdown_PreDeleteWG_HeldUntilFinalize(t *testing.T) {
 		// 预期：Shutdown 仍阻塞。
 	}
 
-	// 步骤 6 续：放行 finalize 闸门 → UpdateTaskStatus 完成（Background ctx 落账成功）→
+	// 步骤 6 续：放行 finalize 闸门 → CAS 条件写完成（Background ctx 落账成功）→
 	// defer preDeleteRelease() 释放 WG → Shutdown 返回。
 	close(store.finalizeGate)
 	select {
@@ -274,7 +274,7 @@ func TestShutdown_PreDeleteWG_HeldUntilFinalize(t *testing.T) {
 	lastErrorContains(t, store, tid, "pre-delete:")
 }
 
-// gateFinalizeStore：UpdateTaskStatus 阻塞在 finalizeGate 上（模拟落账慢/阻塞），
+// gateFinalizeStore：UpdateTaskStatusConditional 阻塞在 finalizeGate 上（模拟落账慢/阻塞），
 // 用于证明 pre-delete WG 持有到落账完成（design.md §6.1）。
 type gateFinalizeStore struct {
 	*mockStore
@@ -292,9 +292,9 @@ func newGateFinalizeStore() *gateFinalizeStore {
 	}
 }
 
-func (s *gateFinalizeStore) UpdateTaskStatus(ctx context.Context, id, status string, lastError sql.NullString) (application.TransitionResult, error) {
-	// 仅 deletion_failed 落账走闸门（脚本失败后的 finalizeOnFail）。
-	if status == StatusDeletionFailed {
+func (s *gateFinalizeStore) UpdateTaskStatusConditional(ctx context.Context, id, from, to string, lastError sql.NullString) (application.TransitionResult, error) {
+	// 仅 deletion_failed 落账走闸门（脚本失败后的 finalizeOnFail CAS 条件写）。
+	if to == StatusDeletionFailed {
 		s.finalizeEnteredMu.Lock()
 		if !s.finalizeEntered {
 			s.finalizeEntered = true
@@ -307,7 +307,7 @@ func (s *gateFinalizeStore) UpdateTaskStatus(ctx context.Context, id, status str
 			return application.TransitionResult{}, ctx.Err()
 		}
 	}
-	return s.mockStore.UpdateTaskStatus(ctx, id, status, lastError)
+	return s.mockStore.UpdateTaskStatusConditional(ctx, id, from, to, lastError)
 }
 
 // waitFinalizeEntered 确定性等待 finalize 落账开始（finalizeEnteredCh 关闭，替代轮询 Sleep）。

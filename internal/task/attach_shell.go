@@ -107,6 +107,15 @@ func (m *Manager) CreateShell(ctx context.Context, taskID string) (TerminalID, e
 	if row.Status != StatusActive {
 		return "", newOpErr(codeInvalidState, fmt.Errorf("create shell requires active, got %s", row.Status))
 	}
+	// add-local-path-task-mode D2：任何 process 查询/创建副作用前解析有效模式——
+	// 持久化 kind/mode 损坏 → internal 零副作用（与 ReopenAttach 同口径）。
+	proj, perr := m.store.GetProject(ctx, row.ProjectID)
+	if perr != nil {
+		return "", newOpErr(codeNotFound, fmt.Errorf("project gone: %w", perr))
+	}
+	if _, kerr := resolveTaskMode(row, proj.Kind); kerr != nil {
+		return "", newOpErr(codeInternal, kerr)
+	}
 	rt := m.getRuntime(taskID)
 	if rt == nil {
 		return "", newOpErr(codeInvalidState, fmt.Errorf("no runtime for active task %s", taskID))

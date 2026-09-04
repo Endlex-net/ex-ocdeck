@@ -175,6 +175,11 @@ func (s *traceStore) BeginDeleteIntent(ctx context.Context, id, mode string, fro
 	return s.TaskStore.BeginDeleteIntent(ctx, id, mode, fromStatuses)
 }
 
+func (s *traceStore) BeginRetryDeleteIntent(ctx context.Context, id, mode string) (application.TransitionResult, error) {
+	s.tr.record("store", "BeginRetryDeleteIntent", fmt.Sprintf("id=%s mode=%s", id, mode))
+	return s.TaskStore.BeginRetryDeleteIntent(ctx, id, mode)
+}
+
 func (s *traceStore) ArchiveTask(ctx context.Context, id string) (application.TransitionResult, error) {
 	s.tr.record("store", "ArchiveTask", fmt.Sprintf("id=%s", id))
 	return s.TaskStore.ArchiveTask(ctx, id)
@@ -431,6 +436,7 @@ var (
 		"CreateTask": true, "UpdateTaskStatus": true, "UpdateTaskStatusConditional": true,
 		"UpdateTaskEnvSnapshot": true, "UpdateTaskLastPort": true, "UpdateTaskNotice": true,
 		"UpdateTaskNoticeCAS": true, "SetTaskDeleteMode": true, "BeginDeleteIntent": true,
+		"BeginRetryDeleteIntent": true,
 		"ArchiveTask": true, "RestoreTask": true, "DeleteTask": true, "CommitCreated": true,
 		"ClaimInitRun": true, "ClaimInitRerun": true, "FinishInitRun": true,
 		"ClaimTaskSession": true, "TouchOwnedTaskSession": true, "DeleteTaskSession": true,

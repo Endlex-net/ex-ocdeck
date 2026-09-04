@@ -103,6 +103,9 @@ func (r *fakeTaskRepo) UpdateTaskNoticeCAS(context.Context, string, *string, *st
 func (r *fakeTaskRepo) BeginDeleteIntent(context.Context, string, ocdecktask.DeleteMode, []ocdecktask.Status) (application.TransitionResult, error) {
 	return r.transitionRes, r.transitionErr
 }
+func (r *fakeTaskRepo) BeginRetryDeleteIntent(context.Context, string, ocdecktask.DeleteMode) (application.TransitionResult, error) {
+	return r.transitionRes, r.transitionErr
+}
 func (r *fakeTaskRepo) DeleteTask(context.Context, string) (application.DeleteResult, error) {
 	return r.deleteRes, r.deleteErr
 }

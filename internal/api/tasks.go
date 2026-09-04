@@ -76,31 +76,6 @@ type TaskBackend interface {
 	ReadPreDeleteLog(ctx context.Context, taskID string) (string, error)
 }
 
-// TaskRowDTO 任务详情 DTO（design.md §21 GET /tasks/:id）。
-type TaskRowDTO struct {
-	ID           string          `json:"id"`
-	ProjectID    string          `json:"project_id"`
-	Name         string          `json:"name"`
-	Branch       string          `json:"branch"`
-	Status       string          `json:"status"`
-	WorktreePath string          `json:"worktree_path"`
-	LastPort     int             `json:"last_port,omitempty"`
-	LastError    string          `json:"last_error,omitempty"`
-	Notice       json.RawMessage `json:"notice,omitempty"`
-	DeleteMode   string          `json:"delete_mode,omitempty"`
-	CreatedAt    int64           `json:"created_at"`
-	UpdatedAt    int64           `json:"updated_at"`
-	InitStatus   string          `json:"init_status"`
-	InitError    string          `json:"init_error,omitempty"`
-	Sessions     []SessionRowDTO `json:"sessions,omitempty"`
-}
-
-// SessionRowDTO 会话归属 DTO。
-type SessionRowDTO struct {
-	SessionID  string `json:"session_id"`
-	LastSeenAt int64  `json:"last_seen_at"`
-}
-
 // registerTaskRoutes 注册 tasks 路由（design.md §21）。
 func (s *Server) registerTaskRoutes(mux *http.ServeMux) {
 	if s.tasks == nil {
@@ -183,20 +158,6 @@ func (r createTaskReq) validate() *ApiError {
 		}
 	}
 	return nil
-}
-
-// projectKindFor 查询项目 kind（add-plain-dir-project D6）。projs 未注入返回空串
-// （兼容测试 fixture 未注入 ProjectStore 的场景；生产路径 projs 必注入）。
-// 查询失败或未知 kind 不在此吞错——需 fail-closed 的入口用 requireProjectKind。
-func (s *Server) projectKindFor(ctx context.Context, projectID string) string {
-	if s.projs == nil {
-		return ""
-	}
-	p, err := s.projs.GetProject(ctx, projectID)
-	if err != nil {
-		return ""
-	}
-	return p.Kind
 }
 
 // requireProjectKind 解析项目 kind 并做 fail-closed 校验（add-plain-dir-project D1/D6）。
@@ -487,8 +448,8 @@ func (s *Server) handleCloseTerminal(w http.ResponseWriter, r *http.Request) {
 }
 
 // taskRowDTO 任务详情 DTO（design.md §21 GET /tasks/:id）。
-// project_kind ∈ repo | dir（add-plain-dir-project D6），由 handler 从项目详情填充；
-// projs 未注入时为空串（API 层降级，不阻塞详情返回）。
+// project_kind ∈ repo | dir（add-plain-dir-project D6），由 handler 经 requireProjectKind
+// fail-closed 解析：projs 未注入/项目不存在/未知 kind → 返回错误信封，不输出 DTO。
 // mode 为任务级运行模式（add-local-path-task-mode D7）：必有字段（非 omitempty），
 // 非法 kind/mode 组合 fail-closed 不输出（toTaskDTO 返回错误）。
 type taskRowDTO struct {

@@ -1154,6 +1154,63 @@ func (q *Queries) BeginDeleteIntent(ctx context.Context, id string, mode ocdeckt
 	})
 }
 
+// BeginRetryDeleteIntent 从 deletion_failed 原子重入删除意图（Retry 专用，design.md §19）：
+// 单事务写 delete_mode + status='deleting' + last_error=NULL——stale 错误清空随 CAS 原子生效，
+// 避免意图事件发布后详情/项目页读到过期错误、Reconcile 卡 deleting 时错误长期残留（评审 C-F3）。
+// 首删入口 BeginDeleteIntent 不清 last_error，行为逐字保持。
+//
+// 与 BeginDeleteIntent 同构：事务内读旧值判守卫，UPDATE WHERE 携带 status IS 'deletion_failed'
+// + 同值排除，RowsAffected=0 → !Matched（行不存在或已并发迁出 deletion_failed）。
+func (q *Queries) BeginRetryDeleteIntent(ctx context.Context, id string, mode ocdecktask.DeleteMode) (application.TransitionResult, error) {
+	return runTx(ctx, q, func(qx *Queries) (application.TransitionResult, error) {
+		row := qx.db.QueryRowContext(ctx, `SELECT status, delete_mode, updated_at FROM tasks WHERE id = ?`, id)
+		var curStatus string
+		var curMode sql.NullString
+		var curUpdatedAt int64
+		if err := row.Scan(&curStatus, &curMode, &curUpdatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				return application.TransitionResult{}, nil
+			}
+			return application.TransitionResult{}, err
+		}
+		if curStatus != string(ocdecktask.StatusDeletionFailed) {
+			return application.TransitionResult{}, nil
+		}
+		newMode := sql.NullString{String: string(mode), Valid: true}
+		now := nowUnix()
+		updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+		// 同值排除（任一列不同才匹配，F-01）：status 目标 'deleting'（守卫保证必不同）+
+		// delete_mode 目标 mode + last_error 目标 NULL。
+		diffPred, diffArgs := anyColDiffersPredicate(
+			[]string{"status", "delete_mode", "last_error"},
+			[]sql.NullString{{String: string(ocdecktask.StatusDeleting), Valid: true}, newMode, {}})
+		qry := "UPDATE tasks SET delete_mode = ?, status = 'deleting', last_error = NULL, " + updClause +
+			" WHERE id = ? AND status IS ? AND (" + diffPred + ")"
+		args := []any{newMode}
+		args = append(args, updArgs...)
+		args = append(args, id, string(ocdecktask.StatusDeletionFailed))
+		args = append(args, diffArgs...)
+		res, err := qx.db.ExecContext(ctx, qry, args...)
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		if n == 0 {
+			// 并发下 status 已迁出 deletion_failed：CAS 失败。
+			return application.TransitionResult{}, nil
+		}
+		return application.TransitionResult{
+			MutationResult: application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt},
+			StatusChanged:  true,
+			From:           ocdecktask.StatusDeletionFailed,
+			To:             ocdecktask.StatusDeleting,
+		}, nil
+	})
+}
+
 func joinPlaceholders(p []string) string {
 	out := make([]byte, 0, len(p)*2-1+2)
 	out = append(out, '?')

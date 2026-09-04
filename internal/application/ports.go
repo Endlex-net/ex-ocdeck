@@ -35,7 +35,7 @@ type Publisher interface {
 // MutationResult。DeleteTask 返回 DeleteResult（含被删行原状态与级联 session ID）。
 type TaskRepository interface {
 	// CreateTask 插入任务行（status 由调用方提供，creating 意图落库）。
-	// 仅消费 ID/ProjectID/Name/Branch/Status/WorktreePath/BaseRef；MUST NOT 再校验 status。
+	// 仅消费 ID/ProjectID/Name/Branch/Status/WorktreePath/BaseRef/Mode；MUST NOT 再校验 status。
 	CreateTask(ctx context.Context, row TaskSnapshot) error
 	UpdateTaskStatus(ctx context.Context, id string, status ocdecktask.Status, lastError *string) (TransitionResult, error)
 	UpdateTaskStatusConditional(ctx context.Context, id string, fromStatus, toStatus ocdecktask.Status, lastError *string) (TransitionResult, error)
@@ -45,6 +45,9 @@ type TaskRepository interface {
 	UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice *string) (MutationResult, error)
 	SetTaskDeleteMode(ctx context.Context, id string, mode ocdecktask.DeleteMode) (MutationResult, error)
 	BeginDeleteIntent(ctx context.Context, id string, mode ocdecktask.DeleteMode, fromStatuses []ocdecktask.Status) (TransitionResult, error)
+	// BeginRetryDeleteIntent 从 deletion_failed 原子重入删除意图（Retry 专用）：单事务写
+	// delete_mode + status=deleting + last_error=NULL（评审 C-F3：stale 错误随意图原子清空）。
+	BeginRetryDeleteIntent(ctx context.Context, id string, mode ocdecktask.DeleteMode) (TransitionResult, error)
 	ArchiveTask(ctx context.Context, id string) (TransitionResult, error)
 	RestoreTask(ctx context.Context, id string) (TransitionResult, error)
 	DeleteTask(ctx context.Context, id string) (DeleteResult, error)

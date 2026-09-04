@@ -57,9 +57,10 @@
 | 未知 kind | 任意 | internal，零副作用 |
 | repo/dir | 未知 mode | internal，零副作用 |
 
-- 所有入口 MUST 在任何写/git/进程副作用前完成解析。
+- 所有入口 MUST 在任何写/git/进程副作用前完成解析；`CreateShell`（attach_shell.go）同为入口——在任何 process 查询/创建前读取项目并解析（实现评审 I-F2 裁决）。
 - 已提交意图的重入路径（deleteResume）：解析失败落 `deletion_failed + last_error`，MUST NOT 执行任何破坏性副作用（与 delete.go:140-144 未知 kind 现状一致）。
 - 分流实现 MUST NOT 依赖 `branch` 判空等隐式信号。
+- 删除失败落账统一经 `finalizeDeletionFailed`：非取消有界 ctx + `writeStatusConditional(deleting → deletion_failed)` 真实 CAS + 检查写错误与 Matched；落账失败返回 internal 并 `errors.Join` 保留原始错误与落账错误（实现评审 I-F1/C-F1 裁决）。
 
 ### D3：创建链路
 
@@ -73,6 +74,8 @@
 ### D4：删除链路
 
 删除入口（delete.go:61）、`deleteResume`（delete.go:135）与删除 Retry（crud.go:453-506，#14）分流从 `proj.Kind` 改为 D2 有效模式：local-path → `deleteResumeDir` 序列；worktree → repo 序列。repo 序列前置的 PreflightDelete/dirty 快照（delete.go:75-93）与 Retry 路径的 DirtyFiles + confirmDirty 门禁（crud.go:483-505）同样按有效模式跳过。硬不变量（内建逻辑不触碰用户目录、不动 git 状态）对 repo local-path 任务同等成立。
+
+Retry（deletion_failed → deleting）重入改为专用原子意图写 `BeginRetryDeleteIntent`：单事务写 `delete_mode + status=deleting + last_error=NULL`（守卫 `status IS deletion_failed`），CAS 未命中在任何 dirty/进程/删除副作用前返回 conflict。首删 `BeginDeleteIntent` 逐字不动（不新增清 last_error 行为）（实现评审 C-F2/C-F3 裁决）。
 
 ### D5：会话对齐模式按任务模式解析
 
