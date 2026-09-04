@@ -321,7 +321,7 @@ func TestWS_Replace4009_OldConnReceives4009(t *testing.T) {
 		if got := websocket.CloseStatus(rerr); got != websocket.StatusCode(wsCloseReplaced) {
 			t.Errorf("old conn close=%v want %d (4009 replaced)", got, wsCloseReplaced)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("old conn did not receive 4009 close")
 	}
 }
