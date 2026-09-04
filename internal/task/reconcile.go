@@ -73,6 +73,13 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		}
 		sessions = nil
 	}
+	// 已有 server（重启恢复）时重设剪贴板选项：-f /dev/null 只在 server 启动时读入，
+	// 存活 server 不会因 ocdeck 重启而改 set-clipboard。失败只记日志，不阻断对账。
+	if len(sessions) > 0 {
+		if optErr := m.proc.EnsureServerOptions(); optErr != nil {
+			log.Printf("reconcile: EnsureServerOptions: %v", optErr)
+		}
+	}
 
 	// 按 taskID 分组会话。
 	sessionsByTask := groupSessionsByTask(sessions)

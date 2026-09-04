@@ -17,6 +17,7 @@ import { attachTouchGestures, type GestureHandle } from './touch-gestures';
 import { shouldSendInput, encodeBinaryInput, createSyntheticGate, type SyntheticGate } from './input-gate';
 import { createLockOrchestrator, type LockOrchestrator } from './session-coordination';
 import { createImeCompensator, type ImeCompensator } from './ime-compensator';
+import { parseOsc52Payload } from './clipboard';
 import { debugMark } from '../debug';
 
 export { shouldSendInput, encodeBinaryInput, createSyntheticGate, type SyntheticGate } from './input-gate';
@@ -86,6 +87,8 @@ export class TermSession {
   private readonly lockChangeCallbacks = new Set<(locked: boolean) => void>();
   /** 应用主题订阅退订（终端配色跟随主题，dispose 时退订防泄漏）。 */
   private unwatchTermTheme: (() => void) | null = null;
+  /** OSC 52 handler 退订。 */
+  private osc52Disposable: { dispose(): void } | null = null;
 
   // IME 补偿器 + 原生 onData tap（全平台启用，design D7）。
   private imeCompensator: ImeCompensator | null = null;
@@ -100,6 +103,8 @@ export class TermSession {
     wrap: HTMLElement,
     private wsPath: string,
     private onState: (s: TermConnState) => void,
+    /** 已校验的 OSC 52 clipboard-write 明文；同步回调，不得回写终端。 */
+    private onClipboardWrite?: (text: string) => void,
   ) {
     const prefs = loadTermPrefs();
     this.term = new Terminal({
@@ -115,6 +120,11 @@ export class TermSession {
     });
     this.term.loadAddon(this.fit);
     this.term.open(host);
+    this.osc52Disposable = this.term.parser.registerOscHandler(52, (data) => {
+      const text = parseOsc52Payload(data);
+      if (text !== null) this.onClipboardWrite?.(text);
+      return true;
+    });
     try {
       this.term.loadAddon(new WebglAddon());
     } catch {
@@ -330,6 +340,8 @@ export class TermSession {
     this.lockOrchestrator.dispose();
     this.lockChangeCallbacks.clear();
     this.lockController.dispose();
+    this.osc52Disposable?.dispose();
+    this.osc52Disposable = null;
     this.term.dispose();
   }
 

@@ -157,7 +157,7 @@ func TestNewSession_EnvInjected(t *testing.T) {
 }
 
 // TestTmuxSocket_InTmpdir 验证 TMUX_TMPDIR 注入使 tmux socket 落在指定 tmpdir
-//（B1 / S5：隔离不变量实测）。创建会话后 socket 文件 MUST 出现在 Manager.tmpdir
+// （B1 / S5：隔离不变量实测）。创建会话后 socket 文件 MUST 出现在 Manager.tmpdir
 // 下（tmux-<uid>/<socketName>），而非默认 /tmp/tmux-<uid>。
 func TestTmuxSocket_InTmpdir(t *testing.T) {
 	if testing.Short() {
@@ -366,7 +366,7 @@ func TestKillSession_Clean(t *testing.T) {
 }
 
 // TestReaper_ReapsEscapedDescendants 验证 reaper 收割忽略 SIGHUP 的逃逸子孙
-//（design.md §15 假设 c / §2 reaper）。
+// （design.md §15 假设 c / §2 reaper）。
 func TestReaper_ReapsEscapedDescendants(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping tmux integration test in -short mode")
@@ -526,7 +526,7 @@ func TestWatchExit_FiresOnSessionGone(t *testing.T) {
 }
 
 // TestKillServer_IdempotentWhenNoServer 验证无 server 时 kill-server 幂等成功
-//（design.md §10/§15）。
+// （design.md §10/§15）。
 func TestKillServer_IdempotentWhenNoServer(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping tmux integration test in -short mode")
@@ -553,9 +553,9 @@ func TestKillServerGlobal_ReapsAllSessions(t *testing.T) {
 	marker := filepath.Join(dir, "marker")
 	pidFile := filepath.Join(dir, "pid")
 	if err := m.NewSession(SessionSpec{
-		Name:    "ocdeck-task8-runtime",
-		Dir:     dir,
-		Env:     map[string]string{},
+		Name: "ocdeck-task8-runtime",
+		Dir:  dir,
+		Env:  map[string]string{},
 		// 逃逸 bash 写自身 PID 到 pidFile，供测试精确追踪（S5：避免全局 pgrep）。
 		CmdArgv: []string{"bash", "-c", "trap \"\" HUP; touch " + marker + "; echo $$ > " + pidFile + "; sleep 600"},
 	}); err != nil {
@@ -641,4 +641,220 @@ func processAlive(pid int) bool {
 		return false
 	}
 	return !strings.HasPrefix(strings.TrimSpace(string(out)), "Z")
+}
+
+func setAttachTermClipboard(m *Manager) {
+	for i, e := range m.baseEnv {
+		if strings.HasPrefix(e, "TERM=") {
+			m.baseEnv[i] = "TERM=xterm-256color"
+			return
+		}
+	}
+	m.baseEnv = append(m.baseEnv, "TERM=xterm-256color")
+}
+
+// readPtyUntil 轮询 PTY 流直到出现 needle，返回累积流；超时/读错误返回 error
+// （不 Fatal，调用方决定是否附诊断后 Fatal）。
+func readPtyUntil(t *testing.T, p interface {
+	ReadCtx(ctx context.Context) ([]byte, error)
+}, needle string, timeout time.Duration) (string, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var buf strings.Builder
+	for {
+		chunk, err := p.ReadCtx(ctx)
+		if len(chunk) > 0 {
+			buf.Write(chunk)
+			if strings.Contains(buf.String(), needle) {
+				drainCtx, drainCancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+				for {
+					more, derr := p.ReadCtx(drainCtx)
+					if len(more) > 0 {
+						buf.Write(more)
+						continue
+					}
+					_ = derr
+					break
+				}
+				drainCancel()
+				return buf.String(), nil
+			}
+		}
+		if err != nil {
+			return buf.String(), fmt.Errorf("pty read: %w (got %q, want contain %q)", err, buf.String(), needle)
+		}
+	}
+}
+
+// waitForTriggerScript 构造 pane 脚本：循环等待 trigger 文件，期间周期打印
+// PANE-READY 哨兵——attach 流出现哨兵即证明 pane shell 存活且阻塞在等 trigger，
+// 消除"trigger 已写入但 pane 尚未跑到循环"与"printf 发出时 pane 未就绪"的竞态。
+func waitForTriggerScript(trigger, extraPrintf string) string {
+	return "while [ ! -f " + shellQuote(trigger) + " ]; do printf 'PANE-READY\\n'; sleep 0.2; done; " +
+		extraPrintf + "sleep 30"
+}
+
+// waitForClientTermname 轮询直到 tmux 注册了 clipboard-capable 的 attach 客户端
+// （client_termname=xterm-256color）。AttachPty 返回仅代表 PTY fork 成功，client
+// 握手/termname 注册是异步的——此前发出的 OSC52 无可转发目标，会被 tmux 丢弃。
+func waitForClientTermname(t *testing.T, m *Manager, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		stdout, _, err := m.execTmux(ctx, "list-clients", "-F", "#{client_termname}")
+		cancel()
+		if err == nil && strings.Contains(stdout, "xterm-256color") {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("attach client with termname xterm-256color not registered within %s", timeout)
+}
+
+// dumpOSC52Diagnostics 在转发断言失败时打印环境证据，供 CI 日志定位
+// （版本/选项/能力判定/客户端注册）。tmux -V 直调，不经 -L/-f。
+func dumpOSC52Diagnostics(t *testing.T, m *Manager) {
+	t.Helper()
+	if out, err := exec.Command("tmux", "-V").Output(); err == nil {
+		t.Logf("diag tmux -V: %s", strings.TrimSpace(string(out)))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if out, _, err := m.execTmux(ctx, "show-options", "-sv", "set-clipboard"); err == nil {
+		t.Logf("diag set-clipboard: %s", strings.TrimSpace(out))
+	}
+	if out, _, err := m.execTmux(ctx, "show-options", "-s", "terminal-features"); err == nil {
+		t.Logf("diag terminal-features: %s", strings.TrimSpace(out))
+	}
+	if out, _, err := m.execTmux(ctx, "list-clients", "-F", "#{client_termname}"); err == nil {
+		t.Logf("diag client termnames: %s", strings.TrimSpace(out))
+	} else {
+		t.Logf("diag list-clients failed: %v", err)
+	}
+}
+
+// requireTmux37 为依赖"set-clipboard on 已生效"的 OSC52 转发集成测试做版本门控：
+// fail-closed 语义下 tmux < 3.7（含版本无法解析、tmux -V 失败）不启用转发，
+// 断言无从谈起，直接 skip（理由注明需 tmux >= 3.7）。复用包内 tmuxVersionAtLeast。
+func requireTmux37(t *testing.T) {
+	t.Helper()
+	out, err := exec.Command("tmux", "-V").Output()
+	version := strings.TrimSpace(string(out))
+	if err != nil {
+		t.Skipf("skipping: OSC52 forwarding requires tmux >= 3.7; tmux -V failed: %v", err)
+	}
+	if !tmuxVersionAtLeast(version, 3, 7) {
+		t.Skipf("skipping: OSC52 forwarding requires tmux >= 3.7, got %q", version)
+	}
+}
+
+// TestNewSession_ForwardsOSC52ToAttachClient 验证 set-clipboard on 后，pane 发出的
+// 原始 OSC 52 会转到 attach 客户端（-f /dev/null 默认 external 会丢弃）。
+func TestNewSession_ForwardsOSC52ToAttachClient(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping tmux integration test in -short mode")
+	}
+	requireTmux37(t)
+	m := newTestManager(t)
+	setAttachTermClipboard(m)
+	defer cleanupTmux(t, m)
+
+	trigger := filepath.Join(shortTmpDir(t), "go")
+	name := "ocdeck-clip-runtime"
+	script := waitForTriggerScript(trigger, `printf '\033]52;c;dGVzdA==\a'; `)
+	if err := m.NewSession(SessionSpec{
+		Name:    name,
+		Dir:     t.TempDir(),
+		CmdArgv: []string{"sh", "-c", script},
+	}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _, _ = m.KillSession(name) }()
+	waitForSessionActive(t, m, name, 3*time.Second)
+
+	shown := runTmuxCmd(t, m, "show-options", "-sv", "set-clipboard")
+	if strings.TrimSpace(shown) != "on" {
+		t.Fatalf("set-clipboard = %q, want on", shown)
+	}
+
+	pt, err := m.AttachPty(name, 80, 24)
+	if err != nil {
+		t.Fatalf("AttachPty: %v", err)
+	}
+	defer pt.Close()
+
+	// 前置条件齐备后才触发：client 已注册（否则 OSC52 无转发目标被丢弃）、
+	// pane shell 已跑到等 trigger 的循环（screen 中有 PANE-READY 残留）。
+	waitForClientTermname(t, m, 5*time.Second)
+	if _, err := readPtyUntil(t, pt, "PANE-READY", 15*time.Second); err != nil {
+		dumpOSC52Diagnostics(t, m)
+		t.Fatalf("pane not ready: %v", err)
+	}
+	if err := os.WriteFile(trigger, []byte("1"), 0o600); err != nil {
+		t.Fatalf("write trigger: %v", err)
+	}
+	got, err := readPtyUntil(t, pt, "]52;c;dGVzdA==", 15*time.Second)
+	if err != nil || !strings.Contains(got, "]52;c;dGVzdA==") {
+		dumpOSC52Diagnostics(t, m)
+		t.Fatalf("attach stream missing OSC52 payload: %v", err)
+	}
+}
+
+// TestEnsureServerOptions_OSC52OnceWithPassthroughWrapper 验证 pane 同时发出原始
+// OSC52 与 DCS tmux-passthrough 包装时，attach 只收到一次 payload（passthrough
+// 被默认 allow-passthrough off 吃掉，raw 由 set-clipboard on 转发）。
+// 明文 sentinel 在两次 printf 之后输出——tmux 顺序处理 pane 输出，attach 流中出现
+// sentinel 即代表两次 OSC52 均已处理完毕，此时计数无竞态（不依赖固定 drain 窗口）。
+func TestEnsureServerOptions_OSC52OnceWithPassthroughWrapper(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping tmux integration test in -short mode")
+	}
+	requireTmux37(t)
+	const (
+		osc52Payload = "]52;c;dGVzdA=="
+		sentinel     = "OCDECK-CLIP-SENTINEL"
+	)
+	m := newTestManager(t)
+	setAttachTermClipboard(m)
+	defer cleanupTmux(t, m)
+
+	trigger := filepath.Join(shortTmpDir(t), "go")
+	name := "ocdeck-clip2-runtime"
+	script := waitForTriggerScript(trigger,
+		`printf '\033]52;c;dGVzdA==\a'; printf '\033Ptmux;\033\033]52;c;dGVzdA==\a\033\\'; printf '`+sentinel+`\n'; `)
+	if err := m.NewSession(SessionSpec{
+		Name:    name,
+		Dir:     t.TempDir(),
+		CmdArgv: []string{"sh", "-c", script},
+	}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	defer func() { _, _ = m.KillSession(name) }()
+	waitForSessionActive(t, m, name, 3*time.Second)
+
+	pt, err := m.AttachPty(name, 80, 24)
+	if err != nil {
+		t.Fatalf("AttachPty: %v", err)
+	}
+	defer pt.Close()
+
+	// 同 ForwardsOSC52：先等 client 注册与 pane 就绪，再触发，消除时序竞态。
+	waitForClientTermname(t, m, 5*time.Second)
+	if _, err := readPtyUntil(t, pt, "PANE-READY", 15*time.Second); err != nil {
+		dumpOSC52Diagnostics(t, m)
+		t.Fatalf("pane not ready: %v", err)
+	}
+	if err := os.WriteFile(trigger, []byte("1"), 0o600); err != nil {
+		t.Fatalf("write trigger: %v", err)
+	}
+	got, err := readPtyUntil(t, pt, sentinel, 15*time.Second)
+	if err != nil || !strings.Contains(got, sentinel) {
+		dumpOSC52Diagnostics(t, m)
+		t.Fatalf("sentinel %q not seen: %v", sentinel, err)
+	}
+	if n := strings.Count(got, osc52Payload); n != 1 {
+		t.Fatalf("OSC52 payload count = %d, want 1 (stream=%q)", n, got)
+	}
 }

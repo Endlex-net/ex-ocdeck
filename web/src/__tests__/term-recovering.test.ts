@@ -50,6 +50,7 @@ const termInstance = {
   element: null,
   textarea: undefined,
   options: {} as Record<string, unknown>,
+  parser: { registerOscHandler: vi.fn(() => ({ dispose: vi.fn() })) },
 };
 vi.mock('@xterm/xterm', () => ({ Terminal: vi.fn(() => termInstance) }));
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: vi.fn(() => ({ fit: vi.fn() })) }));

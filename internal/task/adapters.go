@@ -607,6 +607,7 @@ func (a *ProcessAdapter) KillSession(name string) (process.KillResult, error) {
 func (a *ProcessAdapter) RetryReap(tickets []string) ([]string, error) { return a.m.RetryReap(tickets) }
 func (a *ProcessAdapter) HasSession(name string) (bool, error)         { return a.m.HasSession(name) }
 func (a *ProcessAdapter) ListSessions() ([]string, error)              { return a.m.ListSessions() }
+func (a *ProcessAdapter) EnsureServerOptions() error                   { return a.m.EnsureServerOptions() }
 func (a *ProcessAdapter) ShowSessionEnv(name, key string) (string, error) {
 	return a.m.ShowSessionEnv(name, key)
 }

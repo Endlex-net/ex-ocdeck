@@ -55,3 +55,56 @@
 .terminal-wrap .terminal-overlay {
   z-index: 6;
 }
+
+/* OSC 52 剪贴板写入确认弹层：远程内容请求写本机剪贴板，需用户显式确认；
+ * 高于锁定按钮、低于断线 overlay。 */
+.terminal-clipboard-popover {
+  position: absolute;
+  left: 50%;
+  bottom: 56px;
+  transform: translateX(-50%);
+  z-index: 5;
+  width: min(440px, calc(100% - 24px));
+  background: var(--term-bg);
+  border: 1px solid var(--term-border);
+  border-radius: 6px;
+  padding: 12px 14px;
+  color: var(--term-fg);
+  box-shadow: var(--shadow-pop);
+}
+.terminal-clipboard-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.terminal-clipboard-desc {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--term-muted);
+  margin-bottom: 8px;
+}
+/* 预览区做成内嵌「引用块」（与锁定按钮同款的 bg/border 混合），
+ * 让待复制内容在视觉上明确是外来的、有边界的。 */
+.terminal-clipboard-text {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  background: color-mix(in oklch, var(--term-bg) 85%, var(--term-border));
+  border: 1px solid var(--term-border);
+  border-radius: 6px;
+  user-select: text;
+  -webkit-user-select: text;
+}
+/* 与 .od-modal-actions 一致的右对齐操作区；按钮触控高度由全局 ≤767px 档（35px）兜底。 */
+.terminal-clipboard-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
