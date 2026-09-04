@@ -225,12 +225,13 @@ export function TaskWorkbenchPage({
     if (tab === tid) setTab(TUI_TAB);
   };
 
-  // dir 任务无 git 功能（D7）：隐藏 Git tab 与分支名，依据 project_kind 而非判空推断
-  const isDir = task?.project_kind === 'dir';
-  // kind 解析为 dir 时若正停在 Git tab，回退到 TUI tab
+  // dir 任务与 repo local-path 任务无 git 功能（D7/add-local-path-task-mode）：隐藏 Git tab 与
+  // 分支名，按任务有效 mode 判定（project_kind=dir 或 mode=local-path），MUST NOT 判空推断
+  const isGitless = task?.project_kind === 'dir' || task?.mode === 'local-path';
+  // 有效模式为无 git 时若正停在 Git tab，回退到 TUI tab
   useEffect(() => {
-    if (isDir && tab === GIT_TAB) setTab(TUI_TAB);
-  }, [isDir, tab]);
+    if (isGitless && tab === GIT_TAB) setTab(TUI_TAB);
+  }, [isGitless, tab]);
 
   // 页头任务切换器候选：与侧栏任务组同源（共享 store），仅活跃+挂起任务（归档不显示）。
   // data-od-id / wb-* class 对齐设计稿 task-workbench.html:229
@@ -380,7 +381,7 @@ export function TaskWorkbenchPage({
         ) : (
           <span className="page-title">{task?.name ?? '…'}</span>
         )}
-        {task?.branch && !isDir && <span className="header-meta mono"><BranchIcon /> {task.branch}</span>}
+        {task?.branch && !isGitless && <span className="header-meta mono"><BranchIcon /> {task.branch}</span>}
         {task && <StatusBadge status={task.status} />}
         {task && <InitStatusBadge task={task} />}
         {task?.init_status === 'failed' && !isNarrow && (
@@ -486,7 +487,7 @@ export function TaskWorkbenchPage({
           +
         </button>
         <span className="tab-sep" />
-        {!isDir && (
+        {!isGitless && (
           <button
             className={`tab ${tab === GIT_TAB ? 'tab-active' : ''}`}
             onClick={() => switchTab(GIT_TAB)}
@@ -553,7 +554,7 @@ export function TaskWorkbenchPage({
             <TerminalView wsPath={`/ws/terminal/shell/${tid}`} active={tab === tid} />
           </div>
         ))}
-        {visited.has(GIT_TAB) && !isDir && (
+        {visited.has(GIT_TAB) && !isGitless && (
           <div className={`pane pane-scroll ${tab === GIT_TAB ? '' : 'pane-hidden'}`}>
             <GitPanel
               taskID={taskID}

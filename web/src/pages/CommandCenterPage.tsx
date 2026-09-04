@@ -8,6 +8,7 @@ import {
   parseNotice,
   type ActiveSessionItem,
   type Project,
+  type TaskMode,
 } from '../types';
 import { StatusBadge } from '../components/StatusBadge';
 import { AgentStatusBadge } from '../components/AgentStatusBadge';
@@ -454,6 +455,7 @@ function toTask(m: MergedTask) {
     branch: m.task.branch,
     status: m.task.status,
     worktree_path: m.task.worktree_path,
+    mode: m.task.mode,
     last_error: m.task.last_error,
     notice: m.task.notice,
     init_status: m.task.init_status,
@@ -760,6 +762,8 @@ function NewTaskPanel({
   const [projListOpen, setProjListOpen] = useState(false);
   const [taskName, setTaskName] = useState('');
   const [baseRef, setBaseRef] = useState('');
+  // 运行模式（add-local-path-task-mode）：仅 repo 项目渲染选择器，缺省 worktree。
+  const [runMode, setRunMode] = useState<TaskMode>('worktree');
   // D9 分支列表状态机：idle|loading|ready|error，与 lastSuccessfulBranches 正交。
   // 仅 ready 计算提交候选；loading/error 禁止提交；dir 项目无此状态机（恒 idle）。
   const [branchPhase, setBranchPhase] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
@@ -771,11 +775,14 @@ function NewTaskPanel({
   const [mutError, setMutError] = useState('');
   const projInputId = useId();
   const branchInputId = useId();
+  const modeGroupId = useId();
   const taskNameRef = useRef<HTMLInputElement>(null);
   const focusedNonceRef = useRef<number | null>(null);
   // 代际防陈旧写回 + 最新选择 ref（异步闭包读最新值而非闭包捕获值）
   const projGenRef = useRef(0);
   const selectedProjectRef = useRef<Project | null>(null);
+  // 选择器状态重置规则用：最近一次已选项目 ID（null = 未选）。仅 ID 变更才重置 runMode。
+  const lastProjectIdRef = useRef<string | null>(null);
   const refreshInFlightRef = useRef(false);
   // 刷新所有权（项目 ID + 代际）：finally 仅在项目与代际均匹配时释放单飞锁与 refreshing，
   // 避免跨项目竞态下旧请求的 finally 释放新刷新的单飞锁（允许并发刷新）
@@ -808,6 +815,8 @@ function NewTaskPanel({
   }, [initNonce, selectedProject, projectQuery]);
 
   const isDir = selectedProject?.kind === 'dir';
+  // local-path 仅 repo 项目可达（dir 不渲染选择器；项目 ID 变更已按重置规则回落 worktree）
+  const isLocalPath = !!selectedProject && !isDir && runMode === 'local-path';
   const filteredProjects = useMemo(() => {
     const q = projectQuery.trim().toLowerCase();
     return q ? projects.filter((p) => p.name.toLowerCase().includes(q)) : projects;
@@ -820,6 +829,14 @@ function NewTaskPanel({
     // 推进代际（清空/切到 dir 也推进，使在途异步响应失效）
     ++projGenRef.current;
     selectedProjectRef.current = selectedProject;
+    // 选择器状态重置规则：已选项目 ID 变更（含切换项目、清除选择、切到 dir）→ 重置为
+    // 缺省「隔离 worktree」，防止新选 repo 未经用户再次主动选择即以就地模式提交；
+    // 不改变项目 ID 的信号（同项目 apply / keep / 无 payload new）保持选择器现状。
+    const pid = selectedProject?.id ?? null;
+    if (pid !== lastProjectIdRef.current) {
+      lastProjectIdRef.current = pid;
+      setRunMode('worktree');
+    }
     // 切换项目时重置刷新状态（与旧项目解耦，避免 B 永久处于刷新中，并释放旧刷新所有权）
     setRefreshing(false);
     refreshInFlightRef.current = false;
@@ -922,8 +939,10 @@ function NewTaskPanel({
   // 下拉展示项：ready 用提交候选；loading/error 展示 stale
   const branchListItems = branchPhase === 'ready' ? filteredBranches : staleBranches;
 
-  // 门禁（D3/D9）：repo 另须分支列表 ready；loading/error（含 refresh 在途）禁止提交
-  const canSubmit = !!selectedProject && taskName.trim() !== '' && !creating && (isDir || branchPhase === 'ready');
+  // 门禁（D3/D9）：repo worktree 模式另须分支列表 ready；loading/error（含 refresh 在途）禁止提交。
+  // local-path 模式不等待分支列表 ready（分支列表状态不作为提交门禁）。
+  const canSubmit =
+    !!selectedProject && taskName.trim() !== '' && !creating && (isDir || isLocalPath || branchPhase === 'ready');
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -932,7 +951,11 @@ function NewTaskPanel({
     setMutError('');
     const proj = selectedProject;
     try {
-      const t = await api.createTask(proj.id, taskName.trim(), isDir ? undefined : filteredBranches[0] || undefined);
+      // local-path：携带 mode=local-path 且 MUST NOT 携带 base_ref（D6 presence 契约）；
+      // worktree/dir 走既有三参调用（mode 缺省 = worktree 语义）。
+      const t = isLocalPath
+        ? await api.createTask(proj.id, taskName.trim(), undefined, 'local-path')
+        : await api.createTask(proj.id, taskName.trim(), isDir ? undefined : filteredBranches[0] || undefined);
       setTaskName('');
       // mutation 成功：跳转工作台（from=home）+ trailing refresh（失败静默，store error 通道承担）
       navigate(`/task/${t.id}?from=home`);
@@ -991,8 +1014,44 @@ function NewTaskPanel({
           )}
         </div>
 
-        {/* 基准分支（仅 repo） */}
+        {/* 运行模式（仅 repo）：双段 segmented control，缺省「隔离 worktree」；
+            dir 项目不渲染（dir 本就就地运行，色块警告在下方保留） */}
         {selectedProject && !isDir && (
+          <div className="od-field">
+            <label className="od-label" id={modeGroupId}>运行模式</label>
+            <div className="cc-segment" role="radiogroup" aria-labelledby={modeGroupId}>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={runMode === 'worktree'}
+                className={`cc-segment-item${runMode === 'worktree' ? ' on' : ''}`}
+                // 同项目手动切换：MUST NOT 清空已选分支、MUST NOT 重新请求分支列表
+                onClick={() => setRunMode('worktree')}
+              >
+                隔离 worktree
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={runMode === 'local-path'}
+                className={`cc-segment-item${runMode === 'local-path' ? ' on' : ''}`}
+                onClick={() => setRunMode('local-path')}
+              >
+                就地运行
+              </button>
+            </div>
+            {/* 低可见度提醒（local-path 选中时）：12px 灰字、无色块无边框；
+                与 dir 色块警告条件互斥、不叠加 */}
+            {isLocalPath && (
+              <div className="cc-store-hint cc-mode-hint">
+                <InfoIcon /> 直接在项目目录里跑，改动就地生效。多任务共享同一目录，并行与否自己把握。
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 基准分支（仅 repo worktree 模式；local-path 无分支语义，整体隐藏非禁用） */}
+        {selectedProject && !isDir && !isLocalPath && (
           <div className="od-field cc-combo">
             <label className="od-label" htmlFor={branchInputId}>基准分支</label>
             <input
@@ -1068,7 +1127,11 @@ function NewTaskPanel({
         {mutError && <div className="error-line">{mutError}</div>}
         {storeError && <div className="cc-store-hint"><InfoIcon /> 轮询数据可能滞后：{storeError}</div>}
 
-        <p className="od-hint">创建后自动切出独立分支与 worktree，并进入工作台；任务名将生成英文分支 slug。</p>
+        <p className="od-hint">
+          {isLocalPath
+            ? '创建后直接在当前目录运行并进入工作台，不切分支。'
+            : '创建后自动切出独立分支与 worktree，并进入工作台；任务名将生成英文分支 slug。'}
+        </p>
 
         <div className="cc-form-actions">
           <button type="button" className="od-btn" onClick={onClose}>取消</button>

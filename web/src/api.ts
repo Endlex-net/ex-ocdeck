@@ -28,6 +28,7 @@ import type {
   SubmissionAnnotationRef,
   SubmissionsListResponse,
   Task,
+  TaskMode,
   TerminalInfo,
 } from './types';
 
@@ -164,11 +165,14 @@ export const api = {
     request<string[]>('POST', `/projects/${projectID}/branches/refresh`),
 
   listTasks: (projectID: string) => request<Task[]>('GET', `/projects/${projectID}/tasks`),
-  /** baseRef 仅 repo 项目可选（短名，空 = 项目默认分支）；dir 项目不提供。 */
-  createTask: (projectID: string, name: string, baseRef?: string) =>
+  /** baseRef 仅 repo 项目 worktree 模式可选（短名，空 = 项目默认分支）；dir 项目不提供。
+   *  mode 仅 repo 项目 local-path 模式显式传 'local-path'（此时 MUST NOT 携带 base_ref）；
+   *  worktree/dir 不传（缺省语义，add-local-path-task-mode D6 presence 契约）。 */
+  createTask: (projectID: string, name: string, baseRef?: string, mode?: TaskMode) =>
     request<Task>('POST', `/projects/${projectID}/tasks`, {
       name,
       ...(baseRef ? { base_ref: baseRef } : {}),
+      ...(mode ? { mode } : {}),
     }),
   getTask: (id: string) => request<Task>('GET', `/tasks/${id}`),
   taskAction: (id: string, action: 'activate' | 'suspend' | 'archive' | 'restore' | 'retry') =>

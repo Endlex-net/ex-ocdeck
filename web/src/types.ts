@@ -3,6 +3,10 @@
 /** 项目类型（add-plain-dir-project D1/D6）：repo=git 仓库，dir=纯目录（无 git 功能）。 */
 export type ProjectKind = 'repo' | 'dir';
 
+/** 任务运行模式（add-local-path-task-mode D7）：worktree=隔离 worktree（repo 缺省）；
+ *  local-path=就地运行（dir 项目恒为）。DTO/摘要/活跃快照均为必有字段，UI 降级按 mode 判定。 */
+export type TaskMode = 'worktree' | 'local-path';
+
 export interface Project {
   id: string;
   name: string;
@@ -30,6 +34,8 @@ export interface TaskSummary {
   init_status: string;
   branch: string;
   worktree_path: string;
+  /** 任务运行模式（必有）：worktree | local-path。 */
+  mode: TaskMode;
   last_error?: string;
   /** json.RawMessage 原样透传：客户端收到的是数组而非字符串。 */
   notice?: NoticeItem[];
@@ -81,12 +87,14 @@ export interface NoticeItem {
 export interface Task {
   id: string;
   project_id: string;
-  /** 所属项目类型（add-plain-dir-project D6）：UI 降级判断的唯一依据。 */
+  /** 所属项目类型（add-plain-dir-project D6）：UI 降级判断依据之一（另一依据为 task.mode，local-path 同 dir 降级）。 */
   project_kind: ProjectKind;
   name: string;
   branch: string;
   status: string;
   worktree_path: string;
+  /** 任务运行模式（必有）：worktree | local-path；git 功能降级判定依据。 */
+  mode: TaskMode;
   last_port?: number;
   last_error?: string;
   /** 服务端以 json.RawMessage 原样输出，客户端收到的是数组而非字符串。 */
@@ -118,6 +126,8 @@ export interface ActiveSessionItem {
   name: string;
   branch: string;
   worktree_path: string;
+  /** 任务运行模式（必有）：worktree | local-path；与 projects 摘要同源。 */
+  mode: TaskMode;
   /** 最近活跃时间（Unix 秒）：task_sessions.last_seen_at 的 MAX，无会话行回退 tasks.updated_at。 */
   last_active_at: number;
   agentStatus?: string;

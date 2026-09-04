@@ -157,6 +157,7 @@ export function sessionOnlyTask(s: ActiveSessionItem): MergedTask {
       init_status: '',
       branch: s.branch,
       worktree_path: s.worktree_path,
+      mode: s.mode,
       updated_at: s.last_active_at,
       agentStatus: s.agentStatus,
       attention_count: 0,

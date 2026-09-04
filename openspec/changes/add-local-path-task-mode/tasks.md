@@ -27,9 +27,9 @@
 
 ## 4. Web
 
-- [ ] 4.1 `web/src/types.ts` Task/TaskSummary/ActiveSessionItem 增加 `mode`；`api.createTask` 增加可选 mode 参数（design D7/D10）
-- [ ] 4.2 新建任务面板（CommandCenterPage.tsx 内联面板）：双段 segmented control「隔离 worktree / 就地运行」（仅 repo 渲染、缺省 worktree）；local-path 联动（隐藏基准分支字段、绕过 ready 门禁、灰字提醒逐字文案「直接在项目目录里跑，改动就地生效。多任务共享同一目录，并行与否自己把握。」、底部 hint 换文案）；选择器状态重置规则（项目 ID 变更重置为 worktree；同项目手动切换保留分支状态；不改变项目的信号保持现状；repo 初次分支请求始终发起）（command-center delta「指挥中心内联新建任务」含「选择器状态重置规则」）
-- [ ] 4.3 工作台 Git tab 与分支展示对 local-path 任务隐藏（TaskWorkbenchPage.tsx:228，同 dir 降级）；删除确认弹窗按任务 mode 出文案——dir：「仅删除任务记录与 opencode 会话数据，不会删除项目目录及其内容」；repo local-path：「仅删除任务记录与 opencode 会话数据，不会删除项目目录及其内容、不改动 git 状态」；两者共同：normal 且配置 pre_delete script 时提示该脚本仍会执行、不出现 worktree/dirty 删除确认项（task-lifecycle delta 弹窗场景）
+- [x] 4.1 `web/src/types.ts` Task/TaskSummary/ActiveSessionItem 增加 `mode`；`api.createTask` 增加可选 mode 参数（design D7/D10）
+- [x] 4.2 新建任务面板（CommandCenterPage.tsx 内联面板）：双段 segmented control「隔离 worktree / 就地运行」（仅 repo 渲染、缺省 worktree）；local-path 联动（隐藏基准分支字段、绕过 ready 门禁、灰字提醒逐字文案「直接在项目目录里跑，改动就地生效。多任务共享同一目录，并行与否自己把握。」、底部 hint 换文案）；选择器状态重置规则（项目 ID 变更重置为 worktree；同项目手动切换保留分支状态；不改变项目的信号保持现状；repo 初次分支请求始终发起）（command-center delta「指挥中心内联新建任务」含「选择器状态重置规则」）
+- [x] 4.3 工作台 Git tab 与分支展示对 local-path 任务隐藏（TaskWorkbenchPage.tsx:228，同 dir 降级）；删除确认弹窗按任务 mode 出文案——dir：「仅删除任务记录与 opencode 会话数据，不会删除项目目录及其内容」；repo local-path：「仅删除任务记录与 opencode 会话数据，不会删除项目目录及其内容、不改动 git 状态」；两者共同：normal 且配置 pre_delete script 时提示该脚本仍会执行、不出现 worktree/dirty 删除确认项（task-lifecycle delta 弹窗场景）
 
 ## 5. 测试与验收
 
