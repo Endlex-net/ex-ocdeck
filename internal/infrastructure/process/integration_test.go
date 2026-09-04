@@ -725,6 +725,9 @@ func dumpOSC52Diagnostics(t *testing.T, m *Manager) {
 	if out, _, err := m.execTmux(ctx, "show-options", "-sv", "set-clipboard"); err == nil {
 		t.Logf("diag set-clipboard: %s", strings.TrimSpace(out))
 	}
+	if out, _, err := m.execTmux(ctx, "show-options", "-wgv", "allow-passthrough"); err == nil {
+		t.Logf("diag allow-passthrough: %s", strings.TrimSpace(out))
+	}
 	if out, _, err := m.execTmux(ctx, "show-options", "-s", "terminal-features"); err == nil {
 		t.Logf("diag terminal-features: %s", strings.TrimSpace(out))
 	}
@@ -735,28 +738,34 @@ func dumpOSC52Diagnostics(t *testing.T, m *Manager) {
 	}
 }
 
-// requireTmux37 为依赖"set-clipboard on 已生效"的 OSC52 转发集成测试做版本门控：
-// fail-closed 语义下 tmux < 3.7（含版本无法解析、tmux -V 失败）不启用转发，
-// 断言无从谈起，直接 skip（理由注明需 tmux >= 3.7）。复用包内 tmuxVersionAtLeast。
-func requireTmux37(t *testing.T) {
+// requireTmux33 为 OSC52 转发类集成测试做版本门控：tmux >= 3.7 走 set-clipboard on
+// 转发 raw OSC52，3.3–3.6 走 set-clipboard external + allow-passthrough on 透传 DCS
+// 包装——两段都启用转发，断言可比；更低版本（含版本无法解析、tmux -V 失败）不启用
+// 转发，断言无从谈起，直接 skip（理由注明需 tmux >= 3.3）。返回版本字符串供测试内
+// 按段分支断言。复用包内 tmuxVersionAtLeast。
+func requireTmux33(t *testing.T) string {
 	t.Helper()
 	out, err := exec.Command("tmux", "-V").Output()
 	version := strings.TrimSpace(string(out))
 	if err != nil {
-		t.Skipf("skipping: OSC52 forwarding requires tmux >= 3.7; tmux -V failed: %v", err)
+		t.Skipf("skipping: OSC52 forwarding requires tmux >= 3.3; tmux -V failed: %v", err)
 	}
-	if !tmuxVersionAtLeast(version, 3, 7) {
-		t.Skipf("skipping: OSC52 forwarding requires tmux >= 3.7, got %q", version)
+	if !tmuxVersionAtLeast(version, 3, 3) {
+		t.Skipf("skipping: OSC52 forwarding requires tmux >= 3.3, got %q", version)
 	}
+	return version
 }
 
-// TestNewSession_ForwardsOSC52ToAttachClient 验证 set-clipboard on 后，pane 发出的
-// 原始 OSC 52 会转到 attach 客户端（-f /dev/null 默认 external 会丢弃）。
+// TestNewSession_ForwardsOSC52ToAttachClient 验证 EnsureServerOptions 启用转发后的
+// server 选项目标态按版本分段：tmux >= 3.7 为 set-clipboard on（后续触发并断言 raw
+// OSC 52 到达 attach 客户端，-f /dev/null 默认 external 会丢弃）；3.3–3.6 为
+// set-clipboard external + allow-passthrough on（raw 在该段被 external 吞掉，端到端
+// DCS 透传由 TestEnsureServerOptions_OSC52OnceWithPassthroughWrapper 覆盖）。
 func TestNewSession_ForwardsOSC52ToAttachClient(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping tmux integration test in -short mode")
 	}
-	requireTmux37(t)
+	version := requireTmux33(t)
 	m := newTestManager(t)
 	setAttachTermClipboard(m)
 	defer cleanupTmux(t, m)
@@ -774,9 +783,22 @@ func TestNewSession_ForwardsOSC52ToAttachClient(t *testing.T) {
 	defer func() { _, _ = m.KillSession(name) }()
 	waitForSessionActive(t, m, name, 3*time.Second)
 
-	shown := runTmuxCmd(t, m, "show-options", "-sv", "set-clipboard")
-	if strings.TrimSpace(shown) != "on" {
-		t.Fatalf("set-clipboard = %q, want on", shown)
+	shown := strings.TrimSpace(runTmuxCmd(t, m, "show-options", "-sv", "set-clipboard"))
+	if tmuxVersionAtLeast(version, 3, 7) {
+		if shown != "on" {
+			t.Fatalf("set-clipboard = %q, want on (tmux >= 3.7)", shown)
+		}
+	} else {
+		if shown != "external" {
+			t.Fatalf("set-clipboard = %q, want external (tmux 3.3-3.6)", shown)
+		}
+		pas := strings.TrimSpace(runTmuxCmd(t, m, "show-options", "-wgv", "allow-passthrough"))
+		if pas != "on" {
+			t.Fatalf("allow-passthrough = %q, want on (tmux 3.3-3.6)", pas)
+		}
+		// 3.3–3.6：目标态断言完成即可；external 吞 raw，raw 转发路径不适用，
+		// DCS 端到端透传在 TestEnsureServerOptions_OSC52OnceWithPassthroughWrapper 覆盖。
+		return
 	}
 
 	pt, err := m.AttachPty(name, 80, 24)
@@ -803,15 +825,16 @@ func TestNewSession_ForwardsOSC52ToAttachClient(t *testing.T) {
 }
 
 // TestEnsureServerOptions_OSC52OnceWithPassthroughWrapper 验证 pane 同时发出原始
-// OSC52 与 DCS tmux-passthrough 包装时，attach 只收到一次 payload（passthrough
-// 被默认 allow-passthrough off 吃掉，raw 由 set-clipboard on 转发）。
+// OSC52 与 DCS tmux-passthrough 包装时，attach 只收到一次 payload：
+// tmux >= 3.7 走 raw 由 set-clipboard on 转发、DCS 被 allow-passthrough off 吃掉；
+// 3.3–3.6 走 raw 被 set-clipboard external 吞掉、DCS 被 allow-passthrough on 透传。
 // 明文 sentinel 在两次 printf 之后输出——tmux 顺序处理 pane 输出，attach 流中出现
 // sentinel 即代表两次 OSC52 均已处理完毕，此时计数无竞态（不依赖固定 drain 窗口）。
 func TestEnsureServerOptions_OSC52OnceWithPassthroughWrapper(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping tmux integration test in -short mode")
 	}
-	requireTmux37(t)
+	requireTmux33(t)
 	const (
 		osc52Payload = "]52;c;dGVzdA=="
 		sentinel     = "OCDECK-CLIP-SENTINEL"
