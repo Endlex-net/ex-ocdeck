@@ -653,14 +653,11 @@ func setAttachTermClipboard(m *Manager) {
 	m.baseEnv = append(m.baseEnv, "TERM=xterm-256color")
 }
 
-func waitForTriggerScript(trigger, extraPrintf string) string {
-	return "while [ ! -f " + shellQuote(trigger) + " ]; do sleep 0.05; done; " +
-		extraPrintf + "sleep 30"
-}
-
+// readPtyUntil 轮询 PTY 流直到出现 needle，返回累积流；超时/读错误返回 error
+// （不 Fatal，调用方决定是否附诊断后 Fatal）。
 func readPtyUntil(t *testing.T, p interface {
 	ReadCtx(ctx context.Context) ([]byte, error)
-}, needle string, timeout time.Duration) string {
+}, needle string, timeout time.Duration) (string, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -681,12 +678,60 @@ func readPtyUntil(t *testing.T, p interface {
 					break
 				}
 				drainCancel()
-				return buf.String()
+				return buf.String(), nil
 			}
 		}
 		if err != nil {
-			t.Fatalf("pty read: %v (got %q, want contain %q)", err, buf.String(), needle)
+			return buf.String(), fmt.Errorf("pty read: %w (got %q, want contain %q)", err, buf.String(), needle)
 		}
+	}
+}
+
+// waitForTriggerScript 构造 pane 脚本：循环等待 trigger 文件，期间周期打印
+// PANE-READY 哨兵——attach 流出现哨兵即证明 pane shell 存活且阻塞在等 trigger，
+// 消除"trigger 已写入但 pane 尚未跑到循环"与"printf 发出时 pane 未就绪"的竞态。
+func waitForTriggerScript(trigger, extraPrintf string) string {
+	return "while [ ! -f " + shellQuote(trigger) + " ]; do printf 'PANE-READY\\n'; sleep 0.2; done; " +
+		extraPrintf + "sleep 30"
+}
+
+// waitForClientTermname 轮询直到 tmux 注册了 clipboard-capable 的 attach 客户端
+// （client_termname=xterm-256color）。AttachPty 返回仅代表 PTY fork 成功，client
+// 握手/termname 注册是异步的——此前发出的 OSC52 无可转发目标，会被 tmux 丢弃。
+func waitForClientTermname(t *testing.T, m *Manager, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		stdout, _, err := m.execTmux(ctx, "list-clients", "-F", "#{client_termname}")
+		cancel()
+		if err == nil && strings.Contains(stdout, "xterm-256color") {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("attach client with termname xterm-256color not registered within %s", timeout)
+}
+
+// dumpOSC52Diagnostics 在转发断言失败时打印环境证据，供 CI 日志定位
+// （版本/选项/能力判定/客户端注册）。tmux -V 直调，不经 -L/-f。
+func dumpOSC52Diagnostics(t *testing.T, m *Manager) {
+	t.Helper()
+	if out, err := exec.Command("tmux", "-V").Output(); err == nil {
+		t.Logf("diag tmux -V: %s", strings.TrimSpace(string(out)))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if out, _, err := m.execTmux(ctx, "show-options", "-sv", "set-clipboard"); err == nil {
+		t.Logf("diag set-clipboard: %s", strings.TrimSpace(out))
+	}
+	if out, _, err := m.execTmux(ctx, "show-options", "-s", "terminal-features"); err == nil {
+		t.Logf("diag terminal-features: %s", strings.TrimSpace(out))
+	}
+	if out, _, err := m.execTmux(ctx, "list-clients", "-F", "#{client_termname}"); err == nil {
+		t.Logf("diag client termnames: %s", strings.TrimSpace(out))
+	} else {
+		t.Logf("diag list-clients failed: %v", err)
 	}
 }
 
@@ -740,12 +785,20 @@ func TestNewSession_ForwardsOSC52ToAttachClient(t *testing.T) {
 	}
 	defer pt.Close()
 
+	// 前置条件齐备后才触发：client 已注册（否则 OSC52 无转发目标被丢弃）、
+	// pane shell 已跑到等 trigger 的循环（screen 中有 PANE-READY 残留）。
+	waitForClientTermname(t, m, 5*time.Second)
+	if _, err := readPtyUntil(t, pt, "PANE-READY", 15*time.Second); err != nil {
+		dumpOSC52Diagnostics(t, m)
+		t.Fatalf("pane not ready: %v", err)
+	}
 	if err := os.WriteFile(trigger, []byte("1"), 0o600); err != nil {
 		t.Fatalf("write trigger: %v", err)
 	}
-	got := readPtyUntil(t, pt, "]52;c;dGVzdA==", 5*time.Second)
-	if !strings.Contains(got, "]52;c;dGVzdA==") {
-		t.Fatalf("attach stream missing OSC52 payload: %q", got)
+	got, err := readPtyUntil(t, pt, "]52;c;dGVzdA==", 15*time.Second)
+	if err != nil || !strings.Contains(got, "]52;c;dGVzdA==") {
+		dumpOSC52Diagnostics(t, m)
+		t.Fatalf("attach stream missing OSC52 payload: %v", err)
 	}
 }
 
@@ -787,10 +840,20 @@ func TestEnsureServerOptions_OSC52OnceWithPassthroughWrapper(t *testing.T) {
 	}
 	defer pt.Close()
 
+	// 同 ForwardsOSC52：先等 client 注册与 pane 就绪，再触发，消除时序竞态。
+	waitForClientTermname(t, m, 5*time.Second)
+	if _, err := readPtyUntil(t, pt, "PANE-READY", 15*time.Second); err != nil {
+		dumpOSC52Diagnostics(t, m)
+		t.Fatalf("pane not ready: %v", err)
+	}
 	if err := os.WriteFile(trigger, []byte("1"), 0o600); err != nil {
 		t.Fatalf("write trigger: %v", err)
 	}
-	got := readPtyUntil(t, pt, sentinel, 5*time.Second)
+	got, err := readPtyUntil(t, pt, sentinel, 15*time.Second)
+	if err != nil || !strings.Contains(got, sentinel) {
+		dumpOSC52Diagnostics(t, m)
+		t.Fatalf("sentinel %q not seen: %v", sentinel, err)
+	}
 	if n := strings.Count(got, osc52Payload); n != 1 {
 		t.Fatalf("OSC52 payload count = %d, want 1 (stream=%q)", n, got)
 	}
