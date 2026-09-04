@@ -35,10 +35,10 @@
 
 - [ ] 5.1 创建：三类新建行的持久化断言（repo 缺省/显式 worktree→`worktree`；repo local-path→`local-path`+空 branch/base_ref+项目路径；dir 缺省→`local-path`）；拒绝非空 base_ref、目录消失 invalid_state 零副作用、dir+mode 拒绝、未知 mode 拒绝、presence 决策表全组合；**createInPlace 零副作用验收**：spy/panic backend + 目录快照断言 slug 生成、分支校验与探测、worktree 路径生成、worktree add、git 调用、项目目录内文件创建均未发生；local-path 不执行 inherit 但 lifecycle 配置读取失败仍阻断创建链；配置 init 时 local-path 任务 init 以 canonical 项目路径为 cwd 执行，成功自动激活、失败保持 suspended 且 init_status=failed（project-lifecycle-config delta）；**创建重试验收**：local-path 任务 creation_failed → Retry 成功时复用 canonical 项目路径并跳过 git/worktree/inherit；Retry 时目录不存在保持 creation_failed 且零副作用；非法 kind/mode 组合在状态修改与任何副作用前拒绝
 - [ ] 5.2 删除：repo local-path 走 dir 序列（normal/force/retry），内建逻辑不触碰项目目录与 git 状态；pre_delete normal 执行（cwd=项目目录）/retry 重执行/force 跳过；非法 kind/mode 组合：首次 Delete/Retry 状态写前拒绝零副作用、deleteResume 仅落 deletion_failed+last_error 无后续副作用
-- [ ] 5.3 对齐与运行时入口：同 repo 两个 local-path 任务 OwnedOnly 互不认领（复用 session_isolation_test.go 模式）；四个运行时入口（Activate/resumeActive/tryRepairRuntime/ensureRecovery）+ Suspend/reconcile/attach_shell 逐一验收按有效模式解析；非法组合（dir+worktree、未知 kind、未知 mode）断言状态/runtime/SSE/align/anchor 均未变化
+- [x] 5.3 对齐与运行时入口：同 repo 两个 local-path 任务 OwnedOnly 互不认领（复用 session_isolation_test.go 模式）；四个运行时入口（Activate/resumeActive/tryRepairRuntime/ensureRecovery）+ Suspend/reconcile/attach_shell 逐一验收按有效模式解析；非法组合（dir+worktree、未知 kind、未知 mode）断言状态/runtime/SSE/align/anchor 均未变化
 - [ ] 5.4 env：local-path 任务激活不注入分支变量（init/pre_delete 直接调用 layerEnvSnapshot 路径同规）；非法 kind/mode 组合 internal error（不持久化快照、不建进程）
 - [ ] 5.5 git 门禁：local-path 任务 status/diff/commit/push 与 diff review → invalid_input，且 git runner 调用数、文件读取、子仓库探测均为零
 - [ ] 5.6 DTO/API 传播：任务详情 REST 与 SSE、项目列表与详情摘要、活跃 REST/SSE snapshot/update 帧——mode 必有且与持久化同源；损坏数据分派全覆盖（任务 DTO/摘要 fail-closed；活跃 REST 500；SSE 初始 500、update 保持 dirty 重试）
 - [ ] 5.7 Web：面板三态（默认 worktree/local-path/dir）与选择器重置规则；弹窗文案按 dir/local-path 区分与 pre-delete 提示；Git tab 降级
-- [ ] 5.8 行为测试有效性证据：每个新增/修改的行为测试在旧实现下失败、新实现下通过（mutation 式验证或基线运行）
+- [x] 5.8 行为测试有效性证据：每个新增/修改的行为测试在旧实现下失败、新实现下通过（mutation 式验证或基线运行）
 - [ ] 5.9 `openspec validate add-local-path-task-mode --strict` 通过；`go build ./...` 与相关包测试通过；web 测试通过
