@@ -284,17 +284,17 @@ func (m *Manager) ensureRecovery(taskID string, tok runtime.InstVersion) {
 		unlock()
 		return
 	}
-	// G3-6：kind 校验在锁内、CAS 与一切副作用前（spec「session 归属捕获」：四个入口
-	// 在任何状态修改或运行时副作用前 MUST 解析并校验 kind，未知 kind 零副作用）。
+	// G3-6：有效模式解析在锁内、CAS 与一切副作用前（spec「session 归属捕获」：四个入口
+	// 在任何状态修改或运行时副作用前 MUST 解析 kind+mode，非法组合零副作用）。
 	proj, perr := m.store.GetProject(context.Background(), row.ProjectID)
 	if perr != nil {
 		log.Printf("ensureRecovery: get project for task %s: %v", taskID, perr)
 		unlock()
 		return
 	}
-	mode, kerr := alignModeForKind(proj.Kind)
+	mode, kerr := resolveAlignMode(row, proj.Kind)
 	if kerr != nil {
-		log.Printf("ensureRecovery: resolve kind for task %s: %v", taskID, kerr)
+		log.Printf("ensureRecovery: resolve mode for task %s: %v", taskID, kerr)
 		unlock()
 		return
 	}
@@ -397,9 +397,9 @@ func (m *Manager) ensureRecoveryFromAttach(taskID string) {
 		unlock()
 		return
 	}
-	mode, kerr := alignModeForKind(proj.Kind)
+	mode, kerr := resolveAlignMode(row, proj.Kind)
 	if kerr != nil {
-		log.Printf("ensureRecovery: attach resolve kind for task %s: %v", taskID, kerr)
+		log.Printf("ensureRecovery: attach resolve mode for task %s: %v", taskID, kerr)
 		unlock()
 		return
 	}

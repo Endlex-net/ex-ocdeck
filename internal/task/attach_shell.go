@@ -59,7 +59,8 @@ func (m *Manager) ReopenAttach(ctx context.Context, taskID string) (TerminalID, 
 	if perr != nil {
 		return "", newOpErr(codeNotFound, fmt.Errorf("project gone: %w", perr))
 	}
-	if _, kerr := alignModeForKind(proj.Kind); kerr != nil {
+	if _, kerr := resolveTaskMode(row, proj.Kind); kerr != nil {
+		// 非法持久化 kind/mode 组合（DB 损坏值）→ internal（add-local-path-task-mode D1/D2）。
 		return "", newOpErr(codeInternal, kerr)
 	}
 	runtimeName := runtimeSessionName(taskID)

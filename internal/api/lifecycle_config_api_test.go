@@ -526,8 +526,8 @@ type projectKindTaskBackend struct {
 	projectID string
 }
 
-func (b *projectKindTaskBackend) Create(ctx context.Context, projectID, taskName, baseRef string) (application.TaskRow, error) {
-	return application.TaskRow{ID: "t-new", ProjectID: projectID, Name: taskName, Status: application.StatusSuspended}, nil
+func (b *projectKindTaskBackend) Create(ctx context.Context, projectID string, opts application.CreateTaskOptions) (application.TaskRow, error) {
+	return application.TaskRow{ID: "t-new", ProjectID: projectID, Name: opts.Name, Status: application.StatusSuspended}, nil
 }
 func (b *projectKindTaskBackend) Get(ctx context.Context, taskID string) (application.TaskRow, error) {
 	return application.TaskRow{ID: taskID, ProjectID: b.projectID, Status: application.StatusSuspended}, nil

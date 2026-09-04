@@ -95,6 +95,7 @@ type TaskSnapshot struct {
 	InitError       *string
 	BaseRef         string
 	AnchorSessionID *string
+	Mode            string
 }
 
 // SessionRepository 表达会话归属隔离的持久化端口（design.md D0:78-86）。

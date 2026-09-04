@@ -32,12 +32,13 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 	if !rehydrateGuardView(row).CanSuspend() {
 		return newOpErr(codeInvalidState, fmt.Errorf("suspend requires active, got %s", row.Status))
 	}
-	// D8：状态转换前解析项目 kind（任何副作用前 fail-closed）。未知持久化 kind → internal（D1）。
+	// D8 + add-local-path-task-mode D2/D5：状态转换前解析任务有效模式（任何副作用前 fail-closed）。
+	// 非法持久化 kind/mode 组合 → internal（D1）。
 	proj, perr := m.store.GetProject(ctx, row.ProjectID)
 	if perr != nil {
 		return newOpErr(codeNotFound, fmt.Errorf("project gone: %w", perr))
 	}
-	mode, kerr := alignModeForKind(proj.Kind)
+	mode, kerr := resolveAlignMode(row, proj.Kind)
 	if kerr != nil {
 		return newOpErr(codeInternal, kerr)
 	}

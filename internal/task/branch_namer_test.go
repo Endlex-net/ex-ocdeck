@@ -64,7 +64,7 @@ func TestCreate_UsesNamerForBranchSlug(t *testing.T) {
 	namer := &mockNamer{slug: "ai-refined-slug"}
 	m := newTestManagerWithNamer(t, store, wt, namer)
 
-	row, err := m.Create(context.Background(), "p1", "修复登录bug", "")
+	row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "修复登录bug"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestCreate_NamerFallbackValuePassThrough(t *testing.T) {
 	namer := &mockNamer{slug: "my-task"}
 	m := newTestManagerWithNamer(t, store, wt, namer)
 
-	row, err := m.Create(context.Background(), "p1", "My Task", "")
+	row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "My Task"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestCreate_NilNamerUsesSlugify(t *testing.T) {
 	// 不注入 Namer：newTestManager 走 nil 路径。
 	m := newTestManager(t, store, newMockProc(), wt, newMockOC(true))
 
-	row, err := m.Create(context.Background(), "p1", "My Task", "")
+	row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "My Task"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestCreate_NamerBranchConflictUnchanged(t *testing.T) {
 	namer := &mockNamer{slug: "dup-slug"}
 	m := newTestManagerWithNamer(t, store, wt, namer)
 
-	_, err := m.Create(context.Background(), "p1", "anything", "")
+	_, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "anything"})
 	if err == nil {
 		t.Fatal("expected conflict on duplicate branch")
 	}
@@ -177,7 +177,7 @@ func TestCreate_NamerInvalidSlugRejectedByValidateBranchName(t *testing.T) {
 	namer := &mockNamer{slug: "bad slug"}
 	m := newTestManagerWithNamer(t, store, &wtValidateErr, namer)
 
-	_, err := m.Create(context.Background(), "p1", "task", "")
+	_, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "task"})
 	if err == nil {
 		t.Fatal("expected invalid_input on invalid branch name")
 	}

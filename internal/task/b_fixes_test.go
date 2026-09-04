@@ -411,7 +411,7 @@ func TestCreate_BranchConflictPreservesExisting(t *testing.T) {
 	wt.branches["ocdeck/my-task"] = true
 	m := newTestManager(t, store, newMockProc(), wt, newMockOC(true))
 
-	_, err := m.Create(context.Background(), "p1", "My Task", "")
+	_, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "My Task"})
 	if err == nil || OpErrorCode(err) != codeConflict {
 		t.Errorf("want conflict on existing branch, got %v", err)
 	}

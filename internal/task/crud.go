@@ -160,19 +160,24 @@ func (m *Manager) writeFinishInitRun(ctx context.Context, id, initStatus string,
 	return m.store.FinishInitRun(ctx, id, initStatus, initError)
 }
 
-// Create 在项目下创建任务：按 proj.Kind 分叉（add-plain-dir-project D2/D10）。
-//   - repo：生成 worktree + 分支（分支 ocdeck/<task-name-slug>，worktree 路径
-//     <dataDir>/worktrees/<projectNameSlug>/<branchPathSlug>-<rand4>）；接受可选 base_ref
-//     短名，解析为全限定 ref 随任务落库，wt.Add 用解析后 baseRef 替代 proj.DefaultBranch。
-//   - dir：无 worktree/分支/inherit 复制；worktree_path=canonical 项目路径，Branch=""；
-//     落库前做无副作用目录预检（os.Stat 存在且为目录，否则 invalid_state 且不落 creating 行）。
+// Create 在项目下创建任务：按 proj.Kind + 请求 mode 分叉（add-plain-dir-project D2/D10
+// + add-local-path-task-mode D3）。
+//   - repo + worktree（缺省）：生成 worktree + 分支（分支 ocdeck/<task-name-slug>，
+//     worktree 路径 <dataDir>/worktrees/<projectNameSlug>/<branchPathSlug>-<rand4>）；
+//     接受可选 base_ref 短名，解析为全限定 ref 随任务落库，wt.Add 用解析后 baseRef
+//     替代 proj.DefaultBranch。落库 mode='worktree'。
+//   - repo + local-path：与 dir 任务完全一致的就地运行语义（createInPlace），
+//     落库 mode='local-path'、branch=""、worktree_path=canonical 项目路径、base_ref=""。
+//   - dir：无 worktree/分支/inherit 复制；恒为就地运行语义，落库 mode='local-path'
+//     （MUST NOT 落到 DB DEFAULT 'worktree'，否则立即成为非法组合）。
 //
-// D5 主流程顺序：项目存在 → kind 分叉 → 无副作用前置检查（repo：slug/branch/分支校验/冲突检查/
-// base_ref 解析；dir：目录预检）→ 落库 creating → 副作用（repo：wt.Add+inherit 复制；dir：仅读配置）
-// → CommitCreated → InitRunner/triggerActivate。
-// 未知 kind fail-closed 报错零副作用（MUST NOT 落 creating 行）。
-func (m *Manager) Create(ctx context.Context, projectID, taskName, baseRef string) (TaskRow, error) {
-	if strings.TrimSpace(taskName) == "" {
+// D5 主流程顺序：项目存在 → kind+mode 分叉 → 无副作用前置检查（repo worktree：slug/branch/
+// 分支校验/冲突检查/base_ref 解析；就地运行：base_ref 拒绝 + 目录预检）→ 落库 creating →
+// 副作用（repo worktree：wt.Add+inherit 复制；就地运行：仅读配置）→ CommitCreated →
+// InitRunner/triggerActivate。
+// 未知 kind / 未知 mode fail-closed 报错零副作用（MUST NOT 落 creating 行）。
+func (m *Manager) Create(ctx context.Context, projectID string, opts CreateTaskOptions) (TaskRow, error) {
+	if strings.TrimSpace(opts.Name) == "" {
 		return TaskRow{}, newOpErr(codeInvalidInput, errors.New("task name is required"))
 	}
 	// 项目存在性检查。
@@ -181,12 +186,26 @@ func (m *Manager) Create(ctx context.Context, projectID, taskName, baseRef strin
 		return TaskRow{}, newOpErr(codeNotFound, fmt.Errorf("project not found: %w", err))
 	}
 
-	// 按 kind 分叉（显式 repo/dir，未知 fail-closed 零副作用）。
+	// 按 kind + mode 分叉（add-local-path-task-mode D2/D3：未提交意图入口，
+	// 任何状态写入与副作用前拒绝、零副作用）。
 	switch proj.Kind {
 	case ProjectKindRepo:
-		return m.createRepo(ctx, projectID, taskName, proj, baseRef)
+		switch opts.Mode {
+		case "", TaskModeWorktree:
+			return m.createRepo(ctx, projectID, opts.Name, proj, opts.BaseRef)
+		case TaskModeLocalPath:
+			return m.createInPlace(ctx, projectID, opts.Name, proj, opts.BaseRef)
+		default:
+			return TaskRow{}, newOpErr(codeInvalidInput, fmt.Errorf("unknown task mode %q", opts.Mode))
+		}
 	case ProjectKindDir:
-		return m.createDir(ctx, projectID, taskName, proj, baseRef)
+		// dir 项目恒为就地运行；显式 worktree 组合在入口拒绝（defensive，API 层 3.1 亦有组合校验）。
+		// base_ref 原样传入：dir + 非空 base_ref → invalid_input（决策表「现状不变」，
+		// 由 createInPlace 入口统一拒绝）。
+		if opts.Mode != "" && opts.Mode != TaskModeLocalPath {
+			return TaskRow{}, newOpErr(codeInvalidInput, fmt.Errorf("mode %q is not allowed for dir project", opts.Mode))
+		}
+		return m.createInPlace(ctx, projectID, opts.Name, proj, opts.BaseRef)
 	default:
 		// 未知持久化 kind（DB 损坏值）→ internal（D1：区别于用户请求非法 kind 的 invalid_input）。
 		return TaskRow{}, newOpErr(codeInternal, fmt.Errorf("unknown project kind %q", proj.Kind))
@@ -235,10 +254,11 @@ func (m *Manager) createRepo(ctx context.Context, projectID, taskName string, pr
 		return TaskRow{}, newOpErr(codeInternal, fmt.Errorf("compute worktree path: %w", err))
 	}
 
-	// ① 意图落库：插入任务行（status=creating）。
+	// ① 意图落库：插入任务行（status=creating，mode='worktree'）。
 	if err := m.writeCreateTask(ctx, TaskRow{
 		ID: taskID, ProjectID: projectID, Name: taskName,
 		Branch: branch, Status: StatusCreating, WorktreePath: wtPath, BaseRef: resolvedBaseRef,
+		Mode: TaskModeWorktree,
 	}); err != nil {
 		return TaskRow{}, newOpErr(codeInternal, fmt.Errorf("create task row: %w", err))
 	}
@@ -299,38 +319,48 @@ func (m *Manager) createRepo(ctx context.Context, projectID, taskName string, pr
 	row, err := m.store.GetTask(ctx, taskID)
 	if err != nil {
 		return TaskRow{ID: taskID, ProjectID: projectID, Name: taskName, Branch: branch,
-			Status: StatusSuspended, WorktreePath: wtPath, BaseRef: resolvedBaseRef}, newOpErr(codeInternal, err)
+			Status: StatusSuspended, WorktreePath: wtPath, BaseRef: resolvedBaseRef,
+			Mode: TaskModeWorktree}, newOpErr(codeInternal, err)
 	}
 	return row, nil
 }
 
-// createDir 实现 dir 项目任务创建（add-plain-dir-project D2）。
-// 无 worktree/分支/inherit 复制；worktree_path=canonical 项目路径，Branch=""。
-// 落库前做无副作用目录预检（os.Stat 存在且为目录，否则 invalid_state 不落 creating 行）。
-// 提供 base_ref → invalid_input 零副作用。
-func (m *Manager) createDir(ctx context.Context, projectID, taskName string, proj ProjectRow, baseRef string) (TaskRow, error) {
+// createInPlace 实现就地运行任务创建（dir 项目任务与 repo 项目 local-path 模式任务共用，
+// add-plain-dir-project D2 + add-local-path-task-mode D3）。
+// 无 worktree/分支/inherit 复制；worktree_path=canonical 项目路径，Branch=""，
+// 落库 mode='local-path'（MUST NOT 落到 DB DEFAULT 'worktree'）。
+// 落库前做无副作用目录预检（EvalSymlinks+IsDir，否则 invalid_state 不落 creating 行）。
+// 提供 base_ref → invalid_input 零副作用（dir 与 repo local-path 均不接受 base_ref）。
+// creation_failed 仅可能来自 lifecycle 配置读取失败或提交点失败。
+func (m *Manager) createInPlace(ctx context.Context, projectID, taskName string, proj ProjectRow, baseRef string) (TaskRow, error) {
 	if baseRef != "" {
+		if proj.Kind == ProjectKindRepo {
+			// repo 项目 local-path 模式任务不接受 base_ref（就地运行无基线分支语义）。
+			return TaskRow{}, newOpErr(codeInvalidInput, errors.New("base_ref is not allowed for local-path task"))
+		}
 		// dir 项目不接受 base_ref（add-plain-dir-project D10/spec：提供即 invalid_input）。
 		return TaskRow{}, newOpErr(codeInvalidInput, errors.New("base_ref is not allowed for dir project"))
 	}
 	// 目录存在性预检（无副作用，落库前完成）：存在且为目录，否则 invalid_state。
 	canonicalPath, err := filepath.EvalSymlinks(proj.Path)
 	if err != nil {
-		return TaskRow{}, newOpErr(codeInvalidState, fmt.Errorf("dir project path not accessible: %w", err))
+		return TaskRow{}, newOpErr(codeInvalidState, fmt.Errorf("project path not accessible: %w", err))
 	}
 	info, err := os.Stat(canonicalPath)
 	if err != nil {
-		return TaskRow{}, newOpErr(codeInvalidState, fmt.Errorf("dir project path not accessible: %w", err))
+		return TaskRow{}, newOpErr(codeInvalidState, fmt.Errorf("project path not accessible: %w", err))
 	}
 	if !info.IsDir() {
-		return TaskRow{}, newOpErr(codeInvalidState, fmt.Errorf("dir project path is not a directory: %s", canonicalPath))
+		return TaskRow{}, newOpErr(codeInvalidState, fmt.Errorf("project path is not a directory: %s", canonicalPath))
 	}
 
 	taskID := newTaskID()
-	// ① 意图落库：插入任务行（status=creating，Branch=""，WorktreePath=canonical 项目路径）。
+	// ① 意图落库：插入任务行（status=creating，Branch=""，WorktreePath=canonical 项目路径，
+	// mode='local-path'）。
 	if err := m.writeCreateTask(ctx, TaskRow{
 		ID: taskID, ProjectID: projectID, Name: taskName,
 		Branch: "", Status: StatusCreating, WorktreePath: canonicalPath, BaseRef: "",
+		Mode: TaskModeLocalPath,
 	}); err != nil {
 		return TaskRow{}, newOpErr(codeInternal, fmt.Errorf("create task row: %w", err))
 	}
@@ -365,7 +395,7 @@ func (m *Manager) createDir(ctx context.Context, projectID, taskName string, pro
 	}
 
 	// ④ 锁外异步链：同 repo（init_status=pending → InitRunner；none → triggerActivate）。
-	// dir 激活只锚定目录，天然兼容（D2）。
+	// 就地运行任务激活只锚定目录，天然兼容（D2/D3）。
 	if initStatus == InitStatusPending {
 		m.startInitRunner(taskID)
 	} else {
@@ -374,7 +404,7 @@ func (m *Manager) createDir(ctx context.Context, projectID, taskName string, pro
 	row, err := m.store.GetTask(ctx, taskID)
 	if err != nil {
 		return TaskRow{ID: taskID, ProjectID: projectID, Name: taskName, Branch: "",
-			Status: StatusSuspended, WorktreePath: canonicalPath}, newOpErr(codeInternal, err)
+			Status: StatusSuspended, WorktreePath: canonicalPath, Mode: TaskModeLocalPath}, newOpErr(codeInternal, err)
 	}
 	return row, nil
 }
@@ -455,22 +485,25 @@ func (m *Manager) Retry(ctx context.Context, taskID string, confirmDirty bool) e
 		if row.DeleteMode.Valid && row.DeleteMode.String == string(DeleteForce) {
 			mode = DeleteForce
 		}
-		// add-plain-dir-project D3：删除重入按项目 kind 分叉（与 Delete 首次一致，delete.go）。
-		// dir 跳过 DirtyFiles 快照与 confirmDirty 门禁（git 静态检查不适用，confirmDirty 接受但忽略），
+		// add-plain-dir-project D3 + add-local-path-task-mode D4：删除重入按任务有效模式分叉
+		// （与 Delete 首次一致，delete.go）。
+		// local-path（dir 任务与 repo 项目 local-path 模式任务）跳过 DirtyFiles 快照与
+		// confirmDirty 门禁（git 静态检查不适用，confirmDirty 接受但忽略），
 		// 直接以 nil 快照进入 deleteResume（deleteResumeDir 忽略 preflightDirty）。
-		// repo 保持现状：preflight DirtyFiles 快照 + confirmDirty 门禁 + deleteResume。
-		// 未知 kind fail-closed：在 deletion_failed → deleting 状态转换与 DirtyFiles 前返回，零副作用。
+		// worktree 保持现状：preflight DirtyFiles 快照 + confirmDirty 门禁 + deleteResume。
+		// 非法 kind/mode 组合 fail-closed：在 deletion_failed → deleting 状态转换与 DirtyFiles
+		// 前返回，零副作用（未提交意图入口，tasks 2.1）。
 		proj, perr := m.store.GetProject(ctx, row.ProjectID)
 		if perr != nil {
 			return newOpErr(codeNotFound, fmt.Errorf("project not found: %w", perr))
 		}
-		if proj.Kind != ProjectKindRepo && proj.Kind != ProjectKindDir {
-			// 未知持久化 kind（DB 损坏值）→ internal（D1）。
-			return newOpErr(codeInternal, fmt.Errorf("task %s unknown project kind %q", taskID, proj.Kind))
+		effMode, rerr := resolveTaskMode(row, proj.Kind)
+		if rerr != nil {
+			return newOpErr(codeInternal, rerr)
 		}
 		// B8：delete_mode 不得被 Normal 重试覆盖；按持久化 delete_mode 重入。
 		// 先置 deleting 再执行（deletion_failed → deleting，design.md §19/§8）。
-		// 在 kind 校验通过后转换，保证未知 kind 零副作用（状态不变）。
+		// 在有效模式校验通过后转换，保证非法组合零副作用（状态不变）。
 		if row.Status == StatusDeletionFailed {
 			if _, err := m.writeDeleteMode(ctx, row.ID, string(mode)); err != nil {
 				return newOpErr(codeInternal, err)
@@ -480,8 +513,8 @@ func (m *Manager) Retry(ctx context.Context, taskID string, confirmDirty bool) e
 			}
 		}
 		var preflightDirty map[string]struct{}
-		switch proj.Kind {
-		case ProjectKindRepo:
+		switch effMode {
+		case TaskModeWorktree:
 			// P0/B1：Retry 重入删除序列 MUST NOT 传 nil 跳过二次 dirty 门禁，也不得以新快照
 			// 为基线把首次未确认文件纳入"已确认"随后 ForceDirty 强删。正确语义与首次 Delete
 			// 一致：取当前 dirty 集合，非空则要求调用方显式 confirmDirty=true；confirmDirty=false
@@ -500,8 +533,8 @@ func (m *Manager) Retry(ctx context.Context, taskID string, confirmDirty bool) e
 				return newOpErr(codeConflict, errors.New("worktree: retry delete has dirty files; confirm deletion again with confirmDirty=true"))
 			}
 			preflightDirty = snap
-		case ProjectKindDir:
-			// dir：跳过 DirtyFiles 快照与 confirmDirty 门禁（preflightDirty 保持 nil）。
+		case TaskModeLocalPath:
+			// local-path：跳过 DirtyFiles 快照与 confirmDirty 门禁（preflightDirty 保持 nil）。
 		}
 		return m.deleteResume(ctx, row, mode, preflightDirty)
 	default:
@@ -509,32 +542,34 @@ func (m *Manager) Retry(ctx context.Context, taskID string, confirmDirty bool) e
 	}
 }
 
-// retryCreate 重试创建（design.md §19 Create Retry 行 + §3.1，tasks 3.2-3.3 + D2/D10）。
-// 按 proj.Kind 分叉：
-//   - repo：严格产物验证——通过则跳过 add，否则重新 add（用落库 BaseRef，MUST NOT 重读
-//     proj.DefaultBranch；repo 落库值为空 fail-closed 报错）。无论产物复用还是重建都重新
-//     幂等执行 inherit（§3.1）。
-//   - dir：跳过 VerifyWorktreeProduct/分支检查/wt.Add，仅校验项目目录仍存在且为目录
-//     （不存在/非目录 → 保持 creation_failed 并报错，零副作用），然后读配置提交。
+// retryCreate 重试创建（design.md §19 Create Retry 行 + §3.1，tasks 3.2-3.3 + D2/D10
+// + add-local-path-task-mode D3）。
+// 按任务有效模式（resolveTaskMode）分叉：
+//   - worktree（repo）：严格产物验证——通过则跳过 add，否则重新 add（用落库 BaseRef，
+//     MUST NOT 重读 proj.DefaultBranch；worktree 任务落库值为空 fail-closed 报错）。
+//     无论产物复用还是重建都重新幂等执行 inherit（§3.1）。
+//   - local-path（dir 任务与 repo 项目 local-path 模式任务）：跳过 VerifyWorktreeProduct/
+//     分支检查/wt.Add，仅校验项目目录仍存在且为目录（不存在/非目录 → 保持 creation_failed
+//     并报错，零副作用），然后读配置提交。
 //
 // CommitCreated(expectedStatus='creation_failed')：从 creation_failed 原子提交到 suspended。
 // 读配置失败 → creation_failed（保留状态，调用方据 error 传播）。
 // 返回二态结果：createDirectActivate（none，调用方 triggerActivate）或 createStartInit（pending，调用方启动 InitRunner）。
-// 未知 kind fail-closed 报错零副作用。
+// 非法 kind/mode 组合 fail-closed 报错零副作用（Retry 为未提交意图入口，状态写前拒绝）。
 func (m *Manager) retryCreate(ctx context.Context, row TaskRow) (createOutcome, error) {
 	proj, err := m.store.GetProject(ctx, row.ProjectID)
 	if err != nil {
 		return 0, newOpErr(codeInternal, fmt.Errorf("project gone during retry: %w", err))
 	}
-	switch proj.Kind {
-	case ProjectKindRepo:
-		return m.retryCreateRepo(ctx, row, proj)
-	case ProjectKindDir:
-		return m.retryCreateDir(ctx, row, proj)
-	default:
-		// 未知持久化 kind（DB 损坏值）→ internal（D1）。
-		return 0, newOpErr(codeInternal, fmt.Errorf("unknown project kind %q", proj.Kind))
+	effMode, rerr := resolveTaskMode(row, proj.Kind)
+	if rerr != nil {
+		// 非法 kind/mode 组合（持久化损坏）→ internal（D1/D2）。
+		return 0, newOpErr(codeInternal, rerr)
 	}
+	if effMode == TaskModeWorktree {
+		return m.retryCreateRepo(ctx, row, proj)
+	}
+	return m.retryCreateDir(ctx, row, proj)
 }
 
 // retryCreateRepo 实现 repo 任务创建重试（design.md §3.1 + add-plain-dir-project D10）。
@@ -596,27 +631,28 @@ func (m *Manager) retryCreateRepo(ctx context.Context, row TaskRow, proj Project
 	return createDirectActivate, nil
 }
 
-// retryCreateDir 实现 dir 任务创建重试（add-plain-dir-project D2）。
+// retryCreateDir 实现就地运行任务创建重试（dir 任务与 repo 项目 local-path 模式任务共用，
+// add-plain-dir-project D2 + add-local-path-task-mode D3）。
 // 跳过 VerifyWorktreeProduct/分支检查/wt.Add，仅校验项目目录仍存在且为目录
 // （不存在/非目录 → 保持 creation_failed 并报错，零副作用），然后读配置提交。
 func (m *Manager) retryCreateDir(ctx context.Context, row TaskRow, proj ProjectRow) (createOutcome, error) {
-	// 目录存在性校验（与 createDir 预检一致，零副作用）：不存在/非目录 → 保持 creation_failed。
+	// 目录存在性校验（与 createInPlace 预检一致，零副作用）：不存在/非目录 → 保持 creation_failed。
 	canonicalPath, err := filepath.EvalSymlinks(proj.Path)
 	if err != nil {
-		le := sql.NullString{String: fmt.Errorf("retry: dir project path not accessible: %w", err).Error(), Valid: true}
+		le := sql.NullString{String: fmt.Errorf("retry: project path not accessible: %w", err).Error(), Valid: true}
 		_, _ = m.writeStatus(ctx, row.ID, StatusCreationFailed, le)
-		return 0, newOpErr(codeInvalidState, fmt.Errorf("retry: dir project path not accessible: %w", err))
+		return 0, newOpErr(codeInvalidState, fmt.Errorf("retry: project path not accessible: %w", err))
 	}
 	info, err := os.Stat(canonicalPath)
 	if err != nil {
-		le := sql.NullString{String: fmt.Errorf("retry: dir project path not accessible: %w", err).Error(), Valid: true}
+		le := sql.NullString{String: fmt.Errorf("retry: project path not accessible: %w", err).Error(), Valid: true}
 		_, _ = m.writeStatus(ctx, row.ID, StatusCreationFailed, le)
-		return 0, newOpErr(codeInvalidState, fmt.Errorf("retry: dir project path not accessible: %w", err))
+		return 0, newOpErr(codeInvalidState, fmt.Errorf("retry: project path not accessible: %w", err))
 	}
 	if !info.IsDir() {
-		le := sql.NullString{String: fmt.Errorf("retry: dir project path is not a directory: %s", canonicalPath).Error(), Valid: true}
+		le := sql.NullString{String: fmt.Errorf("retry: project path is not a directory: %s", canonicalPath).Error(), Valid: true}
 		_, _ = m.writeStatus(ctx, row.ID, StatusCreationFailed, le)
-		return 0, newOpErr(codeInvalidState, fmt.Errorf("retry: dir project path is not a directory: %s", canonicalPath))
+		return 0, newOpErr(codeInvalidState, fmt.Errorf("retry: project path is not a directory: %s", canonicalPath))
 	}
 
 	// 仅读 lifecycle 配置（不枚举/复制 gitignored 文件，D2）。读配置失败 → creation_failed。

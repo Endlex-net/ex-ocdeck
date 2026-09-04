@@ -57,7 +57,7 @@ func TestCreate_AutoActivateTriggered(t *testing.T) {
 	oc := newMockOC(true)
 	m, _ := newTestManagerWithLifecycle(t, store, proc, wt, oc)
 
-	row, err := m.Create(context.Background(), "p1", "Auto Task", "")
+	row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "Auto Task"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestCreate_AutoActivateFailureFallsToSuspended(t *testing.T) {
 	oc.probeErr = errors.New("capability mismatch boom")
 	m, _ := newTestManagerWithLifecycle(t, store, proc, wt, oc)
 
-	row, err := m.Create(context.Background(), "p1", "Fail Task", "")
+	row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "Fail Task"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestCreate_AutoActivateUsesLifecycleCtxNotRequestCtx(t *testing.T) {
 
 	// Create 用可取消请求 ctx，Create 返回后立即取消请求 ctx。
 	reqCtx, reqCancel := context.WithCancel(context.Background())
-	row, err := m.Create(reqCtx, "p1", "Ctx Task", "")
+	row, err := m.Create(reqCtx, "p1", CreateTaskOptions{Name: "Ctx Task"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}

@@ -132,7 +132,7 @@ func TestCreateDir_ZeroFileSideEffects_TreeIdentical(t *testing.T) {
 	store.seedProject(ProjectRow{ID: "pdir", Name: "d", Path: projDir, DefaultBranch: "", Kind: ProjectKindDir})
 	m := newDirTestManager(t, store, newMockProc(), newMockOC(true))
 
-	row, err := m.Create(context.Background(), "pdir", "my task", "")
+	row, err := m.Create(context.Background(), "pdir", CreateTaskOptions{Name: "my task"})
 	if err != nil {
 		t.Fatalf("Create dir: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestCreateDir_InitScript_TriggersInitRunner(t *testing.T) {
 	// 注入 LifecycleRunner mock 以断言 InitRunner 被启动并执行脚本。
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, newMockProc(), wrapDirPanicWorktree(newMockWorktree()), newMockOC(true), runner)
-	row, err := m.Create(context.Background(), "pdir", "init task", "")
+	row, err := m.Create(context.Background(), "pdir", CreateTaskOptions{Name: "init task"})
 	if err != nil {
 		t.Fatalf("Create dir with init: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestCreateDir_PathDoesNotExist_InvalidState_NoCreatingRow(t *testing.T) {
 	store.seedProject(ProjectRow{ID: "pdir", Name: "d", Path: "/nonexistent-xyz-abc-123", DefaultBranch: "", Kind: ProjectKindDir})
 	m := newDirTestManager(t, store, newMockProc(), newMockOC(true))
 
-	_, err := m.Create(context.Background(), "pdir", "task", "")
+	_, err := 	m.Create(context.Background(), "pdir", CreateTaskOptions{Name: "task"})
 	if err == nil {
 		t.Fatal("Create dir with nonexistent path: want error, got nil")
 	}
@@ -210,7 +210,7 @@ func TestCreateDir_PathIsFile_InvalidState(t *testing.T) {
 	store.seedProject(ProjectRow{ID: "pdir", Name: "d", Path: filePath, DefaultBranch: "", Kind: ProjectKindDir})
 	m := newDirTestManager(t, store, newMockProc(), newMockOC(true))
 
-	_, err := m.Create(context.Background(), "pdir", "task", "")
+	_, err := 	m.Create(context.Background(), "pdir", CreateTaskOptions{Name: "task"})
 	if err == nil {
 		t.Fatal("Create dir with file path: want error, got nil")
 	}
@@ -227,7 +227,7 @@ func TestCreateDir_ProvidingBaseRef_InvalidInput(t *testing.T) {
 	store.seedProject(ProjectRow{ID: "pdir", Name: "d", Path: projDir, DefaultBranch: "", Kind: ProjectKindDir})
 	m := newDirTestManager(t, store, newMockProc(), newMockOC(true))
 
-	_, err := m.Create(context.Background(), "pdir", "task", "feature-x")
+	_, err := m.Create(context.Background(), "pdir", CreateTaskOptions{Name: "task", BaseRef: "feature-x"})
 	if err == nil {
 		t.Fatal("Create dir with base_ref: want error, got nil")
 	}
@@ -249,7 +249,7 @@ func TestCreateDir_PanicMocksProveNoNamerOrWorktreeBackend(t *testing.T) {
 	m := newDirTestManager(t, store, newMockProc(), newMockOC(true))
 
 	// 成功即证明 Namer/WorktreeBackend 未被调用（panic mock 否则 fail）。
-	if _, err := m.Create(context.Background(), "pdir", "task", ""); err != nil {
+	if _, err := 	m.Create(context.Background(), "pdir", CreateTaskOptions{Name: "task"}); err != nil {
 		t.Fatalf("Create dir: %v", err)
 	}
 }
@@ -261,7 +261,7 @@ func TestRetryCreateDir_DirGone_KeepsCreationFailed(t *testing.T) {
 	store := newMockStore()
 	store.seedProject(ProjectRow{ID: "pdir", Name: "d", Path: projDir, DefaultBranch: "", Kind: ProjectKindDir})
 	t1 := TaskRow{ID: "t1", ProjectID: "pdir", Name: "task", Branch: "",
-		Status: StatusCreationFailed, WorktreePath: projDir, BaseRef: ""}
+		Status: StatusCreationFailed, WorktreePath: projDir, BaseRef: "", Mode: TaskModeLocalPath}
 	store.tasks["t1"] = t1
 	m := newDirTestManager(t, store, newMockProc(), newMockOC(true))
 
@@ -285,7 +285,7 @@ func TestRetryCreateDir_Success(t *testing.T) {
 	store := newMockStore()
 	store.seedProject(ProjectRow{ID: "pdir", Name: "d", Path: projDir, DefaultBranch: "", Kind: ProjectKindDir})
 	t1 := TaskRow{ID: "t1", ProjectID: "pdir", Name: "task", Branch: "",
-		Status: StatusCreationFailed, WorktreePath: projDir, BaseRef: ""}
+		Status: StatusCreationFailed, WorktreePath: projDir, BaseRef: "", Mode: TaskModeLocalPath}
 	store.tasks["t1"] = t1
 	m := newDirTestManager(t, store, newMockProc(), newMockOC(true))
 
@@ -335,7 +335,7 @@ func TestCreateRepo_DefaultBaseRef_LandsFullQualifiedRef(t *testing.T) {
 	wt := &baseRefWorktree{mockWorktree: newMockWorktree()}
 	m := newRepoTestManager(t, store, wt)
 
-	row, err := m.Create(context.Background(), "prep", "my task", "")
+	row, err := m.Create(context.Background(), "prep", CreateTaskOptions{Name: "my task"})
 	if err != nil {
 		t.Fatalf("Create repo default: %v", err)
 	}
@@ -361,7 +361,7 @@ func TestCreateRepo_BaseRefLocal_ResolvedToHeads(t *testing.T) {
 	}
 	m := newRepoTestManager(t, store, wt)
 
-	row, err := m.Create(context.Background(), "prep", "task", "feature-x")
+	row, err := 	m.Create(context.Background(), "prep", CreateTaskOptions{Name: "task", BaseRef: "feature-x"})
 	if err != nil {
 		t.Fatalf("Create repo base_ref local: %v", err)
 	}
@@ -383,7 +383,7 @@ func TestCreateRepo_BaseRefRemote_ResolvedToRemotes(t *testing.T) {
 	}
 	m := newRepoTestManager(t, store, wt)
 
-	row, err := m.Create(context.Background(), "prep", "task", "origin/feature-x")
+	row, err := m.Create(context.Background(), "prep", CreateTaskOptions{Name: "task", BaseRef: "origin/feature-x"})
 	if err != nil {
 		t.Fatalf("Create repo base_ref remote: %v", err)
 	}
@@ -410,7 +410,7 @@ func TestCreateRepo_HeadsPriorityOverRemotes(t *testing.T) {
 	}
 	m := newRepoTestManager(t, store, wt)
 
-	row, err := m.Create(context.Background(), "prep", "task", "feature-x")
+	row, err := 	m.Create(context.Background(), "prep", CreateTaskOptions{Name: "task", BaseRef: "feature-x"})
 	if err != nil {
 		t.Fatalf("Create repo heads priority: %v", err)
 	}
@@ -436,7 +436,7 @@ func TestCreateRepo_BaseRefNotExists_InvalidInput_ZeroSideEffect(t *testing.T) {
 	}
 	m := newRepoTestManager(t, store, wt)
 
-	_, err := m.Create(context.Background(), "prep", "task", "nonexistent-branch")
+	_, err := 	m.Create(context.Background(), "prep", CreateTaskOptions{Name: "task", BaseRef: "nonexistent-branch"})
 	if err == nil {
 		t.Fatal("Create repo with nonexistent base_ref: want error, got nil")
 	}
@@ -458,7 +458,7 @@ func TestCreateRepo_InvalidBaseRef_InvalidInput(t *testing.T) {
 	m := newRepoTestManager(t, store, wt)
 
 	// base_ref 含非法字符 ".." → ValidateBranchName 拒绝（resolveRepoBaseRef 先校验）。
-	_, err := m.Create(context.Background(), "prep", "task", "foo..bar")
+	_, err := 	m.Create(context.Background(), "prep", CreateTaskOptions{Name: "task", BaseRef: "foo..bar"})
 	if err == nil {
 		t.Fatal("Create repo with invalid base_ref: want error, got nil")
 	}
@@ -585,7 +585,7 @@ func TestCreate_UnknownKind_FailClosed(t *testing.T) {
 	store.seedProject(ProjectRow{ID: "p", Name: "p", Path: "/x", DefaultBranch: "main", Kind: "bogus"})
 	m := newDirTestManager(t, store, newMockProc(), newMockOC(true))
 
-	_, err := m.Create(context.Background(), "p", "task", "")
+	_, err := 	m.Create(context.Background(), "p", CreateTaskOptions{Name: "task"})
 	if err == nil {
 		t.Fatal("Create unknown kind: want error, got nil")
 	}

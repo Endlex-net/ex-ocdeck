@@ -50,7 +50,7 @@ func TestP146_Create_Repo_ViaLifecycle(t *testing.T) {
 	proc := newMockProc()
 	m := newP146TestManager(t, store, proc, wt, newMockOC(true))
 
-	row, err := m.Create(context.Background(), "p1", "My Task", "")
+	row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "My Task"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestP146_Create_Repo_GuardReject_ViaLifecycle(t *testing.T) {
 	wt.branches["ocdeck/my-task"] = true
 	m := newP146TestManager(t, store, newMockProc(), wt, newMockOC(true))
 
-	_, err := m.Create(context.Background(), "p1", "My Task", "")
+	_, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "My Task"})
 	if err == nil {
 		t.Fatal("expected conflict on branch exists")
 	}
@@ -104,7 +104,7 @@ func TestP146_Create_Dir_ViaLifecycle(t *testing.T) {
 	store.seedProject(ProjectRow{ID: "p1", Name: "proj", Path: dir, DefaultBranch: "", Kind: ProjectKindDir})
 	m := newP146TestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
 
-	row, err := m.Create(context.Background(), "p1", "My Task", "")
+	row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "My Task"})
 	if err != nil {
 		t.Fatalf("Create dir: %v", err)
 	}

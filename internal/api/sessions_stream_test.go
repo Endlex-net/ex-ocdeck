@@ -210,9 +210,9 @@ func (b *streamBackend) agentStatusCallCount() int {
 	return len(b.agentStatusCalls)
 }
 
-func (b *streamBackend) Create(ctx context.Context, projectID, taskName, baseRef string) (application.TaskRow, error) {
+func (b *streamBackend) Create(ctx context.Context, projectID string, opts application.CreateTaskOptions) (application.TaskRow, error) {
 	b.recordWrite("Create")
-	return b.fakeTaskBackend.Create(ctx, projectID, taskName, baseRef)
+	return b.fakeTaskBackend.Create(ctx, projectID, opts)
 }
 func (b *streamBackend) Activate(ctx context.Context, taskID string) error {
 	b.recordWrite("Activate")

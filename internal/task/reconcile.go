@@ -19,6 +19,21 @@ import (
 func (m *Manager) Reconcile(ctx context.Context) error {
 	policy := m.cfg.ShutdownPolicy
 
+	// add-local-path-task-mode P1-F1（D2/D11）：只读有效模式预检 MUST 先于一切
+	// converge/debt/进程操作——对全部任务行解析 kind+mode，任一非法组合（dir+worktree、
+	// 未知 kind、未知 mode、项目缺失）→ internal fail-closed 拒开 HTTP、零副作用
+	//（无 converge/debt 收敛、无 kill、无状态写入）。解析结果（taskID → 对齐模式）
+	// 复用传给恢复路径，避免 resolver 错误在恢复矩阵中被当作普通恢复失败触发 cleanup+suspended。
+	tasks, err := m.store.ListAllTasks(ctx)
+	if err != nil {
+		return fmt.Errorf("reconcile: list tasks: %w", err)
+	}
+	alignByTask, perr := m.preflightTaskModes(ctx, tasks)
+	if perr != nil {
+		// 非法 kind/mode 组合（持久化损坏）→ internal（D1/D2），fail-closed 拒开 HTTP。
+		return newOpErr(codeInternal, fmt.Errorf("reconcile: preflight task modes: %w", perr))
+	}
+
 	// tasks 3.8：ConvergeInterruptedInitRuns MUST 先于既有启动恢复步骤执行——
 	// 把 init_status∈{pending,running} 的任务收敛为 failed（interrupted by server restart）。
 	// 更新失败 MUST fail-closed 阻止 HTTP 开放。
@@ -49,10 +64,15 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		return fmt.Errorf("reconcile: retry orphan sessions: %w", rerr)
 	}
 
-	// 枚举全部 DB 任务。
-	tasks, err := m.store.ListAllTasks(ctx)
+	// P1-F4：converge/restore/replay/retryOrphanSessions 可能修改任务状态与 notice
+	//（如 complete recovery debt 重放经 CompleteRecoveryFailureAndClearDebts 把 activating
+	// 收敛为 suspended + last_error=cause）。业务快照 MUST 在这些步骤之后重新读取，供
+	// debt pre-pass / taskByID / persist|kill 矩阵使用——stale 快照会让 persist 分支按
+	// 已收敛的 activating 清理（CAS miss 噪音）、kill 分支覆盖 recovery last_error。
+	// 入口第一份快照仅供 P1-F1 零副作用模式预检，语义不变。
+	tasks, err = m.store.ListAllTasks(ctx)
 	if err != nil {
-		return fmt.Errorf("reconcile: list tasks: %w", err)
+		return fmt.Errorf("reconcile: refresh task snapshot: %w", err)
 	}
 
 	// cleanup-debt pre-pass（design.md §5：全局首步骤，先于枚举/处理会话）。
@@ -97,7 +117,7 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 
 	switch policy {
 	case config.ShutdownPersist:
-		if err := m.reconcilePersist(ctx, tasks, sessionsByTask); err != nil {
+		if err := m.reconcilePersist(ctx, tasks, sessionsByTask, alignByTask); err != nil {
 			errs = append(errs, err)
 		}
 		// 第三轮：persist 模式枚举/恢复可能产生新 orphan，开放 HTTP 前 MUST 再次 flush
@@ -112,6 +132,32 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// preflightTaskModes 启动期只读有效模式预检（add-local-path-task-mode P1-F1，D2 单点收口）：
+// 按任务行逐行解析 kind+mode（GetProject 按项目缓存，纯读零副作用），返回 taskID → 对齐模式
+// 供恢复路径复用。任一非法组合（dir+worktree、未知 kind、未知 mode）或项目缺失返回错误，
+// 调用方 MUST fail-closed 拒开 HTTP、不执行任何后续副作用。
+func (m *Manager) preflightTaskModes(ctx context.Context, tasks []TaskRow) (map[string]AlignMode, error) {
+	kindByProject := make(map[string]string)
+	alignByTask := make(map[string]AlignMode, len(tasks))
+	for _, t := range tasks {
+		kind, ok := kindByProject[t.ProjectID]
+		if !ok {
+			proj, err := m.store.GetProject(ctx, t.ProjectID)
+			if err != nil {
+				return nil, fmt.Errorf("task %s: get project %s: %w", t.ID, t.ProjectID, err)
+			}
+			kind = proj.Kind
+			kindByProject[t.ProjectID] = kind
+		}
+		mode, err := resolveAlignMode(t, kind)
+		if err != nil {
+			return nil, err
+		}
+		alignByTask[t.ID] = mode
+	}
+	return alignByTask, nil
 }
 
 // commitSuspendedReconcile 在 reconcile persist 分支把任务从 fromStatus CAS 到 suspended
@@ -135,7 +181,7 @@ func (m *Manager) commitSuspendedReconcile(ctx context.Context, taskID, fromStat
 // 区分，不续跑）。旧版 -serve/-tui 会话随 names 一并按异常会话清理（不热迁移）。
 // KillSession/notice/状态提交错误聚合返回（design.md §5/§8，不静默）。
 // B2：状态 CAS 的 error 与 committed=false 结果 MUST 检查并传播（不得 _, _ 吞没）。
-func (m *Manager) reconcilePersist(ctx context.Context, tasks []TaskRow, sessionsByTask map[string][]string) error {
+func (m *Manager) reconcilePersist(ctx context.Context, tasks []TaskRow, sessionsByTask map[string][]string, alignByTask map[string]AlignMode) error {
 	var errs []error
 	for _, t := range tasks {
 		names := sessionsByTask[t.ID]
@@ -207,7 +253,8 @@ func (m *Manager) reconcilePersist(ctx context.Context, tasks []TaskRow, session
 			if hasRuntime && m.runtimeHealthyRecoverable(ctx, cur) {
 				// 恢复活跃：读回密码与端口 → 重建运行时 → SSE 订阅 + 全量对齐。
 				// 使用重读后的 cur（notice 已消化），避免基于旧快照恢复。
-				if err := m.resumeActive(ctx, cur); err != nil {
+				// 对齐模式复用入口预检结果（P1-F1）。
+				if err := m.resumeActive(ctx, cur, alignByTask[cur.ID]); err != nil {
 					// 恢复中途失败 → kill runtime → suspended + last_error。
 					cleanupErr := m.cleanupActivationRuntime(ctx, t.ID)
 					le := err.Error()
@@ -303,18 +350,9 @@ func (m *Manager) reconcileKill(ctx context.Context, tasks []TaskRow, sessions [
 // resumeActive persist 恢复活跃运行时（design.md §5 恢复序列 + single-process D7：
 // 单进程 runtime 会话）。端口以会话内 OCDECK_SERVE_PORT 为准（读回失败 →
 // suspended+last_error，不得静默用 last_port，B9）。env snapshot 解析错误传播（B9）。
-func (m *Manager) resumeActive(ctx context.Context, t TaskRow) error {
-	// add-plain-dir-project D8：persist 恢复路径在任何状态修改/运行时副作用前校验项目 kind，
-	// 未知值零副作用报错；mode 显式传入 startSSE/alignSessions。
-	proj, perr := m.store.GetProject(ctx, t.ProjectID)
-	if perr != nil {
-		return fmt.Errorf("project gone: %w", perr)
-	}
-	mode, kerr := alignModeForKind(proj.Kind)
-	if kerr != nil {
-		// 未知持久化 kind（DB 损坏值）→ internal（D1）。
-		return newOpErr(codeInternal, kerr)
-	}
+// mode 为 Reconcile 入口预检解析的对齐模式（P1-F1：复用预检结果，不在恢复路径重复解析——
+// 非法 kind/mode 组合已在预检阶段 fail-closed 拒开 HTTP，不会走到本函数）。
+func (m *Manager) resumeActive(ctx context.Context, t TaskRow, mode AlignMode) error {
 	runtimeName := runtimeSessionName(t.ID)
 	pw, err := m.proc.ShowSessionEnv(runtimeName, "OPENCODE_SERVER_PASSWORD")
 	if err != nil || pw == "" {

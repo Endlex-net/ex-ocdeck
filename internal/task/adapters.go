@@ -33,7 +33,7 @@ func (a *StoreAdapter) GetProject(ctx context.Context, id string) (ProjectRow, e
 func (a *StoreAdapter) CreateTask(ctx context.Context, t TaskRow) error {
 	return a.db.CreateTask(ctx, store.TaskRow{
 		ID: t.ID, ProjectID: t.ProjectID, Name: t.Name, Branch: t.Branch,
-		Status: t.Status, WorktreePath: t.WorktreePath, BaseRef: t.BaseRef,
+		Status: t.Status, WorktreePath: t.WorktreePath, BaseRef: t.BaseRef, Mode: t.Mode,
 	})
 }
 
@@ -395,6 +395,7 @@ func taskRowToSnapshot(r TaskRow) application.TaskSnapshot {
 		InitError:       nullStringToPtr(r.InitError),
 		BaseRef:         r.BaseRef,
 		AnchorSessionID: nullStringToPtr(r.AnchorSessionID),
+		Mode:            r.Mode,
 	}
 }
 
@@ -492,7 +493,7 @@ func toTaskRow(t store.TaskRow) TaskRow {
 		WorktreePath: t.WorktreePath, LastPort: t.LastPort, LastError: t.LastError, Notice: t.Notice,
 		DeleteMode: t.DeleteMode, EnvSnapshot: t.EnvSnapshot, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
 		ArchivedAt: t.ArchivedAt, InitStatus: t.InitStatus, InitError: t.InitError, BaseRef: t.BaseRef,
-		AnchorSessionID: t.AnchorSessionID,
+		AnchorSessionID: t.AnchorSessionID, Mode: t.Mode,
 	}
 }
 
@@ -521,6 +522,7 @@ func taskSnapshotToTaskRow(s application.TaskSnapshot) TaskRow {
 		InitError:       ptrToNullString(s.InitError),
 		BaseRef:         s.BaseRef,
 		AnchorSessionID: ptrToNullString(s.AnchorSessionID),
+		Mode:            s.Mode,
 	}
 }
 

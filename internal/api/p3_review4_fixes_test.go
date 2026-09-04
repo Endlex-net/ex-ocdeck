@@ -27,7 +27,7 @@ type fakeTaskBackend struct {
 	attachPtyCalls []string
 }
 
-func (f *fakeTaskBackend) Create(ctx context.Context, projectID, taskName, baseRef string) (application.TaskRow, error) {
+func (f *fakeTaskBackend) Create(ctx context.Context, projectID string, opts application.CreateTaskOptions) (application.TaskRow, error) {
 	return application.TaskRow{}, nil
 }
 func (f *fakeTaskBackend) Activate(ctx context.Context, taskID string) error { return nil }

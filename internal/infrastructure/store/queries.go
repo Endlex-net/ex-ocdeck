@@ -56,6 +56,8 @@ type ProjectRow struct {
 // init_status ∈ none | pending | running | succeeded | failed；init_error 仅 failed 时非空。
 // BaseRef 对应 migration 0008 新增列（add-plain-dir-project D10）：repo 任务的基线分支全引用
 // （如 refs/heads/main），dir 项目任务为空串。
+// Mode 对应 migration 0013 新增列（add-local-path-task-mode D1）：任务级运行模式，
+// worktree | local-path（dir 项目任务恒为 local-path）。
 type TaskRow struct {
 	ID              string
 	ProjectID       string
@@ -75,6 +77,7 @@ type TaskRow struct {
 	InitError       sql.NullString
 	BaseRef         string
 	AnchorSessionID sql.NullString
+	Mode            string
 }
 
 // LifecycleConfigRow project_lifecycle_configs 表行映射（design.md §2，migration 0007）。
@@ -340,21 +343,28 @@ func (q *Queries) DeleteGlobalEnvVar(ctx context.Context, key string) error {
 }
 
 // CreateTask 插入任务行。base_ref 为 repo 任务的基线分支全引用，dir 项目任务传空串
-// （migration 0008，add-plain-dir-project D10）。
+// （migration 0008，add-plain-dir-project D10）。mode 为任务级运行模式（migration 0013，
+// add-local-path-task-mode D1）：创建方 MUST 显式传入（repo worktree/local-path、dir local-path），
+// dir 任务 MUST NOT 落到列 DEFAULT 'worktree'（否则立即成为非法组合）；调用方传空串时
+// 按列 DEFAULT 语义显式写 'worktree'（与存量 repo 行等价），杜绝持久化空 mode。
 func (q *Queries) CreateTask(ctx context.Context, t TaskRow) error {
+	mode := t.Mode
+	if mode == "" {
+		mode = "worktree"
+	}
 	_, err := q.db.ExecContext(ctx,
-		`INSERT INTO tasks (id, project_id, name, branch, status, worktree_path, base_ref, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.ProjectID, t.Name, t.Branch, t.Status, t.WorktreePath, t.BaseRef, nowUnix(), nowUnix())
+		`INSERT INTO tasks (id, project_id, name, branch, status, worktree_path, base_ref, mode, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.ProjectID, t.Name, t.Branch, t.Status, t.WorktreePath, t.BaseRef, mode, nowUnix(), nowUnix())
 	return err
 }
 
-// GetTask 按 ID 查询任务（含 env_snapshot、init_status/init_error、base_ref）。
+// GetTask 按 ID 查询任务（含 env_snapshot、init_status/init_error、base_ref、mode）。
 func (q *Queries) GetTask(ctx context.Context, id string) (TaskRow, error) {
 	row := q.db.QueryRowContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
 		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
-		        anchor_session_id
+		        anchor_session_id, mode
 		 FROM tasks WHERE id = ?`, id)
 	return scanTaskRow(row)
 }
@@ -364,7 +374,7 @@ func (q *Queries) ListTasksByProject(ctx context.Context, projectID string) ([]T
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
 		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
-		        anchor_session_id
+		        anchor_session_id, mode
 		 FROM tasks WHERE project_id = ? ORDER BY created_at ASC`, projectID)
 	if err != nil {
 		return nil, err
@@ -378,7 +388,7 @@ func (q *Queries) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
 		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
-		        anchor_session_id
+		        anchor_session_id, mode
 		 FROM tasks ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
@@ -1489,7 +1499,7 @@ func scanTaskRow(row rowScanner) (TaskRow, error) {
 	err := row.Scan(&t.ID, &t.ProjectID, &t.Name, &t.Branch, &t.Status, &t.WorktreePath,
 		&t.LastPort, &t.LastError, &t.Notice, &t.DeleteMode, &t.EnvSnapshot,
 		&t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.InitStatus, &t.InitError, &t.BaseRef,
-		&t.AnchorSessionID)
+		&t.AnchorSessionID, &t.Mode)
 	return t, err
 }
 

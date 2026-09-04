@@ -98,7 +98,7 @@ func TestFileEdit_Read_NoWorktree(t *testing.T) {
 	adapter := NewFileEditPortAdapter(m)
 	// seedSuspendedTask 设 WorktreePath=/data/worktrees/...，但该路径不存在；
 	// 改为直接造一个空 WorktreePath 的 task
-	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusSuspended, WorktreePath: ""}
+	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusSuspended, WorktreePath: "", Mode: TaskModeWorktree}
 
 	_, err := adapter.ReadRaw(context.Background(), "t1", "f.txt")
 	if !isOpErrCode(err, codeInvalidState) {
@@ -109,7 +109,7 @@ func TestFileEdit_Read_NoWorktree(t *testing.T) {
 func TestFileEdit_Read_DirProject(t *testing.T) {
 	store := newMockStore()
 	store.seedProject(ProjectRow{ID: "p1", Name: "p", Path: "/tmp", Kind: ProjectKindDir})
-	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/tmp"}
+	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/tmp", Mode: TaskModeLocalPath}
 	m := newTestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
 	adapter := NewFileEditPortAdapter(m)
 

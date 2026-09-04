@@ -20,22 +20,32 @@ type GitStatusDTO = application.GitStatusDTO
 // GitDiffDTO diff 响应（单文件两侧版本内容八字段契约，design.md §21 git/diff）。
 type GitDiffDTO = application.GitDiffDTO
 
-// assertGitRepoTask 解析任务所属项目 kind，校验该任务可作为 git 操作目标（add-plain-dir-project D5）。
-// 在执行任何 git 命令前调用：dir 项目 → codeInvalidInput（明确"project kind is dir (not a git repository)"），
-// 未知 kind → codeInvalidInput fail-closed。repo 项目通过，返回 ProjectRow 供后续 git 命令使用。
+// assertGitRepoTask 解析任务有效模式，校验该任务可作为 git 操作目标（add-plain-dir-project D5
+// + add-local-path-task-mode D8）。
+// 在执行任何 git 命令/文件读取/子仓库探测前调用：local-path 模式任务 → codeInvalidInput
+//（dir 项目为"纯目录项目非 git 仓库"；repo 项目 local-path 模式为"就地运行任务无 git worktree"，
+// 文案按模式区分）；非法 kind/mode 组合 → codeInternal fail-closed。worktree 模式任务通过，
+// 返回 ProjectRow 供后续 git 命令使用。
 func (m *Manager) assertGitRepoTask(ctx context.Context, row TaskRow) (ProjectRow, error) {
 	proj, err := m.store.GetProject(ctx, row.ProjectID)
 	if err != nil {
 		return ProjectRow{}, newOpErr(codeNotFound, fmt.Errorf("project not found: %w", err))
 	}
-	switch proj.Kind {
-	case ProjectKindRepo:
+	effMode, rerr := resolveTaskMode(row, proj.Kind)
+	if rerr != nil {
+		// 非法持久化 kind/mode 组合（DB 损坏值）→ internal（D1/D2）。
+		return ProjectRow{}, newOpErr(codeInternal, rerr)
+	}
+	switch effMode {
+	case TaskModeWorktree:
 		return proj, nil
-	case ProjectKindDir:
-		return ProjectRow{}, newOpErr(codeInvalidInput, errors.New("project kind is dir (not a git repository)"))
+	case TaskModeLocalPath:
+		if proj.Kind == ProjectKindDir {
+			return ProjectRow{}, newOpErr(codeInvalidInput, errors.New("project kind is dir (not a git repository)"))
+		}
+		return ProjectRow{}, newOpErr(codeInvalidInput, errors.New("task runs in local-path mode (in-place, no git worktree)"))
 	default:
-		// 未知持久化 kind（DB 损坏值）→ internal（D1：区别于用户请求非法 kind 的 invalid_input）。
-		return ProjectRow{}, newOpErr(codeInternal, fmt.Errorf("unknown project kind %q", proj.Kind))
+		return ProjectRow{}, newOpErr(codeInternal, fmt.Errorf("task %s: unknown effective mode %q", row.ID, effMode))
 	}
 }
 

@@ -1683,7 +1683,8 @@ func (s *getTaskFailAfterClaimStore) GetTask(ctx context.Context, id string) (Ta
 }
 func (s *getTaskFailAfterClaimStore) seedProject(p ProjectRow) { s.mockStore.seedProject(p) }
 
-// TestReconcile_Order_ConvergeBeforeRestore：Converge 在 ListAllTasks 之前。
+// TestReconcile_Order_ConvergeBeforeRestore：ListAllTasks（有效模式预检，P1-F1）最先，
+// Converge 仍在后续恢复步骤（restore cleanup debts 等）之前。
 func TestReconcile_Order_ConvergeBeforeRestore(t *testing.T) {
 	resetLifecycleCfgMock()
 	store := &orderTraceStore{mockStore: newMockStore()}
@@ -1697,13 +1698,21 @@ func TestReconcile_Order_ConvergeBeforeRestore(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	order := store.snapshot()
-	convergeIdx, listIdx := -1, -1
+	convergeIdx, listIdx, preflightIdx := -1, -1, -1
 	for i, name := range order {
-		if name == "converge" {
-			convergeIdx = i
-		}
-		if name == "listAll" {
-			listIdx = i
+		switch name {
+		case "converge":
+			if convergeIdx < 0 {
+				convergeIdx = i
+			}
+		case "listAll":
+			if listIdx < 0 {
+				listIdx = i // 首次 ListAllTasks = P1-F1 预检快照（F4 的二次刷新在其后）
+			}
+		case "getProject":
+			if preflightIdx < 0 {
+				preflightIdx = i // 首次 GetProject = 有效模式预检（P1-F1）
+			}
 		}
 	}
 	if convergeIdx < 0 {
@@ -1712,8 +1721,14 @@ func TestReconcile_Order_ConvergeBeforeRestore(t *testing.T) {
 	if listIdx < 0 {
 		t.Fatalf("ListAllTasks not called")
 	}
-	if convergeIdx >= listIdx {
-		t.Fatalf("ConvergeInterruptedInitRuns (idx %d) must be before ListAllTasks (idx %d)", convergeIdx, listIdx)
+	if preflightIdx < 0 {
+		t.Fatalf("preflight GetProject not called")
+	}
+	if listIdx >= preflightIdx {
+		t.Fatalf("ListAllTasks (idx %d) must precede mode preflight (idx %d)", listIdx, preflightIdx)
+	}
+	if preflightIdx >= convergeIdx {
+		t.Fatalf("mode preflight (idx %d) must precede ConvergeInterruptedInitRuns (idx %d)", preflightIdx, convergeIdx)
 	}
 }
 
@@ -1736,6 +1751,13 @@ func (s *orderTraceStore) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 	s.order = append(s.order, "listAll")
 	s.mu.Unlock()
 	return s.mockStore.ListAllTasks(ctx)
+}
+
+func (s *orderTraceStore) GetProject(ctx context.Context, id string) (ProjectRow, error) {
+	s.mu.Lock()
+	s.order = append(s.order, "getProject")
+	s.mu.Unlock()
+	return s.mockStore.GetProject(ctx, id)
 }
 
 func (s *orderTraceStore) snapshot() []string {

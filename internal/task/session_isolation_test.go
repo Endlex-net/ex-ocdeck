@@ -317,24 +317,17 @@ func TestUnknownKind_ActivateZeroSideEffect(t *testing.T) {
 	}
 }
 
-// TestUnknownKind_ResumeActiveZeroSideEffect 验证 resumeActive 在项目 kind 未知时零副作用。
+// TestUnknownKind_ResumeActiveZeroSideEffect 验证未知 kind 在恢复路径 fail-closed 零副作用。
+// P1-F1：kind/mode 解析上移至 Reconcile 入口 preflightTaskModes（经 resolveAlignMode 单点收口），
+// resumeActive 复用预检结果——非法组合不可能进入恢复矩阵（入口级零副作用由
+// TestReconcile_IllegalModeCombo_FailClosedZeroSideEffects 覆盖）。
 func TestUnknownKind_ResumeActiveZeroSideEffect(t *testing.T) {
 	store := newMockStore()
 	store.seedProject(ProjectRow{ID: "p1", Name: "p", Path: "/repo", Kind: "bogus"})
 	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusActive,
 		WorktreePath: "/data/worktrees/p1/t1", Name: "task"}
-	proc := newMockProc()
-	proc.envValues[serveSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
-	}
-	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
-	err := m.resumeActive(context.Background(), store.tasks["t1"])
-	if err == nil {
-		t.Fatal("resumeActive with unknown kind should fail")
-	}
-	// runtime 不应被注册（零副作用）。
-	if rt := m.getRuntime("t1"); rt != nil {
-		t.Errorf("runtime should not be registered on unknown kind, got %+v", rt)
+	if _, err := resolveAlignMode(store.tasks["t1"], "bogus"); err == nil {
+		t.Fatal("resolveAlignMode with unknown kind should fail (preflight gate)")
 	}
 }
 
@@ -402,6 +395,7 @@ func TestReopenAttach_ClaimConflictKeepsActiveWithLastError(t *testing.T) {
 		ID: "t1", ProjectID: "p1", Status: StatusActive,
 		WorktreePath: "/data/worktrees/p1/t1", Name: "task",
 		EnvSnapshot: sql.NullString{String: `{"vars":{}}`, Valid: true},
+		Mode:        TaskModeWorktree,
 	}
 	proc := newMockProc()
 	m := newTestManager(t, tStore, proc, newMockWorktree(), newMockOC(true))

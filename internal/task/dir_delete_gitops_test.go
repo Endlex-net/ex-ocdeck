@@ -54,7 +54,7 @@ func (w *panicWorktree) Remove(ctx context.Context, wtPath string, opts worktree
 func seedDirTaskWithDir(s *mockStore, taskID, projectID, projDir string) TaskRow {
 	s.seedProject(ProjectRow{ID: projectID, Name: "p", Path: projDir, DefaultBranch: "", Kind: ProjectKindDir})
 	t := TaskRow{ID: taskID, ProjectID: projectID, Name: "my task",
-		Status: StatusSuspended, WorktreePath: projDir, InitStatus: InitStatusNone}
+		Status: StatusSuspended, WorktreePath: projDir, InitStatus: InitStatusNone, Mode: TaskModeLocalPath}
 	s.tasks[taskID] = t
 	return t
 }

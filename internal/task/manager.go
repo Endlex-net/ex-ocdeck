@@ -159,6 +159,10 @@ type SessionRow = application.SessionRow
 
 type ActiveTaskOverviewRow = application.ActiveTaskOverviewRow
 
+// CreateTaskOptions 创建任务请求选项（add-local-path-task-mode D3），
+// 定义在 application（dto.go）锁定 api → application import 方向；此处保留别名。
+type CreateTaskOptions = application.CreateTaskOptions
+
 // LifecycleConfigRow 项目生命周期配置行（design.md §2.1，解耦 store 包结构）。
 // 缺行读取时三脚本字段为空串（无配置 = 空配置语义）。
 type LifecycleConfigRow struct {

@@ -175,15 +175,21 @@ func (m *Manager) layerEnvSnapshot(ctx context.Context, row TaskRow) (map[string
 	merged["OCDECK_TASK_NAME"] = row.Name
 	merged["OCDECK_TASK_PATH"] = row.WorktreePath
 	merged["OCDECK_PROJECT_PATH"] = proj.Path
-	// 生命周期分支变量（task-base-branch-context D4/D5）：repo 注入 BASE/HEAD 短名；
-	// dir 强制不注入两键（键不存在，即使脏数据有 base_ref/branch）；未知 kind fail-closed，
-	// 不得按 dir 静默缺键。layerEnvSnapshot MUST 自检 kind：init/pre_delete 直接调用本函数，
-	// 不经过 Activate 入口的 alignModeForKind 门禁。repo 异常行返回 error：调用方 MUST NOT
+	// 生命周期分支变量（task-base-branch-context D4/D5 + add-local-path-task-mode D9）：
+	// worktree 模式任务注入 BASE/HEAD 短名；local-path 模式任务（dir 任务与 repo 项目
+	// local-path 模式任务）强制不注入两键（键不存在，即使脏数据有 base_ref/branch，不注入空串）；
+	// dir+worktree/未知 kind/未知 mode fail-closed internal error，不得按 local-path 静默缺键。
+	// layerEnvSnapshot MUST 自检有效模式：init/pre_delete 直接调用本函数，不经过 Activate
+	// 入口的 resolveAlignMode 门禁。worktree 模式任务异常行返回 error：调用方 MUST NOT
 	// 持久化新快照、MUST NOT 创建进程。
-	switch proj.Kind {
-	case ProjectKindRepo:
+	effMode, rerr := resolveTaskMode(row, proj.Kind)
+	if rerr != nil {
+		return nil, fmt.Errorf("lifecycle env: %w", rerr)
+	}
+	switch effMode {
+	case TaskModeWorktree:
 		if row.Branch == "" {
-			return nil, fmt.Errorf("task %s: repo task missing branch for lifecycle env", row.ID)
+			return nil, fmt.Errorf("task %s: worktree task missing branch for lifecycle env", row.ID)
 		}
 		base, ok := baseBranchShortName(row.BaseRef)
 		if !ok {
@@ -191,10 +197,8 @@ func (m *Manager) layerEnvSnapshot(ctx context.Context, row TaskRow) (map[string
 		}
 		merged["OCDECK_TASK_BASE_BRANCH"] = base
 		merged["OCDECK_TASK_HEAD_BRANCH"] = row.Branch
-	case ProjectKindDir:
-		// dir：两键不存在（不注入空串）。
-	default:
-		return nil, fmt.Errorf("task %s: unknown project kind %q for lifecycle env", row.ID, proj.Kind)
+	case TaskModeLocalPath:
+		// local-path：两键不存在（不注入空串）。
 	}
 	return merged, nil
 }
@@ -290,15 +294,16 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 	if row.Status != StatusSuspended {
 		return newOpErr(codeInvalidState, fmt.Errorf("activate requires suspended, got %s", row.Status))
 	}
-	// add-plain-dir-project D8：早期 kind 门禁——在任何状态修改/副作用前解析并校验项目 kind，
-	// 未知值零副作用报错（MUST NOT 在 serve 启动后才发现未知 kind）。mode 显式传入后续 startSSE/alignSessions。
+	// add-plain-dir-project D8 + add-local-path-task-mode D2/D5：早期有效模式门禁——在任何
+	// 状态修改/副作用前解析并校验 kind+mode，非法组合零副作用报错（MUST NOT 在 serve 启动后
+	// 才发现非法组合）。对齐模式显式传入后续 startSSE/alignSessions。
 	proj, err := m.store.GetProject(ctx, row.ProjectID)
 	if err != nil {
 		return newOpErr(codeNotFound, fmt.Errorf("project gone: %w", err))
 	}
-	mode, err := alignModeForKind(proj.Kind)
+	mode, err := resolveAlignMode(row, proj.Kind)
 	if err != nil {
-		// 未知持久化 kind（DB 损坏值）→ internal（D1：区别于用户请求非法 kind 的 invalid_input）。
+		// 非法持久化 kind/mode 组合（DB 损坏值）→ internal（D1：区别于用户请求非法值的 invalid_input）。
 		return newOpErr(codeInternal, err)
 	}
 	// 前置检查：无未清理的旧代残留会话（tmux ls 中仍存在该任务会话则拒绝）。

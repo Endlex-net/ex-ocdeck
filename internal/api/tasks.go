@@ -13,7 +13,7 @@ import (
 // TaskBackend 是 api 层调用的 TaskManager 能力（design.md §18 task 行 + §21 路由）。
 // api handler 只做 DTO/HTTP 语义，不做编排。返回 application.TaskRow + error（api 做 DTO 转换）。
 type TaskBackend interface {
-	Create(ctx context.Context, projectID, taskName, baseRef string) (application.TaskRow, error)
+	Create(ctx context.Context, projectID string, opts application.CreateTaskOptions) (application.TaskRow, error)
 	Activate(ctx context.Context, taskID string) error
 	Suspend(ctx context.Context, taskID string) error
 	Archive(ctx context.Context, taskID string) error
@@ -226,7 +226,10 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeApiError(w, ae)
 		return
 	}
-	t, err := s.tasks.Create(r.Context(), projectID, req.Name, strings.TrimSpace(req.BaseRef))
+	t, err := s.tasks.Create(r.Context(), projectID, application.CreateTaskOptions{
+		Name:    req.Name,
+		BaseRef: strings.TrimSpace(req.BaseRef),
+	})
 	if err != nil {
 		writeApiError(w, mapTaskErr(err))
 		return
