@@ -5,3 +5,4 @@ web/dist/
 nohup.out
 .opencode/
 /dist/
+.idea/

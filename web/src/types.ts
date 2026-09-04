@@ -254,11 +254,19 @@ export interface NotificationBarkChannel {
   token_masked?: string;
 }
 
+/** 通知配置 wecom 渠道（GET 为 url_masked 必填，PUT 提交 url）。
+ *  完整 webhook URL 整体按密钥保护，url_masked 仅为 `***` 或空串，MUST NOT 回显原文。 */
+export interface NotificationWecomChannel {
+  enabled: boolean;
+  url_masked: string;
+}
+
 /** 通知配置 channels 结构。 */
 export interface NotificationChannels {
   web: { enabled: boolean };
   bark: NotificationBarkChannel;
   macos: { enabled: boolean };
+  wecom: NotificationWecomChannel;
 }
 
 /** GET /api/v1/notification/config 响应（token_masked 形态）。
@@ -273,7 +281,8 @@ export interface NotificationConfig {
   load_error?: string;
 }
 
-/** PUT /api/v1/notification/config 请求体：bark 令牌字段名为 token（非 token_masked）。 */
+/** PUT /api/v1/notification/config 请求体：bark 令牌字段名为 token（非 token_masked），
+ *  wecom webhook 字段名为 url（非 url_masked）。 */
 export interface NotificationConfigPut {
   enabled: boolean;
   categories: NotificationCategories;
@@ -282,6 +291,7 @@ export interface NotificationConfigPut {
     web: { enabled: boolean };
     bark: { enabled: boolean; endpoint: string; token: string };
     macos: { enabled: boolean };
+    wecom: { enabled: boolean; url: string };
   };
   llm_summary: boolean;
   base_url: string;
@@ -303,6 +313,149 @@ export interface NotificationIntent {
   title: string;
   body: string;
   url: string;
+}
+
+// ---------- diff review 批注/提交/文件编辑（diff-review-workbench design.md D8，
+// 与 internal/api/annotations.go、git.go 的 DTO 逐字对齐，字段一律 camelCase） ----------
+
+/** 批注锚定侧（annotationDTO.side）。 */
+export type DiffSide = 'old' | 'new';
+
+/** 换行风格（diffreview.LineEnding）。 */
+export type LineEnding = 'lf' | 'crlf';
+
+/** 文件编辑不可编辑原因七值枚举（diffreview.ReadReasonCode，design.md D5）。 */
+export type FileEditReasonCode =
+  | 'binary'
+  | 'non_utf8'
+  | 'mixed_line_endings'
+  | 'too_large'
+  | 'not_regular'
+  | 'missing'
+  | 'read_only';
+
+/** 批注（annotationDTO）。stale 由服务端 D4 惰性计算；revision 随每次实变严格 +1。 */
+export interface Annotation {
+  id: string;
+  path: string;
+  side: DiffSide;
+  ref: string;
+  untracked: boolean;
+  startLine: number;
+  endLine: number;
+  snapshotStartLine: number;
+  snapshotLineCount: number;
+  snapshot: string;
+  comment: string;
+  revision: number;
+  stale: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 提交快照条目（submissionItemDTO）：不含 snapshotLineCount（由 snapshot 行数推导，
+ *  不属于提交快照契约）。 */
+export interface SubmissionItem {
+  annotationId: string;
+  path: string;
+  side: DiffSide;
+  ref: string;
+  untracked: boolean;
+  startLine: number;
+  endLine: number;
+  snapshotStartLine: number;
+  snapshot: string;
+  comment: string;
+}
+
+/** 提交状态（submissionDTO.status）。 */
+export type SubmissionStatus = 'queued' | 'sending' | 'sent' | 'failed' | 'delivery_unknown';
+
+/** 提交记录（submissionDTO）。sentAt 仅 status=sent 时非 null；items 始终存在（可为空数组）。 */
+export interface Submission {
+  id: string;
+  status: SubmissionStatus;
+  note: string;
+  payload: string;
+  truncated: boolean;
+  error: string;
+  createdAt: number;
+  sentAt: number | null;
+  items: SubmissionItem[];
+}
+
+/** 提交能力（submitCapabilityDTO）：state 不暴露 absent，前端按 unknown 降级处理。 */
+export interface SubmitCapability {
+  state: 'supported' | 'unsupported' | 'unknown';
+  reason: string;
+}
+
+/** GET /tasks/:id/annotations 响应。 */
+export interface AnnotationsListResponse {
+  annotations: Annotation[];
+  submitCapability: SubmitCapability;
+}
+
+/** POST /tasks/:id/annotations 请求体（createAnnotationReq）。 */
+export interface AnnotationCreateInput {
+  path: string;
+  side: DiffSide;
+  ref: string;
+  untracked: boolean;
+  startLine: number;
+  endLine: number;
+  snapshotStartLine: number;
+  snapshotLineCount: number;
+  snapshot: string;
+  comment: string;
+}
+
+/** 提交批次条目（submissionItemReq）：id + revision（1..MaxInt64 JSON 整数）。 */
+export interface SubmissionAnnotationRef {
+  id: string;
+  revision: number;
+}
+
+/** GET /tasks/:id/annotation-submissions 分区响应：queue=queued/sending（seq ASC）、
+ *  history=sent（sent_at DESC, seq DESC）、failures=failed/delivery_unknown（created_at DESC, seq DESC）。 */
+export interface SubmissionsListResponse {
+  queue: Submission[];
+  history: Submission[];
+  failures: Submission[];
+}
+
+/** GET /tasks/:id/git/file 判别联合 editable=true 分支（fileEditEditableDTO）。 */
+export interface FileEditReadEditable {
+  editable: true;
+  content: string;
+  baseHash: string;
+  lineEnding: LineEnding;
+  hasBom: boolean;
+  mode: string;
+}
+
+/** GET /tasks/:id/git/file 判别联合 editable=false 分支（fileEditNotEditableDTO）。 */
+export interface FileEditReadNotEditable {
+  editable: false;
+  reasonCode: FileEditReasonCode;
+  reason: string;
+}
+
+/** 文件编辑读取判别联合（design.md D5/D8）：两组分支字段互斥。 */
+export type FileEditRead = FileEditReadEditable | FileEditReadNotEditable;
+
+/** POST /tasks/:id/git/file 请求体（fileEditWriteReq）。 */
+export interface FileEditWriteInput {
+  path: string;
+  content: string;
+  baseHash: string;
+  lineEnding: LineEnding;
+  baseMode: string;
+}
+
+/** POST /tasks/:id/git/file 响应（fileEditWriteResp）：写回成功后的新基线 hash。 */
+export interface FileEditWriteResult {
+  baseHash: string;
 }
 
 /** 过渡态：操作进行中，UI 禁用操作并显示 spinner。 */

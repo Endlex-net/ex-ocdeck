@@ -90,7 +90,20 @@ type OCClient interface {
 	ListPermissions(ctx context.Context, dir string) ([]opencode.PermissionRequest, error)
 	// ListQuestions GET /question → pending 问题请求快照（design.md D6）。
 	ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error)
+	// PromptAsync 投递一条 text prompt 到目标 session 的异步队列（design.md D1）。
+	// 返回 transport DTO（不返回 error）；签名与 *opencode.Client 逐字一致。
+	// adapter 获取失败（taskOcClient ok=false）由 PromptPort 返回 pre_send_failure（D1），
+	// 不属于本接口的职责。
+	PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []opencode.PromptFilePart) opencode.PromptResult
+	// ProbePromptAsyncCapability 探测目标 serve 是否支持 prompt_async（design.md D1）。
+	// GET /doc 结构化解析，返回 supported/unsupported/unknown 三值。
+	// 签名与 *opencode.Client 逐字一致；adapter 在 RuntimePort.ProbeCapability 复用。
+	ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState
 }
+
+// 编译期断言：*opencode.Client 实现 OCClient（签名 MUST 与 *Client 逐字一致，
+// design.md D1）。factory 直接返回 *opencode.Client（manager.go:448）。
+var _ OCClient = (*opencode.Client)(nil)
 
 // OCClientFactory 构造指向某 serve（port+password）的 OCClient。
 type OCClientFactory func(port int, password string, opts opencode.Options) OCClient

@@ -154,24 +154,24 @@ describe('GitPanel diff 区域（CodeMirror merge 集成）', () => {
     unmount();
   });
 
-  it('wrapOverride 由 GitPanel 持有：切换文件后保留换行选择（与 modeOverride 同生命周期）', async () => {
+  it('wrapOverride 由 GitPanel 持有：默认换行开；切换文件后保留换行选择（与 modeOverride 同生命周期）', async () => {
     const { container, unmount } = mount(<GitPanel taskID="t1" active />);
     await until(() => container.querySelectorAll('.git-file-path').length === 2);
 
-    // 打开 a.txt（默认不折行）→ 开启换行
+    // 打开 a.txt（默认换行开、长行折行展示）→ 手动切不换行
     clickFile(container, 'src/a.txt');
     await until(() => container.querySelectorAll('.cm-editor').length === 2);
-    expect(container.querySelectorAll('.cm-content.cm-lineWrapping')).toHaveLength(0);
+    expect(container.querySelectorAll('.cm-content.cm-lineWrapping')).toHaveLength(2);
     const wrapBtn = [...container.querySelectorAll<HTMLButtonElement>('.diff-toolbar button')].find(
       (b) => b.textContent?.includes('换行'),
     );
     act(() => wrapBtn!.click());
-    await until(() => container.querySelectorAll('.cm-content.cm-lineWrapping').length === 2);
+    await until(() => container.querySelectorAll('.cm-content.cm-lineWrapping').length === 0);
 
-    // 切换到 b.txt：换行选择保留（仍折行），diff 内容更新
+    // 切换到 b.txt：换行选择保留（仍不折行），diff 内容更新
     clickFile(container, 'src/b.txt');
     await until(() => container.textContent?.includes('b-old') ?? false);
-    expect(container.querySelectorAll('.cm-content.cm-lineWrapping').length === 2);
+    expect(container.querySelectorAll('.cm-content.cm-lineWrapping').length === 0);
     unmount();
   });
 

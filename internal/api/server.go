@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"ocdeck/internal/application/diffreview"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/ai"
 	"ocdeck/internal/infrastructure/notify"
@@ -28,6 +29,7 @@ type Server struct {
 	store           StoreRO
 	projs           ProjectStore
 	tasks           TaskBackend
+	diffreview      *diffreview.Service
 	envs            EnvStore
 	lifecycleCfgs   LifecycleConfigStore
 	ocCfgs          OCConfigService
@@ -138,6 +140,12 @@ func (s *Server) SetOCConfigService(svc OCConfigService) {
 	s.ocCfgs = svc
 }
 
+// SetDiffReviewService 注入 diffreview.Service（diff-review-workbench design.md D8
+// 批注/提交/git/file 路由）。延迟注入需调用 RebuildRoutes。
+func (s *Server) SetDiffReviewService(svc *diffreview.Service) {
+	s.diffreview = svc
+}
+
 // RebuildRoutes 重建路由（供延迟注入 ProjectStore/TaskBackend 后调用）。
 // 重置 mux 并重新注册全部路由。
 func (s *Server) RebuildRoutes() {
@@ -184,6 +192,7 @@ func (s *Server) registerRoutes() {
 	s.registerProjectRoutes(apiMux)
 	s.registerTaskRoutes(apiMux)            // task 路由接入主 api 子 mux
 	s.registerGitRoutes(apiMux)             // git 状态/diff/commit/push（design.md §21）
+	s.registerAnnotationRoutes(apiMux)      // 批注/提交（diff-review-workbench design.md D8）
 	s.registerEnvRoutes(apiMux)             // project/task env CRUD（design.md §21）
 	s.registerLifecycleConfigRoutes(apiMux) // project lifecycle config（design.md §8）
 	s.registerOCConfigRoutes(apiMux)        // 全局 oc 配置管理（design.md §13/§21）

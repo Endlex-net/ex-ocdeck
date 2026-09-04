@@ -2,7 +2,13 @@ import type { PaletteConfig } from './palette-focus';
 import type {
   ActiveSessionItem,
   AIConfig,
+  Annotation,
+  AnnotationCreateInput,
+  AnnotationsListResponse,
   EnvResponse,
+  FileEditRead,
+  FileEditWriteInput,
+  FileEditWriteResult,
   GitDiffResult,
   GitStatus,
   GlobalEnvMode,
@@ -18,6 +24,9 @@ import type {
   ProjectDetail,
   ProjectKind,
   ServerStatus,
+  Submission,
+  SubmissionAnnotationRef,
+  SubmissionsListResponse,
   Task,
   TerminalInfo,
 } from './types';
@@ -197,6 +206,39 @@ export const api = {
   gitCommit: (taskID: string, message: string, paths: string[]) =>
     request<void>('POST', `/tasks/${taskID}/git/commit`, { message, paths }),
   gitPush: (taskID: string) => request<void>('POST', `/tasks/${taskID}/git/push`),
+
+  /** 批注列表 + 提交能力（diff-review-workbench D8）；submitCapability.state 非 supported 禁用提交。 */
+  listAnnotations: (taskID: string) =>
+    request<AnnotationsListResponse>('GET', `/tasks/${taskID}/annotations`),
+  /** 创建批注：1-based 闭区间；快照须构造自原始 GitDiffResult 侧内容（含行尾字符）。 */
+  createAnnotation: (taskID: string, body: AnnotationCreateInput) =>
+    request<Annotation>('POST', `/tasks/${taskID}/annotations`, body),
+  /** 编辑评论：空白拒绝；与原值相同返回原 DTO 且 revision 不变。 */
+  updateAnnotationComment: (taskID: string, annotationID: string, comment: string) =>
+    request<Annotation>('PATCH', `/tasks/${taskID}/annotations/${annotationID}`, { comment }),
+  deleteAnnotation: (taskID: string, annotationID: string) =>
+    request<void>('DELETE', `/tasks/${taskID}/annotations/${annotationID}`),
+
+  /** 提交批注：条目携带 id+revision（与请求时一致，复核失败 409）。 */
+  createSubmission: (taskID: string, annotations: SubmissionAnnotationRef[], note: string) =>
+    request<Submission>('POST', `/tasks/${taskID}/annotation-submissions`, { annotations, note }),
+  /** 分区列表：queue=queued/sending、history=sent、failures=failed/delivery_unknown。 */
+  listSubmissions: (taskID: string) =>
+    request<SubmissionsListResponse>('GET', `/tasks/${taskID}/annotation-submissions`),
+  /** 撤回：仅 queued（非 queued invalid_state）。 */
+  cancelSubmission: (taskID: string, submissionID: string) =>
+    request<void>('POST', `/tasks/${taskID}/annotation-submissions/${submissionID}/cancel`),
+  /** 删除历史：仅终态 sent/failed/delivery_unknown（非终态 invalid_state）。 */
+  deleteSubmission: (taskID: string, submissionID: string) =>
+    request<void>('DELETE', `/tasks/${taskID}/annotation-submissions/${submissionID}`),
+
+  /** 文件编辑读取判别联合：editable=true 时 content/baseHash/lineEnding/hasBom/mode；
+   *  editable=false 时 reasonCode 七值枚举 + reason。 */
+  gitFileRead: (taskID: string, path: string) =>
+    request<FileEditRead>('GET', `/tasks/${taskID}/git/file`, undefined, { path }),
+  /** 文件编辑写回：hash/换行风格/mode 不一致 409 零写盘；成功返回新 baseHash。 */
+  gitFileWrite: (taskID: string, body: FileEditWriteInput) =>
+    request<FileEditWriteResult>('POST', `/tasks/${taskID}/git/file`, body),
 
   /** base 为 `/projects/:id/env` 或 `/tasks/:id/env`，二者同构。 */
   getEnv: (base: string) => request<EnvResponse>('GET', base),

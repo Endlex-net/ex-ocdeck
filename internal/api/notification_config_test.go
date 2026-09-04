@@ -56,6 +56,8 @@ func mustParseNotificationConfigDTO(t *testing.T, body interface{ Read(p []byte)
 }
 
 // validNotificationConfigJSON 一份完整合法的 PUT 请求体（总开关开 + bark 配置）。
+// 含 wecom 对象：PUT 请求体缺少 channels.wecom 时按 spec 兼容规则默认关闭填充，
+// 但 intending-to-keep-wecom-enabled 的 PUT 应显式带 wecom。
 func validNotificationConfigJSON(enabled bool) string {
 	return fmt.Sprintf(`{
   "enabled": %t,
@@ -64,7 +66,8 @@ func validNotificationConfigJSON(enabled bool) string {
   "channels": {
     "web":   {"enabled": false},
     "bark":  {"enabled": true, "endpoint": "https://api.day.app", "token": "bark-token-1234567890"},
-    "macos": {"enabled": false}
+    "macos": {"enabled": false},
+    "wecom": {"enabled": false, "url": ""}
   },
   "llm_summary": false,
   "base_url": ""
@@ -879,4 +882,232 @@ func readAllString(t *testing.T, r interface{ Read(p []byte) (int, error) }) str
 		t.Fatalf("read body: %v", err)
 	}
 	return string(data)
+}
+
+// --- wecom ---
+
+// validNotificationConfigJSONWithWecom 一份含 wecom 启用并配置 webhook URL 的 PUT 请求体。
+func validNotificationConfigJSONWithWecom(enabled bool, wecomURL string) string {
+	return fmt.Sprintf(`{
+  "enabled": %t,
+  "categories": {"question": true, "permission": true, "idle": true, "retry": true, "error": true},
+  "idle_timeout_seconds": 60,
+  "channels": {
+    "web":   {"enabled": false},
+    "bark":  {"enabled": false, "endpoint": "https://api.day.app", "token": ""},
+    "macos": {"enabled": false},
+    "wecom": {"enabled": true, "url": %s}
+  },
+  "llm_summary": false,
+  "base_url": ""
+}`, enabled, jsonQuote(wecomURL))
+}
+
+func jsonQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// mustConfigWithWecomURL 构造已启用且配置 wecom URL 的配置（用于 seed）。
+func mustConfigWithWecomURL(url string) notification.Config {
+	cfg := notification.DefaultConfig()
+	cfg.Enabled = true
+	cfg.Channels.Wecom.Enabled = true
+	cfg.Channels.Wecom.URL = url
+	return cfg
+}
+
+// TestNotificationConfig_GET_MaskedWecomURL 已存储 wecom URL 时 GET 返回
+// url_masked=="***" 且响应无 URL 原文。
+func TestNotificationConfig_GET_MaskedWecomURL(t *testing.T) {
+	dir := t.TempDir()
+	const secretURL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret-wecom-abc"
+	store := notify.LoadStore(dir)
+	if err := store.Put(mustConfigWithWecomURL(secretURL)); err != nil {
+		t.Fatalf("seed put: %v", err)
+	}
+	s := newNotificationConfigServer(t, store, nil)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	resp, err := http.DefaultClient.Do(authedReq("GET", ts.URL+"/api/v1/notification/config", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body := readAllString(t, resp.Body)
+	if strings.Contains(body, secretURL) {
+		t.Fatalf("response MUST NOT contain full wecom URL: %s", body)
+	}
+	dto := mustParseNotificationConfigDTO(t, strings.NewReader(body))
+	if dto.Channels.Wecom.URLMasked != "***" {
+		t.Errorf("url_masked = %q, want ***", dto.Channels.Wecom.URLMasked)
+	}
+	if !dto.Channels.Wecom.Enabled {
+		t.Errorf("wecom enabled = false, want true")
+	}
+}
+
+// TestNotificationConfig_PUT_WecomURLPreserved 已存 URL 后分别提交空、***、
+// prefix***suffix 均 200 且保留原值。
+func TestNotificationConfig_PUT_WecomURLPreserved(t *testing.T) {
+	dir := t.TempDir()
+	const origURL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=orig-wecom-key"
+	store := notify.LoadStore(dir)
+	if err := store.Put(mustConfigWithWecomURL(origURL)); err != nil {
+		t.Fatalf("seed put: %v", err)
+	}
+	s := newNotificationConfigServer(t, store, nil)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	for _, masked := range []string{"", "***", "prefix***suffix"} {
+		t.Run("url="+masked, func(t *testing.T) {
+			body := validNotificationConfigJSONWithWecom(true, masked)
+			resp, err := http.DefaultClient.Do(authedReq("PUT", ts.URL+"/api/v1/notification/config", body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200 for url=%q", resp.StatusCode, masked)
+			}
+			dto := mustParseNotificationConfigDTO(t, resp.Body)
+			if dto.Channels.Wecom.URLMasked != "***" {
+				t.Errorf("url_masked = %q, want *** (original preserved)", dto.Channels.Wecom.URLMasked)
+			}
+		})
+	}
+}
+
+// TestNotificationConfig_PUT_MaskedWecomURLNoStoredNotRejected 从未保存 URL 时
+// 提交 *** → 200 且 url_masked 空。
+func TestNotificationConfig_PUT_MaskedWecomURLNoStoredNotRejected(t *testing.T) {
+	dir := t.TempDir()
+	store := notify.LoadStore(dir)
+	s := newNotificationConfigServer(t, store, nil)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	body := validNotificationConfigJSONWithWecom(true, "***")
+	resp, err := http.DefaultClient.Do(authedReq("PUT", ts.URL+"/api/v1/notification/config", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	dto := mustParseNotificationConfigDTO(t, resp.Body)
+	if dto.Channels.Wecom.URLMasked != "" {
+		t.Errorf("url_masked = %q, want empty (no stored url)", dto.Channels.Wecom.URLMasked)
+	}
+}
+
+// TestNotificationConfig_PUT_WecomInvalidURL_422 非法 wecom URL 经 Put
+// ConfigValidationError → 422。
+func TestNotificationConfig_PUT_WecomInvalidURL_422(t *testing.T) {
+	dir := t.TempDir()
+	store := notify.LoadStore(dir)
+	s := newNotificationConfigServer(t, store, nil)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	body := validNotificationConfigJSONWithWecom(true, "http://not-https.example.com")
+	resp, err := http.DefaultClient.Do(authedReq("PUT", ts.URL+"/api/v1/notification/config", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", resp.StatusCode)
+	}
+	eb := mustParseErrorBody(t, resp.Body)
+	if eb.Error.Code != CodeInvalidInput {
+		t.Errorf("code = %v, want invalid_input", eb.Error.Code)
+	}
+	// 错误信息不含 URL 原文。
+	if strings.Contains(eb.Error.Message, "not-https.example.com") {
+		t.Errorf("error message leaks URL: %q", eb.Error.Message)
+	}
+	// 未落盘。
+	if _, err := os.Stat(filepath.Join(dir, "notification.json")); err == nil {
+		t.Error("notification.json written despite 422")
+	}
+}
+
+// TestNotificationConfig_PUT_BodyOver4KiB_400NoWrite 请求体 >4096 字节返回 400 且不写盘。
+func TestNotificationConfig_PUT_BodyOver4KiB_400NoWrite(t *testing.T) {
+	dir := t.TempDir()
+	store := notify.LoadStore(dir)
+	s := newNotificationConfigServer(t, store, nil)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	// 构造 >4096 字节请求体：在 base_url 填充长字符串。
+	padding := strings.Repeat("x", 5000)
+	body := strings.Replace(validNotificationConfigJSON(false), `"base_url": ""`, fmt.Sprintf(`"base_url": "https://example.com/%s"`, padding), 1)
+	if len(body) <= 4096 {
+		t.Fatalf("test body must be >4096, got %d", len(body))
+	}
+	resp, err := http.DefaultClient.Do(authedReq("PUT", ts.URL+"/api/v1/notification/config", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	eb := mustParseErrorBody(t, resp.Body)
+	if eb.Error.Code != CodeInvalidInput {
+		t.Errorf("code = %v, want invalid_input", eb.Error.Code)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "notification.json")); err == nil {
+		t.Error("notification.json written despite 400 oversize")
+	}
+}
+
+// TestNotificationTest_ResultsIncludeWecom 测试通知 results 含 name=wecom。
+func TestNotificationTest_ResultsIncludeWecom(t *testing.T) {
+	dir := t.TempDir()
+	store := notify.LoadStore(dir)
+	cfg := notification.DefaultConfig()
+	cfg.Enabled = true
+	cfg.BaseURL = "http://127.0.0.1:18080"
+	cfg.Channels.Wecom.Enabled = true
+	cfg.Channels.Wecom.URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test"
+	if err := store.Put(cfg); err != nil {
+		t.Fatalf("seed put: %v", err)
+	}
+	wecom := &fakeTestChannel{name: "wecom"}
+	s := newNotificationConfigServer(t, store, newNotifierTester([]notification.Channel{wecom}))
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/notification/test", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var body struct {
+		Results []ChannelTestResult `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	found := false
+	for _, r := range body.Results {
+		if r.Name == "wecom" {
+			found = true
+			if r.Status != notification.ChannelStatusSuccess {
+				t.Errorf("wecom status = %q, want success", r.Status)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("results must include name=wecom, got %+v", body.Results)
+	}
 }
