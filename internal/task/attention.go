@@ -905,7 +905,7 @@ func (m *Manager) ListProjectTaskSummaries(ctx context.Context) ([]ProjectTaskSu
 	for _, t := range rows {
 		summary := ProjectTaskSummary{
 			TaskID: t.ID, Name: t.Name, ProjectID: t.ProjectID, Status: t.Status,
-			InitStatus: t.InitStatus, Branch: t.Branch, WorktreePath: t.WorktreePath,
+			InitStatus: t.InitStatus, Branch: t.Branch, Mode: t.Mode, WorktreePath: t.WorktreePath,
 			UpdatedAt: t.UpdatedAt,
 		}
 		if t.LastError.Valid {

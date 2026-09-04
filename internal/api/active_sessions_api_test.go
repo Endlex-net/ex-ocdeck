@@ -74,10 +74,11 @@ func (b *activeSessionsBackend) agentStatusCallCount() int {
 }
 
 // activeRow 构造 application.ActiveTaskOverviewRow 测试行辅助。
+// Kind/Mode 取合法缺省组合（repo + worktree）；非默认组合的用例就地改写字段。
 func activeRow(id, projectID, projectName, name, branch, wt string, lastActive int64) application.ActiveTaskOverviewRow {
 	return application.ActiveTaskOverviewRow{
 		ID: id, ProjectID: projectID, ProjectName: projectName, Name: name,
-		Branch: branch, WorktreePath: wt, LastActiveAt: lastActive,
+		Branch: branch, WorktreePath: wt, Mode: "worktree", Kind: "repo", LastActiveAt: lastActive,
 	}
 }
 
@@ -130,8 +131,8 @@ func TestListActiveSessions_HappyPath(t *testing.T) {
 	}
 	// 字段断言 + sort（last_active_at DESC）。
 	want := []activeSessionDTO{
-		{TaskID: "t1", ProjectID: "p1", ProjectName: "projA", Name: "taskA", Branch: "bA", WorktreePath: "/wtA", LastActiveAt: 300, AgentStatus: "busy", Attention: attentionDTO{Permissions: []permissionDTO{}, Questions: []questionDTO{}}},
-		{TaskID: "t2", ProjectID: "p2", ProjectName: "projB", Name: "taskB", Branch: "bB", WorktreePath: "/wtB", LastActiveAt: 200, AgentStatus: "idle", Attention: attentionDTO{Permissions: []permissionDTO{}, Questions: []questionDTO{}}},
+		{TaskID: "t1", ProjectID: "p1", ProjectName: "projA", Name: "taskA", Branch: "bA", WorktreePath: "/wtA", Mode: "worktree", LastActiveAt: 300, AgentStatus: "busy", Attention: attentionDTO{Permissions: []permissionDTO{}, Questions: []questionDTO{}}},
+		{TaskID: "t2", ProjectID: "p2", ProjectName: "projB", Name: "taskB", Branch: "bB", WorktreePath: "/wtB", Mode: "worktree", LastActiveAt: 200, AgentStatus: "idle", Attention: attentionDTO{Permissions: []permissionDTO{}, Questions: []questionDTO{}}},
 	}
 	for i, w := range want {
 		if !reflect.DeepEqual(got[i], w) {

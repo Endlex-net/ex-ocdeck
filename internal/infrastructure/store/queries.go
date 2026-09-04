@@ -400,6 +400,8 @@ func (q *Queries) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 // ActiveTaskOverviewRow 跨项目 active 任务概览投影行（cross-project-active-sessions D2）。
 // 仅供 GET /api/v1/tasks/active 读模型：不含 status/init 等详情字段，不携带 agentStatus。
 // last_active_at 为 MAX(task_sessions.last_seen_at)，无 session 时回退 t.updated_at。
+// Mode/Kind 为任务运行模式与项目类型（add-local-path-task-mode D7）：API 组装按
+// kind+mode 组合 fail-closed 校验。
 type ActiveTaskOverviewRow struct {
 	ID           string
 	ProjectID    string
@@ -407,6 +409,8 @@ type ActiveTaskOverviewRow struct {
 	Name         string
 	Branch       string
 	WorktreePath string
+	Mode         string
+	Kind         string
 	LastActiveAt int64
 }
 
@@ -421,6 +425,7 @@ type ActiveTaskOverviewRow struct {
 func (q *Queries) ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOverviewRow, error) {
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT t.id, t.project_id, p.name AS project_name, t.name, t.branch, t.worktree_path,
+		        t.mode, p.kind,
 		        COALESCE(
 		          MAX(CASE
 		            WHEN s.last_seen_at >= 100000000000
@@ -442,7 +447,7 @@ func (q *Queries) ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOverv
 	var out []ActiveTaskOverviewRow
 	for rows.Next() {
 		var r ActiveTaskOverviewRow
-		if err := rows.Scan(&r.ID, &r.ProjectID, &r.ProjectName, &r.Name, &r.Branch, &r.WorktreePath, &r.LastActiveAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.ProjectName, &r.Name, &r.Branch, &r.WorktreePath, &r.Mode, &r.Kind, &r.LastActiveAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

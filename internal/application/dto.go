@@ -95,6 +95,8 @@ type SessionRow struct {
 // ActiveTaskOverviewRow 跨项目 active 任务概览投影行（cross-project-active-sessions D1/D2）。
 // 仅供 GET /api/v1/tasks/active 读模型：字段与 store.ActiveTaskOverviewRow 一一对应，
 // 不携带 agentStatus（由 API 层组装读内存快照填充到 DTO，sse-active-sessions P2.2）。
+// Mode 为任务级运行模式、Kind 为项目类型（add-local-path-task-mode D7）：API 组装按
+// kind+mode 组合 fail-closed 校验（合法组合仅 (repo,worktree)/(repo,local-path)/(dir,local-path)）。
 type ActiveTaskOverviewRow struct {
 	ID           string
 	ProjectID    string
@@ -102,6 +104,8 @@ type ActiveTaskOverviewRow struct {
 	Name         string
 	Branch       string
 	WorktreePath string
+	Mode         string
+	Kind         string
 	LastActiveAt int64
 }
 
@@ -129,7 +133,8 @@ type Attention struct {
 }
 
 // ProjectTaskSummary 项目任务摘要（design.md D4：10 存储字段 + attention_count，
-// GET /projects tasks 摘要）。
+// GET /projects tasks 摘要）。Mode 为任务级运行模式（add-local-path-task-mode D7：
+// worktree | local-path），API 组装按 kind 校验组合，非法 fail-closed。
 type ProjectTaskSummary struct {
 	TaskID         string
 	Name           string
@@ -137,6 +142,7 @@ type ProjectTaskSummary struct {
 	Status         string
 	InitStatus     string
 	Branch         string
+	Mode           string
 	WorktreePath   string
 	LastError      string
 	Notice         string

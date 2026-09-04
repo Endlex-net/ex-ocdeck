@@ -21,9 +21,9 @@ func (a *agentStatusTaskBackend) AgentStatus(ctx context.Context, taskID string)
 	return a.status
 }
 
-// Get 返回带 ProjectID 的零值任务行，供 handleGetTask 在 fail-closed kind 校验下通过。
+// Get 返回带 ProjectID 的任务行，供 handleGetTask 在 fail-closed kind/mode 校验下通过。
 func (a *agentStatusTaskBackend) Get(ctx context.Context, taskID string) (application.TaskRow, error) {
-	return application.TaskRow{ID: taskID, ProjectID: a.getTaskID}, nil
+	return application.TaskRow{ID: taskID, ProjectID: a.getTaskID, Mode: "worktree"}, nil
 }
 
 // newAgentStatusServer 构造带 ProjectStore + TaskBackend 的 Server（agentStatus 测试用）。

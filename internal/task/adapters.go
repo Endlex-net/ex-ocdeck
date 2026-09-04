@@ -78,7 +78,8 @@ func (a *StoreAdapter) ListActiveTaskOverview(ctx context.Context) ([]ActiveTask
 	for _, r := range rows {
 		out = append(out, ActiveTaskOverviewRow{
 			ID: r.ID, ProjectID: r.ProjectID, ProjectName: r.ProjectName, Name: r.Name,
-			Branch: r.Branch, WorktreePath: r.WorktreePath, LastActiveAt: r.LastActiveAt,
+			Branch: r.Branch, WorktreePath: r.WorktreePath, Mode: r.Mode, Kind: r.Kind,
+			LastActiveAt: r.LastActiveAt,
 		})
 	}
 	return out, nil

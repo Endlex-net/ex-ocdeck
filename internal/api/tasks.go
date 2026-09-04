@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -137,14 +138,49 @@ func (s *Server) registerTaskRoutes(mux *http.ServeMux) {
 
 // createTaskReq 创建任务请求体。base_ref 为可选基线分支短名（add-plain-dir-project D10，
 // 仅 repo 项目接受；dir 项目提供即 invalid_input，由 task 层校验）。
+// Mode 为任务级运行模式（add-local-path-task-mode D6）：指针保留 presence 语义——
+// null=缺省（repo→worktree；dir→local-path），非 null=显式提供。
 type createTaskReq struct {
-	Name    string `json:"name"`
-	BaseRef string `json:"base_ref"`
+	Name    string  `json:"name"`
+	BaseRef string  `json:"base_ref"`
+	Mode    *string `json:"mode"`
+}
+
+// 任务级运行模式合法值（add-local-path-task-mode D7）。与 internal/task 的 TaskMode
+// 常量同源；api 层不经由 task 包，参照 projectKind* 本地常量先例。
+const (
+	taskModeWorktree  = "worktree"
+	taskModeLocalPath = "local-path"
+)
+
+// validTaskModeForKind 校验 kind+mode 组合（task-lifecycle delta 决策表：合法组合仅
+// (repo,worktree)/(repo,local-path)/(dir,local-path)）。未知 kind 或未知 mode 均为
+// 持久化损坏，fail-closed（DTO 输出路径不得产出缺/坏 mode 的元素，D7）。
+func validTaskModeForKind(kind, mode string) bool {
+	switch kind {
+	case projectKindRepo:
+		return mode == taskModeWorktree || mode == taskModeLocalPath
+	case projectKindDir:
+		return mode == taskModeLocalPath
+	default:
+		return false
+	}
 }
 
 func (r createTaskReq) validate() *ApiError {
-	if r.Name == "" || r.Name == "  " {
+	// ② name 非空（校验顺序见 add-local-path-task-mode D6）：trim 判空，任何空白名称
+	// 均先于 ③mode/④kind 报错；原名称透传 task 层，不在此改写。
+	if strings.TrimSpace(r.Name) == "" {
 		return NewError(CodeInvalidInput, "task name is required")
+	}
+	// ③ mode 值域（校验顺序见 add-local-path-task-mode D6）：显式提供时 trim 后为
+	// 空串或未知值 → invalid_input；缺省（null）跳过。
+	if r.Mode != nil {
+		switch strings.TrimSpace(*r.Mode) {
+		case taskModeWorktree, taskModeLocalPath:
+		default:
+			return NewError(CodeInvalidInput, "mode must be worktree or local-path")
+		}
 	}
 	return nil
 }
@@ -200,7 +236,12 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	// 复用一次项目详情填充 project_kind，避免 N+1（D6）。
 	out := make([]taskRowDTO, 0, len(tasks))
 	for _, t := range tasks {
-		dto := toTaskDTO(t, kind)
+		dto, de := toTaskDTO(t, kind)
+		if de != nil {
+			// mode 非法为持久化损坏：fail-closed 500，不输出缺 mode 元素（D7）。
+			writeApiError(w, de)
+			return
+		}
 		dto.AgentStatus = s.tasks.AgentStatus(r.Context(), t.ID)
 		out = append(out, dto)
 	}
@@ -226,17 +267,36 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeApiError(w, ae)
 		return
 	}
+	// ⑤ 组合校验（add-local-path-task-mode D6）：dir 项目拒绝显式 mode（任意取值）。
+	// ⑥ base_ref 与模式的组合校验在 task 层 createInPlace/createRepo 入口（与现状
+	// base_ref 校验位置一致），API 层只透传。
+	mode := ""
+	if req.Mode != nil {
+		if kind == projectKindDir {
+			writeApiError(w, NewError(CodeInvalidInput, "dir project tasks must not accept mode"))
+			return
+		}
+		mode = strings.TrimSpace(*req.Mode)
+	}
 	t, err := s.tasks.Create(r.Context(), projectID, application.CreateTaskOptions{
 		Name:    req.Name,
 		BaseRef: strings.TrimSpace(req.BaseRef),
+		Mode:    mode,
 	})
 	if err != nil {
 		writeApiError(w, mapTaskErr(err))
 		return
 	}
+	// fail-closed（D7）：组装 DTO 并校验 kind/mode 后才提交 201；损坏行 → 500 标准
+	// 错误信封，MUST NOT 先写 201 再失败。
+	dto, de := toTaskDTO(t, kind)
+	if de != nil {
+		writeApiError(w, de)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(toTaskDTO(t, kind))
+	_ = json.NewEncoder(w).Encode(dto)
 }
 
 func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
@@ -265,7 +325,10 @@ func (s *Server) buildTaskDetailDTOBase(ctx context.Context, t application.TaskR
 	if ae != nil {
 		return taskRowDTO{}, ae
 	}
-	dto := toTaskDTO(t, kind)
+	dto, de := toTaskDTO(t, kind)
+	if de != nil {
+		return taskRowDTO{}, de
+	}
 	dto.Sessions = toSessionDTOs(sessions)
 	att, _ := s.tasks.Attention(t.ID)
 	dto.Attention = toAttentionDTO(att)
@@ -351,7 +414,11 @@ func (s *Server) handleRerunInit(w http.ResponseWriter, r *http.Request) {
 		writeApiError(w, mapTaskErr(err))
 		return
 	}
-	dto := toTaskDTO(row, kind)
+	dto, de := toTaskDTO(row, kind)
+	if de != nil {
+		writeApiError(w, de)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(dto)
@@ -422,6 +489,8 @@ func (s *Server) handleCloseTerminal(w http.ResponseWriter, r *http.Request) {
 // taskRowDTO 任务详情 DTO（design.md §21 GET /tasks/:id）。
 // project_kind ∈ repo | dir（add-plain-dir-project D6），由 handler 从项目详情填充；
 // projs 未注入时为空串（API 层降级，不阻塞详情返回）。
+// mode 为任务级运行模式（add-local-path-task-mode D7）：必有字段（非 omitempty），
+// 非法 kind/mode 组合 fail-closed 不输出（toTaskDTO 返回错误）。
 type taskRowDTO struct {
 	ID           string          `json:"id"`
 	ProjectID    string          `json:"project_id"`
@@ -438,6 +507,7 @@ type taskRowDTO struct {
 	InitStatus   string          `json:"init_status"`
 	InitError    string          `json:"init_error,omitempty"`
 	ProjectKind  string          `json:"project_kind"`
+	Mode         string          `json:"mode"`
 	Sessions     []sessionRowDTO `json:"sessions,omitempty"`
 	AgentStatus  string          `json:"agentStatus,omitempty"`
 	Attention    attentionDTO    `json:"attention"`
@@ -498,6 +568,8 @@ func toAttentionDTO(att application.Attention) attentionDTO {
 // （buildActiveSessionsSnapshot，P2.2 起与 SSE 共享）读内存快照填充。
 // AgentStatus 快照不可用为空串，经 omitempty 省略（idle/busy/retry 三态）。
 // Attention 纯读快照（design.md D6），空数组非 null。
+// mode 为必有字段（add-local-path-task-mode D7）；组装遇非法 kind/mode 返回错误
+// （REST → 500；SSE 初始组装 500、update 保持 dirty 重试）。
 type activeSessionDTO struct {
 	TaskID       string       `json:"task_id"`
 	ProjectID    string       `json:"project_id"`
@@ -505,16 +577,22 @@ type activeSessionDTO struct {
 	Name         string       `json:"name"`
 	Branch       string       `json:"branch"`
 	WorktreePath string       `json:"worktree_path"`
+	Mode         string       `json:"mode"`
 	LastActiveAt int64        `json:"last_active_at"`
 	AgentStatus  string       `json:"agentStatus,omitempty"`
 	Attention    attentionDTO `json:"attention"`
 }
 
-func toTaskDTO(t application.TaskRow, projectKind string) taskRowDTO {
+// toTaskDTO 任务详情 DTO 纯映射（design.md §21）。mode 为必有字段：非法 kind/mode
+// 组合为持久化损坏，返回 internal ApiError fail-closed，调用方不得输出该 DTO（D7）。
+func toTaskDTO(t application.TaskRow, projectKind string) (taskRowDTO, *ApiError) {
+	if !validTaskModeForKind(projectKind, t.Mode) {
+		return taskRowDTO{}, NewError(CodeInternal, fmt.Sprintf("task %s: invalid mode %q", t.ID, t.Mode))
+	}
 	dto := taskRowDTO{
 		ID: t.ID, ProjectID: t.ProjectID, Name: t.Name, Branch: t.Branch, Status: t.Status,
 		WorktreePath: t.WorktreePath, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
-		ProjectKind: projectKind,
+		ProjectKind: projectKind, Mode: t.Mode,
 	}
 	if t.LastPort.Valid {
 		dto.LastPort = int(t.LastPort.Int64)
@@ -533,7 +611,7 @@ func toTaskDTO(t application.TaskRow, projectKind string) taskRowDTO {
 	if t.InitError.Valid {
 		dto.InitError = t.InitError.String
 	}
-	return dto
+	return dto, nil
 }
 
 func toSessionDTOs(rows []application.SessionRow) []sessionRowDTO {

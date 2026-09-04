@@ -28,6 +28,10 @@ func newLifecycleTaskBackend(rows ...application.TaskRow) *lifecycleTaskBackend 
 		tasks:           map[string]application.TaskRow{},
 	}
 	for _, r := range rows {
+		if r.Mode == "" {
+			// 夹具缺省为 repo worktree 任务（mode 必有校验需合法值，add-local-path-task-mode D7）。
+			r.Mode = "worktree"
+		}
 		b.tasks[r.ID] = r
 	}
 	return b
@@ -317,7 +321,7 @@ func TestLifecycleAPI_RerunInit_Success_200WithTaskDTO(t *testing.T) {
 	lc := newFakeLifecycleConfigStore()
 	tb := newLifecycleTaskBackend(application.TaskRow{ID: "t1", ProjectID: "p1", Status: application.StatusSuspended})
 	tb.rerunFn = func(ctx context.Context, taskID string) (application.TaskRow, error) {
-		return application.TaskRow{ID: "t1", ProjectID: "p1", Status: application.StatusSuspended, InitStatus: application.InitStatusRunning}, nil
+		return application.TaskRow{ID: "t1", ProjectID: "p1", Status: application.StatusSuspended, InitStatus: application.InitStatusRunning, Mode: "worktree"}, nil
 	}
 	s := newLifecycleAPIServer(t, projs, lc, tb)
 	ts := httptest.NewServer(s.mux)
@@ -520,23 +524,25 @@ func TestLifecycleAPI_PutFieldLimit_64KBPlus1_Still422(t *testing.T) {
 // --- add-plain-dir-project D6：task DTO project_kind 填充 ---
 
 // projectKindTaskBackend 覆盖 Create/List/Get/RerunInit，返回固定 ProjectID 的任务，
-// 供 project_kind 填充测试。
+// 供 project_kind 填充测试。mode 按项目 kind 取合法组合（add-local-path-task-mode D7：
+// dir→local-path，repo→worktree），否则 DTO fail-closed 校验即 500。
 type projectKindTaskBackend struct {
 	*fakeTaskBackend
 	projectID string
+	mode      string
 }
 
 func (b *projectKindTaskBackend) Create(ctx context.Context, projectID string, opts application.CreateTaskOptions) (application.TaskRow, error) {
-	return application.TaskRow{ID: "t-new", ProjectID: projectID, Name: opts.Name, Status: application.StatusSuspended}, nil
+	return application.TaskRow{ID: "t-new", ProjectID: projectID, Name: opts.Name, Status: application.StatusSuspended, Mode: b.mode}, nil
 }
 func (b *projectKindTaskBackend) Get(ctx context.Context, taskID string) (application.TaskRow, error) {
-	return application.TaskRow{ID: taskID, ProjectID: b.projectID, Status: application.StatusSuspended}, nil
+	return application.TaskRow{ID: taskID, ProjectID: b.projectID, Status: application.StatusSuspended, Mode: b.mode}, nil
 }
 func (b *projectKindTaskBackend) List(ctx context.Context, projectID string) ([]application.TaskRow, error) {
-	return []application.TaskRow{{ID: "t1", ProjectID: projectID, Status: application.StatusSuspended}}, nil
+	return []application.TaskRow{{ID: "t1", ProjectID: projectID, Status: application.StatusSuspended, Mode: b.mode}}, nil
 }
 func (b *projectKindTaskBackend) RerunInit(ctx context.Context, taskID string) (application.TaskRow, error) {
-	return application.TaskRow{ID: taskID, ProjectID: b.projectID, Status: application.StatusSuspended, InitStatus: application.InitStatusRunning}, nil
+	return application.TaskRow{ID: taskID, ProjectID: b.projectID, Status: application.StatusSuspended, InitStatus: application.InitStatusRunning, Mode: b.mode}, nil
 }
 
 // TestTaskDTO_ProjectKind_FilledAtListCreateGetRerunInit 验证 task DTO 的 project_kind 字段
@@ -548,7 +554,12 @@ func TestTaskDTO_ProjectKind_FilledAtListCreateGetRerunInit(t *testing.T) {
 	lc := newFakeLifecycleConfigStore()
 
 	newSrv := func(projectID string) *Server {
-		tb := &projectKindTaskBackend{fakeTaskBackend: &fakeTaskBackend{}, projectID: projectID}
+		// mode 按项目 kind 取合法组合：dir→local-path，repo→worktree。
+		mode := "worktree"
+		if projectID == "pdir" {
+			mode = "local-path"
+		}
+		tb := &projectKindTaskBackend{fakeTaskBackend: &fakeTaskBackend{}, projectID: projectID, mode: mode}
 		return newLifecycleAPIServer(t, projs, lc, tb)
 	}
 
@@ -635,6 +646,86 @@ func TestTaskDTO_ProjectKind_FilledAtListCreateGetRerunInit(t *testing.T) {
 			t.Errorf("ProjectKind = %q, want 'repo' (prefetched before RerunInit side-effect)", dto.ProjectKind)
 		}
 	})
+}
+
+// --- P2 gate：创建校验顺序与 fail-closed（add-local-path-task-mode D6/D7） ---
+
+// modeCorruptCreateBackend Create 返回持久化 mode 损坏的任务行，验证创建响应 fail-closed。
+type modeCorruptCreateBackend struct {
+	*fakeTaskBackend
+	row application.TaskRow
+}
+
+func (b *modeCorruptCreateBackend) Create(ctx context.Context, projectID string, opts application.CreateTaskOptions) (application.TaskRow, error) {
+	return b.row, nil
+}
+
+// TestCreateTask_BlankNameCheckedBeforeModeAndKind 验证校验顺序：②name（trim 判空）
+// 先于 ③mode 值域与 ④kind fail-closed——空白名称报 name 错误，而非 mode/not_found 错误。
+func TestCreateTask_BlankNameCheckedBeforeModeAndKind(t *testing.T) {
+	projs := newFakeProjectStore()
+	projs.projects["p1"] = storeProjectRow{ID: "p1", Name: "p", Path: "/x", DefaultBranch: "main", Kind: "repo"}
+	lc := newFakeLifecycleConfigStore()
+	tb := newLifecycleTaskBackend()
+	s := newLifecycleAPIServer(t, projs, lc, tb)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	for _, tc := range []struct {
+		desc, url, body string
+	}{
+		{"blank name + invalid mode reports name error", "/api/v1/projects/p1/tasks", `{"name":" ","mode":"bogus"}`},
+		{"blank name + missing project reports name error", "/api/v1/projects/p-missing/tasks", `{"name":"\t"}`},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+tc.url, tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusUnprocessableEntity {
+				t.Fatalf("status = %d, want 422", resp.StatusCode)
+			}
+			var eb errorBody
+			if err := json.NewDecoder(resp.Body).Decode(&eb); err != nil {
+				t.Fatal(err)
+			}
+			if eb.Error.Code != CodeInvalidInput || eb.Error.Message != "task name is required" {
+				t.Errorf("error = %v/%q, want invalid_input/'task name is required' (order ② before ③/④)", eb.Error.Code, eb.Error.Message)
+			}
+		})
+	}
+}
+
+// TestCreateTask_CorruptModeRowReturns500Not201 验证创建响应 fail-closed（D7）：
+// Create 返回 kind/mode 损坏行时响应为 500 标准错误信封，MUST NOT 先写 201 再失败。
+func TestCreateTask_CorruptModeRowReturns500Not201(t *testing.T) {
+	projs := newFakeProjectStore()
+	projs.projects["p1"] = storeProjectRow{ID: "p1", Name: "p", Path: "/x", DefaultBranch: "main", Kind: "repo"}
+	lc := newFakeLifecycleConfigStore()
+	tb := &modeCorruptCreateBackend{
+		fakeTaskBackend: &fakeTaskBackend{},
+		row:             application.TaskRow{ID: "t1", ProjectID: "p1", Status: application.StatusSuspended, Mode: "weird"},
+	}
+	s := newLifecycleAPIServer(t, projs, lc, tb)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects/p1/tasks", `{"name":"x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (not 201)", resp.StatusCode)
+	}
+	var eb errorBody
+	if err := json.NewDecoder(resp.Body).Decode(&eb); err != nil {
+		t.Fatal(err)
+	}
+	if eb.Error.Code != CodeInternal {
+		t.Errorf("error code = %q, want internal", eb.Error.Code)
+	}
 }
 
 // --- add-plain-dir-project D1/D6：API fail-closed 路径 ---

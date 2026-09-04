@@ -21,10 +21,10 @@ func newProjectsSnapshotFixture() (*projectSummaryBackend, *fakeProjectStore) {
 		fakeTaskBackend: &fakeTaskBackend{},
 		summaries: []application.ProjectTaskSummary{
 			{TaskID: "t1", Name: "taskA", ProjectID: "p1", Status: application.StatusActive,
-				InitStatus: application.InitStatusNone, Branch: "b1", WorktreePath: "/wt1",
+				InitStatus: application.InitStatusNone, Branch: "b1", Mode: "worktree", WorktreePath: "/wt1",
 				UpdatedAt: 100, AttentionCount: 2, Notice: `{"items":["n"]}`},
 			{TaskID: "t2", Name: "taskB", ProjectID: "p1", Status: application.StatusSuspended,
-				InitStatus: application.InitStatusSucceeded, Branch: "b2", WorktreePath: "/wt2",
+				InitStatus: application.InitStatusSucceeded, Branch: "b2", Mode: "worktree", WorktreePath: "/wt2",
 				LastError: "boom", UpdatedAt: 200},
 		},
 		agentStatusSnapshot: map[string]string{"t1": "busy"},
@@ -55,10 +55,10 @@ func TestBuildProjectsSnapshot_AssemblesProjectsCountsSummariesAgentStatus(t *te
 			TaskCount: 2, Tasks: map[string]int{application.StatusActive: 1, application.StatusSuspended: 1},
 			TaskSummaries: []projectTaskSummaryDTO{
 				{ID: "t1", Name: "taskA", Status: application.StatusActive, InitStatus: application.InitStatusNone,
-					Branch: "b1", WorktreePath: "/wt1", Notice: json.RawMessage(`{"items":["n"]}`),
+					Branch: "b1", Mode: "worktree", WorktreePath: "/wt1", Notice: json.RawMessage(`{"items":["n"]}`),
 					UpdatedAt: 100, AgentStatus: "busy", AttentionCount: 2},
 				{ID: "t2", Name: "taskB", Status: application.StatusSuspended, InitStatus: application.InitStatusSucceeded,
-					Branch: "b2", WorktreePath: "/wt2", LastError: "boom", UpdatedAt: 200},
+					Branch: "b2", Mode: "worktree", WorktreePath: "/wt2", LastError: "boom", UpdatedAt: 200},
 			},
 		},
 		{

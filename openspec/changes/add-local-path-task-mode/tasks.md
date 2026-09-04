@@ -20,10 +20,10 @@
 
 ## 3. API 与 DTO 传播
 
-- [ ] 3.1 `createTaskReq` 增加 `Mode *string`（presence 语义）；按 task-lifecycle delta 决策表实现校验顺序 ①-⑥（值域 → kind fail-closed → dir+mode 组合拒绝）（design D6）
-- [ ] 3.2 `taskRowDTO` 增加 `mode` 必有字段（非 omitempty，非法值 fail-closed 不输出）；`toTaskDTO` 从任务行取值（design D7）
-- [ ] 3.3 项目列表任务摘要（project-management spec 字段表）与任务详情 SSE（task-detail-stream spec 字段穷举）增加 `mode` 必有字段；摘要组装遇非法 kind/mode 同样 fail-closed（500 标准错误信封，不输出缺 mode 元素）
-- [ ] 3.4 活跃任务概览链透传 mode：`store.ActiveTaskOverviewRow`（queries.go:390-435）→ `application.ActiveTaskOverviewRow`（dto.go:83-94）→ StoreAdapter（adapters.go:72-84）→ `activeSessionDTO`/`buildActiveSessionsSnapshot`（api/tasks.go:493-508、sessions_snapshot.go:17-35）；REST 非法 kind/mode 返回 500；SSE 初始组装 500、update 保持 dirty 重试、MUST NOT 推送缺 mode 帧（design D7）
+- [x] 3.1 `createTaskReq` 增加 `Mode *string`（presence 语义）；按 task-lifecycle delta 决策表实现校验顺序 ①-⑥（值域 → kind fail-closed → dir+mode 组合拒绝）（design D6）
+- [x] 3.2 `taskRowDTO` 增加 `mode` 必有字段（非 omitempty，非法值 fail-closed 不输出）；`toTaskDTO` 从任务行取值（design D7）
+- [x] 3.3 项目列表任务摘要（project-management spec 字段表）与任务详情 SSE（task-detail-stream spec 字段穷举）增加 `mode` 必有字段；摘要组装遇非法 kind/mode 同样 fail-closed（500 标准错误信封，不输出缺 mode 元素）
+- [x] 3.4 活跃任务概览链透传 mode：`store.ActiveTaskOverviewRow`（queries.go:390-435）→ `application.ActiveTaskOverviewRow`（dto.go:83-94）→ StoreAdapter（adapters.go:72-84）→ `activeSessionDTO`/`buildActiveSessionsSnapshot`（api/tasks.go:493-508、sessions_snapshot.go:17-35）；REST 非法 kind/mode 返回 500；SSE 初始组装 500、update 保持 dirty 重试、MUST NOT 推送缺 mode 帧（design D7）
 
 ## 4. Web
 
