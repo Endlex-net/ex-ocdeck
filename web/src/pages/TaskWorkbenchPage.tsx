@@ -5,7 +5,7 @@ import { resolveBackHref, type FromSource } from '../router';
 import { useMediaQuery, useProjects, useProjectsRefresh } from '../hooks';
 import { debugMark } from '../debug';
 import { subscribeTask } from '../sse';
-import { isTransitional, initActivateBlockReason, parseNotice, type Task } from '../types';
+import { isGitlessTask, isTransitional, initActivateBlockReason, parseNotice, type Task } from '../types';
 import { shouldCloseOverflowOnBlur } from './workbench-overflow';
 import { StatusBadge } from '../components/StatusBadge';
 import { TaskActions } from '../components/TaskActions';
@@ -226,8 +226,8 @@ export function TaskWorkbenchPage({
   };
 
   // dir 任务与 repo local-path 任务无 git 功能（D7/add-local-path-task-mode）：隐藏 Git tab 与
-  // 分支名，按任务有效 mode 判定（project_kind=dir 或 mode=local-path），MUST NOT 判空推断
-  const isGitless = task?.project_kind === 'dir' || task?.mode === 'local-path';
+  // 分支名，按任务有效 mode 判定（isGitlessTask：project_kind=dir 或 mode=local-path），MUST NOT 判空推断
+  const isGitless = !!task && isGitlessTask(task.project_kind, task.mode);
   // 有效模式为无 git 时若正停在 Git tab，回退到 TUI tab
   useEffect(() => {
     if (isGitless && tab === GIT_TAB) setTab(TUI_TAB);
@@ -237,7 +237,7 @@ export function TaskWorkbenchPage({
   // data-od-id / wb-* class 对齐设计稿 task-workbench.html:229
   // 注意：以下 Hook 必须在任何条件 return 之前（404 分支不得改变 Hook 调用次数）。
   const switcherTasks = useMemo(() => {
-    const out: Array<{ taskID: string; name: string; branch: string; projectName: string; agentStatus?: string; attentionCount: number; current: boolean }> = [];
+    const out: Array<{ taskID: string; name: string; branch: string; gitless: boolean; projectName: string; agentStatus?: string; attentionCount: number; current: boolean }> = [];
     for (const p of projects) {
       // 与侧栏 SidebarTaskGroups 同源：仅 active+suspended（归档/失败等不显示）
       for (const t of (p.tasks ?? []).filter((x) => x.status === 'active' || x.status === 'suspended')) {
@@ -245,6 +245,7 @@ export function TaskWorkbenchPage({
           taskID: t.id,
           name: t.name,
           branch: t.branch,
+          gitless: isGitlessTask(p.kind, t.mode),
           projectName: p.name,
           agentStatus: t.agentStatus,
           attentionCount: t.attention_count ?? 0,
@@ -359,7 +360,8 @@ export function TaskWorkbenchPage({
                           title={t.attentionCount > 0 ? `等待人工处理：${t.attentionCount} 个待处理请求` : undefined}
                         ><span className="od-agent-dot" /></span>
                         <span className="wb-sw-name">{t.name}</span>
-                        <span className="mono">{t.branch}</span>
+                        {/* gitless 任务（dir/local-path）不渲染分支名，整段移除不留占位 */}
+                        {!t.gitless && <span className="mono">{t.branch}</span>}
                       </button>
                     ))}
                   </div>

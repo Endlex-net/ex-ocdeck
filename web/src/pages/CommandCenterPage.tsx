@@ -4,11 +4,13 @@ import { navigate } from '../router';
 import { useProjects, useProjectsRefresh } from '../hooks';
 import { subscribeActiveSessions } from '../sse';
 import {
+  isGitlessTask,
   isTransitional,
   parseNotice,
   type ActiveSessionItem,
   type Project,
   type TaskMode,
+  type TaskSummary,
 } from '../types';
 import { StatusBadge } from '../components/StatusBadge';
 import { AgentStatusBadge } from '../components/AgentStatusBadge';
@@ -466,6 +468,25 @@ function toTask(m: MergedTask) {
   };
 }
 
+/** 任务行副标题「项目名 · ⎇ 分支」：gitless 任务（dir/local-path）无分支语义，
+ *  不渲染分支图标与分支名（git-operations delta），整段移除、不留空图标占位。 */
+function RowProjectBranch({
+  projectKind,
+  projectName,
+  task,
+}: {
+  projectKind: MergedTask['project_kind'];
+  projectName: string;
+  task: TaskSummary;
+}) {
+  if (isGitlessTask(projectKind, task.mode)) return <>{projectName}</>;
+  return (
+    <>
+      {projectName} · <BranchIcon /> {task.branch}
+    </>
+  );
+}
+
 /** 「需要关注」行：主类别呈现 + 次要标记 + 行内操作集。 */
 function AttentionRow({
   item,
@@ -510,7 +531,7 @@ function AttentionRow({
           <AgentStatusBadge agentStatus={t.agentStatus} attentionCount={humanPending ? Math.max(1, t.attention_count ?? 0) : 0} />
         </div>
         <div className="od-row-sub mono">
-          {item.project_name} · <BranchIcon /> {t.branch}
+          <RowProjectBranch projectKind={item.project_kind} projectName={item.project_name} task={t} />
         </div>
         {/* 主类别提示 */}
         <div className={`cc-row-hint${hintUrgent ? ' urgent' : ''}`}>
@@ -660,7 +681,7 @@ function TaskRow({ m }: { m: MergedTask }) {
           <AgentStatusBadge agentStatus={m.agentStatus} attention={m.attention} />
         </div>
         <div className="od-row-sub mono">
-          {m.project_name} · <BranchIcon /> {m.task.branch}
+          <RowProjectBranch projectKind={m.project_kind} projectName={m.project_name} task={m.task} />
         </div>
         {m.task.notice && parseNotice(m.task.notice).length > 0 && (
           <div className="cc-row-hint">
@@ -706,7 +727,7 @@ function ParkedRow({
           {status === 'suspended' ? <span className="badge badge-suspended">挂起</span> : <span className="badge badge-archived">归档</span>}
         </div>
         <div className="od-row-sub mono">
-          {m.project_name} · <BranchIcon /> {m.task.branch}
+          <RowProjectBranch projectKind={m.project_kind} projectName={m.project_name} task={m.task} />
         </div>
       </div>
       <div className="od-row-side" onClick={(e) => e.stopPropagation()}>

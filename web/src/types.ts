@@ -512,3 +512,12 @@ export function parseNotice(raw: Task['notice']): NoticeItem[] {
   }
   return [];
 }
+
+/**
+ * 任务无 git 功能（add-plain-dir-project D7 / add-local-path-task-mode）：dir 任务与
+ * repo local-path 任务同级降级。分支名/分支图标/Git 入口显隐统一按 kind+mode 判定，
+ * MUST NOT 判空（branch）推断；projectKind 缺席（sessions-only 无 projects 快照）时按 mode 判定。
+ */
+export function isGitlessTask(projectKind: ProjectKind | undefined, mode: TaskMode): boolean {
+  return projectKind === 'dir' || mode === 'local-path';
+}

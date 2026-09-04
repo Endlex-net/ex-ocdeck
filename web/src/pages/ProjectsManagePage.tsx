@@ -9,6 +9,7 @@ import {
   deleteErrorMessage,
 } from '../hooks';
 import {
+  isGitlessTask,
   isTransitional,
   parseNotice,
   type Project,
@@ -284,9 +285,10 @@ function OverviewPane({
                       {t.name}
                     </div>
                     <div className="od-row-sub">
-                      {/* dir 任务无分支概念，直接展示项目目录路径（依据 project_kind，非判空推断） */}
+                      {/* dir 任务与 repo local-path 任务无分支概念（isGitlessTask，非判空推断）：
+                          直接展示项目目录路径，不渲染分支名 */}
                       <span className="mono">
-                        {t.project_kind === 'dir'
+                        {isGitlessTask(t.project_kind, t.mode)
                           ? t.worktree_path
                           : t.branch || t.worktree_path}
                       </span>
