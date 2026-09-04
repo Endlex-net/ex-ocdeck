@@ -652,9 +652,12 @@ func TestParseTmuxVersion(t *testing.T) {
 
 // newClipboardMockManager 构造带记录 execTmuxFn 的 Manager：
 // -V 应答 version（空串表示 tmux -V 失败）；failArgs 中列出的每个 set-option
-// （如 {"get-clipboard","off"}）返回错误；noServer 时 set-option 返回
-// "无 server"错误；其余调用成功。
-func newClipboardMockManager(version string, failArgs [][]string, noServer bool, calls *[][]string) *Manager {
+// （如 {"get-clipboard","off"}）返回 permission denied 错误；invalidOptions 中
+// 列出的每个 set-option 返回 "invalid option" 错误（模拟 tmux < 3.3 无
+// allow-passthrough）；noServer 时 set-option 返回"无 server"错误；其余调用成功。
+// failArgs/invalidOptions 以 {option, value} 描述并忽略 -g/-wg flags（故障注入与
+// 作用域解耦），调用是否带正确 flags 由断言侧比对完整 recorded args 验证。
+func newClipboardMockManager(version string, failArgs, invalidOptions [][]string, noServer bool, calls *[][]string) *Manager {
 	return &Manager{
 		execTmuxFn: func(_ context.Context, args ...string) (string, string, error) {
 			cp := append([]string(nil), args...)
@@ -666,8 +669,13 @@ func newClipboardMockManager(version string, failArgs [][]string, noServer bool,
 				return version + "\n", "", nil
 			}
 			for _, fa := range failArgs {
-				if equalArgs(cp, append([]string{"set-option", "-s"}, fa...)) {
+				if isSetOptionCall(cp, fa) {
 					return "", "permission denied", &tmuxCmdError{sub: args, stderr: "permission denied", err: errors.New("exit 1")}
+				}
+			}
+			for _, io := range invalidOptions {
+				if isSetOptionCall(cp, io) {
+					return "", "invalid option: " + io[0], &tmuxCmdError{sub: args, stderr: "invalid option: " + io[0], err: errors.New("exit 1")}
 				}
 			}
 			if noServer && len(args) > 0 && args[0] == "set-option" {
@@ -693,71 +701,123 @@ func optCalls(calls [][]string) [][]string {
 	return out
 }
 
-// clipboardExternal = set-option -s set-clipboard external（fail-closed 目标态）。
+// clipboardExternal = set-option -s set-clipboard external（fail-closed 目标态；
+// set-clipboard 是 server 选项，-s 写 server 表）。
 var clipboardExternal = []string{"set-option", "-s", "set-clipboard", "external"}
 
-// TestEnsureServerOptions_FailClosedMatrix 验证 fail-closed 语义：
-// 只有 tmux >= 3.7 且 get-clipboard off 成功才置 set-clipboard on；
-// 其余场景保持/恢复 external（3.2–3.6 的 get-clipboard 默认 buffer，
-// on + buffer 会跨任务泄露 paste buffer），恢复失败 MUST 作为错误返回。
+// TestEnsureServerOptions_FailClosedMatrix 验证按版本分段的 fail-closed 语义：
+// >=3.7 走 [get-clipboard off → allow-passthrough off → set-clipboard on] 转发 raw；
+// 3.3–3.6 走 [set-clipboard external → allow-passthrough on] 透传 DCS；其余保持/
+// 恢复 external（3.2–3.6 的 get-clipboard 默认 buffer，on + buffer 会跨任务泄露
+// paste buffer），补救失败 MUST 作为错误返回。
 func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
-	// 版本不足（含可解析的 3.5a）或无法解析 → 只置 external，恢复成功时返回 nil。
-	for _, v := range []string{"tmux 3.2", "tmux 3.4", "tmux 3.5a", "tmux 3.6a", "tmux next-3.4", "bogus", "tmux"} {
-		t.Run("below/unparsable "+v, func(t *testing.T) {
+	clipboardPassthroughOff := []string{"set-option", "-wg", "allow-passthrough", "off"}
+	clipboardPassthroughOn := []string{"set-option", "-wg", "allow-passthrough", "on"}
+
+	// <3.3 或版本无法解析 → 恢复 external + 尝试关 passthrough（防不可解析实为
+	// ≥3.3 的遗留开启），恢复成功时返回 nil。
+	for _, v := range []string{"tmux 3.2", "tmux next-3.4", "bogus", "tmux"} {
+		t.Run("below3.3/unparsable "+v, func(t *testing.T) {
 			var calls [][]string
-			m := newClipboardMockManager(v, nil, false, &calls)
+			m := newClipboardMockManager(v, nil, nil, false, &calls)
 			if err := m.EnsureServerOptions(); err != nil {
 				t.Fatalf("err = %v, want nil (feature unavailable is not an error)", err)
 			}
 			opts := optCalls(calls)
-			if len(opts) != 1 || !equalArgs(opts[0], clipboardExternal) {
-				t.Fatalf("set-option calls = %v, want exactly [set-clipboard external]", opts)
+			if len(opts) != 2 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardPassthroughOff) {
+				t.Fatalf("set-option calls = %v, want exactly [set-clipboard external, allow-passthrough off]", opts)
+			}
+		})
+	}
+
+	t.Run("below3.3 passthrough off unknown option skipped", func(t *testing.T) {
+		var calls [][]string
+		// tmux 3.2 无 allow-passthrough（3.3 引入）：invalid option 属预期，best-effort 跳过。
+		m := newClipboardMockManager("tmux 3.2", nil, [][]string{{"allow-passthrough", "off"}}, false, &calls)
+		if err := m.EnsureServerOptions(); err != nil {
+			t.Fatalf("err = %v, want nil (unknown option is not an error)", err)
+		}
+		opts := optCalls(calls)
+		if len(opts) != 2 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardPassthroughOff) {
+			t.Fatalf("set-option calls = %v, want [set-clipboard external, allow-passthrough off]", opts)
+		}
+	})
+
+	// 3.3–3.6（含 3.5a）：先确保 external 再开 passthrough（DCS 透传路径）。
+	for _, v := range []string{"tmux 3.3", "tmux 3.4", "tmux 3.5a", "tmux 3.6a"} {
+		t.Run("passthrough segment "+v, func(t *testing.T) {
+			var calls [][]string
+			m := newClipboardMockManager(v, nil, nil, false, &calls)
+			if err := m.EnsureServerOptions(); err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			opts := optCalls(calls)
+			if len(opts) != 2 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardPassthroughOn) {
+				t.Fatalf("set-option calls = %v, want exactly [set-clipboard external, allow-passthrough on]", opts)
 			}
 		})
 	}
 
 	t.Run("tmux -V error", func(t *testing.T) {
 		var calls [][]string
-		m := newClipboardMockManager("", nil, false, &calls)
+		m := newClipboardMockManager("", nil, nil, false, &calls)
 		if err := m.EnsureServerOptions(); err != nil {
 			t.Fatalf("err = %v, want nil", err)
 		}
 		opts := optCalls(calls)
-		if len(opts) != 1 || !equalArgs(opts[0], clipboardExternal) {
-			t.Fatalf("set-option calls = %v, want exactly [set-clipboard external]", opts)
+		if len(opts) != 2 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardPassthroughOff) {
+			t.Fatalf("set-option calls = %v, want [set-clipboard external, allow-passthrough off]", opts)
 		}
 	})
 
 	t.Run("3.7 happy path order", func(t *testing.T) {
 		var calls [][]string
-		m := newClipboardMockManager("tmux 3.7c", nil, false, &calls)
+		m := newClipboardMockManager("tmux 3.7c", nil, nil, false, &calls)
 		if err := m.EnsureServerOptions(); err != nil {
 			t.Fatalf("err = %v, want nil", err)
 		}
 		opts := optCalls(calls)
 		wantGetOff := []string{"set-option", "-s", "get-clipboard", "off"}
 		wantClipOn := []string{"set-option", "-s", "set-clipboard", "on"}
-		if len(opts) != 2 || !equalArgs(opts[0], wantGetOff) || !equalArgs(opts[1], wantClipOn) {
-			t.Fatalf("set-option calls = %v, want [get-clipboard off, set-clipboard on] in that order", opts)
+		if len(opts) != 3 || !equalArgs(opts[0], wantGetOff) || !equalArgs(opts[1], clipboardPassthroughOff) || !equalArgs(opts[2], wantClipOn) {
+			t.Fatalf("set-option calls = %v, want [get-clipboard off, allow-passthrough off, set-clipboard on] in that order", opts)
 		}
 	})
 
 	t.Run("3.7 get-clipboard off fails restores external", func(t *testing.T) {
 		var calls [][]string
-		m := newClipboardMockManager("tmux 3.7", [][]string{{"get-clipboard", "off"}}, false, &calls)
+		m := newClipboardMockManager("tmux 3.7", [][]string{{"get-clipboard", "off"}}, nil, false, &calls)
 		err := m.EnsureServerOptions()
 		if err == nil {
 			t.Fatal("want error when get-clipboard off fails")
 		}
 		opts := optCalls(calls)
-		if len(opts) != 2 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) || !equalArgs(opts[1], clipboardExternal) {
-			t.Fatalf("set-option calls = %v, want [get-clipboard off, set-clipboard external]", opts)
+		// 统一恢复：external + 关 passthrough（防任何一段遗留 on）。
+		if len(opts) != 3 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) || !equalArgs(opts[1], clipboardExternal) || !equalArgs(opts[2], clipboardPassthroughOff) {
+			t.Fatalf("set-option calls = %v, want [get-clipboard off, set-clipboard external, allow-passthrough off]", opts)
 		}
 	})
 
-	t.Run("below 3.7 restore external fails surfaces error", func(t *testing.T) {
+	t.Run("3.7 allow-passthrough off fails restores external", func(t *testing.T) {
 		var calls [][]string
-		m := newClipboardMockManager("tmux 3.6a", [][]string{{"set-clipboard", "external"}}, false, &calls)
+		m := newClipboardMockManager("tmux 3.7", [][]string{{"allow-passthrough", "off"}}, nil, false, &calls)
+		err := m.EnsureServerOptions()
+		if err == nil {
+			t.Fatal("want error when allow-passthrough off fails (would leave raw+DCS dual write)")
+		}
+		if !strings.Contains(err.Error(), "allow-passthrough off") {
+			t.Errorf("err = %v, want mention allow-passthrough off failure", err)
+		}
+		opts := optCalls(calls)
+		// 统一恢复独立重试两项：external 成功、passthrough off 再次失败并入错误。
+		if len(opts) != 4 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) || !equalArgs(opts[1], clipboardPassthroughOff) || !equalArgs(opts[2], clipboardExternal) || !equalArgs(opts[3], clipboardPassthroughOff) {
+			t.Fatalf("set-option calls = %v, want [get-clipboard off, allow-passthrough off, set-clipboard external, allow-passthrough off]", opts)
+		}
+	})
+
+	t.Run("below3.3 restore external fails surfaces error", func(t *testing.T) {
+		var calls [][]string
+		m := newClipboardMockManager("tmux 3.2", [][]string{{"set-clipboard", "external"}}, nil, false, &calls)
 		err := m.EnsureServerOptions()
 		// 恢复失败 MUST NOT 被吞掉：server 可能遗留 on + get-clipboard buffer。
 		if err == nil {
@@ -767,14 +827,95 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 			t.Errorf("err = %v, want mention restore set-clipboard external", err)
 		}
 		opts := optCalls(calls)
-		if len(opts) != 1 || !equalArgs(opts[0], clipboardExternal) {
-			t.Fatalf("set-option calls = %v, want exactly [set-clipboard external]", opts)
+		if len(opts) != 2 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardPassthroughOff) {
+			t.Fatalf("set-option calls = %v, want [set-clipboard external, allow-passthrough off]", opts)
+		}
+	})
+
+	t.Run("passthrough segment first step external fails restores fail-closed", func(t *testing.T) {
+		var calls [][]string
+		m := newClipboardMockManager("tmux 3.3", [][]string{{"set-clipboard", "external"}}, nil, false, &calls)
+		err := m.EnsureServerOptions()
+		if err == nil {
+			t.Fatal("want error when first step set-clipboard external fails")
+		}
+		// 原错误与恢复段错误都要出现：首步失败无法证明 raw 已关，恢复须独立重试
+		// external 并收回可能遗留的 passthrough。
+		if !strings.Contains(err.Error(), "set-clipboard external") || !strings.Contains(err.Error(), "restore set-clipboard external") {
+			t.Errorf("err = %v, want mention original and restore set-clipboard external failures", err)
+		}
+		opts := optCalls(calls)
+		if len(opts) != 3 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardExternal) || !equalArgs(opts[2], clipboardPassthroughOff) {
+			t.Fatalf("set-option calls = %v, want [set-clipboard external, set-clipboard external retry, allow-passthrough off]", opts)
+		}
+	})
+
+	t.Run("passthrough segment passthrough on fails restores off", func(t *testing.T) {
+		var calls [][]string
+		m := newClipboardMockManager("tmux 3.4", [][]string{{"allow-passthrough", "on"}}, nil, false, &calls)
+		err := m.EnsureServerOptions()
+		if err == nil {
+			t.Fatal("want error when allow-passthrough on fails")
+		}
+		if !strings.Contains(err.Error(), "allow-passthrough on") {
+			t.Errorf("err = %v, want mention allow-passthrough on failure", err)
+		}
+		opts := optCalls(calls)
+		// 统一恢复独立尝试两项：external 幂等重试 + 收回 passthrough off。
+		if len(opts) != 4 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardPassthroughOn) || !equalArgs(opts[2], clipboardExternal) || !equalArgs(opts[3], clipboardPassthroughOff) {
+			t.Fatalf("set-option calls = %v, want [set-clipboard external, allow-passthrough on, set-clipboard external, allow-passthrough off]", opts)
+		}
+	})
+
+	t.Run("passthrough segment passthrough on and restore both fail combines errors", func(t *testing.T) {
+		var calls [][]string
+		m := newClipboardMockManager("tmux 3.4", [][]string{{"allow-passthrough", "on"}, {"allow-passthrough", "off"}}, nil, false, &calls)
+		err := m.EnsureServerOptions()
+		if err == nil {
+			t.Fatal("want error when both passthrough on and restore off fail")
+		}
+		if !strings.Contains(err.Error(), "allow-passthrough on") || !strings.Contains(err.Error(), "restore allow-passthrough off") {
+			t.Errorf("err = %v, want combined errors mentioning both failures", err)
+		}
+		opts := optCalls(calls)
+		if len(opts) != 4 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardPassthroughOn) || !equalArgs(opts[2], clipboardExternal) || !equalArgs(opts[3], clipboardPassthroughOff) {
+			t.Fatalf("set-option calls = %v, want [set-clipboard external, allow-passthrough on, set-clipboard external, allow-passthrough off]", opts)
+		}
+	})
+
+	t.Run("passthrough segment passthrough on no server returns without restore", func(t *testing.T) {
+		var calls [][]string
+		m := &Manager{
+			execTmuxFn: func(_ context.Context, args ...string) (string, string, error) {
+				cp := append([]string(nil), args...)
+				calls = append(calls, cp)
+				if len(args) == 1 && args[0] == "-V" {
+					return "tmux 3.4\n", "", nil
+				}
+				if isSetOptionCall(cp, []string{"allow-passthrough", "on"}) {
+					return "", "no server running on /tmp/tmux-0/ocdeck", &tmuxCmdError{
+						sub:    args,
+						stderr: "no server running on /tmp/tmux-0/ocdeck",
+						err:    errors.New("exit 1"),
+					}
+				}
+				return "", "", nil
+			},
+		}
+		err := m.EnsureServerOptions()
+		// 无 server 即无遗留状态可补救（external 已确保），MUST NOT 再走恢复路径。
+		if !errors.Is(err, ErrNoTmuxServer) {
+			t.Fatalf("err = %v, want ErrNoTmuxServer", err)
+		}
+		opts := optCalls(calls)
+		if len(opts) != 2 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardPassthroughOn) {
+			t.Fatalf("set-option calls = %v, want exactly [set-clipboard external, allow-passthrough on]", opts)
 		}
 	})
 
 	t.Run("3.7 get-clipboard and restore both fail combines errors", func(t *testing.T) {
 		var calls [][]string
-		m := newClipboardMockManager("tmux 3.7", [][]string{{"get-clipboard", "off"}, {"set-clipboard", "external"}}, false, &calls)
+		m := newClipboardMockManager("tmux 3.7", [][]string{{"get-clipboard", "off"}, {"set-clipboard", "external"}}, nil, false, &calls)
 		err := m.EnsureServerOptions()
 		if err == nil {
 			t.Fatal("want error when both get-clipboard off and restore fail")
@@ -789,23 +930,24 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 			t.Errorf("errors.As tmuxCmdError failed; original unwrap chain lost (err=%v)", err)
 		}
 		opts := optCalls(calls)
-		if len(opts) != 2 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) || !equalArgs(opts[1], clipboardExternal) {
-			t.Fatalf("set-option calls = %v, want [get-clipboard off, set-clipboard external]", opts)
+		// 统一恢复在 external 失败后仍独立尝试关 passthrough。
+		if len(opts) != 3 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) || !equalArgs(opts[1], clipboardExternal) || !equalArgs(opts[2], clipboardPassthroughOff) {
+			t.Fatalf("set-option calls = %v, want [get-clipboard off, set-clipboard external, allow-passthrough off]", opts)
 		}
 	})
 
 	t.Run("3.7 set-clipboard on fails after get-clipboard off state safe", func(t *testing.T) {
 		var calls [][]string
-		m := newClipboardMockManager("tmux 3.7", [][]string{{"set-clipboard", "on"}}, false, &calls)
+		m := newClipboardMockManager("tmux 3.7", [][]string{{"set-clipboard", "on"}}, nil, false, &calls)
 		err := m.EnsureServerOptions()
 		if err == nil {
 			t.Fatal("want error when set-clipboard on fails")
 		}
 		opts := optCalls(calls)
-		// 状态安全：get-clipboard off 已生效，set-clipboard on 失败不会留下 on+buffer，
-		// MUST NOT 额外触发 restore external。
-		if len(opts) != 2 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) || !equalArgs(opts[1], []string{"set-option", "-s", "set-clipboard", "on"}) {
-			t.Fatalf("set-option calls = %v, want exactly [get-clipboard off, set-clipboard on]", opts)
+		// 状态安全：get-clipboard off 与 allow-passthrough off 已生效，set-clipboard on
+		// 失败不会留下 on+buffer 或双写，MUST NOT 额外触发 restore external。
+		if len(opts) != 3 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) || !equalArgs(opts[1], clipboardPassthroughOff) || !equalArgs(opts[2], []string{"set-option", "-s", "set-clipboard", "on"}) {
+			t.Fatalf("set-option calls = %v, want exactly [get-clipboard off, allow-passthrough off, set-clipboard on]", opts)
 		}
 	})
 
@@ -851,9 +993,58 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 		}
 	})
 
+	// 版本探测返回有效版本但耗尽共享 ctx：3.3–3.6 段首步 set-clipboard external
+	// 用该 ctx 必然失败，统一恢复路径必须换 fresh ctx 重试成功。
+	t.Run("3.3-3.6 first step fails after version deadline exhausted uses fresh ctx restore", func(t *testing.T) {
+		type callRec struct {
+			args     []string
+			deadline time.Time
+		}
+		var recs []callRec
+		m := &Manager{
+			execTmuxFn: func(ctx context.Context, args ...string) (string, string, error) {
+				rec := callRec{args: append([]string(nil), args...)}
+				if dl, ok := ctx.Deadline(); ok {
+					rec.deadline = dl
+				}
+				recs = append(recs, rec)
+				if len(args) == 1 && args[0] == "-V" {
+					<-ctx.Done() // 版本探测吃满共享 ctx，但版本本身有效
+					return "tmux 3.4\n", "", nil
+				}
+				if args[0] == "set-option" && ctx.Err() != nil {
+					return "", "context deadline exceeded", &tmuxCmdError{sub: args, stderr: "context deadline exceeded", err: ctx.Err()}
+				}
+				return "", "", nil
+			},
+		}
+		err := m.EnsureServerOptions()
+		if err == nil {
+			t.Fatal("want error from the exhausted-ctx first step")
+		}
+		if !strings.Contains(err.Error(), "set-clipboard external") {
+			t.Errorf("err = %v, want mention first step set-clipboard external failure", err)
+		}
+		if len(recs) != 4 {
+			t.Fatalf("calls = %v, want exactly [-V, set external fail, set external retry, pt off]", recs)
+		}
+		if !equalArgs(recs[1].args, []string{"set-option", "-s", "set-clipboard", "external"}) ||
+			!equalArgs(recs[2].args, []string{"set-option", "-s", "set-clipboard", "external"}) ||
+			!equalArgs(recs[3].args, []string{"set-option", "-wg", "allow-passthrough", "off"}) {
+			t.Fatalf("calls = %v, want [set external, set external retry, pt off] after -V", recs)
+		}
+		versionDl := recs[0].deadline
+		// 恢复段两次调用各自持有独立 fresh deadline，均须在未来且晚于 version deadline。
+		for i := 2; i <= 3; i++ {
+			if !recs[i].deadline.After(time.Now()) || !recs[i].deadline.After(versionDl) {
+				t.Fatalf("restore call %d deadline %v must be fresh (future, after version deadline %v)", i, recs[i].deadline, versionDl)
+			}
+		}
+	})
+
 	t.Run("no server", func(t *testing.T) {
 		var calls [][]string
-		m := newClipboardMockManager("tmux 3.7", nil, true, &calls)
+		m := newClipboardMockManager("tmux 3.7", nil, nil, true, &calls)
 		err := m.EnsureServerOptions()
 		if !errors.Is(err, ErrNoTmuxServer) {
 			t.Fatalf("err = %v, want ErrNoTmuxServer", err)
@@ -864,12 +1055,58 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 			t.Fatalf("set-option calls = %v, want exactly [get-clipboard off]", opts)
 		}
 	})
+
+	t.Run("no server below3.3 stops after first ErrNoTmuxServer", func(t *testing.T) {
+		var calls [][]string
+		m := newClipboardMockManager("tmux 3.2", nil, nil, true, &calls)
+		err := m.EnsureServerOptions()
+		if !errors.Is(err, ErrNoTmuxServer) {
+			t.Fatalf("err = %v, want ErrNoTmuxServer", err)
+		}
+		opts := optCalls(calls)
+		// 首个补救（external）已确认无 server，无遗留状态，MUST NOT 再打第二枪。
+		if len(opts) != 1 || !equalArgs(opts[0], clipboardExternal) {
+			t.Fatalf("set-option calls = %v, want exactly [set-clipboard external]", opts)
+		}
+	})
+}
+
+// TestEnsureServerOptions_AllowPassthroughUnknownOptionVariants 验证 <3.3 上关闭
+// allow-passthrough 遇到两种 "选项不存在" stderr 措辞都被 best-effort 跳过：
+// "invalid option"（选项名匹配失败）与 "unknown option"（scope 解析失败）——
+// allow-passthrough 于 3.3 引入，更老版本上 set 该选项必然报其一。
+func TestEnsureServerOptions_AllowPassthroughUnknownOptionVariants(t *testing.T) {
+	for _, stderr := range []string{"invalid option: allow-passthrough", "unknown option: allow-passthrough"} {
+		t.Run(stderr, func(t *testing.T) {
+			var calls [][]string
+			m := &Manager{
+				execTmuxFn: func(_ context.Context, args ...string) (string, string, error) {
+					cp := append([]string(nil), args...)
+					calls = append(calls, cp)
+					if len(args) == 1 && args[0] == "-V" {
+						return "tmux 3.2\n", "", nil
+					}
+					if isSetOptionCall(cp, []string{"allow-passthrough", "off"}) {
+						return "", stderr, &tmuxCmdError{sub: args, stderr: stderr, err: errors.New("exit 1")}
+					}
+					return "", "", nil
+				},
+			}
+			if err := m.EnsureServerOptions(); err != nil {
+				t.Fatalf("err = %v, want nil (%q is not a real failure)", err, stderr)
+			}
+			opts := optCalls(calls)
+			if len(opts) != 2 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], []string{"set-option", "-wg", "allow-passthrough", "off"}) {
+				t.Fatalf("set-option calls = %v, want [set-clipboard external, allow-passthrough off]", opts)
+			}
+		})
+	}
 }
 
 func TestNewSession_EnsureServerOptionsBestEffort(t *testing.T) {
 	var calls [][]string
 	// get-clipboard off 失败 → EnsureServerOptions 返回错误；NewSession 只记日志不失败。
-	m := newClipboardMockManager("tmux 3.7", [][]string{{"get-clipboard", "off"}}, false, &calls)
+	m := newClipboardMockManager("tmux 3.7", [][]string{{"get-clipboard", "off"}}, nil, false, &calls)
 	err := m.NewSession(SessionSpec{
 		Name:    "ocdeck-task1-runtime",
 		Dir:     "/tmp",
@@ -885,6 +1122,11 @@ func TestNewSession_EnsureServerOptionsBestEffort(t *testing.T) {
 	if len(opts) == 0 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) {
 		t.Errorf("first set-option = %v, want get-clipboard off (fail-closed order), all=%v", opts, calls)
 	}
+}
+
+// isSetOptionCall 判断 args 是否为对 {option, value} 的 set-option 调用（flags 任意）。
+func isSetOptionCall(args, optionValue []string) bool {
+	return len(args) == 4 && args[0] == "set-option" && equalArgs(args[2:], optionValue)
 }
 
 func equalArgs(a, b []string) bool {
