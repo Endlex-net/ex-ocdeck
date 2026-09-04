@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"ocdeck/internal/application"
+	"ocdeck/internal/application/diffreview"
 )
 
 // registerGitRoutes 注册任务 worktree 的 git 状态/diff/commit/push 路由（design.md §21、§9）。
@@ -22,6 +23,12 @@ func (s *Server) registerGitRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/tasks/{id}/git/diff", s.handleGitDiff)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/git/commit", s.handleGitCommit)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/git/push", s.handleGitPush)
+	// diff-review-workbench D8：文件编辑读取/写回（3.9/3.10 的 HTTP 面）。
+	// 依赖 diffreview.Service 注入；未注入时仅注册既有 git 路由。
+	if s.diffreview != nil {
+		mux.HandleFunc("GET /api/v1/tasks/{id}/git/file", s.handleGitFileRead)
+		mux.HandleFunc("POST /api/v1/tasks/{id}/git/file", s.handleGitFileWrite)
+	}
 }
 
 // gitStatusResponse status 响应（含当前分支）。
@@ -123,4 +130,56 @@ func (s *Server) handleGitPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// handleGitFileRead GET /api/v1/tasks/{id}/git/file?path=（diff-review-workbench D8/D5）。
+// 返回文件编辑读取判别联合：editable=true（content/baseHash/lineEnding/hasBom/mode）或
+// editable=false（reasonCode/reason，reasonCode 七值枚举）。domain 校验与判定链在 service。
+func (s *Server) handleGitFileRead(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("id")
+	path := r.URL.Query().Get("path")
+	res, err := s.diffreview.ReadFile(r.Context(), taskID, path)
+	if err != nil {
+		writeApiError(w, mapDiffReviewErr(err))
+		return
+	}
+	if res.Editable {
+		writeJSONBody(w, http.StatusOK, fileEditEditableDTO{
+			Editable:   true,
+			Content:    res.Content,
+			BaseHash:   res.BaseHash,
+			LineEnding: string(res.LineEnding),
+			HasBom:     res.HasBOM,
+			Mode:       res.Mode,
+		})
+		return
+	}
+	writeJSONBody(w, http.StatusOK, fileEditNotEditableDTO{
+		Editable:   false,
+		ReasonCode: string(res.ReasonCode),
+		Reason:     res.Reason,
+	})
+}
+
+// handleGitFileWrite POST /api/v1/tasks/{id}/git/file（独占 wire 上限 4MiB，D8）。
+// 解码成功后调用 service.WriteFile（3.10 领域格式校验 + 冲突检查 + 写盘 9 步）。
+func (s *Server) handleGitFileWrite(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("id")
+	var req fileEditWriteReq
+	if ae := decodeBoundedJSON(r, &req, gitFileWriteMaxBytes); ae != nil {
+		writeApiError(w, ae)
+		return
+	}
+	res, err := s.diffreview.WriteFile(r.Context(), taskID, diffreview.FileEditWriteRequest{
+		Path:       req.Path,
+		Content:    req.Content,
+		BaseHash:   req.BaseHash,
+		LineEnding: diffreview.LineEnding(req.LineEnding),
+		BaseMode:   req.BaseMode,
+	})
+	if err != nil {
+		writeApiError(w, mapDiffReviewErr(err))
+		return
+	}
+	writeJSONBody(w, http.StatusOK, fileEditWriteResp{BaseHash: res.BaseHash})
 }

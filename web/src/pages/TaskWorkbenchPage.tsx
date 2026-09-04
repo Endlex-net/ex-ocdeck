@@ -555,7 +555,11 @@ export function TaskWorkbenchPage({
         ))}
         {visited.has(GIT_TAB) && !isDir && (
           <div className={`pane pane-scroll ${tab === GIT_TAB ? '' : 'pane-hidden'}`}>
-            <GitPanel taskID={taskID} active={tab === GIT_TAB} />
+            <GitPanel
+              taskID={taskID}
+              active={tab === GIT_TAB}
+              agentBusy={task?.agentStatus === 'busy' || task?.agentStatus === 'retry'}
+            />
           </div>
         )}
         {visited.has(SETTINGS_TAB) && (

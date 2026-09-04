@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -218,6 +219,137 @@ func TestSuspend_BranchC_PartialFailRepair(t *testing.T) {
 	// 分支 c 修复成功 → 回 active。
 	if row.Status != StatusActive {
 		t.Errorf("status = %s, want active (branch c repaired)", row.Status)
+	}
+}
+
+// cancelOnKillProc 包装 mockProc：首次 KillSession 时触发 cancel（模拟请求中途取消）。
+// 用于验证 suspending 已提交后的补偿路径使用 detached ctx 而非已取消的请求 ctx（F3）。
+type cancelOnKillProc struct {
+	*mockProc
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (p *cancelOnKillProc) KillSession(name string) (process.KillResult, error) {
+	p.once.Do(p.cancel)
+	return p.mockProc.KillSession(name)
+}
+
+// TestSuspend_BranchC_RestoreCommitCtxCancel_ConvergesSuspended（F3）：
+// 分支 c 修复成功，但恢复 active 的状态提交时请求 ctx 已取消（werr）——
+// 补偿必须使用 detached ctx 完成清理与 suspended 收敛，werr 经 cause 并入 last_error，
+// 不得伪造 killResultEntry 产生 retryable notice。
+func TestSuspend_BranchC_RestoreCommitCtxCancel_ConvergesSuspended(t *testing.T) {
+	store := newMockStore()
+	seedSuspendedTask(store, "t1", "p1")
+	store.mutTask("t1", func(t *TaskRow) { t.Status = StatusActive })
+	store.mutTask("t1", func(t *TaskRow) {
+		t.EnvSnapshot = sql.NullString{String: `{"vars":{"PATH":"/usr/bin"}}`, Valid: true}
+		t.LastPort = sql.NullInt64{Int64: 50001, Valid: true}
+	})
+	proc := newMockProc()
+	proc.sessions[serveSessionName("t1")] = true
+	proc.envValues[serveSessionName("t1")] = map[string]string{"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001"}
+	// tui/serve kill 失败 → 分支 c；serve 存活 → tryRepairRuntime 成功。
+	proc.killResults[tuiSessionName("t1")] = process.KillResult{SessionKilled: false, Disposition: process.DispositionKillFailed, CleanupTickets: []string{"tk1"}}
+	proc.killResults[serveSessionName("t1")] = process.KillResult{SessionKilled: false, Disposition: process.DispositionKillFailed, CleanupTickets: []string{"tk2"}}
+	aware := newCtxAwareStore(store)
+	m := newTestManager(t, aware, proc, newMockWorktree(), newMockOC(true))
+
+	// 首次 KillSession（tui）时取消请求 ctx：其后的 restore active 提交必因 ctx 取消失败。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.proc = &cancelOnKillProc{mockProc: proc, cancel: cancel}
+
+	err := m.Suspend(ctx, "t1")
+	if err == nil {
+		t.Fatal("Suspend should surface restore-commit failure")
+	}
+	row, _ := store.GetTask(context.Background(), "t1")
+	// detached ctx 补偿：最终必须收敛到 suspended（不得卡 suspending）。
+	if row.Status != StatusSuspended {
+		t.Fatalf("status = %s, want suspended (detached compensation)", row.Status)
+	}
+	// werr 经 cause 并入 last_error（含 restore active commit 语义）。
+	if !row.LastError.Valid || !strings.Contains(row.LastError.String, "restore active commit") {
+		t.Errorf("last_error = %v, want contains 'restore active commit'", row.LastError.String)
+	}
+	// finishSuspend 的写路径 MUST NOT 使用已取消的请求 ctx：
+	// deadCalls 只允许出现 restore active 提交那一次 UpdateTaskStatusConditional，
+	// 不得出现 finishSuspend 的 UpdateTaskStatus / UpdateTaskEnvSnapshot。
+	for _, m := range aware.deadCalls() {
+		if m == "UpdateTaskStatus" || m == "UpdateTaskEnvSnapshot" {
+			t.Errorf("finishSuspend write %q used canceled request ctx", m)
+		}
+	}
+	// 无 werr 被伪造进残留 notice（F16：tui 真实 kill 失败可合法产生 kill_failed notice，
+	// 但 restore-commit 错误 MUST NOT 经 killResultEntry 混入 notice/债务）。
+	if row.Notice.Valid && strings.Contains(row.Notice.String, "restore active commit") {
+		t.Errorf("restore-commit error must not leak into residual notice: %s", row.Notice.String)
+	}
+}
+
+// TestFinishSuspend_CauseOnlyNoFabricatedNotice（F21/F16）：
+// 直接调用 finishSuspend（空 results + 仅 cause）——cause 并入 last_error 与返回值，
+// 但 MUST NOT 产生任何残留 notice（notice 不含 killErr 文本，旧断言无法识别伪造
+// killResultEntry；此直测验证 cause 不经 killRes 通道）。
+func TestFinishSuspend_CauseOnlyNoFabricatedNotice(t *testing.T) {
+	store := newMockStore()
+	seedSuspendedTask(store, "t1", "p1")
+	store.mutTask("t1", func(t *TaskRow) { t.Status = StatusSuspending })
+	m := newTestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
+
+	cause := errors.New("restore active commit: db down")
+	err := m.finishSuspend(context.Background(), "t1", nil, cause)
+	if err == nil || !strings.Contains(err.Error(), "restore active commit") {
+		t.Fatalf("finishSuspend should return cause, got %v", err)
+	}
+	row, _ := store.GetTask(context.Background(), "t1")
+	if row.Status != StatusSuspended {
+		t.Fatalf("status = %s, want suspended", row.Status)
+	}
+	// cause 进 last_error。
+	if !row.LastError.Valid || !strings.Contains(row.LastError.String, "restore active commit") {
+		t.Errorf("last_error = %v, want contains cause", row.LastError.String)
+	}
+	// 空 results + 仅 cause → 零残留 notice。
+	if row.Notice.Valid && row.Notice.String != "" {
+		t.Errorf("no residual notice expected for cause-only finish, got %s", row.Notice.String)
+	}
+}
+
+// TestFinishSuspend_CausePlusWriteFaults_AllReasonsInReturn（F22）：
+// cause + env 清理失败 + 状态提交失败并发——返回错误必须聚合全部原因（F20：
+// 状态写失败不得被 cause 掩盖）；last_error 只含提交前已知错误（cause + env 清理失败）。
+func TestFinishSuspend_CausePlusWriteFaults_AllReasonsInReturn(t *testing.T) {
+	store := newMockStore()
+	seedSuspendedTask(store, "t1", "p1")
+	store.mutTask("t1", func(t *TaskRow) { t.Status = StatusSuspending })
+	// 用已取消的 ctx 调用 finishSuspend：ctxAwareStore 让 env 清理与状态写双双失败。
+	aware := newCtxAwareStore(store)
+	m := newTestManager(t, aware, newMockProc(), newMockWorktree(), newMockOC(true))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cause := errors.New("restore active commit: db down")
+	err := m.finishSuspend(ctx, "t1", nil, cause)
+	if err == nil {
+		t.Fatal("finishSuspend should aggregate errors")
+	}
+	// 返回聚合必须包含：cause + env 清理失败 + 状态提交失败（F20 核心）。
+	for _, want := range []string{"restore active commit", "clear env snapshot", "commit suspended"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("return error missing %q: %v", want, err)
+		}
+	}
+	// 行仍为 suspending（状态写失败），last_error 只含提交前已知错误（cause+env），
+	// 不含状态提交错误本身（无法写进该次失败的持久化操作）。
+	row, _ := store.GetTask(context.Background(), "t1")
+	if row.Status != StatusSuspending {
+		t.Errorf("status = %s, want suspending (commit failed)", row.Status)
+	}
+	if row.LastError.Valid && strings.Contains(row.LastError.String, "commit suspended") {
+		t.Errorf("last_error must not contain the commit failure itself: %s", row.LastError.String)
 	}
 }
 

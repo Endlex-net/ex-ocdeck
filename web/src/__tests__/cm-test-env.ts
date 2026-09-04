@@ -22,6 +22,11 @@ if (typeof globalThis.requestAnimationFrame === 'undefined') {
   globalThis.cancelAnimationFrame = (id: number) =>
     clearTimeout(id as unknown as ReturnType<typeof setTimeout>);
 }
+// jsdom 的 Range 缺几何 API；CM 鼠标选区路径（MouseSelection.isInPrimarySelection）会调用
+if (typeof Range !== 'undefined' && !Range.prototype.getClientRects) {
+  Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
+  Range.prototype.getBoundingClientRect = () => ({}) as DOMRect;
+}
 
 /** 覆盖 matchMedia（DiffViewer 形态默认值依赖）：matches=true 模拟 ≤1024px 窄屏。 */
 export function stubMatchMedia(matches: boolean) {

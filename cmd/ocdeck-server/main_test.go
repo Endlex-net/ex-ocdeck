@@ -13,6 +13,7 @@ import (
 	ocdeckevent "ocdeck/internal/domain/event"
 	ocdecktask "ocdeck/internal/domain/task"
 	"ocdeck/internal/infrastructure/eventbus"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // stubTaskRepo 嵌入 application.TaskRepository，仅覆盖本测试触达的
@@ -88,4 +89,114 @@ func TestP165_BusWiring_LifecyclePublishesToSubscribers(t *testing.T) {
 		t.Fatalf("same-value write should not publish, got %s", ev.Type)
 	case <-time.After(50 * time.Millisecond):
 	}
+}
+
+// TestDiffReviewStartupFailClosed 验证生产接线的启动收敛 fail-closed 语义（F1/F12）：
+// 构造 composition-root 等价的 diffreview service（SQLite adapter），ConvergeOnStartup
+// 在正常 DB 上成功（sending→delivery_unknown）；断言启动序列在收敛失败时 MUST 不开放 API/调度器
+// （run() 中 Reconcile 前调用 ConvergeDiffReviewOnStartup，返回 error 即拒绝启动）。
+func TestDiffReviewStartupFailClosed(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	// composition-root 等价：构造 store adapter（与 main.go 同源）。
+	repo := store.NewDiffReviewRepoAdapter(db.Queries)
+
+	// 无 sending 行 → 收敛 0 行成功（正常启动路径）。
+	n, err := repo.ConvergeDiffReviewOnStartup(ctx)
+	if err != nil {
+		t.Fatalf("converge on clean db should succeed, got %v", err)
+	}
+	if n != 0 {
+		t.Errorf("clean db converge affected = %d, want 0", n)
+	}
+
+	// 构造一个 sending 行，验证收敛成功（sending→delivery_unknown）。
+	if err := seedTaskForSubmissions(ctx, db); err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	if err := seedSendingSubmission(ctx, db, "s1", "t1"); err != nil {
+		t.Fatalf("seed sending submission: %v", err)
+	}
+	n, err = repo.ConvergeDiffReviewOnStartup(ctx)
+	if err != nil {
+		t.Fatalf("converge with sending row should succeed, got %v", err)
+	}
+	if n != 1 {
+		t.Errorf("converge affected = %d, want 1", n)
+	}
+}
+
+// TestDiffReviewStartupFailClosed_OnWriteFailure 验证 F12①：收敛写库失败时启动编排 MUST fail-closed
+// （不开放 API/调度器）。经生产 gate 函数 diffReviewStartupGate（与 main.go run() 共用同一函数）
+// 断言编排层在收敛失败时不调用 openAPI（而非仅断言 converge 返回 error）。
+func TestDiffReviewStartupFailClosed_OnWriteFailure(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	// 先种 FK 父行 + 一条 sending 行，再关闭 DB 使收敛写失败。
+	if err := seedTaskForSubmissions(ctx, db); err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	if err := seedSendingSubmission(ctx, db, "s1", "t1"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	db.Close() // 关闭 DB，后续 ConvergeOnStartup 写库失败。
+
+	repo := store.NewDiffReviewRepoAdapter(db.Queries)
+	apiOpened := false
+	openAPI := func() error { apiOpened = true; return nil }
+	gateErr := diffReviewStartupGate(ctx, repo, openAPI)
+	if gateErr == nil {
+		t.Fatal("startup gate should return error on converge write failure (fail-closed)")
+	}
+	if apiOpened {
+		t.Fatal("fail-closed violated: openAPI called despite converge write failure")
+	}
+}
+
+// TestDiffReviewStartupFailClosed_OnSuccessOpensAPI 验证 F12①：收敛成功时启动编排开放 API。
+func TestDiffReviewStartupFailClosed_OnSuccessOpensAPI(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	repo := store.NewDiffReviewRepoAdapter(db.Queries)
+	apiOpened := false
+	openAPI := func() error { apiOpened = true; return nil }
+	if err := diffReviewStartupGate(ctx, repo, openAPI); err != nil {
+		t.Fatalf("startup gate on clean db should succeed, got %v", err)
+	}
+	if !apiOpened {
+		t.Fatal("converge success should open API")
+	}
+}
+
+// seedTaskForSubmissions 种 diff_review_submissions 的 FK 父行（project + task；
+// 与 store 包测试同款最小行，满足 submissions.task_id → tasks.id → projects.id）。
+func seedTaskForSubmissions(ctx context.Context, db *store.DB) error {
+	if err := db.CreateProject(ctx, "p1", "proj", "/tmp/repo", "main", "repo"); err != nil {
+		return err
+	}
+	return db.CreateTask(ctx, store.TaskRow{
+		ID: "t1", ProjectID: "p1", Name: "task", Branch: "b", Status: "suspended", WorktreePath: "/tmp/wt",
+	})
+}
+
+// seedSendingSubmission 插入一条 sending 状态的 diff_review_submission 行（供启动收敛测试）。
+func seedSendingSubmission(ctx context.Context, db *store.DB, id, taskID string) error {
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO diff_review_submissions
+		   (id, task_id, status, target_session_id, message_id, note, payload, truncated, error, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, taskID, "sending", "sess1", "msg_seed", "", "", 0, "", 1)
+	return err
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"ocdeck/internal/application"
 	"ocdeck/internal/infrastructure/git"
@@ -90,6 +91,10 @@ func (m *Manager) GitStatus(ctx context.Context, taskID string) (GitStatusDTO, e
 // 错误矩阵：词法非法/新侧真实路径逃逸 → invalid_input；未解决冲突 → invalid_state；
 // ref 解析与旧侧 git 失败、子模块 dirty 探测失败 → git_error（透传 stderr）；
 // 新侧非 ENOENT IO 错误 → internal。
+//
+// 本方法为公共加锁入口：阶段①词法校验 → tryLockTask → 阶段② task/worktree/repo kind 校验，
+// 随后调 gitDiffLocked（已持锁核心 helper，承载阶段③④⑤⑥ + UTF-8 规范化管线）。
+// 组装器（D7）MUST 只调 gitDiffLocked（禁止递归加锁）。
 func (m *Manager) GitDiff(ctx context.Context, taskID, ref, path string, untracked bool) (GitDiffDTO, error) {
 	// 阶段①：纯词法校验。untracked 组合约束沿用既有消息；path 校验与工作区读取同源
 	//（git.ValidateDiffPath）。MUST 在任务锁与任何 git 命令/文件读取之前完成。
@@ -123,8 +128,18 @@ func (m *Manager) GitDiff(ctx context.Context, taskID, ref, path string, untrack
 		return GitDiffDTO{}, err
 	}
 
+	return m.gitDiffLocked(ctx, row, ref, path, untracked)
+}
+
+// gitDiffLocked 为已持锁核心 helper（design.md D7 末段 + D9 + specs/git-operations「文件 diff 查看」）。
+// 承载阶段③ref 解析 → ④旧侧探测+读取 → ⑤新侧读取 → ⑥DTO 组装，并在读取两侧 git.SideContent
+// 后对 Content 施加 UTF-8 规范化管线（raw bytes 已由 git 包完成 NUL 嗅探与 524288 byte 截断；
+// 此处追加 ToValidUTF8 + rune 边界 524288 截断）。调用方 MUST 已持任务锁并完成阶段①②校验。
+// 组装器（D7）直接调用本 helper，禁止经公共 GitDiff 入口（会递归加锁死锁）。
+func (m *Manager) gitDiffLocked(ctx context.Context, row TaskRow, ref, path string, untracked bool) (GitDiffDTO, error) {
 	// 阶段③：ref 解析（词法校验全部通过后执行；untracked 模式已保证 ref 为空）。
 	oid := ""
+	var err error
 	if ref != "" {
 		oid, err = git.ResolveRefOID(ctx, row.WorktreePath, ref)
 		if err != nil {
@@ -162,22 +177,70 @@ func (m *Manager) GitDiff(ctx context.Context, taskID, ref, path string, untrack
 		return GitDiffDTO{}, newOpErr(codeInternal, err)
 	}
 
+	// UTF-8 规范化管线（specs/git-operations「文件 diff 查看」单侧内容处理管线唯一顺序）：
+	// raw bytes → NUL 嗅探（git 包 finalizeSideContent 已完成）→ ToValidUTF8（非法序列替换
+	// U+FFFD）→ 规范化结果按 UTF-8 rune 边界限制至 524288 bytes。truncated=true iff 原始
+	// 读取超限（SideContent.Truncated）或规范化结果因上限被裁短（替换扩张导致的裁短同样置位）。
+	// mode 120000/160000 的侧内容为链接目标/commit OID 文本，规范化无害。
+	oldNorm, oldTrunc := normalizeDiffSideContent(oldSide.Content, oldSide.Truncated)
+	newNorm, newTrunc := normalizeDiffSideContent(newSide.Content, newSide.Truncated)
+
 	// 阶段⑥：DTO 组装。isBinary=任一侧二进制，置位后清空两侧内容但不改变 truncated。
 	dto := GitDiffDTO{
-		OldContent: oldSide.Content,
-		NewContent: newSide.Content,
-		OldExists:  oldSide.Exists,
-		NewExists:  newSide.Exists,
-		OldMode:    oldSide.Mode,
-		NewMode:    newSide.Mode,
-		IsBinary:   oldSide.IsBinary || newSide.IsBinary,
-		Truncated:  oldSide.Truncated || newSide.Truncated,
+		OldContent:   oldNorm,
+		NewContent:   newNorm,
+		OldExists:    oldSide.Exists,
+		NewExists:    newSide.Exists,
+		OldMode:      oldSide.Mode,
+		NewMode:      newSide.Mode,
+		IsBinary:     oldSide.IsBinary || newSide.IsBinary,
+		Truncated:    oldTrunc || newTrunc,
+		OldTruncated: oldTrunc,
+		NewTruncated: newTrunc,
 	}
 	if dto.IsBinary {
 		dto.OldContent = ""
 		dto.NewContent = ""
 	}
 	return dto, nil
+}
+
+// normalizeDiffSideContent 对单侧内容施加 UTF-8 规范化与 rune 边界 524288 byte 上限
+//（specs/git-operations「文件 diff 查看」单侧内容处理管线后两步）。
+// rawTruncated 为 git 包 finalizeSideContent 已判定的原始读取超限标志。
+// 返回 (normalized, truncated)：truncated=true iff rawTruncated 或规范化结果因 rune 边界裁短。
+func normalizeDiffSideContent(content string, rawTruncated bool) (string, bool) {
+	// ToValidUTF8 把非法字节序列替换为 U+FFFD（"\uFFFD"）。非空内容时规范化；空串透传避免无谓分配。
+	normalized := content
+	if content != "" {
+		normalized = strings.ToValidUTF8(content, "\uFFFD")
+	}
+	truncated := rawTruncated
+	// 规范化结果按 UTF-8 rune 边界限制至 FileContentMaxBytes：超限时截到不超过上限的最后一个
+	// rune 边界，并置位 truncated（替换扩张使规范化结果超过上限同样裁短置位）。
+	if len(normalized) > git.FileContentMaxBytes {
+		normalized = truncateAtRuneBoundary(normalized, git.FileContentMaxBytes)
+		truncated = true
+	}
+	return normalized, truncated
+}
+
+// truncateAtRuneBoundary 将 s 截到不超过 maxBytes 的最长 UTF-8 rune 边界前缀。
+// 不会在多字节 rune 中间截断（避免产生新的非法字节）。
+func truncateAtRuneBoundary(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	// 回退到不超过 maxBytes 的最后一个 rune 起始字节。
+	end := maxBytes
+	for end > 0 {
+		// utf8.RuneStart: 该字节是 rune 的首字节（非 continuation byte 10xxxxxx）。
+		if (s[end]&0xC0) != 0x80 {
+			break
+		}
+		end--
+	}
+	return s[:end]
 }
 
 // GitCommit 在任务 worktree 中暂存 paths（非空时）并以 message 提交（design.md §9/§21）。

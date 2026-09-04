@@ -608,6 +608,9 @@ func (m *Manager) commitRuntimeReady(ctx context.Context, taskID, wtPath, runtim
 		if fatalErr := m.incidentFatalFor(taskID, rt.instVersion); fatalErr != nil {
 			go m.ensureRecovery(taskID, rt.instVersion)
 		}
+		// F3：active 提交后才启动 diff review 调度器（此前启动会让首探抢跑，
+		// taskOcClient 拒绝非 active task）。幂等（已运行则 no-op）。
+		m.StartDiffReviewSchedulerForTask(m.lifeCtx, taskID)
 		return nil
 	}
 	fresh, rerr := m.store.GetTask(ctx, taskID)
@@ -618,6 +621,9 @@ func (m *Manager) commitRuntimeReady(ctx context.Context, taskID, wtPath, runtim
 	}
 	if fresh.Status == StatusActive {
 		if cur := m.getRuntime(taskID); cur != nil && cur.instVersion == rt.instVersion {
+			// 幂等提交：另一 committer 已完成 CAS（其已启动调度器）；此处补一次
+			// 幂等启动无妨（已运行则 no-op）。
+			m.StartDiffReviewSchedulerForTask(m.lifeCtx, taskID)
 			return nil
 		}
 	}

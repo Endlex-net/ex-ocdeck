@@ -51,6 +51,9 @@
   --font-ui: Inter, system-ui, -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
 
+  /* 编辑器光标（CM .cm-cursor border-left / caret-color 消费）：浅底用墨色（≈18:1 对比度） */
+  --editor-caret: var(--ink);
+
   --radius: 8px;
   --shadow-pop: 0 4px 16px color-mix(in oklch, var(--fg) 12%, transparent);
   --sidebar-w: 232px;
@@ -86,6 +89,9 @@
   --term-green: oklch(0.78 0.16 155);
   --term-red: oklch(0.72 0.17 27);
   --shadow-pop: 0 4px 16px color-mix(in oklch, black 45%, transparent);
+
+  /* 编辑器光标：深底墨色不可见（CM 缺省黑），用户指定琥珀色 rgb(255,204,2) 的精确 oklch 等价（≈12:1 对比度） */
+  --editor-caret: oklch(0.8652 0.1766 90.35);
 }
 
 /* 侧栏比内容区再深一档（VS Code 式层级），与终端区分（派生自 --bg，非新色相字面量） */

@@ -1116,6 +1116,15 @@ select.input {
   padding: 10px 0 24px;
 }
 
+/* 单侧存在（纯新增/纯删除）并排形态的空侧坍缩：wrapper 0 宽 + 隐藏，存在侧 flexGrow 铺满全宽。
+   语义仍是并排 MergeView（手势/编辑/内联批注区走并排路径）；空侧 EditorView 实例保留
+   （merge 对齐需要高度测量），但 0 宽不可见、不可交互、不进 Tab 焦点序。 */
+.diff-collapse-a .cm-mergeViewEditor:has(> .cm-editor.cm-merge-a),
+.diff-collapse-b .cm-mergeViewEditor:has(> .cm-editor.cm-merge-b) {
+  flex: 0 0 0;
+  visibility: hidden;
+}
+
 /* 并排（.cm-mergeView 容器）与单列（单个 .cm-editor）统一外框 */
 .diff-editor > .cm-mergeView,
 .diff-editor > .cm-editor {
@@ -1246,6 +1255,45 @@ select.input {
 
 .tok-inserted {
   color: color-mix(in oklch, var(--success) 80%, var(--fg));
+}
+
+/* markdown 结构化标记（classHighlighter 实测类名；全部走设计系统变量派生） */
+.tok-heading {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.tok-strong {
+  font-weight: 600;
+}
+
+.tok-emphasis {
+  font-style: italic;
+}
+
+.tok-strikethrough {
+  text-decoration: line-through;
+}
+
+.tok-link {
+  color: var(--accent);
+}
+
+.tok-url {
+  color: var(--muted);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklch, var(--muted) 45%, transparent);
+}
+
+.tok-quote {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.tok-monospace {
+  background: var(--surface);
+  border-radius: 3px;
+  padding: 0 2px;
 }
 
 /* ---------- 工作台页头「⋯」溢出菜单（design task-workbench.html wb-overflow） ----------
@@ -1506,4 +1554,409 @@ select.input {
     border-top: 1px solid var(--border);
     margin-top: 4px;
   }
+}
+/* ---------- diff review 批注 / 编辑模式（diff-review-workbench design D8，tasks 5.5 视觉定稿） ---------- */
+
+/* busy 编辑警告横幅（D6）：醒目但不挡操作——顶部细条，非弹层 */
+.alert-warn {
+  color: var(--warn);
+  background: var(--warn-soft);
+}
+
+/* 编辑模式工具栏状态与门禁原因 */
+.edit-status {
+  color: var(--muted);
+  font-size: 11px;
+  align-self: center;
+}
+
+.edit-gate-reason {
+  color: var(--muted);
+  font-size: 11px;
+  align-self: center;
+}
+
+.edit-gate-note {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.edit-restore-confirm {
+  color: var(--warn);
+  font-size: 11px;
+  align-self: center;
+}
+
+.edit-conflict-bar {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.edit-conflict-bar > span:first-child {
+  flex: 1;
+  min-width: 0;
+  white-space: normal;
+}
+
+.edit-conflict-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* 批注 gutter：行号右侧窄车道，小圆点不遮挡代码、不改变红绿语义 */
+.cm-annotationGutter {
+  width: 14px;
+}
+
+.cm-annotationDot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  margin-top: 1px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 8px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.75;
+}
+
+.cm-annotationDot:hover {
+  opacity: 1;
+}
+
+.cm-annotationDot-stale {
+  background: var(--warn);
+}
+
+/* 批注候选选区高亮（框选后内联批注区打开期间） */
+.cm-annotationCandidate {
+  background: var(--accent-soft);
+  outline: 1px dashed color-mix(in oklch, var(--accent) 45%, var(--border));
+}
+
+/* 内联批注区（批注 6，参考 GitLab 变更评论）：最后选中行下方切开的内嵌卡片。
+   嵌在 CM block widget 里随编辑器滚动——低存在感边框、无浮层阴影、不遮挡其他行 */
+.ann-inline-host {
+  display: block;
+  cursor: default;
+  /* 不换行长行：宿主在 .cm-content 内容流内宽度跟随最长行，横向滚动会把卡片推出视口。
+     sticky 把卡片钉在可视区内（left 偏移与宽度由 syncInlineHostWidth 量测 scroller 可视宽 /
+     gutters 宽后内联设置，钉在内容区左缘、避开 sticky gutters；未设置时回退默认块级宽度
+     ——换行场景内容宽即可视宽，行为不变） */
+  position: sticky;
+  left: 0;
+  box-sizing: border-box;
+}
+
+.ann-inline {
+  margin: 2px 0 4px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  border-radius: 6px;
+  /* 宿主继承 .cm-content 的等宽字体与 pre 排版，卡片恢复 UI 字体与正常空白折叠 */
+  font-family: var(--font-ui);
+  white-space: normal;
+}
+
+.ann-inline-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.ann-inline-title {
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ann-inline-side {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.ann-inline-input {
+  width: 100%;
+  min-width: 0;
+  resize: vertical;
+  font-size: 12px;
+}
+
+.ann-inline-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 行范围标签（低存在感，左侧占位） */
+.ann-inline-range {
+  margin-right: auto;
+  color: var(--muted);
+  font-size: 11px;
+  user-select: none;
+}
+
+/* 快捷键提示（低存在感） */
+.ann-inline-hint {
+  color: var(--muted);
+  font-size: 10px;
+  user-select: none;
+}
+
+/* 批注列表面板：低存在感，嵌于 git 侧栏 */
+.review-panel {
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: 45%;
+}
+
+.review-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.review-title {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.review-collapse {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.review-capability-note {
+  margin: 0 10px 6px;
+  color: var(--warn);
+  font-size: 11px;
+}
+
+.review-panel .error-line {
+  margin: 0 10px 6px;
+}
+
+.ann-list {
+  overflow: auto;
+  min-height: 0;
+  padding: 0 6px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ann-empty {
+  color: var(--muted);
+  font-size: 11px;
+  padding: 8px 6px;
+}
+
+.ann-item {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 8px;
+  background: var(--bg);
+}
+
+.ann-item-highlight {
+  border-color: color-mix(in oklch, var(--accent) 55%, var(--border));
+  background: var(--accent-soft);
+}
+
+.ann-item-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.ann-item-loc {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ann-stale-badge {
+  flex-shrink: 0;
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-radius: 8px;
+  padding: 0 6px;
+  font-size: 10px;
+}
+
+.ann-comment {
+  font-size: 12px;
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-top: 3px;
+}
+
+.ann-item-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.ann-danger {
+  color: var(--danger);
+}
+
+.ann-edit-input {
+  width: 100%;
+  min-width: 0;
+  resize: vertical;
+  font-size: 12px;
+  margin-top: 3px;
+}
+
+/* 提交分区（队列/失败/历史） */
+.subs {
+  border-top: 1px solid var(--border);
+  padding: 4px 6px 6px;
+  overflow: auto;
+  min-height: 0;
+}
+
+.subs-section + .subs-section {
+  margin-top: 6px;
+}
+
+.subs-title {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 2px 4px;
+}
+
+.subs-item {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 8px;
+  margin-top: 3px;
+  background: var(--bg);
+}
+
+.subs-item-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--fg);
+}
+
+.subs-time {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
+.subs-note {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 2px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.subs-error {
+  color: var(--danger);
+  font-size: 11px;
+  margin-top: 2px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 提交只读详情（历史快照 / 失败 payload） */
+.subs-detail {
+  margin-top: 5px;
+  border-top: 1px dashed var(--border);
+  padding-top: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.subs-detail-payload-title {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.subs-snapshot,
+.subs-payload {
+  margin: 0;
+  padding: 5px 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 1.5;
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: text;
+}
+
+/* 提交预览弹层 */
+.od-modal.ann-preview {
+  max-width: 560px;
+}
+
+.ann-preview-hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+
+.ann-preview-list {
+  max-height: 40vh;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.ann-preview-excluded {
+  opacity: 0.6;
+}
+
+.ann-excluded-note {
+  color: var(--muted);
+  font-size: 11px;
+  align-self: center;
+}
+
+.ann-note-input {
+  width: 100%;
+  min-width: 0;
+  resize: vertical;
+  font-size: 12px;
 }

@@ -681,6 +681,8 @@ func TestReadWorktreeSideContent_DirectoryEscapeRejected(t *testing.T) {
 }
 
 // TestReadWorktreeSideContent_BoundedPrefix512KB 验证 512KB+1 有界读取判定截断。
+// F10：SideContent.Content 现为完整 raw（工作区有界读取上限 FileContentMaxBytes+1），
+// 不再预截断；Truncated 仅表示原始读取超限，rune-safe 裁短由核心 helper 完成。
 func TestReadWorktreeSideContent_BoundedPrefix512KB(t *testing.T) {
 	repo := newTestRepo(t)
 	content := strings.Repeat("x", FileContentMaxBytes+10)
@@ -694,11 +696,12 @@ func TestReadWorktreeSideContent_BoundedPrefix512KB(t *testing.T) {
 	if !sc.Exists || !sc.Truncated {
 		t.Fatalf("big file: got %+v, want Exists+Truncated", sc)
 	}
-	if len(sc.Content) != FileContentMaxBytes {
-		t.Errorf("truncated content len = %d, want %d", len(sc.Content), FileContentMaxBytes)
+	// raw 有界读取上限为 FileContentMaxBytes+1（用于判定超限），不预截断。
+	if len(sc.Content) != FileContentMaxBytes+1 {
+		t.Errorf("raw content len = %d, want %d (bounded read, no pre-truncation)", len(sc.Content), FileContentMaxBytes+1)
 	}
-	if sc.Content != content[:FileContentMaxBytes] {
-		t.Error("truncated content must be the bounded prefix")
+	if sc.Content != content[:FileContentMaxBytes+1] {
+		t.Error("raw content must be the bounded read prefix (FileContentMaxBytes+1)")
 	}
 
 	// 恰好 512KB：不截断。
@@ -805,7 +808,9 @@ func TestReadSideContent_IndexInvariant(t *testing.T) {
 }
 
 // TestReadRefSideContent_OverflowTruncated 验证 git show 超 16MB exec 上限的
-// ErrOutputTruncated 真值表：stdout 非空且 stderr 空 → 512KB 有界前缀 + Truncated，不报错。
+// ErrOutputTruncated 真值表：stdout 非空且 stderr 空 → 返回 raw + Truncated=true，不报错。
+// F10：SideContent.Content 为 exec 上限内的 raw（execOutputLimit=16MB），不预截断；
+// rune-safe 裁短由核心 helper 完成。
 func TestReadRefSideContent_OverflowTruncated(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping >16MB blob test in -short mode")
@@ -825,8 +830,9 @@ func TestReadRefSideContent_OverflowTruncated(t *testing.T) {
 	if !sc.Truncated {
 		t.Error("overflow should return Truncated=true")
 	}
-	if len(sc.Content) != FileContentMaxBytes {
-		t.Errorf("overflow content len = %d, want %d", len(sc.Content), FileContentMaxBytes)
+	// F10：raw 为 exec 上限内全部 stdout（16MB），不预截断为 512KB。
+	if len(sc.Content) <= FileContentMaxBytes {
+		t.Errorf("overflow raw content len = %d, want > %d (no pre-truncation)", len(sc.Content), FileContentMaxBytes)
 	}
 }
 

@@ -89,9 +89,8 @@ func (m *Manager) suspendRun(ctx context.Context, taskID string, mode AlignMode)
 	// infra 错误作为 killResultEntry（killErr）传入 finishSuspend，使 last_error 含 infra 上下文
 	//（finishSund 会提交 suspended + 记 notice + 以 firstErr 作 last_error）。
 	if herr != nil && !errors.Is(herr, process.ErrNoTmuxServer) {
-		forceRes := m.forceKillAll(ctx, []string{tuiName, processName, legacyServe})
-		forceRes = append(forceRes, killResultEntry{name: processName, killErr: herr})
-		return newOpErr(codeProcessError, m.finishSuspend(ctx, taskID, forceRes))
+		base := []killResultEntry{{name: processName, killErr: herr}}
+		return newOpErr(codeProcessError, m.cleanupAndFinalizeSuspendDetached(ctx, taskID, base, []string{tuiName, processName, legacyServe}, nil))
 	}
 
 	// KillSession 全部会话：tui → shells → serve（design.md §19；serve 最后杀，
@@ -101,24 +100,23 @@ func (m *Manager) suspendRun(ctx context.Context, taskID string, mode AlignMode)
 	//（infra 错误作为 killResultEntry 传入 finishSund，使 last_error 含 infra 上下文）。
 	shellNames, err := m.listShellSessions(taskID)
 	if err != nil {
-		forceRes := m.forceKillAll(ctx, []string{tuiName, processName, legacyServe})
-		forceRes = append(forceRes, killResultEntry{name: processName, killErr: err})
-		return newOpErr(codeProcessError, m.finishSuspend(ctx, taskID, append(killRes, forceRes...)))
+		killRes = append(killRes, killResultEntry{name: processName, killErr: err})
+		return newOpErr(codeProcessError, m.cleanupAndFinalizeSuspendDetached(ctx, taskID, killRes, []string{tuiName, processName, legacyServe}, nil))
 	}
 	killRes = append(killRes, m.killTaskSessions(ctx, taskID, shellNames)...)
 	killRes = append(killRes, m.killTaskSessions(ctx, taskID, []string{processName, legacyServe})...)
 
-	// 分支 a：kill 前 serve 已死 → 继续完成剩余清理 → suspended。
+	// 分支 a：kill 前 serve 已死 → 继续完成剩余清理 → suspended（detached finalize，F3）。
 	if !serveAliveBeforeKill {
-		return m.finishSuspend(ctx, taskID, killRes)
+		return m.finalizeSuspendDetached(ctx, taskID, killRes, nil)
 	}
 
 	// 分支 b/c：kill 前 serve 存活。
 	// 判定是否有 kill 失败（B7：以 kill 结果为准，非 kill 后 HasSession）。
 	hasFailure := hasKillFailure(killRes)
 	if !hasFailure {
-		// 分支 b：全部成功 → suspended。
-		return m.finishSuspend(ctx, taskID, killRes)
+		// 分支 b：全部成功 → suspended（detached finalize，F3）。
+		return m.finalizeSuspendDetached(ctx, taskID, killRes, nil)
 	}
 
 	// 分支 c：serve 存活但有 kill 失败 → 尝试修复运行时（恢复完整运行时，B7）。
@@ -126,13 +124,59 @@ func (m *Manager) suspendRun(ctx context.Context, taskID string, mode AlignMode)
 	if ferr == nil && fixed {
 		// 修复成功 → 回 active + last_error（design.md §5）。
 		le := sql.NullString{String: "suspend partially failed, runtime repaired", Valid: true}
-		_, _ = m.writeStatusConditional(ctx, taskID, StatusSuspending, StatusActive, le)
+		cas, werr := m.writeStatusConditional(ctx, taskID, StatusSuspending, StatusActive, le)
+		if werr != nil {
+			// F3：写失败必须走补偿清理（本文件收敛约束：任意失败路径收敛到 active 或
+			// suspended，不得留修复出的 runtime 悬挂在 suspending）。集中 helper：
+			// detached cleanup（独立预算）+ detached finalize（独立预算），不被请求取消打断。
+			// F16/F20：werr 经 cause 并入 last_error 与返回值（MUST NOT 伪造 killResultEntry）。
+			return newOpErr(codeInternal, m.cleanupAndFinalizeSuspendDetached(ctx, taskID, killRes,
+				[]string{tuiName, processName, legacyServe}, fmt.Errorf("restore active commit: %w", werr)))
+		}
+		if !cas.Matched {
+			// F3：复读状态——已是 active（另一路径已提交，runtime 可用）→ 幂等成功并启动
+			// 调度器；否则清理本次修复的 runtime 并收敛挂起（不得静默返回成功）。
+			cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			fresh, rerr := m.store.GetTask(cctx, taskID)
+			ccancel()
+			if rerr == nil && fresh.Status == StatusActive && m.getRuntime(taskID) != nil {
+				m.StartDiffReviewSchedulerForTask(m.lifeCtx, taskID)
+				return nil
+			}
+			m.clearRuntime(taskID)
+			return m.cleanupAndFinalizeSuspendDetached(ctx, taskID, killRes, []string{tuiName, processName, legacyServe}, nil)
+		}
+		// F3：恢复 active 提交成功后启动 diff review 调度器（tryRepairRuntime 经
+		// setRuntime 注册运行时，但 setRuntime 不再承担启动点）。幂等。
+		m.StartDiffReviewSchedulerForTask(m.lifeCtx, taskID)
 		return nil
 	}
 	// 修复失败或期间 serve 死亡 → 转分支 a：强制 kill 残余 → suspended。
-	forceRes := m.forceKillAll(ctx, []string{tuiName, processName, legacyServe})
+	// F3：已提交 suspending 后的补偿统一走集中 helper（detached cleanup/finalize 独立预算，
+	// tryRepairRuntime 因请求取消失败时也不被打断）。
+	return m.cleanupAndFinalizeSuspendDetached(ctx, taskID, killRes, []string{tuiName, processName, legacyServe}, nil)
+}
+
+// finalizeSuspendDetached 以独立 detached finalize ctx 提交 finishSuspend（F3：
+// suspending 已提交后的收敛统一入口——不被请求取消打断；无强制清理需求的分支 a/b 用）。
+func (m *Manager) finalizeSuspendDetached(ctx context.Context, taskID string, killRes []killResultEntry, cause error) error {
+	fctx, fcancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer fcancel()
+	return m.finishSuspend(fctx, taskID, killRes, cause)
+}
+
+// cleanupAndFinalizeSuspendDetached 先强制清理（独立 detached cleanup 预算，90s 覆盖
+// forceKillAll 串行 KillSession 的多次 30s 预算），cleanup 完成后另起独立 detached
+// finalize ctx（30s）提交 finishSuspend（F3：cleanup 耗尽不会影响 finalize 预算）。
+// killRes 为 kill 阶段已收集结果；forceNames 为需强制 kill 的会话名；cause 为生命周期
+// 原因错误（经 finishSuspend 并入 last_error/返回值，不产生 notice）。
+func (m *Manager) cleanupAndFinalizeSuspendDetached(ctx context.Context, taskID string, killRes []killResultEntry, forceNames []string, cause error) error {
+	m.clearRuntime(taskID)
+	cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), 90*time.Second)
+	forceRes := m.forceKillAll(cctx, forceNames)
+	ccancel()
 	killRes = append(killRes, forceRes...)
-	return m.finishSuspend(ctx, taskID, killRes)
+	return m.finalizeSuspendDetached(ctx, taskID, killRes, cause)
 }
 
 // killResultEntry 记录一次 KillSession 结果。
@@ -184,48 +228,50 @@ func hasKillFailure(results []killResultEntry) bool {
 
 // finishSund 落为 suspended：逐项聚合记录残留 notice（killRes + 强制清理中的失败项），
 // 清除 env 快照，置 suspended。
-// suspended 状态提交失败 MUST 处理：env 快照/状态写回失败记 last_error 并返回错误，
-// 不得静默置为无效流转（design.md §19 Suspend 行：kill 失败记 notice + last_error）。
-func (m *Manager) finishSuspend(ctx context.Context, taskID string, results []killResultEntry) error {
-	var firstErr error
+// cause 为生命周期原因错误（如恢复 active 提交失败），仅并入 last_error 与返回值——
+// F16：MUST NOT 经 killResultEntry 伪造进程清理失败（那会错误产生 retryable kill_failed
+// notice，后续 Activate 被债务拒绝）；只有真实进程清理失败（killRes 内的 killErr）
+// 才产生 residual notice。
+// F20 错误聚合：cause 与全部操作错误（notice 记录失败/env 清理失败/状态提交失败）经
+// errors.Join 聚合返回——状态写失败 MUST 无条件进入返回值（不得被 cause 预先占据 firstErr
+// 而丢失）；last_error 保存提交前已知错误（cause + notice/env 错误），状态提交自身的错误
+// 仅进入返回聚合（无法写进该次失败的持久化操作）。调用方不得用包含 cause 的返回值判断
+// 补偿本身是否失败。
+// suspended 状态提交失败 MUST 处理：不得静默置为无效流转（design.md §19 Suspend 行）。
+func (m *Manager) finishSuspend(ctx context.Context, taskID string, results []killResultEntry, cause error) error {
+	var errs []error
+	if cause != nil {
+		errs = append(errs, cause)
+	}
 	for _, r := range results {
 		if r.killErr != nil {
 			// 基础设施错误：记 notice（reason=kill_failed, retryable=true，保留 tickets）。
 			if nerr := m.recordResidualNotice(ctx, taskID, r.name, r.result.CleanupTickets, noticeReasonKillFailed, true); nerr != nil {
-				if firstErr == nil {
-					firstErr = fmt.Errorf("record notice %s: %w", r.name, nerr)
-				}
+				errs = append(errs, fmt.Errorf("record notice %s: %w", r.name, nerr))
 			}
-			if firstErr == nil {
-				firstErr = fmt.Errorf("kill session %s: %w", r.name, r.killErr)
-			}
+			errs = append(errs, fmt.Errorf("kill session %s: %w", r.name, r.killErr))
 			continue
 		}
 		if nerr := m.recordResidualNoticeFromDisposition(ctx, taskID, r.name, r.result); nerr != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("record notice %s: %w", r.name, nerr)
-			}
+			errs = append(errs, fmt.Errorf("record notice %s: %w", r.name, nerr))
 		}
 	}
 	// 清除 env 快照（design.md §2：Suspend 成功清快照）。
 	if _, err := m.writeEnvSnapshot(ctx, taskID, sql.NullString{}); err != nil {
-		if firstErr == nil {
-			firstErr = fmt.Errorf("clear env snapshot: %w", err)
-		}
+		errs = append(errs, fmt.Errorf("clear env snapshot: %w", err))
 	}
 	le := sql.NullString{}
-	if firstErr != nil {
-		le = sql.NullString{String: firstErr.Error(), Valid: true}
+	if joined := errors.Join(errs...); joined != nil {
+		le = sql.NullString{String: joined.Error(), Valid: true}
 	}
 	if _, err := m.writeStatus(ctx, taskID, StatusSuspended, le); err != nil {
-		if firstErr == nil {
-			firstErr = fmt.Errorf("commit suspended: %w", err)
-		}
+		// F20：状态提交失败无条件进入返回值（不得被 cause 掩盖）。
+		errs = append(errs, fmt.Errorf("commit suspended: %w", err))
 	} else {
 		// 任务离开 active：撤销收敛债务登记（best-effort compare-and-delete，design.md D2）。
 		m.deleteConvergeDebt(taskID)
 	}
-	return firstErr
+	return errors.Join(errs...)
 }
 
 // tryRepairRuntime 尝试修复运行时（design.md §5 分支 c，B7）。

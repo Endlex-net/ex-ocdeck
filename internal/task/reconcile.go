@@ -375,6 +375,8 @@ func (m *Manager) resumeActive(ctx context.Context, t TaskRow) error {
 		m.clearRuntime(t.ID)
 		return fmt.Errorf("commit active on resume: %w", err)
 	}
+	// F3：active 提交后才启动 diff review 调度器（避免首探抢跑非 active task）。幂等。
+	m.StartDiffReviewSchedulerForTask(m.lifeCtx, t.ID)
 	return nil
 }
 

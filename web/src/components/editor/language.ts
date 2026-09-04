@@ -15,6 +15,7 @@ export function extractExtension(path: string): string {
 /** 扩展名 → 语言 loader 静态映射表（design D7 唯一清单）；命中后经动态 import() 按需加载。 */
 const languageLoaders: Record<string, () => Promise<Extension>> = {
   '.md': async () => (await import('@codemirror/lang-markdown')).markdown(),
+  '.markdown': async () => (await import('@codemirror/lang-markdown')).markdown(),
   '.json': async () => (await import('@codemirror/lang-json')).json(),
   '.yaml': async () => (await import('@codemirror/lang-yaml')).yaml(),
   '.yml': async () => (await import('@codemirror/lang-yaml')).yaml(),

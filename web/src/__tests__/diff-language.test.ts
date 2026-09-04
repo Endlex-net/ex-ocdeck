@@ -32,6 +32,7 @@ describe('loadLanguage（映射表唯一清单，动态加载）', () => {
   it('映射表内扩展名全部可加载为非空 Extension', async () => {
     const paths = [
       'a.md',
+      'a.markdown',
       'a.json',
       'a.yaml',
       'a.yml',
@@ -47,6 +48,34 @@ describe('loadLanguage（映射表唯一清单，动态加载）', () => {
     for (const p of paths) {
       expect(await loadLanguage(p), p).not.toBeNull();
     }
+  });
+
+  it('markdown 渲染产出结构化高亮 token（批注 2：tok-heading/strong/emphasis/link 等）', async () => {
+    const { EditorView } = await import('@codemirror/view');
+    const { syntaxHighlighting } = await import('@codemirror/language');
+    const { classHighlighter } = await import('@lezer/highlight');
+    const lang = await loadLanguage('a.md');
+    expect(lang).not.toBeNull();
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    const view = new EditorView({
+      parent: host,
+      doc: '# 标题\n\n普通 **加粗** *斜体* [链接](https://x)\n',
+      extensions: [lang!, syntaxHighlighting(classHighlighter)],
+    });
+    await new Promise((r) => setTimeout(r, 200));
+    const classes = new Set<string>();
+    host.querySelectorAll('[class*="tok-"]').forEach((el) =>
+      el.classList.forEach((c) => {
+        if (c.startsWith('tok-')) classes.add(c);
+      }),
+    );
+    expect(classes.has('tok-heading')).toBe(true);
+    expect(classes.has('tok-strong')).toBe(true);
+    expect(classes.has('tok-emphasis')).toBe(true);
+    expect(classes.has('tok-link')).toBe(true);
+    view.destroy();
+    host.remove();
   });
 
   it('未识别扩展名返回 null（纯文本降级，不报错）', async () => {
