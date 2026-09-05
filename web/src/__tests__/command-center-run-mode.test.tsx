@@ -8,7 +8,7 @@ import { emitPaletteFocus, __resetPaletteFocusForTest } from '../palette-focus';
 import { mount, flushUI, stubMatchMedia } from './cm-test-env';
 import type { Project } from '../types';
 
-/* ==================== 新建任务面板运行模式（add-local-path-task-mode tasks 5.7） ====================
+/* ==================== 新建任务面板工作空间（add-local-path-task-mode tasks 5.7） ====================
  * 覆盖 command-center delta「指挥中心内联新建任务」：
  * - 三态：默认 worktree（选择器+基准分支）/ local-path（隐藏基准分支、绕过 ready 门禁、
  *   逐字提醒、提交 mode=local-path 且无 base_ref）/ dir（不渲染选择器、保留色块警告、无 mode）
@@ -173,15 +173,15 @@ function renderPage(ui: React.ReactElement = <CommandCenterPage />) {
   return utils;
 }
 
-describe('新建任务面板运行模式三态（add-local-path-task-mode 5.7）', () => {
-  it('默认态：repo 项目缺省「隔离 worktree」，渲染基准分支，提交体不含 mode 字段（presence）', async () => {
+describe('新建任务面板工作空间三态（add-local-path-task-mode 5.7）', () => {
+  it('默认态：repo 项目缺省「worktree」，渲染基准分支，提交体不含 mode 字段（presence）', async () => {
     const { container } = renderPage();
     await openWithProject('ocdeck', 'p1');
 
-    // 双段选择器渲染，缺省选中「隔离 worktree」
+    // 双段选择器渲染，缺省选中「worktree」
     expect(container.querySelector('#cc-new-task-panel .cc-segment')).not.toBeNull();
-    expect(radio(container, '隔离 worktree').getAttribute('aria-checked')).toBe('true');
-    expect(radio(container, '就地运行').getAttribute('aria-checked')).toBe('false');
+    expect(radio(container, 'worktree').getAttribute('aria-checked')).toBe('true');
+    expect(radio(container, 'local').getAttribute('aria-checked')).toBe('false');
     expect(hasBranchField(container)).toBe(true);
     // 非 local-path 提醒、非 dir 色块警告
     expect(modeHint(container)).toBeNull();
@@ -201,12 +201,12 @@ describe('新建任务面板运行模式三态（add-local-path-task-mode 5.7）
     const { container } = renderPage();
     await openWithProject('ocdeck', 'p1');
     await act(async () => {
-      radio(container, '就地运行').click();
+      radio(container, 'local').click();
     });
     await flushUI();
 
-    expect(radio(container, '就地运行').getAttribute('aria-checked')).toBe('true');
-    expect(radio(container, '隔离 worktree').getAttribute('aria-checked')).toBe('false');
+    expect(radio(container, 'local').getAttribute('aria-checked')).toBe('true');
+    expect(radio(container, 'worktree').getAttribute('aria-checked')).toBe('false');
     // 基准分支字段整体隐藏（非禁用）
     expect(hasBranchField(container)).toBe(false);
     // 灰字提醒逐字文案（command-center delta「运行模式选择器（repo）」）
@@ -241,9 +241,9 @@ describe('新建任务面板运行模式三态（add-local-path-task-mode 5.7）
     await dispatchSubmit(container);
     expect(api.createTask).not.toHaveBeenCalled();
 
-    // 切到就地运行：不再等待分支列表 ready，loading 在途仍可提交
+    // 切到 local：不再等待分支列表 ready，loading 在途仍可提交
     await act(async () => {
-      radio(container, '就地运行').click();
+      radio(container, 'local').click();
     });
     await flushUI();
     expect(submitBtn(container).disabled).toBe(false);
@@ -264,7 +264,7 @@ describe('新建任务面板运行模式三态（add-local-path-task-mode 5.7）
     await openWithProject('plain', 'd1');
 
     expect(container.querySelector('#cc-new-task-panel .cc-segment')).toBeNull();
-    expect(container.textContent).not.toContain('就地运行');
+    expect(container.textContent).not.toContain('local');
     // 现有色块警告原样保留，与 local-path 灰字提醒互斥
     expect(dirWarn(container)).not.toBeNull();
     expect(dirWarn(container)!.textContent).toContain('纯目录项目无文件隔离');
@@ -279,34 +279,34 @@ describe('新建任务面板运行模式三态（add-local-path-task-mode 5.7）
 });
 
 describe('选择器状态重置规则（add-local-path-task-mode 5.7）', () => {
-  it('项目 ID 变更（切换项目/切到 dir/清除选择）重置为「隔离 worktree」', async () => {
+  it('项目 ID 变更（切换项目/切到 dir/清除选择）重置为「worktree」', async () => {
     storeProjects = [proj('p1', 'ocdeck'), proj('p2', 'other'), proj('d1', 'plain', { kind: 'dir' })];
     const { container } = renderPage();
     await openWithProject('ocdeck', 'p1');
     await act(async () => {
-      radio(container, '就地运行').click();
+      radio(container, 'local').click();
     });
     await flushUI();
-    expect(radio(container, '就地运行').getAttribute('aria-checked')).toBe('true');
+    expect(radio(container, 'local').getAttribute('aria-checked')).toBe('true');
 
     // ① 切换项目：p1 → p2（repo → repo）
     await openWithProject('other', 'p2');
-    expect(radio(container, '隔离 worktree').getAttribute('aria-checked')).toBe('true');
-    expect(radio(container, '就地运行').getAttribute('aria-checked')).toBe('false');
+    expect(radio(container, 'worktree').getAttribute('aria-checked')).toBe('true');
+    expect(radio(container, 'local').getAttribute('aria-checked')).toBe('false');
 
     // ② repo → dir：选择器不渲染（dir）；切回 repo 后验证未继承就地选择
     await act(async () => {
-      radio(container, '就地运行').click();
+      radio(container, 'local').click();
     });
     await flushUI();
     await openWithProject('plain', 'd1');
     expect(container.querySelector('#cc-new-task-panel .cc-segment')).toBeNull();
     await openWithProject('other', 'p2');
-    expect(radio(container, '隔离 worktree').getAttribute('aria-checked')).toBe('true');
+    expect(radio(container, 'worktree').getAttribute('aria-checked')).toBe('true');
 
     // ③ 清除项目选择（偏离已选输入）→ 重选另一 repo：仍缺省 worktree
     await act(async () => {
-      radio(container, '就地运行').click();
+      radio(container, 'local').click();
     });
     await flushUI();
     await act(async () => {
@@ -315,8 +315,8 @@ describe('选择器状态重置规则（add-local-path-task-mode 5.7）', () => 
     await flushUI();
     expect(container.querySelector('#cc-new-task-panel .cc-segment')).toBeNull();
     await openWithProject('ocdeck', 'p1');
-    expect(radio(container, '隔离 worktree').getAttribute('aria-checked')).toBe('true');
-    expect(radio(container, '就地运行').getAttribute('aria-checked')).toBe('false');
+    expect(radio(container, 'worktree').getAttribute('aria-checked')).toBe('true');
+    expect(radio(container, 'local').getAttribute('aria-checked')).toBe('false');
   });
 
   it('同项目手动切换保留已选分支与分支状态，不重新请求分支列表', async () => {
@@ -329,7 +329,7 @@ describe('选择器状态重置规则（add-local-path-task-mode 5.7）', () => 
       setInput(branchInput(container), 'develop');
     });
     await act(async () => {
-      radio(container, '就地运行').click();
+      radio(container, 'local').click();
     });
     await flushUI();
     expect(hasBranchField(container)).toBe(false);
@@ -337,7 +337,7 @@ describe('选择器状态重置规则（add-local-path-task-mode 5.7）', () => 
 
     // 切回 worktree：基准分支字段恢复展示、已选分支保留、分支列表状态保持原样
     await act(async () => {
-      radio(container, '隔离 worktree').click();
+      radio(container, 'worktree').click();
     });
     await flushUI();
     expect(hasBranchField(container)).toBe(true);
@@ -349,11 +349,11 @@ describe('选择器状态重置规则（add-local-path-task-mode 5.7）', () => 
     expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'develop');
   });
 
-  it('不改变项目的信号保持 mode：无 payload new（keep）不重置就地运行', async () => {
+  it('不改变项目的信号保持 mode：无 payload new（keep）不重置 local 选择', async () => {
     const { container } = renderPage();
     await openWithProject('ocdeck', 'p1');
     await act(async () => {
-      radio(container, '就地运行').click();
+      radio(container, 'local').click();
     });
     await flushUI();
 
@@ -362,7 +362,7 @@ describe('选择器状态重置规则（add-local-path-task-mode 5.7）', () => 
     });
     await flushUI();
 
-    expect(radio(container, '就地运行').getAttribute('aria-checked')).toBe('true');
+    expect(radio(container, 'local').getAttribute('aria-checked')).toBe('true');
     expect(modeHint(container)).not.toBeNull();
     expect(hasBranchField(container)).toBe(false);
   });
@@ -374,11 +374,11 @@ describe('选择器状态重置规则（add-local-path-task-mode 5.7）', () => 
 
     // 同项目反复切换模式：不重新请求分支列表
     await act(async () => {
-      radio(container, '就地运行').click();
+      radio(container, 'local').click();
     });
     await flushUI();
     await act(async () => {
-      radio(container, '隔离 worktree').click();
+      radio(container, 'worktree').click();
     });
     await flushUI();
     expect(api.listBranches).toHaveBeenCalledTimes(1);

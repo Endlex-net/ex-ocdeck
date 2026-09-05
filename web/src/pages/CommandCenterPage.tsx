@@ -783,7 +783,7 @@ function NewTaskPanel({
   const [projListOpen, setProjListOpen] = useState(false);
   const [taskName, setTaskName] = useState('');
   const [baseRef, setBaseRef] = useState('');
-  // 运行模式（add-local-path-task-mode）：仅 repo 项目渲染选择器，缺省 worktree。
+  // 工作空间选择器（add-local-path-task-mode）：仅 repo 项目渲染，缺省 worktree。
   const [runMode, setRunMode] = useState<TaskMode>('worktree');
   // D9 分支列表状态机：idle|loading|ready|error，与 lastSuccessfulBranches 正交。
   // 仅 ready 计算提交候选；loading/error 禁止提交；dir 项目无此状态机（恒 idle）。
@@ -851,7 +851,7 @@ function NewTaskPanel({
     ++projGenRef.current;
     selectedProjectRef.current = selectedProject;
     // 选择器状态重置规则：已选项目 ID 变更（含切换项目、清除选择、切到 dir）→ 重置为
-    // 缺省「隔离 worktree」，防止新选 repo 未经用户再次主动选择即以就地模式提交；
+    // 缺省「worktree」，防止新选 repo 未经用户再次主动选择即以就地模式提交；
     // 不改变项目 ID 的信号（同项目 apply / keep / 无 payload new）保持选择器现状。
     const pid = selectedProject?.id ?? null;
     if (pid !== lastProjectIdRef.current) {
@@ -1035,11 +1035,11 @@ function NewTaskPanel({
           )}
         </div>
 
-        {/* 运行模式（仅 repo）：双段 segmented control，缺省「隔离 worktree」；
+        {/* 工作空间（仅 repo）：双段 segmented control，缺省「worktree」；
             dir 项目不渲染（dir 本就就地运行，色块警告在下方保留） */}
         {selectedProject && !isDir && (
           <div className="od-field">
-            <label className="od-label" id={modeGroupId}>运行模式</label>
+            <label className="od-label" id={modeGroupId}>工作空间</label>
             <div className="cc-segment" role="radiogroup" aria-labelledby={modeGroupId}>
               <button
                 type="button"
@@ -1049,7 +1049,7 @@ function NewTaskPanel({
                 // 同项目手动切换：MUST NOT 清空已选分支、MUST NOT 重新请求分支列表
                 onClick={() => setRunMode('worktree')}
               >
-                隔离 worktree
+                worktree
               </button>
               <button
                 type="button"
@@ -1058,7 +1058,7 @@ function NewTaskPanel({
                 className={`cc-segment-item${runMode === 'local-path' ? ' on' : ''}`}
                 onClick={() => setRunMode('local-path')}
               >
-                就地运行
+                local
               </button>
             </div>
             {/* 低可见度提醒（local-path 选中时）：12px 灰字、无色块无边框；
