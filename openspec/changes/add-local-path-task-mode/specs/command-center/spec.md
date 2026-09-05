@@ -41,11 +41,11 @@
 
 ### Requirement: 指挥中心内联新建任务
 
-指挥中心 MUST 提供内联新建任务面板：项目选择（可过滤下拉）、任务名、运行模式选择器（双段 segmented control：「隔离 worktree / 就地运行」，仅 repo 项目选中时渲染，缺省选中「隔离 worktree」；dir 项目 MUST NOT 渲染该选择器）、基准分支选择（repo 项目）与"刷新远端分支"；纯目录项目 MUST 展示多任务共享目录警告。**提交门禁**：仅当已选中有效项目 ID 且任务名非空时 MUST 才可发起 POST（按钮禁用）；用户在选择后继续编辑项目输入导致偏离已选项时 MUST 清除已选项目 ID；`base_ref` MUST 仅对 repo 项目的 worktree 模式提交；提交在途期间 MUST 防重复提交。repo 项目 worktree 模式另须分支列表状态为 `ready`（见下）才可提交；local-path 模式下 MUST NOT 等待分支列表 ready（分支列表状态不作为提交门禁）。创建成功 MUST 跳转新任务工作台；创建失败 MUST 展示错误原因。面板行为 MUST 复用项目管理页相同的创建契约（`POST /api/v1/projects/{id}/tasks`，worktree 模式可选 `base_ref`，local-path 模式提交 MUST 携带 `mode=local-path` 且 MUST NOT 携带 `base_ref`）。
+指挥中心 MUST 提供内联新建任务面板：项目选择（可过滤下拉）、任务名、工作空间选择器（双段 segmented control：「worktree / local」，仅 repo 项目选中时渲染，缺省选中「worktree」；dir 项目 MUST NOT 渲染该选择器）、基准分支选择（repo 项目）与"刷新远端分支"；纯目录项目 MUST 展示多任务共享目录警告。**提交门禁**：仅当已选中有效项目 ID 且任务名非空时 MUST 才可发起 POST（按钮禁用）；用户在选择后继续编辑项目输入导致偏离已选项时 MUST 清除已选项目 ID；`base_ref` MUST 仅对 repo 项目的 worktree 模式提交；提交在途期间 MUST 防重复提交。repo 项目 worktree 模式另须分支列表状态为 `ready`（见下）才可提交；local-path 模式下 MUST NOT 等待分支列表 ready（分支列表状态不作为提交门禁）。创建成功 MUST 跳转新任务工作台；创建失败 MUST 展示错误原因。面板行为 MUST 复用项目管理页相同的创建契约（`POST /api/v1/projects/{id}/tasks`，worktree 模式可选 `base_ref`，local-path 模式提交 MUST 携带 `mode=local-path` 且 MUST NOT 携带 `base_ref`）。
 
-**运行模式选择器（repo）**：选中「就地运行」时：基准分支字段（含刷新远端分支按钮）MUST 整体隐藏（非禁用）；提交 MUST NOT 携带 `base_ref`、MUST 携带 `mode=local-path`；选择器下方 MUST 显示低可见度提醒（12px 灰字、无色块无边框），文案 MUST 逐字为：「直接在项目目录里跑，改动就地生效。多任务共享同一目录，并行与否自己把握。」；底部 od-hint 文案 MUST 切换为「创建后直接在当前目录运行并进入工作台，不切分支。」切换模式 MUST NOT 清空已选分支、MUST NOT 重新请求分支列表（切回「隔离 worktree」时基准分支字段与分支列表状态恢复原样）。dir 项目的现有色块警告 MUST 原样保留，与 local-path 灰字提醒条件互斥、不得叠加。
+**工作空间选择器（repo）**：选中「local」时：基准分支字段（含刷新远端分支按钮）MUST 整体隐藏（非禁用）；提交 MUST NOT 携带 `base_ref`、MUST 携带 `mode=local-path`；选择器下方 MUST 显示低可见度提醒（12px 灰字、无色块无边框），文案 MUST 逐字为：「直接在项目目录里跑，改动就地生效。多任务共享同一目录，并行与否自己把握。」；底部 od-hint 文案 MUST 切换为「创建后直接在当前目录运行并进入工作台，不切分支。」切换模式 MUST NOT 清空已选分支、MUST NOT 重新请求分支列表（切回「worktree」时基准分支字段与分支列表状态恢复原样）。dir 项目的现有色块警告 MUST 原样保留，与 local-path 灰字提醒条件互斥、不得叠加。
 
-**选择器状态重置规则**：面板挂载时选择器为缺省「隔离 worktree」；已选项目 ID 发生变更（含切换项目、清除项目选择、从 repo 切到 dir）时，选择器 MUST 重置为「隔离 worktree」——防止新选 repo 未经用户再次主动选择即以就地模式提交。仅同一项目内的手动模式切换适用上文联动规则（保留已选分支与分支列表状态）。不改变已选项目的面板信号（如无 payload 的 new / action=keep 初始化信号）MUST 保持选择器现状；若信号导致已选项目 ID 变化，按项目变更重置。repo 项目选中后的初次分支列表请求 MUST 始终发起（与现状一致，与当前模式无关），保证切回 worktree 时分支数据可用。
+**选择器状态重置规则**：面板挂载时选择器为缺省「worktree」；已选项目 ID 发生变更（含切换项目、清除项目选择、从 repo 切到 dir）时，选择器 MUST 重置为「worktree」——防止新选 repo 未经用户再次主动选择即以就地模式提交。仅同一项目内的手动模式切换适用上文联动规则（保留已选分支与分支列表状态）。不改变已选项目的面板信号（如无 payload 的 new / action=keep 初始化信号）MUST 保持选择器现状；若信号导致已选项目 ID 变化，按项目变更重置。repo 项目选中后的初次分支列表请求 MUST 始终发起（与现状一致，与当前模式无关），保证切回 worktree 时分支数据可用。
 
 **基准分支列表状态（repo）**：MUST 维护 `idle | loading | ready | error`，与 `lastSuccessfulBranches` 正交。选中 repo 项目后立即进入 `loading` 并发起初次 `GET /api/v1/projects/{id}/branches`；成功（含返回空数组）进入 `ready` 并写入 `lastSuccessfulBranches`；失败进入 `error` 并保留错误文案，此时无历史数据，列表为空。点击「刷新远端分支」进入 `loading`（refresh 在途，MUST NOT 清空 `lastSuccessfulBranches`）；成功进入 `ready` 并覆盖 `lastSuccessfulBranches`；失败进入 `error`，MUST 保留最近一次 ready 数据作为 stale 列表展示，并标注「本地快照未刷新」及重试入口。`loading` 与 `error` 时 MUST 禁止提交（按钮禁用，Enter 不发起 POST；该门禁仅作用于 worktree 模式）。仅 `ready` 时按下方规则计算过滤首项并允许提交；stale 列表 MUST NOT 用于 `filteredBranches[0]` 或提交。dir 项目无此状态机。切走 repo 项目时重置为 `idle` 并清空 `lastSuccessfulBranches`。
 
@@ -71,8 +71,8 @@
 
 #### Scenario: 切换项目时模式选择器重置
 
-- **WHEN** 用户在 repo 项目 A 下选中「就地运行」，随后切换选中项目（含切到 dir 项目或清除选择后重选）
-- **THEN** 运行模式选择器 MUST 重置为「隔离 worktree」，不继承项目 A 的就地运行选择
+- **WHEN** 用户在 repo 项目 A 下选中「local」，随后切换选中项目（含切到 dir 项目或清除选择后重选）
+- **THEN** 工作空间选择器 MUST 重置为「worktree」，不继承项目 A 的就地运行选择
 
 #### Scenario: 纯目录项目警告
 
@@ -186,20 +186,20 @@
 
 #### Scenario: 选择就地运行创建任务
 
-- **WHEN** 用户在 repo 项目新建任务面板选中「就地运行」并提交
+- **WHEN** 用户在 repo 项目新建任务面板选中「local」并提交
 - **THEN** `POST /api/v1/projects/{id}/tasks` 请求携带 `mode=local-path` 且不携带 `base_ref`，创建成功后跳转新任务工作台
 
 #### Scenario: local-path 模式下分支列表未 ready 仍可提交
 
-- **WHEN** 用户在 repo 项目选中「就地运行」，分支列表状态为 `loading`、`error` 或尚未发起，任务名非空并提交
+- **WHEN** 用户在 repo 项目选中「local」，分支列表状态为 `loading`、`error` 或尚未发起，任务名非空并提交
 - **THEN** 提交不被分支列表状态阻断，请求正常发起
 
 #### Scenario: dir 项目不渲染模式选择器
 
 - **WHEN** 用户在内联面板中选中 kind=dir 的项目
-- **THEN** 面板不渲染运行模式选择器，现有「纯目录项目无文件隔离」色块警告原样保留，不出现 local-path 灰字提醒
+- **THEN** 面板不渲染工作空间选择器，现有「纯目录项目无文件隔离」色块警告原样保留，不出现 local-path 灰字提醒
 
 #### Scenario: 模式切换保留已选分支
 
-- **WHEN** 用户在 repo 项目下已选基准分支，随后在「隔离 worktree」与「就地运行」间切换运行模式
-- **THEN** 已选分支不被清空、不重新发起 `GET /api/v1/projects/{id}/branches`；切回「隔离 worktree」时基准分支字段恢复展示且分支列表状态保持原样
+- **WHEN** 用户在 repo 项目下已选基准分支，随后在「worktree」与「local」间切换运行模式
+- **THEN** 已选分支不被清空、不重新发起 `GET /api/v1/projects/{id}/branches`；切回「worktree」时基准分支字段恢复展示且分支列表状态保持原样

@@ -114,7 +114,7 @@ activate.go:183 的 kind switch 改按 D2 有效模式：worktree → 注入 `OC
 
 ### D10：Web 新建任务面板
 
-按 proposal「UI 设计说明与框图」节实现（segmented control 默认「隔离 worktree」、local-path 联动、灰字提醒逐字文案、dir 不渲染选择器）。`api.createTask` 增加可选 mode 参数；local-path 提交不携带 `base_ref` 且绕过分支 ready 门禁。
+按 proposal「UI 设计说明与框图」节实现（segmented control 默认「worktree」、local-path 联动、灰字提醒逐字文案、dir 不渲染选择器）。`api.createTask` 增加可选 mode 参数；local-path 提交不携带 `base_ref` 且绕过分支 ready 门禁。
 
 ### D11：reconcile / recovery
 

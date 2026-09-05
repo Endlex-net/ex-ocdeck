@@ -22,7 +22,7 @@
 | dir | 缺失 | — | 非空 | invalid_input（现状不变） |
 | dir | 显式提供 | 任意取值 | 任意 | invalid_input |
 
-Web 新建任务面板 SHALL 提供运行模式选择器（双段 segmented control：「隔离 worktree / 就地运行」），仅 repo 项目选中时渲染，缺省选中「隔离 worktree」；dir 项目 MUST NOT 渲染该选择器。选中「就地运行」时：基准分支字段（含刷新远端分支按钮）MUST 整体隐藏（非禁用），提交门禁 MUST NOT 再等待分支列表 ready，底部提示文案 MUST 切换为不承诺分支/worktree 的版本；选择器下方 SHALL 显示低可见度提醒（12px 灰字、无色块无边框），文案 MUST 为：「直接在项目目录里跑，改动就地生效。多任务共享同一目录，并行与否自己把握。」切换模式 MUST NOT 清空已选分支、MUST NOT 重新请求分支列表。已选项目 ID 变更（含切换项目、清除选择、切到 dir）时，选择器 MUST 重置为缺省「隔离 worktree」（细则见 command-center spec「指挥中心内联新建任务」的「选择器状态重置规则」）。dir 项目的现有色块警告 MUST 原样保留，与 local-path 灰字提醒条件互斥、不得叠加。
+Web 新建任务面板 SHALL 提供工作空间选择器（双段 segmented control：「worktree / local」），仅 repo 项目选中时渲染，缺省选中「worktree」；dir 项目 MUST NOT 渲染该选择器。选中「local」时：基准分支字段（含刷新远端分支按钮）MUST 整体隐藏（非禁用），提交门禁 MUST NOT 再等待分支列表 ready，底部提示文案 MUST 切换为不承诺分支/worktree 的版本；选择器下方 SHALL 显示低可见度提醒（12px 灰字、无色块无边框），文案 MUST 为：「直接在项目目录里跑，改动就地生效。多任务共享同一目录，并行与否自己把握。」切换模式 MUST NOT 清空已选分支、MUST NOT 重新请求分支列表。已选项目 ID 变更（含切换项目、清除选择、切到 dir）时，选择器 MUST 重置为缺省「worktree」（细则见 command-center spec「指挥中心内联新建任务」的「选择器状态重置规则」）。dir 项目的现有色块警告 MUST 原样保留，与 local-path 灰字提醒条件互斥、不得叠加。
 
 #### Scenario: 缺省模式行为不变
 
@@ -31,13 +31,13 @@ Web 新建任务面板 SHALL 提供运行模式选择器（双段 segmented cont
 
 #### Scenario: 选择就地运行创建任务
 
-- **WHEN** 用户在 repo 项目新建任务面板选中「就地运行」并创建任务
+- **WHEN** 用户在 repo 项目新建任务面板选中「local」并创建任务
 - **THEN** 任务按 local-path 模式创建：不建 worktree/分支，直接在项目目录运行；基准分支字段不展示，提交请求携带 `mode=local-path` 且无 `base_ref`
 
 #### Scenario: dir 项目无模式选择器
 
 - **WHEN** 用户在新建任务面板选中 dir 项目
-- **THEN** 面板不渲染运行模式选择器，现有「纯目录项目无文件隔离」色块警告原样保留
+- **THEN** 面板不渲染工作空间选择器，现有「纯目录项目无文件隔离」色块警告原样保留
 
 #### Scenario: dir 项目拒绝 mode 参数
 
@@ -51,8 +51,8 @@ Web 新建任务面板 SHALL 提供运行模式选择器（双段 segmented cont
 
 #### Scenario: 就地运行选中态的联动与提醒
 
-- **WHEN** 用户在 repo 项目下将运行模式切换为「就地运行」
-- **THEN** 基准分支字段（含刷新远端分支按钮）整体隐藏；选择器下方显示灰字提醒「直接在项目目录里跑，改动就地生效。多任务共享同一目录，并行与否自己把握。」；提交不再等待分支列表加载完成；切回「隔离 worktree」时已选分支与分支列表保持原样
+- **WHEN** 用户在 repo 项目下将运行模式切换为「local」
+- **THEN** 基准分支字段（含刷新远端分支按钮）整体隐藏；选择器下方显示灰字提醒「直接在项目目录里跑，改动就地生效。多任务共享同一目录，并行与否自己把握。」；提交不再等待分支列表加载完成；切回「worktree」时已选分支与分支列表保持原样
 
 ## MODIFIED Requirements
 
