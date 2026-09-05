@@ -4,7 +4,9 @@
 export type ProjectKind = 'repo' | 'dir';
 
 /** 任务运行模式（add-local-path-task-mode D7）：worktree=隔离 worktree（repo 缺省）；
- *  local-path=就地运行（dir 项目恒为）。DTO/摘要/活跃快照均为必有字段，UI 降级按 mode 判定。 */
+ *  local-path=就地运行（dir 项目恒为）。DTO/摘要/活跃快照均为必有字段。
+ *  UI 显隐二分（6.2/D8）：Git 能力（Git tab/面板入口）仅按 project_kind==='dir' 隐藏；
+ *  任务行分支展示按 isGitlessTask（dir 或 local-path）隐藏。 */
 export type TaskMode = 'worktree' | 'local-path';
 
 export interface Project {
@@ -87,13 +89,14 @@ export interface NoticeItem {
 export interface Task {
   id: string;
   project_id: string;
-  /** 所属项目类型（add-plain-dir-project D6）：UI 降级判断依据之一（另一依据为 task.mode，local-path 同 dir 降级）。 */
+  /** 所属项目类型（add-plain-dir-project D6）：Git 能力判定唯一依据（仅 dir 隐藏 Git tab，D8）。 */
   project_kind: ProjectKind;
   name: string;
   branch: string;
   status: string;
   worktree_path: string;
-  /** 任务运行模式（必有）：worktree | local-path；git 功能降级判定依据。 */
+  /** 任务运行模式（必有）：worktree | local-path；任务行分支展示（isGitlessTask）与
+   *  删除文案/序列按 mode 判定，Git 能力不再按 mode 判定（仅 dir 隐藏，D8）。 */
   mode: TaskMode;
   last_port?: number;
   last_error?: string;
@@ -514,9 +517,12 @@ export function parseNotice(raw: Task['notice']): NoticeItem[] {
 }
 
 /**
- * 任务无 git 功能（add-plain-dir-project D7 / add-local-path-task-mode）：dir 任务与
- * repo local-path 任务同级降级。分支名/分支图标/Git 入口显隐统一按 kind+mode 判定，
- * MUST NOT 判空（branch）推断；projectKind 缺席（sessions-only 无 projects 快照）时按 mode 判定。
+ * 任务行分支展示判定（add-plain-dir-project D7 / add-local-path-task-mode 6.2）：dir 任务与
+ * repo local-path 任务无分支概念（task.branch 恒空），任务行分支名/分支图标显隐统一按
+ * kind+mode 判定，MUST NOT 判空（branch）推断；projectKind 缺席（sessions-only 无 projects
+ * 快照）时按 mode 判定。
+ * 注意：Git 能力显隐（Git tab/面板入口）不经过本函数——仅按 project_kind==='dir' 判定
+ * （add-local-path-task-mode D8），repo local-path 任务开放 Git 面板。
  */
 export function isGitlessTask(projectKind: ProjectKind | undefined, mode: TaskMode): boolean {
   return projectKind === 'dir' || mode === 'local-path';

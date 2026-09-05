@@ -8,7 +8,8 @@
 
 - repo（worktree）项目创建任务时，新增任务级运行模式选择：worktree（现状，默认）或 local-path（新增）。
 - local-path 模式下任务直接在项目 repo 目录就地运行：不创建 worktree、不创建分支、允许 dirty working tree。
-- local-path 任务的 git 语义与现有 dir 项目任务完全一致：无分支、拒绝 base_ref、删除任务时不触碰目录与 git 状态。
+- local-path 任务的删除语义与现有 dir 项目任务完全一致：无分支、拒绝 base_ref、删除任务时不触碰目录与 git 状态。
+- repo 项目 local-path（local）模式开放完整 git 管理（status/diff/diff review/commit/push，作用于项目目录当前分支）：改动就地生效、提交推送直接作用于用户分支，风险由用户自担。
 - 同一 repo 项目的多个 local-path 任务不限制并发，但 UI 提供低可见度提醒（共享同一工作目录）。
 - 任务创建界面新增模式选择器（默认 worktree），选择 local-path 时展示低可见度提示。
 - 现有 dir 项目类型保留并存，不收敛、不迁移。
@@ -16,7 +17,7 @@
 非目标：
 - 不改变 worktree 模式的任何现有行为（仍为默认）。
 - 不新增项目类型；dir 项目类型语义不变。
-- 不支持 local-path 任务的 base_ref / 分支相关能力。
+- 不创建/管理任务专属分支及 base_ref；git 操作作用于当前 checkout 分支。
 
 ## UI 设计说明与框图
 
@@ -118,7 +119,7 @@ dir 项目态（无「工作空间」选择器，现有色块警告原样保留�
 - `env-management`: 生命周期变量注入按任务模式分流（local-path 不注入分支变量，同 dir）。
 - `project-management`: 项目列表任务摘要字段表增加 `mode`；worktree 存放位置约定限定为 worktree 模式任务。
 - `task-detail-stream`: 任务详情 DTO 字段穷举增加 `mode`。
-- `git-operations`: 任务级 git 操作（status/diff/commit/push）与 diff review 门禁扩展到 local-path 任务（同 dir 拒绝）。
+- `git-operations`: dir 项目任务维持 git 操作降级；repo 项目 local-path 任务开放完整 git 操作（status/diff/diff review/commit/push，作用于当前分支）。
 - `opencode-orchestration`: session 对齐/认领语义按任务有效模式分流（local-path 走 ownedOnly，同 dir）。
 - `project-lifecycle-config`: inherit/init/pre-delete 的 kind 语义覆盖 local-path 任务（同 dir：不 inherit、init cwd 为项目目录、pre-delete 用户授权例外）。
 - `active-sessions-stream`: 活跃任务流 SSE DTO 增加 `mode` 必有字段（mode 全链路透传的一环）。
@@ -129,5 +130,5 @@ dir 项目态（无「工作空间」选择器，现有色块警告原样保留�
 - 任务数据模型：`tasks.mode` 列（migration 0013），任务级运行模式持久化与回填（存量 repo→worktree、dir→local-path）。
 - 任务生命周期分流点（14 处）：创建/重试/删除/对齐/env 注入/git 门禁从项目级 kind 改为任务级有效模式（`internal/task/`）。
 - API：`POST /api/v1/projects/{id}/tasks` 增加 `mode` 字段；任务 DTO / 项目任务摘要 / 详情 SSE / 活跃任务概览 REST 与 SSE 增加 `mode` 必有字段。
-- Web：新建任务面板模式选择器与低可见度提醒；工作台 Git tab 与删除确认弹窗按任务 mode 降级（`web/src/`）。
+- Web：新建任务面板模式选择器与低可见度提醒；工作台 Git tab 对 repo local-path 任务显示（仅 dir 隐藏）、删除确认弹窗按任务 mode 出文案（`web/src/`）。
 - 复用现有 dir 项目任务语义（`createDir` 路径），不引入新的项目类型。

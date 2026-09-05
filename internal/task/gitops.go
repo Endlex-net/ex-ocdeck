@@ -21,11 +21,17 @@ type GitStatusDTO = application.GitStatusDTO
 type GitDiffDTO = application.GitDiffDTO
 
 // assertGitRepoTask 解析任务有效模式，校验该任务可作为 git 操作目标（add-plain-dir-project D5
-// + add-local-path-task-mode D8）。
-// 在执行任何 git 命令/文件读取/子仓库探测前调用：local-path 模式任务 → codeInvalidInput
-//（dir 项目为"纯目录项目非 git 仓库"；repo 项目 local-path 模式为"就地运行任务无 git worktree"，
-// 文案按模式区分）；非法 kind/mode 组合 → codeInternal fail-closed。worktree 模式任务通过，
-// 返回 ProjectRow 供后续 git 命令使用。
+// + add-local-path-task-mode D8 修订：repo 项目 local-path 模式开放完整 git 能力）。
+// 在执行任何 git 命令/文件读取/子仓库探测前调用：
+//   - worktree 模式任务（repo 项目 worktree）→ 通过，返回 ProjectRow；
+//   - local-path 模式任务（repo 项目 local-path）→ 通过，返回 ProjectRow（操作作用于项目目录
+//     当前 checkout 的当前分支，row.WorktreePath 即项目路径，无 base_ref 依赖）；
+//   - dir 项目任务 → codeInvalidInput（文案不变：「纯目录项目非 git 仓库」）；
+//   - 非法 kind/mode 组合 → codeInternal fail-closed。
+//
+// 风险归属（design D8 显式契约）：repo local-path 任务的操作对象是用户主仓库当前分支，
+// 改动就地生效、提交与推送直接作用于用户分支；dirty 混杂与直接提交/推送主仓库分支的风险
+// 由用户自担（与 local-path 共享目录语义一致）。
 func (m *Manager) assertGitRepoTask(ctx context.Context, row TaskRow) (ProjectRow, error) {
 	proj, err := m.store.GetProject(ctx, row.ProjectID)
 	if err != nil {
@@ -37,13 +43,12 @@ func (m *Manager) assertGitRepoTask(ctx context.Context, row TaskRow) (ProjectRo
 		return ProjectRow{}, newOpErr(codeInternal, rerr)
 	}
 	switch effMode {
-	case TaskModeWorktree:
-		return proj, nil
-	case TaskModeLocalPath:
+	case TaskModeWorktree, TaskModeLocalPath:
+		// repo 项目两种模式均放行 git 能力；dir 项目恒为 local-path 但走下方 dir 拒绝分支。
 		if proj.Kind == ProjectKindDir {
 			return ProjectRow{}, newOpErr(codeInvalidInput, errors.New("project kind is dir (not a git repository)"))
 		}
-		return ProjectRow{}, newOpErr(codeInvalidInput, errors.New("task runs in local-path mode (in-place, no git worktree)"))
+		return proj, nil
 	default:
 		return ProjectRow{}, newOpErr(codeInternal, fmt.Errorf("task %s: unknown effective mode %q", row.ID, effMode))
 	}

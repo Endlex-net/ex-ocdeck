@@ -14,7 +14,7 @@
 - [x] 2.4 删除链路：删除入口（delete.go:61）、`deleteResume`（delete.go:135）、删除 Retry（crud.go:453-506）按有效模式分流；repo 序列前置 PreflightDelete/dirty 快照与 Retry 的 DirtyFiles+confirmDirty 门禁按有效模式跳过。错误处置按 2.1 分层：首次 Delete/Retry 在状态写前拒绝；deleteResume 解析失败仅落 `deletion_failed + last_error`（design D4）
 - [x] 2.5 会话对齐：`alignModeForKind` 改为按有效模式解析（local-path→OwnedOnly）。调用点全覆盖：Activate（activate.go:299）、Suspend（suspend.go:40）、恢复双入口（recovery.go:295/400）、reconcile（reconcile.go:313）、attach_shell（attach_shell.go:62）；四个运行时入口（Activate、persist 重启恢复 resumeActive、挂起修复 tryRepairRuntime、自动重拉恢复 ensureRecovery）在任何状态修改或运行时副作用前完成解析（opencode-orchestration delta「session 归属捕获」）（design D5）
 - [x] 2.6 生命周期变量：`layerEnvSnapshot`（activate.go:183）按有效模式注入分支变量——worktree 注入 BASE/HEAD，local-path 两键不存在；非法 kind/mode 组合 → internal error（不持久化快照、不建进程）（design D9）
-- [x] 2.7 git 门禁：`assertGitRepoTask`（gitops.go:26）按有效模式拒绝 local-path：invalid_input、在任何 git 命令/文件读取/子仓库探测前拒绝；原因文案按模式区分（语义契约见 git-operations delta「纯目录项目任务的 git 操作降级」，非逐字冻结）。覆盖 status/diff/commit/push 与 diff review（diffreview_adapters.go:186）（design D8）
+- [x] 2.7 git 门禁：`assertGitRepoTask`（gitops.go:26）按有效模式拒绝 local-path（git 能力部分已由 6.x 推翻）：invalid_input、在任何 git 命令/文件读取/子仓库探测前拒绝；原因文案按模式区分（语义契约见 git-operations delta「纯目录项目任务的 git 操作降级」，非逐字冻结）。覆盖 status/diff/commit/push 与 diff review（diffreview_adapters.go:186）（design D8）
 - [x] 2.8 reconcile/recovery：reconcile 对 local-path 任务跳过 git/产物验证并保持 creating→creation_failed 收敛语义（同 dir）；recovery 仅按 D5 分流对齐模式，锚定 claim 冲突语义不变（design D11）
 - [x] 2.9 **分流点复查验收（G2）**：grep `proj.Kind` 与 `alignModeForKind` 全部调用点，对照 design Context 表 14 处分流点逐一确认已按有效模式驱动，无遗漏
 
@@ -29,7 +29,7 @@
 
 - [x] 4.1 `web/src/types.ts` Task/TaskSummary/ActiveSessionItem 增加 `mode`；`api.createTask` 增加可选 mode 参数（design D7/D10）
 - [x] 4.2 新建任务面板（CommandCenterPage.tsx 内联面板）：双段 segmented control「worktree / local」（仅 repo 渲染、缺省 worktree）；local-path 联动（隐藏基准分支字段、绕过 ready 门禁、灰字提醒逐字文案「直接在项目目录里跑，改动就地生效。多任务共享同一目录，并行与否自己把握。」、底部 hint 换文案）；选择器状态重置规则（项目 ID 变更重置为 worktree；同项目手动切换保留分支状态；不改变项目的信号保持现状；repo 初次分支请求始终发起）（command-center delta「指挥中心内联新建任务」含「选择器状态重置规则」）
-- [x] 4.3 工作台 Git tab 与分支展示对 local-path 任务隐藏（TaskWorkbenchPage.tsx:228，同 dir 降级）；删除确认弹窗按任务 mode 出文案——dir：「仅删除任务记录与 opencode 会话数据，不会删除项目目录及其内容」；repo local-path：「仅删除任务记录与 opencode 会话数据，不会删除项目目录及其内容、不改动 git 状态」；两者共同：normal 且配置 pre_delete script 时提示该脚本仍会执行、不出现 worktree/dirty 删除确认项（task-lifecycle delta 弹窗场景）
+- [x] 4.3 工作台 Git tab 与分支展示对 local-path 任务隐藏（TaskWorkbenchPage.tsx:228，同 dir 降级）（git 能力部分已由 6.x 推翻）；删除确认弹窗按任务 mode 出文案——dir：「仅删除任务记录与 opencode 会话数据，不会删除项目目录及其内容」；repo local-path：「仅删除任务记录与 opencode 会话数据，不会删除项目目录及其内容、不改动 git 状态」；两者共同：normal 且配置 pre_delete script 时提示该脚本仍会执行、不出现 worktree/dirty 删除确认项（task-lifecycle delta 弹窗场景）
 
 ## 5. 测试与验收
 
@@ -37,8 +37,17 @@
 - [x] 5.2 删除：repo local-path 走 dir 序列（normal/force/retry），内建逻辑不触碰项目目录与 git 状态；pre_delete normal 执行（cwd=项目目录）/retry 重执行/force 跳过；非法 kind/mode 组合：首次 Delete/Retry 状态写前拒绝零副作用、deleteResume 仅落 deletion_failed+last_error 无后续副作用
 - [x] 5.3 对齐与运行时入口：同 repo 两个 local-path 任务 OwnedOnly 互不认领（复用 session_isolation_test.go 模式）；四个运行时入口（Activate/resumeActive/tryRepairRuntime/ensureRecovery）+ Suspend/reconcile/attach_shell 逐一验收按有效模式解析；非法组合（dir+worktree、未知 kind、未知 mode）断言状态/runtime/SSE/align/anchor 均未变化
 - [x] 5.4 env：local-path 任务激活不注入分支变量（init/pre_delete 直接调用 layerEnvSnapshot 路径同规）；非法 kind/mode 组合 internal error（不持久化快照、不建进程）
-- [x] 5.5 git 门禁：local-path 任务 status/diff/commit/push 与 diff review → invalid_input，且 git runner 调用数、文件读取、子仓库探测均为零
+- [x] 5.5 git 门禁：local-path 任务 status/diff/commit/push 与 diff review → invalid_input（git 能力部分已由 6.x 推翻），且 git runner 调用数、文件读取、子仓库探测均为零
 - [x] 5.6 DTO/API 传播：任务详情 REST 与 SSE、项目列表与详情摘要、活跃 REST/SSE snapshot/update 帧——mode 必有且与持久化同源；损坏数据分派全覆盖（任务 DTO/摘要 fail-closed；活跃 REST 500；SSE 初始 500、update 保持 dirty 重试）
-- [x] 5.7 Web：面板三态（默认 worktree/local-path/dir）与选择器重置规则；弹窗文案按 dir/local-path 区分与 pre-delete 提示；Git tab 降级
+- [x] 5.7 Web：面板三态（默认 worktree/local-path/dir）与选择器重置规则；弹窗文案按 dir/local-path 区分与 pre-delete 提示；Git tab 降级（git 能力部分已由 6.x 推翻）
 - [x] 5.8 行为测试有效性证据：每个新增/修改的行为测试在旧实现下失败、新实现下通过（mutation 式验证或基线运行）
 - [x] 5.9 `openspec validate add-local-path-task-mode --strict` 通过；`go build ./...` 与相关包测试通过；web 测试通过
+
+## 6. local-path git 能力开放（review 裁决改判）
+
+- [x] 6.1 后端门禁放行：`assertGitRepoTask`（gitops.go:29）改按 D2 有效模式——repo + local-path 放行 status/diff/commit/push/diff review，全部作用于项目目录当前 checkout 的当前分支（commit 落 HEAD、push `git push -u origin <当前分支>` 禁 force、diff review 经 DiffSourcePortAdapter.ReadLocked 同一门禁，来源 `(ref, path, untracked)` 由 UI 传入）；dir 维持 invalid_input 拒绝（文案不变）；非法 kind/mode 组合仍 internal fail-closed。行为测试：local-path 各操作放行且落点为项目目录、dir 拒绝不变、非法组合零副作用（design D8）
+- [x] 6.2 Web 判定拆分（MUST NOT 直接收窄共享 helper `isGitlessTask`，web/src/types.ts:516——否则任务行分支名会错误显示）：
+  - Git 能力判定：仅 dir 隐藏——repo local-path 任务显示 Git tab 与 git 面板入口（TaskWorkbenchPage）
+  - 任务分支展示判定：dir 或 local-path 隐藏——工作台页头任务分支名（`task.branch` 恒为空，GitPanel 内实时分支显示）与指挥中心/项目页任务行分支显示维持隐藏
+  - 点名更新 `web/src/types.ts`（isGitlessTask 相关注释）与 `TaskWorkbenchPage.tsx` 残留旧注释；测试覆盖三态（dir：Git tab 与分支均隐藏 / repo worktree：均显示 / repo local-path：Git tab 显示且页头与任务行无分支名）
+- [x] 6.3 回归验收：反向更新既有 local-path git 降级断言——`internal/task/local_path_mode_test.go`（git 门禁 invalid_input 断言改为放行 + 项目目录落点断言）、`web/src/__tests__/task-workbench-git-tab.test.tsx`（local-path Git tab 隐藏断言改为显示）；`web/src/__tests__/gitless-branch-display.test.tsx` 列为必须保持全绿的回归文件；核对 2.7/4.3/5.5/5.7 已完成项中 local-path git 降级部分由本组反向覆盖；`go build ./...`、相关包测试与 web 测试通过

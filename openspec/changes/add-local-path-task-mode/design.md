@@ -15,25 +15,25 @@
 | 7 | `internal/task/reconcile.go:313` reconcile | alignModeForKind |
 | 8 | `internal/task/attach_shell.go:62` shell | alignModeForKind |
 | 9 | `internal/task/activate.go:183` layerEnvSnapshot | repo 要求 Branch/base_ref 非空并注入分支变量 |
-| 10 | `internal/task/gitops.go:26` assertGitRepoTask | repo 放行 git status/diff/commit/push |
+| 10 | `internal/task/gitops.go:29` assertGitRepoTask | repo 放行 git status/diff/commit/push；本变更改按 D2 有效模式：worktree 与 repo local-path 放行（D8），dir 拒绝（文案不变） |
 | 11 | `internal/task/diffreview_adapters.go:186` diff review | 复用同一 git 门禁 |
-| 12 | `web/src/pages/TaskWorkbenchPage.tsx:228` | 工作台 Git tab 按 kind 渲染 |
-| 13 | `web/src/pages/CommandCenterPage.tsx:446` 删除弹窗 | 由 project task summary 驱动（summary 无 mode） |
+| 12 | `web/src/pages/TaskWorkbenchPage.tsx:228` | 工作台 Git tab 按 kind 渲染；本变更 isGitless 收窄为 `project_kind==='dir'`（repo local-path 显示，D8） |
+| 13 | `web/src/pages/CommandCenterPage.tsx:446` 删除弹窗 | 由 project task summary 驱动（summary 无 mode）；本变更按 D7 透传 mode，弹窗按 `task.mode` 出文案 |
 | 14 | `internal/task/crud.go:453-506` 删除 Retry | kind → repo 执行 DirtyFiles 快照 + confirmDirty 门禁（483-505）；dir 跳过 |
 
-本变更把「就地运行」从项目级属性下沉为**任务级运行模式**：repo 项目创建任务时可选 worktree（默认）/ local-path。若 local-path 任务被当作 repo 任务处理：#9 激活直接报错（空 branch）、#10/#11 放行对用户主仓库的 git 操作、#4-8 以 AlignModeRepo claim 共享目录 session（多任务互抢）。
+本变更把「就地运行」从项目级属性下沉为**任务级运行模式**：repo 项目创建任务时可选 worktree（默认）/ local-path。若 local-path 任务被当作 repo 任务无差别处理：#9 激活直接报错（空 branch）、#4-8 以 AlignModeRepo claim 共享目录 session（多任务互抢）。#10/#11 的 git 操作经 review 裁决**显式放行**（D8：作用于项目目录当前分支、风险由用户自担），不属于事故场景；除 git 门禁外，local-path 的生命周期序列仍与 dir 同款（D2）。
 
 ## Goals / Non-Goals
 
 **Goals:**
-- repo 项目任务创建支持任务级 `mode`（worktree 默认 / local-path），local-path 行为与 dir 任务完全一致
+- repo 项目任务创建支持任务级 `mode`（worktree 默认 / local-path）；除 D8 主动 git 能力外，创建、删除、env、对齐等生命周期语义同 dir
 - 上表全部 14 个分流点改由「任务持久化 mode」驱动，非法组合 fail-closed
-- Web 新建任务面板模式选择器与低可见度提醒；工作台/删除弹窗按任务 mode 降级
+- Web 新建任务面板模式选择器与低可见度提醒；删除弹窗按任务 mode 出文案；工作台 Git tab 仅对 dir 项目任务隐藏（repo local-path 显示，D8）
 
 **Non-Goals:**
 - 不改变 worktree 模式任何现有行为
 - 不新增项目类型；dir 项目对外语义不变（无 mode 选择器、拒绝 mode 参数）
-- 不支持 local-path 任务的 base_ref / 分支能力 / git 面板
+- 不支持 local-path 任务的 base_ref / 分支能力（任务无分支概念；git 能力见 D8，作用于当前分支）
 - 不收敛/迁移 dir 项目类型
 
 ## Decisions
@@ -51,7 +51,7 @@
 | proj.Kind | task.Mode | 结果 |
 |---|---|---|
 | repo | worktree | worktree 序列 |
-| repo | local-path | local-path（=dir）序列 |
+| repo | local-path | local-path（=dir）序列（除 D8 git 能力外） |
 | dir | local-path | local-path（=dir）序列 |
 | dir | worktree | 持久化损坏 → internal，零副作用 |
 | 未知 kind | 任意 | internal，零副作用 |
@@ -89,7 +89,7 @@ Retry（deletion_failed → deleting）重入改为专用原子意图写 `BeginR
 
 ### D7：mode 传播链与分层责任表
 
-删除弹窗（CommandCenterPage.tsx:446）与工作台 Git tab 需要任务 mode，选择**全链路透传**方案（不采用「弹窗前再取详情」——增加一次往返且 summary 驱动的列表态删除入口同样需要 mode）：
+删除弹窗（CommandCenterPage.tsx:446）按任务 mode 出文案，选择**全链路透传**方案（不采用「弹窗前再取详情」——增加一次往返且 summary 驱动的列表态删除入口同样需要 mode）；工作台 Git tab 显隐改按 `project_kind==='dir'` 判定（D8），不依赖 mode：
 
 | 层 | 类型/位置 | 责任 |
 |---|---|---|
@@ -100,13 +100,19 @@ Retry（deletion_failed → deleting）重入改为专用原子意图写 `BeginR
 | task 包 | `internal/task/types.go` TaskRow + `adapters.go:489` | domain 映射；`TaskMode` 常量（`worktree`/`local-path`）定义于 task 包（与 ProjectKind 同处） |
 | api | `taskRowDTO` + 项目列表 task summary（project-management spec 字段表） | 必有字段（非 omitempty），unknown 值 fail-closed 不输出 |
 | SSE | task-detail-stream spec 字段穷举 | 同 taskRowDTO |
-| web | `web/src/types.ts` Task/TaskSummary + CommandCenterPage 弹窗 + TaskWorkbenchPage Git tab | 按 `task.mode` 渲染降级 |
+| web | `web/src/types.ts` Task/TaskSummary + CommandCenterPage 弹窗 + TaskWorkbenchPage Git tab | 弹窗按 `task.mode` 出文案；Git tab 显隐按 `project_kind==='dir'`（D8） |
 
 活跃任务概览链（REST `/tasks/active` 与 SSE `/tasks/active/stream` 同构）同样透传 mode：`store.ActiveTaskOverviewRow`（queries.go:390-435）→ `application.ActiveTaskOverviewRow`（dto.go:83-94）→ task StoreAdapter（adapters.go:72-84）→ `activeSessionDTO`/`buildActiveSessionsSnapshot`（api/tasks.go:493-508、sessions_snapshot.go:17-35）→ web `ActiveSessionItem`（types.ts:114-126）。mode 为必有字段；非法 kind/mode 时 REST 返回 500；SSE 初始组装返回 500，update 组装按既有「保持 dirty 并重试」处理。
 
-### D8：Git/diff 能力门禁
+### D8：Git/diff 能力门禁（review 裁决：repo 项目 local-path 开放完整 git 能力）
 
-`assertGitRepoTask`（gitops.go:26）改按 D2 有效模式：local-path → `codeInvalidInput`（拒绝时机与错误码同 dir；原因文案按模式区分——dir 为「纯目录项目非 git 仓库」，local-path 为「就地运行任务无 git worktree」，逐字契约见 git-operations delta「纯目录项目任务的 git 操作降级」requirement），在任何 git/文件读取前拒绝；覆盖 status/diff/commit/push 与 diff review（diffreview_adapters.go:186 同一门禁）。工作台 Git tab 与分支展示对 local-path 任务隐藏（同 dir 降级，TaskWorkbenchPage.tsx:228）。
+`assertGitRepoTask`（gitops.go:29）改按 D2 有效模式：**repo 项目 local-path 模式任务放行全部 git 操作（status/diff/commit/push 与 diff review）**；dir 项目任务维持 `codeInvalidInput` 拒绝（文案不变：「纯目录项目非 git 仓库」）；非法 kind/mode 组合仍 internal fail-closed。diff review 经 DiffSourcePortAdapter.ReadLocked（diffreview_adapters.go:186 同一门禁），来源 `(ref, path, untracked)` 由 UI 传入。
+
+操作语义：全部作用于项目目录当前 checkout 的**当前分支**——GitStatus/GitDiff/GitCommit/GitPush 均基于 `row.WorktreePath`（local-path 任务即项目路径），无 base_ref 依赖。commit 提交到当前分支 HEAD；push 为 `git push -u origin <当前分支>` 且 MUST NOT force-push。diff 来源钉死为现有 GitPanel 三组（仅未提交部分，对比 HEAD/index）：`ref=HEAD`（已暂存，工作区 vs HEAD）、`ref=''`（未暂存，工作区 vs index）、`untracked`（未跟踪文件）；MUST NOT 展示当前分支相对 upstream 或 base 的已提交 commit 差异（分支变更视图留待后续迭代）。
+
+风险归属（显式契约）：操作对象是用户主仓库当前分支，改动就地生效、提交与推送直接作用于用户分支；dirty 混杂与直接提交/推送主仓库分支的风险由用户自担（与 local 模式共享目录语义一致）。
+
+Web：repo 项目 local-path 任务显示 Git tab 与 git 面板入口（TaskWorkbenchPage isGitless 收窄为 `project_kind==='dir'`）；工作台页头任务分支名保持隐藏（`task.branch` 恒为空，GitPanel 内有实时分支显示 status.branch）；指挥中心/项目页任务行分支显示维持 gitless 隐藏不变。env：local-path 仍不注入分支变量（D9 不变）；删除/pre-delete/对齐等其余模式分流不变。
 
 ### D9：layerEnvSnapshot 分支变量
 

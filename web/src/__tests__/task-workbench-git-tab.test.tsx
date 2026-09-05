@@ -6,9 +6,11 @@ import { subscribeTask } from '../sse';
 import { mount, flushUI } from './cm-test-env';
 import type { Project, Task } from '../types';
 
-/* ==================== 工作台 Git tab 降级（add-local-path-task-mode tasks 5.7） ====================
- * 覆盖 task-lifecycle delta：repo local-path 任务与 dir 任务同级降级——Git tab 隐藏
- * （含已驻留 Git tab 时回退 TUI）、页头不展示分支名；按 task.mode 判定，MUST NOT 判空推断。 */
+/* ==================== 工作台 Git 能力判定（add-local-path-task-mode 6.2/D8 反向） ====================
+ * Git 能力判定拆分：Git tab/面板入口仅按 project_kind==='dir' 隐藏——repo local-path 任务
+ * 显示 Git tab（已驻留不回退 TUI）；页头分支名不依赖 isGitless 守卫，按落库 branch 恒空隐藏
+ * （D3），分支显示由 GitPanel 内实时分支提供。MUST NOT 收窄共享 helper isGitlessTask
+ * （任务行分支展示仍按 kind+mode 判定，见 gitless-branch-display.test.tsx）。 */
 
 type TaskSubOpts = {
   onData: (t: Task) => void;
@@ -81,8 +83,8 @@ beforeEach(() => {
   vi.mocked(subscribeTask).mockClear();
 });
 
-describe('TaskWorkbenchPage Git tab 降级（repo local-path，add-local-path-task-mode 5.7）', () => {
-  it('回归基线：worktree 任务页头展示分支名、Git tab 存在', () => {
+describe('TaskWorkbenchPage Git 能力判定（add-local-path-task-mode 6.2）', () => {
+  it('repo worktree：Git tab 显示、页头展示分支名（对照基线）', () => {
     const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
     act(() => taskSub!.onData(makeTask({})));
     expect(container.querySelector('.header-meta')?.textContent).toContain('ocdeck/demo');
@@ -90,22 +92,17 @@ describe('TaskWorkbenchPage Git tab 降级（repo local-path，add-local-path-ta
     unmount();
   });
 
-  it('local-path 任务：Git tab 隐藏、页头不展示分支名（落库 branch 恒空亦然）', () => {
+  it('repo local-path：Git tab 显示、页头不展示分支名（落库 branch 恒空，GitPanel 内实时分支）', () => {
     const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
-    // 现实帧：branch 恒为空（D3）
+    // 现实帧：branch 恒为空（D3）；页头隐藏依赖该数据不变量而非 isGitless 守卫
     act(() => taskSub!.onData(makeTask({ mode: 'local-path', branch: '' })));
-    expect(gitTab(container)).toBeUndefined();
+    expect(gitTab(container)).not.toBeUndefined();
     expect(container.querySelector('.header-meta')).toBeNull();
     expect(activeTab(container)!.textContent).toBe('终端');
-
-    // 钉住 !isGitless 守卫本身：即使携带非空 branch 也不展示（数据不变量由后端保证）
-    act(() => taskSub!.onData(makeTask({ mode: 'local-path', branch: 'ocdeck/demo' })));
-    expect(gitTab(container)).toBeUndefined();
-    expect(container.querySelector('.header-meta')).toBeNull();
     unmount();
   });
 
-  it('已驻留 Git tab 时收到 local-path 帧回退 TUI', async () => {
+  it('已驻留 Git tab 时收到 local-path 帧不回退（Git 能力不再按 mode 判定）', async () => {
     const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
     act(() => taskSub!.onData(makeTask({ mode: 'worktree' })));
     expect(gitTab(container)).not.toBeUndefined();
@@ -117,19 +114,29 @@ describe('TaskWorkbenchPage Git tab 降级（repo local-path，add-local-path-ta
     await flushUI();
     expect(activeTab(container)!.textContent).toBe('Git');
 
-    // 后续帧按 mode 判定降级：Git tab 移除，回到 TUI tab
+    // 后续 local-path 帧不降级：Git tab 与面板保留
     act(() => taskSub!.onData(makeTask({ mode: 'local-path', branch: '' })));
     await flushUI();
-    expect(gitTab(container)).toBeUndefined();
-    expect(activeTab(container)!.textContent).toBe('终端');
+    expect(gitTab(container)).not.toBeUndefined();
+    expect(activeTab(container)!.textContent).toBe('Git');
     unmount();
   });
 
-  it('dir 任务同样降级（project_kind=dir，既有行为回归）', () => {
+  it('dir 任务仍隐藏 Git tab 与分支名；已驻留 Git tab 时回退 TUI（既有行为回归）', async () => {
     const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    // 先以 repo worktree 帧驻留 Git tab，再收到 dir 帧 → 回退 TUI
+    act(() => taskSub!.onData(makeTask({ mode: 'worktree' })));
+    await act(async () => {
+      gitTab(container)!.click();
+    });
+    await flushUI();
+    expect(activeTab(container)!.textContent).toBe('Git');
+
     act(() => taskSub!.onData(makeTask({ project_kind: 'dir', mode: 'local-path', branch: '' })));
+    await flushUI();
     expect(gitTab(container)).toBeUndefined();
     expect(container.querySelector('.header-meta')).toBeNull();
+    expect(activeTab(container)!.textContent).toBe('终端');
     unmount();
   });
 });

@@ -225,10 +225,10 @@ export function TaskWorkbenchPage({
     if (tab === tid) setTab(TUI_TAB);
   };
 
-  // dir 任务与 repo local-path 任务无 git 功能（D7/add-local-path-task-mode）：隐藏 Git tab 与
-  // 分支名，按任务有效 mode 判定（isGitlessTask：project_kind=dir 或 mode=local-path），MUST NOT 判空推断
-  const isGitless = !!task && isGitlessTask(task.project_kind, task.mode);
-  // 有效模式为无 git 时若正停在 Git tab，回退到 TUI tab
+  // Git 能力判定（add-local-path-task-mode 6.2/D8）：仅 dir 项目任务隐藏 Git tab 与 git 面板入口，
+  // repo local-path 任务开放（git 操作作用于项目目录当前分支）；分支名展示另按 isGitlessTask 判定。
+  const isGitless = task?.project_kind === 'dir';
+  // dir 任务无 git 能力时若正停在 Git tab，回退到 TUI tab（repo local-path 不回退）
   useEffect(() => {
     if (isGitless && tab === GIT_TAB) setTab(TUI_TAB);
   }, [isGitless, tab]);

@@ -1612,77 +1612,126 @@ func TestLayerEnvSnapshot_IllegalCombo_ErrorNoPersist(t *testing.T) {
 	}
 }
 
-// --- 5.5 git 门禁 ---
+// --- 5.5 git 门禁（6.1/6.3 反向更新：repo local-path 开放 git 能力） ---
 
-// TestGitOps_LocalPath_GatedBeforeAnyGitWork repo local-path 任务 status/diff/commit/push 与
-// diff review → invalid_input 且携带 local-path 专属文案（区别于词法校验错误），零 git 命令/
-// 文件读取/子仓库探测：
-//   - PATH fake-git sentinel：任何 git 调用（含子仓库探测等隐式 git）都会留痕 → 日志必须为空；
-//   - 探针传相对路径 + untracked=true：绕过词法校验（绝对路径/缺 path 在门禁前就被拒，
-//     会让 invalid_input 平凡真）、绕过 ref/index git 命令，直达模式门禁；门禁放行时
-//     untracked 新侧直接读工作区——0000 权限文件读取失败（internal ≠ invalid_input，可观测）；
-//   - 相对目录 source：untracked 目录走 gitlink/subrepo 探测分支（directory-only），
-//     门禁放行时必经 git 探测（sentinel 留痕）。
-func TestGitOps_LocalPath_GatedBeforeAnyGitWork(t *testing.T) {
-	sentinel := newGitSentinel(t)
-	projDir := t.TempDir() // 真实非 git 目录
-	// 读取探针：owner 也无读权限的文件（非 root 下任何读取尝试都失败，可观测）。
-	const probeRel = "probe-secret.txt"
-	probePath := filepath.Join(projDir, probeRel)
-	if err := os.WriteFile(probePath, []byte("secret"), 0o000); err != nil {
+// TestGitOps_LocalPath_GatePassesAndOperatesOnProjectDir repo local-path 任务 status/diff/
+// commit/push 与 diff review 放行且作用于项目目录当前 checkout 的当前分支（design D8 修订）。
+//
+// 放行取证：在真实 git 仓库（init + 初始提交）上断言各操作真实作用于项目目录——
+//   - GitStatus：返回当前分支名（非空、与项目目录 checkout 一致）；
+//   - GitDiff：dirty 文件返回工作区 vs index 差异（NewContent 非空，证明读到项目目录内容）；
+//   - GitCommit：修改文件后提交，HEAD 前进（rev-parse 前后不同），证明提交落项目目录当前分支 HEAD；
+//   - GitPush：配置本地 bare remote 后 push 成功（git push -u origin <当前分支>、无 force），
+//     remote ref 与本地一致；
+//   - diff review ReadLocked：门禁放行 → callback 被调用（>0），证明 source 真实读取项目目录。
+//
+// mutation 有效性证据：本测试在 6.1 改判前的旧实现（assertGitRepoTask local-path 分支返回
+// invalid_input + "task runs in local-path mode" 文案）下会失败——各操作在门禁处早退，
+// GitStatus 拿不到分支名、GitCommit HEAD 不前进、GitPush 非 git_error 而是 invalid_input、
+// diff review callback 为 0。改判后全通过。
+func TestGitOps_LocalPath_GatePassesAndOperatesOnProjectDir(t *testing.T) {
+	projDir := t.TempDir()
+	runGitInit(t, projDir, "init", "-q", "-b", "main")
+	// 初始提交（建立 HEAD 与分支）。
+	if err := os.WriteFile(filepath.Join(projDir, "README.md"), []byte("init\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(probePath, 0o644) })
-	// 自证探针有效：0000 权限文件确实不可读（否则「读取失败可观测」不成立）。
-	if _, err := os.ReadFile(probePath); err == nil {
-		t.Fatal("probe file must be unreadable (0000) for the read-probe assertion to be meaningful")
-	}
-	// 目录探针：untracked 目录走 gitlink/subrepo 探测分支（content.go directory-only 分支）。
-	const subRel = "subdir"
-	if err := os.MkdirAll(filepath.Join(projDir, subRel), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	runGitInit(t, projDir, "add", "README.md")
+	runGitInit(t, projDir, "commit", "-qm", "init")
+	// 本地 bare remote 供 push 验证（git push -u origin <branch>）。
+	remoteDir := t.TempDir()
+	runGitInit(t, remoteDir, "init", "--bare", "-q")
+	runGitInit(t, projDir, "remote", "add", "origin", remoteDir)
 
 	store := newMockStore()
 	seedLocalPathRepoTask(store, "t1", "p1", projDir)
 	m := newTestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
-	const wantMsg = "task runs in local-path mode (in-place, no git worktree)"
-	// 各入口独立断言（非 Fatalf）：mutation 取证时单个入口违规不截断其余入口的探针证据。
-	checkEntry := func(what string, err error) {
-		t.Helper()
-		if !isOpErrCode(err, codeInvalidInput) || !strings.Contains(err.Error(), wantMsg) {
-			t.Errorf("%s: err = %v, want invalid_input + local-path mode message", what, err)
-		}
+
+	// GitStatus：放行，分支名与项目目录当前 checkout 一致。
+	status, err := m.GitStatus(context.Background(), "t1")
+	if err != nil {
+		t.Fatalf("GitStatus local-path: %v, want nil（门禁放行）", err)
+	}
+	if status.Branch != "main" {
+		t.Errorf("GitStatus branch = %q, want main（项目目录当前 checkout）", status.Branch)
 	}
 
-	_, err := m.GitStatus(context.Background(), "t1")
-	checkEntry("GitStatus", err)
-	// GitDiff untracked 文件：门禁先于新侧工作区读取。
-	_, err = m.GitDiff(context.Background(), "t1", "", probeRel, true)
-	checkEntry("GitDiff(untracked file)", err)
-	// GitDiff untracked 目录：门禁先于 gitlink/subrepo 探测分支。
-	_, err = m.GitDiff(context.Background(), "t1", "", subRel, true)
-	checkEntry("GitDiff(untracked dir)", err)
-	checkEntry("GitCommit", m.GitCommit(context.Background(), "t1", "msg", nil))
-	checkEntry("GitPush", m.GitPush(context.Background(), "t1"))
-	// diff review 复用同一门禁（diffreview_adapters.go ReadLocked）：文件 + 目录双 source，
-	// callback 计数必须为零。
-	adapter := NewDiffSourcePortAdapter(m)
-	srcs := []diffreview.DiffSource{
-		{Path: probeRel, Untracked: true},
-		{Path: subRel, Untracked: true},
+	// GitDiff：dirty 文件返回工作区 vs index 差异（证明读到项目目录内容）。
+	if err := os.WriteFile(filepath.Join(projDir, "README.md"), []byte("changed\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
+	diff, derr := m.GitDiff(context.Background(), "t1", "", "README.md", false)
+	if derr != nil {
+		t.Fatalf("GitDiff local-path unstaged: %v, want nil（门禁放行）", derr)
+	}
+	if !diff.NewExists || diff.NewContent != "changed\n" {
+		t.Errorf("GitDiff new side = (exists=%v, content=%q), want project dir working tree content", diff.NewExists, diff.NewContent)
+	}
+
+	// GitCommit：提交落当前分支 HEAD——HEAD 前后不同即证明作用于项目目录。
+	headBefore := gitOutput(t, projDir, "rev-parse", "HEAD")
+	if cerr := m.GitCommit(context.Background(), "t1", "local-path commit", []string{"README.md"}); cerr != nil {
+		t.Fatalf("GitCommit local-path: %v, want nil（提交落当前分支 HEAD）", cerr)
+	}
+	headAfter := gitOutput(t, projDir, "rev-parse", "HEAD")
+	if headAfter == headBefore {
+		t.Fatalf("GitCommit did not advance HEAD in project dir (before=%s after=%s)", headBefore, headAfter)
+	}
+
+	// GitPush：git push -u origin <当前分支>，MUST NOT force；remote ref 与本地一致。
+	if perr := m.GitPush(context.Background(), "t1"); perr != nil {
+		t.Fatalf("GitPush local-path: %v, want nil（push -u origin main，无 force）", perr)
+	}
+	localHead := gitOutput(t, projDir, "rev-parse", "HEAD")
+	remoteHead := gitOutput(t, remoteDir, "rev-parse", "refs/heads/main")
+	if remoteHead != localHead {
+		t.Errorf("remote head = %s, want %s（push 推送到 origin 当前分支）", remoteHead, localHead)
+	}
+
+	// diff review ReadLocked：门禁放行 → callback 被调用（source 真实读取项目目录）。
+	adapter := NewDiffSourcePortAdapter(m)
+	srcs := []diffreview.DiffSource{{Path: "README.md", Untracked: false}}
 	callbacks := 0
-	err = adapter.ReadLocked(context.Background(), "t1", srcs, func(src diffreview.DiffSource, result diffreview.DiffSourceResult, err error) error {
+	if rerr := adapter.ReadLocked(context.Background(), "t1", srcs, func(src diffreview.DiffSource, result diffreview.DiffSourceResult, err error) error {
 		callbacks++
 		return nil
-	})
-	checkEntry("diff review ReadLocked", err)
-	if callbacks != 0 {
-		t.Errorf("diff review callback invoked %d times for local-path task: gate MUST reject before any source read", callbacks)
+	}); rerr != nil {
+		t.Fatalf("diff review ReadLocked local-path: %v, want nil（门禁放行）", rerr)
 	}
-	// 全部入口走完：sentinel 必须为空（零 git 命令/零子仓库探测）。
-	assertGitSentinelEmpty(t, sentinel)
+	if callbacks == 0 {
+		t.Error("diff review callback = 0, want >0（门禁放行后 source 真实读取项目目录）")
+	}
+}
+
+// TestGitOps_LocalPath_DetachedHead_PushFailsStatusBranchEmpty detached HEAD 边界
+// （git-operations delta spec scenario）：status 分支留空不阻断；push 透传 git 错误，
+// MUST NOT 伪装成功。
+func TestGitOps_LocalPath_DetachedHead_PushFailsStatusBranchEmpty(t *testing.T) {
+	projDir := t.TempDir()
+	runGitInit(t, projDir, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(projDir, "README.md"), []byte("init\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitInit(t, projDir, "add", "README.md")
+	runGitInit(t, projDir, "commit", "-qm", "init")
+	// 切到 detached HEAD（--detach 脱离分支引用）。
+	runGitInit(t, projDir, "checkout", "-q", "--detach")
+
+	store := newMockStore()
+	seedLocalPathRepoTask(store, "t1", "p1", projDir)
+	m := newTestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
+
+	status, err := m.GitStatus(context.Background(), "t1")
+	if err != nil {
+		t.Fatalf("GitStatus detached: %v, want nil（status 不阻断）", err)
+	}
+	if status.Branch != "" {
+		t.Errorf("GitStatus detached branch = %q, want empty（gitops.go 现状语义）", status.Branch)
+	}
+	// push 在 detached HEAD 下无分支可推 → git_error 透传，MUST NOT 伪装成功。
+	if perr := m.GitPush(context.Background(), "t1"); !isOpErrCode(perr, codeGitError) {
+		t.Errorf("GitPush detached: err = %v, want git_error（透传，不伪装成功）", perr)
+	}
 }
 
 // TestGitOps_IllegalCombo_FailClosed dir+worktree 非法组合 → git 门禁 internal fail-closed。
