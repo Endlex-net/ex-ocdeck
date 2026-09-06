@@ -21,7 +21,7 @@ package task
 //   - 5.5 git 门禁（6.1/6.3 修订）：repo local-path status/diff/commit/push 与 diff review
 //     放行且作用于项目目录当前 checkout；dir 项目 → invalid_input；dir+worktree → internal。
 //     ReadLocked 回调恰好一次、err==nil 且 NewContent/NewExists 与项目目录工作区一致。
-//   - 5.6 文件编辑读写（/git/file，6.x G6-F2）：repo local-path 任务的 FileEditPort ReadRaw
+//   - 6.1 文件编辑读写（/git/file，6.x G6-F2）：repo local-path 任务的 FileEditPort ReadRaw
 //     读取项目目录文件成功、Write 写回真实落盘到项目目录（断言内容变化）；dir 项目 ReadRaw/Write
 //     → invalid_input（assertGitRepoTask 既有语义不变）。
 
@@ -1774,7 +1774,7 @@ func TestGitOps_IllegalCombo_FailClosed(t *testing.T) {
 	}
 }
 
-// --- 5.6 文件编辑读写落点（/git/file，6.x G6-F2：repo local-path 开放 diff 视图内文件编辑读写） ---
+// --- 6.1 文件编辑读写落点（/git/file，6.x G6-F2：repo local-path 开放 diff 视图内文件编辑读写） ---
 
 // TestFileEdit_LocalPath_ReadWriteOnProjectDir repo local-path 任务经 FileEditPort ReadRaw/Write
 // 直接读写项目目录当前 checkout（/git/file 契约：读写落点 = 项目目录，经 assertGitRepoTask 门禁
