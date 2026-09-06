@@ -19,6 +19,17 @@ func (s *LifecycleService) BeginDeleteIntent(ctx context.Context, id string, mod
 	return res, nil
 }
 
+// BeginRetryDeleteIntent records the delete intent re-entry from deletion_failed
+// (atomically clearing stale last_error) and commits the resulting domain event.
+func (s *LifecycleService) BeginRetryDeleteIntent(ctx context.Context, id string, mode ocdecktask.DeleteMode) (application.TransitionResult, error) {
+	res, err := s.tasks.BeginRetryDeleteIntent(ctx, id, mode)
+	if err != nil {
+		return application.TransitionResult{}, err
+	}
+	s.commitTransitionResult(ctx, id, res)
+	return res, nil
+}
+
 // DeleteTask removes the task row (cascading remaining sessions) and commits
 // session.deleted events for each cascaded session before the task.deleted event.
 func (s *LifecycleService) DeleteTask(ctx context.Context, id string) (application.DeleteResult, error) {

@@ -184,18 +184,70 @@ const (
 	ProjectKindDir  = "dir"
 )
 
-// alignModeForKind 按项目 kind 解析对齐模式（add-plain-dir-project D8）。
-// repo → AlignModeRepo；dir → AlignModeOwnedOnly；未知值 fail-closed 返回错误。
-// 调用方 MUST 在任何副作用前调用本函数取得 mode（design.md D8：MUST NOT 在 serve 启动后才发现未知 kind）。
-func alignModeForKind(kind string) (AlignMode, error) {
-	switch kind {
+// TaskMode 任务级运行模式（add-local-path-task-mode D1/D2，持久化于 tasks.mode，
+// migration 0013）：
+//   - worktree：隔离 worktree + 独立分支（repo 项目缺省，既有行为不变）；
+//   - local-path：就地运行，除 repo local-path 的 D8 git 能力外，沿用 dir 项目任务的
+//     生命周期语义（无 worktree/分支）。
+const (
+	TaskModeWorktree  = "worktree"
+	TaskModeLocalPath = "local-path"
+)
+
+// resolveTaskMode 解析任务有效运行模式（add-local-path-task-mode D2，纯函数，单点收口）。
+// 穷尽矩阵、kind-first：合法组合仅 (repo,worktree)、(repo,local-path)、(dir,local-path)；
+// dir+worktree、未知 kind、未知 mode 均为持久化损坏 → internal error。
+//
+// 入口错误处置分层（tasks 2.1）：未提交意图的入口（Create/Activate/Suspend/首次 Delete/
+// Retry）在任何状态写入与副作用前拒绝、零副作用；已提交意图的重入路径（deleteResume）
+// 仅允许写 deletion_failed + last_error，随后 MUST NOT 执行任何破坏性副作用。
+// 分流 MUST NOT 依赖 branch 判空等隐式信号（delete.go 既有不变量）。
+func resolveTaskMode(t TaskRow, projKind string) (string, error) {
+	switch projKind {
 	case ProjectKindRepo:
-		return AlignModeRepo, nil
+		switch t.Mode {
+		case TaskModeWorktree, TaskModeLocalPath:
+			return t.Mode, nil
+		default:
+			return "", fmt.Errorf("task %s: invalid mode %q for repo project", t.ID, t.Mode)
+		}
 	case ProjectKindDir:
+		switch t.Mode {
+		case TaskModeLocalPath:
+			return TaskModeLocalPath, nil
+		case TaskModeWorktree:
+			return "", fmt.Errorf("task %s: dir project task must not use mode %q", t.ID, t.Mode)
+		default:
+			return "", fmt.Errorf("task %s: invalid mode %q for dir project", t.ID, t.Mode)
+		}
+	default:
+		return "", fmt.Errorf("task %s: unknown project kind %q", t.ID, projKind)
+	}
+}
+
+// alignModeForTask 按任务有效运行模式解析对齐模式（add-local-path-task-mode D5）：
+// worktree → AlignModeRepo（目录私有 claim）；local-path → AlignModeOwnedOnly（目录可共享，
+// 绝不 claim——共享目录下 claim 语义会让多个 local-path 任务互抢 session 归属）。
+// 未知值 fail-closed；调用方 MUST 先经 resolveTaskMode 取得有效模式。
+func alignModeForTask(mode string) (AlignMode, error) {
+	switch mode {
+	case TaskModeWorktree:
+		return AlignModeRepo, nil
+	case TaskModeLocalPath:
 		return AlignModeOwnedOnly, nil
 	default:
-		return 0, fmt.Errorf("task: unknown project kind %q", kind)
+		return 0, fmt.Errorf("task: unknown task mode %q", mode)
 	}
+}
+
+// resolveAlignMode 组合解析（D5）：先经 resolveTaskMode 完成 kind+mode 合法性校验
+// （四个运行时入口在任何状态修改或运行时副作用前完成），再映射为对齐模式。
+func resolveAlignMode(t TaskRow, projKind string) (AlignMode, error) {
+	effMode, err := resolveTaskMode(t, projKind)
+	if err != nil {
+		return 0, err
+	}
+	return alignModeForTask(effMode)
 }
 
 // worktreeRemoveOpts 解耦 worktree.RemoveOpts（避免 task 直接依赖 worktree 包结构）。

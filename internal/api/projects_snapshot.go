@@ -36,7 +36,13 @@ func (s *Server) buildProjectsSnapshot(ctx context.Context) ([]projectDTO, error
 			return nil, cerr
 		}
 		dto := toProjectDTO(p, counts)
-		dto.TaskSummaries = s.toProjectTaskSummaryDTOs(byProject[p.ID])
+		// mode 必有透传（add-local-path-task-mode D7）：非法 kind/mode → 组装失败，
+		// REST 500 / SSE 保留上次快照（决策在调用方），不输出缺 mode 元素。
+		sums, serr := s.toProjectTaskSummaryDTOs(p.Kind, byProject[p.ID])
+		if serr != nil {
+			return nil, serr
+		}
+		dto.TaskSummaries = sums
 		out = append(out, dto)
 	}
 	return out, nil

@@ -55,7 +55,7 @@
 
 **对外 SSE 帧**仅允许三种写出：`event: snapshot` 与 `event: update` 的 data MUST 为与 REST `GET /api/v1/tasks/active` 同构的 `ActiveSessionItem` 裸数组；心跳 MUST 为注释行 `: ping`，无 data。MUST NOT 把内部 `Type` 名用作 SSE `event:`，MUST NOT 发送领域 Payload、增量 diff、单任务补丁或 error 事件帧。
 
-`ActiveSessionItem` 元素字段 MUST 为：`task_id`、`project_id`、`project_name`、`name`、`branch`、`worktree_path`（string，均必有）；`last_active_at`（Unix 秒，number，必有）；`agentStatus`（`idle` \| `busy` \| `retry`，不可用或零 owned 时省略，MUST NOT 输出空串）；`attention`（object，必有）为 `{permissions: PermissionSignal[], questions: QuestionSignal[]}`，无 pending 时两数组为 `[]` 非 `null`。`PermissionSignal` 为 `{id, permission, patterns, since}`（`patterns` 为 string[]，`since` 为 Unix 秒）。`QuestionSignal` 为 `{id, questions: [{header, question}], since}`（`since` 为 Unix 秒）。空活跃列表 MUST 编码为 `[]` 非 `null`。
+`ActiveSessionItem` 元素字段 MUST 为：`task_id`、`project_id`、`project_name`、`name`、`branch`、`worktree_path`（string，均必有）；`mode`（必有，取值 `worktree`/`local-path`，与任务持久化 `mode` 同源）；`last_active_at`（Unix 秒，number，必有）；`agentStatus`（`idle` \| `busy` \| `retry`，不可用或零 owned 时省略，MUST NOT 输出空串）；`attention`（object，必有）为 `{permissions: PermissionSignal[], questions: QuestionSignal[]}`，无 pending 时两数组为 `[]` 非 `null`。`PermissionSignal` 为 `{id, permission, patterns, since}`（`patterns` 为 string[]，`since` 为 Unix 秒）。`QuestionSignal` 为 `{id, questions: [{header, question}], since}`（`since` 为 Unix 秒）。空活跃列表 MUST 编码为 `[]` 非 `null`。
 
 #### Scenario: 内部领域事件闭合且仅小载荷
 
@@ -85,11 +85,16 @@
 #### Scenario: 数组元素字段完整
 
 - **WHEN** 客户端收到 `snapshot` 或 `update` 且当前存在至少一个 active 任务
-- **THEN** 每个元素含 `task_id`/`project_id`/`project_name`/`name`/`branch`/`worktree_path`/`last_active_at`/`attention`；`attention.permissions` 与 `attention.questions` 为数组；可用时 `agentStatus` 为三态之一，不可用时该字段缺省
+- **THEN** 每个元素含 `task_id`/`project_id`/`project_name`/`name`/`branch`/`mode`/`worktree_path`/`last_active_at`/`attention`；`attention.permissions` 与 `attention.questions` 为数组；可用时 `agentStatus` 为三态之一，不可用时该字段缺省
+
+#### Scenario: 活跃流快照帧携带 mode
+
+- **WHEN** 客户端收到 `GET /api/v1/tasks/active/stream` 的 `snapshot` 或 `update` 帧，且当前存在至少一个活跃任务
+- **THEN** 每个元素携带 `mode` 字段（必有，`worktree` 或 `local-path`），与任务持久化 `mode` 一致
 
 ### Requirement: 活跃会话 SSE 推送端点
 
-系统 SHALL 提供 `GET /api/v1/tasks/active/stream` 端点，鉴权方式与其他 `/api/v1/*` 管理 API 一致（Bearer token）。该端点为前一变更引入且尚未发布，task 中心命名生效后旧路径 `GET /api/v1/sessions/active/stream` MUST NOT 保留别名：对旧路径的请求 MUST 返回 JSON 404 标准错误信封（MUST NOT 写 SSE 响应头、MUST NOT 建立任何事件订阅）。端点 MUST 以 `text/event-stream` 推送，所有数据帧的 data MUST 为与 REST 端点响应体完全同构的活跃会话**裸数组**。建连时序 MUST 为：认证通过 → 对领域 topic `task`/`session`/`serve_runtime`/`control` 各订阅一次并 fan-in（任一路溢出视为溢出）→ 再组装初始快照；组装期间到达且通过消费过滤表的事件 MUST 置脏标记。初始快照组装失败时 MUST 四路全部退订并返回 500 标准错误信封，MUST NOT 写入 SSE 响应头。组装成功 MUST 写 200 与 SSE 响应头、发送完整 `event: snapshot` 帧并随即 flush（首帧 MUST 立即可达，MUST NOT 滞留到后续心跳）；若脏标记已置位 MUST 紧接着进入合并窗口补发 `event: update`。此后事件到达 MUST 经合并窗口（本变更固定 500ms；后续调整须另走规格变更）合并，窗口到期以最新全量快照发送 `update` 帧；组装失败 MUST 跳过本次发送、保持脏标记并在后续事件或心跳 tick 重试，MUST NOT 关闭连接。订阅溢出信号置位时 MUST 先置脏标记再立即触发一次窗口外全量快照重推；脏标记在组装失败时保持并由后续事件或心跳 tick 继续重试（自愈信号不得丢失）；写/flush 失败按统一写路径立即退订退出（客户端重连经 snapshot 自愈）。无事件期间 MUST 以心跳注释行维持连接（默认 25s）。所有帧（snapshot/update/溢出重推/心跳）MUST 经统一写路径写出并检查写与 flush 错误：任何一次写或 flush 失败 MUST 立即退订并退出 handler，MUST NOT 依赖后续心跳或 context 兜底。帧组装 MUST 复用与 REST 端点相同的读模型组装逻辑，元素字段为 `task_id`、`project_id`、`project_name`、`name`、`branch`、`worktree_path`、`last_active_at`（Unix 秒）、`agentStatus`（`idle` | `busy` | `retry`，不可用时省略）、`attention`（同 agent-attention spec 结构）。推送路径 MUST 为纯读操作，MUST NOT 实时调用 opencode 接口，MUST NOT 产生任何写副作用。端点 MUST 在客户端断开或服务进程 context 取消时释放订阅并退出 handler；服务端关停 MUST 先取消活跃 stream 再执行 HTTP Shutdown，使关停可在其预算内完成。
+系统 SHALL 提供 `GET /api/v1/tasks/active/stream` 端点，鉴权方式与其他 `/api/v1/*` 管理 API 一致（Bearer token）。该端点为前一变更引入且尚未发布，task 中心命名生效后旧路径 `GET /api/v1/sessions/active/stream` MUST NOT 保留别名：对旧路径的请求 MUST 返回 JSON 404 标准错误信封（MUST NOT 写 SSE 响应头、MUST NOT 建立任何事件订阅）。端点 MUST 以 `text/event-stream` 推送，所有数据帧的 data MUST 为与 REST 端点响应体完全同构的活跃会话**裸数组**。建连时序 MUST 为：认证通过 → 对领域 topic `task`/`session`/`serve_runtime`/`control` 各订阅一次并 fan-in（任一路溢出视为溢出）→ 再组装初始快照；组装期间到达且通过消费过滤表的事件 MUST 置脏标记。初始快照组装失败时 MUST 四路全部退订并返回 500 标准错误信封，MUST NOT 写入 SSE 响应头。持久化 `kind`/`mode` 非法（数据损坏）时初始组装 MUST fail-closed 返回 500；update 帧组装遇同类损坏 MUST 按既有组装失败语义处理（跳过本次发送、保持脏标记、由后续事件或心跳 tick 重试），MUST NOT 推送缺 `mode` 或取值非法的帧。组装成功 MUST 写 200 与 SSE 响应头、发送完整 `event: snapshot` 帧并随即 flush（首帧 MUST 立即可达，MUST NOT 滞留到后续心跳）；若脏标记已置位 MUST 紧接着进入合并窗口补发 `event: update`。此后事件到达 MUST 经合并窗口（本变更固定 500ms；后续调整须另走规格变更）合并，窗口到期以最新全量快照发送 `update` 帧；组装失败 MUST 跳过本次发送、保持脏标记并在后续事件或心跳 tick 重试，MUST NOT 关闭连接。订阅溢出信号置位时 MUST 先置脏标记再立即触发一次窗口外全量快照重推；脏标记在组装失败时保持并由后续事件或心跳 tick 继续重试（自愈信号不得丢失）；写/flush 失败按统一写路径立即退订退出（客户端重连经 snapshot 自愈）。无事件期间 MUST 以心跳注释行维持连接（默认 25s）。所有帧（snapshot/update/溢出重推/心跳）MUST 经统一写路径写出并检查写与 flush 错误：任何一次写或 flush 失败 MUST 立即退订并退出 handler，MUST NOT 依赖后续心跳或 context 兜底。帧组装 MUST 复用与 REST 端点相同的读模型组装逻辑，元素字段为 `task_id`、`project_id`、`project_name`、`name`、`branch`、`worktree_path`、`mode`（必有，取值 `worktree`/`local-path`，与任务持久化 `mode` 同源）、`last_active_at`（Unix 秒）、`agentStatus`（`idle` | `busy` | `retry`，不可用时省略）、`attention`（同 agent-attention spec 结构）。推送路径 MUST 为纯读操作，MUST NOT 实时调用 opencode 接口，MUST NOT 产生任何写副作用。端点 MUST 在客户端断开或服务进程 context 取消时释放订阅并退出 handler；服务端关停 MUST 先取消活跃 stream 再执行 HTTP Shutdown，使关停可在其预算内完成。
 
 #### Scenario: 连接即收快照
 
@@ -110,6 +115,16 @@
 
 - **WHEN** 建连时初始快照组装因底层查询失败
 - **THEN** 响应为 500 标准错误信封，不写入 SSE 响应头，订阅被释放
+
+#### Scenario: 初始组装遇非法 kind/mode 返回 500
+
+- **WHEN** 建连时初始快照组装遇到活跃任务持久化 `kind`/`mode` 非法或损坏
+- **THEN** 响应为 500 标准错误信封（fail-closed），不写入 SSE 响应头，四路订阅被释放
+
+#### Scenario: update 组装遇非法 kind/mode 保持脏标记
+
+- **WHEN** 连接存续期间某次 update 帧组装遇到活跃任务持久化 `kind`/`mode` 非法或损坏
+- **THEN** 该帧被跳过并保持脏标记，由后续事件或心跳 tick 重试；MUST NOT 推送缺 `mode` 或取值非法的帧
 
 #### Scenario: 事件驱动更新
 

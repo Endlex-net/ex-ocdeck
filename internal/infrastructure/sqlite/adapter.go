@@ -34,11 +34,11 @@ func New(db *store.DB) *Adapter { return &Adapter{db: db} }
 // --- TaskRepository（design.md D0） ---
 
 // CreateTask 委托 store.CreateTask（仅消费 row 的 ID/ProjectID/Name/Branch/Status/
-// WorktreePath/BaseRef，status 由调用方提供不再校验）。
+// WorktreePath/BaseRef/Mode，status 由调用方提供不再校验）。
 func (a *Adapter) CreateTask(ctx context.Context, row application.TaskSnapshot) error {
 	return a.db.CreateTask(ctx, store.TaskRow{
 		ID: row.ID, ProjectID: row.ProjectID, Name: row.Name, Branch: row.Branch,
-		Status: row.Status, WorktreePath: row.WorktreePath, BaseRef: row.BaseRef,
+		Status: row.Status, WorktreePath: row.WorktreePath, BaseRef: row.BaseRef, Mode: row.Mode,
 	})
 }
 
@@ -80,6 +80,11 @@ func (a *Adapter) SetTaskDeleteMode(ctx context.Context, id string, mode ocdeckt
 // BeginDeleteIntent 委托 store.BeginDeleteIntent。
 func (a *Adapter) BeginDeleteIntent(ctx context.Context, id string, mode ocdecktask.DeleteMode, fromStatuses []ocdecktask.Status) (application.TransitionResult, error) {
 	return a.db.BeginDeleteIntent(ctx, id, mode, fromStatuses)
+}
+
+// BeginRetryDeleteIntent 委托 store.BeginRetryDeleteIntent（Retry 专用：原子清空 last_error）。
+func (a *Adapter) BeginRetryDeleteIntent(ctx context.Context, id string, mode ocdecktask.DeleteMode) (application.TransitionResult, error) {
+	return a.db.BeginRetryDeleteIntent(ctx, id, mode)
 }
 
 // ArchiveTask 委托 store.ArchiveTask。
@@ -204,6 +209,7 @@ func toTaskSnapshot(r store.TaskRow) application.TaskSnapshot {
 		InitError:       nullStringToPtrSnapshot(r.InitError),
 		BaseRef:         r.BaseRef,
 		AnchorSessionID: nullStringToPtrSnapshot(r.AnchorSessionID),
+		Mode:            r.Mode,
 	}
 }
 

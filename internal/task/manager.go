@@ -37,6 +37,9 @@ type TaskStore interface {
 	UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error)
 	SetTaskDeleteMode(ctx context.Context, id, mode string) (application.MutationResult, error)
 	BeginDeleteIntent(ctx context.Context, id, mode string, fromStatuses []string) (application.TransitionResult, error)
+	// BeginRetryDeleteIntent deletion_failed 重入意图（Retry 专用）：原子写 delete_mode +
+	// status=deleting + last_error=NULL（评审 C-F3）。
+	BeginRetryDeleteIntent(ctx context.Context, id, mode string) (application.TransitionResult, error)
 	ArchiveTask(ctx context.Context, id string) (application.TransitionResult, error)
 	RestoreTask(ctx context.Context, id string) (application.TransitionResult, error)
 	DeleteTask(ctx context.Context, id string) (application.DeleteResult, error)
@@ -158,6 +161,10 @@ type TaskRow = application.TaskRow
 type SessionRow = application.SessionRow
 
 type ActiveTaskOverviewRow = application.ActiveTaskOverviewRow
+
+// CreateTaskOptions 创建任务请求选项（add-local-path-task-mode D3），
+// 定义在 application（dto.go）锁定 api → application import 方向；此处保留别名。
+type CreateTaskOptions = application.CreateTaskOptions
 
 // LifecycleConfigRow 项目生命周期配置行（design.md §2.1，解耦 store 包结构）。
 // 缺行读取时三脚本字段为空串（无配置 = 空配置语义）。

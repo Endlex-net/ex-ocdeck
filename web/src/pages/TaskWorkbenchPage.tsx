@@ -5,7 +5,7 @@ import { resolveBackHref, type FromSource } from '../router';
 import { useMediaQuery, useProjects, useProjectsRefresh } from '../hooks';
 import { debugMark } from '../debug';
 import { subscribeTask } from '../sse';
-import { isTransitional, initActivateBlockReason, parseNotice, type Task } from '../types';
+import { isGitlessTask, isTransitional, initActivateBlockReason, parseNotice, type Task } from '../types';
 import { shouldCloseOverflowOnBlur } from './workbench-overflow';
 import { StatusBadge } from '../components/StatusBadge';
 import { TaskActions } from '../components/TaskActions';
@@ -225,18 +225,21 @@ export function TaskWorkbenchPage({
     if (tab === tid) setTab(TUI_TAB);
   };
 
-  // dir 任务无 git 功能（D7）：隐藏 Git tab 与分支名，依据 project_kind 而非判空推断
-  const isDir = task?.project_kind === 'dir';
-  // kind 解析为 dir 时若正停在 Git tab，回退到 TUI tab
+  // Git 能力判定（add-local-path-task-mode 6.2/D8）：仅 dir 项目任务隐藏 Git tab 与 git 面板入口，
+  // repo local-path 任务开放（git 操作作用于项目目录当前分支）。
+  const isGitless = task?.project_kind === 'dir';
+  // 任务分支展示判定：dir 或 repo local-path 任务无分支概念（task.branch 恒空），页头/任务行分支名隐藏
+  const isBranchless = !!task && isGitlessTask(task.project_kind, task.mode);
+  // dir 任务无 git 能力时若正停在 Git tab，回退到 TUI tab（repo local-path 不回退）
   useEffect(() => {
-    if (isDir && tab === GIT_TAB) setTab(TUI_TAB);
-  }, [isDir, tab]);
+    if (isGitless && tab === GIT_TAB) setTab(TUI_TAB);
+  }, [isGitless, tab]);
 
   // 页头任务切换器候选：与侧栏任务组同源（共享 store），仅活跃+挂起任务（归档不显示）。
   // data-od-id / wb-* class 对齐设计稿 task-workbench.html:229
   // 注意：以下 Hook 必须在任何条件 return 之前（404 分支不得改变 Hook 调用次数）。
   const switcherTasks = useMemo(() => {
-    const out: Array<{ taskID: string; name: string; branch: string; projectName: string; agentStatus?: string; attentionCount: number; current: boolean }> = [];
+    const out: Array<{ taskID: string; name: string; branch: string; gitless: boolean; projectName: string; agentStatus?: string; attentionCount: number; current: boolean }> = [];
     for (const p of projects) {
       // 与侧栏 SidebarTaskGroups 同源：仅 active+suspended（归档/失败等不显示）
       for (const t of (p.tasks ?? []).filter((x) => x.status === 'active' || x.status === 'suspended')) {
@@ -244,6 +247,7 @@ export function TaskWorkbenchPage({
           taskID: t.id,
           name: t.name,
           branch: t.branch,
+          gitless: isGitlessTask(p.kind, t.mode),
           projectName: p.name,
           agentStatus: t.agentStatus,
           attentionCount: t.attention_count ?? 0,
@@ -358,7 +362,8 @@ export function TaskWorkbenchPage({
                           title={t.attentionCount > 0 ? `等待人工处理：${t.attentionCount} 个待处理请求` : undefined}
                         ><span className="od-agent-dot" /></span>
                         <span className="wb-sw-name">{t.name}</span>
-                        <span className="mono">{t.branch}</span>
+                        {/* gitless 任务（dir/local-path）不渲染分支名，整段移除不留占位 */}
+                        {!t.gitless && <span className="mono">{t.branch}</span>}
                       </button>
                     ))}
                   </div>
@@ -380,7 +385,7 @@ export function TaskWorkbenchPage({
         ) : (
           <span className="page-title">{task?.name ?? '…'}</span>
         )}
-        {task?.branch && !isDir && <span className="header-meta mono"><BranchIcon /> {task.branch}</span>}
+        {task?.branch && !isBranchless && <span className="header-meta mono"><BranchIcon /> {task.branch}</span>}
         {task && <StatusBadge status={task.status} />}
         {task && <InitStatusBadge task={task} />}
         {task?.init_status === 'failed' && !isNarrow && (
@@ -486,7 +491,7 @@ export function TaskWorkbenchPage({
           +
         </button>
         <span className="tab-sep" />
-        {!isDir && (
+        {!isGitless && (
           <button
             className={`tab ${tab === GIT_TAB ? 'tab-active' : ''}`}
             onClick={() => switchTab(GIT_TAB)}
@@ -553,7 +558,7 @@ export function TaskWorkbenchPage({
             <TerminalView wsPath={`/ws/terminal/shell/${tid}`} active={tab === tid} />
           </div>
         ))}
-        {visited.has(GIT_TAB) && !isDir && (
+        {visited.has(GIT_TAB) && !isGitless && (
           <div className={`pane pane-scroll ${tab === GIT_TAB ? '' : 'pane-hidden'}`}>
             <GitPanel
               taskID={taskID}

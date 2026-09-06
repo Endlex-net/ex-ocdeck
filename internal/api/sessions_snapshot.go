@@ -9,11 +9,15 @@ package api
 
 import (
 	"context"
+	"fmt"
 )
 
 // buildActiveSessionsSnapshot 组装 active sessions 全量快照（REST handler 与
 // SSE 全量重推共用；design.md D3）。store 失败返回 error（调用方 500 / SSE 保留
 // 上次快照）；空结果返回非 nil 空切片（JSON `[]` 非 null）。
+// mode 必有透传（add-local-path-task-mode D7）：非法 kind/mode 组合为持久化损坏，
+// 返回错误 fail-closed——REST 500；SSE 初始组装 500、update 保持 dirty 重试，
+// MUST NOT 推送缺 mode 的帧。
 func (s *Server) buildActiveSessionsSnapshot(ctx context.Context) ([]activeSessionDTO, error) {
 	rows, err := s.tasks.ListActiveTaskOverview(ctx)
 	if err != nil {
@@ -21,9 +25,13 @@ func (s *Server) buildActiveSessionsSnapshot(ctx context.Context) ([]activeSessi
 	}
 	out := make([]activeSessionDTO, 0, len(rows))
 	for _, row := range rows {
+		if !validTaskModeForKind(row.Kind, row.Mode) {
+			return nil, fmt.Errorf("task %s: invalid mode %q for kind %q", row.ID, row.Mode, row.Kind)
+		}
 		dto := activeSessionDTO{
 			TaskID: row.ID, ProjectID: row.ProjectID, ProjectName: row.ProjectName,
 			Name: row.Name, Branch: row.Branch, WorktreePath: row.WorktreePath,
+			Mode: row.Mode,
 			LastActiveAt: row.LastActiveAt,
 			AgentStatus:  s.tasks.AgentStatusSnapshot(row.ID),
 		}

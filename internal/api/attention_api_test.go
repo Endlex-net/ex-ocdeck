@@ -25,7 +25,7 @@ func (b *attentionTaskBackend) Attention(taskID string) (application.Attention, 
 }
 
 func (b *attentionTaskBackend) Get(ctx context.Context, taskID string) (application.TaskRow, error) {
-	return application.TaskRow{ID: taskID, ProjectID: "p1", Status: application.StatusActive}, nil
+	return application.TaskRow{ID: taskID, ProjectID: "p1", Status: application.StatusActive, Mode: "worktree"}, nil
 }
 
 func TestGetTask_AttentionFields(t *testing.T) {
@@ -154,10 +154,10 @@ func TestListProjects_TaskSummaries(t *testing.T) {
 		fakeTaskBackend: &fakeTaskBackend{},
 		summaries: []application.ProjectTaskSummary{
 			{TaskID: "t1", Name: "taskA", ProjectID: "p1", Status: application.StatusActive,
-				InitStatus: application.InitStatusNone, Branch: "b1", WorktreePath: "/wt1",
+				InitStatus: application.InitStatusNone, Branch: "b1", Mode: "worktree", WorktreePath: "/wt1",
 				UpdatedAt: 100, AttentionCount: 2},
 			{TaskID: "t2", Name: "taskB", ProjectID: "p1", Status: application.StatusSuspended,
-				InitStatus: application.InitStatusSucceeded, Branch: "b2", WorktreePath: "/wt2",
+				InitStatus: application.InitStatusSucceeded, Branch: "b2", Mode: "worktree", WorktreePath: "/wt2",
 				UpdatedAt: 200, AttentionCount: 0},
 		},
 		agentStatusSnapshot: map[string]string{"t1": "busy"},
@@ -267,7 +267,7 @@ func TestListProjects_AgentStatusSnapshotDegradation(t *testing.T) {
 		fakeTaskBackend: &fakeTaskBackend{},
 		summaries: []application.ProjectTaskSummary{
 			{TaskID: "t1", Name: "taskA", ProjectID: "p1", Status: application.StatusActive,
-				InitStatus: application.InitStatusNone, Branch: "b1", WorktreePath: "/wt1", UpdatedAt: 100},
+				InitStatus: application.InitStatusNone, Branch: "b1", Mode: "worktree", WorktreePath: "/wt1", UpdatedAt: 100},
 		},
 	}
 	projs := newFakeProjectStore()

@@ -33,7 +33,7 @@ func (a *StoreAdapter) GetProject(ctx context.Context, id string) (ProjectRow, e
 func (a *StoreAdapter) CreateTask(ctx context.Context, t TaskRow) error {
 	return a.db.CreateTask(ctx, store.TaskRow{
 		ID: t.ID, ProjectID: t.ProjectID, Name: t.Name, Branch: t.Branch,
-		Status: t.Status, WorktreePath: t.WorktreePath, BaseRef: t.BaseRef,
+		Status: t.Status, WorktreePath: t.WorktreePath, BaseRef: t.BaseRef, Mode: t.Mode,
 	})
 }
 
@@ -78,7 +78,8 @@ func (a *StoreAdapter) ListActiveTaskOverview(ctx context.Context) ([]ActiveTask
 	for _, r := range rows {
 		out = append(out, ActiveTaskOverviewRow{
 			ID: r.ID, ProjectID: r.ProjectID, ProjectName: r.ProjectName, Name: r.Name,
-			Branch: r.Branch, WorktreePath: r.WorktreePath, LastActiveAt: r.LastActiveAt,
+			Branch: r.Branch, WorktreePath: r.WorktreePath, Mode: r.Mode, Kind: r.Kind,
+			LastActiveAt: r.LastActiveAt,
 		})
 	}
 	return out, nil
@@ -111,6 +112,9 @@ func (a *StoreAdapter) BeginDeleteIntent(ctx context.Context, id, mode string, f
 		fs[i] = ocdecktask.Status(s)
 	}
 	return a.db.BeginDeleteIntent(ctx, id, ocdecktask.DeleteMode(mode), fs)
+}
+func (a *StoreAdapter) BeginRetryDeleteIntent(ctx context.Context, id, mode string) (application.TransitionResult, error) {
+	return a.db.BeginRetryDeleteIntent(ctx, id, ocdecktask.DeleteMode(mode))
 }
 func (a *StoreAdapter) ArchiveTask(ctx context.Context, id string) (application.TransitionResult, error) {
 	return a.db.ArchiveTask(ctx, id)
@@ -395,6 +399,7 @@ func taskRowToSnapshot(r TaskRow) application.TaskSnapshot {
 		InitError:       nullStringToPtr(r.InitError),
 		BaseRef:         r.BaseRef,
 		AnchorSessionID: nullStringToPtr(r.AnchorSessionID),
+		Mode:            r.Mode,
 	}
 }
 
@@ -492,7 +497,7 @@ func toTaskRow(t store.TaskRow) TaskRow {
 		WorktreePath: t.WorktreePath, LastPort: t.LastPort, LastError: t.LastError, Notice: t.Notice,
 		DeleteMode: t.DeleteMode, EnvSnapshot: t.EnvSnapshot, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
 		ArchivedAt: t.ArchivedAt, InitStatus: t.InitStatus, InitError: t.InitError, BaseRef: t.BaseRef,
-		AnchorSessionID: t.AnchorSessionID,
+		AnchorSessionID: t.AnchorSessionID, Mode: t.Mode,
 	}
 }
 
@@ -521,6 +526,7 @@ func taskSnapshotToTaskRow(s application.TaskSnapshot) TaskRow {
 		InitError:       ptrToNullString(s.InitError),
 		BaseRef:         s.BaseRef,
 		AnchorSessionID: ptrToNullString(s.AnchorSessionID),
+		Mode:            s.Mode,
 	}
 }
 

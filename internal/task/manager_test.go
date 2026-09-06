@@ -21,7 +21,8 @@ func seedSuspendedTask(s *mockStore, taskID, projectID string) TaskRow {
 	s.seedProject(ProjectRow{ID: projectID, Name: "p", Path: "/repo", DefaultBranch: "main"})
 	t := TaskRow{ID: taskID, ProjectID: projectID, Name: "my task", Branch: "ocdeck/my-task",
 		BaseRef: "refs/heads/main",
-		Status:  StatusSuspended, WorktreePath: "/data/worktrees/" + projectID + "/" + taskID}
+		Status:  StatusSuspended, WorktreePath: "/data/worktrees/" + projectID + "/" + taskID,
+		Mode: TaskModeWorktree}
 	s.tasks[taskID] = t
 	return t
 }
@@ -32,7 +33,8 @@ func seedActiveTask(s *mockStore, taskID, projectID string) TaskRow {
 	s.seedProject(ProjectRow{ID: projectID, Name: "p", Path: "/repo", DefaultBranch: "main"})
 	t := TaskRow{ID: taskID, ProjectID: projectID, Name: "my task", Branch: "ocdeck/my-task",
 		BaseRef: "refs/heads/main",
-		Status:  StatusActive, WorktreePath: "/data/worktrees/" + projectID + "/" + taskID}
+		Status:  StatusActive, WorktreePath: "/data/worktrees/" + projectID + "/" + taskID,
+		Mode: TaskModeWorktree}
 	s.tasks[taskID] = t
 	return t
 }
@@ -43,7 +45,7 @@ func TestCreate_Success(t *testing.T) {
 	wt := newMockWorktree()
 	m := newTestManager(t, store, newMockProc(), wt, newMockOC(true))
 
-	row, err := m.Create(context.Background(), "p1", "My Task", "")
+	row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "My Task"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -65,7 +67,7 @@ func TestCreate_WorktreeFail_CreationFailed(t *testing.T) {
 	wt.addErr = errors.New("branch exists")
 	m := newTestManager(t, store, newMockProc(), wt, newMockOC(true))
 
-	_, err := m.Create(context.Background(), "p1", "task", "")
+	_, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "task"})
 	if err == nil {
 		t.Fatal("expected error on worktree add failure")
 	}
@@ -471,8 +473,8 @@ func TestKeyedMutex_ConcurrentCreate(t *testing.T) {
 
 	// 并发创建两个任务：各自独立 taskID，不冲突（keyed mutex per task）。
 	done := make(chan error, 2)
-	go func() { _, err := m.Create(context.Background(), "p1", "A", ""); done <- err }()
-	go func() { _, err := m.Create(context.Background(), "p1", "B", ""); done <- err }()
+	go func() { _, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "A"}); done <- err }()
+	go func() { _, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "B"}); done <- err }()
 	for i := 0; i < 2; i++ {
 		if err := <-done; err != nil {
 			t.Errorf("concurrent create %d: %v", i, err)

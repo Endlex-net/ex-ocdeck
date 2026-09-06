@@ -37,7 +37,7 @@ func TestBuildActiveSessionsSnapshot_AssemblesOverviewAttentionAgentStatus(t *te
 	want := []activeSessionDTO{
 		{
 			TaskID: "t1", ProjectID: "p1", ProjectName: "projA", Name: "taskA",
-			Branch: "bA", WorktreePath: "/wtA", LastActiveAt: 300, AgentStatus: "busy",
+			Branch: "bA", WorktreePath: "/wtA", Mode: "worktree", LastActiveAt: 300, AgentStatus: "busy",
 			Attention: attentionDTO{
 				Permissions: []permissionDTO{{Since: 100}},
 				Questions:   []questionDTO{},
@@ -45,7 +45,7 @@ func TestBuildActiveSessionsSnapshot_AssemblesOverviewAttentionAgentStatus(t *te
 		},
 		{
 			TaskID: "t2", ProjectID: "p2", ProjectName: "projB", Name: "taskB",
-			Branch: "bB", WorktreePath: "/wtB", LastActiveAt: 200,
+			Branch: "bB", WorktreePath: "/wtB", Mode: "worktree", LastActiveAt: 200,
 			// 无 attention 注入 → fake 默认空快照 → 空数组非 null。
 			Attention: attentionDTO{Permissions: []permissionDTO{}, Questions: []questionDTO{}},
 		},

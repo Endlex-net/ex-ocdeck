@@ -106,7 +106,7 @@ func TestCreateChain_NoInitScript_DirectActivate(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 
-	row, err := m.Create(context.Background(), "p1", "mytask", "")
+	row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "mytask"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestCreateChain_WithInitScript_StartsInitRunner(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 
-	row, err := m.Create(context.Background(), "p1", "mytask", "")
+	row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "mytask"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestCreateChain_InitScriptFails_InitFailed(t *testing.T) {
 	runner := &mockLifecycleRunner{runScriptErr: fmt.Errorf("script boom")}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 
-	row, err := m.Create(context.Background(), "p1", "mytask", "")
+	row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "mytask"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestCreateChain_InheritConfigReadFails_CreationFailed(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 
-	_, err := m.Create(context.Background(), "p1", "mytask", "")
+	_, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "mytask"})
 	if err == nil {
 		t.Fatalf("Create must fail when lifecycle config read fails")
 	}
@@ -871,7 +871,7 @@ func TestCreateChain_InitScriptSucceeded_TriggersActivate(t *testing.T) {
 	runner := &mockLifecycleRunner{}
 	m := newLifecycleTestManager(t, store, proc, wt, oc, runner)
 
-	row, err := m.Create(context.Background(), "p1", "mytask", "")
+	row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "mytask"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}

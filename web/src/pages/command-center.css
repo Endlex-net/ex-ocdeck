@@ -240,6 +240,44 @@
   margin-top: 10px;
 }
 
+/* 工作空间 segmented control（add-local-path-task-mode）：与 od-input 同一 32px 字段节奏；
+   选中段用 od-btn-primary 同款 accent 底色，未选中段 surface 底 + muted 文字。
+   宽度贴合内容：od-field 是纵向 flex 容器，子项默认 align-self: stretch 会把本容器
+   拉成全宽（inline-flex 被覆盖），必须显式 flex-start 只包裹两个选项段。 */
+.cc-segment {
+  display: inline-flex;
+  align-self: flex-start;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  /* 圆角衔接：item 无自身圆角，选中段 accent 底由此处裁剪，两端圆角与容器边框对齐 */
+  overflow: hidden;
+}
+.cc-segment-item {
+  padding: 0 14px;
+  font-size: 13px;
+  background: var(--surface);
+  color: var(--muted);
+  border: none;
+  cursor: pointer;
+}
+.cc-segment-item + .cc-segment-item {
+  border-left: 1px solid var(--border);
+}
+.cc-segment-item:hover {
+  background: var(--surface-hover);
+}
+.cc-segment-item.on,
+.cc-segment-item.on:hover {
+  background: var(--accent);
+  color: var(--on-ink);
+}
+
+/* local-path 低可见度提醒：复用 cc-store-hint 的 12px 灰字（无色块无边框），仅补段下间距 */
+.cc-mode-hint {
+  margin-top: 6px;
+}
+
 .cc-store-hint {
   margin-top: 8px;
   font-size: 12px;

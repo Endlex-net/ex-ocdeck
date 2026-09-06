@@ -7,7 +7,8 @@
 // LifecycleService，断言：
 //   - Create repo/dir 成功路径状态收敛（自动激活推进 active）与 guard 拒绝零落库；
 //   - Retry creation_failed 解锁后再调度自动激活（不自锁）；
-//   - Retry deletion_failed 重入：SetDeleteMode + deleting 两笔写入先于 dirty preflight；
+//   - Retry deletion_failed 重入：原子意图写 BeginRetryDeleteIntent（delete_mode + deleting
+//     + last_error=NULL）先于 dirty preflight；
 //   - Activate guard 拒绝零 CAS；成功路径推进 active。
 package task
 
@@ -50,7 +51,7 @@ func TestP146_Create_Repo_ViaLifecycle(t *testing.T) {
 	proc := newMockProc()
 	m := newP146TestManager(t, store, proc, wt, newMockOC(true))
 
-	row, err := m.Create(context.Background(), "p1", "My Task", "")
+	row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "My Task"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -81,7 +82,7 @@ func TestP146_Create_Repo_GuardReject_ViaLifecycle(t *testing.T) {
 	wt.branches["ocdeck/my-task"] = true
 	m := newP146TestManager(t, store, newMockProc(), wt, newMockOC(true))
 
-	_, err := m.Create(context.Background(), "p1", "My Task", "")
+	_, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "My Task"})
 	if err == nil {
 		t.Fatal("expected conflict on branch exists")
 	}
@@ -104,7 +105,7 @@ func TestP146_Create_Dir_ViaLifecycle(t *testing.T) {
 	store.seedProject(ProjectRow{ID: "p1", Name: "proj", Path: dir, DefaultBranch: "", Kind: ProjectKindDir})
 	m := newP146TestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
 
-	row, err := m.Create(context.Background(), "p1", "My Task", "")
+	row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "My Task"})
 	if err != nil {
 		t.Fatalf("Create dir: %v", err)
 	}
@@ -144,8 +145,9 @@ func TestP146_Retry_CreationFailed_UnlockThenActivate(t *testing.T) {
 }
 
 // TestP146_Retry_DeletionFailed_Reenter_ViaLifecycle deletion_failed + 持久化 force 模式重入：
-// SetDeleteMode + UpdateTaskStatus(deleting) 两笔写入（经 lifecycle 路由）MUST 先于
-// dirty preflight 发生；preflight 失败后落回 deletion_failed。
+// 原子意图写入 BeginRetryDeleteIntent（delete_mode=force + status=deleting + last_error=NULL
+// 单事务，经 lifecycle 路由）MUST 先于 dirty preflight 发生；preflight 失败后经 CAS 条件写
+// 落回 deletion_failed。
 func TestP146_Retry_DeletionFailed_Reenter_ViaLifecycle(t *testing.T) {
 	store := newMockStore()
 	store.seedProject(ProjectRow{ID: "p1", Name: "proj", Path: "/repo", DefaultBranch: "main"})
@@ -164,14 +166,13 @@ func TestP146_Retry_DeletionFailed_Reenter_ViaLifecycle(t *testing.T) {
 	if OpErrorCode(err) != codeGitError {
 		t.Fatalf("code = %s, want git_error", OpErrorCode(err))
 	}
-	// 两笔写入先于 DirtyFiles（deleteResume 未达即失败，写入顺序仍冻结）。
+	// 原子意图写入先于 DirtyFiles（deleteResume 未达即失败，写入顺序仍冻结）。
 	assertOrdered(t, tr, []traceOp{
-		{src: "store", op: "SetTaskDeleteMode", key: "mode=force"},
-		{src: "store", op: "UpdateTaskStatus", key: "status=deleting"},
+		{src: "store", op: "BeginRetryDeleteIntent", key: "id=t1 mode=force"},
 		{src: "wt", op: "DirtyFiles", key: "/data/worktrees/p1/t1"},
-		{src: "store", op: "UpdateTaskStatus", key: "status=deletion_failed"},
+		{src: "store", op: "UpdateTaskStatusConditional", key: "id=t1 deleting->deletion_failed"},
 	}, "Retry.deletionFailed.reenter")
-	// SetDeleteMode 写入生效（force 持久化，不被 Normal 重试覆盖）。
+	// delete_mode 写入生效（force 持久化，不被 Normal 重试覆盖）。
 	row, _ := store.GetTask(context.Background(), "t1")
 	if !row.DeleteMode.Valid || row.DeleteMode.String != string(DeleteForce) {
 		t.Fatalf("delete_mode = %+v, want force", row.DeleteMode)

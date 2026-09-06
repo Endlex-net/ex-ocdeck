@@ -127,6 +127,7 @@ func fixtureTaskRow(id string) application.TaskRow {
 		Branch:       "main",
 		Status:       application.StatusActive,
 		WorktreePath: "/wtA",
+		Mode:         "worktree",
 		CreatedAt:    100,
 		UpdatedAt:    200,
 		InitStatus:   "none",

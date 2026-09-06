@@ -20,22 +20,37 @@ type GitStatusDTO = application.GitStatusDTO
 // GitDiffDTO diff 响应（单文件两侧版本内容八字段契约，design.md §21 git/diff）。
 type GitDiffDTO = application.GitDiffDTO
 
-// assertGitRepoTask 解析任务所属项目 kind，校验该任务可作为 git 操作目标（add-plain-dir-project D5）。
-// 在执行任何 git 命令前调用：dir 项目 → codeInvalidInput（明确"project kind is dir (not a git repository)"），
-// 未知 kind → codeInvalidInput fail-closed。repo 项目通过，返回 ProjectRow 供后续 git 命令使用。
+// assertGitRepoTask 解析任务有效模式，校验该任务可作为 git 操作目标（add-plain-dir-project D5
+// + add-local-path-task-mode D8 修订：repo 项目 local-path 模式开放完整 git 能力）。
+// 在执行任何 git 命令/文件读取/子仓库探测前调用：
+//   - worktree 模式任务（repo 项目 worktree）→ 通过，返回 ProjectRow；
+//   - local-path 模式任务（repo 项目 local-path）→ 通过，返回 ProjectRow（操作作用于项目目录
+//     当前 checkout 的当前分支，row.WorktreePath 即项目路径，无 base_ref 依赖）；
+//   - dir 项目任务 → codeInvalidInput（文案不变：「纯目录项目非 git 仓库」）；
+//   - 非法 kind/mode 组合 → codeInternal fail-closed。
+//
+// 风险归属（design D8 显式契约）：repo local-path 任务的操作对象是用户主仓库当前分支，
+// 改动就地生效、提交与推送直接作用于用户分支；dirty 混杂与直接提交/推送主仓库分支的风险
+// 由用户自担（与 local-path 共享目录语义一致）。
 func (m *Manager) assertGitRepoTask(ctx context.Context, row TaskRow) (ProjectRow, error) {
 	proj, err := m.store.GetProject(ctx, row.ProjectID)
 	if err != nil {
 		return ProjectRow{}, newOpErr(codeNotFound, fmt.Errorf("project not found: %w", err))
 	}
-	switch proj.Kind {
-	case ProjectKindRepo:
+	effMode, rerr := resolveTaskMode(row, proj.Kind)
+	if rerr != nil {
+		// 非法持久化 kind/mode 组合（DB 损坏值）→ internal（D1/D2）。
+		return ProjectRow{}, newOpErr(codeInternal, rerr)
+	}
+	switch effMode {
+	case TaskModeWorktree, TaskModeLocalPath:
+		// repo 项目两种模式均放行 git 能力；dir 项目恒为 local-path 但走下方 dir 拒绝分支。
+		if proj.Kind == ProjectKindDir {
+			return ProjectRow{}, newOpErr(codeInvalidInput, errors.New("project kind is dir (not a git repository)"))
+		}
 		return proj, nil
-	case ProjectKindDir:
-		return ProjectRow{}, newOpErr(codeInvalidInput, errors.New("project kind is dir (not a git repository)"))
 	default:
-		// 未知持久化 kind（DB 损坏值）→ internal（D1：区别于用户请求非法 kind 的 invalid_input）。
-		return ProjectRow{}, newOpErr(codeInternal, fmt.Errorf("unknown project kind %q", proj.Kind))
+		return ProjectRow{}, newOpErr(codeInternal, fmt.Errorf("task %s: unknown effective mode %q", row.ID, effMode))
 	}
 }
 

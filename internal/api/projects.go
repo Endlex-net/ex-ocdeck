@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -58,14 +59,16 @@ type projectDTO struct {
 	TaskSummaries []projectTaskSummaryDTO `json:"tasks"`
 }
 
-// projectTaskSummaryDTO 项目任务摘要 DTO（design.md D4 11 字段）。
-// notice 为 NoticeItem[] 原样透传（无 notice 时省略）；agentStatus 水合失败省略。
+// projectTaskSummaryDTO 项目任务摘要 DTO（design.md D4 11 字段 + mode，project-management
+// delta 字段表）。notice 为 NoticeItem[] 原样透传（无 notice 时省略）；agentStatus 水合失败省略；
+// mode 为必有字段（add-local-path-task-mode D7），非法 kind/mode 组装 fail-closed 报错。
 type projectTaskSummaryDTO struct {
 	ID             string          `json:"id"`
 	Name           string          `json:"name"`
 	Status         string          `json:"status"`
 	InitStatus     string          `json:"init_status"`
 	Branch         string          `json:"branch"`
+	Mode           string          `json:"mode"`
 	WorktreePath   string          `json:"worktree_path"`
 	LastError      string          `json:"last_error,omitempty"`
 	Notice         json.RawMessage `json:"notice,omitempty"`
@@ -141,12 +144,17 @@ func groupSummariesByProject(summaries []application.ProjectTaskSummary) map[str
 
 // toProjectTaskSummaryDTOs 转换任务摘要为 DTO；active 任务的 agentStatus 读内存快照
 // （projects-stream，与 /tasks/active 同模式；快照不可用空串经 omitempty 省略）。
-func (s *Server) toProjectTaskSummaryDTOs(summaries []application.ProjectTaskSummary) []projectTaskSummaryDTO {
+// mode 为必有字段（add-local-path-task-mode D7）：非法 kind/mode 组合为持久化损坏，
+// 返回错误 fail-closed（调用方 500 / SSE 保留上次快照），不输出缺 mode 元素。
+func (s *Server) toProjectTaskSummaryDTOs(projectKind string, summaries []application.ProjectTaskSummary) ([]projectTaskSummaryDTO, error) {
 	out := make([]projectTaskSummaryDTO, 0, len(summaries))
 	for _, sm := range summaries {
+		if !validTaskModeForKind(projectKind, sm.Mode) {
+			return nil, fmt.Errorf("task %s: invalid mode %q for kind %q", sm.TaskID, sm.Mode, projectKind)
+		}
 		dto := projectTaskSummaryDTO{
 			ID: sm.TaskID, Name: sm.Name, Status: sm.Status, InitStatus: sm.InitStatus,
-			Branch: sm.Branch, WorktreePath: sm.WorktreePath, LastError: sm.LastError,
+			Branch: sm.Branch, Mode: sm.Mode, WorktreePath: sm.WorktreePath, LastError: sm.LastError,
 			UpdatedAt: sm.UpdatedAt, AttentionCount: sm.AttentionCount,
 		}
 		if sm.Notice != "" {
@@ -157,7 +165,7 @@ func (s *Server) toProjectTaskSummaryDTOs(summaries []application.ProjectTaskSum
 		}
 		out = append(out, dto)
 	}
-	return out
+	return out, nil
 }
 
 // handleCreateProject POST /api/v1/projects（design.md §21，spec：项目注册）。
@@ -285,13 +293,19 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 		dto.Tasks = map[string]int{}
 	}
 	// tasks 摘要（design.md D4）：取全部任务摘要并按项目过滤。
+	// mode fail-closed（add-local-path-task-mode D7）：非法 kind/mode → 500 标准错误信封。
 	if s.tasks != nil {
 		summaries, serr := s.tasks.ListProjectTaskSummaries(r.Context())
 		if serr != nil {
 			writeError(w, CodeInternal, "list project task summaries failed")
 			return
 		}
-		dto.TaskSummaries = s.toProjectTaskSummaryDTOs(groupSummariesByProject(summaries)[id])
+		sums, de := s.toProjectTaskSummaryDTOs(p.Kind, groupSummariesByProject(summaries)[id])
+		if de != nil {
+			writeError(w, CodeInternal, "list project task summaries failed")
+			return
+		}
+		dto.TaskSummaries = sums
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(dto)

@@ -123,6 +123,11 @@ func (s *mockStore) CreateTask(ctx context.Context, t TaskRow) error {
 	if t.InitStatus == "" {
 		t.InitStatus = InitStatusNone
 	}
+	// 与 store schema migration 0013 一致：新建任务 mode 默认 worktree
+	//（add-local-path-task-mode D1：Create 链显式写入，此处仅为直连 mock 的缺省兜底）。
+	if t.Mode == "" {
+		t.Mode = TaskModeWorktree
+	}
 	s.tasks[t.ID] = t
 	return nil
 }
@@ -140,6 +145,13 @@ func (s *mockStore) GetTask(ctx context.Context, id string) (TaskRow, error) {
 	if t.InitStatus == "" {
 		t.InitStatus = InitStatusNone
 	}
+	// 与 store schema migration 0013 一致：mode 缺省为 worktree
+	//（add-local-path-task-mode D1：列 NOT NULL DEFAULT 'worktree'，存量 dir 行由 migration
+	// 回填 local-path）。测试直接构造 TaskRow 时可能未设置，读回时归一化，模拟 DB 不变量
+	//「任何行读出必有非空 mode」。dir 项目任务的 fixture MUST 显式设 Mode: TaskModeLocalPath。
+	if t.Mode == "" {
+		t.Mode = TaskModeWorktree
+	}
 	s.mu.Unlock()
 	// onGetTask 读后回调（锁外，G3-16 屏障：复核取值后、返回前阻塞——期间测试
 	// 可改状态/关通道，模拟「复核读取与判定之间」的交错窗口）。
@@ -155,6 +167,10 @@ func (s *mockStore) ListTasksByProject(ctx context.Context, projectID string) ([
 	var out []TaskRow
 	for _, t := range s.tasks {
 		if t.ProjectID == projectID {
+			if t.Mode == "" {
+				// 读回归一化模拟 DB DEFAULT（migration 0013），与 GetTask 一致。
+				t.Mode = TaskModeWorktree
+			}
 			out = append(out, t)
 		}
 	}
@@ -166,6 +182,10 @@ func (s *mockStore) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 	defer s.mu.Unlock()
 	var out []TaskRow
 	for _, t := range s.tasks {
+		if t.Mode == "" {
+			// 读回归一化模拟 DB DEFAULT（migration 0013），与 GetTask 一致。
+			t.Mode = TaskModeWorktree
+		}
 		out = append(out, t)
 	}
 	return out, nil
@@ -387,6 +407,25 @@ func (s *mockStore) BeginDeleteIntent(ctx context.Context, id, mode string, from
 		}
 	}
 	return application.TransitionResult{}, nil
+}
+
+// BeginRetryDeleteIntent 镜像 store SQL 语义（评审 C-F3）：仅 deletion_failed 命中，
+// 原子写 delete_mode + status=deleting + last_error=NULL。
+func (s *mockStore) BeginRetryDeleteIntent(ctx context.Context, id, mode string) (application.TransitionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.tasks[id]
+	if !ok {
+		return application.TransitionResult{}, fmt.Errorf("not found")
+	}
+	if t.Status != StatusDeletionFailed {
+		return application.TransitionResult{}, nil
+	}
+	t.Status = StatusDeleting
+	t.DeleteMode = sql.NullString{String: mode, Valid: true}
+	t.LastError = sql.NullString{}
+	s.tasks[id] = t
+	return application.TransitionResult{MutationResult: application.MutationResult{Matched: true, Changed: true}}, nil
 }
 
 func (s *mockStore) ArchiveTask(ctx context.Context, id string) (application.TransitionResult, error) {

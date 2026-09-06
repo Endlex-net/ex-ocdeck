@@ -56,6 +56,8 @@ type ProjectRow struct {
 // init_status ∈ none | pending | running | succeeded | failed；init_error 仅 failed 时非空。
 // BaseRef 对应 migration 0008 新增列（add-plain-dir-project D10）：repo 任务的基线分支全引用
 // （如 refs/heads/main），dir 项目任务为空串。
+// Mode 对应 migration 0013 新增列（add-local-path-task-mode D1）：任务级运行模式，
+// worktree | local-path（dir 项目任务恒为 local-path）。
 type TaskRow struct {
 	ID              string
 	ProjectID       string
@@ -75,6 +77,7 @@ type TaskRow struct {
 	InitError       sql.NullString
 	BaseRef         string
 	AnchorSessionID sql.NullString
+	Mode            string
 }
 
 // LifecycleConfigRow project_lifecycle_configs 表行映射（design.md §2，migration 0007）。
@@ -340,21 +343,28 @@ func (q *Queries) DeleteGlobalEnvVar(ctx context.Context, key string) error {
 }
 
 // CreateTask 插入任务行。base_ref 为 repo 任务的基线分支全引用，dir 项目任务传空串
-// （migration 0008，add-plain-dir-project D10）。
+// （migration 0008，add-plain-dir-project D10）。mode 为任务级运行模式（migration 0013，
+// add-local-path-task-mode D1）：创建方 MUST 显式传入（repo worktree/local-path、dir local-path），
+// dir 任务 MUST NOT 落到列 DEFAULT 'worktree'（否则立即成为非法组合）；调用方传空串时
+// 按列 DEFAULT 语义显式写 'worktree'（与存量 repo 行等价），杜绝持久化空 mode。
 func (q *Queries) CreateTask(ctx context.Context, t TaskRow) error {
+	mode := t.Mode
+	if mode == "" {
+		mode = "worktree"
+	}
 	_, err := q.db.ExecContext(ctx,
-		`INSERT INTO tasks (id, project_id, name, branch, status, worktree_path, base_ref, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.ProjectID, t.Name, t.Branch, t.Status, t.WorktreePath, t.BaseRef, nowUnix(), nowUnix())
+		`INSERT INTO tasks (id, project_id, name, branch, status, worktree_path, base_ref, mode, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.ProjectID, t.Name, t.Branch, t.Status, t.WorktreePath, t.BaseRef, mode, nowUnix(), nowUnix())
 	return err
 }
 
-// GetTask 按 ID 查询任务（含 env_snapshot、init_status/init_error、base_ref）。
+// GetTask 按 ID 查询任务（含 env_snapshot、init_status/init_error、base_ref、mode）。
 func (q *Queries) GetTask(ctx context.Context, id string) (TaskRow, error) {
 	row := q.db.QueryRowContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
 		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
-		        anchor_session_id
+		        anchor_session_id, mode
 		 FROM tasks WHERE id = ?`, id)
 	return scanTaskRow(row)
 }
@@ -364,7 +374,7 @@ func (q *Queries) ListTasksByProject(ctx context.Context, projectID string) ([]T
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
 		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
-		        anchor_session_id
+		        anchor_session_id, mode
 		 FROM tasks WHERE project_id = ? ORDER BY created_at ASC`, projectID)
 	if err != nil {
 		return nil, err
@@ -378,7 +388,7 @@ func (q *Queries) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
 		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
-		        anchor_session_id
+		        anchor_session_id, mode
 		 FROM tasks ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
@@ -390,6 +400,8 @@ func (q *Queries) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 // ActiveTaskOverviewRow 跨项目 active 任务概览投影行（cross-project-active-sessions D2）。
 // 仅供 GET /api/v1/tasks/active 读模型：不含 status/init 等详情字段，不携带 agentStatus。
 // last_active_at 为 MAX(task_sessions.last_seen_at)，无 session 时回退 t.updated_at。
+// Mode/Kind 为任务运行模式与项目类型（add-local-path-task-mode D7）：API 组装按
+// kind+mode 组合 fail-closed 校验。
 type ActiveTaskOverviewRow struct {
 	ID           string
 	ProjectID    string
@@ -397,6 +409,8 @@ type ActiveTaskOverviewRow struct {
 	Name         string
 	Branch       string
 	WorktreePath string
+	Mode         string
+	Kind         string
 	LastActiveAt int64
 }
 
@@ -411,6 +425,7 @@ type ActiveTaskOverviewRow struct {
 func (q *Queries) ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOverviewRow, error) {
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT t.id, t.project_id, p.name AS project_name, t.name, t.branch, t.worktree_path,
+		        t.mode, p.kind,
 		        COALESCE(
 		          MAX(CASE
 		            WHEN s.last_seen_at >= 100000000000
@@ -432,7 +447,7 @@ func (q *Queries) ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOverv
 	var out []ActiveTaskOverviewRow
 	for rows.Next() {
 		var r ActiveTaskOverviewRow
-		if err := rows.Scan(&r.ID, &r.ProjectID, &r.ProjectName, &r.Name, &r.Branch, &r.WorktreePath, &r.LastActiveAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.ProjectID, &r.ProjectName, &r.Name, &r.Branch, &r.WorktreePath, &r.Mode, &r.Kind, &r.LastActiveAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -1139,6 +1154,63 @@ func (q *Queries) BeginDeleteIntent(ctx context.Context, id string, mode ocdeckt
 	})
 }
 
+// BeginRetryDeleteIntent 从 deletion_failed 原子重入删除意图（Retry 专用，design.md §19）：
+// 单事务写 delete_mode + status='deleting' + last_error=NULL——stale 错误清空随 CAS 原子生效，
+// 避免意图事件发布后详情/项目页读到过期错误、Reconcile 卡 deleting 时错误长期残留（评审 C-F3）。
+// 首删入口 BeginDeleteIntent 不清 last_error，行为逐字保持。
+//
+// 与 BeginDeleteIntent 同构：事务内读旧值判守卫，UPDATE WHERE 携带 status IS 'deletion_failed'
+// + 同值排除，RowsAffected=0 → !Matched（行不存在或已并发迁出 deletion_failed）。
+func (q *Queries) BeginRetryDeleteIntent(ctx context.Context, id string, mode ocdecktask.DeleteMode) (application.TransitionResult, error) {
+	return runTx(ctx, q, func(qx *Queries) (application.TransitionResult, error) {
+		row := qx.db.QueryRowContext(ctx, `SELECT status, delete_mode, updated_at FROM tasks WHERE id = ?`, id)
+		var curStatus string
+		var curMode sql.NullString
+		var curUpdatedAt int64
+		if err := row.Scan(&curStatus, &curMode, &curUpdatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				return application.TransitionResult{}, nil
+			}
+			return application.TransitionResult{}, err
+		}
+		if curStatus != string(ocdecktask.StatusDeletionFailed) {
+			return application.TransitionResult{}, nil
+		}
+		newMode := sql.NullString{String: string(mode), Valid: true}
+		now := nowUnix()
+		updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+		// 同值排除（任一列不同才匹配，F-01）：status 目标 'deleting'（守卫保证必不同）+
+		// delete_mode 目标 mode + last_error 目标 NULL。
+		diffPred, diffArgs := anyColDiffersPredicate(
+			[]string{"status", "delete_mode", "last_error"},
+			[]sql.NullString{{String: string(ocdecktask.StatusDeleting), Valid: true}, newMode, {}})
+		qry := "UPDATE tasks SET delete_mode = ?, status = 'deleting', last_error = NULL, " + updClause +
+			" WHERE id = ? AND status IS ? AND (" + diffPred + ")"
+		args := []any{newMode}
+		args = append(args, updArgs...)
+		args = append(args, id, string(ocdecktask.StatusDeletionFailed))
+		args = append(args, diffArgs...)
+		res, err := qx.db.ExecContext(ctx, qry, args...)
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return application.TransitionResult{}, err
+		}
+		if n == 0 {
+			// 并发下 status 已迁出 deletion_failed：CAS 失败。
+			return application.TransitionResult{}, nil
+		}
+		return application.TransitionResult{
+			MutationResult: application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt},
+			StatusChanged:  true,
+			From:           ocdecktask.StatusDeletionFailed,
+			To:             ocdecktask.StatusDeleting,
+		}, nil
+	})
+}
+
 func joinPlaceholders(p []string) string {
 	out := make([]byte, 0, len(p)*2-1+2)
 	out = append(out, '?')
@@ -1489,7 +1561,7 @@ func scanTaskRow(row rowScanner) (TaskRow, error) {
 	err := row.Scan(&t.ID, &t.ProjectID, &t.Name, &t.Branch, &t.Status, &t.WorktreePath,
 		&t.LastPort, &t.LastError, &t.Notice, &t.DeleteMode, &t.EnvSnapshot,
 		&t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.InitStatus, &t.InitError, &t.BaseRef,
-		&t.AnchorSessionID)
+		&t.AnchorSessionID, &t.Mode)
 	return t, err
 }
 

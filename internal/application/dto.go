@@ -48,6 +48,8 @@ const (
 
 // TaskRow tasks 表行映射（解耦 store 包结构，design.md §18）。
 // BaseRef 为 repo 任务的基线分支全引用，dir 项目任务为空串（add-plain-dir-project D10）。
+// Mode 为任务级运行模式（add-local-path-task-mode D1）：worktree | local-path，
+// 取值常量定义于 internal/task（与 ProjectKind 同处）。
 type TaskRow struct {
 	ID           string
 	ProjectID    string
@@ -67,6 +69,16 @@ type TaskRow struct {
 	InitError       sql.NullString
 	BaseRef         string
 	AnchorSessionID sql.NullString
+	Mode            string
+}
+
+// CreateTaskOptions 创建任务的请求选项（add-local-path-task-mode D3）：
+// 避免位置参数膨胀；Mode 为空串表示缺省（repo → worktree；dir → local-path），
+// 非空时 MUST 为任务包定义的合法模式值（非法值由 task 层 invalid_input 拒绝）。
+type CreateTaskOptions struct {
+	Name    string
+	BaseRef string
+	Mode    string
 }
 
 // SessionRow 会话归属行（解耦 store 包结构，design.md §18）。
@@ -83,6 +95,8 @@ type SessionRow struct {
 // ActiveTaskOverviewRow 跨项目 active 任务概览投影行（cross-project-active-sessions D1/D2）。
 // 仅供 GET /api/v1/tasks/active 读模型：字段与 store.ActiveTaskOverviewRow 一一对应，
 // 不携带 agentStatus（由 API 层组装读内存快照填充到 DTO，sse-active-sessions P2.2）。
+// Mode 为任务级运行模式、Kind 为项目类型（add-local-path-task-mode D7）：API 组装按
+// kind+mode 组合 fail-closed 校验（合法组合仅 (repo,worktree)/(repo,local-path)/(dir,local-path)）。
 type ActiveTaskOverviewRow struct {
 	ID           string
 	ProjectID    string
@@ -90,6 +104,8 @@ type ActiveTaskOverviewRow struct {
 	Name         string
 	Branch       string
 	WorktreePath string
+	Mode         string
+	Kind         string
 	LastActiveAt int64
 }
 
@@ -117,7 +133,8 @@ type Attention struct {
 }
 
 // ProjectTaskSummary 项目任务摘要（design.md D4：10 存储字段 + attention_count，
-// GET /projects tasks 摘要）。
+// GET /projects tasks 摘要）。Mode 为任务级运行模式（add-local-path-task-mode D7：
+// worktree | local-path），API 组装按 kind 校验组合，非法 fail-closed。
 type ProjectTaskSummary struct {
 	TaskID         string
 	Name           string
@@ -125,6 +142,7 @@ type ProjectTaskSummary struct {
 	Status         string
 	InitStatus     string
 	Branch         string
+	Mode           string
 	WorktreePath   string
 	LastError      string
 	Notice         string

@@ -175,6 +175,11 @@ func (s *traceStore) BeginDeleteIntent(ctx context.Context, id, mode string, fro
 	return s.TaskStore.BeginDeleteIntent(ctx, id, mode, fromStatuses)
 }
 
+func (s *traceStore) BeginRetryDeleteIntent(ctx context.Context, id, mode string) (application.TransitionResult, error) {
+	s.tr.record("store", "BeginRetryDeleteIntent", fmt.Sprintf("id=%s mode=%s", id, mode))
+	return s.TaskStore.BeginRetryDeleteIntent(ctx, id, mode)
+}
+
 func (s *traceStore) ArchiveTask(ctx context.Context, id string) (application.TransitionResult, error) {
 	s.tr.record("store", "ArchiveTask", fmt.Sprintf("id=%s", id))
 	return s.TaskStore.ArchiveTask(ctx, id)
@@ -431,6 +436,7 @@ var (
 		"CreateTask": true, "UpdateTaskStatus": true, "UpdateTaskStatusConditional": true,
 		"UpdateTaskEnvSnapshot": true, "UpdateTaskLastPort": true, "UpdateTaskNotice": true,
 		"UpdateTaskNoticeCAS": true, "SetTaskDeleteMode": true, "BeginDeleteIntent": true,
+		"BeginRetryDeleteIntent": true,
 		"ArchiveTask": true, "RestoreTask": true, "DeleteTask": true, "CommitCreated": true,
 		"ClaimInitRun": true, "ClaimInitRerun": true, "FinishInitRun": true,
 		"ClaimTaskSession": true, "TouchOwnedTaskSession": true, "DeleteTaskSession": true,
@@ -582,7 +588,7 @@ func TestP141_Create_Repo_Success_Trace(t *testing.T) {
 	// repo Create 无 init 脚本 → triggerActivate 异步；用 lifecycle ctx 让其推进到 active。
 	m.SetLifecycleCtx(context.Background())
 
-	row, err := m.Create(context.Background(), "p1", "My Task", "")
+	row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "My Task"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -625,7 +631,7 @@ func TestP141_Create_Repo_GuardReject_Trace(t *testing.T) {
 	tr := &tracer{}
 	m := newTraceTestManager(t, store, proc, wt, oc, tr)
 
-	_, err := m.Create(context.Background(), "p1", "My Task", "")
+	_, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "My Task"})
 	if err == nil {
 		t.Fatal("expected conflict on branch exists")
 	}
@@ -656,7 +662,7 @@ func TestP141_Create_Dir_Success_Trace(t *testing.T) {
 	m := newTraceTestManager(t, store, proc, wt, oc, tr)
 	m.SetLifecycleCtx(context.Background())
 
-	row, err := m.Create(context.Background(), "p1", "My Task", "")
+	row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "My Task"})
 	if err != nil {
 		t.Fatalf("Create dir: %v", err)
 	}
@@ -698,7 +704,7 @@ func TestP141_Create_Dir_GuardReject_Trace(t *testing.T) {
 	tr := &tracer{}
 	m := newTraceTestManager(t, store, proc, wt, oc, tr)
 
-	_, err := m.Create(context.Background(), "p1", "My Task", "feat/x")
+	_, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "My Task", BaseRef: "feat/x"})
 	if err == nil {
 		t.Fatal("expected invalid_input on base_ref for dir project")
 	}

@@ -80,8 +80,13 @@ func TestLayerEnvSnapshot_BaseBranchInjection(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newMockStore()
 			store.seedProject(ProjectRow{ID: "p1", Name: "p", Path: "/repo", DefaultBranch: "main", Kind: tc.kind})
+			// D9：repo fixture 用 worktree 模式，dir fixture 用 local-path（有效模式矩阵）。
+			mode := TaskModeWorktree
+			if tc.kind != ProjectKindRepo {
+				mode = TaskModeLocalPath
+			}
 			store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Name: "my task", Branch: tc.branch, BaseRef: tc.baseRef,
-				Status: StatusSuspended, WorktreePath: "/data/worktrees/p1/t1"}
+				Status: StatusSuspended, WorktreePath: "/data/worktrees/p1/t1", Mode: mode}
 			m := newTestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
 			merged, err := m.layerEnvSnapshot(context.Background(), store.tasks["t1"])
 			if tc.wantErr {
@@ -148,8 +153,13 @@ func TestMergeEnvSnapshot_BaseBranchLifecycleCounts(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newMockStore()
 			store.seedProject(ProjectRow{ID: "p1", Name: "p", Path: "/repo", DefaultBranch: "main", Kind: tc.kind})
+			// D9：repo fixture 用 worktree 模式，dir fixture 用 local-path（有效模式矩阵）。
+			mode := TaskModeWorktree
+			if tc.kind != ProjectKindRepo {
+				mode = TaskModeLocalPath
+			}
 			store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Name: "my task", Branch: tc.branch, BaseRef: tc.baseRef,
-				Status: StatusSuspended, WorktreePath: "/data/worktrees/p1/t1"}
+				Status: StatusSuspended, WorktreePath: "/data/worktrees/p1/t1", Mode: mode}
 			m := newTestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
 			merged, err := m.mergeEnvSnapshot(context.Background(), store.tasks["t1"], 50001)
 			if err != nil {

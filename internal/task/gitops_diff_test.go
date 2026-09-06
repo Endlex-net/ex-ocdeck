@@ -30,7 +30,7 @@ func seedRepoTask(t *testing.T, store *mockStore, taskID, projectID, dir string)
 	t.Helper()
 	store.seedProject(ProjectRow{ID: projectID, Name: "p", Path: dir, DefaultBranch: "main", Kind: ProjectKindRepo})
 	row := TaskRow{ID: taskID, ProjectID: projectID, Name: "my task",
-		Status: StatusSuspended, WorktreePath: dir, InitStatus: InitStatusNone}
+		Status: StatusSuspended, WorktreePath: dir, InitStatus: InitStatusNone, Mode: TaskModeWorktree}
 	store.tasks[taskID] = row
 	return row
 }

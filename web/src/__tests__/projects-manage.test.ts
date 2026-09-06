@@ -119,6 +119,7 @@ function makeTask(id: string, status: string): Task {
     branch: 'main',
     status,
     worktree_path: '/tmp/x',
+    mode: 'worktree',
     init_status: 'succeeded',
     created_at: 0,
     updated_at: 0,

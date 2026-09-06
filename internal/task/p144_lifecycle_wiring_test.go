@@ -157,6 +157,10 @@ func (a *mockAppAdapter) BeginDeleteIntent(ctx context.Context, id string, mode 
 	return a.s.BeginDeleteIntent(ctx, id, string(mode), statuses)
 }
 
+func (a *mockAppAdapter) BeginRetryDeleteIntent(ctx context.Context, id string, mode ocdecktask.DeleteMode) (application.TransitionResult, error) {
+	return a.s.BeginRetryDeleteIntent(ctx, id, string(mode))
+}
+
 func (a *mockAppAdapter) DeleteTask(ctx context.Context, id string) (application.DeleteResult, error) {
 	return a.s.DeleteTask(ctx, id)
 }

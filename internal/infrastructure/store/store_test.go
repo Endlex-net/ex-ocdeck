@@ -274,6 +274,92 @@ func TestUpdateTaskStatusConditional(t *testing.T) {
 	}
 }
 
+// TestUpdateTaskStatusConditional_DeletingMovedAwayNoOverwrite 验证 finalize deletion_failed
+// 依赖的 CAS 语义（add-local-path-task-mode 评审 C-F1，真实 SQLite adapter）：行状态已迁出
+// deleting 时，from=deleting → deletion_failed 的条件写返回未命中，且不覆盖当前
+// status/last_error（无条件写会覆盖并发收敛结果）。
+func TestUpdateTaskStatusConditional_DeletingMovedAwayNoOverwrite(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	seedProjectTask(t, db, "t1") // status=suspended（已迁出 deleting）
+	r, err := db.UpdateTaskStatusConditional(ctx, "t1", "deleting", "deletion_failed",
+		nsToPtr(sql.NullString{String: "boom", Valid: true}))
+	if err != nil {
+		t.Fatalf("conditional err: %v", err)
+	}
+	if r.Matched {
+		t.Error("Matched = true, want false (row moved out of deleting)")
+	}
+	task, err := db.GetTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if task.Status != "suspended" {
+		t.Errorf("status = %s, want suspended（CAS 未命中不得覆盖已收敛状态）", task.Status)
+	}
+	if task.LastError.Valid {
+		t.Errorf("last_error = %q, want unset（CAS 未命中不得写列）", task.LastError.String)
+	}
+}
+
+// TestBeginRetryDeleteIntent_ClearsLastError 验证 Retry 专用原子意图写（评审 C-F3，
+// 真实 SQLite adapter）：deletion_failed 行带旧 last_error → intent 成功后 status=deleting、
+// delete_mode 写入、last_error 清空；行已迁出 deletion_failed 时未命中且不覆盖任何列。
+func TestBeginRetryDeleteIntent_ClearsLastError(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	seedProjectTask(t, db, "t1")
+	// t2 用独立项目（projects.path UNIQUE）。
+	if err := db.CreateProject(ctx, "p2", "proj2", "/tmp/repo2", "main", "repo"); err != nil {
+		t.Fatalf("create project p2: %v", err)
+	}
+	if err := db.CreateTask(ctx, TaskRow{ID: "t2", ProjectID: "p2", Name: "task", Branch: "b", Status: "suspended", WorktreePath: "/tmp/wt2"}); err != nil {
+		t.Fatalf("create t2: %v", err)
+	}
+	// t1：种子 deletion_failed + 旧 last_error（前次删除失败落账）。
+	if _, err := db.UpdateTaskStatus(ctx, "t1", "deletion_failed", nsToPtr(sql.NullString{String: "stale: previous delete failed", Valid: true})); err != nil {
+		t.Fatalf("seed deletion_failed: %v", err)
+	}
+	r, err := db.BeginRetryDeleteIntent(ctx, "t1", "force")
+	if err != nil {
+		t.Fatalf("intent err: %v", err)
+	}
+	if !r.Matched {
+		t.Fatal("Matched = false, want true (row in deletion_failed)")
+	}
+	task, err := db.GetTask(ctx, "t1")
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if task.Status != "deleting" {
+		t.Errorf("status = %s, want deleting", task.Status)
+	}
+	if !task.DeleteMode.Valid || task.DeleteMode.String != "force" {
+		t.Errorf("delete_mode = %v, want force", task.DeleteMode)
+	}
+	if task.LastError.Valid {
+		t.Errorf("last_error = %q, want empty（意图提交原子清空 stale 错误，评审 C-F3）", task.LastError.String)
+	}
+	// t2：行状态已迁出 deletion_failed（suspended）→ 未命中且不动任何列。
+	if _, err := db.UpdateTaskStatus(ctx, "t2", "suspended", nsToPtr(sql.NullString{String: "kept", Valid: true})); err != nil {
+		t.Fatalf("seed t2: %v", err)
+	}
+	r2, err := db.BeginRetryDeleteIntent(ctx, "t2", "force")
+	if err != nil {
+		t.Fatalf("intent t2 err: %v", err)
+	}
+	if r2.Matched {
+		t.Error("t2 Matched = true, want false (row not in deletion_failed)")
+	}
+	task2, err := db.GetTask(ctx, "t2")
+	if err != nil {
+		t.Fatalf("get t2: %v", err)
+	}
+	if task2.Status != "suspended" || !task2.LastError.Valid || task2.LastError.String != "kept" {
+		t.Errorf("t2 = %+v, want untouched suspended with last_error kept", task2)
+	}
+}
+
 // seedActiveTaskOverview 在多项目多任务场景下构造测试数据
 // （cross-project-active-sessions D2：跨项目 active 概览聚合）。
 // 所有 active 任务均带 session 以便用可控的 last_seen_at 验证排序（updated_at 由

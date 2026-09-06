@@ -160,7 +160,7 @@ func TestP0_ResumeActive_RestoresWatchersBeforeActive(t *testing.T) {
 	m := newTestManager(t, store, badListProc, newMockWorktree(), newMockOC(true))
 	m.SetLifecycleCtx(context.Background())
 
-	err := m.resumeActive(context.Background(), store.tasks["t1"])
+	err := m.resumeActive(context.Background(), store.tasks["t1"], AlignModeRepo)
 	if err == nil {
 		t.Fatal("resumeActive with watcher restore failure MUST return error")
 	}
@@ -330,7 +330,7 @@ func TestP1_Create_PreChecksBeforeInsert(t *testing.T) {
 	wt.branches["ocdeck/pre-check-task"] = true // 分支已存在
 	m := newTestManager(t, store, newMockProc(), wt, newMockOC(true))
 
-	_, err := m.Create(context.Background(), "p1", "Pre Check Task", "")
+	_, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "Pre Check Task"})
 	if err == nil || OpErrorCode(err) != codeConflict {
 		t.Fatalf("want conflict on branch conflict; got %v", err)
 	}
@@ -348,7 +348,7 @@ func TestP1_Create_InvalidBranchNameBeforeInsert(t *testing.T) {
 	wt := &invalidBranchWT{mockWorktree: newMockWorktree()}
 	m := newTestManager(t, store, newMockProc(), wt, newMockOC(true))
 
-	_, err := m.Create(context.Background(), "p1", "My Task", "")
+	_, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "My Task"})
 	if err == nil || OpErrorCode(err) != codeInvalidInput {
 		t.Fatalf("want invalid_input on invalid branch name; got %v", err)
 	}

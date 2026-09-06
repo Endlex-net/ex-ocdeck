@@ -3,6 +3,12 @@
 /** 项目类型（add-plain-dir-project D1/D6）：repo=git 仓库，dir=纯目录（无 git 功能）。 */
 export type ProjectKind = 'repo' | 'dir';
 
+/** 任务运行模式（add-local-path-task-mode D7）：worktree=隔离 worktree（repo 缺省）；
+ *  local-path=就地运行（dir 项目恒为）。DTO/摘要/活跃快照均为必有字段。
+ *  UI 显隐二分（6.2/D8）：Git 能力（Git tab/面板入口）仅按 project_kind==='dir' 隐藏；
+ *  任务行分支展示按 isGitlessTask（dir 或 local-path）隐藏。 */
+export type TaskMode = 'worktree' | 'local-path';
+
 export interface Project {
   id: string;
   name: string;
@@ -30,6 +36,8 @@ export interface TaskSummary {
   init_status: string;
   branch: string;
   worktree_path: string;
+  /** 任务运行模式（必有）：worktree | local-path。 */
+  mode: TaskMode;
   last_error?: string;
   /** json.RawMessage 原样透传：客户端收到的是数组而非字符串。 */
   notice?: NoticeItem[];
@@ -81,12 +89,15 @@ export interface NoticeItem {
 export interface Task {
   id: string;
   project_id: string;
-  /** 所属项目类型（add-plain-dir-project D6）：UI 降级判断的唯一依据。 */
+  /** 所属项目类型（add-plain-dir-project D6）：Git 能力判定唯一依据（仅 dir 隐藏 Git tab，D8）。 */
   project_kind: ProjectKind;
   name: string;
   branch: string;
   status: string;
   worktree_path: string;
+  /** 任务运行模式（必有）：worktree | local-path；任务行分支展示（isGitlessTask）与
+   *  删除文案/序列按 mode 判定，Git 能力不再按 mode 判定（仅 dir 隐藏，D8）。 */
+  mode: TaskMode;
   last_port?: number;
   last_error?: string;
   /** 服务端以 json.RawMessage 原样输出，客户端收到的是数组而非字符串。 */
@@ -118,6 +129,8 @@ export interface ActiveSessionItem {
   name: string;
   branch: string;
   worktree_path: string;
+  /** 任务运行模式（必有）：worktree | local-path；与 projects 摘要同源。 */
+  mode: TaskMode;
   /** 最近活跃时间（Unix 秒）：task_sessions.last_seen_at 的 MAX，无会话行回退 tasks.updated_at。 */
   last_active_at: number;
   agentStatus?: string;
@@ -501,4 +514,16 @@ export function parseNotice(raw: Task['notice']): NoticeItem[] {
     );
   }
   return [];
+}
+
+/**
+ * 任务行分支展示判定（add-plain-dir-project D7 / add-local-path-task-mode 6.2）：dir 任务与
+ * repo local-path 任务无分支概念（task.branch 恒空），任务行分支名/分支图标显隐统一按
+ * kind+mode 判定，MUST NOT 判空（branch）推断；projectKind 缺席（sessions-only 无 projects
+ * 快照）时按 mode 判定。
+ * 注意：Git 能力显隐（Git tab/面板入口）不经过本函数——仅按 project_kind==='dir' 判定
+ * （add-local-path-task-mode D8），repo local-path 任务开放 Git 面板。
+ */
+export function isGitlessTask(projectKind: ProjectKind | undefined, mode: TaskMode): boolean {
+  return projectKind === 'dir' || mode === 'local-path';
 }
