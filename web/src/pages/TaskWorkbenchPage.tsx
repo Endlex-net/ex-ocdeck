@@ -226,8 +226,10 @@ export function TaskWorkbenchPage({
   };
 
   // Git 能力判定（add-local-path-task-mode 6.2/D8）：仅 dir 项目任务隐藏 Git tab 与 git 面板入口，
-  // repo local-path 任务开放（git 操作作用于项目目录当前分支）；分支名展示另按 isGitlessTask 判定。
+  // repo local-path 任务开放（git 操作作用于项目目录当前分支）。
   const isGitless = task?.project_kind === 'dir';
+  // 任务分支展示判定：dir 或 repo local-path 任务无分支概念（task.branch 恒空），页头/任务行分支名隐藏
+  const isBranchless = !!task && isGitlessTask(task.project_kind, task.mode);
   // dir 任务无 git 能力时若正停在 Git tab，回退到 TUI tab（repo local-path 不回退）
   useEffect(() => {
     if (isGitless && tab === GIT_TAB) setTab(TUI_TAB);
@@ -383,7 +385,7 @@ export function TaskWorkbenchPage({
         ) : (
           <span className="page-title">{task?.name ?? '…'}</span>
         )}
-        {task?.branch && !isGitless && <span className="header-meta mono"><BranchIcon /> {task.branch}</span>}
+        {task?.branch && !isBranchless && <span className="header-meta mono"><BranchIcon /> {task.branch}</span>}
         {task && <StatusBadge status={task.status} />}
         {task && <InitStatusBadge task={task} />}
         {task?.init_status === 'failed' && !isNarrow && (

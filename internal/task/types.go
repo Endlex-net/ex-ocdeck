@@ -186,7 +186,8 @@ const (
 // TaskMode 任务级运行模式（add-local-path-task-mode D1/D2，持久化于 tasks.mode，
 // migration 0013）：
 //   - worktree：隔离 worktree + 独立分支（repo 项目缺省，既有行为不变）；
-//   - local-path：就地运行，语义与 dir 项目任务完全一致（无 worktree/分支/git）。
+//   - local-path：就地运行，除 repo local-path 的 D8 git 能力外，沿用 dir 项目任务的
+//     生命周期语义（无 worktree/分支）。
 const (
 	TaskModeWorktree  = "worktree"
 	TaskModeLocalPath = "local-path"

@@ -7,10 +7,9 @@ import { mount, flushUI } from './cm-test-env';
 import type { Project, Task } from '../types';
 
 /* ==================== 工作台 Git 能力判定（add-local-path-task-mode 6.2/D8 反向） ====================
- * Git 能力判定拆分：Git tab/面板入口仅按 project_kind==='dir' 隐藏——repo local-path 任务
- * 显示 Git tab（已驻留不回退 TUI）；页头分支名不依赖 isGitless 守卫，按落库 branch 恒空隐藏
- * （D3），分支显示由 GitPanel 内实时分支提供。MUST NOT 收窄共享 helper isGitlessTask
- * （任务行分支展示仍按 kind+mode 判定，见 gitless-branch-display.test.tsx）。 */
+ * 判定拆分：Git tab/面板入口仅按 project_kind==='dir' 隐藏——repo local-path 任务显示 Git tab
+ * （已驻留不回退 TUI）；页头分支名按分支展示判定 isGitlessTask（kind+mode）隐藏——local-path
+ * 任务即使异常携带非空 branch 也不展示（D3 落库恒空），实时分支由 GitPanel 内提供。 */
 
 type TaskSubOpts = {
   onData: (t: Task) => void;
@@ -94,11 +93,16 @@ describe('TaskWorkbenchPage Git 能力判定（add-local-path-task-mode 6.2）',
 
   it('repo local-path：Git tab 显示、页头不展示分支名（落库 branch 恒空，GitPanel 内实时分支）', () => {
     const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
-    // 现实帧：branch 恒为空（D3）；页头隐藏依赖该数据不变量而非 isGitless 守卫
+    // 现实帧：branch 恒为空（D3）
     act(() => taskSub!.onData(makeTask({ mode: 'local-path', branch: '' })));
     expect(gitTab(container)).not.toBeUndefined();
     expect(container.querySelector('.header-meta')).toBeNull();
     expect(activeTab(container)!.textContent).toBe('终端');
+
+    // 防御：异常携带非空 branch 时页头仍隐藏（分支展示按 isGitlessTask），Git tab 不受影响
+    act(() => taskSub!.onData(makeTask({ mode: 'local-path', branch: 'ocdeck/demo' })));
+    expect(container.querySelector('.header-meta')).toBeNull();
+    expect(gitTab(container)).not.toBeUndefined();
     unmount();
   });
 

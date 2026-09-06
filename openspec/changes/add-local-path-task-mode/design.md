@@ -106,7 +106,7 @@ Retry（deletion_failed → deleting）重入改为专用原子意图写 `BeginR
 
 ### D8：Git/diff 能力门禁（review 裁决：repo 项目 local-path 开放完整 git 能力）
 
-`assertGitRepoTask`（gitops.go:29）改按 D2 有效模式：**repo 项目 local-path 模式任务放行全部 git 操作（status/diff/commit/push 与 diff review）**；dir 项目任务维持 `codeInvalidInput` 拒绝（文案不变：「纯目录项目非 git 仓库」）；非法 kind/mode 组合仍 internal fail-closed。diff review 经 DiffSourcePortAdapter.ReadLocked（diffreview_adapters.go:186 同一门禁），来源 `(ref, path, untracked)` 由 UI 传入。
+`assertGitRepoTask`（gitops.go:29）改按 D2 有效模式：**repo 项目 local-path 模式任务放行全部 git 操作（status / diff / diff review / commit / push / diff 视图内文件编辑读写）**；dir 项目任务维持 `codeInvalidInput` 拒绝（文案不变：「纯目录项目非 git 仓库」）；非法 kind/mode 组合仍 internal fail-closed。diff review 经 DiffSourcePortAdapter.ReadLocked（diffreview_adapters.go:186 同一门禁），来源 `(ref, path, untracked)` 由 UI 传入；diff 视图内文件编辑读写经 diffreview_fileedit.go 同一门禁（GitPanel 经 /git/file 接线），读（ReadRaw）与编辑写回落点均为项目目录当前 checkout。
 
 操作语义：全部作用于项目目录当前 checkout 的**当前分支**——GitStatus/GitDiff/GitCommit/GitPush 均基于 `row.WorktreePath`（local-path 任务即项目路径），无 base_ref 依赖。commit 提交到当前分支 HEAD；push 为 `git push -u origin <当前分支>` 且 MUST NOT force-push。diff 来源钉死为现有 GitPanel 三组（仅未提交部分，对比 HEAD/index）：`ref=HEAD`（已暂存，工作区 vs HEAD）、`ref=''`（未暂存，工作区 vs index）、`untracked`（未跟踪文件）；MUST NOT 展示当前分支相对 upstream 或 base 的已提交 commit 差异（分支变更视图留待后续迭代）。
 

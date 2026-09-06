@@ -18,8 +18,12 @@ package task
 //     ReopenAttach/ensureRecovery(+FromAttach) 非法组合零副作用（Reconcile 已有 P1 gate）。
 //   - 5.4 env：local-path 激活不注入分支变量（快照级断言）；非法组合 layerEnvSnapshot/
 //     mergeEnvSnapshot internal error 且不持久化快照。
-//   - 5.5 git 门禁：local-path status/diff/commit/push 与 diff review → invalid_input，
-//     零 git 命令（真实非 git 目录对照）；dir+worktree → internal。
+//   - 5.5 git 门禁（6.1/6.3 修订）：repo local-path status/diff/commit/push 与 diff review
+//     放行且作用于项目目录当前 checkout；dir 项目 → invalid_input；dir+worktree → internal。
+//     ReadLocked 回调恰好一次、err==nil 且 NewContent/NewExists 与项目目录工作区一致。
+//   - 5.6 文件编辑读写（/git/file，6.x G6-F2）：repo local-path 任务的 FileEditPort ReadRaw
+//     读取项目目录文件成功、Write 写回真实落盘到项目目录（断言内容变化）；dir 项目 ReadRaw/Write
+//     → invalid_input（assertGitRepoTask 既有语义不变）。
 
 import (
 	"context"
@@ -370,6 +374,23 @@ func seedLocalPathRepoTask(s *mockStore, taskID, projectID, projDir string) Task
 		Status: StatusSuspended, WorktreePath: projDir, InitStatus: InitStatusNone, Mode: TaskModeLocalPath}
 	s.tasks[taskID] = t
 	return t
+}
+
+// initLocalPathGitRepo 在 dir 初始化 main 分支 git 仓库并做初始提交，显式设置本地
+// user.email/user.name（空全局/系统 git config 环境可移植：不依赖开发机 git identity）。
+// 与 initTestGitRepo（gitops_untracked_test.go）区别：本 helper 用 `-b main` 固定分支名，
+// 供 GitStatus 分支断言使用。
+func initLocalPathGitRepo(t *testing.T, dir string) {
+	t.Helper()
+	runGitInit(t, dir, "init", "-q", "-b", "main")
+	runGitInit(t, dir, "config", "user.email", "t@t.com")
+	runGitInit(t, dir, "config", "user.name", "tester")
+	readme := filepath.Join(dir, "README.md")
+	if err := os.WriteFile(readme, []byte("init\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitInit(t, dir, "add", "README.md")
+	runGitInit(t, dir, "commit", "-qm", "init")
 }
 
 // newLocalPathCreateManager 构造 local-path 创建测试 Manager（panicNamer + dirPanicWorktree，
@@ -1623,21 +1644,16 @@ func TestLayerEnvSnapshot_IllegalCombo_ErrorNoPersist(t *testing.T) {
 //   - GitCommit：修改文件后提交，HEAD 前进（rev-parse 前后不同），证明提交落项目目录当前分支 HEAD；
 //   - GitPush：配置本地 bare remote 后 push 成功（git push -u origin <当前分支>、无 force），
 //     remote ref 与本地一致；
-//   - diff review ReadLocked：门禁放行 → callback 被调用（>0），证明 source 真实读取项目目录。
+//   - diff review ReadLocked：门禁放行 → callback 恰好一次、err==nil 且 NewContent/NewExists
+//     与项目目录工作区一致（ref="" 比对工作区 vs index：新侧 = 工作区内容），证明 source 真实读取项目目录。
 //
 // mutation 有效性证据：本测试在 6.1 改判前的旧实现（assertGitRepoTask local-path 分支返回
 // invalid_input + "task runs in local-path mode" 文案）下会失败——各操作在门禁处早退，
 // GitStatus 拿不到分支名、GitCommit HEAD 不前进、GitPush 非 git_error 而是 invalid_input、
-// diff review callback 为 0。改判后全通过。
+// diff review ReadLocked 返回 invalid_input（callbacks == 0）。改判后全通过。
 func TestGitOps_LocalPath_GatePassesAndOperatesOnProjectDir(t *testing.T) {
 	projDir := t.TempDir()
-	runGitInit(t, projDir, "init", "-q", "-b", "main")
-	// 初始提交（建立 HEAD 与分支）。
-	if err := os.WriteFile(filepath.Join(projDir, "README.md"), []byte("init\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	runGitInit(t, projDir, "add", "README.md")
-	runGitInit(t, projDir, "commit", "-qm", "init")
+	initLocalPathGitRepo(t, projDir)
 	// 本地 bare remote 供 push 验证（git push -u origin <branch>）。
 	remoteDir := t.TempDir()
 	runGitInit(t, remoteDir, "init", "--bare", "-q")
@@ -1688,18 +1704,33 @@ func TestGitOps_LocalPath_GatePassesAndOperatesOnProjectDir(t *testing.T) {
 		t.Errorf("remote head = %s, want %s（push 推送到 origin 当前分支）", remoteHead, localHead)
 	}
 
-	// diff review ReadLocked：门禁放行 → callback 被调用（source 真实读取项目目录）。
+	// diff review ReadLocked：门禁放行 → callback 恰好一次、err==nil 且 NewContent/NewExists
+	// 与项目目录工作区一致（ref="" 比对工作区 vs index：新侧 = 工作区内容）。仅计数会漏掉
+	// 来源读取失败（adapter 把 err 交回调后继续并返回 nil，diffreview_adapters.go:190），
+	// 故 MUST 断言回调次数、回调 err 与已知结果字段。
+	if err := os.WriteFile(filepath.Join(projDir, "README.md"), []byte("review\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	adapter := NewDiffSourcePortAdapter(m)
 	srcs := []diffreview.DiffSource{{Path: "README.md", Untracked: false}}
 	callbacks := 0
+	var gotResult diffreview.DiffSourceResult
 	if rerr := adapter.ReadLocked(context.Background(), "t1", srcs, func(src diffreview.DiffSource, result diffreview.DiffSourceResult, err error) error {
 		callbacks++
+		gotResult = result
+		if err != nil {
+			t.Errorf("diff review callback err = %v, want nil（来源真实读取成功）", err)
+		}
 		return nil
 	}); rerr != nil {
 		t.Fatalf("diff review ReadLocked local-path: %v, want nil（门禁放行）", rerr)
 	}
-	if callbacks == 0 {
-		t.Error("diff review callback = 0, want >0（门禁放行后 source 真实读取项目目录）")
+	if callbacks != 1 {
+		t.Errorf("diff review callback count = %d, want 1（恰好一次）", callbacks)
+	}
+	if !gotResult.NewExists || gotResult.NewContent != "review\n" {
+		t.Errorf("diff review NewContent = (exists=%v, %q), want (true, %q)（真实读取项目目录工作区）",
+			gotResult.NewExists, gotResult.NewContent, "review\\n")
 	}
 }
 
@@ -1708,12 +1739,7 @@ func TestGitOps_LocalPath_GatePassesAndOperatesOnProjectDir(t *testing.T) {
 // MUST NOT 伪装成功。
 func TestGitOps_LocalPath_DetachedHead_PushFailsStatusBranchEmpty(t *testing.T) {
 	projDir := t.TempDir()
-	runGitInit(t, projDir, "init", "-q", "-b", "main")
-	if err := os.WriteFile(filepath.Join(projDir, "README.md"), []byte("init\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	runGitInit(t, projDir, "add", "README.md")
-	runGitInit(t, projDir, "commit", "-qm", "init")
+	initLocalPathGitRepo(t, projDir)
 	// 切到 detached HEAD（--detach 脱离分支引用）。
 	runGitInit(t, projDir, "checkout", "-q", "--detach")
 
@@ -1745,6 +1771,84 @@ func TestGitOps_IllegalCombo_FailClosed(t *testing.T) {
 
 	if _, err := m.GitStatus(context.Background(), "t1"); !isOpErrCode(err, codeInternal) {
 		t.Fatalf("GitStatus dir+worktree: err = %v, want internal", err)
+	}
+}
+
+// --- 5.6 文件编辑读写落点（/git/file，6.x G6-F2：repo local-path 开放 diff 视图内文件编辑读写） ---
+
+// TestFileEdit_LocalPath_ReadWriteOnProjectDir repo local-path 任务经 FileEditPort ReadRaw/Write
+// 直接读写项目目录当前 checkout（/git/file 契约：读写落点 = 项目目录，经 assertGitRepoTask 门禁
+// 放行，与 diffreview_fileedit.go:64/:228 同一门禁）。dir 项目 ReadRaw/Write 仍 invalid_input
+// 拒绝（assertGitRepoTask 既有语义不变）。
+//
+// 放行取证：
+//   - ReadRaw：读取项目目录 README.md 成功（Exists=true，Bytes == 项目目录文件内容）；
+//   - Write：写回真实落盘到项目目录（os.ReadFile 断言文件内容变化为新内容），返回新 baseHash；
+//   - dir 项目：ReadRaw/Write 均 invalid_input（既有 dir 拒绝分支保持）。
+//
+// mutation 有效性证据：assertGitRepoTask 恢复 local-path 拒绝分支（返回 invalid_input）后，
+// ReadRaw/Write 在门禁处早退 → 本测试 ReadRaw 非预期 invalid_input、Write 不落盘而 invalid_input、
+// dir 子用例仍 invalid_input（绿）。还原放行后全通过。
+func TestFileEdit_LocalPath_ReadWriteOnProjectDir(t *testing.T) {
+	projDir := t.TempDir()
+	initLocalPathGitRepo(t, projDir)
+
+	store := newMockStore()
+	seedLocalPathRepoTask(store, "t1", "p1", projDir)
+	m := newTestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
+	adapter := NewFileEditPortAdapter(m)
+
+	// ReadRaw：读项目目录 README.md（读路径落点 = 项目目录）。
+	raw, err := adapter.ReadRaw(context.Background(), "t1", "README.md")
+	if err != nil {
+		t.Fatalf("ReadRaw local-path: %v, want nil（门禁放行，读项目目录文件）", err)
+	}
+	if !raw.Exists {
+		t.Fatal("ReadRaw Exists = false, want true（项目目录 README.md 存在）")
+	}
+	if string(raw.Bytes) != "init\n" {
+		t.Errorf("ReadRaw Bytes = %q, want %q（真实读取项目目录文件内容）", string(raw.Bytes), "init\\n")
+	}
+
+	// Write：写回落盘到项目目录（断言文件内容变化为新内容）。
+	baseHash := diffreview.SHA256Hex([]byte("init\n"))
+	newContent := "edited\n"
+	res, werr := adapter.Write(context.Background(), "t1", diffreview.FileEditWriteRequest{
+		Path: "README.md", Content: newContent, BaseHash: baseHash,
+		LineEnding: diffreview.LineEndingLF, BaseMode: "0644",
+	})
+	if werr != nil {
+		t.Fatalf("Write local-path: %v, want nil（写回落盘到项目目录）", werr)
+	}
+	got, rerr := os.ReadFile(filepath.Join(projDir, "README.md"))
+	if rerr != nil {
+		t.Fatalf("read project dir README.md after write: %v", rerr)
+	}
+	if string(got) != newContent {
+		t.Errorf("project dir README.md = %q, want %q（Write 真实落盘到项目目录）", string(got), newContent)
+	}
+	if res.BaseHash != diffreview.SHA256Hex([]byte(newContent)) {
+		t.Errorf("Write BaseHash = %q, want %q（新内容 SHA-256）", res.BaseHash, diffreview.SHA256Hex([]byte(newContent)))
+	}
+
+	// dir 项目：ReadRaw/Write 均 invalid_input（assertGitRepoTask 既有 dir 拒绝分支保持）。
+	dirProj := t.TempDir()
+	dirStore := newMockStore()
+	dirStore.seedProject(ProjectRow{ID: "p2", Name: "p2", Path: dirProj, Kind: ProjectKindDir})
+	dirStore.tasks["t2"] = TaskRow{ID: "t2", ProjectID: "p2", Name: "dir task",
+		Status: StatusSuspended, WorktreePath: dirProj, InitStatus: InitStatusNone, Mode: TaskModeLocalPath}
+	dirM := newTestManager(t, dirStore, newMockProc(), newMockWorktree(), newMockOC(true))
+	dirAdapter := NewFileEditPortAdapter(dirM)
+
+	if _, rerr := dirAdapter.ReadRaw(context.Background(), "t2", "README.md"); !isOpErrCode(rerr, codeInvalidInput) {
+		t.Errorf("dir ReadRaw: err = %v, want codeInvalidInput（dir 项目非 git 仓库，既有语义）", rerr)
+	}
+	_, werr = dirAdapter.Write(context.Background(), "t2", diffreview.FileEditWriteRequest{
+		Path: "README.md", Content: "x\n", BaseHash: diffreview.SHA256Hex([]byte("init\n")),
+		LineEnding: diffreview.LineEndingLF, BaseMode: "0644",
+	})
+	if !isOpErrCode(werr, codeInvalidInput) {
+		t.Errorf("dir Write: err = %v, want codeInvalidInput（dir 项目非 git 仓库，既有语义）", werr)
 	}
 }
 

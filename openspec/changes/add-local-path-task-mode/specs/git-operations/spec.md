@@ -4,7 +4,7 @@
 
 ### Requirement: repo 项目 local-path 模式任务的 git 能力
 
-repo 项目 local-path 模式任务 SHALL 开放任务级 git 管理：status / diff / diff review / commit / push，操作对象为项目目录（`worktree_path` 即项目路径）当前 checkout 的**当前分支**。`assertGitRepoTask` 门禁按 D2 有效模式放行（repo + local-path 通过），非法 kind/mode 组合仍 internal fail-closed。diff 来源钉死为现有 GitPanel 三组（仅未提交部分，对比 HEAD/index）：`ref=HEAD`（已暂存，工作区 vs HEAD）、`ref=''`（未暂存，工作区 vs index）、`untracked`（未跟踪文件）。MUST NOT 展示当前分支相对 upstream 或 base 的已提交 commit 差异（分支变更视图留待后续迭代）。commit SHALL 提交到当前分支 HEAD；push SHALL 为 `git push -u origin <当前分支>` 且 MUST NOT force-push。风险归属（显式契约）：操作对象是用户主仓库当前分支，改动就地生效、提交与推送直接作用于用户分支；dirty 混杂与直接提交/推送主仓库分支的风险由用户自担（与 local 模式共享目录语义一致）。
+repo 项目 local-path 模式任务 SHALL 开放任务级 git 管理：status / diff / diff review / commit / push / diff 视图内文件编辑读写，操作对象为项目目录（`worktree_path` 即项目路径）当前 checkout 的**当前分支**。`assertGitRepoTask` 门禁按 D2 有效模式放行（repo + local-path 通过），非法 kind/mode 组合仍 internal fail-closed。diff 来源钉死为现有 GitPanel 三组（仅未提交部分，对比 HEAD/index）：`ref=HEAD`（已暂存，工作区 vs HEAD）、`ref=''`（未暂存，工作区 vs index）、`untracked`（未跟踪文件）。MUST NOT 展示当前分支相对 upstream 或 base 的已提交 commit 差异（分支变更视图留待后续迭代）。commit SHALL 提交到当前分支 HEAD；push SHALL 为 `git push -u origin <当前分支>` 且 MUST NOT force-push。diff 视图内文件编辑读写 SHALL 经 /git/file 接线与 diffreview_fileedit.go 同一门禁放行：读（ReadRaw）落点为项目目录，编辑写回落点为项目目录当前 checkout。风险归属（显式契约）：操作对象是用户主仓库当前分支，改动就地生效、提交/推送/文件编辑写回直接作用于用户分支与工作区；dirty 混杂与直接修改/提交/推送主仓库的风险由用户自担（与 local 模式共享目录语义一致）。
 
 #### Scenario: local-path 模式任务 git 操作放行且作用于项目目录
 
@@ -20,6 +20,11 @@ repo 项目 local-path 模式任务 SHALL 开放任务级 git 管理：status / 
 
 - **WHEN** repo 项目 local-path 模式任务发起 diff review（DiffSourcePortAdapter.ReadLocked 同一门禁，来源 `(ref, path, untracked)` 由 UI 传入）
 - **THEN** 门禁放行，review 基于项目目录当前 checkout 的指定来源执行
+
+#### Scenario: local-path 模式任务 diff 视图内文件编辑读写放行
+
+- **WHEN** repo 项目 local-path 模式任务在 GitPanel diff 视图内读取（ReadRaw）或编辑写回文件（/git/file 接线，经 diffreview_fileedit.go 同一门禁）
+- **THEN** 读取与写回落点均为项目目录当前 checkout（`worktree_path` 即项目路径），改动就地生效；风险由用户自担
 
 #### Scenario: detached HEAD 边界
 

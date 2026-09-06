@@ -45,9 +45,9 @@
 
 ## 6. local-path git 能力开放（review 裁决改判）
 
-- [x] 6.1 后端门禁放行：`assertGitRepoTask`（gitops.go:29）改按 D2 有效模式——repo + local-path 放行 status/diff/commit/push/diff review，全部作用于项目目录当前 checkout 的当前分支（commit 落 HEAD、push `git push -u origin <当前分支>` 禁 force、diff review 经 DiffSourcePortAdapter.ReadLocked 同一门禁，来源 `(ref, path, untracked)` 由 UI 传入）；dir 维持 invalid_input 拒绝（文案不变）；非法 kind/mode 组合仍 internal fail-closed。行为测试：local-path 各操作放行且落点为项目目录、dir 拒绝不变、非法组合零副作用（design D8）
+- [x] 6.1 后端门禁放行：`assertGitRepoTask`（gitops.go:29）改按 D2 有效模式——repo + local-path 放行 status / diff / diff review / commit / push / diff 视图内文件编辑读写，全部作用于项目目录当前 checkout 的当前分支（commit 落 HEAD、push `git push -u origin <当前分支>` 禁 force、diff review 经 DiffSourcePortAdapter.ReadLocked 同一门禁，来源 `(ref, path, untracked)` 由 UI 传入、diff 视图内文件编辑读写经 diffreview_fileedit.go 同一门禁（/git/file），ReadRaw 与写回落点均为项目目录）；dir 维持 invalid_input 拒绝（文案不变）；非法 kind/mode 组合仍 internal fail-closed。行为测试：local-path 各操作放行且落点为项目目录、local-path ReadRaw/Write 落点测试（读与写回均为项目目录当前 checkout）、dir 拒绝不变、非法组合零副作用（design D8）
 - [x] 6.2 Web 判定拆分（MUST NOT 直接收窄共享 helper `isGitlessTask`，web/src/types.ts:516——否则任务行分支名会错误显示）：
   - Git 能力判定：仅 dir 隐藏——repo local-path 任务显示 Git tab 与 git 面板入口（TaskWorkbenchPage）
   - 任务分支展示判定：dir 或 local-path 隐藏——工作台页头任务分支名（`task.branch` 恒为空，GitPanel 内实时分支显示）与指挥中心/项目页任务行分支显示维持隐藏
   - 点名更新 `web/src/types.ts`（isGitlessTask 相关注释）与 `TaskWorkbenchPage.tsx` 残留旧注释；测试覆盖三态（dir：Git tab 与分支均隐藏 / repo worktree：均显示 / repo local-path：Git tab 显示且页头与任务行无分支名）
-- [x] 6.3 回归验收：反向更新既有 local-path git 降级断言——`internal/task/local_path_mode_test.go`（git 门禁 invalid_input 断言改为放行 + 项目目录落点断言）、`web/src/__tests__/task-workbench-git-tab.test.tsx`（local-path Git tab 隐藏断言改为显示）；`web/src/__tests__/gitless-branch-display.test.tsx` 列为必须保持全绿的回归文件；核对 2.7/4.3/5.5/5.7 已完成项中 local-path git 降级部分由本组反向覆盖；`go build ./...`、相关包测试与 web 测试通过
+- [x] 6.3 回归验收：反向更新既有 local-path git 降级断言——`internal/task/local_path_mode_test.go`（git 门禁 invalid_input 断言改为放行 + 项目目录落点断言）、`web/src/__tests__/task-workbench-git-tab.test.tsx`（local-path Git tab 隐藏断言改为显示）；`web/src/__tests__/gitless-branch-display.test.tsx` 列为必须保持全绿的回归文件；核对 2.7/4.3/5.5/5.7 已完成项中 local-path git 降级部分由本组反向覆盖；核对 `internal/task/diffreview_fileedit_test.go`：现存 local-path 用例仅 dir 项目拒绝语义（6.1 放行后语义不变，无反向更新项），另新增 repo local-path ReadRaw/Write 落点用例；`go build ./...`、相关包测试与 web 测试通过
