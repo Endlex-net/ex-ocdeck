@@ -16,7 +16,8 @@ import { createLockController, type LockController } from './lock';
 import { attachTouchGestures, type GestureHandle } from './touch-gestures';
 import { shouldSendInput, encodeBinaryInput, createSyntheticGate, type SyntheticGate } from './input-gate';
 import { createLockOrchestrator, type LockOrchestrator } from './session-coordination';
-import { createImeCompensator, type ImeCompensator } from './ime-compensator';
+import { createImeCompensator, isImeProcessKey, type ImeCompensator } from './ime-compensator';
+import { parseOsc52Payload } from './clipboard';
 import { debugMark } from '../debug';
 
 export { shouldSendInput, encodeBinaryInput, createSyntheticGate, type SyntheticGate } from './input-gate';
@@ -86,6 +87,8 @@ export class TermSession {
   private readonly lockChangeCallbacks = new Set<(locked: boolean) => void>();
   /** 应用主题订阅退订（终端配色跟随主题，dispose 时退订防泄漏）。 */
   private unwatchTermTheme: (() => void) | null = null;
+  /** OSC 52 handler 退订。 */
+  private osc52Disposable: { dispose(): void } | null = null;
 
   // IME 补偿器 + 原生 onData tap（全平台启用，design D7）。
   private imeCompensator: ImeCompensator | null = null;
@@ -100,6 +103,8 @@ export class TermSession {
     wrap: HTMLElement,
     private wsPath: string,
     private onState: (s: TermConnState) => void,
+    /** 已校验的 OSC 52 clipboard-write 明文；同步回调，不得回写终端。 */
+    private onClipboardWrite?: (text: string) => void,
   ) {
     const prefs = loadTermPrefs();
     this.term = new Terminal({
@@ -115,6 +120,16 @@ export class TermSession {
     });
     this.term.loadAddon(this.fit);
     this.term.open(host);
+    this.osc52Disposable = this.term.parser.registerOscHandler(52, (data) => {
+      const text = parseOsc52Payload(data);
+      if (text !== null) this.onClipboardWrite?.(text);
+      return true;
+    });
+    // Shift+Enter → opencode input_newline：xterm 对 Enter/Shift+Enter 均发 \r，修饰信息丢失；
+    // 经 custom key handler 翻译为 modifyOtherKeys 形态 CSI 27;2;13~（opentui parse.keypress.ts
+    // 无条件解析为 {name:"return", shift:true}）。kitty CSI u 被 opencode useKittyKeyboard
+    // 门控，本场景协商不成立，不可用。
+    this.term.attachCustomKeyEventHandler((ev) => this.handleCustomKey(ev));
     try {
       this.term.loadAddon(new WebglAddon());
     } catch {
@@ -330,6 +345,8 @@ export class TermSession {
     this.lockOrchestrator.dispose();
     this.lockChangeCallbacks.clear();
     this.lockController.dispose();
+    this.osc52Disposable?.dispose();
+    this.osc52Disposable = null;
     this.term.dispose();
   }
 
@@ -466,6 +483,32 @@ export class TermSession {
     if (this.ws?.readyState === WebSocket.OPEN && this.authed) {
       this.ws.send(JSON.stringify({ type: 'resize', cols: this.term.cols, rows: this.term.rows }));
     }
+  }
+
+  /**
+   * Shift+Enter 拦截翻译：keydown 命中即 preventDefault（阻止浏览器派生 keypress，
+   * 否则 xterm _keyPress 会把 charCode 13 再发为 \r，造成「先换行后提交」），
+   * 经统一输入门禁发送 CSI 27;2;13~ 并 return false 阻止 xterm 默认 \r。
+   * 防御：残留的 Shift+Enter keypress 直接吞掉（return false），不重复发送。
+   * 其余键一律 return true 不干预。
+   * IME 门禁：isComposing 之外复用 isImeProcessKey（key==='Process' || keyCode===229，
+   * ime-compensator 既有契约）覆盖 composition 边界上 isComposing=false 的事件。
+   */
+  private handleCustomKey(ev: KeyboardEvent): boolean {
+    const isShiftEnter =
+      ev.key === 'Enter' && ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey;
+    if (ev.type === 'keydown') {
+      if (isShiftEnter && !ev.isComposing && !isImeProcessKey(ev.key, ev.keyCode)) {
+        ev.preventDefault();
+        this.sendInput('\x1b[27;2;13~', false);
+        return false;
+      }
+      return true;
+    }
+    if (ev.type === 'keypress' && isShiftEnter) {
+      return false;
+    }
+    return true;
   }
 
   /** 统一输入门禁（design D5）：onData + onBinary 双出口。 */

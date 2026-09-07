@@ -6,6 +6,13 @@
 // 执行（仅最小基础集），会话 env 经 `-e KEY=VALUE` argv 显式注入，防止 tmux
 // server 全局环境后门（design.md §2 exec env 清洗不变量）。
 //
+// `-f /dev/null` 使 set-clipboard 默认为 external，pane OSC 52 不会转到 attach
+// 客户端；EnsureServerOptions 按版本分段 fail-closed 启用转发：tmux >= 3.7 先关
+// get-clipboard 再置 set-clipboard on（转发 raw OSC52）；3.3–3.6 置 external +
+// allow-passthrough on（opencode 同时发 raw 与 DCS 包装，external 吞 raw、读查询
+// 无响应无泄露，DCS 透传恰好一份）；<3.3 或版本不可解析保持/恢复 external。
+// 不启用 allow-passthrough all（不可见 pane 也透传，攻击面更大）。最低仍是 3.2。
+//
 // 进程身份（pid+startTime）MUST NOT 出本包：对外 notice/接口一律使用 opaque
 // cleanup ticket 字符串，包内编码 pid+startTime+pgid。
 package process
@@ -14,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -502,7 +510,213 @@ func (m *Manager) NewSession(spec SessionSpec) error {
 		return fmt.Errorf("process: NewSession %s: %w", spec.Name, err)
 	}
 	_ = stderr
+	// 会话创建会拉起 tmux server；此时再设 server option，避免无 server 时
+	// set-option 自己起一个空 server。剪贴板为 best-effort，失败只记日志。
+	if optErr := m.EnsureServerOptions(); optErr != nil {
+		log.Printf("process: EnsureServerOptions after NewSession %s: %v", spec.Name, optErr)
+	}
 	return nil
+}
+
+// EnsureServerOptions 幂等设置专属 tmux server 的剪贴板选项，按版本分段、fail-closed：
+//
+//   - tmux >= 3.7：先 get-clipboard off（3.2–3.6 的 get-clipboard 默认
+//     buffer，若在其上开 set-clipboard on，pane 发 OSC 52 查询会拿到全 server 共享的
+//     paste buffer，造成跨任务剪贴板泄露），成功后关 allow-passthrough（防 3.3–3.6
+//     段遗留导致 raw+DCS 双写），最后才 set-clipboard on 转发 raw OSC52。
+//   - tmux 3.3–3.6：opencode 在 $TMUX 下会同时发 raw OSC52 与 DCS tmux-passthrough
+//     包装版——set-clipboard external 下 raw 被吞、读查询无响应（无泄露），开启
+//     allow-passthrough on（3.3 引入，仅可见 pane 透传）让 DCS 版透传到 attach
+//     客户端，恰好一份。顺序 fail-closed：先确保 external 再开 passthrough。
+//   - <3.3 / 版本无法解析（next-3.x 等）/ tmux -V 失败：特性不可用，恢复/保持
+//     external。
+//
+// 任一步失败（get-clipboard off / set-clipboard / allow-passthrough）统一走
+// restoreFailClosed 收回安全态（external + passthrough off）。唯一例外：≥3.7 段
+// 最后的 set-clipboard on 失败直接返回——此时 get-clipboard off 与 passthrough off
+// 均已生效，off + external 不转发、无泄露、无双写，状态已安全，无需（也不应）重试。
+//
+// 选项作用域：set-clipboard/get-clipboard 是 server 选项（options-table.c
+// .scope = OPTIONS_TABLE_SERVER），用规范 -s 写 server 表；allow-passthrough 是
+// window|pane 选项，用 -wg 写 global window。对非 server 选项，tmux 忽略 -s/-g 并
+// 按选项表 scope 落点写入（3.3–3.4 options_scope_from_name，3.5+ 同语义）；3.7c
+// 实测对 set-clipboard 用 -g 仍落 server 表（-g 被忽略），不得依赖这种巧合。
+//
+// 补救用独立 fresh ctx（版本检查可能耗尽共享 deadline）；恢复失败与原错误用
+// errors.Join 合并返回，不得吞掉。调用方（NewSession/reconcile）一律 best-effort
+// 记日志，不阻断。ErrNoTmuxServer 是唯一例外：无 server 即无遗留状态，无需补救。
+func (m *Manager) EnsureServerOptions() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	version := m.tmuxVersion(ctx)
+	switch {
+	case tmuxVersionAtLeast(version, 3, 7):
+		// 先关 get-clipboard，成功后才开 set-clipboard on，中间不留不安全窗口。
+		if err := m.setTmuxOption(ctx, "s", "get-clipboard", "off"); err != nil {
+			if errors.Is(err, ErrNoTmuxServer) {
+				return err
+			}
+			// 先前调用可能遗留 set-clipboard on 或 passthrough on；统一收回
+			// fail-closed 安全态，恢复失败与原错误合并返回（errors.Join 保留各条
+			// unwrap 链），不得吞掉。
+			if rerr := m.restoreFailClosed(); rerr != nil {
+				return errors.Join(err, rerr)
+			}
+			return err
+		}
+		// 关 passthrough（防 3.3–3.6 段遗留双写）；失败则不启用 on，统一收回安全态。
+		if err := m.setTmuxOption(ctx, "wg", "allow-passthrough", "off"); err != nil {
+			if errors.Is(err, ErrNoTmuxServer) {
+				return err
+			}
+			if rerr := m.restoreFailClosed(); rerr != nil {
+				return errors.Join(err, rerr)
+			}
+			return fmt.Errorf("process: EnsureServerOptions allow-passthrough off: %w", err)
+		}
+		return m.setTmuxOption(ctx, "s", "set-clipboard", "on")
+	case tmuxVersionAtLeast(version, 3, 3):
+		// 3.3–3.6：DCS passthrough 路径。先确保 external（读查询无响应、raw 被吞，
+		// 无泄露），再开 passthrough；任一步失败统一收回 fail-closed 安全态
+		//（passthrough 可能遗留 on，external + on 仍会透传 DCS），恢复失败与原错误
+		// 合并返回，不得吞掉。
+		if err := m.setTmuxOption(ctx, "s", "set-clipboard", "external"); err != nil {
+			if errors.Is(err, ErrNoTmuxServer) {
+				return err
+			}
+			if rerr := m.restoreFailClosed(); rerr != nil {
+				return errors.Join(err, rerr)
+			}
+			return err
+		}
+		if err := m.setTmuxOption(ctx, "wg", "allow-passthrough", "on"); err != nil {
+			if errors.Is(err, ErrNoTmuxServer) {
+				return err
+			}
+			if rerr := m.restoreFailClosed(); rerr != nil {
+				return errors.Join(
+					fmt.Errorf("process: EnsureServerOptions allow-passthrough on: %w", err),
+					rerr)
+			}
+			return fmt.Errorf("process: EnsureServerOptions allow-passthrough on: %w", err)
+		}
+		log.Printf("process: clipboard via DCS passthrough (tmux 3.3-3.6, got %q)", version)
+		return nil
+	default:
+		// 特性不可用：MUST 收回 fail-closed 安全态；恢复失败向上暴露（调用方记日志可见）。
+		rerr := m.restoreFailClosed()
+		if rerr != nil {
+			log.Printf("process: clipboard unavailable (tmux %q < 3.3 or unparsable); fail-closed remediation failed: %v", version, rerr)
+		} else {
+			log.Printf("process: clipboard unavailable (tmux %q < 3.3 or unparsable), set-clipboard kept external", version)
+		}
+		return rerr
+	}
+}
+
+// restoreFailClosed 以独立 fresh ctx 统一收回 fail-closed 安全态：独立尝试
+// set-clipboard external（-s）与 allow-passthrough off（-wg，防遗留 on 继续透传
+// DCS），各自错误 errors.Join 合并返回，不得吞掉。tmux < 3.3 无 allow-passthrough
+// （报 invalid/unknown option）按 best-effort 跳过——无该选项即无遗留。
+// 首个 ErrNoTmuxServer 直接返回：无 server 即无遗留状态，无需（也无法）继续补救。
+func (m *Manager) restoreFailClosed() error {
+	rerr := m.setTmuxOptionFreshCtx("s", "set-clipboard", "external")
+	if errors.Is(rerr, ErrNoTmuxServer) {
+		return rerr
+	}
+	if rerr != nil {
+		rerr = fmt.Errorf("restore set-clipboard external: %w", rerr)
+	}
+	if perr := m.setTmuxOptionFreshCtx("wg", "allow-passthrough", "off"); perr != nil &&
+		!errors.Is(perr, ErrNoTmuxServer) && !isUnknownOptionErr(perr) {
+		rerr = errors.Join(rerr, fmt.Errorf("restore allow-passthrough off: %w", perr))
+	}
+	return rerr
+}
+
+// setTmuxOptionFreshCtx 以独立 fresh ctx 设置 tmux 选项：版本检查（tmux -V）
+// 可能已耗尽共享 ctx 的 deadline，补救 MUST 不依赖它。
+// "无 server" 原样返回 ErrNoTmuxServer（无遗留状态，无需补救）。
+func (m *Manager) setTmuxOptionFreshCtx(flags, option, value string) error {
+	rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer rcancel()
+	return m.setTmuxOption(rctx, flags, option, value)
+}
+
+// setTmuxOption 以 tmux set-option -<flags> 设置选项（幂等）。flags 按选项表 scope
+// 选择：server 选项（set-clipboard/get-clipboard）用 "s"；window|pane 选项
+// （allow-passthrough）用 "wg"（global window）。其余 flags 组合会被 tmux 忽略并
+// 仍按选项表 scope 落点写入（如 -g 对 server 选项仍进 server 表），不得依赖。
+// "无 server" 映射为 ErrNoTmuxServer，供调用方区分空运行时。
+func (m *Manager) setTmuxOption(ctx context.Context, flags, option, value string) error {
+	_, _, err := m.execTmux(ctx, "set-option", "-"+flags, option, value)
+	if err == nil {
+		return nil
+	}
+	var ce *tmuxCmdError
+	if errors.As(err, &ce) && isNoServerExit(ce) {
+		return ErrNoTmuxServer
+	}
+	return fmt.Errorf("process: EnsureServerOptions set-option -%s %s %s: %w", flags, option, value, err)
+}
+
+// tmuxVersion 读 `tmux -V`。MUST 不经 -L/-f：带 socket 的 -V 可能被当成子命令，
+// 且会多打一枪专属 server（短命会话刚退出时尤其危险）。
+func (m *Manager) tmuxVersion(ctx context.Context) string {
+	if m.execTmuxFn != nil {
+		stdout, _, err := m.execTmuxFn(ctx, "-V")
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(stdout)
+	}
+	cmd := exec.CommandContext(ctx, "tmux", "-V")
+	cmd.Env = m.tmuxExecEnv()
+	stdout, _, err := runBounded(ctx, cmd, []string{"-V"})
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(stdout)
+}
+
+// parseTmuxVersion 解析 `tmux -V` 输出（如 "tmux 3.4"、"tmux 3.5a"）。
+// next-3.x 或无法解析时 ok=false。
+func parseTmuxVersion(s string) (major, minor int, ok bool) {
+	fields := strings.Fields(s)
+	if len(fields) < 2 {
+		return 0, 0, false
+	}
+	ver := strings.TrimPrefix(fields[1], "v")
+	parts := strings.SplitN(ver, ".", 3)
+	if len(parts) < 2 {
+		return 0, 0, false
+	}
+	major, err1 := strconv.Atoi(digitsPrefix(parts[0]))
+	minor, err2 := strconv.Atoi(digitsPrefix(parts[1]))
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return major, minor, true
+}
+
+func digitsPrefix(s string) string {
+	for i, c := range s {
+		if c < '0' || c > '9' {
+			return s[:i]
+		}
+	}
+	return s
+}
+
+func tmuxVersionAtLeast(version string, major, minor int) bool {
+	maj, min, ok := parseTmuxVersion(version)
+	if !ok {
+		return false
+	}
+	if maj != major {
+		return maj > major
+	}
+	return min >= minor
 }
 
 // ErrNoTmuxServer 表示专属 tmux server 未启动（无任何会话）。
@@ -775,4 +989,17 @@ func isNoServerExit(ce *tmuxCmdError) bool {
 		return true
 	}
 	return false
+}
+
+// isUnknownOptionErr 判断错误是否为 tmux "选项不存在"（stderr "invalid option: <name>"
+// 出自选项名匹配、"unknown option: <name>" 出自 scope 解析）。allow-passthrough 于
+// 3.3 引入——在 <3.3 上 set-option -wg 该选项必然报此错，属预期（无该选项即无遗留），
+// 与真实故障区分开。
+func isUnknownOptionErr(err error) bool {
+	var ce *tmuxCmdError
+	if !errors.As(err, &ce) {
+		return false
+	}
+	low := strings.ToLower(ce.stderr)
+	return strings.Contains(low, "invalid option") || strings.Contains(low, "unknown option")
 }

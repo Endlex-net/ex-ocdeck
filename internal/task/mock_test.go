@@ -994,6 +994,8 @@ func (p *mockProc) ListSessions() ([]string, error) {
 	return out, nil
 }
 
+func (p *mockProc) EnsureServerOptions() error { return nil }
+
 func (p *mockProc) ShowSessionEnv(name, key string) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1197,10 +1199,10 @@ type mockOC struct {
 
 func newMockOC(healthOK bool) *mockOC {
 	return &mockOC{
-		healthOK:           healthOK,
-		onReadyCh:          make(chan struct{}, 1),
-		deleteErrByID:      map[string]error{},
-		promptAsyncResult:  opencode.PromptResult{Kind: opencode.ResultPreSendFailure, Detail: "mockOC: prompt_async not configured"},
+		healthOK:          healthOK,
+		onReadyCh:         make(chan struct{}, 1),
+		deleteErrByID:     map[string]error{},
+		promptAsyncResult: opencode.PromptResult{Kind: opencode.ResultPreSendFailure, Detail: "mockOC: prompt_async not configured"},
 	}
 }
 

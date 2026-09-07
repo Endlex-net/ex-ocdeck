@@ -114,6 +114,8 @@ const termInstance = {
   options: {} as Record<string, unknown>,
   modes: { mouseTrackingMode: 'none' as const },
   buffer: { active: { type: 'normal' as const } },
+  parser: { registerOscHandler: vi.fn(() => ({ dispose: vi.fn() })) },
+  attachCustomKeyEventHandler: vi.fn(),
 };
 vi.mock('@xterm/xterm', () => ({
   Terminal: vi.fn(() => termInstance),
@@ -156,12 +158,18 @@ const imeCompensatorMock = {
   settle: vi.fn(),
   dispose: vi.fn(),
 };
-vi.mock('../terminal/ime-compensator', () => ({
-  createImeCompensator: vi.fn((opts: unknown) => {
-    capturedImeOpts = opts as { emit: (data: string) => void; now: () => number; schedule: (fn: () => void, delayMs?: number) => { cancel(): void } };
-    return imeCompensatorMock;
-  }),
-}));
+vi.mock('../terminal/ime-compensator', async () => {
+  const actual = await vi.importActual<typeof import('../terminal/ime-compensator')>(
+    '../terminal/ime-compensator',
+  );
+  return {
+    ...actual, // isImeProcessKey 等纯函数走真实实现（Shift+Enter 拦截复用该契约）
+    createImeCompensator: vi.fn((opts: unknown) => {
+      capturedImeOpts = opts as { emit: (data: string) => void; now: () => number; schedule: (fn: () => void, delayMs?: number) => { cancel(): void } };
+      return imeCompensatorMock;
+    }),
+  };
+});
 
 // ---------- 全局 stubs ----------
 
@@ -1566,6 +1574,185 @@ describe('TermSession adapter → blur-DEL 组合（lock 先门禁后 blur）', 
       session.dispose();
     } finally {
       (globalThis as { WebSocket: unknown }).WebSocket = savedWs;
+    }
+  });
+});
+
+/* ============================ OSC 52 clipboard 接线 ============================ */
+
+describe('OSC 52 clipboard 接线', () => {
+  it('构造时注册 osc 52 handler；handler 同步返回 true 并把合法 payload 转发为明文', async () => {
+    env.matchMediaMatches = false;
+    const { TermSession } = await import('../terminal/session');
+    const forwarded: string[] = [];
+    const session = new TermSession({} as HTMLElement, fakeWrap(), '/ws/x', () => {}, (t) => forwarded.push(t));
+
+    expect(termInstance.parser.registerOscHandler).toHaveBeenCalledWith(52, expect.any(Function));
+    // vi.fn 无参签名，元组取值需经 unknown 断言（handler 实际为 (data) => boolean）
+    const handler = (termInstance.parser.registerOscHandler.mock.calls as unknown as [number, (data: string) => boolean][])[0][1];
+
+    // 合法 c; payload → 转发解码明文，handler 同步返回 true（不返回 Promise）
+    expect(handler('c;SGVsbG8=')).toBe(true);
+    expect(forwarded).toEqual(['Hello']);
+    session.dispose();
+  });
+
+  it('读请求 c;? / 非 c / 非法 payload：消费但不转发、绝不回写终端', async () => {
+    env.matchMediaMatches = false;
+    const { TermSession } = await import('../terminal/session');
+    const forwarded: string[] = [];
+    const session = new TermSession({} as HTMLElement, fakeWrap(), '/ws/x', () => {}, (t) => forwarded.push(t));
+    const handler = (termInstance.parser.registerOscHandler.mock.calls as unknown as [number, (data: string) => boolean][])[0][1];
+
+    expect(handler('c;?')).toBe(true);
+    expect(handler('p;SGVsbG8=')).toBe(true);
+    expect(handler('c;!!!!')).toBe(true);
+    expect(handler('c;')).toBe(true);
+    expect(forwarded).toEqual([]);
+    // 防外泄关键：读请求不得触发任何 term.input / 数据回写
+    expect(termInstance.input).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it('dispose 时注销 osc 52 handler', async () => {
+    env.matchMediaMatches = false;
+    const { TermSession } = await import('../terminal/session');
+    const session = new TermSession({} as HTMLElement, fakeWrap(), '/ws/x', () => {});
+    const disposable = termInstance.parser.registerOscHandler.mock.results[0].value as {
+      dispose: ReturnType<typeof vi.fn>;
+    };
+    expect(disposable.dispose).not.toHaveBeenCalled();
+    session.dispose();
+    expect(disposable.dispose).toHaveBeenCalledTimes(1);
+  });
+});
+
+/* ============================ Shift+Enter → input_newline（CSI 27;2;13~） ============================ */
+
+describe('Shift+Enter 拦截翻译', () => {
+  /** fake 键盘事件：带 preventDefault spy 与 keyCode（默认 13=Enter）。 */
+  function keyEv(init?: Partial<KeyboardEvent>): KeyboardEvent & { preventDefault: ReturnType<typeof vi.fn> } {
+    const ev = {
+      type: 'keydown',
+      key: 'Enter',
+      keyCode: 13,
+      shiftKey: false,
+      ctrlKey: false,
+      altKey: false,
+      metaKey: false,
+      isComposing: false,
+      preventDefault: vi.fn(),
+      ...init,
+    };
+    return ev as unknown as KeyboardEvent & { preventDefault: ReturnType<typeof vi.fn> };
+  }
+
+  /** 构造 authed + WS OPEN 的 session（sendInput 门禁放行），返回捕获的 custom handler 与 ws。 */
+  async function authedSession() {
+    env.matchMediaMatches = false;
+    const { TermSession } = await import('../terminal/session');
+    const session = new TermSession({} as HTMLElement, fakeWrap(), '/ws/x', () => {});
+    const savedWs = (globalThis as { WebSocket: unknown }).WebSocket;
+    let wsInstance: {
+      readyState: number;
+      binaryType: string;
+      send: ReturnType<typeof vi.fn>;
+      close: ReturnType<typeof vi.fn>;
+      onmessage?: (ev: MessageEvent) => void;
+    } | null = null;
+    const WsCtor = vi.fn(function (this: unknown) {
+      wsInstance = { readyState: 1, binaryType: 'arraybuffer', send: vi.fn(), close: vi.fn() };
+      return wsInstance as object;
+    }) as unknown as typeof WebSocket;
+    (WsCtor as unknown as { OPEN: number }).OPEN = 1;
+    (globalThis as { WebSocket: unknown }).WebSocket = WsCtor;
+    session.connect();
+    wsInstance!.onmessage!({ data: JSON.stringify({ type: 'auth_ok' }) } as MessageEvent);
+    const handler = (
+      termInstance.attachCustomKeyEventHandler.mock.calls as unknown as [(ev: KeyboardEvent) => boolean][]
+    )[0][0];
+    return {
+      handler,
+      ws: wsInstance!,
+      /** 统计 CSI 27;2;13~ 的发送次数 */
+      seqSendCount() {
+        return wsInstance!.send.mock.calls.filter(
+          (c: unknown[]) =>
+            c[0] instanceof Uint8Array &&
+            String.fromCharCode(...Array.from(c[0] as Uint8Array)) === '\x1b[27;2;13~',
+        ).length;
+      },
+      cleanup() {
+        (globalThis as { WebSocket: unknown }).WebSocket = savedWs;
+        session.dispose();
+      },
+    };
+  }
+
+  it('构造时注册 custom key handler', async () => {
+    env.matchMediaMatches = false;
+    const { TermSession } = await import('../terminal/session');
+    const session = new TermSession({} as HTMLElement, fakeWrap(), '/ws/x', () => {});
+    expect(termInstance.attachCustomKeyEventHandler).toHaveBeenCalledWith(expect.any(Function));
+    session.dispose();
+  });
+
+  it('Shift+Enter keydown → preventDefault + 发送一次 CSI 27;2;13~ 并返回 false', async () => {
+    const { handler, seqSendCount, cleanup } = await authedSession();
+    try {
+      const ev = keyEv({ shiftKey: true });
+      expect(handler(ev)).toBe(false);
+      expect(ev.preventDefault).toHaveBeenCalledTimes(1); // 阻止浏览器派生 keypress
+      expect(seqSendCount()).toBe(1);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('真实事件序列：keydown 拦截后的残留 Shift+Enter keypress 被吞掉、不二次发送', async () => {
+    const { handler, seqSendCount, cleanup } = await authedSession();
+    try {
+      const keydown = keyEv({ shiftKey: true });
+      expect(handler(keydown)).toBe(false);
+      expect(seqSendCount()).toBe(1);
+
+      // xterm 早退不取消 DOM 事件时的防御路径：keypress 到达（无 isComposing 字段语义不变）
+      const keypress = keyEv({ type: 'keypress', shiftKey: true });
+      expect(handler(keypress)).toBe(false); // 吞掉，不透传给 xterm
+      expect(keypress.preventDefault).not.toHaveBeenCalled();
+      expect(seqSendCount()).toBe(1); // 不重复发送
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('IME 229：keyCode=229 的 Shift+Enter keydown 不拦截（composition 边界）', async () => {
+    const { handler, seqSendCount, cleanup } = await authedSession();
+    try {
+      const ev = keyEv({ shiftKey: true, keyCode: 229 });
+      expect(handler(ev)).toBe(true);
+      expect(ev.preventDefault).not.toHaveBeenCalled();
+      expect(seqSendCount()).toBe(0);
+      expect(handler(keyEv({ shiftKey: true, key: 'Process' }))).toBe(true);
+      expect(seqSendCount()).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('非 Shift+Enter 形态 → 返回 true 且不发送：普通/Ctrl+Shift/Alt+Shift/meta Enter、isComposing、keyup、普通 keypress', async () => {
+    const { handler, seqSendCount, cleanup } = await authedSession();
+    try {
+      expect(handler(keyEv())).toBe(true);
+      expect(handler(keyEv({ ctrlKey: true, shiftKey: true }))).toBe(true);
+      expect(handler(keyEv({ altKey: true, shiftKey: true }))).toBe(true);
+      expect(handler(keyEv({ metaKey: true, shiftKey: true }))).toBe(true);
+      expect(handler(keyEv({ isComposing: true, shiftKey: true }))).toBe(true);
+      expect(handler(keyEv({ type: 'keyup', shiftKey: true }))).toBe(true);
+      expect(handler(keyEv({ type: 'keypress' }))).toBe(true); // 非 shift 的 keypress 不干预
+      expect(seqSendCount()).toBe(0);
+    } finally {
+      cleanup();
     }
   });
 });

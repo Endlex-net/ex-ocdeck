@@ -68,6 +68,7 @@ type ProcessBackend interface {
 	RetryReap(tickets []string) ([]string, error)
 	HasSession(name string) (bool, error)
 	ListSessions() ([]string, error)
+	EnsureServerOptions() error
 	ShowSessionEnv(name, key string) (string, error)
 	// ShowSessionEnvContext 同 ShowSessionEnv 但使用调用方 ctx（cross-project-active-sessions D0）。
 	ShowSessionEnvContext(ctx context.Context, name, key string) (string, error)

@@ -8,6 +8,11 @@ import type { PaletteConfig } from '../palette-focus';
 import { navigate, type ConfigsTab } from '../router';
 import type { MobileCaps, MobileMode } from '../terminal/mobile-mode';
 import {
+  loadClipboardPolicy,
+  saveClipboardPolicy,
+  type ClipboardPolicy,
+} from '../terminal/clipboard';
+import {
   loadMobileCaps,
   loadMobileMode,
   saveMobileCaps,
@@ -153,6 +158,69 @@ const MOBILE_MODE_HINT: Record<MobileMode, string> = {
   off: '完全按桌面终端处理（含不收缩避让键盘）',
 };
 
+const CLIPBOARD_POLICY_OPTIONS: { value: ClipboardPolicy; label: string }[] = [
+  { value: 'ask', label: '询问' },
+  { value: 'auto', label: '自动允许' },
+  { value: 'off', label: '关闭' },
+];
+
+const CLIPBOARD_POLICY_HINT: Record<ClipboardPolicy, string> = {
+  ask: '远程终端复制时先弹窗确认，再写入本机剪贴板',
+  auto: '远程终端复制直接写入本机剪贴板',
+  off: '忽略远程终端的复制请求',
+};
+
+/** 远程剪贴板策略（ask/auto/off）：授权是源级持久的，必须在设置里可撤销。 */
+function ClipboardPolicyField() {
+  const [policy, setPolicy] = useState<ClipboardPolicy>(() => loadClipboardPolicy());
+
+  // 外部变更（终端「始终允许」、跨标签页）后按实际存储收敛。
+  useEffect(() => {
+    const reload = () => setPolicy(loadClipboardPolicy());
+    window.addEventListener(TERM_PREFS_CHANGED, reload);
+    window.addEventListener('storage', reload);
+    return () => {
+      window.removeEventListener(TERM_PREFS_CHANGED, reload);
+      window.removeEventListener('storage', reload);
+    };
+  }, []);
+
+  const selectPolicy = (p: ClipboardPolicy) => {
+    try {
+      saveClipboardPolicy(p);
+    } catch {
+      return;
+    }
+    setPolicy(p);
+  };
+
+  return (
+    <div className="od-field">
+      <span className="od-label" id="clipPolicySegLabel">
+        远程剪贴板
+      </span>
+      <div
+        className="seg"
+        role="group"
+        aria-labelledby="clipPolicySegLabel"
+      >
+        {CLIPBOARD_POLICY_OPTIONS.map((opt) => (
+          <button
+            key={opt.value}
+            type="button"
+            className={policy === opt.value ? 'on' : ''}
+            aria-pressed={policy === opt.value}
+            onClick={() => selectPolicy(opt.value)}
+          >
+            {opt.label}
+          </button>
+        ))}
+      </div>
+      <div className="od-hint">{CLIPBOARD_POLICY_HINT[policy]}；对本设备的所有终端生效</div>
+    </div>
+  );
+}
+
 function AppearancePanel() {
   const { preference, setPreference } = useTheme();
 
@@ -289,6 +357,7 @@ function AppearancePanel() {
         )}
         {mobileError && <div className="error-line">{mobileError}</div>}
       </div>
+      <ClipboardPolicyField />
       <TermAppearanceEditor />
     </section>
   );
