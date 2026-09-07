@@ -5,15 +5,15 @@
 ## Requirements
 ### Requirement: 任务创建
 
-系统 SHALL 支持在项目下创建任务。`kind=repo` 项目的每个任务 MUST 拥有独立的 git worktree 与独立分支（从选定基线切出，缺省为项目默认分支）。`kind=dir`（纯目录）项目的任务 MUST NOT 创建 worktree 与分支：分支记录为空、`worktree_path` 记录为项目路径本身、分支命名（LLM slug 与机械 slugify）、分支校验/冲突检查、worktree 路径生成与碰撞重试、worktree add、inherit 文件继承全部跳过；init script 保留（仍按项目配置决定 `init_status` 并触发 InitRunner/自动激活）。dir 任务创建在落库前 MUST 做无副作用预检：项目路径存在且为目录，否则以 invalid_state 拒绝且 MUST NOT 落 creating 行。dir 任务创建 MUST 为零文件/git 副作用（除落库与后续激活/init 的进程副作用外），`creation_failed` 仅可能来自 lifecycle 配置读取失败或提交点失败。以下 worktree/分支义务均仅适用于 `kind=repo` 项目。
+系统 SHALL 支持在项目下创建任务。`kind=repo` 项目的任务按任务级运行模式分流（模式选择与持久化见「任务运行模式选择」）：worktree 模式（缺省）任务 MUST 拥有独立的 git worktree 与独立分支（从选定基线切出，缺省为项目默认分支）；local-path 模式任务 MUST 遵循与 `kind=dir` 任务完全一致的创建语义——MUST NOT 创建 worktree 与分支：分支记录为空、`worktree_path` 记录为项目路径本身、分支命名（LLM slug 与机械 slugify）、分支校验/冲突检查、worktree 路径生成与碰撞重试、worktree add、inherit 文件继承全部跳过；init script 保留（仍按项目配置决定 `init_status` 并触发 InitRunner/自动激活）。`kind=dir`（纯目录）项目的任务 MUST NOT 创建 worktree 与分支：分支记录为空、`worktree_path` 记录为项目路径本身、分支命名（LLM slug 与机械 slugify）、分支校验/冲突检查、worktree 路径生成与碰撞重试、worktree add、inherit 文件继承全部跳过；init script 保留（仍按项目配置决定 `init_status` 并触发 InitRunner/自动激活）。dir 任务与 repo 项目 local-path 模式任务创建在落库前 MUST 做无副作用预检：项目路径存在且为目录，否则以 invalid_state 拒绝且 MUST NOT 落 creating 行。dir 任务与 local-path 模式任务创建 MUST 为零文件/git 副作用（除落库与后续激活/init 的进程副作用外），`creation_failed` 仅可能来自 lifecycle 配置读取失败或提交点失败。以下 worktree/分支义务均仅适用于 `kind=repo` 项目的 worktree 模式任务。
 
 分支名 MUST 为 `ocdeck/<slug>`，slug 生成策略：当 AI 配置可用（见 ai-provider-config spec 的可用性判定）时，SHALL 调用 LLM 将任务名提炼为语义化英文 kebab-case slug（≤50 字符，匹配 `^[a-z0-9]([a-z0-9-]{0,48}[a-z0-9])?$` 且不命中无意义词表，否则视为失败）；LLM 调用失败、超时、输出非法或 AI 未配置时，MUST 回退到机械 slugify（与既有行为一致，空结果兜底 `task`）。**AI 错误本身 MUST NOT 向用户返回、MUST NOT 阻断任务创建**——命名回退后创建流程继续，但随后仍可能因既有的分支名校验/冲突等前置检查失败（该语义不变）。LLM 调用 SHALL 设置超时（≤10s）且发生在任何副作用（落库、worktree add）之前。
 
-新建任务的 worktree 路径 MUST 为 `<dataDir>/worktrees/<projectName-slug>/<branchPathSlug>-<rand4>/`：`projectName-slug` 为项目名经规范化（小写、非 `[a-z0-9-]` 折叠为 `-`，允许为空）的结果，为空时回退 `project-<projectID前8位>`，且 MUST 截断至 ≤50 字符；`branchPathSlug` 为分支名去掉 `ocdeck/` 前缀后截断至 ≤50 字符的目录段（截断后去尾部 `-`，截空时兜底 `task`）——目录段是分支名的派生展示，**分支名本身行为不变**（机械 slugify 无长度限制），DB 落库的 `worktree_path` 为唯一事实源，MUST NOT 从目录反推分支；`rand4` 为 4 位小写字母数字随机后缀（crypto/rand）。熵失败语义：Go 1.24 起 `crypto/rand` 底层熵失败为不可恢复 fatal（进程终止，天然满足零副作用）；实现保留 error 返回路径作为可注入熵源的防御 seam，**当使用可注入熵源且其返回错误时 MUST 返回错误且零副作用**。目录碰撞检测 MUST 在落库前以无副作用的存在性检查完成：碰撞时重新生成后缀（≤3 次），3 次均碰撞 MUST 返回错误且不产生任何副作用。路径在创建时确定并落库，此后删除/挂起/激活/重试等全部生命周期操作 MUST 按 DB 记录的 `worktree_path` 执行，**MUST NOT 按新格式重算**——既有任务（含旧 `<projectID>/<taskID>` 格式路径）行为不变，不做迁移。worktree 创建在任何文件/git 副作用前 MUST 通过 `<dataDir>/worktrees` 根的包含性校验。
+新建任务（worktree 模式）的 worktree 路径 MUST 为 `<dataDir>/worktrees/<projectName-slug>/<branchPathSlug>-<rand4>/`：`projectName-slug` 为项目名经规范化（小写、非 `[a-z0-9-]` 折叠为 `-`，允许为空）的结果，为空时回退 `project-<projectID前8位>`，且 MUST 截断至 ≤50 字符；`branchPathSlug` 为分支名去掉 `ocdeck/` 前缀后截断至 ≤50 字符的目录段（截断后去尾部 `-`，截空时兜底 `task`）——目录段是分支名的派生展示，**分支名本身行为不变**（机械 slugify 无长度限制），DB 落库的 `worktree_path` 为唯一事实源，MUST NOT 从目录反推分支；`rand4` 为 4 位小写字母数字随机后缀（crypto/rand）。熵失败语义：Go 1.24 起 `crypto/rand` 底层熵失败为不可恢复 fatal（进程终止，天然满足零副作用）；实现保留 error 返回路径作为可注入熵源的防御 seam，**当使用可注入熵源且其返回错误时 MUST 返回错误且零副作用**。目录碰撞检测 MUST 在落库前以无副作用的存在性检查完成：碰撞时重新生成后缀（≤3 次），3 次均碰撞 MUST 返回错误且不产生任何副作用。路径在创建时确定并落库，此后删除/挂起/激活/重试等全部生命周期操作 MUST 按 DB 记录的 `worktree_path` 执行，**MUST NOT 按新格式重算**——既有任务（含旧 `<projectID>/<taskID>` 格式路径）行为不变，不做迁移。worktree 创建在任何文件/git 副作用前 MUST 通过 `<dataDir>/worktrees` 根的包含性校验。
 
-创建流程在 worktree 创建成功后、提交 suspended 前，SHALL 执行项目配置的 inherit 文件继承（语义见 project-lifecycle-config spec），inherit 失败 MUST NOT 阻断创建。提交 suspended 后：若项目配置了 init script，SHALL 先异步执行 init 并仅在成功后触发自动激活；init 失败 MUST NOT 触发激活，任务保持 suspended 且 init_status=failed（init 状态机见 project-lifecycle-config spec）；激活失败任务落挂起并记录 last_error，用户可手动重试激活。项目未配置 inherit/init 时，创建流程与既有行为完全一致。
+创建流程（worktree 模式）在 worktree 创建成功后、提交 suspended 前，SHALL 执行项目配置的 inherit 文件继承（语义见 project-lifecycle-config spec），inherit 失败 MUST NOT 阻断创建。提交 suspended 后：若项目配置了 init script，SHALL 先异步执行 init 并仅在成功后触发自动激活；init 失败 MUST NOT 触发激活，任务保持 suspended 且 init_status=failed（init 状态机见 project-lifecycle-config spec）；激活失败任务落挂起并记录 last_error，用户可手动重试激活。项目未配置 inherit/init 时，创建流程与既有行为完全一致。
 
-repo 任务创建 SHALL 支持可选基线分支参数 `base_ref`：外部输入为短名（本地分支 `feature-x` 或远端分支 `origin/feature-x`），缺省（空）从项目默认分支切出（向后兼容）。系统 MUST 先对短名执行 `git check-ref-format --branch <短名>` 规范校验，再将输入按 `refs/heads/<name>` → `refs/remotes/<name>` 顺序探测（heads 优先：本地与远端同名时解析为本地分支），仅接受这两个命名空间（拒绝 tag/SHA/任意表达式），经 `git rev-parse --verify` 存在性校验；任一环节失败 MUST 返回 invalid_input。base_ref 校验为无副作用前置检查，MUST 在落 creating 行之前完成；提供非法/不存在 base_ref 时 MUST NOT 产生落库或 worktree 副作用。**解析后的全限定 ref MUST 随任务落库（`tasks.base_ref`），包括缺省创建（落库 `refs/heads/<项目默认分支>`）**；Retry 重试 MUST 使用落库的全限定 ref，MUST NOT 重读项目默认分支；repo 任务落库值为空 MUST fail-closed 报错（空值仅 dir 任务使用）。Retry 保证使用同一 ref（分支名），不保证同一 commit（分支 tip 移动后按当前 tip 重建，与既有语义一致）。任务分支（`ocdeck/<slug>`）命名逻辑与基线解耦、行为不变。`kind=dir` 项目的任务创建 MUST NOT 接受 `base_ref`（提供即 invalid_input）。
+repo 项目 worktree 模式任务创建 SHALL 支持可选基线分支参数 `base_ref`：外部输入为短名（本地分支 `feature-x` 或远端分支 `origin/feature-x`），缺省（空）从项目默认分支切出（向后兼容）。系统 MUST 先对短名执行 `git check-ref-format --branch <短名>` 规范校验，再将输入按 `refs/heads/<name>` → `refs/remotes/<name>` 顺序探测（heads 优先：本地与远端同名时解析为本地分支），仅接受这两个命名空间（拒绝 tag/SHA/任意表达式），经 `git rev-parse --verify` 存在性校验；任一环节失败 MUST 返回 invalid_input。base_ref 校验为无副作用前置检查，MUST 在落 creating 行之前完成；提供非法/不存在 base_ref 时 MUST NOT 产生落库或 worktree 副作用。**解析后的全限定 ref MUST 随任务落库（`tasks.base_ref`），包括缺省创建（落库 `refs/heads/<项目默认分支>`）**；Retry 重试 MUST 使用落库的全限定 ref，MUST NOT 重读项目默认分支；worktree 模式任务落库值为空 MUST fail-closed 报错（空值仅 dir 任务与 local-path 模式任务使用）。Retry 保证使用同一 ref（分支名），不保证同一 commit（分支 tip 移动后按当前 tip 重建，与既有语义一致）。任务分支（`ocdeck/<slug>`）命名逻辑与基线解耦、行为不变。`kind=dir` 项目的任务与 repo 项目 local-path 模式任务创建 MUST NOT 接受 `base_ref`（提供 trim 后非空值即 invalid_input；缺失/null/trim 后空串视为未提供）。
 
 系统 SHALL 提供项目分支列表只读查询 `GET /api/v1/projects/{id}/branches`（本地+远端分支，`git branch`/`git branch -r`，不进入仓库写锁）：返回稳定排序、去重后的短名 JSON 数组（如 `["feature-x","main","origin/feature-x"]`），本地分支在前、远端分支在后，按 `%(symref)` 元数据排除远端 symbolic ref（如 `origin/HEAD`）；返回的短名 MUST 可直接作为 `base_ref` 输入。dir 项目调用该查询 MUST 返回 invalid_input。
 
@@ -21,37 +21,37 @@ repo 任务创建 SHALL 支持可选基线分支参数 `base_ref`：外部输入
 
 #### Scenario: 创建任务（repo 项目）
 
-- **WHEN** 用户在 repo 项目下创建任务（提供任务名称）
+- **WHEN** 用户在 repo 项目下创建任务（提供任务名称，未选择运行模式或选择 worktree 模式）
 - **THEN** 系统创建 worktree 与分支，任务进入挂起状态，随后**自动触发激活**（异步启动进程组并锚定 session）；激活失败任务落挂起并记录 last_error，用户可手动重试激活
 
 #### Scenario: LLM 生成语义化分支名（repo 项目）
 
-- **WHEN** AI 配置可用，用户以中文任务名（如「接入AI与worktree命名优化」）创建任务
+- **WHEN** AI 配置可用，用户在 repo 项目下以 worktree 模式创建中文任务名任务（如「接入AI与worktree命名优化」）
 - **THEN** 系统调用 LLM 生成英文 slug，分支名为 `ocdeck/<ai-slug>`（如 `ocdeck/ai-worktree`），worktree 目录为 `<dataDir>/worktrees/<projectName-slug>/<ai-slug>-<rand4>/`（AI 路径下目录段与分支 slug 一致）
 
 #### Scenario: AI 未配置或失败时回退（repo 项目）
 
-- **WHEN** AI 未配置、调用失败/超时、或输出未通过清洗门禁
+- **WHEN** 用户在 repo 项目下以 worktree 模式创建任务，AI 未配置、调用失败/超时、或输出未通过清洗门禁
 - **THEN** 系统回退到机械 slugify 生成分支名，AI 错误不向用户暴露；创建流程继续，随后仍遵循既有前置检查语义（如分支冲突时报错）
 
 #### Scenario: 新路径格式的人类可读目录（repo 项目）
 
-- **WHEN** 创建新任务
+- **WHEN** 用户在 repo 项目下以 worktree 模式创建新任务
 - **THEN** worktree 目录为 `<dataDir>/worktrees/<projectName-slug>/<branchPathSlug>-<rand4>/`（branchPathSlug 为分支名去 `ocdeck/` 前缀后截断 ≤50 字符的目录段，分支名本身不变），项目名与分支语义可从路径直接辨认；存量旧格式任务的目录与全部生命周期操作（含创建重试）不受影响
 
 #### Scenario: 纯中文项目名的目录回退（repo 项目）
 
-- **WHEN** 项目名规范化后为空（如纯中文项目名）
+- **WHEN** repo 项目名称规范化后为空（如纯中文项目名），用户以 worktree 模式创建任务
 - **THEN** 目录第一段为 `project-<projectID前8位>`，保证非空、合法、可区分
 
 #### Scenario: 目录碰撞重试（repo 项目）
 
-- **WHEN** 落库前的存在性检查发现目标目录已存在
+- **WHEN** repo 项目 worktree 模式任务创建时，落库前的存在性检查发现目标目录已存在
 - **THEN** 系统重新生成 4 位随机后缀重试（≤3 次）；3 次均碰撞则返回错误，不产生落库或 worktree 副作用
 
 #### Scenario: 配置 init 的项目创建任务（repo 项目）
 
-- **WHEN** 项目配置了 init script，创建任务
+- **WHEN** repo 项目配置了 init script，用户以 worktree 模式创建任务
 - **THEN** worktree 创建 → inherit 复制 → 挂起（init_status=pending）→ init 执行成功 → 自动激活
 
 #### Scenario: init 失败停留在挂起（repo 项目）
@@ -61,7 +61,7 @@ repo 任务创建 SHALL 支持可选基线分支参数 `base_ref`：外部输入
 
 #### Scenario: 未配置项目行为不变（repo 项目）
 
-- **WHEN** 项目未配置 inherit patterns 与 init script，创建任务
+- **WHEN** repo 项目未配置 inherit patterns 与 init script，用户以 worktree 模式创建任务
 - **THEN** 创建流程与既有行为一致：worktree 创建后直接自动激活，init_status=none
 
 #### Scenario: Probe 冷启动重试（repo 项目）
@@ -71,42 +71,42 @@ repo 任务创建 SHALL 支持可选基线分支参数 `base_ref`：外部输入
 
 #### Scenario: 分支名冲突（repo 项目）
 
-- **WHEN** 生成的分支名已存在（无论由 LLM 生成还是 slugify 回退）
+- **WHEN** repo 项目 worktree 模式任务创建时，生成的分支名已存在（无论由 LLM 生成还是 slugify 回退）
 - **THEN** 系统报错并提示用户更换任务名称
 
 #### Scenario: 指定基线分支创建（repo 项目）
 
-- **WHEN** 用户创建 repo 任务并提供 `base_ref` 短名（本地分支 `feature-x` 或远端分支 `origin/feature-x`）
+- **WHEN** 用户以 worktree 模式创建 repo 任务并提供 `base_ref` 短名（本地分支 `feature-x` 或远端分支 `origin/feature-x`）
 - **THEN** 系统校验该分支存在后，worktree 从该基线切出（任务分支命名不变），解析后的全限定 ref 落库供 Retry 使用
 
 #### Scenario: 默认基线行为不变（repo 项目）
 
-- **WHEN** 用户创建 repo 任务未提供 `base_ref`
+- **WHEN** 用户以 worktree 模式创建 repo 任务且未提供 `base_ref`
 - **THEN** worktree 从项目默认分支切出，与既有行为一致；落库 `refs/heads/<项目默认分支>`
 
 #### Scenario: 同名本地与远端分支的解析优先级（repo 项目）
 
-- **WHEN** 仓库同时存在本地分支 `origin/feature-x`（`refs/heads/origin/feature-x`）与远端分支 `origin/feature-x`（`refs/remotes/origin/feature-x`），用户提供短名 `origin/feature-x`
+- **WHEN** 用户以 worktree 模式创建任务并提供短名 `origin/feature-x`，仓库同时存在本地分支 `origin/feature-x`（`refs/heads/origin/feature-x`）与远端分支 `origin/feature-x`（`refs/remotes/origin/feature-x`）
 - **THEN** 系统按 heads 优先解析为本地 `refs/heads/origin/feature-x`（全限定 ref 落库，Retry 不受远端变化影响）
 
 #### Scenario: 缺省基线创建后默认分支变化的 Retry（repo 项目）
 
-- **WHEN** 缺省基线创建的任务落 creation_failed，随后项目默认分支被修改，用户 Retry
+- **WHEN** 以 worktree 模式缺省基线创建的任务落 creation_failed，随后项目默认分支被修改，用户 Retry
 - **THEN** Retry 仍使用创建时落库的 `refs/heads/<原默认分支>` 重建 worktree，不受默认分支变化影响
 
 #### Scenario: 非法或不存在的基线分支（repo 项目）
 
-- **WHEN** 用户提供的 `base_ref` 未通过 check-ref-format、不是本地/远端分支、或分支不存在
+- **WHEN** 用户以 worktree 模式创建 repo 任务，提供的 `base_ref` 未通过 check-ref-format、不是本地/远端分支、或分支不存在
 - **THEN** 系统返回 invalid_input 明确错误，MUST NOT 落 creating 行、零副作用
 
 #### Scenario: dir 项目拒绝 base_ref
 
-- **WHEN** 用户对 dir 项目创建任务并提供 `base_ref`
+- **WHEN** 用户对 dir 项目创建任务并提供非空 `base_ref`
 - **THEN** 系统返回 invalid_input（纯目录项目无基线分支语义），零副作用
 
 #### Scenario: Retry 使用落库基线（repo 项目）
 
-- **WHEN** 以 `base_ref=origin/feature-x` 创建的任务落 creation_failed 后 Retry，期间项目默认分支已被修改
+- **WHEN** 以 worktree 模式、`base_ref=origin/feature-x` 创建的任务落 creation_failed 后 Retry，期间项目默认分支已被修改
 - **THEN** Retry 仍按落库的 `refs/remotes/origin/feature-x` 重建 worktree（同一 ref，tip 为当前值），不受默认分支变化影响
 
 #### Scenario: 分支列表查询成功（repo 项目）
@@ -169,6 +169,31 @@ repo 任务创建 SHALL 支持可选基线分支参数 `base_ref`：外部输入
 - **WHEN** 同一 dir 项目下已存在活跃任务，用户再创建/激活新任务
 - **THEN** 系统允许并行（无互斥锁，符合无人工并发配额语义），UI 显示"多任务共享同一目录、无文件隔离"提示
 
+#### Scenario: local-path 模式创建任务（repo 项目）
+
+- **WHEN** 用户在 repo 项目下以 local-path 模式创建任务
+- **THEN** 系统不创建 worktree/分支、不执行分支命名与校验、不执行 inherit；任务落库 `branch` 为空、`worktree_path` 等于项目路径、`base_ref` 为空、`mode=local-path` 持久化，随后按项目 init 配置走 InitRunner 或直接自动激活；init/激活开始前项目目录内零新增文件（允许 dirty working tree，不做任何 git 状态检查）
+
+#### Scenario: local-path 模式拒绝 base_ref
+
+- **WHEN** 用户对 repo 项目以 local-path 模式创建任务并提供非空 `base_ref`
+- **THEN** 系统返回 invalid_input（就地运行无基线分支语义），零副作用，MUST NOT 落 creating 行
+
+#### Scenario: local-path 模式目录消失时拒绝创建
+
+- **WHEN** 用户以 local-path 模式创建任务，但项目路径已不存在或不再是目录
+- **THEN** 系统以 invalid_state 拒绝，MUST NOT 落 creating 行，零副作用
+
+#### Scenario: local-path 模式创建重试
+
+- **WHEN** local-path 模式任务处于 creation_failed（配置读取失败/提交点失败），用户 Retry
+- **THEN** 系统跳过 worktree 产物验证与分支检查，仅校验项目目录仍存在后重读配置并提交，随后按 init 配置触发 InitRunner 或自动激活（与 dir 任务重试语义一致）
+
+#### Scenario: local-path 模式并行多任务
+
+- **WHEN** 同一 repo 项目下已存在活跃的 local-path 模式任务，用户再以 local-path 模式创建/激活新任务
+- **THEN** 系统允许并行（无互斥锁，符合无人工并发配额语义），创建面板的低可见度提醒已在模式选中时展示「多任务共享同一目录」语义
+
 ### Requirement: 任务状态机
 任务 SHALL 具有三种用户可见状态：活跃、挂起、归档；删除为**硬删除**（成功后记录移除，无"已删除"展示态）。合法流转 MUST 限定为：挂起→活跃、活跃→挂起、挂起→归档、归档→挂起、活跃→挂起（自动，kill 模式服务端重启；persist 模式重启且会话存活时保持活跃）、挂起/归档/创建失败→删除。系统 SHALL 额外维护内部过渡状态（creating/creation_failed/activating/suspending/deleting/deletion_failed）与 `last_error` 字段，用于表达部分失败与恢复；对过渡态任务的 Retry 操作 MUST 幂等（外部资源不存在视为该步骤已成功）。
 
@@ -223,13 +248,13 @@ repo 任务创建 SHALL 支持可选基线分支参数 `base_ref`：外部输入
 
 ### Requirement: 任务删除清理
 
-系统 SHALL 在删除任务前完成全部前置检查（dirty/untracked 确认、分支被其他 worktree 占用检查、路径包含性校验），**全部通过后才允许任何副作用**。此外，任务 init 进行中（`init_status ∈ {pending,running}`）时 MUST 拒绝删除与归档（invalid_state，提示 init 进行中）。删除副作用 MUST 按序执行：① 持久化 delete_mode + 置 deleting ② **RetryReap 既有 cleanup debt**（remaining 非空则落 deletion_failed，不得继续）③ 删 oc session 数据（逐个，404 幂等视为成功）④ kill 残余 tmux 会话（若有）⑤ 二次 dirty 门禁 ⑥ pre_delete script（项目配置时；worktree 不存在则幂等跳过；语义见 project-lifecycle-config spec）⑦ 删 worktree ⑧ 删本地分支 ⑨ 删 DB 记录 ⑩ best-effort 清理任务日志目录（忽略错误）。远端分支 MUST NOT 被删除。**Force 模式只能跳过 ③ 与 ⑥，MUST NOT 跳过 ② 进程收割**。
+对 worktree 模式任务，系统 SHALL 在删除前完成全部前置检查（dirty/untracked 确认、分支被其他 worktree 占用检查、路径包含性校验），**全部通过后才允许任何副作用**；local-path 模式任务（含 dir 任务）MUST 跳过全部 git/文件前置检查（见下方 dir 序列变体）。此外，任务 init 进行中（`init_status ∈ {pending,running}`）时 MUST 拒绝删除与归档（invalid_state，提示 init 进行中）。worktree 模式任务的删除副作用 MUST 按序执行：① 持久化 delete_mode + 置 deleting ② **RetryReap 既有 cleanup debt**（remaining 非空则落 deletion_failed，不得继续）③ 删 oc session 数据（逐个，404 幂等视为成功）④ kill 残余 tmux 会话（若有）⑤ 二次 dirty 门禁 ⑥ pre_delete script（项目配置时；worktree 不存在则幂等跳过；语义见 project-lifecycle-config spec）⑦ 删 worktree ⑧ 删本地分支 ⑨ 删 DB 记录 ⑩ best-effort 清理任务日志目录（忽略错误）。远端分支 MUST NOT 被删除。**Force 模式只能跳过 ③ 与 ⑥，MUST NOT 跳过 ② 进程收割**。
 
-`kind=dir` 项目的任务删除 MUST 按以下变体执行。**硬不变量：ocdeck 内建删除逻辑 MUST NOT 对用户目录（`worktree_path` = 项目路径）及其内容执行任何写/删操作；唯一例外是用户显式配置的 pre_delete script（用户授权操作，不计入不变量）**。dir 任务 MUST NOT 执行任何 git/文件类步骤：跳过全部前置 git 检查（dirty 确认、分支占用、包含性校验）、⑤ 二次 dirty 门禁、⑦ 删 worktree、⑧ 删本地分支；`confirmDirty` 参数接受但忽略。dir normal 序列：① → ② → ③ → ④ → ⑥（pre_delete script 以项目目录为 cwd，用户授权）→ ⑨ → ⑩；dir force 序列与 repo force 契约一致（跳过 ③ 与 ⑥，MUST NOT 跳过 ②）：① → ② → ④ → ⑨ → ⑩。即 dir 删除仅清理 ocdeck 自身数据（DB 记录、tmux 进程组、任务日志目录）与本任务拥有的 opencode session 数据。实现 MUST 在删除序列入口按项目 `kind` 一次性分流为 repo/dir 两条序列（共享步骤抽共用 helper），MUST NOT 依赖 `branch` 判空等隐式信号逐步跳过；删除重试（Retry）按持久化 delete_mode 重入同一 dir 序列。
+`kind=dir` 项目的任务与 `kind=repo` 项目的 local-path 模式任务删除 MUST 按以下变体（下文统称 dir 序列）执行。**硬不变量：ocdeck 内建删除逻辑 MUST NOT 对用户目录（`worktree_path` = 项目路径）及其内容执行任何写/删操作；唯一例外是用户显式配置的 pre_delete script（用户授权操作，不计入不变量）**。dir 序列 MUST NOT 执行任何 git/文件类步骤：跳过全部前置 git 检查（dirty 确认、分支占用、包含性校验）、⑤ 二次 dirty 门禁、⑦ 删 worktree、⑧ 删本地分支；`confirmDirty` 参数接受但忽略。dir normal 序列：① → ② → ③ → ④ → ⑥（pre_delete script 以项目目录为 cwd，用户授权）→ ⑨ → ⑩；dir force 序列与 repo force 契约一致（跳过 ③ 与 ⑥，MUST NOT 跳过 ②）：① → ② → ④ → ⑨ → ⑩。即 dir 序列删除仅清理 ocdeck 自身数据（DB 记录、tmux 进程组、任务日志目录）与本任务拥有的 opencode session 数据。实现 MUST 在删除序列入口按「项目 `kind` + 任务持久化 `mode`」一次性分流为 repo/dir 两条序列（共享步骤抽共用 helper）：repo 项目 worktree 模式任务走 repo 序列，dir 项目任务与 repo 项目 local-path 模式任务走 dir 序列；MUST NOT 依赖 `branch` 判空等隐式信号逐步跳过；删除重试（Retry）按持久化 delete_mode 重入同一 dir 序列。
 
 #### Scenario: 删除挂起任务（repo 项目）
 
-- **WHEN** 用户删除一个 repo 项目的挂起任务并完成 dirty 确认（如有）
+- **WHEN** 用户删除一个 repo 项目的 worktree 模式挂起任务并完成 dirty 确认（如有）
 - **THEN** 系统按序完成全部清理（含 worktree 与本地分支移除），任务记录移除
 
 #### Scenario: 进程已死时删除
@@ -254,17 +279,17 @@ repo 任务创建 SHALL 支持可选基线分支参数 `base_ref`：外部输入
 
 #### Scenario: 配置 pre-delete 的删除顺序（repo 项目）
 
-- **WHEN** repo 项目配置了 pre_delete script，删除任务
+- **WHEN** repo 项目配置了 pre_delete script，删除 worktree 模式任务
 - **THEN** pre_delete script 在 kill 残余会话与二次 dirty 门禁之后、worktree 移除之前执行；脚本失败落 deletion_failed，可重试或强制删除
 
 #### Scenario: dirty worktree 删除确认（repo 项目）
 
-- **WHEN** 删除的 repo 任务 worktree 存在未提交或未跟踪文件
+- **WHEN** 删除的 repo 项目 worktree 模式任务的 worktree 存在未提交或未跟踪文件
 - **THEN** 系统提示变更内容并要求显式确认后才继续
 
 #### Scenario: 分支被占用（repo 项目）
 
-- **WHEN** repo 任务分支被其他 worktree 使用中
+- **WHEN** repo 项目 worktree 模式任务分支被其他 worktree 使用中
 - **THEN** 系统拒绝删除并说明占用方
 
 #### Scenario: 删除 dir 项目任务（normal）
@@ -292,8 +317,28 @@ repo 任务创建 SHALL 支持可选基线分支参数 `base_ref`：外部输入
 - **WHEN** 用户在 Web UI 删除 dir 项目的任务
 - **THEN** 删除确认弹窗明确"仅删除任务记录与 opencode 会话数据，不会删除项目目录及其内容"，不出现 worktree/dirty 删除确认项；normal 模式且项目配置了 pre_delete script 时提示该脚本仍会执行
 
+#### Scenario: 删除 repo 项目 local-path 任务（normal）
+
+- **WHEN** 用户以 normal 模式删除 repo 项目的 local-path 模式任务（无需 dirty 确认——项目目录天然允许 dirty）
+- **THEN** 系统按 dir normal 序列完成清理：debt 重试 → 删本任务 oc session 数据 → kill 残余会话 → pre_delete script（如配置，用户授权）→ 删 DB 记录 → 清理任务日志目录；MUST NOT 执行任何 git 步骤（无分支可删、不 reset、不 clean）
+
+#### Scenario: 强制删除 repo 项目 local-path 任务
+
+- **WHEN** 用户对 repo 项目的 local-path 模式任务选择强制删除（Force）
+- **THEN** 系统按 dir force 序列执行：跳过 oc session 删除与 pre_delete script，完成 debt 重试 → kill 残余会话 → 删 DB 记录 → 清理任务日志目录
+
+#### Scenario: local-path 删除内建逻辑不触碰项目目录
+
+- **WHEN** repo 项目 local-path 模式任务删除执行完成（含 normal、force、retry 任一路径，且未配置 pre_delete script）
+- **THEN** 项目目录的文件树与 git 状态无任何增删改（ocdeck 内建逻辑零写/删 syscall、零 git 命令），仅 ocdeck 数据与本任务拥有的 opencode session 数据被清理
+
+#### Scenario: local-path 任务删除确认弹窗文案
+
+- **WHEN** 用户在 Web UI 删除 repo 项目的 local-path 模式任务
+- **THEN** 删除确认弹窗明确"仅删除任务记录与 opencode 会话数据，不会删除项目目录及其内容、不改动 git 状态"，不出现 worktree/dirty 删除确认项；normal 模式且项目配置了 pre_delete script 时提示该脚本仍会执行
+
 ### Requirement: 服务端重启语义
-服务端进程的生命周期语义 SHALL 由关停策略（shutdownPolicy）决定：persist 模式下任务进程托管于 tmux 会话、不随服务端退出而终止，服务端重启后 MUST 对 **active/activating** 中会话存活且无 cleanup debt 的任务恢复活跃（重订阅 SSE + 全量对齐），会话已消失的任务落为挂起；**suspending 任务 MUST 完成清理落为挂起**（以持久化意图为准，不得恢复活跃）；**archived/creation_failed/deletion_failed 等持久状态 MUST 保持原状**（仅清理其异常会话）；kill_on_start / kill_immediate 模式下服务端退出则全部任务进程被终止（立即或下次启动清理），重启后 active/activating/suspending 任务 MUST 收敛为挂起（其余持久状态保持原状），由用户手动激活恢复。`kind=dir` 项目的任务 reconcile 语义与 repo 完全一致（creating 落 creation_failed、creation_failed 保持原状），reconcile MUST NOT 对 dir 任务执行任何 git/产物验证；dir 任务的目录存在性 MUST 仅在创建前置与 Retry 时校验。
+服务端进程的生命周期语义 SHALL 由关停策略（shutdownPolicy）决定：persist 模式下任务进程托管于 tmux 会话、不随服务端退出而终止，服务端重启后 MUST 对 **active/activating** 中会话存活且无 cleanup debt 的任务恢复活跃（重订阅 SSE + 全量对齐），会话已消失的任务落为挂起；**suspending 任务 MUST 完成清理落为挂起**（以持久化意图为准，不得恢复活跃）；**archived/creation_failed/deletion_failed 等持久状态 MUST 保持原状**（仅清理其异常会话）；kill_on_start / kill_immediate 模式下服务端退出则全部任务进程被终止（立即或下次启动清理），重启后 active/activating/suspending 任务 MUST 收敛为挂起（其余持久状态保持原状），由用户手动激活恢复。`kind=dir` 项目的任务与 repo 项目 local-path 模式任务 reconcile 语义与 repo worktree 模式任务完全一致（creating 落 creation_failed、creation_failed 保持原状），reconcile MUST NOT 对 dir 任务与 local-path 模式任务执行任何 git/产物验证；dir 任务与 local-path 模式任务的目录存在性 MUST 仅在创建前置与 Retry 时校验。
 
 #### Scenario: 服务端重启后（persist）
 - **WHEN** 服务端重启（persist 模式，此前有活跃任务）
@@ -307,6 +352,11 @@ repo 任务创建 SHALL 支持可选基线分支参数 `base_ref`：外部输入
 
 - **WHEN** 服务端重启后 reconcile 遇到 dir 项目的 creating/creation_failed 任务
 - **THEN** 与 repo 任务语义完全一致：creating 落 creation_failed（可 Retry），creation_failed 保持原状；reconcile 不执行任何 git/产物验证，dir 任务的目录存在性仅在创建前置与 Retry 时校验
+
+#### Scenario: reconcile 处理 local-path 任务
+
+- **WHEN** 服务端重启后 reconcile 遇到 repo 项目 local-path 模式的 creating/creation_failed 任务
+- **THEN** 与 dir 任务语义完全一致：creating 落 creation_failed（可 Retry），creation_failed 保持原状；reconcile 不执行任何 git/产物验证，目录存在性仅在创建前置与 Retry 时校验
 
 ### Requirement: 无人工并发配额
 系统 SHALL NOT 设置并行活跃任务数量的人工配额；当端口、文件描述符或磁盘等资源耗尽时 MUST 返回明确错误而非静默失败。
@@ -361,4 +411,56 @@ repo 任务创建 SHALL 支持可选基线分支参数 `base_ref`：外部输入
 
 - **WHEN** 某任务的状态改写中新状态与当前相同，但 `last_error` 内容不同
 - **THEN** 该更新按真实变更提交，`updated_at` 按秒精度规则推进（跨秒推进、同秒数值不变），MUST NOT 被同值 no-op 吞掉新的错误信息
+
+### Requirement: 任务运行模式选择（repo 项目）
+
+`kind=repo` 项目的任务创建 SHALL 支持任务级运行模式参数 `mode`，取值 `worktree`（隔离 worktree，缺省）或 `local-path`（就地运行）。请求体中 `mode` 的 presence 语义 MUST 可区分「字段缺失」与「显式提供」：字段缺失（JSON 中不存在或为 null）→ 按缺省 `worktree` 处理；显式提供时取值 trim 后为空串或为 `worktree`/`local-path` 以外的未知值 → invalid_input。`mode` MUST 随任务持久化，创建后的全部生命周期操作（Retry、激活、挂起、删除、reconcile、git 操作门禁、生命周期变量注入）MUST 按持久化 `mode` 分流，MUST NOT 依赖 `branch` 判空等隐式信号逐步推断。`kind=dir` 项目恒为就地运行语义，MUST NOT 接受 `mode` 参数（显式提供任意取值即 invalid_input；字段缺失时行为不变）。worktree 模式任务行为与既有 repo 任务完全一致。
+
+创建请求的校验顺序 MUST 为：① JSON 解析 → ② 任务名非空 → ③ `mode` 值域校验（显式提供时 trim 空串/未知值 → invalid_input）→ ④ 项目 kind 解析（fail-closed）→ ⑤ 组合校验（dir + 显式提供 `mode` → invalid_input）→ ⑥ base_ref 与模式组合校验（local-path/dir + 非空 base_ref → invalid_input）。任一环节失败 MUST 零副作用、MUST NOT 落 creating 行。
+
+请求决策表（base_ref 自身的合法性校验沿既有契约，不变）：
+
+| 项目 kind | mode presence | mode 值 | base_ref | 结果 |
+|---|---|---|---|---|
+| repo | 缺失 | — | 缺失/合法短名 | worktree 模式（现状不变） |
+| repo | 缺失 | — | 非法/不存在 | invalid_input（现状不变） |
+| repo | 显式提供 | `worktree` | 同现状 | worktree 模式（现状不变） |
+| repo | 显式提供 | `local-path` | 缺失 | local-path 模式创建 |
+| repo | 显式提供 | `local-path` | 非空 | invalid_input |
+| repo | 显式提供 | trim 后空串 / 未知值 | 任意 | invalid_input |
+| dir | 缺失 | — | 缺失 | dir 创建（现状不变） |
+| dir | 缺失 | — | 非空 | invalid_input（现状不变） |
+| dir | 显式提供 | 任意取值 | 任意 | invalid_input |
+
+Web 新建任务面板 SHALL 提供工作空间选择器（双段 segmented control：「worktree / local」），仅 repo 项目选中时渲染，缺省选中「worktree」；dir 项目 MUST NOT 渲染该选择器。选中「local」时：基准分支字段（含刷新远端分支按钮）MUST 整体隐藏（非禁用），提交门禁 MUST NOT 再等待分支列表 ready，底部提示文案 MUST 切换为不承诺分支/worktree 的版本；选择器下方 SHALL 显示低可见度提醒（12px 灰字、无色块无边框），文案 MUST 为：「直接在项目目录里跑，改动就地生效。多任务共享同一目录，并行与否自己把握。」切换模式 MUST NOT 清空已选分支、MUST NOT 重新请求分支列表。已选项目 ID 变更（含切换项目、清除选择、切到 dir）时，选择器 MUST 重置为缺省「worktree」（细则见 command-center spec「指挥中心内联新建任务」的「选择器状态重置规则」）。dir 项目的现有色块警告 MUST 原样保留，与 local-path 灰字提醒条件互斥、不得叠加。
+
+#### Scenario: 缺省模式行为不变
+
+- **WHEN** 用户在 repo 项目下创建任务且未选择运行模式
+- **THEN** 任务按 worktree 模式创建（独立 worktree 与分支），与既有行为完全一致
+
+#### Scenario: 选择就地运行创建任务
+
+- **WHEN** 用户在 repo 项目新建任务面板选中「local」并创建任务
+- **THEN** 任务按 local-path 模式创建：不建 worktree/分支，直接在项目目录运行；基准分支字段不展示，提交请求携带 `mode=local-path` 且无 `base_ref`
+
+#### Scenario: dir 项目无模式选择器
+
+- **WHEN** 用户在新建任务面板选中 dir 项目
+- **THEN** 面板不渲染工作空间选择器，现有「纯目录项目无文件隔离」色块警告原样保留
+
+#### Scenario: dir 项目拒绝 mode 参数
+
+- **WHEN** 对 dir 项目创建任务并提供 `mode` 参数（任意取值）
+- **THEN** 系统返回 invalid_input，零副作用
+
+#### Scenario: 未知 mode 取值 fail-closed
+
+- **WHEN** 创建任务时提供 `worktree`/`local-path` 以外的 `mode` 取值
+- **THEN** 系统返回 invalid_input，零副作用（MUST NOT 落 creating 行）
+
+#### Scenario: 就地运行选中态的联动与提醒
+
+- **WHEN** 用户在 repo 项目下将运行模式切换为「local」
+- **THEN** 基准分支字段（含刷新远端分支按钮）整体隐藏；选择器下方显示灰字提醒「直接在项目目录里跑，改动就地生效。多任务共享同一目录，并行与否自己把握。」；提交不再等待分支列表加载完成；切回「worktree」时已选分支与分支列表保持原样
 
