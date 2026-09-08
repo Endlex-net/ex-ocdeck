@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -15,11 +16,19 @@ import (
 	"ocdeck/internal/config"
 	ocdecksess "ocdeck/internal/domain/session"
 	ocdecktask "ocdeck/internal/domain/task"
+	"ocdeck/internal/infrastructure/hostenv"
 	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
 	"ocdeck/internal/infrastructure/pty"
 	"ocdeck/internal/infrastructure/store"
 )
+
+// TestMain 将 login shell 兜底捕获替换为空结果：宿主隔离类测试只依赖进程环境，
+// 不受运行机 shell 配置干扰（hostenv 兜底行为由 hostenv 包内单测覆盖）。
+func TestMain(m *testing.M) {
+	hostenv.Capture = func() map[string]string { return nil }
+	os.Exit(m.Run())
+}
 
 // --- mock store ---
 

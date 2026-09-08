@@ -13,6 +13,7 @@ import (
 )
 
 // hostEnv 读取宿主环境变量（design.md §2：基础集从宿主取，不继承全部）。
+// D1 收窄：仅进程环境，不做 login shell 兜底（基础集/locale/userShell 来源不变）。
 func hostEnv(key string) (string, bool) {
 	return os.LookupEnv(key)
 }

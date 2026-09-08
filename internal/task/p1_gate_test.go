@@ -52,7 +52,8 @@ func (s *envVarsStore) ListGlobalEnvVars(ctx context.Context) ([]GlobalEnvVarRow
 // TestMergeEnvSnapshot_PriorityAndReservedKeys 验证 design.md §2 env 合并优先级：
 // 基础集 < 项目级 < 任务级 < 生命周期变量(OCDECK_*)；reserved keys 不可被用户 env 覆盖且不进快照。
 func TestMergeEnvSnapshot_PriorityAndReservedKeys(t *testing.T) {
-	// 控制宿主基础集 env（hostEnv 读 os.LookupEnv）。
+	// 控制宿主基础集 env（hostEnv 读 os.LookupEnv，D1 后仍仅进程环境；follow_host
+	// 的 login shell 兜底已在 TestMain 禁用）。
 	t.Setenv("TERM", "xterm-host")
 	t.Setenv("HOME", "/home/host")
 	t.Setenv("PATH", "/usr/host/bin")
@@ -147,7 +148,8 @@ func TestMergeEnvSnapshot_PriorityAndReservedKeys(t *testing.T) {
 // 覆盖：manual 存值、follow_host 从服务端进程 env 解析、follow_host 宿主未设置跳过、
 // 全局级被项目级/任务级覆盖、reserved key 在全局级同样被忽略并跳过。
 func TestMergeEnvSnapshot_GlobalLayer(t *testing.T) {
-	// 控制宿主基础集与 follow_host 解析（hostEnv 读 os.LookupEnv）。
+	// 控制宿主基础集（os.LookupEnv）与 follow_host 解析（hostenv.Lookup，进程环境优先；
+	// login shell 兜底已在 TestMain 禁用）。
 	t.Setenv("TERM", "xterm-host")
 	t.Setenv("HOME", "/home/host")
 	t.Setenv("PATH", "/usr/host/bin")

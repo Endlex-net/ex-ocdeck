@@ -112,6 +112,10 @@ server 启动时读取该文件并注入进程环境：
 
 可用 `OCDECK_ENV_FILE` 覆盖 env 文件路径。
 
+**宿主环境变量兜底**：全局级 `follow_host` 变量优先从 server 进程环境解析；未命中时兜底从用户 login shell（取 `SHELL`，缺省 darwin `/bin/zsh`、linux 查 `/etc/passwd` 当前用户登录 shell 后回退 `/bin/bash`）捕获的环境解析，捕获懒加载并在 server 进程生命周期内缓存。因此 systemd user service 等极简进程环境下，用户 shell 启动文件中 export 的变量也能被解析到（是否读取 `.bashrc`/`.zshrc`/`.profile` 遵循所选 shell 的启动文件规则）。
+
+设置页「系统环境变量」区展示进程环境与捕获环境的合并视图（来源标注 `process`/`shell`/`both`），并提供刷新按钮：修改 shell 配置后刷新即可让后续 follow_host 解析与新激活任务使用最新值，**无需重启 server**（已运行任务仍需挂起后激活生效）。
+
 | 变量 | 必填 | 说明 |
 |------|------|------|
 | `OCDECK_TOKEN` | 是 | 访问令牌，浏览器与 API 鉴权使用 |

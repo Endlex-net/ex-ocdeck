@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import type { GlobalEnvMode, GlobalEnvVar } from '../types';
 import { WarnIcon, InfoIcon } from '../icons';
@@ -45,8 +45,17 @@ function ModeToggle({
 /**
  * 全局环境变量编辑器（design.md 2.9）：跨项目生效，每项可选 follow_host / manual。
  * follow_host 展示服务端当前解析值，宿主未设置时置灰提示。
+ * reloadTick / onChanged 为兄弟组件共享的 reload 信号（host-env-sync-and-display D5）：
+ * 收到信号时重载以更新 resolvedValue；本组件增删改成功后经 onChanged 广播，
+ * 使 SystemEnvPanel 同步「已配置」标注（避免把 manual 配置误当未配置而 upsert 覆盖）。
  */
-export function GlobalEnvEditor() {
+export function GlobalEnvEditor({
+  reloadTick = 0,
+  onChanged,
+}: {
+  reloadTick?: number;
+  onChanged?: () => void;
+}) {
   const [vars, setVars] = useState<GlobalEnvVar[]>([]);
   const [warning, setWarning] = useState('');
   const [loaded, setLoaded] = useState(false);
@@ -61,24 +70,30 @@ export function GlobalEnvEditor() {
   const [editValue, setEditValue] = useState('');
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
+  /** 请求序号：仅当前请求可提交成功/失败/完成状态；迟到的旧响应（含旧失败）直接丢弃，
+   *  防止覆盖 tick 广播后新 load 的结果（如 resolvedValue 刷新）。 */
+  const loadSeq = useRef(0);
 
   const load = async () => {
+    const seq = ++loadSeq.current;
     try {
       const res = await api.getGlobalEnv();
+      if (seq !== loadSeq.current) return;
       setVars(res.vars ?? []);
       setWarning(res.warning ?? '');
       setRestartHint(res.restartRequired);
       setError('');
     } catch (err) {
+      if (seq !== loadSeq.current) return;
       setError(err instanceof ApiError ? err.message : '加载全局环境变量失败');
     } finally {
-      setLoaded(true);
+      if (seq === loadSeq.current) setLoaded(true);
     }
   };
 
   useEffect(() => {
     void load();
-  }, []);
+  }, [reloadTick]);
 
   const applyMutation = (res: { restartRequired: boolean; warning?: string }) => {
     if (res.warning) setWarning(res.warning);
@@ -87,6 +102,12 @@ export function GlobalEnvEditor() {
 
   const showError = (err: unknown, fallback: string) =>
     setError(err instanceof ApiError ? `[${err.code}] ${err.message}` : fallback);
+
+  /** 变更成功后的重载：有共享信号则广播（tick 驱动本组件与 SystemEnvPanel 同时重载），否则自载。 */
+  const reloadAfterMutation = () => {
+    if (onChanged) onChanged();
+    else void load();
+  };
 
   const add = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -98,7 +119,7 @@ export function GlobalEnvEditor() {
       applyMutation(await api.putGlobalEnv(key, newMode, newMode === 'manual' ? newValue : ''));
       setNewKey('');
       setNewValue('');
-      await load();
+      reloadAfterMutation();
     } catch (err) {
       showError(err, '保存失败');
     } finally {
@@ -122,7 +143,7 @@ export function GlobalEnvEditor() {
         await api.putGlobalEnv(key, editMode, editMode === 'manual' ? editValue : ''),
       );
       setEditKey(null);
-      await load();
+      reloadAfterMutation();
     } catch (err) {
       showError(err, '保存失败');
     } finally {
@@ -137,7 +158,7 @@ export function GlobalEnvEditor() {
     try {
       applyMutation(await api.deleteGlobalEnv(key));
       setConfirmDel(null);
-      await load();
+      reloadAfterMutation();
     } catch (err) {
       setConfirmDel(null);
       showError(err, '删除失败');

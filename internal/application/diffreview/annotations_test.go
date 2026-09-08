@@ -28,6 +28,8 @@ type mockRepo struct {
 	getSubmissionErr error
 	// getSubmissionCalls 记录 GetDiffReviewSubmission 调用次数（G4：断言创建成功后不再读回）。
 	getSubmissionCalls int
+	// createSubmissionCalls 记录 CreateDiffReviewSubmission 调用次数（D9：断言窗口不自洽时零落库）。
+	createSubmissionCalls int
 	// promptCalls 记录 PromptAsync 调用（供 messageID 复用断言）——在 mockPrompt 中记录。
 }
 
@@ -90,6 +92,7 @@ func (r *mockRepo) GetDiffAnnotation(ctx context.Context, id string) (DiffAnnota
 	return rec, nil
 }
 func (r *mockRepo) CreateDiffReviewSubmission(ctx context.Context, in CreateDiffReviewSubmissionInput) (DiffReviewSubmissionRecord, error) {
+	r.createSubmissionCalls++
 	sub := in.Submission
 	sub.Seq = r.nextSeq
 	r.nextSeq++
