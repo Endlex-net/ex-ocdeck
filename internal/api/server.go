@@ -77,7 +77,6 @@ type StoreRO interface {
 type ProjectStore interface {
 	CreateProject(ctx context.Context, id, name, path, defaultBranch, kind string) error
 	GetProject(ctx context.Context, id string) (storeProjectRow, error)
-	GetProjectByPath(ctx context.Context, path string) (storeProjectRow, error)
 	ListProjects(ctx context.Context) ([]storeProjectRow, error)
 	// DeleteProjectIfEmpty 原子删除项目（B9）：仅当无任务时删除，返回是否删除。
 	DeleteProjectIfEmpty(ctx context.Context, id string) (bool, error)

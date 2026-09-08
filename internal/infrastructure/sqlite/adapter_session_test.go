@@ -24,8 +24,8 @@ import (
 func seedTaskWithProject(t *testing.T, db *store.DB, taskID string) {
 	t.Helper()
 	ctx := context.Background()
-	// project path 唯一：同库重复 seed 时幂等跳过。
-	if _, err := db.GetProjectByPath(ctx, "/repo"); err != nil {
+	// 按 id 幂等：同库重复 seed 时跳过建项目。
+	if _, err := db.GetProject(ctx, "p1"); err != nil {
 		if err := db.CreateProject(ctx, "p1", "proj", "/repo", "main", "repo"); err != nil {
 			t.Fatalf("create project: %v", err)
 		}

@@ -15,6 +15,7 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -105,9 +106,68 @@ func (d *DB) Migrate(ctx context.Context) error {
 	return d.runMigrations()
 }
 
-func (d *DB) runMigrations() error {
-	if _, err := d.DB.Exec("PRAGMA foreign_keys=ON;"); err != nil {
-		return fmt.Errorf("enable foreign_keys: %w", err)
+// migrationsRequiringForeignKeysOff 必须在 begin 前于连接级关闭 FK 强制执行的
+// migration 版本（事务内 PRAGMA foreign_keys 为 no-op）。0014 重建 projects 表：
+// FK ON 下 DROP projects 的隐式 DELETE 会级联清空 tasks 等子表数据，故必须先
+// 解除强制，commit 前用 foreign_key_check 兜底完整性
+// （design allow-duplicate-project-path D3）。
+var migrationsRequiringForeignKeysOff = map[int]struct{}{14: {}}
+
+func (d *DB) runMigrations() (err error) {
+	// 引导读取已应用版本（事务外、只读；全新库 schema_version 表不存在视为空集合）。
+	applied, err := appliedVersions(d.DB)
+	if err != nil {
+		return err
+	}
+
+	names, err := migrationNames()
+	if err != nil {
+		return err
+	}
+
+	type pendingMigration struct {
+		name string
+		ver  int
+	}
+	var pending []pendingMigration
+	for _, name := range names {
+		ver, err := migrationVersion(name)
+		if err != nil {
+			return err
+		}
+		if _, ok := applied[ver]; ok {
+			continue
+		}
+		pending = append(pending, pendingMigration{name: name, ver: ver})
+	}
+
+	// 待执行集合含 no-FK 登记版本 → begin 前连接级关闭 FK 强制；否则维持既有 ON。
+	fkOff := false
+	for _, m := range pending {
+		if _, ok := migrationsRequiringForeignKeysOff[m.ver]; ok {
+			fkOff = true
+			break
+		}
+	}
+	pragma := "PRAGMA foreign_keys=ON;"
+	if fkOff {
+		pragma = "PRAGMA foreign_keys=OFF;"
+	}
+	if _, err := d.DB.Exec(pragma); err != nil {
+		return fmt.Errorf("set foreign_keys for migration: %w", err)
+	}
+	if fkOff {
+		// commit/回滚后恢复 FK ON 并读回验证（tx 回滚 defer 先注册后执行，
+		// 保证恢复发生在事务收束之后）；恢复失败返回错误、拒绝启动，
+		// 与迁移失败同时发生时经 errors.Join 两者在返回错误中均可观察。
+		defer func() {
+			if restoreForeignKeysHook != nil {
+				restoreForeignKeysHook()
+			}
+			if rerr := restoreForeignKeysOn(d.DB); rerr != nil {
+				err = errors.Join(err, rerr)
+			}
+		}()
 	}
 
 	tx, err := d.DB.Begin()
@@ -127,33 +187,33 @@ func (d *DB) runMigrations() error {
 		return fmt.Errorf("ensure schema_version table: %w", err)
 	}
 
-	applied, err := loadAppliedVersions(tx)
-	if err != nil {
-		return err
-	}
-
-	names, err := migrationNames()
-	if err != nil {
-		return err
-	}
-
-	for _, name := range names {
-		ver, err := migrationVersion(name)
+	for _, m := range pending {
+		content, err := migrationsFS.ReadFile(filepath.Join("migrations", m.name))
 		if err != nil {
-			return err
-		}
-		if _, ok := applied[ver]; ok {
-			continue
-		}
-		content, err := migrationsFS.ReadFile(filepath.Join("migrations", name))
-		if err != nil {
-			return fmt.Errorf("read migration %s: %w", name, err)
+			return fmt.Errorf("read migration %s: %w", m.name, err)
 		}
 		if _, err := tx.Exec(string(content)); err != nil {
-			return fmt.Errorf("apply migration %s: %w", name, err)
+			return fmt.Errorf("apply migration %s: %w", m.name, err)
 		}
-		if _, err := tx.Exec("INSERT INTO schema_version (version) VALUES (?)", ver); err != nil {
-			return fmt.Errorf("record migration %s: %w", name, err)
+		if _, err := tx.Exec("INSERT INTO schema_version (version) VALUES (?)", m.ver); err != nil {
+			return fmt.Errorf("record migration %s: %w", m.name, err)
+		}
+	}
+
+	// 本次关闭过 FK 时，commit 前完整性兜底：任何违规行或查询出错 → 回滚报错。
+	if fkOff {
+		rows, err := tx.Query("PRAGMA foreign_key_check")
+		if err != nil {
+			return fmt.Errorf("migration foreign_key_check: %w", err)
+		}
+		violated := rows.Next()
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("migration foreign_key_check: %w", err)
+		}
+		rows.Close()
+		if violated {
+			return fmt.Errorf("migration foreign_key_check reported violations")
 		}
 	}
 
@@ -164,8 +224,18 @@ func (d *DB) runMigrations() error {
 	return nil
 }
 
-func loadAppliedVersions(tx *sql.Tx) (map[int]struct{}, error) {
-	rows, err := tx.Query("SELECT version FROM schema_version")
+// appliedVersions 事务外引导读取已应用版本集合。schema_version 表不存在
+// （全新库）视为空集合；存在性探测或版本读取失败必须返回错误，不得当作空集合。
+func appliedVersions(db *sql.DB) (map[int]struct{}, error) {
+	var n int
+	if err := db.QueryRow(
+		`SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'schema_version'`).Scan(&n); err != nil {
+		return nil, fmt.Errorf("probe schema_version table: %w", err)
+	}
+	if n == 0 {
+		return map[int]struct{}{}, nil
+	}
+	rows, err := db.Query("SELECT version FROM schema_version")
 	if err != nil {
 		return nil, fmt.Errorf("load applied versions: %w", err)
 	}
@@ -179,6 +249,26 @@ func loadAppliedVersions(tx *sql.Tx) (map[int]struct{}, error) {
 		applied[v] = struct{}{}
 	}
 	return applied, rows.Err()
+}
+
+// restoreForeignKeysOn 恢复连接级 FK 强制为 ON 并读回验证（no-FK 迁移收尾）。
+// restoreForeignKeysHook 供测试在 FK 恢复阶段注入故障（如关闭 DB），随后仍执行
+// 真实的 restoreForeignKeysOn；生产为 nil 不调用，零开销
+// （注入模式同 queries.go beforeConditionalUpdateHook）。
+var restoreForeignKeysHook func()
+
+func restoreForeignKeysOn(db *sql.DB) error {
+	if _, err := db.Exec("PRAGMA foreign_keys=ON;"); err != nil {
+		return fmt.Errorf("restore foreign_keys=ON: %w", err)
+	}
+	var on int
+	if err := db.QueryRow("PRAGMA foreign_keys").Scan(&on); err != nil {
+		return fmt.Errorf("verify foreign_keys: %w", err)
+	}
+	if on != 1 {
+		return fmt.Errorf("foreign_keys not restored (got %d)", on)
+	}
+	return nil
 }
 
 func migrationNames() ([]string, error) {
