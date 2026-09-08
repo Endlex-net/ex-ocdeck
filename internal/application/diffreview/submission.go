@@ -111,7 +111,8 @@ func (s *Service) CreateSubmission(ctx context.Context, req CreateSubmissionRequ
 	}
 
 	// 7. payload 组装（批注快照即完整内容：不读取 diff、不附加相关 diff/Context 段，
-	// 行号高效格式 Q(path):start-end，用户决策）。
+	// 行号高效格式 Q(path):start-end，用户决策；D9 统一省略规则 + 窗口校验，
+	// 不自洽 → ErrInvalidSnapshotWindow，零副作用）。
 	result, err := assemblePayloadFromAnnotations(selected, req.Note)
 	if err != nil {
 		return DiffReviewSubmissionRecord{}, nil, err

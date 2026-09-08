@@ -1,10 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { Component, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { Compartment, EditorState, Text, type Extension } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import { MergeView, unifiedMergeView } from '@codemirror/merge';
 import { editableExtensions, editorTheme, readOnlyExtensions } from '../editor/extensions';
-import { loadLanguage } from '../editor/language';
+import { extractExtension, loadLanguage } from '../editor/language';
 import type {
   Annotation,
   AnnotationCreateInput,
@@ -29,6 +29,7 @@ import {
   type AnnotationGesture,
 } from './annotation-ext';
 import { EditSession } from './edit-session';
+import MarkdownPreview, { type BlockLineRange } from './MarkdownPreview';
 import {
   buildSnapshot,
   editGateFor,
@@ -122,6 +123,25 @@ interface InlineDraftState {
   /** 内联批注区的宿主节点（React portal 挂载点，插入最后选中行下方的 CM block widget）。 */
   host: HTMLDivElement;
 }
+
+/** 逐侧预览失败隔离（design D6）：仅捕获本侧渲染异常并替换为固定提示，另一侧不受影响；
+ *  图片等网络加载失败走 MarkdownPreview 内 img onError 降级，不经过本边界。
+ *  重试 = 换 key 重挂，key 以本侧 content 为 reset identity（见渲染分支）。 */
+class PreviewErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  render() {
+    if (this.state.failed) {
+      return <div className="md-preview-failed">渲染失败，请切回源码</div>;
+    }
+    return this.props.children;
+  }
+}
+
 /** 单文件 diff 渲染 + 查看模式批注手势 + 编辑模式写回（diff-review-workbench tasks 5.2/5.3）。 */
 export default function DiffViewer({
   diff,
@@ -181,6 +201,17 @@ export default function DiffViewer({
   const [restoreArmed, setRestoreArmed] = useState(false);
   const [restoreBusy, setRestoreBusy] = useState(false);
 
+  // markdown 渲染预览（design D3）：默认源码模式；不持久化、不跨文件保留（GitPanel 以三元组 key 重挂载，自然回默认）
+  const [preview, setPreview] = useState(false);
+  // D8：块级批注草稿（锚定范围）；F1：评论/busy/错误与源码草稿完全独立（blockXxx 三态），
+  // 两类提交的并发终态互不污染；全局单草稿语义由生命周期互斥保证（块级草稿仅存在于预览态）。
+  // F2：提交代际——草稿状态任何切换（开启/关闭/换目标）使在途提交的终态清理失效
+  const [blockDraft, setBlockDraft] = useState<{ side: DiffSide; startLine: number; endLine: number } | null>(null);
+  const [blockComment, setBlockComment] = useState('');
+  const [blockBusy, setBlockBusy] = useState(false);
+  const [blockError, setBlockError] = useState('');
+  const blockSubmitSeq = useRef(0);
+
   const state = deriveDiffState(diff);
   const singleSided = diff.oldExists !== diff.newExists;
   // 形态选择保持用户语义：null = 未选择（按视口默认）；单侧存在不再默认切单列——
@@ -203,6 +234,22 @@ export default function DiffViewer({
     state.kind === 'message' ? state.text : null,
   );
 
+  // D3 谓词契约（spec 逐字）：预览资格 canPreview = isMarkdown && merge && !truncated && 查看模式；
+  // 渲染激活 previewActive = preview && canPreview。「预览」开关出现条件 = canPreview；
+  // aria-pressed、实际渲染分支、编辑器创建短路及相应 effect 依赖 MUST 使用 previewActive。
+  // D2：isMarkdown 复用 extractExtension（与语法高亮同一扩展名提取规则，不引入第二套判定）。
+  const isMarkdown = ['.md', '.markdown'].includes(extractExtension(path));
+  const canPreview = isMarkdown && state.kind === 'merge' && !diff.truncated && editPhase === 'view';
+  const previewActive = preview && canPreview;
+  // 预览侧清单：双侧均存在 → 左右两栏等宽并标注「旧侧/新侧」；单侧存在 → 仅渲染存在侧（flex:1 占满宽度）
+  const previewSides: Array<{ side: DiffSide; label: string; content: string }> = [];
+  if (diff.oldExists) previewSides.push({ side: 'old', label: '旧侧', content: diff.oldContent });
+  if (diff.newExists) previewSides.push({ side: 'new', label: '新侧', content: diff.newContent });
+  // F2：过滤结果按引用稳定（避免每次渲染触发 MarkdownPreview 重聚合）
+  const previewAnnotations = useMemo(
+    () => filterByTriple(annotations, { path, ref: sourceRef, untracked }),
+    [annotations, path, sourceRef, untracked],
+  );
   const session = sessionRef.current;
   void sessionTick; // session 事件驱动重渲染
 
@@ -314,6 +361,46 @@ export default function DiffViewer({
     }
   };
 
+  /** D8：块级草稿提交——复用既有批注数据契约（±3 快照窗口 buildSnapshot、stale 与 ReviewPanel 行为不变）。
+   *  F1：读写独立的 blockXxx 状态，与源码批注提交并发互不污染。 */
+  const submitBlockDraft = useCallback(async () => {
+    // fail-closed：仅预览激活的查看模式可提交；重入拒绝；空评论丢弃（与源码草稿同一语义）
+    if (!blockDraft || !previewActive || editPhase !== 'view' || !onCreateAnnotation || blockBusy) {
+      return;
+    }
+    if (!blockComment.trim()) {
+      closeBlockDraft();
+      return;
+    }
+    const target = blockDraft;
+    const seq = ++blockSubmitSeq.current;
+    setBlockBusy(true);
+    setBlockError('');
+    try {
+      const win = buildSnapshot(sideContent(diff, target.side), target.startLine, target.endLine);
+      await onCreateAnnotation({
+        path,
+        side: target.side,
+        ref: sourceRef,
+        untracked,
+        startLine: target.startLine,
+        endLine: target.endLine,
+        snapshotStartLine: win.snapshotStartLine,
+        snapshotLineCount: win.snapshotLineCount,
+        snapshot: win.snapshot,
+        comment: blockComment,
+      });
+      // F2：草稿已切换/关闭（代际推进）时，旧提交不得关闭新草稿或复位新会话状态
+      if (seq !== blockSubmitSeq.current) return;
+      closeBlockDraft();
+    } catch (err) {
+      if (seq !== blockSubmitSeq.current) return;
+      setBlockError(err instanceof Error ? err.message : '创建批注失败');
+      setBlockBusy(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blockDraft, blockComment, blockBusy, previewActive, editPhase, onCreateAnnotation, diff, path, sourceRef, untracked]);
+
   /** 把当前 props 的批注（三元组过滤 + 排序后）下发到各编辑器 gutter。 */
   const applyAnnotations = () => {
     const eds = editorsRef.current;
@@ -344,6 +431,85 @@ export default function DiffViewer({
     applyAnnotationsRef.current();
   }, [annotations]);
 
+  // ---------- markdown 预览（design D3/D4/D6/D8） ----------
+
+  // D6 动态失效：同一组件 key 下 diff 刷新导致资格失效（非 merge/truncated/进入编辑）时，
+  // 渲染取 previewActive 交集立即按源码/既有派生状态显示，并在此清除预览状态——资格恢复 MUST NOT 自动重进预览；
+  // D8：预览资格失效同样丢弃块级草稿（退出预览即丢弃，含此自动退出路径）
+  useEffect(() => {
+    if (!canPreview) {
+      setPreview(false);
+      closeBlockDraft();
+    }
+  }, [canPreview]);
+
+  // D8：同一组件 key 下 diff 刷新使任一侧内容或存在性变化时，清除该侧块级草稿
+  //（草稿锚定的行范围属于旧内容，继续提交会构造错误快照）；
+  // F3：仅变化侧命中当前草稿时执行完整清理（范围/评论/错误/busy），他侧变化不得修改任何草稿状态
+  const seenPreviewSide = useRef({
+    old: diff.oldContent,
+    new: diff.newContent,
+    oldExists: diff.oldExists,
+    newExists: diff.newExists,
+  });
+  useEffect(() => {
+    const seen = seenPreviewSide.current;
+    const oldChanged = seen.old !== diff.oldContent || seen.oldExists !== diff.oldExists;
+    const newChanged = seen.new !== diff.newContent || seen.newExists !== diff.newExists;
+    if (!oldChanged && !newChanged) return;
+    seenPreviewSide.current = {
+      old: diff.oldContent,
+      new: diff.newContent,
+      oldExists: diff.oldExists,
+      newExists: diff.newExists,
+    };
+    const hitsDraft =
+      !!blockDraft &&
+      ((blockDraft.side === 'old' && oldChanged) || (blockDraft.side === 'new' && newChanged));
+    if (hitsDraft) closeBlockDraft();
+  }, [diff.oldContent, diff.newContent, diff.oldExists, diff.newExists]);
+
+  // D4：进入预览关闭源码批注草稿并清除跨侧选区提示；D8：退出预览丢弃块级草稿；
+  // 两个方向各自冗余的清理动作对应必然为空的状态，MUST NOT 清除 editModePreferred
+  const togglePreview = () => {
+    if (!canPreview) return;
+    closeDraft();
+    closeBlockDraft();
+    setCrossSideHint('');
+    setPreview((p) => !p);
+  };
+
+  // D8：块级草稿开启（owner 绑定侧别）；全局单草稿语义由生命周期互斥保证（块级草稿仅存在于预览态）。
+  // F2：开新草稿推进提交代际并复位 busy/评论/错误——旧提交完成不得关闭新草稿。
+  // F1/F2：仅操作独立的 blockXxx 状态；useCallback 稳定外层函数（per-side 闭包另经 useMemo 缓存，
+  //  避免渲染分支按侧调用时每次渲染创建新引用）
+  const openBlockDraft = useCallback(
+    (side: DiffSide) => (range: BlockLineRange) => {
+      if (!previewActive || editPhase !== 'view' || !onCreateAnnotation) return;
+      blockSubmitSeq.current++;
+      setBlockBusy(false);
+      setBlockComment('');
+      setBlockError('');
+      setBlockDraft({ side, startLine: range.startLine, endLine: range.endLine });
+    },
+    [previewActive, editPhase, onCreateAnnotation],
+  );
+
+  /** D8/F2：关闭块级草稿的统一终态清理（成功/取消/失效路径一致）：丢弃评论、错误并复位 busy。 */
+  const closeBlockDraft = useCallback(() => {
+    blockSubmitSeq.current++;
+    setBlockDraft(null);
+    setBlockComment('');
+    setBlockError('');
+    setBlockBusy(false);
+  }, []);
+
+  // F2：per-side 回调按侧缓存（渲染分支按侧取用，引用跨渲染稳定）
+  const openBlockDraftFor = useMemo(
+    () => ({ old: openBlockDraft('old'), new: openBlockDraft('new') }),
+    [openBlockDraft],
+  );
+
   // ---------- 编辑模式 ----------
 
   /** F7：资格预取（进入编辑前完成服务端判定）。eligible 结果缓存为编辑基线。
@@ -372,9 +538,18 @@ export default function DiffViewer({
     }
   };
 
-  // F7：按视图身份预取资格（diff 刷新/视图变化即重新判定，资格拒绝随之作废）
+  // F7：按视图身份预取资格（diff 刷新/视图变化即重新判定，资格拒绝随之作废）。
+  // D4：diff 刷新后门禁或 merge 状态不再成立时，作废缓存的资格结果与编辑基线（唯一动作，不新增枚举值）
   useEffect(() => {
-    if (!editIO || !gate.ok || state.kind !== 'merge') return;
+    if (!editIO) return;
+    if (!gate.ok || state.kind !== 'merge') {
+      eligibilitySeq.current++;
+      firstReadRef.current = null;
+      setEligibility('checking');
+      setDeniedReason('');
+      setEnterError('');
+      return;
+    }
     void checkEligibility();
     return () => {
       eligibilitySeq.current++; // effect 重跑/卸载：作废旧代际在途请求
@@ -382,10 +557,21 @@ export default function DiffViewer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editIO, gate.ok, state.kind, diff]);
 
-  /** 进入编辑：仅 eligible 可入；复用预取 GET 结果作为编辑基线（不重复 GET）。 */
+  /** 进入编辑（D4 前置集，spec 逐字）：非预览状态、merge 渲染状态、编辑门禁成立、
+   *  资格为可编辑且持有有效编辑基线；复用预取 GET 结果作为编辑基线（不重复 GET）。 */
   const enterEdit = () => {
     const firstRead = firstReadRef.current;
-    if (!editIO || editPhase !== 'view' || eligibility !== 'eligible' || !firstRead) return;
+    if (
+      preview ||
+      state.kind !== 'merge' ||
+      !gate.ok ||
+      !editIO ||
+      editPhase !== 'view' ||
+      eligibility !== 'eligible' ||
+      !firstRead
+    ) {
+      return;
+    }
     closeDraft(); // F7(旧)：进入编辑前关闭内联批注区与候选高亮（编辑模式无批注手势）
     setCrossSideHint('');
     sessionRef.current = new EditSession({
@@ -398,13 +584,15 @@ export default function DiffViewer({
     onEditModeChange?.(true); // 批注 3：编辑偏好同步到 GitPanel（跨文件保持）
   };
 
-  // 批注 3：编辑偏好为 true 且本视图资格 eligible → 自动进入编辑（切文件免再选）
+  // 批注 3：编辑偏好为 true 且本视图资格 eligible → 自动进入编辑（切文件免再选）。
+  // D4：显式进入与自动进入共用 enterEdit 同一前置集（预览中资格请求完成 MUST NOT 触发进入编辑）；
+  // 依赖至少含 preview、gate.ok、state.kind，切回源码后偏好与资格仍成立时自然恢复
   useEffect(() => {
     if (editModePreferred && editPhase === 'view' && eligibility === 'eligible') {
       enterEdit();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editModePreferred, editPhase, eligibility]);
+  }, [editModePreferred, editPhase, eligibility, preview, gate.ok, state.kind]);
 
   /** 退出事务开始：新侧编辑器切只读过渡态（session 保留，输入不会静默丢失）。 */
   const lockEditors = (locked: boolean) => {
@@ -563,7 +751,8 @@ export default function DiffViewer({
   // ---------- 编辑器创建（销毁-重建路径：形态/换行/编辑模式/文档纪元 变化） ----------
 
   useEffect(() => {
-    if (state.kind !== 'merge' || !containerRef.current) return;
+    // D3：预览激活时短路，不创建 CodeMirror 实例（预览分支不渲染 containerRef）
+    if (state.kind !== 'merge' || previewActive || !containerRef.current) return;
     // 批注 6：编辑器销毁-重建时关闭内联批注区——宿主 block widget 随旧编辑器销毁，
     // 草稿锚点无法跨重建保留（进入编辑前 enterEdit 已先行关闭，此处覆盖形态/换行切换）
     closeDraft();
@@ -654,9 +843,9 @@ export default function DiffViewer({
       editorsRef.current = {};
     };
     // state 为每次 render 新建对象，deps 取 kind 原始值避免无关 rerender 重建编辑器；
-    // 编辑模式进出与 discard/restore（docEpoch）走同一销毁-重建路径
+    // 编辑模式进出与 discard/restore（docEpoch）走同一销毁-重建路径；进出预览经 previewActive 短路/重建（D3）
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.kind, mode, wrapOverride, diff.oldContent, diff.newContent, path, editPhase, docEpoch]);
+  }, [state.kind, mode, wrapOverride, diff.oldContent, diff.newContent, path, editPhase, docEpoch, previewActive]);
 
   const editStatusText = (s: EditSession | null): string => {
     if (!s) return '';
@@ -702,69 +891,85 @@ export default function DiffViewer({
       {state.kind === 'merge' && (
         <>
           <div className="diff-toolbar">
-            <button
-              type="button"
-              className="btn btn-small btn-ghost"
-              aria-pressed={mode === 'unified'}
-              disabled={exiting || discardBusy}
-              onClick={() => onModeChange('unified')}
-            >
-              单列
-            </button>
-            <button
-              type="button"
-              className="btn btn-small btn-ghost"
-              aria-pressed={mode === 'side-by-side'}
-              disabled={exiting || discardBusy}
-              onClick={() => onModeChange('side-by-side')}
-            >
-              并排
-            </button>
-            <button
-              type="button"
-              className="btn btn-small btn-ghost"
-              aria-pressed={wrapOverride}
-              disabled={exiting || discardBusy}
-              onClick={() => onWrapChange(!wrapOverride)}
-            >
-              换行
-            </button>
-            <span className="header-spacer" />
-            {editIO && editPhase === 'view' && !gate.ok && (
+            {/* D3：开关出现条件 = canPreview；aria-pressed = previewActive */}
+            {canPreview && (
               <button
                 type="button"
                 className="btn btn-small btn-ghost"
-                disabled
-                title={gate.reason}
+                aria-pressed={previewActive}
+                onClick={togglePreview}
               >
-                编辑
+                预览
               </button>
             )}
-            {/* F7：仅 eligible 提供编辑命令；denied 不提供命令（原因见下方提示条） */}
-            {editIO && editPhase === 'view' && gate.ok && eligibility === 'eligible' && (
-              <button
-                type="button"
-                className="btn btn-small btn-ghost"
-                title="直接编辑工作区文件"
-                onClick={enterEdit}
-              >
-                编辑
-              </button>
-            )}
-            {editIO && editPhase === 'view' && gate.ok && eligibility === 'checking' && (
-              <button type="button" className="btn btn-small btn-ghost" disabled>
-                检查中…
-              </button>
-            )}
-            {editIO && editPhase === 'view' && gate.ok && eligibility === 'error' && (
-              <button
-                type="button"
-                className="btn btn-small btn-ghost"
-                title={enterError}
-                onClick={() => void checkEligibility()}
-              >
-                重试
-              </button>
+            {/* D3：预览态工具栏仅保留「预览」开关，不显示单列/并排/换行与编辑相关控件 */}
+            {!previewActive && (
+              <>
+                <button
+                  type="button"
+                  className="btn btn-small btn-ghost"
+                  aria-pressed={mode === 'unified'}
+                  disabled={exiting || discardBusy}
+                  onClick={() => onModeChange('unified')}
+                >
+                  单列
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-small btn-ghost"
+                  aria-pressed={mode === 'side-by-side'}
+                  disabled={exiting || discardBusy}
+                  onClick={() => onModeChange('side-by-side')}
+                >
+                  并排
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-small btn-ghost"
+                  aria-pressed={wrapOverride}
+                  disabled={exiting || discardBusy}
+                  onClick={() => onWrapChange(!wrapOverride)}
+                >
+                  换行
+                </button>
+                <span className="header-spacer" />
+                {editIO && editPhase === 'view' && !gate.ok && (
+                  <button
+                    type="button"
+                    className="btn btn-small btn-ghost"
+                    disabled
+                    title={gate.reason}
+                  >
+                    编辑
+                  </button>
+                )}
+                {/* F7：仅 eligible 提供编辑命令；denied 不提供命令（原因见下方提示条） */}
+                {editIO && editPhase === 'view' && gate.ok && eligibility === 'eligible' && (
+                  <button
+                    type="button"
+                    className="btn btn-small btn-ghost"
+                    title="直接编辑工作区文件"
+                    onClick={enterEdit}
+                  >
+                    编辑
+                  </button>
+                )}
+                {editIO && editPhase === 'view' && gate.ok && eligibility === 'checking' && (
+                  <button type="button" className="btn btn-small btn-ghost" disabled>
+                    检查中…
+                  </button>
+                )}
+                {editIO && editPhase === 'view' && gate.ok && eligibility === 'error' && (
+                  <button
+                    type="button"
+                    className="btn btn-small btn-ghost"
+                    title={enterError}
+                    onClick={() => void checkEligibility()}
+                  >
+                    重试
+                  </button>
+                )}
+              </>
             )}
             {editPhase === 'edit' && session && (
               <>
@@ -812,16 +1017,16 @@ export default function DiffViewer({
                 </button>
               </>
             )}
-            {editIO && editPhase === 'view' && !gate.ok && (
+            {!previewActive && editIO && editPhase === 'view' && !gate.ok && (
               <span className="edit-gate-reason">{gate.reason}</span>
             )}
           </div>
-          {deniedReason && editPhase === 'view' && (
+          {deniedReason && editPhase === 'view' && !previewActive && (
             <div className="alert-bar alert-notice">
               <span>不可编辑：{deniedReason}</span>
             </div>
           )}
-          {enterError && editPhase === 'view' && (
+          {enterError && editPhase === 'view' && !previewActive && (
             <div className="alert-bar alert-notice">
               <span>进入编辑失败：{enterError}（可直接重试）</span>
             </div>
@@ -831,7 +1036,7 @@ export default function DiffViewer({
               <span>{exitError}</span>
             </div>
           )}
-          {crossSideHint && editPhase === 'view' && (
+          {crossSideHint && editPhase === 'view' && !previewActive && (
             <div className="alert-bar alert-notice">
               <span>{crossSideHint}</span>
             </div>
@@ -864,14 +1069,59 @@ export default function DiffViewer({
               </span>
             </div>
           )}
-          <div
-            ref={containerRef}
-            className={collapseSide ? `diff-editor diff-collapse-${collapseSide}` : 'diff-editor'}
-          />
+          {previewActive && blockError && (
+            <div className="alert-bar alert-error">
+              <span>{blockError}</span>
+            </div>
+          )}
+          {previewActive ? (
+            // D5/D6：预览激活时替代 CodeMirror 容器（容器分支不渲染，编辑器创建 effect 短路）；
+            // 每侧独立 ErrorBoundary 失败隔离，边界 key 以本侧 content 为 reset identity——
+            // 仅本侧内容变化时重挂本侧边界重试（逐侧隔离，未变化侧不重试、图片失败登记不丢失）；
+            // 切回源码再进入预览 = 卸载重挂、切换文件 = 组件重挂载，二者整体重置。
+            // D8：批注数据/草稿状态 owner 为本组件，MarkdownPreview 只做受控渲染；
+            // F2：过滤后的 annotations 与回调经 useMemo/useCallback 稳定引用
+            <div className="md-diff">
+              {previewSides.map((s) => (
+                <section key={s.side} className="md-diff-pane">
+                  <div className="md-diff-pane-label">{s.label}</div>
+                  <PreviewErrorBoundary key={`${s.side}:${s.content}`}>
+                    <MarkdownPreview
+                      content={s.content}
+                      side={onCreateAnnotation || onLocateAnnotations ? s.side : undefined}
+                      annotations={previewAnnotations}
+                      draft={
+                        blockDraft && blockDraft.side === s.side
+                          ? {
+                              startLine: blockDraft.startLine,
+                              endLine: blockDraft.endLine,
+                              comment: blockComment,
+                            }
+                          : null
+                      }
+                      onAnnotateBlock={
+                        onCreateAnnotation ? openBlockDraftFor[s.side] : undefined
+                      }
+                      onDraftCommentChange={setBlockComment}
+                      onSubmitDraft={submitBlockDraft}
+                      onCancelDraft={closeBlockDraft}
+                      onLocateAnnotations={onLocateAnnotations}
+                    />
+                  </PreviewErrorBoundary>
+                </section>
+              ))}
+            </div>
+          ) : (
+            <div
+              ref={containerRef}
+              className={collapseSide ? `diff-editor diff-collapse-${collapseSide}` : 'diff-editor'}
+            />
+          )}
           {/* 批注 6：内联批注区（参考 GitLab 变更评论）——portal 挂进 CM block widget 宿主，
-              在该侧最后选中行下方切开，随编辑器滚动，无悬浮浮层 */}
+              在该侧最后选中行下方切开，随编辑器滚动，无悬浮浮层；D4：仅在非预览激活时显示 */}
           {draft &&
             editPhase === 'view' &&
+            !previewActive &&
             createPortal(
               <div
                 className="ann-inline"
