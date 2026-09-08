@@ -28,6 +28,7 @@ import {
   type MergedTask,
 } from './command-center-selector';
 import { createErrorMessage } from '../hooks';
+import { requestTerminalFocus } from '../terminal/focus-request';
 import { classifyMatch } from '../fuzzy-match';
 import { rankBranchOptions } from './command-center-branch-rank';
 import {
@@ -502,7 +503,11 @@ function AttentionRow({
   onShowLog: (t: { title: string; fetchLog: () => Promise<string> }) => void;
 }) {
   const t = item.task;
-  const gotoWorkbench = () => navigate(`/task/${t.id}?from=home`);
+  // 导航焦点请求信号（design D3）：navigate 照常，信号为附加调用（下同）
+  const gotoWorkbench = () => {
+    requestTerminalFocus(t.id);
+    navigate(`/task/${t.id}?from=home`);
+  };
   const secondaryLabels = item.secondary.map((k) => attentionKindLabel(k));
   // 等待人工（权限/提问待处理）时状态徽标变蓝；计数取摘要 attention_count，
   // sessions-only 任务摘要无计数（0）时以 1 兜底保证状态呈现。
@@ -661,7 +666,10 @@ function itemToMerged(item: AttentionItem): MergedTask {
 
 /** 「其余活跃任务」行：点击跳工作台 + 过渡徽章 + agent 状态。 */
 function TaskRow({ m }: { m: MergedTask }) {
-  const goto = () => navigate(`/task/${m.task.id}?from=home`);
+  const goto = () => {
+    requestTerminalFocus(m.task.id);
+    navigate(`/task/${m.task.id}?from=home`);
+  };
   return (
     <div
       className={`od-row od-row-clickable${isTransitional(m.task.status) ? ' cc-row-trans' : ''}`}
@@ -710,7 +718,10 @@ function ParkedRow({
   onDelete: (m: MergedTask) => void;
 }) {
   const status = m.task.status;
-  const goto = () => navigate(`/task/${m.task.id}?from=home`);
+  const goto = () => {
+    requestTerminalFocus(m.task.id);
+    navigate(`/task/${m.task.id}?from=home`);
+  };
   return (
     <div
       className="od-row od-row-clickable"

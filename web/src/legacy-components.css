@@ -919,13 +919,30 @@ select.input {
 }
 
 .git-side {
-  width: 340px;
+  width: var(--git-side-w, 340px);
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
   min-height: 0;
   border-right: 1px solid var(--border);
   background: var(--surface);
+}
+
+/* D6 拖宽把手：.git-side 右缘 6px 热区（GitPanel 渲染于 side 与 diff 区之间的 flex 项） */
+.git-panel > .od-resize-handle {
+  flex: 0 0 6px;
+}
+
+/* D6 收起态（会话内状态，不持久化）：36px 窄条仅纵向展开按钮；
+   展开恢复收起前宽度（--git-side-w 未动）。≤1024px 堆叠态不进入收起态（组件层不渲染该 class） */
+.git-side.git-side-collapsed {
+  width: 36px;
+  flex-basis: 36px;
+  align-items: center;
+}
+
+.git-side .git-side-expand {
+  flex: 0 0 auto;
 }
 
 .git-toolbar {
@@ -1146,8 +1163,10 @@ select.input {
   background: var(--accent-soft);
 }
 
+/* D7：position:relative 作为中缝把手的定位上下文（left = ratio × 内容盒宽，左右 padding 为 0） */
 .diff-editor {
   padding: 10px 0 24px;
+  position: relative;
 }
 
 /* 单侧存在（纯新增/纯删除）并排形态的空侧坍缩：wrapper 0 宽 + 隐藏，存在侧 flexGrow 铺满全宽。

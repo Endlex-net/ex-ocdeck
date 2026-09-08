@@ -51,6 +51,7 @@ vi.mock('../api', () => ({
 vi.mock('../hooks', () => ({
   useTheme: () => ({ preference: 'system' as const, setPreference: () => {} }),
   useProjects: () => ({ projects: [], initialized: true, error: '' }),
+  useMediaQuery: () => false,
 }));
 
 vi.mock('../pages/CommandCenterPage', () => ({

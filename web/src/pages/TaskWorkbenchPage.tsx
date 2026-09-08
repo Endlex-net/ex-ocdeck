@@ -18,6 +18,12 @@ import { LifecycleLogModal } from '../components/LifecycleLogModal';
 import { OpenInEditorMenu } from '../components/OpenInEditorMenu';
 import { RerunInitButton } from '../components/RerunInitButton';
 import { TerminalView } from '../terminal/TerminalView';
+import {
+  cancelTerminalFocusForTask,
+  isTerminalFocusExpired,
+  requestTerminalFocus,
+  subscribeTerminalFocus,
+} from '../terminal/focus-request';
 import { BranchIcon, CaretDownIcon, MoreIcon, WarnIcon, InfoIcon } from '../icons';
 
 const TUI_TAB = 'tui';
@@ -163,6 +169,28 @@ export function TaskWorkbenchPage({
     setTab(t);
     setVisited((v) => (v.has(t) ? v : new Set(v).add(t)));
   };
+
+  // 标签激活（design D3，G1 闭合同任务再点击）：目标任务收到匹配且未过期的焦点请求、
+  // 当前 tab ≠ TUI（如 Git/shell/设置）时激活 TUI 标签——只激活不消费（消费在 TUI
+  // TerminalView）。仅显式导航请求触发（订阅回调只在发布/挂载快照时触发），普通重连、
+  // 无请求的挂载不产生调用、不切标签。
+  const tabRef = useRef(tab);
+  tabRef.current = tab;
+  useEffect(() => {
+    const unsub = subscribeTerminalFocus((req) => {
+      if (req.taskID !== taskID || isTerminalFocusExpired(req)) return;
+      if (tabRef.current !== TUI_TAB) switchTab(TUI_TAB);
+    });
+    return () => {
+      unsub();
+      // 路由离开目标任务（工作台卸载，含 task 未返回、TerminalView 未挂载的加载
+      // 阶段）：该任务未消费的请求作废（design D3 取消规则）。按 taskID 守卫，
+      // 不误删其他任务更晚发布的新请求。
+      cancelTerminalFocusForTask(taskID);
+    };
+    // switchTab 仅包装 setTab/setVisited（稳定 setter），首帧闭包语义不变
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [taskID]);
 
   useEffect(() => {
     const sub = subscribeTask(taskID, {
@@ -354,6 +382,8 @@ export function TaskWorkbenchPage({
                         role="menuitem"
                         onClick={() => {
                           setSwitcherOpen(false);
+                          // 导航焦点请求信号（design D3）：navigate 照常，信号为附加调用
+                          requestTerminalFocus(t.taskID);
                           navigate(`/task/${t.taskID}`);
                         }}
                       >

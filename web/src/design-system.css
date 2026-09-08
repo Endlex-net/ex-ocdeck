@@ -154,6 +154,10 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
   top: 0;
   height: 100vh;
 }
+/* D5 拖宽把手：.od-sidebar 右缘 6px 热区（AppShell 渲染于 sidebar 与 main 之间的 flex 项） */
+.od-shell > .od-resize-handle {
+  flex: 0 0 6px;
+}
 .od-brand {
   display: flex; align-items: center; gap: 10px;
   padding: 18px 20px 14px;

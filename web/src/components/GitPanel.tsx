@@ -1,5 +1,6 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { api, ApiError } from '../api';
+import { useMediaQuery } from '../hooks';
 import type {
   Annotation,
   AnnotationCreateInput,
@@ -9,7 +10,8 @@ import type {
   SubmitCapability,
 } from '../types';
 import type { DiffViewMode } from './diff/DiffViewer';
-import { BranchIcon } from '../icons';
+import { BranchIcon, SidebarCollapseIcon, SidebarExpandIcon } from '../icons';
+import { ResizeHandle, usePersistedSize } from './resize';
 import { ReviewPanel } from './ReviewPanel';
 
 // 编辑器代码（CodeMirror 及语言包）整 chunk 懒加载，与主 bundle 分离（design D8）。
@@ -83,6 +85,12 @@ export function GitPanel({
   const [highlightIDs, setHighlightIDs] = useState<Set<string>>(new Set());
   // 编辑模式离开守卫（DiffViewer 注册）：切换文件/视图消失前 flush 并等待在途写；阻塞未解决 → 拒绝
   const leaveGuard = useRef<(() => Promise<boolean>) | null>(null);
+  // D6：文件面板宽度持久化（ocdeck:git-side-width，int px ∈ [240,600]，默认 340）+
+  // 收起态（会话内 useState 不持久化；≤1024px 堆叠态收起偏好不生效，返回桌面恢复）
+  const gitSide = usePersistedSize('ocdeck:git-side-width', 340, 240, 600, true);
+  const [gitSideCollapsed, setGitSideCollapsed] = useState(false);
+  const narrow = useMediaQuery('(max-width: 1024px)');
+  const sideCollapsed = gitSideCollapsed && !narrow;
   // loadStatus 是 async，setState updater 内不能 await——用 ref 拿当前 selFile
   const selFileRef = useRef(selFile);
   selFileRef.current = selFile;
@@ -259,23 +267,52 @@ export function GitPanel({
 
   return (
     <div className="git-panel">
-      <div className="git-side">
-        <div className="git-toolbar">
-          <span className="mono git-branch" title="当前分支">
-            <BranchIcon /> {status?.branch ?? '…'}
-          </span>
-          <span className="header-spacer" />
+      <div
+        className={sideCollapsed ? 'git-side git-side-collapsed' : 'git-side'}
+        // D6：宽度经 CSS 变量传递（桌面规则 width: var(--git-side-w, 340px)），
+        // 内联固定值 MUST NOT 直接写 width（窄屏 width:100% 规则保持优先）
+        style={{ '--git-side-w': `${gitSide.value}px` } as CSSProperties}
+      >
+        {sideCollapsed ? (
           <button
-            className="btn btn-small btn-ghost"
-            disabled={refreshing}
-            onClick={() => void refreshAll()}
+            type="button"
+            className="btn btn-ghost git-side-expand"
+            onClick={() => setGitSideCollapsed(false)}
+            aria-label="展开文件面板"
+            title="展开文件面板"
           >
-            {refreshing ? '刷新中…' : '刷新'}
+            <SidebarExpandIcon />
           </button>
-          <button className="btn btn-small" disabled={pushing} onClick={() => void push()}>
-            {pushing ? '推送中…' : '推送'}
-          </button>
-        </div>
+        ) : (
+          <>
+            <div className="git-toolbar">
+              <span className="mono git-branch" title="当前分支">
+                <BranchIcon /> {status?.branch ?? '…'}
+              </span>
+              <span className="header-spacer" />
+              <button
+                className="btn btn-small btn-ghost"
+                disabled={refreshing}
+                onClick={() => void refreshAll()}
+              >
+                {refreshing ? '刷新中…' : '刷新'}
+              </button>
+              <button className="btn btn-small" disabled={pushing} onClick={() => void push()}>
+                {pushing ? '推送中…' : '推送'}
+              </button>
+              {/* D6：收起入口仅 >1024px 桌面显示（堆叠态强制完整显示） */}
+              {!narrow && (
+                <button
+                  type="button"
+                  className="btn btn-small btn-ghost git-side-collapse"
+                  onClick={() => setGitSideCollapsed(true)}
+                  aria-label="收起文件面板"
+                  title="收起文件面板"
+                >
+                  <SidebarCollapseIcon />
+                </button>
+              )}
+            </div>
 
         {loadError && <div className="error-line">{loadError}</div>}
         {opResult && <div className="git-result">{opResult}</div>}
@@ -367,7 +404,21 @@ export function GitPanel({
             {committing ? '提交中…' : `提交（${effective.size}）`}
           </button>
         </div>
+          </>
+        )}
       </div>
+
+      {/* D6：文件面板拖宽把手（.git-side 右缘 6px 热区）；收起态与 ≤1024px 堆叠态不渲染 */}
+      {!narrow && !sideCollapsed && (
+        <ResizeHandle
+          mode="px"
+          value={gitSide.value}
+          min={240}
+          max={600}
+          onDrag={gitSide.setSize}
+          onCommit={gitSide.commitSize}
+        />
+      )}
 
       <div className="git-diff">
         {!selFile && <div className="empty">点击左侧文件查看 diff。</div>}

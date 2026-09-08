@@ -325,6 +325,14 @@ export class TermSession {
     this.setState('idle');
   }
 
+  /**
+   * 聚焦终端（导航焦点请求 design D3 的消费入口）：封装 term.focus()，
+   * 消费方不直接触 DOM；锁定/焦点保护门禁由消费方（TerminalView）在调用前检查。
+   */
+  focus(): void {
+    this.term.focus();
+  }
+
   dispose(): void {
     this.disposed = true;
     this.clearTimer();
