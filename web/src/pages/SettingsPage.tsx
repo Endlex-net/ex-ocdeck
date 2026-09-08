@@ -1,5 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
+import {
+  EDITOR_TOOLS_CHANGED,
+  loadEditorTools,
+  loadEditorUriTemplate,
+  saveEditorTool,
+  saveEditorUriTemplate,
+  type EditorTool,
+} from '../editor-tools';
 import { GlobalEnvEditor } from '../components/GlobalEnvEditor';
 import { SystemEnvPanel } from '../components/SystemEnvPanel';
 import { NotificationConfigPanel } from '../components/NotificationConfigPanel';
@@ -37,6 +45,7 @@ const TABS: { key: ConfigsTab; label: string; id: string; panel: string }[] = [
   { key: 'ai', label: 'AI 配置', id: 'tab-ai', panel: 'panel-ai' },
   { key: 'notifications', label: '通知', id: 'tab-notifications', panel: 'panel-notifications' },
   { key: 'palette', label: '命令面板', id: 'tab-palette', panel: 'panel-palette' },
+  { key: 'tools', label: '常用工具', id: 'tab-tools', panel: 'panel-tools' },
 ];
 
 const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
@@ -158,6 +167,11 @@ export function SettingsPage({
             loadState={paletteLoadState}
             loadError={paletteLoadError}
           />
+        </div>
+      )}
+      {tab === 'tools' && (
+        <div role="tabpanel" id="panel-tools" aria-labelledby="tab-tools">
+          <EditorToolsPanel />
         </div>
       )}
     </>
@@ -378,6 +392,131 @@ function AppearancePanel() {
       </div>
       <ClipboardPolicyField />
       <TermAppearanceEditor />
+    </section>
+  );
+}
+
+/* ============================ 常用工具子标签（add-frontend-tool-quick-open 2.3） ============================
+ * VSCode/GoLand 本机编辑器启用开关（缺省关闭，仅持久化于 localStorage）：
+ * 开启后任务详情页页头出现对应快捷打开入口。变更走 saveEditorTool（事务语义），
+ * 面板监听 EDITOR_TOOLS_CHANGED + storage 收敛外部变更（同 ClipboardPolicyField 模式）。 */
+const EDITOR_TOOLS: { tool: EditorTool; label: string; hint: string }[] = [
+  {
+    tool: 'vscode',
+    label: 'VSCode',
+    hint: '在任务详情页页头显示 VSCode 快捷打开；需本机已安装 VSCode，使用本机路径打开',
+  },
+  {
+    tool: 'goland',
+    label: 'GoLand',
+    hint: '在任务详情页页头显示 GoLand 快捷打开；需本机已安装 GoLand，使用本机路径打开',
+  },
+];
+
+/** 各工具内置默认模板（placeholder 展示；模板含 {path} 占位符，缺省/清空即走内置分支）。 */
+const EDITOR_TOOL_DEFAULT_TEMPLATES: Record<EditorTool, string> = {
+  vscode: 'vscode://file{path}/',
+  goland: 'goland://open?file={path}',
+};
+
+/** 模板能力说明（spec「自定义唤起 URI 模板」末段原文）。 */
+const EDITOR_TOOL_TEMPLATE_HINT =
+  'VSCode 可配置 vscode://vscode-remote/ssh-remote+<主机>{path} 形式的模板打开远程开发机目录' +
+  '（需本机已安装 Remote-SSH 扩展且 SSH 可达；该形式为社区实测、非官方文档化）；' +
+  'GoLand 不存在通过 URL 打开远程项目的可用形式。';
+
+function EditorToolsPanel() {
+  const [tools, setTools] = useState(() => loadEditorTools());
+  const [templates, setTemplates] = useState<Record<EditorTool, string>>(() => ({
+    vscode: loadEditorUriTemplate('vscode') ?? '',
+    goland: loadEditorUriTemplate('goland') ?? '',
+  }));
+  // 最近一次同步到的存储快照：事件只收敛「草稿未被本地编辑」的字段，未失焦草稿不丢（评审 F1）。
+  const storedRef = useRef(templates);
+
+  // 外部变更（快捷入口下拉、跨标签页）后按实际存储收敛。
+  useEffect(() => {
+    const reload = () => {
+      setTools(loadEditorTools());
+      const prevStored = storedRef.current;
+      const next: Record<EditorTool, string> = {
+        vscode: loadEditorUriTemplate('vscode') ?? '',
+        goland: loadEditorUriTemplate('goland') ?? '',
+      };
+      // updater 惰性执行且必须纯净：与之比较的旧存储快照先捕获到局部变量（不读可变 ref）。
+      setTemplates((draft) => ({
+        vscode: draft.vscode === prevStored.vscode ? next.vscode : draft.vscode,
+        goland: draft.goland === prevStored.goland ? next.goland : draft.goland,
+      }));
+      storedRef.current = next;
+    };
+    window.addEventListener(EDITOR_TOOLS_CHANGED, reload);
+    window.addEventListener('storage', reload);
+    return () => {
+      window.removeEventListener(EDITOR_TOOLS_CHANGED, reload);
+      window.removeEventListener('storage', reload);
+    };
+  }, []);
+
+  // 写失败（向上抛出）不视为生效：UI 不翻转，存储不变。
+  const setTool = (tool: EditorTool, enabled: boolean) => {
+    try {
+      saveEditorTool(tool, enabled);
+    } catch {
+      return;
+    }
+    setTools(loadEditorTools());
+  };
+
+  // 模板失焦保存：非空写原文、空值清除恢复内置；按实际已存值收敛该字段（写失败时回收为旧值，不视为生效）。
+  const saveTemplate = (tool: EditorTool, value: string) => {
+    try {
+      saveEditorUriTemplate(tool, value);
+    } catch {
+      /* 写失败不派发事件，输入框收敛回已存值 */
+    }
+    const stored = loadEditorUriTemplate(tool) ?? '';
+    storedRef.current = { ...storedRef.current, [tool]: stored };
+    setTemplates((t) => ({ ...t, [tool]: stored }));
+  };
+
+  return (
+    <section className="od-card">
+      <div className="od-card-head">
+        <h2>常用工具</h2>
+      </div>
+      {EDITOR_TOOLS.map(({ tool, label, hint }) => (
+        <div className="od-field" key={tool}>
+          <label htmlFor={`editor-tool-${tool}`} style={{ display: 'block', margin: '4px 0' }}>
+            <input
+              type="checkbox"
+              id={`editor-tool-${tool}`}
+              checked={tools[tool]}
+              onChange={(e) => setTool(tool, e.target.checked)}
+            />{' '}
+            在任务详情页显示「{label}」快捷打开
+          </label>
+          <div className="od-hint">{hint}</div>
+          <label
+            htmlFor={`editor-tool-template-${tool}`}
+            style={{ display: 'block', margin: '10px 0 4px' }}
+          >
+            自定义唤起 URI 模板（可选）
+          </label>
+          <input
+            className="od-input mono"
+            id={`editor-tool-template-${tool}`}
+            type="text"
+            spellCheck={false}
+            style={{ maxWidth: 420 }}
+            placeholder={EDITOR_TOOL_DEFAULT_TEMPLATES[tool]}
+            value={templates[tool]}
+            onChange={(e) => setTemplates((t) => ({ ...t, [tool]: e.target.value }))}
+            onBlur={(e) => saveTemplate(tool, e.target.value)}
+          />
+        </div>
+      ))}
+      <div className="od-hint">{EDITOR_TOOL_TEMPLATE_HINT}</div>
     </section>
   );
 }
