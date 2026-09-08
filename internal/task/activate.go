@@ -16,6 +16,7 @@ import (
 	"ocdeck/internal/application/runtime"
 	apptask "ocdeck/internal/application/task"
 	ocdecksess "ocdeck/internal/domain/session"
+	"ocdeck/internal/infrastructure/hostenv"
 	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
 	"ocdeck/internal/infrastructure/store"
@@ -101,6 +102,34 @@ func baseBranchShortName(fullRef string) (string, bool) {
 // 不含 port 参数与持久化——供 serve/tui/shell 与脚本执行复用同一层叠逻辑。
 // 行为不变量：serve/tui/shell 的 env 内容与顺序与抽取前完全一致（既有测试全绿）。
 func (m *Manager) layerEnvSnapshot(ctx context.Context, row TaskRow) (map[string]string, error) {
+	// 形态校验前移（host-env-sync D1）：kind/mode/base_ref/branch 校验 MUST 先于任何
+	// 可能触发捕获的宿主解析（follow_host 经 hostenv.Lookup 首次 miss 会触发懒加载
+	// 捕获），非法任务拒绝路径不得触发捕获副作用。GetProject 与 resolveTaskMode 的
+	// 先后顺序保持不变（错误优先级与原实现一致）。
+	proj, perr := m.store.GetProject(ctx, row.ProjectID)
+	if perr != nil {
+		return nil, fmt.Errorf("get project for lifecycle env: %w", perr)
+	}
+	// layerEnvSnapshot MUST 自检有效模式：init/pre_delete 直接调用本函数，不经过
+	// Activate 入口的 resolveAlignMode 门禁。worktree 模式任务异常行返回 error：
+	// 调用方 MUST NOT 持久化新快照、MUST NOT 创建进程。
+	effMode, rerr := resolveTaskMode(row, proj.Kind)
+	if rerr != nil {
+		return nil, fmt.Errorf("lifecycle env: %w", rerr)
+	}
+	var baseBranch string
+	switch effMode {
+	case TaskModeWorktree:
+		if row.Branch == "" {
+			return nil, fmt.Errorf("task %s: worktree task missing branch for lifecycle env", row.ID)
+		}
+		base, ok := baseBranchShortName(row.BaseRef)
+		if !ok {
+			return nil, fmt.Errorf("task %s: base_ref %q is not refs/heads/<name> or refs/remotes/<name>", row.ID, row.BaseRef)
+		}
+		baseBranch = base
+	}
+
 	merged := map[string]string{}
 	// TERM 强制为 terminfo 认识的规范值（xterm.js 客户端即 xterm-256color），
 	// MUST NOT 继承宿主 TERM（如 xterm-ghostty 会致 tmux "missing or unsuitable terminal"）。
@@ -136,7 +165,9 @@ func (m *Manager) layerEnvSnapshot(ctx context.Context, row TaskRow) (map[string
 		case "manual":
 			merged[e.Key] = e.Value
 		case "follow_host":
-			if v, ok := hostEnv(e.Key); ok && v != "" {
+			// D1 收窄：仅 follow_host 值解析走 hostenv.Lookup（进程环境未命中时兜底
+			// login shell 捕获缓存）；基础集与 locale 判断保持进程环境读取不变。
+			if v, ok := hostenv.Lookup(e.Key); ok && v != "" {
 				merged[e.Key] = v
 			}
 			// 宿主未设置/空 → 跳过该变量（不注入空值，design.md §2）。
@@ -167,35 +198,18 @@ func (m *Manager) layerEnvSnapshot(ctx context.Context, row TaskRow) (map[string
 	}
 	// 生命周期变量 OCDECK_*（env-management spec：注入 OCDECK_TASK_ID、OCDECK_TASK_NAME、
 	// OCDECK_TASK_PATH、OCDECK_PROJECT_PATH；OCDECK_SERVE_PORT 由调用方按场景注入）。
-	proj, perr := m.store.GetProject(ctx, row.ProjectID)
-	if perr != nil {
-		return nil, fmt.Errorf("get project for lifecycle env: %w", perr)
-	}
 	merged["OCDECK_TASK_ID"] = row.ID
 	merged["OCDECK_TASK_NAME"] = row.Name
 	merged["OCDECK_TASK_PATH"] = row.WorktreePath
 	merged["OCDECK_PROJECT_PATH"] = proj.Path
 	// 生命周期分支变量（task-base-branch-context D4/D5 + add-local-path-task-mode D9）：
 	// worktree 模式任务注入 BASE/HEAD 短名；local-path 模式任务（dir 任务与 repo 项目
-	// local-path 模式任务）强制不注入两键（键不存在，即使脏数据有 base_ref/branch，不注入空串）；
-	// dir+worktree/未知 kind/未知 mode fail-closed internal error，不得按 local-path 静默缺键。
-	// layerEnvSnapshot MUST 自检有效模式：init/pre_delete 直接调用本函数，不经过 Activate
-	// 入口的 resolveAlignMode 门禁。worktree 模式任务异常行返回 error：调用方 MUST NOT
-	// 持久化新快照、MUST NOT 创建进程。
-	effMode, rerr := resolveTaskMode(row, proj.Kind)
-	if rerr != nil {
-		return nil, fmt.Errorf("lifecycle env: %w", rerr)
-	}
+	// local-path 模式任务）强制不注入两键（键不存在，即使脏数据有 base_ref/branch，不注入
+	// 空串）；dir+worktree/未知 kind/未知 mode 已在函数开头 fail-closed 拒绝。
+	// baseBranch 由前置形态校验产出，此处只做注入（非法行不会到达）。
 	switch effMode {
 	case TaskModeWorktree:
-		if row.Branch == "" {
-			return nil, fmt.Errorf("task %s: worktree task missing branch for lifecycle env", row.ID)
-		}
-		base, ok := baseBranchShortName(row.BaseRef)
-		if !ok {
-			return nil, fmt.Errorf("task %s: base_ref %q is not refs/heads/<name> or refs/remotes/<name>", row.ID, row.BaseRef)
-		}
-		merged["OCDECK_TASK_BASE_BRANCH"] = base
+		merged["OCDECK_TASK_BASE_BRANCH"] = baseBranch
 		merged["OCDECK_TASK_HEAD_BRANCH"] = row.Branch
 	case TaskModeLocalPath:
 		// local-path：两键不存在（不注入空串）。

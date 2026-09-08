@@ -13,6 +13,7 @@ import type {
   GitStatus,
   GlobalEnvMode,
   GlobalEnvResponse,
+  HostEnvResponse,
   LifecycleConfig,
   NotificationConfig,
   NotificationConfigPut,
@@ -268,6 +269,12 @@ export const api = {
     request<GlobalEnvResponse>('PUT', '/env', { key, mode, value }),
   deleteGlobalEnv: (key: string) =>
     request<GlobalEnvResponse>('DELETE', `/env/${encodeURIComponent(key)}`),
+
+  /** 宿主环境变量合并视图（host-env-sync-and-display D4）：首次调用可能触发 login shell 捕获，
+   *  前端需 loading 态；捕获失败时降级为仅进程环境视图（正常返回）。 */
+  getHostEnv: () => request<HostEnvResponse>('GET', '/env/host'),
+  /** 显式刷新宿主捕获缓存；成功返回最新合并视图，失败 500 code=internal（原视图由前端保留）。 */
+  refreshHostEnv: () => request<HostEnvResponse>('POST', '/env/host/refresh'),
 
   listOcConfigs: () => request<{ configs: OcConfigInfo[] }>('GET', '/oc-configs'),
   getOcConfig: (name: string) =>

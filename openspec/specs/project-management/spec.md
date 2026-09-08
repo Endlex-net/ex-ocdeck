@@ -35,7 +35,7 @@
 - **THEN** 系统拒绝注册（而非自动降级为 dir 项目），错误信息提示可显式选择纯目录类型
 ### Requirement: 项目列表与详情
 
-系统 SHALL 提供项目列表与单项目详情查询，详情包含该项目下的任务数量与任务状态分布。项目列表（`GET /api/v1/projects`）的每个元素 MUST 附加 `tasks` 摘要数组，摘要元素字段为 `id`、`name`、`status`、`init_status`、`branch`、`worktree_path`、`last_error`、`notice`（形状与现有任务 DTO 一致：`NoticeItem[]`，无 notice 时省略，见 `web/src/types.ts:210` `parseNotice`）、`updated_at`（Unix 秒）、`agentStatus`（活跃任务读 agentStatus 内存快照——快照维护见 active-sessions-stream spec「agent 状态事件驱动维护」；不可用时省略；命名与 `GET /api/v1/tasks/active` 一致）、`attention_count`（pending 权限 + 问题总数，见 agent-attention spec）；该字段为可加性扩展，MUST NOT 改变既有字段语义。任务摘要 MUST 覆盖该项目的全部非删除态任务（活跃、挂起、归档、过渡与失败态）；项目无任务时 `tasks` MUST 为空数组 `[]`（MUST NOT 为 `null`）。
+系统 SHALL 提供项目列表与单项目详情查询，详情包含该项目下的任务数量与任务状态分布。项目列表（`GET /api/v1/projects`）的每个元素 MUST 附加 `tasks` 摘要数组，摘要元素字段为 `id`、`name`、`status`、`init_status`、`branch`、`mode`（必有，取值 `worktree`/`local-path`；可加性扩展，MUST NOT 改变既有字段语义）、`worktree_path`、`last_error`、`notice`（形状与现有任务 DTO 一致：`NoticeItem[]`，无 notice 时省略，见 `web/src/types.ts:210` `parseNotice`）、`updated_at`（Unix 秒）、`agentStatus`（活跃任务读 agentStatus 内存快照——快照维护见 active-sessions-stream spec「agent 状态事件驱动维护」；不可用时省略；命名与 `GET /api/v1/tasks/active` 一致）、`attention_count`（pending 权限 + 问题总数，见 agent-attention spec）；该字段为可加性扩展，MUST NOT 改变既有字段语义。任务摘要 MUST 覆盖该项目的全部非删除态任务（活跃、挂起、归档、过渡与失败态）；项目无任务时 `tasks` MUST 为空数组 `[]`（MUST NOT 为 `null`）。
 
 失败与只读语义（与 `GET /api/v1/tasks/active` 对齐）：摘要查询失败 MUST 返回 500 标准错误信封且 MUST NOT 进入响应组装；`agentStatus` MUST 读内存快照，请求路径 MUST NOT 实时探测 opencode（原「并发实时水合（每请求并发上限 8、预算 3 秒）」语义自本变更起移除）；快照不可用的任务 MUST 降级为该字段省略，MUST NOT 导致整个请求失败；完整请求路径 MUST 为纯读操作（MUST NOT 写数据库、触发 align、改变任务状态机或启动/停止进程）。
 
@@ -80,6 +80,12 @@
 
 - **WHEN** 客户端请求 `GET /api/v1/tasks/{id}`
 - **THEN** 该响应的 `agentStatus` 保持既有实时探测语义，行为与本变更前一致
+
+#### Scenario: 摘要元素携带 mode 字段
+
+- **WHEN** 用户请求项目列表或单项目详情
+- **THEN** 每个任务摘要元素携带 `mode` 字段（`worktree` 或 `local-path`，与任务持久化 `mode` 一致），既有字段语义不变
+
 ### Requirement: 项目管理单页（master-detail）
 
 系统 SHALL 将项目列表与项目详情合并为单页（`#/projects`）：左侧为项目轨道列（搜索 + 项目列表 + 注册项目入口），右侧为选中项目的详情面板（头部含名称/类型徽章/路径/删除项目；子标签含概览（健康摘要 + 任务行）、自动化（init 脚本/文件继承/pre-delete 脚本）、环境变量）。`#/projects#<projectID>` 深链 MUST 直接选中对应项目。≤1024px 视口 MUST 转为列表⇄详情钻取式导航（详情视图提供返回列表入口）。任务行 MUST 完整呈现状态机（活跃/挂起/归档/过渡/失败/init 状态与对应操作集），操作行为与现有项目详情页一致。项目删除 MUST 保留两步确认与"仍有任务时禁止删除"语义；注册表单 MUST 保留 repo/dir 类型选择与上下文提示。
@@ -123,14 +129,19 @@
 - **THEN** 系统删除项目记录（不触碰磁盘上的仓库）
 
 ### Requirement: worktree 存放位置约定
-系统 SHALL 将 `kind=repo` 项目的任务 worktree 统一创建在 ocdeck 自有数据目录下：`<dataDir>/worktrees/<projectName-slug>/<branchPathSlug>-<rand4>/`（路径格式详见 task-lifecycle spec 任务创建要求；存量旧格式目录行为不变），MUST NOT 创建在源仓库内部。路径 MUST 以 canonical path + `filepath.Rel` 语义校验包含性。
+系统 SHALL 将 `kind=repo` 项目 worktree 模式任务的 worktree 统一创建在 ocdeck 自有数据目录下：`<dataDir>/worktrees/<projectName-slug>/<branchPathSlug>-<rand4>/`（路径格式详见 task-lifecycle spec 任务创建要求；存量旧格式目录行为不变），MUST NOT 创建在源仓库内部。路径 MUST 以 canonical path + `filepath.Rel` 语义校验包含性。
 
-`kind=dir` 项目的任务 MUST NOT 创建 worktree：任务运行目录直接锚定为项目路径本身（`worktree_path` 记录为项目路径）。ocdeck 的任务创建内建步骤在 init/激活开始前 MUST NOT 在项目目录内创建任何文件或子目录；用户授权的 init script、pre-delete script 与 agent 会话行为除外。
+`kind=dir` 项目的任务与 `kind=repo` 项目的 local-path 模式任务 MUST NOT 创建 worktree：任务运行目录直接锚定为项目路径本身（`worktree_path` 记录为项目路径）。ocdeck 的任务创建内建步骤在 init/激活开始前 MUST NOT 在项目目录内创建任何文件或子目录；用户授权的 init script、pre-delete script 与 agent 会话行为除外。
 
 #### Scenario: 创建任务时的 worktree 路径
-- **WHEN** repo 项目下创建任务
+- **WHEN** repo 项目下以 worktree 模式创建任务
 - **THEN** worktree 落于 `<dataDir>/worktrees/` 下按任务创建要求生成的路径，源仓库目录不被污染
 
 #### Scenario: dir 项目任务不创建 worktree
 - **WHEN** dir 项目下创建任务
 - **THEN** 任务记录的 `worktree_path` 等于项目路径；init/激活开始前磁盘上无新增目录或文件（用户授权的 init script 与 agent 会话行为除外）
+
+#### Scenario: repo 项目 local-path 模式任务的 worktree_path 等于项目路径
+
+- **WHEN** repo 项目下以 local-path 模式创建任务
+- **THEN** 任务记录的 `worktree_path` 等于项目路径，数据目录 `worktrees/` 下无新增目录；init/激活开始前项目目录内零新增目录或文件（用户授权的 init script 与 agent 会话行为除外）
