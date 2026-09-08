@@ -500,12 +500,17 @@ function RegisterForm({
   focusNameNonce?: number;
 }) {
   const refresh = useProjectsRefresh();
+  const { projects } = useProjects();
   const [name, setName] = useState('');
   const [path, setPath] = useState('');
   const [kind, setKind] = useState<ProjectKind>('repo');
   const [creating, setCreating] = useState(false);
   const [mutError, setMutError] = useState('');
   const nameRef = useRef<HTMLInputElement>(null);
+
+  // 重复路径实时提醒：trim 后字符串全等匹配已注册项目 path，不阻塞提交（allow-duplicate-project-path D4）
+  const trimmedPath = path.trim();
+  const dupProjects = trimmedPath ? projects.filter((p) => p.path === trimmedPath) : [];
 
   // 表单打开或 palette-focus 触发后聚焦名称输入
   useEffect(() => {
@@ -625,6 +630,14 @@ function RegisterForm({
               ? '填写已克隆到本机的项目目录路径，目录本身须已是 git 仓库；不支持直接填写远端仓库地址（http/ssh），如需使用请先自行 git clone 到本机。'
               : '填写任意普通目录路径，不要求 git 仓库；该目录下的多个任务将共享同一目录。'}
           </div>
+          {dupProjects.length > 0 && (
+            <div className="od-alert od-alert-info" data-od-id="register-path-duplicate">
+              <InfoIcon />
+              <div className="od-alert-body">
+                {`该路径已注册项目${dupProjects.map((p) => `「${p.name}」`).join('')}，将继续创建独立的新项目。`}
+              </div>
+            </div>
+          )}
         </div>
         {mutError && <div className="error-line">{mutError}</div>}
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
