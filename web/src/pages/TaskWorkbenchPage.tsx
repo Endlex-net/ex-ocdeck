@@ -15,6 +15,7 @@ import { EnvEditor } from '../components/EnvEditor';
 import { AgentStatusBadge } from '../components/AgentStatusBadge';
 import { InitStatusBadge } from '../components/InitStatusBadge';
 import { LifecycleLogModal } from '../components/LifecycleLogModal';
+import { OpenInEditorMenu } from '../components/OpenInEditorMenu';
 import { RerunInitButton } from '../components/RerunInitButton';
 import { TerminalView } from '../terminal/TerminalView';
 import { BranchIcon, CaretDownIcon, MoreIcon, WarnIcon, InfoIcon } from '../icons';
@@ -402,6 +403,8 @@ export function TaskWorkbenchPage({
         {error && !isNarrow && <span className="header-error">{error}</span>}
         {task && !isNarrow && (
           <>
+            {/* 「在编辑器中打开」快捷入口（add-frontend-tool-quick-open）：header-spacer 之后、主操作之前 */}
+            <OpenInEditorMenu worktreePath={task.worktree_path} />
             {/* 主操作按状态机呈现（actionsFor：活跃=挂起；挂起=激活/归档；归档=恢复；失败=重试） */}
             <TaskActions task={task} onDone={onTaskActionDone} onError={setError} />
             {/* 「⋯」溢出菜单：删除等次级操作（对齐设计稿 task-workbench.html 页头 wb-overflow） */}
@@ -416,6 +419,7 @@ export function TaskWorkbenchPage({
         {/* 窄屏（design D3）：主操作图标化保留在 header，次级操作（init 日志/删除）收同一「⋯」溢出菜单。 */}
         {task && isNarrow && (
           <>
+            <OpenInEditorMenu worktreePath={task.worktree_path} />
             <TaskActions task={task} onDone={onTaskActionDone} onError={setError} compact />
             <WorkbenchOverflow
               key="narrow"
