@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { GlobalEnvEditor } from '../components/GlobalEnvEditor';
+import { SystemEnvPanel } from '../components/SystemEnvPanel';
 import { NotificationConfigPanel } from '../components/NotificationConfigPanel';
 import { PaletteConfigPanel, type PaletteConfigLoadState } from '../components/PaletteConfigPanel';
 import { TermAppearanceEditor } from '../components/TermAppearanceEditor';
@@ -56,6 +57,9 @@ export function SettingsPage({
   paletteLoadError: string;
 }) {
   const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  // 环境变量 tab 共享 reload 信号（host-env-sync-and-display D5）：SystemEnvPanel 添加/刷新
+  // 成功后递增，驱动 GlobalEnvEditor 重载（resolvedValue 可能变化）；SystemEnvPanel 同步已配置 key 集。
+  const [envReloadTick, setEnvReloadTick] = useState(0);
 
   const selectTab = (key: ConfigsTab) => {
     // replace 模式：不污染返回栈（design.md D3 子标签切换不新增历史项）。
@@ -113,7 +117,22 @@ export function SettingsPage({
             <div className="od-card-head">
               <h2>全局环境变量</h2>
             </div>
-            <GlobalEnvEditor />
+            <GlobalEnvEditor
+              reloadTick={envReloadTick}
+              onChanged={() => setEnvReloadTick((t) => t + 1)}
+            />
+          </section>
+          <section className="od-card">
+            <div className="od-card-head">
+              <h2>系统环境变量</h2>
+              <span className="muted" style={{ fontSize: '12.5px' }}>
+                服务端读到的宿主环境（进程环境 ∪ login shell）
+              </span>
+            </div>
+            <SystemEnvPanel
+              reloadTick={envReloadTick}
+              onGlobalChanged={() => setEnvReloadTick((t) => t + 1)}
+            />
           </section>
         </div>
       )}

@@ -210,6 +210,21 @@ export interface GlobalEnvResponse {
   warning?: string;
 }
 
+/** 系统环境变量来源（host-env-sync-and-display D4）：进程环境 / login shell 捕获 / 两者皆有。 */
+export type HostEnvSource = 'process' | 'shell' | 'both';
+
+/** GET /env/host 合并视图条目；value 为明文（UI 默认掩码展示）。 */
+export interface HostEnvVar {
+  key: string;
+  value: string;
+  source: HostEnvSource;
+}
+
+/** GET /env/host 与 POST /env/host/refresh 成功响应（同构）。 */
+export interface HostEnvResponse {
+  vars?: HostEnvVar[];
+}
+
 export interface OcConfigInfo {
   name: string;
 }
