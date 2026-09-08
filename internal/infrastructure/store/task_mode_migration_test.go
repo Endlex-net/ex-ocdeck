@@ -74,7 +74,7 @@ func TestMigration0013_TaskMode_UpgradeFrom0012(t *testing.T) {
 	}
 
 	db := &DB{DB: sqlDB, Queries: New(sqlDB)}
-	// Migrate 仅应用未记录的 0013。
+	// Migrate 从 0012 升级到最新版本，验证 0013 的 mode 回填。
 	if err := db.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate from 0012: %v", err)
 	}

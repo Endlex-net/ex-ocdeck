@@ -147,15 +147,6 @@ func (q *Queries) GetProject(ctx context.Context, id string) (ProjectRow, error)
 	return p, err
 }
 
-// GetProjectByPath 按 path 查询项目（path 唯一）。
-func (q *Queries) GetProjectByPath(ctx context.Context, path string) (ProjectRow, error) {
-	row := q.db.QueryRowContext(ctx,
-		`SELECT id, name, path, default_branch, kind, created_at FROM projects WHERE path = ?`, path)
-	var p ProjectRow
-	err := row.Scan(&p.ID, &p.Name, &p.Path, &p.DefaultBranch, &p.Kind, &p.CreatedAt)
-	return p, err
-}
-
 // ListProjects 返回全部项目。
 func (q *Queries) ListProjects(ctx context.Context) ([]ProjectRow, error) {
 	rows, err := q.db.QueryContext(ctx,

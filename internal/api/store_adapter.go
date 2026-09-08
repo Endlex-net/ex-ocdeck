@@ -36,21 +36,6 @@ func (a *storeProjectAdapter) GetProject(ctx context.Context, id string) (storeP
 	}, nil
 }
 
-func (a *storeProjectAdapter) GetProjectByPath(ctx context.Context, path string) (storeProjectRow, error) {
-	p, err := a.db.GetProjectByPath(ctx, path)
-	if err != nil {
-		return storeProjectRow{}, err
-	}
-	return storeProjectRow{
-		ID:            p.ID,
-		Name:          p.Name,
-		Path:          p.Path,
-		DefaultBranch: p.DefaultBranch,
-		Kind:          p.Kind,
-		CreatedAt:     p.CreatedAt,
-	}, nil
-}
-
 func (a *storeProjectAdapter) ListProjects(ctx context.Context) ([]storeProjectRow, error) {
 	rows, err := a.db.ListProjects(ctx)
 	if err != nil {
