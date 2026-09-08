@@ -57,6 +57,10 @@ describe('路由解析与重定向', () => {
     expect(resolveRoute('/configs#palette')).toEqual({ kind: 'page', page: 'configs', fragment: 'palette' });
   });
 
+  it('#/configs#tools → configs 页选中 tools（常用工具，add-frontend-tool-quick-open）tab', () => {
+    expect(resolveRoute('/configs#tools')).toEqual({ kind: 'page', page: 'configs', fragment: 'tools' });
+  });
+
   it('#/configs#未知tab → 回退 appearance', () => {
     expect(resolveRoute('/configs#foobar')).toEqual({
       kind: 'page',
@@ -341,6 +345,7 @@ describe('ConfigsTab 类型守卫', () => {
     expect(isConfigsTab('ai')).toBe(true);
     expect(isConfigsTab('notifications')).toBe(true);
     expect(isConfigsTab('palette')).toBe(true);
+    expect(isConfigsTab('tools')).toBe(true);
   });
 
   it('非法 tab', () => {
