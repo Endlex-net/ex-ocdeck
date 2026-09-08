@@ -191,8 +191,8 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	path := strings.TrimSpace(req.Path)
 
-	// path 绝对化 + EvalSymlinks 归一（B9）：避免相对路径漂移与 symlink 别名
-	// 导致同一仓库/目录注册多次或唯一性判断失真。
+	// path 绝对化 + EvalSymlinks 归一（B9）：统一项目路径的存储与后续访问语义，
+	// 避免相对路径漂移与 symlink 别名导致同一目录以不同形式存储。
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		writeApiError(w, NewError(CodeInvalidInput, "cannot resolve absolute path: "+path))
@@ -245,18 +245,8 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// path 唯一性检查（归一后；schema UNIQUE 约束兜底，这里提前给出 409）。
-	if existing, gerr := s.projs.GetProjectByPath(r.Context(), path); gerr == nil && existing.ID != "" {
-		writeApiError(w, NewError(CodeConflict, "project already registered for path: "+path))
-		return
-	}
-
 	id := newID()
 	if err := s.projs.CreateProject(r.Context(), id, strings.TrimSpace(req.Name), path, branch, kind); err != nil {
-		if isUniqueViolation(err) {
-			writeApiError(w, NewError(CodeConflict, "project already registered for path: "+path))
-			return
-		}
 		writeError(w, CodeInternal, "create project failed")
 		return
 	}
@@ -459,16 +449,6 @@ func newID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
-}
-
-// isUniqueViolation 判断是否为唯一约束冲突（modernc.org/sqlite 返回 SQLITE_CONSTRAINT）。
-// 宽松匹配错误信息，避免引入 driver 特定类型依赖。
-func isUniqueViolation(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "UNIQUE constraint failed") || strings.Contains(msg, "constraint failed")
 }
 
 // 编译期断言：确保 context 与 errors 仍被引用（防止未来重构误删 import）。

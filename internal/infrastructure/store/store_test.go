@@ -309,7 +309,7 @@ func TestBeginRetryDeleteIntent_ClearsLastError(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 	seedProjectTask(t, db, "t1")
-	// t2 用独立项目（projects.path UNIQUE）。
+	// t2 使用独立项目。
 	if err := db.CreateProject(ctx, "p2", "proj2", "/tmp/repo2", "main", "repo"); err != nil {
 		t.Fatalf("create project p2: %v", err)
 	}

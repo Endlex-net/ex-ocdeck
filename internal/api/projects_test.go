@@ -21,24 +21,18 @@ import (
 // fakeProjectStore 内存实现 ProjectStore，用于测试。
 type fakeProjectStore struct {
 	projects map[string]storeProjectRow
-	byPath   map[string]string // path -> projectID
 	counts   map[string]storeTaskCounts
 }
 
 func newFakeProjectStore() *fakeProjectStore {
 	return &fakeProjectStore{
 		projects: map[string]storeProjectRow{},
-		byPath:   map[string]string{},
 		counts:   map[string]storeTaskCounts{},
 	}
 }
 
 func (f *fakeProjectStore) CreateProject(ctx context.Context, id, name, path, defaultBranch, kind string) error {
-	if _, ok := f.byPath[path]; ok {
-		return errors.New("UNIQUE constraint failed: projects.path")
-	}
 	f.projects[id] = storeProjectRow{ID: id, Name: name, Path: path, DefaultBranch: defaultBranch, Kind: kind, CreatedAt: 1}
-	f.byPath[path] = id
 	return nil
 }
 
@@ -48,14 +42,6 @@ func (f *fakeProjectStore) GetProject(ctx context.Context, id string) (storeProj
 		return storeProjectRow{}, errors.New("not found")
 	}
 	return p, nil
-}
-
-func (f *fakeProjectStore) GetProjectByPath(ctx context.Context, path string) (storeProjectRow, error) {
-	id, ok := f.byPath[path]
-	if !ok {
-		return storeProjectRow{}, errors.New("not found")
-	}
-	return f.projects[id], nil
 }
 
 func (f *fakeProjectStore) ListProjects(ctx context.Context) ([]storeProjectRow, error) {
@@ -69,12 +55,10 @@ func (f *fakeProjectStore) ListProjects(ctx context.Context) ([]storeProjectRow,
 }
 
 func (f *fakeProjectStore) DeleteProjectIfEmpty(ctx context.Context, id string) (bool, error) {
-	p, ok := f.projects[id]
-	if !ok {
+	if _, ok := f.projects[id]; !ok {
 		return false, nil // 不存在：未删除
 	}
 	delete(f.projects, id)
-	delete(f.byPath, p.Path)
 	return true, nil
 }
 
@@ -204,29 +188,202 @@ func TestCreateProject_NonexistentPath(t *testing.T) {
 	}
 }
 
-func TestCreateProject_DuplicatePath_409(t *testing.T) {
+// TestCreateProject_DuplicatePath_201 验证同一 canonical path 可注册多个项目
+// （allow-duplicate-project-path tasks 2.3）：repo+repo、dir+dir、repo/dir 交叉均 201，
+// 不返回 409；两次创建 id 不同、两条记录均可按 id 回读、path 均为 canonical 归一结果、
+// kind 各自正确；DB 中该 path 恰好两条记录（无 UNIQUE 约束）；响应 DTO 无新增字段。
+func TestCreateProject_DuplicatePath_201(t *testing.T) {
+	cases := []struct {
+		name       string
+		firstKind  string
+		secondKind string
+	}{
+		{name: "repo_repo", firstKind: "repo", secondKind: "repo"},
+		{name: "dir_dir", firstKind: "dir", secondKind: "dir"},
+		{name: "repo_dir_cross", firstKind: "repo", secondKind: "dir"},
+		{name: "dir_repo_cross", firstKind: "dir", secondKind: "repo"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// repo 注册校验要求路径本身为合法 git 仓库，交叉场景同样成立。
+			repo := newTestRepo(t)
+			repoCanon, err := filepath.EvalSymlinks(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv, db := newServerWithRealStore(t)
+			ts := httptest.NewServer(srv.mux)
+			defer ts.Close()
+
+			create := func(name, kind string) projectDTO {
+				t.Helper()
+				body := `{"name":` + quoteJSON(name) + `,"kind":"` + kind + `","path":` + quoteJSON(repo) + `}`
+				resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", body))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusCreated {
+					t.Fatalf("create %s (kind=%s) status = %d, want 201", name, kind, resp.StatusCode)
+				}
+				var dto projectDTO
+				if err := json.NewDecoder(resp.Body).Decode(&dto); err != nil {
+					t.Fatal(err)
+				}
+				return dto
+			}
+			first := create("p1", tc.firstKind)
+			second := create("p2", tc.secondKind)
+
+			if first.ID == "" || second.ID == "" || first.ID == second.ID {
+				t.Errorf("ids = %q / %q, want distinct non-empty (各自独立)", first.ID, second.ID)
+			}
+			for _, c := range []struct {
+				dto  projectDTO
+				kind string
+			}{{first, tc.firstKind}, {second, tc.secondKind}} {
+				// 按 id 回读（两条记录均独立存在）。
+				p, err := db.GetProject(context.Background(), c.dto.ID)
+				if err != nil {
+					t.Fatalf("get created project %s: %v", c.dto.ID, err)
+				}
+				if p.Path != repoCanon {
+					t.Errorf("stored path = %q, want canonical %q", p.Path, repoCanon)
+				}
+				if p.Kind != c.kind {
+					t.Errorf("stored kind = %q, want %q", p.Kind, c.kind)
+				}
+			}
+			// dir 项目无默认分支；repo 项目探测到 main。
+			if tc.firstKind == "dir" && first.DefaultBranch != "" {
+				t.Errorf("first default_branch = %q, want '' (dir)", first.DefaultBranch)
+			}
+			if tc.secondKind == "repo" && second.DefaultBranch != "main" {
+				t.Errorf("second default_branch = %q, want main (repo)", second.DefaultBranch)
+			}
+			// 该 path 恰好两条记录（projects.path 无 UNIQUE 约束）。
+			var n int
+			if err := db.QueryRow("SELECT count(*) FROM projects WHERE path = ?", repoCanon).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			if n != 2 {
+				t.Errorf("projects with path = %d, want 2", n)
+			}
+		})
+	}
+}
+
+// TestCreateProject_DuplicatePath_NoWarningField 验证重复 path 注册成功的响应 DTO
+// 不新增字段（design D1：无 warning 字段，DTO 形状不变）。
+func TestCreateProject_DuplicatePath_NoWarningField(t *testing.T) {
 	repo := newTestRepo(t)
-	projs := newFakeProjectStore()
-	srv := newServerWithStore(t, projs)
+	srv, _ := newServerWithRealStore(t)
 	ts := httptest.NewServer(srv.mux)
 	defer ts.Close()
 
-	body := `{"name":"p1","path":` + quoteJSON(repo) + `}`
-	resp1, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", body))
+	body := `{"name":"p","path":` + quoteJSON(repo) + `}`
+	for i := 0; i < 2; i++ {
+		resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create #%d status = %d, want 201", i+1, resp.StatusCode)
+		}
+		if i == 0 {
+			continue
+		}
+		var raw map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := raw["warning"]; ok {
+			t.Error("response DTO must not contain warning field")
+		}
+	}
+}
+
+// TestCreateProject_DifferentInputsSameCanonicalPath_201 验证不同输入归一到同一
+// canonical path 后同样注册成功（tasks 2.3）：`" <repo>/ "` trim + 归一后与
+// 已注册项目 path 相同，仍 201 且存储为归一后路径。
+func TestCreateProject_DifferentInputsSameCanonicalPath_201(t *testing.T) {
+	repo := newTestRepo(t)
+	repoCanon, err := filepath.EvalSymlinks(repo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp1.Body.Close()
-	if resp1.StatusCode != http.StatusCreated {
-		t.Fatalf("first create status = %d, want 201", resp1.StatusCode)
+	srv, db := newServerWithRealStore(t)
+	ts := httptest.NewServer(srv.mux)
+	defer ts.Close()
+
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", `{"name":"p1","path":`+quoteJSON(repo)+`}`))
+	if err != nil {
+		t.Fatal(err)
 	}
-	resp2, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", body))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first create status = %d, want 201", resp.StatusCode)
+	}
+
+	// 带前后空白与尾斜杠的输入，归一后与 repo 同一 canonical path。
+	variant := " " + repo + "/ "
+	resp2, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", `{"name":"p2","path":`+quoteJSON(variant)+`}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusConflict {
-		t.Fatalf("second create status = %d, want 409", resp2.StatusCode)
+	if resp2.StatusCode != http.StatusCreated {
+		t.Fatalf("normalized-input create status = %d, want 201", resp2.StatusCode)
+	}
+	var dto projectDTO
+	if err := json.NewDecoder(resp2.Body).Decode(&dto); err != nil {
+		t.Fatal(err)
+	}
+	if dto.Path != repoCanon {
+		t.Errorf("dto path = %q, want canonical %q", dto.Path, repoCanon)
+	}
+	var n int
+	if err := db.QueryRow("SELECT count(*) FROM projects WHERE path = ?", repoCanon).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("projects with path = %d, want 2", n)
+	}
+}
+
+// TestCreateProject_DuplicatePath_NotARepo_422 验证重复 path 不免除既有校验
+// （spec「重复 path 不免除既有校验」）：路径已注册为 dir 项目，再以 kind=repo
+// 提交同一路径（非 git 仓库）→ 422，且 MUST NOT 创建新项目记录。
+func TestCreateProject_DuplicatePath_NotARepo_422(t *testing.T) {
+	notRepo := t.TempDir() // 空 dir，非 git repo
+	srv, db := newServerWithRealStore(t)
+	ts := httptest.NewServer(srv.mux)
+	defer ts.Close()
+
+	resp, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", `{"name":"p1","kind":"dir","path":`+quoteJSON(notRepo)+`}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first create status = %d, want 201", resp.StatusCode)
+	}
+
+	resp2, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", `{"name":"p2","kind":"repo","path":`+quoteJSON(notRepo)+`}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("duplicate non-repo status = %d, want 422", resp2.StatusCode)
+	}
+	var n int
+	if err := db.QueryRow("SELECT count(*) FROM projects").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("projects count = %d, want 1 (校验失败 MUST NOT 创建记录)", n)
 	}
 }
 
@@ -426,8 +583,9 @@ func newServerWithRealStore(t *testing.T) (*Server, *store.DB) {
 	return WithProjectStore(cfg, db, NewProjectStoreAdapter(db)), db
 }
 
-// TestCreateProject_SymlinkNormalization 验证注册路径经 EvalSymlinks 归一后存储，
-// 同一仓库经 symlink 别名注册两次应 409。
+// TestCreateProject_SymlinkNormalization 验证注册路径经 EvalSymlinks 归一后存储：
+// 同一仓库经 symlink 别名注册两次均成功，两条记录存储同一 canonical path
+// （allow-duplicate-project-path：归一语义不变，path 不再拒绝重复）。
 func TestCreateProject_SymlinkNormalization(t *testing.T) {
 	repo := newTestRepo(t)
 	srv, db := newServerWithRealStore(t)
@@ -451,24 +609,44 @@ func TestCreateProject_SymlinkNormalization(t *testing.T) {
 		t.Fatalf("first create status = %d, want 201", resp.StatusCode)
 	}
 
-	// 用 symlink 别名注册同一仓库应 409（归一后 path 相同）。
+	// 用 symlink 别名注册同一仓库：归一后 path 相同，仍创建成功（不同 id）。
 	body2 := `{"name":"p2","path":` + quoteJSON(link) + `}`
 	resp2, err := http.DefaultClient.Do(authedReq("POST", ts.URL+"/api/v1/projects", body2))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusConflict {
-		t.Fatalf("symlink alias create status = %d, want 409", resp2.StatusCode)
+	if resp2.StatusCode != http.StatusCreated {
+		t.Fatalf("symlink alias create status = %d, want 201", resp2.StatusCode)
 	}
-
-	// DB 中应只有一条项目记录。
-	var n int
-	if err := db.QueryRow("SELECT count(*) FROM projects").Scan(&n); err != nil {
+	var dto projectDTO
+	if err := json.NewDecoder(resp2.Body).Decode(&dto); err != nil {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Errorf("projects count = %d, want 1 (symlink normalized)", n)
+
+	// DB 中应有两条记录，path 均为真实路径的 canonical 归一结果。
+	repoCanon, _ := filepath.EvalSymlinks(repo)
+	if dto.Path != repoCanon {
+		t.Errorf("alias dto path = %q, want canonical %q", dto.Path, repoCanon)
+	}
+	rows, err := db.Query("SELECT DISTINCT path FROM projects")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, p)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 || paths[0] != repoCanon {
+		t.Errorf("distinct stored paths = %v, want [%s] (canonical normalization)", paths, repoCanon)
 	}
 }
 
