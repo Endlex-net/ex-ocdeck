@@ -2,6 +2,8 @@
 package diffreview
 
 import (
+	"errors"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -38,10 +40,11 @@ func TestPayloadFixedHeaderAndAnnotationSection(t *testing.T) {
 }
 
 // TestPayloadLineRangeFormat 验证行号高效格式（Q(path):start-end / 单行 Q(path):start）。
+// a1 为 6 行范围（> 5 行，D9 省略分支）：窗口自洽（837..845 共 9 行）且输出无 fence。
 func TestPayloadLineRangeFormat(t *testing.T) {
 	anns := []DiffAnnotationRecord{
-		{ID: "a1", Path: "internal/task/diffreview_coverage_test.go", Side: "new", StartLine: 840, EndLine: 845, SnapshotStartLine: 837, SnapshotLineCount: 9, Snapshot: "x\n", Comment: "c1", CreatedAt: 1},
-		{ID: "a2", Path: "f.go", Side: "old", Ref: "HEAD", StartLine: 7, EndLine: 7, SnapshotStartLine: 4, SnapshotLineCount: 7, Snapshot: "y\n", Comment: "c2", CreatedAt: 2},
+		{ID: "a1", Path: "internal/task/diffreview_coverage_test.go", Side: "new", StartLine: 840, EndLine: 845, SnapshotStartLine: 837, SnapshotLineCount: 9, Snapshot: "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9", Comment: "c1", CreatedAt: 1},
+		{ID: "a2", Path: "f.go", Side: "old", Ref: "HEAD", StartLine: 7, EndLine: 7, SnapshotStartLine: 7, SnapshotLineCount: 2, Snapshot: "y\n", Comment: "c2", CreatedAt: 2},
 	}
 	result, err := assemblePayloadFromAnnotations(anns, "")
 	if err != nil {
@@ -52,6 +55,11 @@ func TestPayloadLineRangeFormat(t *testing.T) {
 	}
 	if !strings.Contains(result.Payload, `### 批注 2 — "f.go":7 (old，来源 "HEAD")`) {
 		t.Errorf("single-line range format wrong\ngot: %s", result.Payload)
+	}
+	// D9：6 行范围（> 5 行）→ 省略分支，批注 1 块仅头与评论（逐字），其后直接跟批注 2 块（无 fence 段）。
+	omittedBlock := `### 批注 1 — "internal/task/diffreview_coverage_test.go":840-845 (new，来源 index)` + "\n评论：c1"
+	if !strings.Contains(result.Payload, omittedBlock+"\n\n### 批注 2") {
+		t.Errorf("6-line range block must omit fence\ngot: %s", result.Payload)
 	}
 	// 旧格式 L840-L845 / 行 L840-L845 MUST NOT 出现。
 	if strings.Contains(result.Payload, "L840") || strings.Contains(result.Payload, "行 ") {
@@ -195,7 +203,8 @@ func TestRuneSafePrefix(t *testing.T) {
 func TestPayloadConcatenationGolden(t *testing.T) {
 	anns := []DiffAnnotationRecord{
 		{ID: "a1", Path: "a.go", Side: "new", StartLine: 1, EndLine: 2, SnapshotStartLine: 1, SnapshotLineCount: 2, Snapshot: "l1\nl2\n", Comment: "c1\n", CreatedAt: 1},
-		{ID: "a2", Path: "b.go", Side: "old", Ref: "", StartLine: 3, EndLine: 3, SnapshotStartLine: 1, SnapshotLineCount: 3, Snapshot: "s1\n", Comment: "c2", CreatedAt: 2},
+		// a2 窗口自洽（3..4 覆盖行 3）：仅调整 SnapshotStartLine/SnapshotLineCount，golden 字节不变。
+		{ID: "a2", Path: "b.go", Side: "old", Ref: "", StartLine: 3, EndLine: 3, SnapshotStartLine: 3, SnapshotLineCount: 2, Snapshot: "s1\n", Comment: "c2", CreatedAt: 2},
 	}
 	result, err := assemblePayloadFromAnnotations(anns, "n1")
 	if err != nil {
@@ -212,5 +221,188 @@ func TestPayloadConcatenationGolden(t *testing.T) {
 		"\n```\ns1\n\n```"
 	if result.Payload != want {
 		t.Errorf("payload golden mismatch:\n--- got ---\n%s\n--- want ---\n%s", result.Payload, want)
+	}
+}
+
+// --- D9 统一省略规则（tasks 6.3） ---
+
+// TestPayloadOmissionLineCountBoundary 验证引用范围行数恰 5 保留 fence、恰 6 省略
+// （D9：行数 > 5 时仅输出批注头与评论，逐字不变）。
+func TestPayloadOmissionLineCountBoundary(t *testing.T) {
+	build := func(n int) DiffAnnotationRecord {
+		lines := make([]string, n)
+		for i := range lines {
+			lines[i] = "l" + strconv.Itoa(i+1)
+		}
+		return DiffAnnotationRecord{
+			ID: "a1", Path: "f.go", Side: "new", StartLine: 1, EndLine: n,
+			SnapshotStartLine: 1, SnapshotLineCount: n,
+			Snapshot: strings.Join(lines, "\n"), Comment: "c", CreatedAt: 1,
+		}
+	}
+	// 行数恰 5 → 未省略，fence 照旧。
+	kept, err := assemblePayloadFromAnnotations([]DiffAnnotationRecord{build(5)}, "")
+	if err != nil {
+		t.Fatalf("assemblePayload(5 lines): %v", err)
+	}
+	if !strings.Contains(kept.Payload, "```\nl1\nl2\nl3\nl4\nl5\n```") {
+		t.Errorf("5-line range must keep fence\ngot: %s", kept.Payload)
+	}
+	// 行数恰 6 → 省略，仅批注头与评论（逐字）。
+	omitted, err := assemblePayloadFromAnnotations([]DiffAnnotationRecord{build(6)}, "")
+	if err != nil {
+		t.Fatalf("assemblePayload(6 lines): %v", err)
+	}
+	want := fixedHeader + "\n\n## 批注\n\n" +
+		`### 批注 1 — "f.go":1-6 (new，来源 index)` + "\n评论：c"
+	if omitted.Payload != want {
+		t.Errorf("omitted payload mismatch:\n--- got ---\n%s\n--- want ---\n%s", omitted.Payload, want)
+	}
+}
+
+// TestPayloadOmissionRuneCountBoundary 验证范围文本 rune 数恰 300 保留、恰 301 省略
+// （D9：字符数 > 300 时省略）。
+func TestPayloadOmissionRuneCountBoundary(t *testing.T) {
+	build := func(n int) DiffAnnotationRecord {
+		return DiffAnnotationRecord{
+			ID: "a1", Path: "f.go", Side: "new", StartLine: 1, EndLine: 1,
+			SnapshotStartLine: 1, SnapshotLineCount: 1,
+			Snapshot: strings.Repeat("a", n), Comment: "c", CreatedAt: 1,
+		}
+	}
+	kept, err := assemblePayloadFromAnnotations([]DiffAnnotationRecord{build(300)}, "")
+	if err != nil {
+		t.Fatalf("assemblePayload(300 runes): %v", err)
+	}
+	if !strings.Contains(kept.Payload, "```\n"+strings.Repeat("a", 300)+"\n```") {
+		t.Errorf("300-rune range must keep fence\ngot: %s", kept.Payload)
+	}
+	omitted, err := assemblePayloadFromAnnotations([]DiffAnnotationRecord{build(301)}, "")
+	if err != nil {
+		t.Fatalf("assemblePayload(301 runes): %v", err)
+	}
+	want := fixedHeader + "\n\n## 批注\n\n" +
+		`### 批注 1 — "f.go":1 (new，来源 index)` + "\n评论：c"
+	if omitted.Payload != want {
+		t.Errorf("omitted payload mismatch:\n--- got ---\n%s\n--- want ---\n%s", omitted.Payload, want)
+	}
+}
+
+// TestPayloadOmissionRuneCountMultibyteBoundary 验证 rune 计数按字符而非字节：
+// 全角字符每 rune 3 bytes，300 runes（900 bytes）保留、301 runes 省略——若按 len() 字节计数，
+// 300-rune 用例（900 bytes）将被误判省略。
+func TestPayloadOmissionRuneCountMultibyteBoundary(t *testing.T) {
+	build := func(n int) DiffAnnotationRecord {
+		return DiffAnnotationRecord{
+			ID: "a1", Path: "f.go", Side: "new", StartLine: 1, EndLine: 1,
+			SnapshotStartLine: 1, SnapshotLineCount: 1,
+			Snapshot: strings.Repeat("中", n), Comment: "c", CreatedAt: 1,
+		}
+	}
+	kept, err := assemblePayloadFromAnnotations([]DiffAnnotationRecord{build(300)}, "")
+	if err != nil {
+		t.Fatalf("assemblePayload(300 runes): %v", err)
+	}
+	if !strings.Contains(kept.Payload, "```\n"+strings.Repeat("中", 300)+"\n```") {
+		t.Errorf("300-rune multibyte range must keep fence (rune counting, not bytes)\ngot: %s", kept.Payload)
+	}
+	omitted, err := assemblePayloadFromAnnotations([]DiffAnnotationRecord{build(301)}, "")
+	if err != nil {
+		t.Fatalf("assemblePayload(301 runes): %v", err)
+	}
+	want := fixedHeader + "\n\n## 批注\n\n" +
+		`### 批注 1 — "f.go":1 (new，来源 index)` + "\n评论：c"
+	if omitted.Payload != want {
+		t.Errorf("omitted payload mismatch:\n--- got ---\n%s\n--- want ---\n%s", omitted.Payload, want)
+	}
+}
+
+// TestPayloadOmissionCountsSlicedRangeOnly 验证 rune 计数对象是切取后的引用范围文本，
+// 而非整个快照窗口：窗口上下文合计 603 runes（> 300），引用切片（行 2-3）合计 201 runes
+// （≤ 300）→ 保留 fence 与快照全文。
+func TestPayloadOmissionCountsSlicedRangeOnly(t *testing.T) {
+	snapshot := strings.Repeat("c", 200) + "\n" +
+		strings.Repeat("a", 100) + "\n" +
+		strings.Repeat("b", 100) + "\n" +
+		strings.Repeat("d", 200)
+	ann := DiffAnnotationRecord{
+		ID: "a1", Path: "f.go", Side: "new", StartLine: 2, EndLine: 3,
+		SnapshotStartLine: 1, SnapshotLineCount: 4, Snapshot: snapshot, Comment: "c", CreatedAt: 1,
+	}
+	result, err := assemblePayloadFromAnnotations([]DiffAnnotationRecord{ann}, "")
+	if err != nil {
+		t.Fatalf("assemblePayload: %v", err)
+	}
+	if !strings.Contains(result.Payload, "```") {
+		t.Errorf("sliced range (201 runes) within window context (603 runes) must keep fence\ngot: %s", result.Payload)
+	}
+	if !strings.Contains(result.Payload, snapshot) {
+		t.Errorf("unomitted block must keep full snapshot window\ngot: %s", result.Payload)
+	}
+}
+
+// TestPayloadRangeTextCountsCRLF 验证范围文本切取保留 CRLF 行尾且 \r 计入 rune 数：
+// 同为 2 行范围，LF 行尾合计 300 runes 保留；CRLF 行尾（\r 计入）为 301 runes 省略。
+func TestPayloadRangeTextCountsCRLF(t *testing.T) {
+	build := func(snapshot string) DiffAnnotationRecord {
+		return DiffAnnotationRecord{
+			ID: "a1", Path: "f.go", Side: "new", StartLine: 1, EndLine: 2,
+			SnapshotStartLine: 1, SnapshotLineCount: 2, Snapshot: snapshot, Comment: "c", CreatedAt: 1,
+		}
+	}
+	lf, err := assemblePayloadFromAnnotations([]DiffAnnotationRecord{
+		build(strings.Repeat("a", 150) + "\n" + strings.Repeat("a", 149)),
+	}, "")
+	if err != nil {
+		t.Fatalf("assemblePayload(LF): %v", err)
+	}
+	if !strings.Contains(lf.Payload, "```") {
+		t.Errorf("300-rune LF range must keep fence\ngot: %s", lf.Payload)
+	}
+	crlf, err := assemblePayloadFromAnnotations([]DiffAnnotationRecord{
+		build(strings.Repeat("a", 150) + "\r\n" + strings.Repeat("a", 149)),
+	}, "")
+	if err != nil {
+		t.Fatalf("assemblePayload(CRLF): %v", err)
+	}
+	if strings.Contains(crlf.Payload, "```") {
+		t.Errorf("\\r must count toward the 300-rune limit (CRLF range omitted)\ngot: %s", crlf.Payload)
+	}
+}
+
+// TestPayloadInvalidSnapshotWindowRejected 验证行偏移越界（损坏窗口）统一返回
+// ErrInvalidSnapshotWindow（API 映射 invalid_input；发生在 core 大小准入之前）。
+func TestPayloadInvalidSnapshotWindowRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		ann  DiffAnnotationRecord
+	}{
+		{"1-line range window corrupted", DiffAnnotationRecord{
+			ID: "a1", Path: "f.go", Side: "new", StartLine: 5, EndLine: 5,
+			SnapshotStartLine: 1, SnapshotLineCount: 1, Snapshot: "x", Comment: "c", CreatedAt: 1,
+		}},
+		{"6-line range window corrupted", DiffAnnotationRecord{
+			ID: "a1", Path: "f.go", Side: "new", StartLine: 1, EndLine: 6,
+			SnapshotStartLine: 1, SnapshotLineCount: 3, Snapshot: "l1\nl2\nl3", Comment: "c", CreatedAt: 1,
+		}},
+		{"negative offset", DiffAnnotationRecord{
+			ID: "a1", Path: "f.go", Side: "new", StartLine: 1, EndLine: 1,
+			SnapshotStartLine: 2, SnapshotLineCount: 1, Snapshot: "x", Comment: "c", CreatedAt: 1,
+		}},
+		// 窗口损坏且最终 core 同时超限：窗口校验 MUST 先于 core 大小准入，
+		// 返回 ErrInvalidSnapshotWindow 而非 ErrPayloadTooLarge。
+		{"corrupted window beats oversized core", DiffAnnotationRecord{
+			ID: "a1", Path: "f.go", Side: "new", StartLine: 5, EndLine: 5,
+			SnapshotStartLine: 1, SnapshotLineCount: 1, Snapshot: "x",
+			Comment: strings.Repeat("x", payloadMaxBytes+100), CreatedAt: 1,
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := assemblePayloadFromAnnotations([]DiffAnnotationRecord{c.ann}, "")
+			if !errors.Is(err, ErrInvalidSnapshotWindow) {
+				t.Fatalf("err=%v want ErrInvalidSnapshotWindow", err)
+			}
+		})
 	}
 }

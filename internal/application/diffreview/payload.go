@@ -5,6 +5,8 @@
 //   - 批注排序 created_at 升序平局 id 字典序；i 从 1 连续编号。
 //   - 动态 fence（最长反引号串+1，最小 3）。
 //   - 行号表述高效格式：Q(path):start-end（单行 Q(path):start）。
+//   - D9 统一省略规则：窗口索引越界 → ErrInvalidSnapshotWindow；引用范围 > 5 行或 > 300 runes
+//     仅输出批注头与评论（仅删 fence 段），对所有文件类型生效。
 //   - 不附加相关 diff/上下文段（用户决策：批注快照自带窗口即足够，不再附加 Context 内容）。
 //   - 65536 字节准入：len(core) > 65536 → ErrPayloadTooLarge（零副作用）。
 package diffreview
@@ -13,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // payloadMaxBytes 体积阈值（65536 字节）。
@@ -58,10 +61,15 @@ func assemblePayloadFromAnnotations(anns []DiffAnnotationRecord, note string) (p
 }
 
 // assemblePayload 组装提交 payload（唯一规则：core = Join([fixedHeader, noteSection?, annotationSection], "\n\n")）。
-// 准入：len(core) > payloadMaxBytes → ErrPayloadTooLarge（零副作用）。Truncated 恒 false
-// （无相关 diff 段，不产生预算截断；DTO 字段保留 wire 兼容）。
+// D9：批注窗口校验（ErrInvalidSnapshotWindow）先于 core 大小准入。准入：len(core) > payloadMaxBytes
+// → ErrPayloadTooLarge（零副作用）。Truncated 恒 false（无相关 diff 段，不产生预算截断；
+// DTO 字段保留 wire 兼容）。
 func assemblePayload(items []DiffReviewSubmissionItemRecord, note string) (payloadResult, error) {
-	core := buildCore(note, buildAnnotationSection(items))
+	section, err := buildAnnotationSection(items)
+	if err != nil {
+		return payloadResult{}, err
+	}
+	core := buildCore(note, section)
 	if len(core) > payloadMaxBytes {
 		return payloadResult{}, ErrPayloadTooLarge
 	}
@@ -92,13 +100,17 @@ func buildCore(note, annotationSection string) string {
 }
 
 // buildAnnotationSection 组装批注节（annotationSection = "## 批注" + "\n\n" + Join(annotationBlocks, "\n\n")）。
-// items 必须已按批注排序键排序；i 从 1 连续编号。
-func buildAnnotationSection(items []DiffReviewSubmissionItemRecord) string {
+// items 必须已按批注排序键排序；i 从 1 连续编号。任一批注块组装失败（窗口不自洽）即整体失败。
+func buildAnnotationSection(items []DiffReviewSubmissionItemRecord) (string, error) {
 	blocks := make([]string, len(items))
 	for i, it := range items {
-		blocks[i] = buildAnnotationBlock(i+1, it)
+		b, err := buildAnnotationBlock(i+1, it)
+		if err != nil {
+			return "", err
+		}
+		blocks[i] = b
 	}
-	return "## 批注" + "\n\n" + strings.Join(blocks, "\n\n")
+	return "## 批注" + "\n\n" + strings.Join(blocks, "\n\n"), nil
 }
 
 // buildAnnotationBlock 组装单条批注块（逐字公式）。
@@ -107,14 +119,30 @@ func buildAnnotationSection(items []DiffReviewSubmissionItemRecord) string {
 //   - "\n" + "评论：" + comment + "\n" + fence + "\n" + snapshot + "\n" + fence
 //
 // 行号表述（用户决策，高效格式）：Q(path):start-end；单行 Q(path):start。
-func buildAnnotationBlock(i int, it DiffReviewSubmissionItemRecord) string {
+// D9 统一省略规则：每条批注先无条件校验窗口索引 lo = startLine - snapshotStartLine、
+// hi = endLine - snapshotStartLine + 1（0 <= lo <= hi <= len(Split(snapshot, "\n"))），
+// 越界返回 ErrInvalidSnapshotWindow；引用范围行数 > 5 或范围文本 rune 数 > 300
+// 时仅输出批注头与评论（仅删 fence 段，头与评论逐字不变）。
+func buildAnnotationBlock(i int, it DiffReviewSubmissionItemRecord) (string, error) {
+	lines := strings.Split(it.Snapshot, "\n")
+	lo := it.StartLine - it.SnapshotStartLine
+	hi := it.EndLine - it.SnapshotStartLine + 1
+	if lo < 0 || lo > hi || hi > len(lines) {
+		return "", ErrInvalidSnapshotWindow
+	}
 	source := sourceLabel(it.Ref, it.Untracked)
 	rng := rangeLabel(it.StartLine, it.EndLine)
-	fence := dynamicFence(it.Snapshot)
-	return "### 批注 " + strconv.Itoa(i) + " — " + strconv.Quote(it.Path) + ":" + rng +
+	head := "### 批注 " + strconv.Itoa(i) + " — " + strconv.Quote(it.Path) + ":" + rng +
 		" (" + it.Side + "，来源 " + source + ")" +
-		"\n" + "评论：" + it.Comment +
-		"\n" + fence + "\n" + it.Snapshot + "\n" + fence
+		"\n" + "评论：" + it.Comment
+	// 引用范围行数（1-based 闭区间）；范围文本按窗口切取后以 "\n" Join 计 rune
+	// （内部 \n 与 CRLF 的 \r 均计入，末行后不额外计分隔符）。
+	if it.EndLine-it.StartLine+1 > 5 ||
+		utf8.RuneCountInString(strings.Join(lines[lo:hi], "\n")) > 300 {
+		return head, nil
+	}
+	fence := dynamicFence(it.Snapshot)
+	return head + "\n" + fence + "\n" + it.Snapshot + "\n" + fence, nil
 }
 
 // sourceLabel 返回来源标签（untracked→"untracked"; ref非空→Q(ref); 否则→"index"）。

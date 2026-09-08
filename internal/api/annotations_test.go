@@ -740,6 +740,31 @@ func TestSubmissionErrors_RepoStageRevisionConflict(t *testing.T) {
 	}
 }
 
+// 提交批注行范围与快照窗口不自洽 → invalid_input 422（ErrInvalidSnapshotWindow 映射），零落库。
+func TestSubmissionErrors_CorruptedSnapshotWindowInvalidInput(t *testing.T) {
+	s, f := newDiffReviewAPIServer(t)
+	f.repo.annotations["a1"] = diffreview.DiffAnnotationRecord{
+		ID: "a1", TaskID: "t1", Path: "a.go", Side: "new",
+		StartLine: 5, EndLine: 5, SnapshotStartLine: 1, SnapshotLineCount: 1,
+		Snapshot: "hello", Comment: "c", Revision: 1,
+		CreatedAt: 1720000000, UpdatedAt: 1720000000,
+	}
+	resp, body := doDiffReviewReq(t, s, "POST", "/api/v1/tasks/t1/annotation-submissions",
+		`{"annotations":[{"id":"a1","revision":1}],"note":"n"}`)
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("corrupted window status = %d, want 422; body=%s", resp.StatusCode, body)
+	}
+	if code := errCodeOf(t, body); code != "invalid_input" {
+		t.Fatalf("corrupted window code = %q, want invalid_input", code)
+	}
+	if len(f.repo.submissions) != 0 {
+		t.Fatalf("corrupted window must not persist, got %d submissions", len(f.repo.submissions))
+	}
+	if f.repo.createSubmissionCalls != 0 {
+		t.Fatalf("corrupted window must not call repository create, got %d calls", f.repo.createSubmissionCalls)
+	}
+}
+
 func TestAnnotationCRUD_Errors(t *testing.T) {
 	s, f := newDiffReviewAPIServer(t)
 	repo := f.repo

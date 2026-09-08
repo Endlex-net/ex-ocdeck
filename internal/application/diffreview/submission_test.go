@@ -233,6 +233,115 @@ func TestCreateSubmissionBatchPriorityCrossTaskOverMissing(t *testing.T) {
 	}
 }
 
+// TestCreateSubmissionInvalidSnapshotWindowNoSideEffects 验证行范围与快照窗口不自洽
+// → ErrInvalidSnapshotWindow（API 映射 invalid_input）且零副作用：不创建提交记录、
+// 批注保持原样、不调用消息发送接口（D9：发生在 core 大小准入与提交记录创建之前；
+// 1 行与 6 行损坏窗口用例）。
+func TestCreateSubmissionInvalidSnapshotWindowNoSideEffects(t *testing.T) {
+	cases := []struct {
+		name string
+		ann  DiffAnnotationRecord
+	}{
+		{"1-line corrupted window", DiffAnnotationRecord{
+			ID: "a1", TaskID: "t1", Path: "f.go", Side: "new", StartLine: 5, EndLine: 5,
+			SnapshotStartLine: 1, SnapshotLineCount: 1, Snapshot: "x", Comment: "c", Revision: 1, CreatedAt: 100,
+		}},
+		{"6-line corrupted window", DiffAnnotationRecord{
+			ID: "a1", TaskID: "t1", Path: "f.go", Side: "new", StartLine: 1, EndLine: 6,
+			SnapshotStartLine: 1, SnapshotLineCount: 3, Snapshot: "l1\nl2\nl3", Comment: "c", Revision: 1, CreatedAt: 100,
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			repo := newMockRepo()
+			repo.annotations["a1"] = c.ann
+			prompt := &mockPrompt{}
+			svc := newSubmissionTestService(repo, &mockDiff{result: DiffSourceResult{NewContent: "x\n", NewExists: true, NewMode: "100644"}}, prompt)
+			_, _, err := svc.CreateSubmission(context.Background(), CreateSubmissionRequest{
+				TaskID:      "t1",
+				Annotations: []SubmissionItemRequest{{ID: "a1", Revision: 1}},
+			})
+			if err != ErrInvalidSnapshotWindow {
+				t.Fatalf("err=%v want ErrInvalidSnapshotWindow", err)
+			}
+			if repo.createSubmissionCalls != 0 {
+				t.Errorf("repository create must not be called, got %d calls", repo.createSubmissionCalls)
+			}
+			if len(repo.submissions) != 0 {
+				t.Errorf("no submission row must persist, got %d", len(repo.submissions))
+			}
+			if repo.annotations["a1"] != c.ann {
+				t.Errorf("annotation must stay untouched:\ngot %+v\nwant %+v", repo.annotations["a1"], c.ann)
+			}
+			if len(prompt.promptCalls) != 0 {
+				t.Errorf("message send must not be called, got %d calls", len(prompt.promptCalls))
+			}
+		})
+	}
+}
+
+// TestCreateSubmissionCorruptedWindowBeatsOversizedCore 验证窗口损坏与 core 超限同时成立时
+// 错误优先级：窗口校验先于 core 大小准入 → ErrInvalidSnapshotWindow（而非 ErrPayloadTooLarge），
+// 且 repository create 未被调用（D9：校验发生在 core 大小准入与提交记录创建之前）。
+func TestCreateSubmissionCorruptedWindowBeatsOversizedCore(t *testing.T) {
+	repo := newMockRepo()
+	repo.annotations["a1"] = DiffAnnotationRecord{
+		ID: "a1", TaskID: "t1", Path: "f.go", Side: "new", StartLine: 5, EndLine: 5,
+		SnapshotStartLine: 1, SnapshotLineCount: 1, Snapshot: "x",
+		Comment: strings.Repeat("x", payloadMaxBytes+100), Revision: 1, CreatedAt: 100,
+	}
+	svc := newSubmissionTestService(repo, &mockDiff{result: DiffSourceResult{NewContent: "x\n", NewExists: true, NewMode: "100644"}}, &mockPrompt{})
+	_, _, err := svc.CreateSubmission(context.Background(), CreateSubmissionRequest{
+		TaskID:      "t1",
+		Annotations: []SubmissionItemRequest{{ID: "a1", Revision: 1}},
+	})
+	if err != ErrInvalidSnapshotWindow {
+		t.Fatalf("err=%v want ErrInvalidSnapshotWindow (not ErrPayloadTooLarge)", err)
+	}
+	if repo.createSubmissionCalls != 0 {
+		t.Errorf("repository create must not be called, got %d calls", repo.createSubmissionCalls)
+	}
+	if len(repo.submissions) != 0 {
+		t.Errorf("no submission row must persist, got %d", len(repo.submissions))
+	}
+}
+
+// TestCreateSubmissionOmissionKeepsFullSnapshotItem 验证省略仅影响 payload 文本：
+// 提交条目（items 快照）仍持久化完整快照窗口（D9：省略 MUST NOT 改变快照存储）。
+func TestCreateSubmissionOmissionKeepsFullSnapshotItem(t *testing.T) {
+	repo := newMockRepo()
+	snapshot := "l1\nl2\nl3\nl4\nl5\nl6"
+	repo.annotations["a1"] = DiffAnnotationRecord{
+		ID: "a1", TaskID: "t1", Path: "f.go", Side: "new", StartLine: 1, EndLine: 6,
+		SnapshotStartLine: 1, SnapshotLineCount: 6, Snapshot: snapshot, Comment: "c", Revision: 1, CreatedAt: 100,
+	}
+	svc := newSubmissionTestService(repo, &mockDiff{result: DiffSourceResult{NewContent: "x\n", NewExists: true, NewMode: "100644"}}, &mockPrompt{})
+	sub, _, err := svc.CreateSubmission(context.Background(), CreateSubmissionRequest{
+		TaskID:      "t1",
+		Annotations: []SubmissionItemRequest{{ID: "a1", Revision: 1}},
+	})
+	if err != nil {
+		t.Fatalf("CreateSubmission: %v", err)
+	}
+	if strings.Contains(sub.Payload, "```") {
+		t.Errorf("omitted payload must not contain fence\ngot: %s", sub.Payload)
+	}
+	// 直接检查 repo 持久化的 items 快照（非 CreateSubmission 返回值）：
+	// 逐字段断言省略逻辑未改变快照窗口与行范围（D9：省略 MUST NOT 改变快照存储）。
+	stored, ok := repo.items[sub.ID]
+	if !ok || len(stored) != 1 {
+		t.Fatalf("submission item must persist in repository storage, got %+v", stored)
+	}
+	it := stored[0]
+	if it.Snapshot != snapshot {
+		t.Errorf("persisted item Snapshot must be full snapshot window\ngot: %q", it.Snapshot)
+	}
+	if it.SnapshotStartLine != 1 || it.StartLine != 1 || it.EndLine != 6 {
+		t.Errorf("persisted item window/range must be untouched: ss=%d start=%d end=%d, want 1/1/6",
+			it.SnapshotStartLine, it.StartLine, it.EndLine)
+	}
+}
+
 // TestCancelSubmissionQueued 验证撤回 queued 提交。
 func TestCancelSubmissionQueued(t *testing.T) {
 	repo := newMockRepo()
