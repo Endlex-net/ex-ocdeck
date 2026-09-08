@@ -50,6 +50,14 @@ done
 
 cd "$REPO"
 
+default_branch="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)"
+if [[ -z "$default_branch" ]]; then
+  default_branch="main"
+fi
+
+# 先同步远端 tag，避免基于过时的本地 tag 算新版本号
+git fetch origin "$default_branch" --tags
+
 latest="$(git tag -l 'v*' --sort=-v:refname | head -n 1 || true)"
 if [[ -z "$latest" ]]; then
   base="0.0.0"
@@ -82,6 +90,10 @@ esac
 new_tag="v${major}.${minor}.${patch}"
 
 echo "==> 将创建并推送 tag: $new_tag ($BUMP)"
+if [[ -n "${latest:-}" ]]; then
+  echo "==> 本次 release 相对 $latest 新增的 commit:"
+  git log --oneline "${latest}..HEAD" || true
+fi
 if [[ "$ASSUME_YES" != "1" ]]; then
   printf "确认继续？[y/N] "
   read -r ans
@@ -98,17 +110,12 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
-default_branch="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)"
-if [[ -z "$default_branch" ]]; then
-  default_branch="main"
-fi
 current_branch="$(git rev-parse --abbrev-ref HEAD)"
 if [[ "$current_branch" != "$default_branch" ]]; then
   echo "error: 当前分支是 $current_branch，需要在默认分支 $default_branch 上打 tag" >&2
   exit 1
 fi
 
-git fetch origin "$default_branch" --tags
 local_sha="$(git rev-parse HEAD)"
 remote_sha="$(git rev-parse "origin/${default_branch}")"
 if [[ "$local_sha" != "$remote_sha" ]]; then
