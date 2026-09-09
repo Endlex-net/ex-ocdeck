@@ -2,15 +2,17 @@
 
 ## Purpose
 
-前端本机编辑器快捷打开能力：设置页「常用工具」子标签提供 VSCode/GoLand 启用开关（默认关闭、本设备 localStorage 持久化）与可选的自定义唤起 URI 模板（默认内置本地模板）；任务详情页页头提供「默认工具图标主按钮 + 下拉」快捷打开入口，按任务工作目录经本机浏览器 URL scheme 唤起本机编辑器。纯前端能力，服务端零改动。
+前端本机编辑器快捷打开能力：设置页「常用工具」子标签提供 VSCode/GoLand/Cursor 本机编辑器启用开关（默认关闭、本设备 localStorage 持久化）、可选的自定义唤起 URI 模板（默认内置本地模板）与自定义工具（名称 + URI 模板）；任务详情页页头提供「默认工具图标主按钮 + 下拉」快捷打开入口，按任务工作目录经本机浏览器 URL scheme 唤起本机编辑器。纯前端能力，服务端零改动。
 
 ## Requirements
 
 ### Requirement: 常用工具开关设置
 
-系统 SHALL 在设置页提供「常用工具」子标签（tab 值为 `tools`，深链 `#/configs#tools`，标签文案「常用工具」），内含 VSCode 与 GoLand 两个本机编辑器的启用开关。每个开关独立开启/关闭，**缺省（无存储记录）均为关闭**。开关状态 MUST 仅持久化于本设备浏览器 localStorage，MUST NOT 写入服务端或随任何 API 请求发送。
+系统 SHALL 在设置页提供「常用工具」子标签（tab 值为 `tools`，深链 `#/configs#tools`，标签文案「常用工具」），内含 VSCode、GoLand 与 Cursor 三个本机编辑器的启用开关。每个开关独立开启/关闭，**缺省（无存储记录）均为关闭**。开关状态 MUST 仅持久化于本设备浏览器 localStorage，MUST NOT 写入服务端或随任何 API 请求发送。
 
-localStorage 契约：键 `ocdeck.editorTools.vscode` 与 `ocdeck.editorTools.goland`。写入语义 MUST 为：开启写 `'1'`、关闭写 `'0'`；读取语义 MUST 为：仅 `'1'` 视为开启，其余任何值或缺省视为关闭。读取侧遇到损坏/非法数据 MUST 只回退默认值（关闭），MUST NOT 改写 localStorage；写入侧失败 MUST 向上抛出且不派发变更事件、不视为已生效。开关变更 MUST 即时生效于当前已打开页面的快捷打开入口显隐（无需刷新页面）。
+localStorage 契约：键 `ocdeck.editorTools.vscode`、`ocdeck.editorTools.goland` 与 `ocdeck.editorTools.cursor`。写入语义 MUST 为：开启写 `'1'`、关闭写 `'0'`；读取语义 MUST 为：仅 `'1'` 视为开启，其余任何值或缺省视为关闭。读取侧遇到损坏/非法数据 MUST 只回退默认值（关闭），MUST NOT 改写 localStorage；写入侧失败 MUST 向上抛出且不派发变更事件、不视为已生效。开关变更 MUST 即时生效于当前已打开页面的快捷打开入口显隐（无需刷新页面）。
+
+Cursor 的模板 scheme 白名单为 `cursor://`；内置唤起分支与 VSCode 同构（`cursor://file/<分段编码路径>/`，尾部斜杠收敛为恰好一个）。设置面板 SHALL 为 Cursor 提供与 VSCode 同构的可选自定义唤起 URI 模板配置（placeholder `cursor://file{path}/`）。
 
 #### Scenario: 缺省关闭
 
@@ -34,7 +36,7 @@ localStorage 契约：键 `ocdeck.editorTools.vscode` 与 `ocdeck.editorTools.go
 
 ### Requirement: 默认编辑器记忆
 
-系统 SHALL 记忆用户的默认编辑器（用于快捷打开主按钮）。localStorage 键 `ocdeck.editorTools.defaultTool`，合法值为 `'vscode'` 与 `'goland'`。默认编辑器的解析规则 MUST 为：存储值合法且对应工具当前已启用 → 以存储值为默认；否则回退为固定顺序（VSCode → GoLand）中第一个已启用的工具。无任何已启用工具时不存在默认编辑器。
+系统 SHALL 记忆用户的默认编辑器（用于快捷打开主按钮）。localStorage 键 `ocdeck.editorTools.defaultTool`，合法值为内置名 `'vscode'`/`'goland'`/`'cursor'` 与自定义工具引用 `'custom:<id>'`（id 非空）。默认编辑器的解析规则 MUST 为：存储值合法且对应工具当前存在（内置已启用 / 自定义 id 存在）→ 以存储值为默认；否则回退为固定顺序（VSCode → GoLand → Cursor）中第一个已启用的内置工具；再无则取自定义工具列表（存储顺序）中的第一个；仍无则不存在默认编辑器。
 
 默认工具键的唯一写入口 MUST 为快捷打开下拉中的显式选择；关闭/开启工具开关 MUST 只更新对应开关键，MUST NOT 清除或改写默认工具键（开关关闭后的默认回退仅为派生状态，不落库）。读取侧遇到非法值 MUST 只按上述回退规则处理、MUST NOT 改写 localStorage；读取时 localStorage 抛异常（如不可用）MUST 按无记录处理并返回回退结果，MUST NOT 抛至渲染层。存储的默认值变更 MUST 与开关变更一样经由变更事件/storage 事件即时收敛到已打开的快捷打开入口。
 
@@ -60,9 +62,9 @@ localStorage 契约：键 `ocdeck.editorTools.vscode` 与 `ocdeck.editorTools.go
 
 ### Requirement: 任务详情页快捷打开入口
 
-系统 SHALL 在任务详情页（任务工作台）页头提供「在编辑器中打开」入口，形态为「默认工具图标主按钮 + 下拉触发按钮」的组合（即使仅启用一个工具也保持该组合结构）。仅当至少一个工具已启用时 MUST 呈现该入口；两个工具均未启用时 MUST 完全隐藏、不留占位。打开目标 MUST 为任务详情接口返回的 `worktree_path` 字段（worktree 模式任务为 worktree 目录；dir 项目任务与 repo 项目 local-path 模式任务该字段为项目路径），前端 MUST NOT 按任务模式自行拼接或改写路径。
+系统 SHALL 在任务详情页（任务工作台）页头提供「在编辑器中打开」入口，形态为「默认工具图标主按钮 + 下拉触发按钮」的组合（即使仅启用一个工具也保持该组合结构）。仅当至少一个可用工具存在（内置已启用或自定义工具名称与模板齐全）时 MUST 呈现该入口；无任何可用工具时 MUST 完全隐藏、不留占位。打开目标 MUST 为任务详情接口返回的 `worktree_path` 字段（worktree 模式任务为 worktree 目录；dir 项目任务与 repo 项目 local-path 模式任务该字段为项目路径），前端 MUST NOT 按任务模式自行拼接或改写路径。
 
-交互语义 MUST 为：点击主按钮直接以当前默认编辑器打开；下拉菜单列出全部已启用工具并以 ✓ 标识当前默认工具；点击下拉中某工具即用它打开，并将其设为默认编辑器（持久化）。下拉为普通 disclosure 模式：Escape 关闭、点击外部关闭。
+交互语义 MUST 为：点击主按钮直接以当前默认编辑器打开；下拉菜单列出全部可用工具（顺序：已启用内置按 VSCode → GoLand → Cursor，其后为自定义工具按存储顺序；名称为空的自定义行不展示）并以 ✓ 标识当前默认工具；点击下拉中某工具即用它打开，并将其设为默认编辑器（持久化，自定义工具写 `custom:<id>`）。下拉为普通 disclosure 模式：Escape 关闭、点击外部关闭。
 
 执行顺序 MUST 为单一主流程：主按钮执行 ①→③，下拉选择执行 ①→②→③：
 
@@ -124,6 +126,8 @@ VSCode 分支 MUST 为：对归一化路径按 `/` 分段，每段做 URI 组件
 
 GoLand 分支 MUST 为：`goland://open?file=` 后接**对归一化路径整体做一次查询值编码**（`/` 编码为 `%2F`、盘符冒号编码为 `%3A`、空格编码为 `%20`、`%` 编码为 `%25`）；MUST NOT 复用 VSCode 分支的分段编码结果，MUST NOT 二次编码。
 
+Cursor 分支 MUST 与 VSCode 分支同构：`cursor://file/` 前缀 + 分段编码路径（盘符段冒号保留字面）+ 尾部 `/` 收敛为恰好一个。
+
 `worktree_path` 为空或缺失时 MUST NOT 构造 URI、MUST NOT 触发唤起（入口禁用态见「任务详情页快捷打开入口」）。
 
 #### Scenario: 含空格路径编码（VSCode）
@@ -155,7 +159,7 @@ GoLand 分支 MUST 为：`goland://open?file=` 后接**对归一化路径整体�
 
 系统 SHALL 允许用户为每个工具配置可选的自定义唤起 URI 模板，localStorage 键为 `ocdeck.editorTools.uriTemplate.vscode` 与 `ocdeck.editorTools.uriTemplate.goland`。未配置（缺省或空）MUST 使用「编辑器唤起 URI 构造」规定的内置分支；内置分支行为 MUST NOT 因模板能力的引入而改变。
 
-模板合法性的判定 MUST 为：模板包含至少一个 `{path}` 占位符，且以该工具允许的 scheme 前缀开头（VSCode 工具允许 `vscode://` 与 `vscode-insiders://`；GoLand 工具允许 `goland://`）。不满足任一条件的模板 MUST 按未设置处理（回退内置分支），MUST NOT 改写 localStorage，MUST NOT 因此阻断唤起。
+模板合法性的判定 MUST 为：模板包含至少一个 `{path}` 占位符，且以该工具允许的 scheme 前缀开头（VSCode 工具允许 `vscode://` 与 `vscode-insiders://`；GoLand 工具允许 `goland://` 与 `jetbrains://`）。不满足任一条件的模板 MUST 按未设置处理（回退内置分支），MUST NOT 改写 localStorage，MUST NOT 因此阻断唤起。
 
 模板有效时，唤起的 URI MUST 为：将模板中全部 `{path}` 出现替换为「模板路径注入值」后的字符串，MUST NOT 对替换结果再做任何编码。模板路径注入值 MUST 为：归一化路径（仅反斜杠转 `/`）按 `/` 分段、每段做 URI 组件编码（Windows 盘符段冒号保留字面）、以 `/` 重新连接、保留开头的 `/`、不做尾斜杠收敛。
 
@@ -172,6 +176,11 @@ GoLand 分支 MUST 为：`goland://open?file=` 后接**对归一化路径整体�
 
 - **WHEN** VSCode 工具配置模板 `vscode://vscode-remote/ssh-remote+devbox{path}`，任务 `worktree_path` 为 `/home/me/proj`，用户以 VSCode 打开
 - **THEN** 触发的 URI 为 `vscode://vscode-remote/ssh-remote+devbox/home/me/proj`
+
+#### Scenario: jetbrains scheme 模板生效（GoLand）
+
+- **WHEN** GoLand 工具配置模板 `jetbrains://goland/navigate/reference?project={path}`，任务 `worktree_path` 为 `/Users/me/my project`，用户以 GoLand 打开
+- **THEN** 触发的 URI 为 `jetbrains://goland/navigate/reference?project=/Users/me/my%20project`
 
 #### Scenario: 缺省模板走内置分支
 
@@ -197,3 +206,33 @@ GoLand 分支 MUST 为：`goland://open?file=` 后接**对归一化路径整体�
 
 - **WHEN** 用户保存模板时 localStorage 抛异常
 - **THEN** 错误向上抛出、不派发变更事件，快捷打开入口仍按旧模板或内置分支构造 URI
+
+### Requirement: 自定义编辑器工具
+
+系统 SHALL 允许用户在设置页「常用工具」子标签维护自定义编辑器工具（名称 + 唤起 URI 模板），localStorage 键 `ocdeck.editorTools.customTools`，值为 JSON 数组文本（元素 `{ id, name, template }`）。读取侧遇到 JSON 损坏、非数组或元素缺字段 MUST 跳过该元素或整项回空数组，MUST NOT 改写 localStorage。保存成功 MUST 派发变更事件（跨标签页经 storage 事件即时收敛）；写入失败 MUST 向上抛出且不派发。
+
+自定义工具模板的安全边界 MUST 为：模板包含至少一个 `{path}` 占位符，且 scheme 匹配通用 URI scheme 语法（`^[a-zA-Z][a-zA-Z0-9+.-]*:`）且 scheme（大小写不敏感）不属于危险名单 `javascript:`、`data:`、`vbscript:`、`file:`。不满足条件的模板 MUST 按不可用处理：该工具不出现在快捷打开列表的可用集合中，设置面板保留原文（便于草稿修正）并给出提示；存储值 MUST NOT 因此被改写。
+
+自定义工具的唤起 URI MUST 为：模板中全部 `{path}` 替换为模板路径注入值（与内置模板注入同一编码语义）；自定义工具 MUST NOT 回退到任何内置分支——不可用时点击即零副作用（不唤起、不写默认、仅关闭菜单）。
+
+设置面板 SHALL 提供自定义工具的添加、逐行名称/模板编辑（失焦保存）、删除能力；名称为空或模板非法的行 MUST 给出提示（该行不进入快捷打开可用列表）。
+
+#### Scenario: 自定义工具出现在快捷打开下拉
+
+- **WHEN** 用户添加自定义工具（名称 `My Editor`、模板 `myapp://open?path={path}`）且名称模板齐全
+- **THEN** 任务详情页下拉在内置工具之后按存储顺序列出 `My Editor`
+
+#### Scenario: 下拉选择自定义工具并设为默认
+
+- **WHEN** 用户在下拉中点击自定义工具 `My Editor`
+- **THEN** 按其模板构造 URI 并同步唤起，`ocdeck.editorTools.defaultTool` 写入 `custom:<id>`，刷新后默认仍为该工具
+
+#### Scenario: 非法自定义模板不唤起
+
+- **WHEN** 自定义工具模板为 `javascript:alert(1){path}`（危险 scheme），用户在下拉中点击该工具
+- **THEN** 不触发唤起、不写默认键，菜单关闭
+
+#### Scenario: 自定义工具被删除后默认回退
+
+- **WHEN** 存储默认为 `custom:<id>`，该自定义工具在另一标签页被删除
+- **THEN** 主按钮按默认解析规则回退（内置启用顺序或其余自定义工具）

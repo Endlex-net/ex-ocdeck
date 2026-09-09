@@ -255,6 +255,29 @@ export function VSCodeIcon(props: IconProps) {
   );
 }
 
+/** Cursor（VSCode fork；官方 logo 为立体方块线框，此处以等距立方体剪影呈现，
+ *  单色 currentColor 随主题取色，保持品牌形态可辨识。） */
+export function CursorIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M12 2.5 3.5 7v10L12 21.5 20.5 17V7L12 2.5z" />
+      <path d="M3.5 7 12 11.5 20.5 7" />
+      <path d="M12 11.5v10" />
+    </Svg>
+  );
+}
+
+/** 自定义工具（通用外部唤起字形：方框 + 外指箭头，表达「经 URL scheme 唤起外部工具」）。 */
+export function GenericToolIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M14 4h6v6" />
+      <path d="M20 4l-9 9" />
+      <path d="M11 5H5a1 1 0 0 0-1 1v13a1 1 0 0 0 1 1h13a1 1 0 0 0 1-1v-6" />
+    </Svg>
+  );
+}
+
 /** GoLand（JetBrains 官方方形标志：方底 + GO 字形 + 底部横条；GO 镂空透出底色。
  *  GoLand 官方 logo 底为近黑色方块，暗色主题下会融没，故用 currentColor 单色剪影
  *  随主题取色（亮主题=黑底白字、暗主题=反转），保持品牌形态可辨识。） */

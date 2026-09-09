@@ -1,43 +1,63 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  buildCustomEditorUri,
   buildEditorUri,
   EDITOR_TOOLS_CHANGED,
+  isUsableCustomTool,
+  loadCustomEditorTools,
   loadDefaultTool,
   loadEditorTools,
   loadEditorUriTemplate,
   resolveDefaultTool,
   saveDefaultTool,
+  type CustomEditorTool,
   type EditorTool,
+  type ResolvedTool,
 } from '../editor-tools';
-import { CaretDownIcon, GoLandIcon, VSCodeIcon } from '../icons';
+import { CaretDownIcon, CursorIcon, GenericToolIcon, GoLandIcon, VSCodeIcon } from '../icons';
 import { shouldCloseOverflowOnBlur } from '../pages/workbench-overflow';
 
 /* ============================ 任务详情页「在编辑器中打开」入口（add-frontend-tool-quick-open 3.1/3.2） ============================
- * 「默认工具图标主按钮 + ⌄ 下拉」组合：数据源 loadEditorTools + loadDefaultTool，
- * 监听 EDITOR_TOOLS_CHANGED + storage 同时重读两类键再经 resolveDefaultTool 派生默认
- * （覆盖开关与默认值两类变更、跨标签页即时收敛）。无已启用工具返回 null；
+ * 「默认工具图标主按钮 + ⌄ 下拉」组合：数据源 loadEditorTools + loadCustomEditorTools + loadDefaultTool，
+ * 监听 EDITOR_TOOLS_CHANGED + storage 同时重读三类键再经 resolveDefaultTool 派生默认
+ * （覆盖开关/自定义工具/默认值三类变更、跨标签页即时收敛）。无任何可用工具返回 null；
  * worktree_path 空/缺失保留组合但双按钮禁用。disclosure 模式参照 WorkbenchOverflow
- * （Escape/外部点击关闭、打开聚焦首项）。打开目标 = worktree_path，前端不按任务模式改写。 */
+ * （Escape/外部点击关闭、打开聚焦首项）。打开目标 = worktree_path，前端不按任务模式改写。
+ * 下拉顺序：已启用内置（VSCode → GoLand → Cursor）→ 自定义工具（存储顺序）。 */
 
-const TOOL_LABEL: Record<EditorTool, string> = { vscode: 'VSCode', goland: 'GoLand' };
-/** 下拉展示与默认回退顺序（spec 固定：VSCode → GoLand）。 */
-const TOOL_ORDER: readonly EditorTool[] = ['vscode', 'goland'];
+const TOOL_LABEL: Record<EditorTool, string> = { vscode: 'VSCode', goland: 'GoLand', cursor: 'Cursor' };
+/** 下拉展示与默认回退顺序（扩展后固定：VSCode → GoLand → Cursor）。 */
+const TOOL_ORDER: readonly EditorTool[] = ['vscode', 'goland', 'cursor'];
 
-function ToolIcon({ tool }: { tool: EditorTool }) {
-  return tool === 'vscode' ? <VSCodeIcon /> : <GoLandIcon />;
+function ToolIcon({ tool }: { tool: ResolvedTool }) {
+  if (tool.kind === 'custom') return <GenericToolIcon />;
+  if (tool.tool === 'vscode') return <VSCodeIcon />;
+  if (tool.tool === 'goland') return <GoLandIcon />;
+  return <CursorIcon />;
+}
+
+function toolLabel(tool: ResolvedTool): string {
+  return tool.kind === 'builtin' ? TOOL_LABEL[tool.tool] : tool.tool.name;
+}
+
+/** DEFAULT_KEY 存储值：内置名或 custom:<id>。 */
+function storedKeyOf(tool: ResolvedTool): string {
+  return tool.kind === 'builtin' ? tool.tool : `custom:${tool.tool.id}`;
 }
 
 export function OpenInEditorMenu({ worktreePath }: { worktreePath: string }) {
   const [tools, setTools] = useState(() => loadEditorTools());
+  const [customTools, setCustomTools] = useState<CustomEditorTool[]>(() => loadCustomEditorTools());
   const [stored, setStored] = useState(() => loadDefaultTool());
   const [menuOpen, setMenuOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
-  // 开关变更与默认值变更（本页写入 / 另一标签页 storage）都重读两类键收敛。
+  // 开关/自定义工具/默认值变更（本页写入 / 另一标签页 storage）都重读三类键收敛。
   useEffect(() => {
     const reload = () => {
       setTools(loadEditorTools());
+      setCustomTools(loadCustomEditorTools());
       setStored(loadDefaultTool());
     };
     window.addEventListener(EDITOR_TOOLS_CHANGED, reload);
@@ -48,8 +68,14 @@ export function OpenInEditorMenu({ worktreePath }: { worktreePath: string }) {
     };
   }, []);
 
-  const enabledTools = TOOL_ORDER.filter((t) => tools[t]);
-  const defaultTool = resolveDefaultTool(tools, stored);
+  // 下拉顺序：已启用内置（固定顺序）→ 可用自定义工具（存储顺序，C1 统一谓词：名称非空 + 模板合法）。
+  const enabledTools: ResolvedTool[] = [
+    ...TOOL_ORDER.filter((t) => tools[t]).map((t) => ({ kind: 'builtin' as const, tool: t })),
+    ...customTools
+      .filter(isUsableCustomTool)
+      .map((t) => ({ kind: 'custom' as const, tool: t })),
+  ];
+  const defaultTool = resolveDefaultTool(tools, customTools, stored);
 
   // disclosure 模式：打开后焦点进入菜单内首个可用项
   useEffect(() => {
@@ -71,16 +97,21 @@ export function OpenInEditorMenu({ worktreePath }: { worktreePath: string }) {
   const disabled = !worktreePath;
 
   /** 点击主流程（spec 执行顺序）：主按钮 ①→③；下拉选择 ①→②→③。 */
-  const openWith = (tool: EditorTool, viaDropdown: boolean) => {
-    // ① 前置校验 + URI 构造：点击时重读存储（不用渲染快照，覆盖「工具已被关闭但未派发事件」）；
+  const openWith = (tool: ResolvedTool, viaDropdown: boolean) => {
+    // ① 前置校验 + URI 构造：点击时重读存储（不用渲染快照，覆盖「工具已被关闭/删除但未派发事件」）；
     // 构造整体兜异常（encodeURIComponent 对孤立 UTF-16 代理对抛 URIError 等）。
     // 任一失败零副作用（不写存储、不派发、不唤起、不改默认），仅关菜单。
     let uri = '';
     try {
-      uri =
-        loadEditorTools()[tool] && worktreePath
-          ? buildEditorUri(tool, worktreePath, loadEditorUriTemplate(tool))
-          : '';
+      if (tool.kind === 'builtin') {
+        uri =
+          loadEditorTools()[tool.tool] && worktreePath
+            ? buildEditorUri(tool.tool, worktreePath, loadEditorUriTemplate(tool.tool))
+            : '';
+      } else {
+        const latest = loadCustomEditorTools().find((t) => t.id === tool.tool.id);
+        uri = latest && isUsableCustomTool(latest) && worktreePath ? buildCustomEditorUri(latest, worktreePath) : '';
+      }
     } catch {
       uri = '';
     }
@@ -91,12 +122,12 @@ export function OpenInEditorMenu({ worktreePath }: { worktreePath: string }) {
     // ②（仅下拉选择）写默认工具键；失败捕获保留原默认与 ✓，不唤起，菜单关闭。
     if (viaDropdown) {
       try {
-        saveDefaultTool(tool);
+        saveDefaultTool(storedKeyOf(tool));
       } catch {
         setMenuOpen(false);
         return;
       }
-      setStored(tool);
+      setStored(storedKeyOf(tool));
     }
     // ③ 同一用户手势调用链内同步唤起；同步异常捕获、页面保持可用、已保存默认不回滚。
     try {
@@ -119,8 +150,8 @@ export function OpenInEditorMenu({ worktreePath }: { worktreePath: string }) {
     >
       <button
         className="btn btn-small btn-ghost"
-        aria-label={`使用 ${TOOL_LABEL[defaultTool]} 打开`}
-        title={`使用 ${TOOL_LABEL[defaultTool]} 打开`}
+        aria-label={`使用 ${toolLabel(defaultTool)} 打开`}
+        title={`使用 ${toolLabel(defaultTool)} 打开`}
         disabled={disabled}
         onClick={() => openWith(defaultTool, false)}
       >
@@ -160,12 +191,18 @@ export function OpenInEditorMenu({ worktreePath }: { worktreePath: string }) {
               }
             }}
           >
-            {enabledTools.map((t) => (
-              <button key={t} className="overflow-item" onClick={() => openWith(t, true)}>
-                <ToolIcon tool={t} /> {TOOL_LABEL[t]}
-                {t === defaultTool ? ' ✓' : ''}
-              </button>
-            ))}
+            {enabledTools.map((t) => {
+              const isDefault =
+                t.kind === 'builtin'
+                  ? defaultTool.kind === 'builtin' && defaultTool.tool === t.tool
+                  : defaultTool.kind === 'custom' && defaultTool.tool.id === t.tool.id;
+              return (
+                <button key={storedKeyOf(t)} className="overflow-item" onClick={() => openWith(t, true)}>
+                  <ToolIcon tool={t} /> {toolLabel(t)}
+                  {isDefault ? ' ✓' : ''}
+                </button>
+              );
+            })}
           </div>
         </>
       )}
