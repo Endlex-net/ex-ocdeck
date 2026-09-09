@@ -155,7 +155,7 @@ GoLand 分支 MUST 为：`goland://open?file=` 后接**对归一化路径整体�
 
 系统 SHALL 允许用户为每个工具配置可选的自定义唤起 URI 模板，localStorage 键为 `ocdeck.editorTools.uriTemplate.vscode` 与 `ocdeck.editorTools.uriTemplate.goland`。未配置（缺省或空）MUST 使用「编辑器唤起 URI 构造」规定的内置分支；内置分支行为 MUST NOT 因模板能力的引入而改变。
 
-模板合法性的判定 MUST 为：模板包含至少一个 `{path}` 占位符，且以该工具允许的 scheme 前缀开头（VSCode 工具允许 `vscode://` 与 `vscode-insiders://`；GoLand 工具允许 `goland://`）。不满足任一条件的模板 MUST 按未设置处理（回退内置分支），MUST NOT 改写 localStorage，MUST NOT 因此阻断唤起。
+模板合法性的判定 MUST 为：模板包含至少一个 `{path}` 占位符，且以该工具允许的 scheme 前缀开头（VSCode 工具允许 `vscode://` 与 `vscode-insiders://`；GoLand 工具允许 `goland://` 与 `jetbrains://`）。不满足任一条件的模板 MUST 按未设置处理（回退内置分支），MUST NOT 改写 localStorage，MUST NOT 因此阻断唤起。
 
 模板有效时，唤起的 URI MUST 为：将模板中全部 `{path}` 出现替换为「模板路径注入值」后的字符串，MUST NOT 对替换结果再做任何编码。模板路径注入值 MUST 为：归一化路径（仅反斜杠转 `/`）按 `/` 分段、每段做 URI 组件编码（Windows 盘符段冒号保留字面）、以 `/` 重新连接、保留开头的 `/`、不做尾斜杠收敛。
 
@@ -172,6 +172,11 @@ GoLand 分支 MUST 为：`goland://open?file=` 后接**对归一化路径整体�
 
 - **WHEN** VSCode 工具配置模板 `vscode://vscode-remote/ssh-remote+devbox{path}`，任务 `worktree_path` 为 `/home/me/proj`，用户以 VSCode 打开
 - **THEN** 触发的 URI 为 `vscode://vscode-remote/ssh-remote+devbox/home/me/proj`
+
+#### Scenario: jetbrains scheme 模板生效（GoLand）
+
+- **WHEN** GoLand 工具配置模板 `jetbrains://goland/navigate/reference?project={path}`，任务 `worktree_path` 为 `/Users/me/my project`，用户以 GoLand 打开
+- **THEN** 触发的 URI 为 `jetbrains://goland/navigate/reference?project=/Users/me/my%20project`
 
 #### Scenario: 缺省模板走内置分支
 

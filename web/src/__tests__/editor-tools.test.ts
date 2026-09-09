@@ -236,6 +236,7 @@ describe('自定义唤起 URI 模板：读写与合法性（add-frontend-tool-qu
     expect(isValidUriTemplate('vscode', 'vscode://file{path}')).toBe(true);
     expect(isValidUriTemplate('vscode', 'vscode-insiders://file{path}/')).toBe(true);
     expect(isValidUriTemplate('goland', 'goland://open?file={path}')).toBe(true);
+    expect(isValidUriTemplate('goland', 'jetbrains://goland/navigate/reference?project={path}')).toBe(true);
     // 缺占位符
     expect(isValidUriTemplate('vscode', 'vscode://file/')).toBe(false);
     // scheme 不符 / 危险 scheme
@@ -285,6 +286,12 @@ describe('buildEditorUri 模板分支（spec「自定义唤起 URI 模板」Scen
   it('注入值分段编码：盘符冒号保留字面、空格编码、/ 不编码', () => {
     expect(buildEditorUri('goland', 'C:\\work\\my proj', 'goland://open?file={path}')).toBe(
       'goland://open?file=C:/work/my%20proj',
+    );
+  });
+
+  it('jetbrains:// 模板（GoLand）：白名单接受且注入生效（回归：曾因白名单仅含 goland:// 被静默回退内置）', () => {
+    expect(buildEditorUri('goland', '/Users/me/my project', 'jetbrains://goland/navigate/reference?project={path}')).toBe(
+      'jetbrains://goland/navigate/reference?project=/Users/me/my%20project',
     );
   });
 });
