@@ -159,7 +159,7 @@ describe('点击主流程', () => {
     expect(itemLabels(container)).toEqual(['VSCode ✓', 'GoLand']);
 
     await clickItem(container, 'GoLand');
-    expect(assignCalls).toEqual(['goland://open?file=%2Ftmp%2Fwt']);
+    expect(assignCalls).toEqual(['jetbrains://goland/navigate/reference?project=%2Ftmp%2Fwt']);
     expect(store.get(DEFAULT_KEY)).toBe('goland');
 
     // ✓ 跟随（下拉关闭）；重新打开后 GoLand 带 ✓

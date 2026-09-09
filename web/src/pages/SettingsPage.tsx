@@ -416,7 +416,7 @@ const EDITOR_TOOLS: { tool: EditorTool; label: string; hint: string }[] = [
 /** 各工具内置默认模板（placeholder 展示；模板含 {path} 占位符，缺省/清空即走内置分支）。 */
 const EDITOR_TOOL_DEFAULT_TEMPLATES: Record<EditorTool, string> = {
   vscode: 'vscode://file{path}/',
-  goland: 'goland://open?file={path}',
+  goland: 'jetbrains://goland/navigate/reference?project={path}',
 };
 
 /** 模板能力说明（spec「自定义唤起 URI 模板」末段原文）。 */

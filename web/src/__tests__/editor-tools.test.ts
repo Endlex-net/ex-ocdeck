@@ -184,11 +184,13 @@ describe('buildEditorUri（编辑器唤起 URI 构造，spec Scenario 逐条）'
   });
 
   it('GoLand：Windows 路径归一后整体一次编码', () => {
-    expect(buildEditorUri('goland', 'C:\\work\\my proj')).toBe('goland://open?file=C%3A%2Fwork%2Fmy%20proj');
+    expect(buildEditorUri('goland', 'C:\\work\\my proj')).toBe(
+      'jetbrains://goland/navigate/reference?project=C%3A%2Fwork%2Fmy%20proj',
+    );
   });
 
   it('GoLand：含百分号路径单次编码（% → %25，不双重编码）', () => {
-    expect(buildEditorUri('goland', '/tmp/a b%c')).toBe('goland://open?file=%2Ftmp%2Fa%20b%25c');
+    expect(buildEditorUri('goland', '/tmp/a b%c')).toBe('jetbrains://goland/navigate/reference?project=%2Ftmp%2Fa%20b%25c');
   });
 
   it('空路径返回空串', () => {
@@ -236,6 +238,7 @@ describe('自定义唤起 URI 模板：读写与合法性（add-frontend-tool-qu
     expect(isValidUriTemplate('vscode', 'vscode://file{path}')).toBe(true);
     expect(isValidUriTemplate('vscode', 'vscode-insiders://file{path}/')).toBe(true);
     expect(isValidUriTemplate('goland', 'goland://open?file={path}')).toBe(true);
+    expect(isValidUriTemplate('goland', 'jetbrains://goland/navigate/reference?project={path}')).toBe(true);
     // 缺占位符
     expect(isValidUriTemplate('vscode', 'vscode://file/')).toBe(false);
     // scheme 不符 / 危险 scheme
@@ -271,7 +274,7 @@ describe('buildEditorUri 模板分支（spec「自定义唤起 URI 模板」Scen
 
   it('scheme 不符（goland 工具配 vscode 模板）回退内置 goland 分支', () => {
     expect(buildEditorUri('goland', '/Users/me/proj', 'vscode://file{path}')).toBe(
-      'goland://open?file=%2FUsers%2Fme%2Fproj',
+      'jetbrains://goland/navigate/reference?project=%2FUsers%2Fme%2Fproj',
     );
   });
 
@@ -285,6 +288,12 @@ describe('buildEditorUri 模板分支（spec「自定义唤起 URI 模板」Scen
   it('注入值分段编码：盘符冒号保留字面、空格编码、/ 不编码', () => {
     expect(buildEditorUri('goland', 'C:\\work\\my proj', 'goland://open?file={path}')).toBe(
       'goland://open?file=C:/work/my%20proj',
+    );
+  });
+
+  it('jetbrains:// 模板（GoLand）：白名单接受且注入生效（回归：曾因白名单仅含 goland:// 被静默回退内置）', () => {
+    expect(buildEditorUri('goland', '/Users/me/my project', 'jetbrains://goland/navigate/reference?project={path}')).toBe(
+      'jetbrains://goland/navigate/reference?project=/Users/me/my%20project',
     );
   });
 });

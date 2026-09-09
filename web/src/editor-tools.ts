@@ -27,7 +27,7 @@ const TOOL_ORDER: readonly EditorTool[] = ['vscode', 'goland'];
 /** 各工具允许的模板 scheme 前缀（白名单同时是安全边界：防 javascript: 等危险 scheme 经 assign 执行）。 */
 const TOOL_TEMPLATE_SCHEMES: Record<EditorTool, readonly string[]> = {
   vscode: ['vscode://', 'vscode-insiders://'],
-  goland: ['goland://'],
+  goland: ['goland://', 'jetbrains://'],
 };
 
 function toolKey(tool: EditorTool): string {
@@ -85,7 +85,7 @@ export function resolveDefaultTool(tools: EditorTools, stored: EditorTool | null
 
 /**
  * 模板合法性判定（spec「自定义唤起 URI 模板」）：含至少一个 {path} 占位符，
- * 且以该工具允许的 scheme 前缀开头（vscode: vscode:// / vscode-insiders://，goland: goland://）。
+ * 且以该工具允许的 scheme 前缀开头（vscode: vscode:// / vscode-insiders://，goland: goland:// / jetbrains://）。
  */
 export function isValidUriTemplate(tool: EditorTool, template: string): boolean {
   return template.includes('{path}') && TOOL_TEMPLATE_SCHEMES[tool].some((s) => template.startsWith(s));
@@ -139,7 +139,7 @@ export function buildEditorUri(tool: EditorTool, path: string, template?: string
   if (template != null && isValidUriTemplate(tool, template)) {
     return template.split('{path}').join(encodeTemplatePath(normalized));
   }
-  if (tool === 'goland') return `goland://open?file=${encodeURIComponent(normalized)}`;
+  if (tool === 'goland') return `jetbrains://goland/navigate/reference?project=${encodeURIComponent(normalized)}`;
   const encoded = normalized
     .split('/')
     .map((seg, i) => (i === 0 && /^[A-Za-z]:$/.test(seg) ? seg : encodeURIComponent(seg)))
