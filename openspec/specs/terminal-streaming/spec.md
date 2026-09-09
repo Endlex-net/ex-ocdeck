@@ -109,7 +109,12 @@
 - **THEN** 仍由字体栈前部的等宽拉丁字体渲染，列宽度量与现状一致
 
 ### Requirement: 终端外观偏好
-系统 SHALL 在「全局配置」页提供「终端外观」配置（该偏好为浏览器端全局偏好，不放在任务级设置入口），允许用户自定义终端 fontFamily 与 fontSize（整数，合法范围 8–32）。偏好 MUST 存于浏览器 localStorage（key：`ocdeck.terminal.fontFamily` / `ocdeck.terminal.fontSize`），对当前浏览器所有任务的 TUI 与 shell 终端生效；未设置时 MUST 使用含 CJK 回退的默认字体栈与默认字号 13。系统 MUST 提供「恢复默认」操作（清除 localStorage 对应项）。保存时 MUST 先完整校验两个字段，全部合法后才写入 localStorage；任一字段非法 MUST NOT 修改任何存储项并提示用户。fontFamily 去除首尾空白后为空视为未设置（删除对应存储项，回到默认栈），允许单独保存合法 fontSize。
+系统 SHALL 在「全局配置」页提供「终端外观」配置（该偏好为浏览器端全局偏好，不放在任务级设置入口），允许用户自定义终端 fontFamily 与 fontSize（整数，合法范围 8–32）。偏好 MUST 存于浏览器 localStorage（key：`ocdeck.terminal.fontFamily` / `ocdeck.terminal.fontSize`），对当前浏览器所有任务的 TUI 与 shell 终端生效；未设置时 MUST 使用含 CJK 回退的默认字体栈与默认字号 13。系统 MUST 提供「恢复默认」操作（清除 localStorage 对应项）。保存时 MUST 先完整校验两个字段，全部合法后才写入 localStorage；任一字段非法 MUST NOT 修改任何存储项并提示用户。fontFamily 去除首尾空白后为空视为未设置（删除对应存储项，回到默认栈），允许单独保存合法 fontSize。fontFamily 的解析输入域为无注释的 CSS family 列表——保存时 MUST 拒绝包含 CSS 注释标记（`/*` 或 `*/`）的字符串，被拒绝的保存 MUST 整体不写入、不派发变更事件并向上抛出（由设置 UI 呈现错误）。
+
+#### Scenario: fontFamily 含 CSS 注释符被拒绝
+
+- **WHEN** 用户保存包含 `/*` 或 `*/` 的 fontFamily（fontSize 合法或未提供）
+- **THEN** 保存被拒绝并提示，localStorage 中已有偏好（含 fontSize）不被修改，不派发变更事件
 
 #### Scenario: 保存自定义字体
 - **WHEN** 用户输入自定义 fontFamily 与合法 fontSize 并保存
