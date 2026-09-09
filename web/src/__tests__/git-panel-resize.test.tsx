@@ -52,6 +52,7 @@ vi.mock('../api', () => ({
     createAnnotation: vi.fn(),
     gitFileRead: vi.fn(),
     gitFileWrite: vi.fn(),
+    reportActivity: vi.fn(),
   },
   ApiError: class ApiError extends Error {
     constructor(

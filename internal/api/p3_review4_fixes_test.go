@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,6 +26,11 @@ type fakeTaskBackend struct {
 	listShellsRes  []application.TerminalID
 	attachPtyFn    func(sessionName string, cols, rows int) (*pty.Pty, error)
 	attachPtyCalls []string
+	// 用户活动上报记录（idle-reminder-user-activity WS bridge 测试断言用）。
+	// pump goroutine 并发写入，读写经 activityMu 保护。
+	activityMu         sync.Mutex
+	activityCalls      []string
+	shellActivityCalls []string
 }
 
 func (f *fakeTaskBackend) Create(ctx context.Context, projectID string, opts application.CreateTaskOptions) (application.TaskRow, error) {
@@ -122,6 +128,26 @@ func (f *fakeTaskBackend) ReadInitLog(ctx context.Context, taskID string) (strin
 }
 func (f *fakeTaskBackend) ReadPreDeleteLog(ctx context.Context, taskID string) (string, error) {
 	return "", nil
+}
+
+// 用户活动上报记录调用（WS bridge 测试断言上报时序与归属）。bridge pump 在独立
+// goroutine 回调，读写均经 activityMu 保护（WS 测试并发读快照）。
+func (f *fakeTaskBackend) RecordUserActivity(_ context.Context, taskID string) {
+	f.activityMu.Lock()
+	defer f.activityMu.Unlock()
+	f.activityCalls = append(f.activityCalls, taskID)
+}
+func (f *fakeTaskBackend) RecordShellUserActivity(_ context.Context, tid string) {
+	f.activityMu.Lock()
+	defer f.activityMu.Unlock()
+	f.shellActivityCalls = append(f.shellActivityCalls, tid)
+}
+
+// recordedActivityCalls 返回用户活动上报记录快照（并发安全）。
+func (f *fakeTaskBackend) recordedActivityCalls() []string {
+	f.activityMu.Lock()
+	defer f.activityMu.Unlock()
+	return append([]string(nil), f.activityCalls...)
 }
 
 // newAPITestServer 构造带 TaskBackend 的 Server。
@@ -355,7 +381,7 @@ func TestWSBridge_CtxCancel_PtyReadBlockingExits(t *testing.T) {
 			cancel()
 		}()
 		s := &Server{}
-		s.bridgeTerminal(ctx, c, p)
+		s.bridgeTerminal(ctx, c, p, func() {})
 	}))
 	defer srv.Close()
 

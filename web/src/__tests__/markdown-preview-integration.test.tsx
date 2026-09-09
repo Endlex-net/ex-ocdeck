@@ -26,6 +26,7 @@ vi.mock('../api', () => ({
       annotations: [],
       submitCapability: { state: 'unknown', reason: '' },
     }),
+    reportActivity: vi.fn(),
   },
   ApiError: class ApiError extends Error {
     constructor(

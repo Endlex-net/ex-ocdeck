@@ -150,6 +150,84 @@ export function GitPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, taskID]);
 
+  // 用户主动操作上报（idle-reminder-user-activity D4）：在区域容器捕获阶段集中监听，
+  // 嵌套组件（ReviewPanel/DiffViewer）手势天然复用同一入口；自动加载/刷新请求与
+  // 程序滚动（scroll 事件）不产生这些事件、不计为主动操作。wheel/touchmove 用 passive
+  // 监听，MUST NOT 阻止默认滚动。
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = panelRef.current;
+    if (!el) return;
+    // DR4（design D6）：六类手势共用 leading+trailing 节流，2s 窗口。
+    const WINDOW_MS = 2000;
+    let lastSentAt = -Infinity; // 单调时钟（performance.now()）；发送即计入窗口（含失败）
+    let pending: string | null = null; // 冷却期内首个手势的 taskID
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const send = (id: string) => {
+      lastSentAt = performance.now();
+      api.reportActivity(id); // fire-and-forget：失败不排队、不重放（D6 规则 6）
+    };
+
+    const clearTimer = () => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+
+    // 尽力补报冷却期积累的手势后清理定时器；无 pending 不发送（D6 规则 5）
+    const flushPending = () => {
+      clearTimer();
+      if (pending === null) return;
+      const id = pending;
+      pending = null;
+      send(id);
+    };
+
+    // 页面进入 hidden：定时器可能被浏览器暂停，立即尽力补报
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') flushPending();
+    };
+
+    const report = (event: Event) => {
+      // 仅可信事件（isTrusted=true，真实用户输入）上报；程序派发的 click/input 等
+      // isTrusted=false，MUST NOT 计为主动操作，也不改变节流状态（D6 规则 1）。
+      if (!event.isTrusted) return;
+      const now = performance.now();
+      if (now - lastSentAt >= WINDOW_MS) {
+        // leading：距上次发送已满 2s 的手势立即发送；滞留 pending 被本次发送覆盖
+        clearTimer();
+        pending = null;
+        send(taskID);
+        return;
+      }
+      // trailing：冷却期内仅首个手势置 pending，按原定时刻补报；后续手势不推迟（D6 规则 3）
+      if (pending !== null) return;
+      pending = taskID;
+      timer = setTimeout(() => {
+        timer = null;
+        const id = pending;
+        pending = null;
+        if (id !== null) send(id);
+      }, lastSentAt + WINDOW_MS - now);
+    };
+
+    const gestureTypes = ['click', 'keydown', 'input', 'touchstart'] as const;
+    const passiveTypes = ['wheel', 'touchmove'] as const;
+    for (const type of gestureTypes) el.addEventListener(type, report, { capture: true });
+    for (const type of passiveTypes) {
+      el.addEventListener(type, report, { capture: true, passive: true });
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      for (const type of gestureTypes) el.removeEventListener(type, report, { capture: true });
+      for (const type of passiveTypes) el.removeEventListener(type, report, { capture: true });
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      flushPending(); // 任务切换/卸载：尽力补报 pending（归属手势发生时的 taskID，不串报）
+    };
+  }, [taskID]);
+
   const allPaths = useMemo(() => (status?.files ?? []).map((f) => f.path), [status]);
   const effective = useMemo(
     () => (selected === null ? new Set(allPaths) : selected),
@@ -266,7 +344,7 @@ export function GitPanel({
   );
 
   return (
-    <div className="git-panel">
+    <div className="git-panel" ref={panelRef}>
       <div
         className={sideCollapsed ? 'git-side git-side-collapsed' : 'git-side'}
         // D6：宽度经 CSS 变量传递（桌面规则 width: var(--git-side-w, 340px)），

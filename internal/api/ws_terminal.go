@@ -79,7 +79,11 @@ func (s *Server) handleWSTUI(w http.ResponseWriter, r *http.Request) {
 	defer s.wsClients.unregister(key, c)
 
 	_ = c.Write(r.Context(), websocket.MessageText, mustJSON(wsAuthResp{Type: "auth_ok"}))
-	s.bridgeTerminal(bridgeCtx, c, p)
+	// idle-reminder-user-activity D3：WS 输入帧即用户主动操作，上报 path 中的 taskID
+	//（识别在 PTY 写入之前，不以写成功为前提）。
+	s.bridgeTerminal(bridgeCtx, c, p, func() {
+		s.tasks.RecordUserActivity(r.Context(), taskID)
+	})
 }
 
 // handleWSShell 处理 /ws/terminal/shell/:tid（shell 终端）。
@@ -139,7 +143,11 @@ func (s *Server) handleWSShell(w http.ResponseWriter, r *http.Request) {
 	defer s.wsClients.unregister(key, c)
 
 	_ = c.Write(r.Context(), websocket.MessageText, mustJSON(wsAuthResp{Type: "auth_ok"}))
-	s.bridgeTerminal(bridgeCtx, c, p)
+	// idle-reminder-user-activity D3：shell 输入帧上报 tid，由 task 层经
+	// taskIDFromSessionName 解析归属任务（解析失败静默忽略）。
+	s.bridgeTerminal(bridgeCtx, c, p, func() {
+		s.tasks.RecordShellUserActivity(r.Context(), tid)
+	})
 }
 
 // mustJSON 序列化为 JSON，失败返回空（仅用于内部固定响应）。
@@ -153,11 +161,14 @@ func mustJSON(v interface{}) []byte {
 //   - WS→PTY：二进制帧写入 PTY，JSON resize 控制帧调整尺寸；
 //   - 双向取消：任一方向退出即取消另一方向（Wait 不永久挂）。
 //
+// onInput（idle-reminder-user-activity D3）：WS→PTY 方向观察到用户输入帧时回调
+//（resize/空帧除外），由 handler 层注入上报入口。
+//
 // ctx 为 bridge 的 replaceCtx：被新连接替换（wsClientRegistry.register 返回的 cancel）或
 // HTTP 请求结束时会被取消。B4：ctx 取消路径 MUST NOT 抢先发 1000——被替换时由新连接负责
 // 发送 4009，正常结束（PTY/WS EOF，ctx 未被取消）才发 1000。故内部用独立 loopCtx 驱动双向
 // 退出，wg.Wait() 后按 ctx.Err() 区分：被取消→直接退出（不发 1000），否则发 1000。
-func (s *Server) bridgeTerminal(ctx context.Context, c *websocket.Conn, p *pty.Pty) {
+func (s *Server) bridgeTerminal(ctx context.Context, c *websocket.Conn, p *pty.Pty, onInput func()) {
 	loopCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -178,7 +189,7 @@ func (s *Server) bridgeTerminal(ctx context.Context, c *websocket.Conn, p *pty.P
 	go func() {
 		defer wg.Done()
 		defer cancel() // WS 退出即取消 PTY→WS 方向
-		pumpWSToPTY(loopCtx, c, p)
+		pumpWSToPTY(loopCtx, c, p, onInput)
 	}()
 
 	wg.Wait()
@@ -234,7 +245,11 @@ func pumpPTYToWS(ctx context.Context, c *websocket.Conn, p *pty.Pty) bool {
 
 // pumpWSToPTY 从 WS 读取并写入 PTY。二进制帧写入 PTY；JSON resize 控制帧调整尺寸。
 // ctx 取消或 WS 读错误即退出。
-func pumpWSToPTY(ctx context.Context, c *websocket.Conn, p *pty.Pty) {
+//
+// onInput（idle-reminder-user-activity D3）：非空 binary 帧与非空非 resize text 帧在
+// PTY 写入**之前**回调上报（活动代表"收到用户输入"，写入失败不撤销已观察到的输入，
+// DR2）；resize 命中仅 Resize、空帧（len==0）不上报，其余写入/退出行为不变。
+func pumpWSToPTY(ctx context.Context, c *websocket.Conn, p *pty.Pty, onInput func()) {
 	for {
 		typ, payload, err := c.Read(ctx)
 		if err != nil {
@@ -242,6 +257,9 @@ func pumpWSToPTY(ctx context.Context, c *websocket.Conn, p *pty.Pty) {
 		}
 		switch typ {
 		case websocket.MessageBinary:
+			if len(payload) > 0 {
+				onInput()
+			}
 			if _, err := p.Write(payload); err != nil {
 				return
 			}
@@ -252,6 +270,9 @@ func pumpWSToPTY(ctx context.Context, c *websocket.Conn, p *pty.Pty) {
 				_ = p.Resize(ctrl.Cols, ctrl.Rows)
 			} else {
 				// 非控制帧按二进制输入处理。
+				if len(payload) > 0 {
+					onInput()
+				}
 				if _, err := p.Write(payload); err != nil {
 					return
 				}

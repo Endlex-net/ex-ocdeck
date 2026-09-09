@@ -24,6 +24,7 @@ vi.mock('../api', () => ({
     listSubmissions: vi.fn(async () => ({ queue: [], history: [], failures: [] })),
     gitFileRead: vi.fn(),
     gitFileWrite: vi.fn(),
+    reportActivity: vi.fn(),
   },
   ApiError: class ApiError extends Error {
     constructor(

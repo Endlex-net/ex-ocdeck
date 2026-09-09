@@ -74,6 +74,14 @@ type TaskBackend interface {
 	// ReadPreDeleteLog 读取 pre-delete 日志（design.md §7.4/§8）：pre-delete.log，tail ≤64KB。
 	// 任务不存在 → not_found；无日志文件返回空串非错误。
 	ReadPreDeleteLog(ctx context.Context, taskID string) (string, error)
+
+	// 用户主动操作上报（idle-reminder-user-activity D5）：发布 task.user_activity
+	// 供 Notifier 取消该任务已武装的 idle 计时。无返回值：上报不产生 HTTP 可见副作用，
+	// 不触碰任务行（不推进 updated_at、不产生 task.activity_changed）。
+	// RecordShellUserActivity 的 tid 为 shell 终端 ID（shell tmux 会话名），
+	// 由实现层解析归属任务；解析失败静默忽略。
+	RecordUserActivity(ctx context.Context, taskID string)
+	RecordShellUserActivity(ctx context.Context, tid string)
 }
 
 // registerTaskRoutes 注册 tasks 路由（design.md §21）。
@@ -91,6 +99,8 @@ func (s *Server) registerTaskRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/tasks/{id}/restore", s.handleTaskAction(s.tasks.Restore))
 	mux.HandleFunc("POST /api/v1/tasks/{id}/retry", s.handleRetryTask)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/rerun-init", s.handleRerunInit)
+	// 用户活动上报（idle-reminder-user-activity D4）：空请求体，fire-and-forget。
+	mux.HandleFunc("POST /api/v1/tasks/{id}/activity", s.handleTaskActivity)
 	mux.HandleFunc("GET /api/v1/tasks/{id}/init-log", s.handleReadInitLog)
 	mux.HandleFunc("GET /api/v1/tasks/{id}/pre-delete-log", s.handleReadPreDeleteLog)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/attach/reopen", s.handleReopenAttach)
@@ -306,6 +316,21 @@ func (s *Server) handleTaskAction(fn func(ctx context.Context, taskID string) er
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+// handleTaskActivity POST /api/v1/tasks/{id}/activity（idle-reminder-user-activity D4）：
+// git 区域用户手势上报。空请求体（不解析 body）；先 Get 存在性校验——错误经既有
+// mapTaskErr 映射返回且 MUST NOT 发布；成功调 RecordUserActivity（发布
+// task.user_activity，不等待消费者）返回 204。任务存在但非 active 同样 204：
+// 消费端无该任务状态/无已武装计时自然 no-op。
+func (s *Server) handleTaskActivity(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("id")
+	if _, err := s.tasks.Get(r.Context(), taskID); err != nil {
+		writeApiError(w, mapTaskErr(err))
+		return
+	}
+	s.tasks.RecordUserActivity(r.Context(), taskID)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleReopenAttach(w http.ResponseWriter, r *http.Request) {
