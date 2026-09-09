@@ -23,6 +23,7 @@ import { debugMark } from '../debug';
 import { useMediaQuery } from '../hooks';
 import '@xterm/xterm/css/xterm.css';
 import './mobile.css';
+import './fonts.css'; // Nerd Font 图标字形 @font-face（terminal-links-emoji-icons design D3）
 
 interface TerminalViewProps {
   /** WS 路径，如 /ws/terminal/<taskID> 或 /ws/terminal/shell/<tid>。 */

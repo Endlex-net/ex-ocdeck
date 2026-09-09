@@ -1,0 +1,11 @@
+/* Nerd Font 图标字形回退（terminal-links-emoji-icons design D3）。
+ * 仅参与约定图标范围（PUA + 平面 15/16 补充符号区），杜绝正文/其他缺字误用图标字体；
+ * font-display: block 短暂阻塞字形绘制，避免首绘豆腐块缓存，就绪后由 session 补渲染。
+ * 由 TerminalView.tsx import（与 mobile.css 同模式），字体文件随 vite 打包进 dist 嵌入二进制。 */
+@font-face {
+  font-family: 'Symbols Nerd Font Mono';
+  src: url('../assets/fonts/SymbolsNerdFontMono-Regular.ttf') format('truetype');
+  font-display: block;
+  /* N3：仅参与约定图标范围，杜绝正文/其他缺字误用图标字体 */
+  unicode-range: U+E000-F8FF, U+F0000-FFFFD, U+100000-10FFFD;
+}

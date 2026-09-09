@@ -6,15 +6,20 @@ import { act } from 'react';
  * 的 resize 持久化接线测试复用（原语本身的行为覆盖见 resize.test.tsx，此处仅做接线桩）。 */
 
 /* ---------- pointer capture 记录型桩（jsdom 未实现；afterAll 恢复原状） ---------- */
+// node 环境无 Element：nativeCapture 置空，installPointerCaptureStubs 直接跳过
+const nativeCapture =
+  typeof Element !== 'undefined'
+    ? {
+        set: Element.prototype.setPointerCapture,
+        has: Element.prototype.hasPointerCapture,
+        release: Element.prototype.releasePointerCapture,
+      }
+    : { set: undefined, has: undefined, release: undefined };
 const capturedPointers = new Set<number>();
-const nativeCapture = {
-  set: Element.prototype.setPointerCapture,
-  has: Element.prototype.hasPointerCapture,
-  release: Element.prototype.releasePointerCapture,
-};
 
-/** 每个测试文件环境调用一次（模块顶层）。 */
+/** 每个测试文件环境调用一次（模块顶层）；无 DOM 环境为 no-op。 */
 export function installPointerCaptureStubs(): void {
+  if (typeof Element === 'undefined') return;
   Element.prototype.setPointerCapture = function setPointerCapture(pointerId: number) {
     capturedPointers.add(pointerId);
   };
@@ -25,9 +30,9 @@ export function installPointerCaptureStubs(): void {
     capturedPointers.delete(pointerId);
   };
   afterAll(() => {
-    Element.prototype.setPointerCapture = nativeCapture.set;
-    Element.prototype.hasPointerCapture = nativeCapture.has;
-    Element.prototype.releasePointerCapture = nativeCapture.release;
+    Element.prototype.setPointerCapture = nativeCapture.set!;
+    Element.prototype.hasPointerCapture = nativeCapture.has!;
+    Element.prototype.releasePointerCapture = nativeCapture.release!;
   });
 }
 
