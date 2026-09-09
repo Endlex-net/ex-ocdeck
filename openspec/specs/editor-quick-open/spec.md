@@ -122,7 +122,7 @@ localStorage 契约：键 `ocdeck.editorTools.vscode` 与 `ocdeck.editorTools.go
 
 VSCode 分支 MUST 为：对归一化路径按 `/` 分段，每段做 URI 组件编码（空格、`#`、`?`、`%`、`&` 等保留字符必须编码），Windows 盘符段的冒号保留字面（如 `C:`），以 `/` 重新连接后去掉开头的 `/`，拼到 `vscode://file/` 前缀之后；随后将结果路径的尾部 `/` 收敛为恰好一个（归一化路径已带一个或多个尾斜杠时 MUST NOT 重复追加，多余尾斜杠收敛为一个）。该尾斜杠收敛仅属于 VSCode 分支。
 
-GoLand 分支 MUST 为：`jetbrains://goland/navigate/reference?project=` 后接**对归一化路径整体做一次查询值编码**（`/` 编码为 `%2F`、盘符冒号编码为 `%3A`、空格编码为 `%20`、`%` 编码为 `%25`）；MUST NOT 复用 VSCode 分支的分段编码结果，MUST NOT 二次编码。
+GoLand 分支 MUST 为：`goland://open?file=` 后接**对归一化路径整体做一次查询值编码**（`/` 编码为 `%2F`、盘符冒号编码为 `%3A`、空格编码为 `%20`、`%` 编码为 `%25`）；MUST NOT 复用 VSCode 分支的分段编码结果，MUST NOT 二次编码。
 
 `worktree_path` 为空或缺失时 MUST NOT 构造 URI、MUST NOT 触发唤起（入口禁用态见「任务详情页快捷打开入口」）。
 
@@ -144,12 +144,12 @@ GoLand 分支 MUST 为：`jetbrains://goland/navigate/reference?project=` 后接
 #### Scenario: Windows 路径归一（GoLand）
 
 - **WHEN** 任务 `worktree_path` 为 `C:\work\my proj` 且用户以 GoLand 打开
-- **THEN** 触发的 URI 为 `jetbrains://goland/navigate/reference?project=C%3A%2Fwork%2Fmy%20proj`
+- **THEN** 触发的 URI 为 `goland://open?file=C%3A%2Fwork%2Fmy%20proj`
 
 #### Scenario: 含百分号路径单次编码（GoLand）
 
 - **WHEN** 任务 `worktree_path` 为 `/tmp/a b%c` 且用户以 GoLand 打开
-- **THEN** 触发的 URI 为 `jetbrains://goland/navigate/reference?project=%2Ftmp%2Fa%20b%25c`（`%` 编码为 `%25`，不出现双重编码）
+- **THEN** 触发的 URI 为 `goland://open?file=%2Ftmp%2Fa%20b%25c`（`%` 编码为 `%25`，不出现双重编码）
 
 ### Requirement: 自定义唤起 URI 模板
 
@@ -191,7 +191,7 @@ GoLand 分支 MUST 为：`jetbrains://goland/navigate/reference?project=` 后接
 #### Scenario: scheme 不符回退内置
 
 - **WHEN** GoLand 工具配置的模板为 `vscode://file{path}`（scheme 不属于 GoLand 允许前缀），用户以 GoLand 打开 `/Users/me/proj`
-- **THEN** 按内置 GoLand 分支构造 URI（`jetbrains://goland/navigate/reference?project=%2FUsers%2Fme%2Fproj`）
+- **THEN** 按内置 GoLand 分支构造 URI（`goland://open?file=%2FUsers%2Fme%2Fproj`）
 
 #### Scenario: 保存空模板清除恢复内置
 

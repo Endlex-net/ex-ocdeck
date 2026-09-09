@@ -184,13 +184,11 @@ describe('buildEditorUri（编辑器唤起 URI 构造，spec Scenario 逐条）'
   });
 
   it('GoLand：Windows 路径归一后整体一次编码', () => {
-    expect(buildEditorUri('goland', 'C:\\work\\my proj')).toBe(
-      'jetbrains://goland/navigate/reference?project=C%3A%2Fwork%2Fmy%20proj',
-    );
+    expect(buildEditorUri('goland', 'C:\\work\\my proj')).toBe('goland://open?file=C%3A%2Fwork%2Fmy%20proj');
   });
 
   it('GoLand：含百分号路径单次编码（% → %25，不双重编码）', () => {
-    expect(buildEditorUri('goland', '/tmp/a b%c')).toBe('jetbrains://goland/navigate/reference?project=%2Ftmp%2Fa%20b%25c');
+    expect(buildEditorUri('goland', '/tmp/a b%c')).toBe('goland://open?file=%2Ftmp%2Fa%20b%25c');
   });
 
   it('空路径返回空串', () => {
@@ -274,7 +272,7 @@ describe('buildEditorUri 模板分支（spec「自定义唤起 URI 模板」Scen
 
   it('scheme 不符（goland 工具配 vscode 模板）回退内置 goland 分支', () => {
     expect(buildEditorUri('goland', '/Users/me/proj', 'vscode://file{path}')).toBe(
-      'jetbrains://goland/navigate/reference?project=%2FUsers%2Fme%2Fproj',
+      'goland://open?file=%2FUsers%2Fme%2Fproj',
     );
   });
 

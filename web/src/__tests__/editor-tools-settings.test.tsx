@@ -161,7 +161,7 @@ describe('设置页「自定义唤起 URI 模板」输入（add-frontend-tool-qu
   it('placeholder 为内置默认模板；能力说明 hint 呈现', () => {
     const { container } = mountSettings();
     expect(templateInput(container, 'vscode').placeholder).toBe('vscode://file{path}/');
-    expect(templateInput(container, 'goland').placeholder).toBe('jetbrains://goland/navigate/reference?project={path}');
+    expect(templateInput(container, 'goland').placeholder).toBe('goland://open?file={path}');
     expect(container.textContent).toContain('vscode://vscode-remote/ssh-remote+<主机>{path}');
     expect(container.textContent).toContain('需本机已安装 Remote-SSH 扩展且 SSH 可达');
     expect(container.textContent).toContain('GoLand 不存在通过 URL 打开远程项目的可用形式');

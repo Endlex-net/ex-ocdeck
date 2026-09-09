@@ -139,7 +139,7 @@ export function buildEditorUri(tool: EditorTool, path: string, template?: string
   if (template != null && isValidUriTemplate(tool, template)) {
     return template.split('{path}').join(encodeTemplatePath(normalized));
   }
-  if (tool === 'goland') return `jetbrains://goland/navigate/reference?project=${encodeURIComponent(normalized)}`;
+  if (tool === 'goland') return `goland://open?file=${encodeURIComponent(normalized)}`;
   const encoded = normalized
     .split('/')
     .map((seg, i) => (i === 0 && /^[A-Za-z]:$/.test(seg) ? seg : encodeURIComponent(seg)))
