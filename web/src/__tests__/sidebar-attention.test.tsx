@@ -12,6 +12,7 @@ let storeProjects: Project[] = [];
 
 vi.mock('../hooks', () => ({
   useProjects: () => ({ projects: storeProjects }),
+  useMediaQuery: () => false,
 }));
 
 vi.mock('../components/ServerStatusBanner', () => ({ ServerStatusBanner: () => null }));

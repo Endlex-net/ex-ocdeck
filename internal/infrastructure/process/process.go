@@ -13,6 +13,14 @@
 // 无响应无泄露，DCS 透传恰好一份）；<3.3 或版本不可解析保持/恢复 external。
 // 不启用 allow-passthrough all（不可见 pane 也透传，攻击面更大）。最低仍是 3.2。
 //
+// 键盘配置（design D1）：tmux extended-keys 默认 off，pane 侧重编码时 Shift+Enter
+// 会退化为 \r（shift 丢失）。NewSession 以纯配置链 `start-server \; set -s
+// exit-empty off \; set -s extended-keys on`（单次 execTmux，";" 为 argv 分隔元素）
+// 在首个 pane 创建前完成 server 级配置——配置晚于 pane 的 `CSI >4;1m` 请求则无效
+// （竞态已实证）；EnsureServerOptions 幂等重放 extended-keys on 并恢复 exit-empty on
+// （前置链曾临时置 off 防空 server 立即退出）。extended-keys 需 tmux >= 3.2，版本
+// 门禁仅作用于该步（start-server/exit-empty 为古老命令无需门禁）。
+//
 // 进程身份（pid+startTime）MUST NOT 出本包：对外 notice/接口一律使用 opaque
 // cleanup ticket 字符串，包内编码 pid+startTime+pgid。
 package process
@@ -93,6 +101,12 @@ type Manager struct {
 	// execTmuxFn 测试注入点：非 nil 时 execTmux 委托给它（用于观测 ctx deadline 等，
 	// 避免测试依赖 5s 真实墙钟）。生产留空走真实 exec.CommandContext 路径。
 	execTmuxFn func(ctx context.Context, args ...string) (stdout, stderr string, err error)
+	// mu 串行化同一 tmux server 的「前置配置—new-session—失败恢复 exit-empty」
+	// 事务窗口与独立的 EnsureServerOptions（design D1 并发约束 I1）：排除
+	// 「A 失败恢复 exit-empty on → 空 server 退出 → B 的 new-session 拉起未配置
+	// 的默认 server」交错。NewSession 尾部调用经不重复加锁的
+	// ensureServerOptionsLocked 复用同一路径。
+	mu sync.Mutex
 }
 
 // Options 构造 Manager 的可注入参数，便于测试隔离。
@@ -503,22 +517,136 @@ func (m *Manager) NewSession(spec SessionSpec) error {
 	cmdString := buildShellCommand(spec.CmdArgv)
 	args = append(args, "--", cmdString)
 
+	// 并发约束（design D1 I1）：互斥锁覆盖「前置配置—new-session—失败恢复
+	// exit-empty」事务窗口与尾部 EnsureServerOptions，另一方的前置配置 MUST 等
+	// 本方事务（含失败恢复）完整落定后才开始。
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// server 前置初始化（design D1 修复方案第 1 步）：键盘配置必须先于首个 pane
+	// 创建生效。
+	m.ensureServerPrechain()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_, stderr, err := m.execTmux(ctx, args...)
 	if err != nil {
-		return fmt.Errorf("process: NewSession %s: %w", spec.Name, err)
+		// 创建失败：立即 best-effort 恢复 exit-empty on（前置链曾临时置 off 防空
+		// server 立即退出）。保留原创建错误，恢复失败汇总；不 kill-server、不影响
+		// 已有会话。
+		createErr := fmt.Errorf("process: NewSession %s: %w", spec.Name, err)
+		if rerr := m.restoreExitEmpty(); rerr != nil {
+			return errors.Join(createErr, rerr)
+		}
+		return createErr
 	}
 	_ = stderr
 	// 会话创建会拉起 tmux server；此时再设 server option，避免无 server 时
 	// set-option 自己起一个空 server。剪贴板为 best-effort，失败只记日志。
-	if optErr := m.EnsureServerOptions(); optErr != nil {
+	if optErr := m.ensureServerOptionsLocked(); optErr != nil {
 		log.Printf("process: EnsureServerOptions after NewSession %s: %v", spec.Name, optErr)
 	}
 	return nil
 }
 
-// EnsureServerOptions 幂等设置专属 tmux server 的剪贴板选项，按版本分段、fail-closed：
+// ensureServerPrechain 执行 NewSession 前置链（design D1 修复方案第 1 步）：单次
+// execTmux 纯配置链，不创建会话——`start-server \; set-option -s exit-empty off \;
+// set-option -s extended-keys on`（set-option 即 tmux set 别名，沿用包内既有命令名）。
+// start-server 显式拉起 server；exit-empty off 防空 server 立即退出（实证 F）；
+// server 命令队列顺序处理 → extended-keys on 先于任何 pane 创建生效（实证 G）。
+// 版本门禁仅作用于 extended-keys：< 3.2 或版本不可解析时仅跳过该段并记日志，
+// start-server/exit-empty 段照常执行。链失败（含低版本不支持）→ 记日志后继续
+// new-session（降级旧行为），由 EnsureServerOptions 步骤②幂等重试。
+func (m *Manager) ensureServerPrechain() {
+	vctx, vcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	version := m.tmuxVersion(vctx)
+	vcancel()
+	args := []string{"start-server", ";", "set-option", "-s", "exit-empty", "off"}
+	if tmuxVersionAtLeast(version, 3, 2) {
+		args = append(args, ";", "set-option", "-s", "extended-keys", "on")
+	} else {
+		log.Printf("process: skip extended-keys in server prechain (tmux %q < 3.2 or unparsable)", version)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, err := m.execTmux(ctx, args...); err != nil {
+		log.Printf("process: server prechain failed, continuing with new-session: %v", err)
+	}
+}
+
+// EnsureServerOptions 幂等配置专属 tmux server 的全部目标选项（design D1 三步）：
+//
+//  ①剪贴板配置（ensureClipboardOptions，内部版本分段/安全顺序/fail-closed 补救
+//    语义一字不动）；
+//  ②幂等 set -s extended-keys on（<3.2 或版本不可解析时仅跳过本步记日志）；
+// ③恢复 set -s exit-empty on（前置链曾临时置 off，恢复既有生命周期语义：全部
+//    会话结束后 server 自动退出）。
+//
+// 三步互相独立、互不跳过：除确定无 server（ErrNoTmuxServer 直通返回，无 server 即
+// 无任何可配置对象）外，任一步失败 MUST 仍执行其余步骤，各步错误 errors.Join 汇总
+// 返回，不吞掉。步骤②③均以独立 fresh ctx 执行（前置步骤/版本探测可能耗尽共享
+// deadline，恢复类操作 MUST 不依赖它）。调用方（NewSession/reconcile）一律
+// best-effort 记日志，不阻断。
+//
+// 并发（design D1 I1）：经 Manager 互斥锁串行化；NewSession 尾部已持锁，走
+// ensureServerOptionsLocked 复用同一路径不重复加锁。
+func (m *Manager) EnsureServerOptions() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ensureServerOptionsLocked()
+}
+
+// ensureServerOptionsLocked 是 EnsureServerOptions 的不加锁内部路径：调用方
+// MUST 已持有 m.mu（NewSession 事务窗口尾部复用，避免重复加锁死锁）。
+// 三步语义与公开方法完全一致（见上）。
+func (m *Manager) ensureServerOptionsLocked() error {
+	var errs []error
+	// 步骤①：剪贴板配置（既有安全顺序与 fail-closed 补救语义不变）。
+	if err := m.ensureClipboardOptions(); err != nil {
+		if errors.Is(err, ErrNoTmuxServer) {
+			return err
+		}
+		errs = append(errs, err)
+	}
+	// 步骤②：extended-keys on（幂等；extended-keys 需 tmux >= 3.2）。
+	if err := m.ensureExtendedKeys(); err != nil {
+		if errors.Is(err, ErrNoTmuxServer) {
+			return err
+		}
+		errs = append(errs, err)
+	}
+	// 步骤③：恢复 exit-empty on（server 生命周期语义与现状一致，实证 G）。
+	if err := m.restoreExitEmpty(); err != nil {
+		if errors.Is(err, ErrNoTmuxServer) {
+			return err
+		}
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// ensureExtendedKeys 幂等置 extended-keys on（server 选项）：off 时 pane 侧重编码
+// 的 Shift+Enter 退化为 \r（design D1 根因）。版本门禁仅作用于本步：< 3.2 或版本
+// 不可解析时跳过并记日志（不算错误）。版本探测与 set-option 各用独立 ctx。
+func (m *Manager) ensureExtendedKeys() error {
+	vctx, vcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	version := m.tmuxVersion(vctx)
+	vcancel()
+	if !tmuxVersionAtLeast(version, 3, 2) {
+		log.Printf("process: skip extended-keys on (tmux %q < 3.2 or unparsable)", version)
+		return nil
+	}
+	return m.setTmuxOptionFreshCtx("s", "extended-keys", "on")
+}
+
+// restoreExitEmpty 恢复 exit-empty on（server 选项，独立有效超时）：NewSession
+// 前置链将其临时置 off 防空 server 立即退出，创建成败落定后 MUST 恢复既有语义——
+// 全部会话结束后 server 自动退出（design D1 实证 G）。
+func (m *Manager) restoreExitEmpty() error {
+	return m.setTmuxOptionFreshCtx("s", "exit-empty", "on")
+}
+
+// ensureClipboardOptions 幂等设置专属 tmux server 的剪贴板选项，按版本分段、fail-closed：
 //
 //   - tmux >= 3.7：先 get-clipboard off（3.2–3.6 的 get-clipboard 默认
 //     buffer，若在其上开 set-clipboard on，pane 发 OSC 52 查询会拿到全 server 共享的
@@ -543,9 +671,9 @@ func (m *Manager) NewSession(spec SessionSpec) error {
 // 实测对 set-clipboard 用 -g 仍落 server 表（-g 被忽略），不得依赖这种巧合。
 //
 // 补救用独立 fresh ctx（版本检查可能耗尽共享 deadline）；恢复失败与原错误用
-// errors.Join 合并返回，不得吞掉。调用方（NewSession/reconcile）一律 best-effort
-// 记日志，不阻断。ErrNoTmuxServer 是唯一例外：无 server 即无遗留状态，无需补救。
-func (m *Manager) EnsureServerOptions() error {
+// errors.Join 合并返回，不得吞掉。调用方（EnsureServerOptions 步骤①）按步骤
+// 语义处理错误；ErrNoTmuxServer 是唯一例外：无 server 即无遗留状态，无需补救。
+func (m *Manager) ensureClipboardOptions() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	version := m.tmuxVersion(ctx)

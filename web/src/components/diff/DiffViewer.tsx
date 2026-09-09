@@ -5,6 +5,7 @@ import { EditorView } from '@codemirror/view';
 import { MergeView, unifiedMergeView } from '@codemirror/merge';
 import { editableExtensions, editorTheme, readOnlyExtensions } from '../editor/extensions';
 import { extractExtension, loadLanguage } from '../editor/language';
+import { ResizeHandle, usePersistedSize } from '../resize';
 import type {
   Annotation,
   AnnotationCreateInput,
@@ -115,6 +116,51 @@ function deriveDiffState(diff: GitDiffResult): DiffState {
   return { kind: 'merge' };
 }
 
+/**
+ * D7：MergeView 无公开 splitter API——比例经 a/b EditorView 的公开 dom 属性定位包装节点，
+ * 校验其确为 .cm-mergeViewEditor flex item（a=old、b=new，以构造参数 a/b 为准）后应用内联
+ * flex: 0 0 <pct>%。锁定版本 @codemirror/merge 6.12.2 的 DOM 结构已实证：
+ * cm-mergeView > cm-mergeViewEditors > cm-mergeViewEditor(wrapA|wrapB) > EditorView.dom，
+ * wrapper 样式 flexGrow:1/flexBasis:0（内联 flex 覆盖）。
+ * 节点关系校验失败返回 false（安全退出：禁用 handle、console.warn、不写布局/比例）。
+ */
+/** a/b 两侧的 .cm-mergeViewEditor wrapper（结构校验失败返回 null）。 */
+function mergeWrappers(view: MergeView | null): [HTMLElement, HTMLElement] | null {
+  if (!view) return null;
+  const wrapA = view.a.dom.parentElement;
+  const wrapB = view.b.dom.parentElement;
+  if (
+    !wrapA ||
+    !wrapB ||
+    !wrapA.classList.contains('cm-mergeViewEditor') ||
+    !wrapB.classList.contains('cm-mergeViewEditor') ||
+    wrapA.parentElement !== wrapB.parentElement
+  ) {
+    return null;
+  }
+  return [wrapA, wrapB];
+}
+
+function applySplitRatio(view: MergeView | null, ratio: number): boolean {
+  const wrappers = mergeWrappers(view);
+  if (!wrappers) {
+    console.warn('[DiffViewer] MergeView 实例不可用或 DOM 结构变化，diff 分栏拖宽已禁用');
+    return false;
+  }
+  wrappers[0].style.flex = `0 0 ${(ratio * 100).toFixed(2)}%`;
+  wrappers[1].style.flex = `0 0 ${((1 - ratio) * 100).toFixed(2)}%`;
+  return true;
+}
+
+/** L1：清除已施加的内联比例、恢复 wrapper 主题默认——双侧→单侧转换不一定重建编辑器
+ * （重建 deps 不含存在性），不清除则残留比例压过 .diff-collapse-* 空侧坍缩规则产生不可见占位。 */
+function clearSplitRatio(view: MergeView | null): void {
+  const wrappers = mergeWrappers(view);
+  if (!wrappers) return;
+  wrappers[0].style.removeProperty('flex');
+  wrappers[1].style.removeProperty('flex');
+}
+
 interface InlineDraftState {
   editorKey: 'a' | 'b' | 'u';
   side: DiffSide;
@@ -166,6 +212,8 @@ export default function DiffViewer({
   const wrapRef = useRef<HTMLDivElement>(null);
   const editorsRef = useRef<{ a?: EditorView; b?: EditorView; u?: EditorView }>({});
   const sessionRef = useRef<EditSession | null>(null);
+  /** D7：当前 side-by-side MergeView 实例（比例应用目标；销毁-重建时同步替换）。 */
+  const mergeViewRef = useRef<MergeView | null>(null);
   /** F3：退出事务期间经 compartment 把新侧编辑器切只读过渡态（保留 session 直至刷新完成）。 */
   const editLockCompartment = useRef(new Compartment());
 
@@ -250,6 +298,66 @@ export default function DiffViewer({
     () => filterByTriple(annotations, { path, ref: sourceRef, untracked }),
     [annotations, path, sourceRef, untracked],
   );
+
+  // ---------- D7：diff 并排分栏比例（design D7） ----------
+  // enabled 谓词 = 源码模式（非预览）+ merge 渲染状态 + side-by-side + 双侧文件均存在。
+  // 单侧坍缩 MUST NOT 应用比例（既有 .diff-collapse-a/b 空侧 flex:0 0 0 优先，内联比例会产生
+  // 不可见占位区）、不显示 handle、不访问存储；已加载内存偏好保留供返回双侧时恢复。
+  const ratioEnabled =
+    state.kind === 'merge' && !previewActive && mode === 'side-by-side' && !singleSided;
+  const ratio = usePersistedSize('ocdeck:diff-split-ratio', 0.5, 0.2, 0.8, ratioEnabled);
+  const ratioRef = useRef(ratio.value);
+  ratioRef.current = ratio.value; // 异步创建完成时读取最新比例（同 selFileRef 模式）
+  const singleSidedRef = useRef(singleSided);
+  singleSidedRef.current = singleSided; // 异步创建完成时读取最新存在性（存在性不进重建 deps）
+  /** 中缝就绪代际 token = 已创建且 DOM 校验通过的那轮编辑器重建的对象身份（L2）。
+   *  handle 渲染条件在 render 期按引用比对：重建输入变化的那次提交 token 变化 → handle 即刻卸载——
+   *  layout cleanup 先于旧实例 passive cleanup（view.destroy）取消在途拖拽事务（L3 / D4 失效先于销毁）；
+   *  回切到相同输入（A→B→A）得到新 token，旧就绪代际不再匹配（L5：新实例创建+校验完成前不暴露 handle）。 */
+  const [seamGenToken, setSeamGenToken] = useState<object | null>(null);
+  // 编辑器重建代际 token：deps 与下方创建 effect 严格一致（两处改动须同步；比例 MUST NOT 进重建 deps）。
+  // 用对象身份而非输入值序列化——输入不变时 memo 命中同一引用，回切相同输入（值相等）得到新引用。
+  const rebuildToken = useMemo(
+    () => ({}),
+    [state.kind, mode, wrapOverride, diff.oldContent, diff.newContent, path, editPhase, docEpoch, previewActive],
+  );
+  /** 有效容器宽度 = .diff-editor contentBox 宽（ratio 换算 10px/宽度与中缝 left 定位）。 */
+  const [editorWidth, setEditorWidth] = useState(0);
+
+  // 中缝有效宽度跟踪：.diff-editor 左右 padding 为 0，clientWidth 即内容盒宽；
+  // 宽度为 0（未完成布局测量）时不启动拖拽/键盘步进
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || !ratioEnabled) return;
+    const sync = () => setEditorWidth(el.clientWidth);
+    sync();
+    const observer = new ResizeObserver(sync);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [ratioEnabled]);
+
+  // 比例变化（存储载入/拖拽/键盘）应用到已创建的 MergeView——比例不在重建 deps 中（见创建 effect），
+  // 经 mergeViewRef 取当前实例。禁用转换（双侧→单侧可能不重建编辑器）时清除已施加的内联比例（L1）；
+  // 应用失败（DOM 结构变化）→ 就绪代际作废，handle 随即卸载并取消在途拖拽事务（L2/L3）
+  useEffect(() => {
+    if (!ratioEnabled) {
+      clearSplitRatio(mergeViewRef.current);
+      return;
+    }
+    const view = mergeViewRef.current;
+    if (!view) return;
+    setSeamGenToken(applySplitRatio(view, ratio.value) ? rebuildToken : null);
+  }, [ratioEnabled, ratio.value, rebuildToken]);
+
+  /** L2：提交前同步校验当前实例关系——失败作废就绪代际并拒绝提交（不写布局/存储）。 */
+  const commitRatio = (next: number) => {
+    if (!applySplitRatio(mergeViewRef.current, next)) {
+      setSeamGenToken(null);
+      return;
+    }
+    ratio.commitSize(next);
+  };
+
   const session = sessionRef.current;
   void sessionTick; // session 事件驱动重渲染
 
@@ -753,6 +861,9 @@ export default function DiffViewer({
   useEffect(() => {
     // D3：预览激活时短路，不创建 CodeMirror 实例（预览分支不渲染 containerRef）
     if (state.kind !== 'merge' || previewActive || !containerRef.current) return;
+    // L3：handle 失效已在 render 期判定（seamGenToken !== rebuildToken → 本次提交即卸载 handle，
+    // layout cleanup 先于本 effect 的 passive cleanup 取消在途拖拽事务），此处无需再翻状态
+    const gen = rebuildToken; // 本轮创建对应的代际 token（async 期间以闭包固定）
     // 批注 6：编辑器销毁-重建时关闭内联批注区——宿主 block widget 随旧编辑器销毁，
     // 草稿锚点无法跨重建保留（进入编辑前 enterEdit 已先行关闭，此处覆盖形态/换行切换）
     closeDraft();
@@ -806,7 +917,7 @@ export default function DiffViewer({
       ];
 
       if (mode === 'side-by-side') {
-        view = new MergeView({
+        const mergeView = new MergeView({
           parent: container,
           a: { doc: diff.oldContent, extensions: editing ? [...readOnlyExtensions, editorTheme, ...wrapExt, ...langExt] : viewExtensions('old') },
           b: editing
@@ -817,7 +928,9 @@ export default function DiffViewer({
           collapseUnchanged,
           diffConfig,
         });
-        editorsRef.current = { a: view.a, b: view.b };
+        view = mergeView;
+        editorsRef.current = { a: mergeView.a, b: mergeView.b };
+        mergeViewRef.current = mergeView;
       } else {
         view = new EditorView({
           parent: container,
@@ -836,13 +949,25 @@ export default function DiffViewer({
         editorsRef.current = { u: view };
       }
       if (!editing) applyAnnotationsRef.current();
+      // D7：MergeView 实际创建完成后（loadLanguage await、destroyed 检查通过）应用持久化比例，
+      // 校验通过才标记本轮代际就绪（handle 恢复交互）；存在性经 ref 取最新值（异步窗口内可能翻转
+      // 且不触发重建）；单侧坍缩不应用；失败保持不可交互
+      if (
+        mergeViewRef.current &&
+        !singleSidedRef.current &&
+        applySplitRatio(mergeViewRef.current, ratioRef.current)
+      ) {
+        setSeamGenToken(gen);
+      }
     })();
     return () => {
       destroyed = true;
       view?.destroy();
       editorsRef.current = {};
+      mergeViewRef.current = null;
     };
     // state 为每次 render 新建对象，deps 取 kind 原始值避免无关 rerender 重建编辑器；
+    // 此 deps 与上方 rebuildToken 的 memo deps 严格一致（改动须两处同步；比例 MUST NOT 进重建 deps）；
     // 编辑模式进出与 discard/restore（docEpoch）走同一销毁-重建路径；进出预览经 previewActive 短路/重建（D3）
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.kind, mode, wrapOverride, diff.oldContent, diff.newContent, path, editPhase, docEpoch, previewActive]);
@@ -1115,7 +1240,27 @@ export default function DiffViewer({
             <div
               ref={containerRef}
               className={collapseSide ? `diff-editor diff-collapse-${collapseSide}` : 'diff-editor'}
-            />
+            >
+              {/* D7：中缝拖宽把手——绝对定位于比例处（left = ratio × 容器内容盒宽）；
+                  仅当前轮代际 token 就绪时渲染（异步创建窗口/单侧坍缩/预览/校验失败均不渲染） */}
+              {ratioEnabled && seamGenToken === rebuildToken && (
+                <ResizeHandle
+                  mode="ratio"
+                  value={ratio.value}
+                  min={0.2}
+                  max={0.8}
+                  containerWidth={editorWidth}
+                  onDrag={ratio.setSize}
+                  onCommit={commitRatio}
+                  style={{
+                    position: 'absolute',
+                    top: 0,
+                    left: `calc(${(ratio.value * 100).toFixed(2)}% - 3px)`,
+                    zIndex: 30,
+                  }}
+                />
+              )}
+            </div>
           )}
           {/* 批注 6：内联批注区（参考 GitLab 变更评论）——portal 挂进 CM block widget 宿主，
               在该侧最后选中行下方切开，随编辑器滚动，无悬浮浮层；D4：仅在非预览激活时显示 */}

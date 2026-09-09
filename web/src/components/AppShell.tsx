@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { useHashRoute, resolveRoute } from '../router';
-import { useProjects } from '../hooks';
+import { useMediaQuery, useProjects } from '../hooks';
+import { requestTerminalFocus } from '../terminal/focus-request';
+import { ResizeHandle, usePersistedSize } from './resize';
 import { ServerStatusBanner } from './ServerStatusBanner';
 import { orderSidebarGroups, transitionalLabel } from './sidebar-order';
 import type { Project } from '../types';
@@ -59,6 +61,10 @@ export function AppShell({
   const { projects } = useProjects();
 
   const [collapsed, setCollapsed] = useState(() => readCollapsed());
+  // D5：侧栏宽度持久化（ocdeck:sidebar-width，int px ∈ [180,480]，默认 232）。
+  // 折叠只切 body class 不动 width state——⌘B 展开恢复持久化宽度。
+  const sidebar = usePersistedSize('ocdeck:sidebar-width', 232, 180, 480, true);
+  const narrowTop = useMediaQuery('(max-width: 767px)');
 
   // 同步 body.od-side-collapsed（与 design-system.css 折叠规则、ocdeck-sidebar.js 行为一致）。
   useEffect(() => {
@@ -90,7 +96,12 @@ export function AppShell({
   const fullbleed = res.kind === 'page' && res.page === 'task';
 
   return (
-    <div className="od-shell">
+    <div
+      className="od-shell"
+      // D5：宽度经 CSS 变量下发（.od-sidebar 消费 var(--sidebar-w)），不直接写 width；
+      // 折叠态 body.od-side-collapsed 的 60px 规则特异性更高、天然优先
+      style={{ '--sidebar-w': `${sidebar.value}px` } as React.CSSProperties}
+    >
       <aside className="od-sidebar" data-od-id="sidebar">
         <div className="od-brand">
           <span className="od-brand-mark">oc</span>
@@ -175,6 +186,18 @@ export function AppShell({
         </div>
       </aside>
 
+      {/* D5：侧栏拖宽把手（.od-sidebar 右缘 6px 热区）；折叠（图标轨）与 ≤767px 顶栏形态不渲染 */}
+      {!collapsed && !narrowTop && (
+        <ResizeHandle
+          mode="px"
+          value={sidebar.value}
+          min={180}
+          max={480}
+          onDrag={sidebar.setSize}
+          onCommit={sidebar.commitSize}
+        />
+      )}
+
       <div className="od-main">
         {/* ServerStatusBanner 壳层内全页面可见（spec）：作为 .od-content 的兄弟，
             不参与内容区滚动/高度链，避免工作台 fullbleed 时 banner+100% 溢出。 */}
@@ -211,6 +234,9 @@ function SidebarTaskGroups({ projects, currentTaskID }: { projects: Project[]; c
                 href={`#/task/${t.id}`}
                 aria-current={currentTaskID === t.id ? 'page' : undefined}
                 title={transLabel ? `${t.name}（${transLabel}）` : t.name}
+                // 导航焦点请求信号（design D3）：导航仍走原生 href，点击后由目标任务
+                // TUI TerminalView 经门禁消费聚焦（覆盖同 taskID 再次点击）
+                onClick={() => requestTerminalFocus(t.id)}
               >
                 {/* 过渡态（创建中/激活中/挂起中）：spinner 呈现；其余沿用 agent 状态点。
                     待人工（attention_count>0）蓝点优先于运行态：圆点表达状态语言，

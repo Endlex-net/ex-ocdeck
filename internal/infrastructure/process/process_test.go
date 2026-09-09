@@ -705,6 +705,30 @@ func optCalls(calls [][]string) [][]string {
 // set-clipboard 是 server 选项，-s 写 server 表）。
 var clipboardExternal = []string{"set-option", "-s", "set-clipboard", "external"}
 
+// 键盘/生命周期配置（design D1）共用断言常量；exit-empty off 仅出现在前置链中。
+var (
+	extendedKeysOn = []string{"set-option", "-s", "extended-keys", "on"}
+	exitEmptyOn    = []string{"set-option", "-s", "exit-empty", "on"}
+	exitEmptyOff   = []string{"set-option", "-s", "exit-empty", "off"}
+)
+
+// clipboardOptCalls 从记录中仅提取剪贴板相关 set-option 调用（set-clipboard /
+// get-clipboard / allow-passthrough）。EnsureServerOptions 重组后还含 extended-keys
+// 与 exit-empty 步骤（design D1），剪贴板安全矩阵断言需过滤掉与本矩阵无关的步骤。
+func clipboardOptCalls(calls [][]string) [][]string {
+	var out [][]string
+	for _, c := range calls {
+		if len(c) != 4 || c[0] != "set-option" {
+			continue
+		}
+		switch c[2] {
+		case "set-clipboard", "get-clipboard", "allow-passthrough":
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // TestEnsureServerOptions_FailClosedMatrix 验证按版本分段的 fail-closed 语义：
 // >=3.7 走 [get-clipboard off → allow-passthrough off → set-clipboard on] 转发 raw；
 // 3.3–3.6 走 [set-clipboard external → allow-passthrough on] 透传 DCS；其余保持/
@@ -723,7 +747,7 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 			if err := m.EnsureServerOptions(); err != nil {
 				t.Fatalf("err = %v, want nil (feature unavailable is not an error)", err)
 			}
-			opts := optCalls(calls)
+			opts := clipboardOptCalls(calls)
 			if len(opts) != 2 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardPassthroughOff) {
 				t.Fatalf("set-option calls = %v, want exactly [set-clipboard external, allow-passthrough off]", opts)
 			}
@@ -737,7 +761,7 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 		if err := m.EnsureServerOptions(); err != nil {
 			t.Fatalf("err = %v, want nil (unknown option is not an error)", err)
 		}
-		opts := optCalls(calls)
+		opts := clipboardOptCalls(calls)
 		if len(opts) != 2 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardPassthroughOff) {
 			t.Fatalf("set-option calls = %v, want [set-clipboard external, allow-passthrough off]", opts)
 		}
@@ -751,7 +775,7 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 			if err := m.EnsureServerOptions(); err != nil {
 				t.Fatalf("err = %v, want nil", err)
 			}
-			opts := optCalls(calls)
+			opts := clipboardOptCalls(calls)
 			if len(opts) != 2 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardPassthroughOn) {
 				t.Fatalf("set-option calls = %v, want exactly [set-clipboard external, allow-passthrough on]", opts)
 			}
@@ -764,7 +788,7 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 		if err := m.EnsureServerOptions(); err != nil {
 			t.Fatalf("err = %v, want nil", err)
 		}
-		opts := optCalls(calls)
+		opts := clipboardOptCalls(calls)
 		if len(opts) != 2 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardPassthroughOff) {
 			t.Fatalf("set-option calls = %v, want [set-clipboard external, allow-passthrough off]", opts)
 		}
@@ -776,7 +800,7 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 		if err := m.EnsureServerOptions(); err != nil {
 			t.Fatalf("err = %v, want nil", err)
 		}
-		opts := optCalls(calls)
+		opts := clipboardOptCalls(calls)
 		wantGetOff := []string{"set-option", "-s", "get-clipboard", "off"}
 		wantClipOn := []string{"set-option", "-s", "set-clipboard", "on"}
 		if len(opts) != 3 || !equalArgs(opts[0], wantGetOff) || !equalArgs(opts[1], clipboardPassthroughOff) || !equalArgs(opts[2], wantClipOn) {
@@ -791,7 +815,7 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 		if err == nil {
 			t.Fatal("want error when get-clipboard off fails")
 		}
-		opts := optCalls(calls)
+		opts := clipboardOptCalls(calls)
 		// 统一恢复：external + 关 passthrough（防任何一段遗留 on）。
 		if len(opts) != 3 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) || !equalArgs(opts[1], clipboardExternal) || !equalArgs(opts[2], clipboardPassthroughOff) {
 			t.Fatalf("set-option calls = %v, want [get-clipboard off, set-clipboard external, allow-passthrough off]", opts)
@@ -808,7 +832,7 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 		if !strings.Contains(err.Error(), "allow-passthrough off") {
 			t.Errorf("err = %v, want mention allow-passthrough off failure", err)
 		}
-		opts := optCalls(calls)
+		opts := clipboardOptCalls(calls)
 		// 统一恢复独立重试两项：external 成功、passthrough off 再次失败并入错误。
 		if len(opts) != 4 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) || !equalArgs(opts[1], clipboardPassthroughOff) || !equalArgs(opts[2], clipboardExternal) || !equalArgs(opts[3], clipboardPassthroughOff) {
 			t.Fatalf("set-option calls = %v, want [get-clipboard off, allow-passthrough off, set-clipboard external, allow-passthrough off]", opts)
@@ -826,7 +850,7 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 		if !strings.Contains(err.Error(), "set-clipboard external") {
 			t.Errorf("err = %v, want mention restore set-clipboard external", err)
 		}
-		opts := optCalls(calls)
+		opts := clipboardOptCalls(calls)
 		if len(opts) != 2 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardPassthroughOff) {
 			t.Fatalf("set-option calls = %v, want [set-clipboard external, allow-passthrough off]", opts)
 		}
@@ -844,7 +868,7 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 		if !strings.Contains(err.Error(), "set-clipboard external") || !strings.Contains(err.Error(), "restore set-clipboard external") {
 			t.Errorf("err = %v, want mention original and restore set-clipboard external failures", err)
 		}
-		opts := optCalls(calls)
+		opts := clipboardOptCalls(calls)
 		if len(opts) != 3 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardExternal) || !equalArgs(opts[2], clipboardPassthroughOff) {
 			t.Fatalf("set-option calls = %v, want [set-clipboard external, set-clipboard external retry, allow-passthrough off]", opts)
 		}
@@ -860,7 +884,7 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 		if !strings.Contains(err.Error(), "allow-passthrough on") {
 			t.Errorf("err = %v, want mention allow-passthrough on failure", err)
 		}
-		opts := optCalls(calls)
+		opts := clipboardOptCalls(calls)
 		// 统一恢复独立尝试两项：external 幂等重试 + 收回 passthrough off。
 		if len(opts) != 4 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardPassthroughOn) || !equalArgs(opts[2], clipboardExternal) || !equalArgs(opts[3], clipboardPassthroughOff) {
 			t.Fatalf("set-option calls = %v, want [set-clipboard external, allow-passthrough on, set-clipboard external, allow-passthrough off]", opts)
@@ -877,7 +901,7 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 		if !strings.Contains(err.Error(), "allow-passthrough on") || !strings.Contains(err.Error(), "restore allow-passthrough off") {
 			t.Errorf("err = %v, want combined errors mentioning both failures", err)
 		}
-		opts := optCalls(calls)
+		opts := clipboardOptCalls(calls)
 		if len(opts) != 4 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardPassthroughOn) || !equalArgs(opts[2], clipboardExternal) || !equalArgs(opts[3], clipboardPassthroughOff) {
 			t.Fatalf("set-option calls = %v, want [set-clipboard external, allow-passthrough on, set-clipboard external, allow-passthrough off]", opts)
 		}
@@ -907,7 +931,7 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 		if !errors.Is(err, ErrNoTmuxServer) {
 			t.Fatalf("err = %v, want ErrNoTmuxServer", err)
 		}
-		opts := optCalls(calls)
+		opts := clipboardOptCalls(calls)
 		if len(opts) != 2 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], clipboardPassthroughOn) {
 			t.Fatalf("set-option calls = %v, want exactly [set-clipboard external, allow-passthrough on]", opts)
 		}
@@ -929,7 +953,7 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 		if !errors.As(err, &ce) {
 			t.Errorf("errors.As tmuxCmdError failed; original unwrap chain lost (err=%v)", err)
 		}
-		opts := optCalls(calls)
+		opts := clipboardOptCalls(calls)
 		// 统一恢复在 external 失败后仍独立尝试关 passthrough。
 		if len(opts) != 3 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) || !equalArgs(opts[1], clipboardExternal) || !equalArgs(opts[2], clipboardPassthroughOff) {
 			t.Fatalf("set-option calls = %v, want [get-clipboard off, set-clipboard external, allow-passthrough off]", opts)
@@ -943,7 +967,7 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 		if err == nil {
 			t.Fatal("want error when set-clipboard on fails")
 		}
-		opts := optCalls(calls)
+		opts := clipboardOptCalls(calls)
 		// 状态安全：get-clipboard off 与 allow-passthrough off 已生效，set-clipboard on
 		// 失败不会留下 on+buffer 或双写，MUST NOT 额外触发 restore external。
 		if len(opts) != 3 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) || !equalArgs(opts[1], clipboardPassthroughOff) || !equalArgs(opts[2], []string{"set-option", "-s", "set-clipboard", "on"}) {
@@ -953,21 +977,27 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 
 	// 版本检查耗尽共享 ctx deadline 的场景：tmux -V 阻塞到 ctx 到期，补救 set-option
 	// 若复用该 ctx 必然带着已过期的 deadline；fresh ctx 应给出未来的 deadline。
+	// 仅首个 -V 阻塞（design D1 后 EnsureServerOptions 含多次版本探测，后续探测
+	// 正常返回错误版本即可）。
 	t.Run("remediation uses fresh context after version deadline exhausted", func(t *testing.T) {
 		type callRec struct {
-			head     string
+			args     []string
 			deadline time.Time
 		}
 		var recs []callRec
+		vProbes := 0
 		m := &Manager{
 			execTmuxFn: func(ctx context.Context, args ...string) (string, string, error) {
-				rec := callRec{head: args[0]}
+				rec := callRec{args: append([]string(nil), args...)}
 				if dl, ok := ctx.Deadline(); ok {
 					rec.deadline = dl
 				}
 				recs = append(recs, rec)
 				if len(args) == 1 && args[0] == "-V" {
-					<-ctx.Done() // 模拟 tmux -V 吃满整个版本检查 ctx
+					vProbes++
+					if vProbes == 1 {
+						<-ctx.Done() // 模拟 tmux -V 吃满整个版本检查 ctx
+					}
 					return "", "deadline exceeded", &tmuxCmdError{sub: args, stderr: "context deadline exceeded", err: ctx.Err()}
 				}
 				return "", "", nil
@@ -980,27 +1010,45 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 			t.Fatalf("calls = %v, want at least [-V, set-option]", recs)
 		}
 		versionDl := recs[0].deadline
-		remediationDl := recs[len(recs)-1].deadline
-		if remediationDl.IsZero() {
-			t.Fatal("remediation call has no deadline")
+		// design D1 后尾部步骤不止一个：按完整 argv 分别定位剪贴板补救与
+		// exit-empty 恢复，各自断言持有独立 fresh deadline。
+		argvs := make([][]string, len(recs))
+		for i, r := range recs {
+			argvs[i] = r.args
 		}
-		// 复用旧 ctx 时 remediation deadline 已过期（== versionDl，且此刻已成过去）。
-		if !remediationDl.After(time.Now()) {
-			t.Fatalf("remediation deadline %v not in the future; version ctx deadline was %v (shared ctx?)", remediationDl, versionDl)
+		clipboardRemedyIdx := indexOfCall(argvs, clipboardExternal)
+		if clipboardRemedyIdx < 0 {
+			t.Fatalf("clipboard remediation %v missing, calls=%v", clipboardExternal, recs)
 		}
-		if !remediationDl.After(versionDl) {
-			t.Fatalf("remediation deadline %v must be re-issued after version deadline %v", remediationDl, versionDl)
+		exitEmptyIdx := indexOfCall(argvs, exitEmptyOn)
+		if exitEmptyIdx < 0 {
+			t.Fatalf("exit-empty restore %v missing, calls=%v", exitEmptyOn, recs)
+		}
+		for _, i := range []int{clipboardRemedyIdx, exitEmptyIdx} {
+			dl := recs[i].deadline
+			if dl.IsZero() {
+				t.Fatalf("call %d (%v) has no deadline", i, recs[i].args)
+			}
+			// 复用旧 ctx 时 deadline 已过期（== versionDl，且此刻已成过去）。
+			if !dl.After(time.Now()) {
+				t.Fatalf("call %d (%v) deadline %v not in the future; version ctx deadline was %v (shared ctx?)", i, recs[i].args, dl, versionDl)
+			}
+			if !dl.After(versionDl) {
+				t.Fatalf("call %d (%v) deadline %v must be re-issued after version deadline %v", i, recs[i].args, dl, versionDl)
+			}
 		}
 	})
 
 	// 版本探测返回有效版本但耗尽共享 ctx：3.3–3.6 段首步 set-clipboard external
 	// 用该 ctx 必然失败，统一恢复路径必须换 fresh ctx 重试成功。
+	// 仅首个 -V 阻塞（design D1 后步骤②还有一次正常版本探测）。
 	t.Run("3.3-3.6 first step fails after version deadline exhausted uses fresh ctx restore", func(t *testing.T) {
 		type callRec struct {
 			args     []string
 			deadline time.Time
 		}
 		var recs []callRec
+		vProbes := 0
 		m := &Manager{
 			execTmuxFn: func(ctx context.Context, args ...string) (string, string, error) {
 				rec := callRec{args: append([]string(nil), args...)}
@@ -1009,7 +1057,10 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 				}
 				recs = append(recs, rec)
 				if len(args) == 1 && args[0] == "-V" {
-					<-ctx.Done() // 版本探测吃满共享 ctx，但版本本身有效
+					vProbes++
+					if vProbes == 1 {
+						<-ctx.Done() // 版本探测吃满共享 ctx，但版本本身有效
+					}
 					return "tmux 3.4\n", "", nil
 				}
 				if args[0] == "set-option" && ctx.Err() != nil {
@@ -1025,8 +1076,10 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 		if !strings.Contains(err.Error(), "set-clipboard external") {
 			t.Errorf("err = %v, want mention first step set-clipboard external failure", err)
 		}
-		if len(recs) != 4 {
-			t.Fatalf("calls = %v, want exactly [-V, set external fail, set external retry, pt off]", recs)
+		// 首个 -V 耗尽后依次：external 失败、external fresh 重试、pt off、
+		// 步骤②版本探测、extended-keys on、exit-empty on（三步互不跳过）。
+		if len(recs) != 7 {
+			t.Fatalf("calls = %v, want 7 records [-V exhaust, set external fail, set external retry, pt off, -V, extended-keys on, exit-empty on]", recs)
 		}
 		if !equalArgs(recs[1].args, []string{"set-option", "-s", "set-clipboard", "external"}) ||
 			!equalArgs(recs[2].args, []string{"set-option", "-s", "set-clipboard", "external"}) ||
@@ -1049,7 +1102,7 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 		if !errors.Is(err, ErrNoTmuxServer) {
 			t.Fatalf("err = %v, want ErrNoTmuxServer", err)
 		}
-		opts := optCalls(calls)
+		opts := clipboardOptCalls(calls)
 		// 无 server 时无遗留状态可补救，MUST NOT 再尝试恢复 external。
 		if len(opts) != 1 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) {
 			t.Fatalf("set-option calls = %v, want exactly [get-clipboard off]", opts)
@@ -1063,7 +1116,7 @@ func TestEnsureServerOptions_FailClosedMatrix(t *testing.T) {
 		if !errors.Is(err, ErrNoTmuxServer) {
 			t.Fatalf("err = %v, want ErrNoTmuxServer", err)
 		}
-		opts := optCalls(calls)
+		opts := clipboardOptCalls(calls)
 		// 首个补救（external）已确认无 server，无遗留状态，MUST NOT 再打第二枪。
 		if len(opts) != 1 || !equalArgs(opts[0], clipboardExternal) {
 			t.Fatalf("set-option calls = %v, want exactly [set-clipboard external]", opts)
@@ -1095,7 +1148,7 @@ func TestEnsureServerOptions_AllowPassthroughUnknownOptionVariants(t *testing.T)
 			if err := m.EnsureServerOptions(); err != nil {
 				t.Fatalf("err = %v, want nil (%q is not a real failure)", err, stderr)
 			}
-			opts := optCalls(calls)
+			opts := clipboardOptCalls(calls)
 			if len(opts) != 2 || !equalArgs(opts[0], clipboardExternal) || !equalArgs(opts[1], []string{"set-option", "-wg", "allow-passthrough", "off"}) {
 				t.Fatalf("set-option calls = %v, want [set-clipboard external, allow-passthrough off]", opts)
 			}
@@ -1115,12 +1168,17 @@ func TestNewSession_EnsureServerOptionsBestEffort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSession should succeed when EnsureServerOptions fails: %v", err)
 	}
-	if len(calls) < 2 || calls[0][0] != "new-session" {
-		t.Fatalf("expected new-session then clipboard options, got %v", calls)
+	// design D1 顺序：前置链先于 new-session（calls[0] 为版本探测）。
+	if len(calls) < 3 || calls[0][0] != "-V" || calls[1][0] != "start-server" || calls[2][0] != "new-session" {
+		t.Fatalf("expected [-V, prechain, new-session, ...], got %v", calls)
 	}
-	opts := optCalls(calls)
+	opts := clipboardOptCalls(calls)
 	if len(opts) == 0 || !equalArgs(opts[0], []string{"set-option", "-s", "get-clipboard", "off"}) {
 		t.Errorf("first set-option = %v, want get-clipboard off (fail-closed order), all=%v", opts, calls)
+	}
+	// 配置失败后 exit-empty 恢复步骤仍执行（三步互不跳过）。
+	if !hasCall(calls, exitEmptyOn) {
+		t.Errorf("exit-empty restore missing after clipboard failure, all=%v", calls)
 	}
 }
 

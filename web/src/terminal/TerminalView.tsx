@@ -1,5 +1,12 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { TermSession, type TermConnState } from './session';
+import {
+  clearTerminalFocus,
+  isFocusRequestTargetAllowed,
+  isTerminalFocusExpired,
+  pendingTerminalFocus,
+  subscribeTerminalFocus,
+} from './focus-request';
 import { DEFAULT_CAPS, resolveMobileCaps } from './mobile-mode';
 import {
   loadMobileCaps,
@@ -16,6 +23,7 @@ import { debugMark } from '../debug';
 import { useMediaQuery } from '../hooks';
 import '@xterm/xterm/css/xterm.css';
 import './mobile.css';
+import './fonts.css'; // Nerd Font 图标字形 @font-face（terminal-links-emoji-icons design D3）
 
 interface TerminalViewProps {
   /** WS 路径，如 /ws/terminal/<taskID> 或 /ws/terminal/shell/<tid>。 */
@@ -39,6 +47,15 @@ const STATE_LABEL: Record<TermConnState, string> = {
 };
 
 const TOAST_MS = 2000;
+
+/** wsPath 形态区分（design D3）：/ws/terminal/<taskID> 为 TUI（返回 taskID，可消费焦点请求）；
+ * /ws/terminal/shell/... 为 shell 实例（返回 null，MUST NOT 消费）。 */
+function tuiTaskIDFromWsPath(wsPath: string): string | null {
+  const prefix = '/ws/terminal/';
+  if (!wsPath.startsWith(prefix)) return null;
+  const rest = wsPath.slice(prefix.length);
+  return rest === '' || rest.startsWith('shell/') ? null : rest;
+}
 
 /** 用户手势内复制：有 Clipboard API 走 writeText，否则 execCommand；失败则保留可选中文本。 */
 function writeTextToClipboard(text: string): Promise<void> {
@@ -83,6 +100,37 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
   const clipSeq = useRef(0);
   const toastTimer = useRef<ReturnType<typeof setTimeout>>();
   const onClipboardWriteRef = useRef<(text: string) => void>(() => {});
+
+  // 导航焦点请求（design D3，唯一消费方 = 目标任务 TUI TerminalView）：
+  // shell 实例不订阅不消费；本地不持有请求状态，等待/取消期间的请求有效性
+  // 一律以单例 pendingTerminalFocus() 快照校验（被取消/覆盖后自然失效）。
+  const tuiTaskID = tuiTaskIDFromWsPath(wsPath);
+  const connStateRef = useRef<TermConnState>('idle');
+  const lockedRef = useRef(false);
+
+  /**
+   * 焦点请求消费（design D3 状态表 + 门禁）：未 connected（idle/connecting/
+   * reconnecting/recovering）挂起等待；进入 connected 后逐条门禁——①过期
+   * ②taskID 匹配（不匹配暂不消费、请求保留给其目标）③锁定 ④⑤焦点保护
+   * （用户已在他处交互，宁可不聚焦不抢焦点）任一不满足即作废，全部通过才
+   * 消费并聚焦（seq 最新由单例「新覆盖旧」保证）。
+   */
+  const tryConsumeFocusRequest = useCallback(() => {
+    const session = sessionRef.current;
+    if (!session || connStateRef.current !== 'connected') return;
+    const req = pendingTerminalFocus();
+    if (!req || req.taskID !== tuiTaskID) return;
+    if (
+      lockedRef.current ||
+      isTerminalFocusExpired(req) ||
+      !isFocusRequestTargetAllowed(document.activeElement)
+    ) {
+      clearTerminalFocus(req.seq);
+      return;
+    }
+    clearTerminalFocus(req.seq);
+    session.focus();
+  }, [tuiTaskID]);
 
   const showCopiedToast = () => {
     if (!clipCtl.takeToastSlot()) return;
@@ -142,20 +190,36 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
       wrap,
       wsPath,
       (s) => {
+        connStateRef.current = s;
         setState(s);
         onStateRef.current?.(s);
+        // 状态表：进入 connected 即对挂起中的焦点请求做门禁检查并消费（design D3）
+        if (s === 'connected') tryConsumeFocusRequest();
       },
       (text) => onClipboardWriteRef.current(text),
     );
     sessionRef.current = session;
     setLocked(session.isLocked());
-    const unsubLock = session.onLockChange(setLocked);
+    lockedRef.current = session.isLocked();
+    const unsubLock = session.onLockChange((v) => {
+      lockedRef.current = v;
+      setLocked(v);
+    });
     return () => {
       sessionRef.current = null;
       unsubLock();
       session.dispose();
     };
-  }, [wsPath]);
+  }, [wsPath, tryConsumeFocusRequest]);
+
+  // 焦点请求订阅（design D3）：挂载即可能同步交付 pending 快照（早于挂载的发布）；
+  // 回调仅在已 connected 时立即按门禁消费，否则等待 onState('connected')。
+  // 等待期的取消不在这里：输入区取消由请求层全局 focusin 守卫负责、路由离开取消由
+  // TaskWorkbenchPage 卸载 cancelTerminalFocusForTask 负责；退订不删更晚的新请求。
+  useEffect(() => {
+    if (!tuiTaskID) return;
+    return subscribeTerminalFocus(() => tryConsumeFocusRequest());
+  }, [tuiTaskID, tryConsumeFocusRequest]);
 
   useEffect(() => {
     const session = sessionRef.current;

@@ -1,6 +1,8 @@
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
+import { WebLinksAddon } from '@xterm/addon-web-links';
+import { UnicodeGraphemesAddon } from '@xterm/addon-unicode-graphemes';
 import { clearToken, getToken, wsURL, UNAUTHORIZED_EVENT } from '../api';
 import {
   loadMobileCaps,
@@ -41,6 +43,39 @@ const encoder = new TextEncoder();
 /** 键盘避让收缩阈值（CSS px，mobile-terminal-mode-settings design D4）：
  * iOS/iPadOS 虚拟键盘 250px+，Safari 工具栏/地址栏伸缩通常 <100px。写死常量，不做设置项。 */
 const KEYBOARD_SHRINK_THRESHOLD = 100;
+
+/**
+ * 链接打开（terminal-links-emoji-icons design D1）：修饰键门控 + 用户手势内同步打开。
+ * 纯文本 URL（WebLinksAddon）与 OSC 8 超链接（Terminal linkHandler）两条入口复用同一函数。
+ * - metaKey/ctrlKey 之外（普通点击）直接 return：保持既有点击/选择行为，不触发打开；
+ * - window.open 同步调用以保住用户手势（新标签/窗口形态由浏览器决定）；被阻止时
+ *   不异步重试、不转当前页导航；链接打开不产生键盘输入、不影响终端会话。
+ */
+export function openLink(event: MouseEvent, uri: string): void {
+  if (!(event.metaKey || event.ctrlKey)) return;
+  window.open(uri, '_blank', 'noopener,noreferrer');
+}
+
+// 图标字体加载生命周期（design D3 N5）：全局单次尝试，不阻塞终端 open；
+// 成功后对所有存活 TermSession 清 webgl 纹理缓存并整屏重绘（消除已缓存的缺字结果）。
+// 失败 console.warn 降级（图标仍为豆腐块、终端继续可用）；不重建终端、不重连、不改偏好。
+const aliveSessions = new Set<TermSession>();
+let iconFontLoadAttempted = false;
+
+function attemptIconFontLoad(): void {
+  if (iconFontLoadAttempted) return;
+  iconFontLoadAttempted = true;
+  const fonts = typeof document !== 'undefined' ? document.fonts : undefined;
+  if (!fonts?.load) return; // 无字体 API 环境（测试/老旧浏览器）跳过，终端不受影响
+  fonts
+    .load('13px "Symbols Nerd Font Mono"', '\u{E0A0}') // powerline 分支符码点采样
+    .then(() => {
+      for (const session of aliveSessions) session.refreshGlyphs();
+    })
+    .catch(() => {
+      console.warn('[TermSession] 图标字体加载失败，Nerd Font 图标可能显示为豆腐块');
+    });
+}
 
 /**
  * TermSession 封装 xterm.js + 终端 WS 的生命周期：
@@ -97,6 +132,8 @@ export class TermSession {
   private vvScrollHandler: (() => void) | null = null;
   private vvFitRaf = 0;
   private imeListenersAttached = false;
+  /** webgl 渲染器实例引用（图标字体加载成功后 clearTextureAtlas 用；加载失败/不可用时 null）。 */
+  private webgl: WebglAddon | null = null;
 
   constructor(
     private host: HTMLElement,
@@ -114,12 +151,22 @@ export class TermSession {
       cursorBlink: true,
       allowProposedApi: true,
       scrollback: 5000,
+      // OSC 8 超链接入口（design D1）：核心自动注册的 OscLinkProvider 走该选项。
+      // allowNonHttpProtocols 不设 → 仅 http(s)，非法/危险目标不打开。
+      linkHandler: { activate: openLink },
       // 终端配色跟随应用主题（terminal/theme.ts，token 对齐常量）；
       // 切换由下方 watchTermTheme 订阅即时应用到已挂载终端，无需重连。
       theme: resolveXtermTheme(readCurrentTermTheme()),
     });
     this.term.loadAddon(this.fit);
     this.term.open(host);
+    // Emoji grapheme 分簇/宽度（design D2）：loadAddon 即激活 '15-graphemes' provider。
+    this.term.loadAddon(new UnicodeGraphemesAddon());
+    // 纯文本 URL 入口（design D1）：WebLinksAddon 的 WebLinkProvider，复用同一门控打开函数。
+    this.term.loadAddon(new WebLinksAddon(openLink));
+    // 图标字体加载（design D3 N5）：全局单次尝试；存活实例登记后触发，成功 settle 补渲染。
+    aliveSessions.add(this);
+    attemptIconFontLoad();
     this.osc52Disposable = this.term.parser.registerOscHandler(52, (data) => {
       const text = parseOsc52Payload(data);
       if (text !== null) this.onClipboardWrite?.(text);
@@ -131,9 +178,10 @@ export class TermSession {
     // 门控，本场景协商不成立，不可用。
     this.term.attachCustomKeyEventHandler((ev) => this.handleCustomKey(ev));
     try {
-      this.term.loadAddon(new WebglAddon());
+      this.webgl = new WebglAddon();
+      this.term.loadAddon(this.webgl);
     } catch {
-      /* WebGL 不可用时回退 canvas 渲染 */
+      this.webgl = null; // WebGL 不可用时回退 DOM renderer 渲染
     }
 
     // 应用主题切换 → 即时翻转终端配色（term.options.theme 运行时赋值，无需重连）；
@@ -325,8 +373,17 @@ export class TermSession {
     this.setState('idle');
   }
 
+  /**
+   * 聚焦终端（导航焦点请求 design D3 的消费入口）：封装 term.focus()，
+   * 消费方不直接触 DOM；锁定/焦点保护门禁由消费方（TerminalView）在调用前检查。
+   */
+  focus(): void {
+    this.term.focus();
+  }
+
   dispose(): void {
     this.disposed = true;
+    aliveSessions.delete(this);
     this.clearTimer();
     this.closeSocket();
     this.observer.disconnect();
@@ -348,6 +405,17 @@ export class TermSession {
     this.osc52Disposable?.dispose();
     this.osc52Disposable = null;
     this.term.dispose();
+  }
+
+  /**
+   * 图标字体加载成功后的补渲染（design D3 N5，由模块级字体加载回调调用）：
+   * 清 webgl 纹理图集中已缓存的缺字结果（DOM renderer 回退路径无 atlas，refresh 即可）并整屏重绘。
+   * 不重建终端、不重连 WS、不改偏好、不动锁定状态；已销毁实例跳过。
+   */
+  refreshGlyphs(): void {
+    if (this.disposed) return;
+    this.webgl?.clearTextureAtlas();
+    this.term.refresh(0, this.term.rows - 1);
   }
 
   // ---------- 锁定对外接口（design D8） ----------
