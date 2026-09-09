@@ -21,6 +21,12 @@ func TestEventDirtiesTaskDetail(t *testing.T) {
 		{"task.deleted other", ocdeckevent.NewTaskDeleted("t2", "active"), false},
 		{"task.activity_changed self", ocdeckevent.NewTaskActivityChanged("t1"), true},
 		{"task.activity_changed other", ocdeckevent.NewTaskActivityChanged("t2"), false},
+		// task.user_activity：一次性用户输入事实，不改变任务详情投影 → 不标脏
+		//（idle-reminder-user-activity D1；无论 RID 是否本任务）。
+		{"task.user_activity self", ocdeckevent.NewTaskUserActivity("t1"), false},
+		{"task.user_activity other", ocdeckevent.NewTaskUserActivity("t2"), false},
+		{"task.user_activity malformed payload", ocdeckevent.Event{Topic: ocdeckevent.TopicTask, Type: ocdeckevent.TypeTaskUserActivity, RID: "t1", Payload: nil}, true},
+		{"task.user_activity wrong topic", ocdeckevent.Event{Topic: ocdeckevent.TopicSession, Type: ocdeckevent.TypeTaskUserActivity, RID: "t1", Payload: struct{}{}}, true},
 		{"sessions.aligned self", ocdeckevent.NewSessionsAligned("t1", 1, 0, 0, []string{"s1"}), true},
 		{"sessions.aligned other", ocdeckevent.NewSessionsAligned("t2", 1, 0, 0, []string{"s1"}), false},
 		{"session.claimed self", ocdeckevent.NewSessionClaimed("s1", "t1"), true},

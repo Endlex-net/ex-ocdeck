@@ -9,7 +9,9 @@ import (
 )
 
 // TestEventDirtiesProjectsTaskTree 按消费过滤表逐行表驱动（projects-stream design D4）。
-// projects 场景为全任务树视图：全部已知 Type 与未知 Type 均标脏，不解读 Payload。
+// projects 场景为全任务树视图：除 task.user_activity（一次性用户输入事实，
+// 见 TestEventDirtiesProjectsTaskTree_UserActivityException）外，全部已知 Type
+// 与未知 Type 均标脏，不解读其余 Payload。
 // 与 eventDirtiesActiveSessions 的差异对照见
 // TestEventDirtiesProjectsTaskTree_ContrastWithActiveSessions。
 func TestEventDirtiesProjectsTaskTree(t *testing.T) {
@@ -78,6 +80,30 @@ func TestEventDirtiesProjectsTaskTree_ContrastWithActiveSessions(t *testing.T) {
 		}
 		if !eventDirtiesProjectsTaskTree(c.ev) {
 			t.Errorf("%s: eventDirtiesProjectsTaskTree = false, want true", c.name)
+		}
+	}
+}
+
+// TestEventDirtiesProjectsTaskTree_UserActivityException 用户活动例外行
+//（idle-reminder-user-activity D1；projects-stream spec「用户活动事件不触发更新」）：
+// 合法 task.user_activity（Topic task 且 Payload struct{}{}）不标脏，畸形标脏，
+// 其余事件维持标脏。
+func TestEventDirtiesProjectsTaskTree_UserActivityException(t *testing.T) {
+	cases := []struct {
+		name string
+		ev   ocdeckevent.Event
+		want bool
+	}{
+		{"legal self RID", ocdeckevent.NewTaskUserActivity("t1"), false},
+		{"legal other RID", ocdeckevent.NewTaskUserActivity("t2"), false},
+		{"malformed payload", ocdeckevent.Event{Topic: ocdeckevent.TopicTask, Type: ocdeckevent.TypeTaskUserActivity, RID: "t1", Payload: nil}, true},
+		{"wrong topic", ocdeckevent.Event{Topic: ocdeckevent.TopicSession, Type: ocdeckevent.TypeTaskUserActivity, RID: "t1", Payload: struct{}{}}, true},
+		{"unknown type still dirty", ocdeckevent.Event{Topic: ocdeckevent.TopicTask, Type: "task.unknown_future", RID: "t1", Payload: struct{}{}}, true},
+		{"task.activity_changed still dirty", ocdeckevent.NewTaskActivityChanged("t1"), true},
+	}
+	for _, c := range cases {
+		if got := eventDirtiesProjectsTaskTree(c.ev); got != c.want {
+			t.Errorf("%s: eventDirtiesProjectsTaskTree = %v, want %v", c.name, got, c.want)
 		}
 	}
 }
