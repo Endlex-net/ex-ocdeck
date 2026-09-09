@@ -44,6 +44,31 @@ const encoder = new TextEncoder();
  * iOS/iPadOS 虚拟键盘 250px+，Safari 工具栏/地址栏伸缩通常 <100px。写死常量，不做设置项。 */
 const KEYBOARD_SHRINK_THRESHOLD = 100;
 
+/** 上游 `@xterm/addon-web-links@0.12.0` 默认 strictUrlRegex 的尾部排除集只含 ASCII 标点，
+ *  CJK/全角标点会被吞进 URL（如 `https://example.com/x。` 的点击范围含结尾「。」）。
+ *  打开前剥离 uri 尾部下述标点（循环直至尾字符不在集合内）；剥离后为空串则不打开。 */
+const TRAILING_CJK_PUNCTUATION = new Set([
+  '。',
+  '，',
+  '、',
+  '；',
+  '：',
+  '？',
+  '！',
+  '「',
+  '」',
+  '『',
+  '』',
+  '【',
+  '】',
+  '（',
+  '）',
+  '《',
+  '》',
+  '〈',
+  '〉',
+]);
+
 /**
  * 链接打开（terminal-links-emoji-icons design D1）：修饰键门控 + 用户手势内同步打开。
  * 纯文本 URL（WebLinksAddon）与 OSC 8 超链接（Terminal linkHandler）两条入口复用同一函数。
@@ -53,7 +78,12 @@ const KEYBOARD_SHRINK_THRESHOLD = 100;
  */
 export function openLink(event: MouseEvent, uri: string): void {
   if (!(event.metaKey || event.ctrlKey)) return;
-  window.open(uri, '_blank', 'noopener,noreferrer');
+  let target = uri;
+  while (target.length > 0 && TRAILING_CJK_PUNCTUATION.has(target[target.length - 1])) {
+    target = target.slice(0, -1);
+  }
+  if (target === '') return;
+  window.open(target, '_blank', 'noopener,noreferrer');
 }
 
 // 图标字体加载生命周期（design D3 N5）：全局单次尝试，不阻塞终端 open；

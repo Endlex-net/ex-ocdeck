@@ -218,6 +218,27 @@ describe('D1 链接修饰键门控（openLink 纯函数三路径）', () => {
     expect(() => openLink({ metaKey: true } as MouseEvent, 'https://example.com/path')).not.toThrow();
     expect(window.open).toHaveBeenCalledTimes(1); // 单次尝试，无异步重试放大
   });
+
+  it('尾部 CJK/全角标点在打开前剥离（上游 strictUrlRegex 吞全角标点的补偿）', async () => {
+    const { openLink } = await import('../terminal/session');
+    // 单个尾标点：句号不入地址
+    openLink({ metaKey: true } as MouseEvent, 'https://example.com/x。');
+    expect(window.open).toHaveBeenLastCalledWith('https://example.com/x', '_blank', 'noopener,noreferrer');
+    // 连续多个尾部标点全部剥离
+    openLink({ metaKey: true } as MouseEvent, 'https://example.com/x。！」）');
+    expect(window.open).toHaveBeenLastCalledWith('https://example.com/x', '_blank', 'noopener,noreferrer');
+    // 中间标点/正常 URL 不受影响
+    openLink({ metaKey: true } as MouseEvent, 'https://example.com/path?q=1&r=2');
+    expect(window.open).toHaveBeenLastCalledWith('https://example.com/path?q=1&r=2', '_blank', 'noopener,noreferrer');
+  });
+
+  it('剥离后为空串则不打开（防御）；无修饰键的 CJK 尾标点 URL 仍走门控不打开', async () => {
+    const { openLink } = await import('../terminal/session');
+    openLink({ metaKey: true } as MouseEvent, '。。');
+    expect(window.open).not.toHaveBeenCalled();
+    openLink({} as MouseEvent, 'https://example.com/x。');
+    expect(window.open).not.toHaveBeenCalled();
+  });
 });
 
 describe('D1 两条入口接线复用同一 openLink（adapter 层）', () => {
