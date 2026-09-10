@@ -206,6 +206,14 @@ type Manager struct {
 	// namer 将任务名提炼为分支 slug（ai-worktree-naming）。nil 时 Create 回退到 Slugify
 	//（构造期或测试未注入时的防御）。生产 wiring 在 main.go 注入 ai.SlugNamer（tasks 3.3）。
 	namer BranchNamer
+	// judge 判定 ai-auto 任务的权限请求（task-permission-mode D5）。nil 时 ai-auto
+	// 行为 = 全部转人工（防御回退，同 namer nil 防御）。生产 wiring 在 main.go 注入
+	// ai.PermJudge 的端口适配（tasks 3.3）。
+	judge PermissionJudge
+	// permAudit ai-auto 判定审计日志（task-permission-mode D11）。nil 时零写入、
+	// 行为与无审计完全一致（旁路）；装配侧 MUST 保持 nil 接口，MUST NOT 注入持有
+	// nil 指针的非 nil interface。生产 wiring 在 main.go 注入 auditlog 适配（tasks 7.1）。
+	permAudit PermAuditLogger
 	// rand4Fn 生成 4 位 [a-z0-9] 随机串，供 newWorktreePath 碰撞重试。可测试注入以确定性
 	// 构造碰撞/rand 失败场景。默认用 crypto/rand（Go 1.24 起 Read 永不返回 error，失败 fatal；
 	// 故 rand4 的 error 分支为防御性保留，生产路径不可达）。
@@ -346,6 +354,24 @@ type taskRuntime struct {
 	attention *attentionState
 	// agentStatus agent 运行态内存快照（design.md D4，P1.8）。懒初始化（激活对账时构造）。
 	agentStatus *agentStatusState
+	// --- ai-auto 权限自动判定状态（task-permission-mode D4，permit_auto.go）---
+	// permJudgeReady 实例就绪状态：newRuntime 未就绪；仅三条就绪提交路径成功且确认
+	// 当前实例后置位（与 StartDiffReviewSchedulerForTask 同接缝）。未就绪期准入拒绝属暂缓。
+	permJudgeReady bool
+	// judgeStopping 停止标记：stopAll/stopAllJoin 置位后准入拒绝、发送前复核失败。
+	// 也作为 judgeWG.Add 与 Wait 的互斥条件（Add 仅在未置位时发生，均在 rt.mu 内）。
+	judgeStopping bool
+	// replyUnsupported 回复能力不可用（仅路由 404 标记，D6 分类 ③）：标记后停止
+	// 本 runtime 的全部后续判定。
+	replyUnsupported bool
+	// judgedPerms per-runtime judged-set（D4 计数契约）：requestID → 已发起判定尝试。
+	// 失败不清除；runtime 销毁即释放。
+	judgedPerms map[string]struct{}
+	// judgeCancel/judgeWG 判定/回复 goroutine 生命周期（与 sseCancel 同族接入停止路径）：
+	// 首次准入通过时从 Manager 生命周期 ctx 派生；stopAll/stopAllJoin cancel + join。
+	judgeCtx    context.Context // 判定/回复 goroutine 共用的 runtime 生命周期 ctx
+	judgeCancel context.CancelFunc
+	judgeWG     sync.WaitGroup
 	mu          sync.Mutex
 }
 
@@ -390,6 +416,12 @@ type Options struct {
 	// Namer 可选：注入后 Create 用其提炼分支 slug（ai-worktree-naming）。
 	// 为 nil 时回退到本包 Slugify（构造期或测试未注入时防御）。
 	Namer BranchNamer
+	// PermissionJudge 可选：注入后 ai-auto 任务的权限请求经其自动判定
+	//（task-permission-mode D5）。为 nil 时 ai-auto 全部转人工（防御回退）。
+	PermissionJudge PermissionJudge
+	// PermAuditLogger 可选：注入后 ai-auto 判定尝试终结时追加审计记录
+	//（task-permission-mode D11）。为 nil 时零写入、行为与无审计完全一致（旁路）。
+	PermAuditLogger PermAuditLogger
 	// DebtStore 可选：注入后未收敛 orphan tickets 持久化跨重启恢复（design.md §10）。
 	DebtStore CleanupDebtStore
 	// LifecycleRunner 可选：注入后启用 init/pre-delete 脚本与 inherit 文件继承
@@ -421,6 +453,8 @@ func New(opts Options) *Manager {
 		wt:                      opts.Worktree,
 		ocFactory:               opts.OCFactory,
 		namer:                   opts.Namer,
+		judge:                   opts.PermissionJudge,
+		permAudit:               opts.PermAuditLogger,
 		debtStore:               opts.DebtStore,
 		lifecycleRunner:         opts.LifecycleRunner,
 		logDir:                  opts.LogDir,
@@ -638,10 +672,16 @@ func (m *Manager) clearRuntime(taskID string) {
 // watch：仅 cancel（非阻塞），不 join——因 stopAll 可能在某 watch 回调内被调用
 // （handleServeExit → cleanupActivationRuntime → stopAll），join 自身 goroutine 会死锁。
 // watch goroutine 的 join 由 stopAllJoin（Shutdown 路径）负责。
+// judge（task-permission-mode D4）：置停止标记 + cancel + join 判定/回复 goroutine。
+// 判定/回复 goroutine 不调用 stopAll（仅 Judge/Reply，均有界），join 无自死锁；
+// 单次判定 10s + 回复 5s 有界，ctx cancel 后快速收敛。
 func (rt *taskRuntime) stopAll() {
 	rt.mu.Lock()
 	sseCancel := rt.sseCancel
 	rt.sseCancel = nil
+	judgeCancel := rt.judgeCancel
+	rt.judgeCancel = nil
+	rt.judgeStopping = true
 	cancels := make([]func(), 0, len(rt.watchCancels))
 	for name, c := range rt.watchCancels {
 		cancels = append(cancels, c)
@@ -650,9 +690,20 @@ func (rt *taskRuntime) stopAll() {
 	}
 	rt.mu.Unlock()
 
+	// judge（task-permission-mode F1/F3）：先 cancel 判定 ctx（消除「SSE join 期间
+	// judge 未取消」窗口），再 join SSE。judgeWG.Wait 无条件执行：Add 与 judgeStopping
+	// 同锁互斥，Wait 前所有 Add 已完成计数——join 语义与谁取得 cancel 无关
+	//（并发停止时未取得 cancel 的调用方同样等待判定 goroutine 退出）。
+	if judgeCancel != nil {
+		judgeCancel()
+	}
 	if sseCancel != nil {
 		sseCancel() // 阻塞式：cancel + join SSE goroutine
 	}
+	rt.judgeWG.Wait() // 无条件（F3）：join 语义与谁取得 cancel 无关。
+	// 有界性说明：goroutine 内 Judge/HTTP 有界（10s/5s）且随 ctx 取消收敛；DB 读随
+	// judgeCtx 取消；审计文件 IO 无独立取消/deadline（Record 同步持 logger mutex
+	// Write），极端缓慢 Write 会拖住本 join（见 permit_auto.go recordPermAudit）。
 	for _, c := range cancels {
 		c() // 非阻塞
 	}
@@ -666,6 +717,9 @@ func (rt *taskRuntime) stopAllJoin() {
 	rt.sseCancel = nil
 	sseDone := rt.sseDone
 	rt.sseDone = nil
+	judgeCancel := rt.judgeCancel
+	rt.judgeCancel = nil
+	rt.judgeStopping = true
 	type wd struct {
 		cancel func()
 		done   <-chan struct{}
@@ -678,12 +732,18 @@ func (rt *taskRuntime) stopAllJoin() {
 	}
 	rt.mu.Unlock()
 
+	// judge：先 cancel（消除与 SSE join 的取消窗口），judgeWG.Wait 无条件执行
+	//（同 stopAll，F1/F3：join 语义与谁取得 cancel 无关）。
+	if judgeCancel != nil {
+		judgeCancel()
+	}
 	// SSE：cancel + join。
 	if sseCancel != nil {
 		sseCancel()
 	} else if sseDone != nil {
 		<-sseDone
 	}
+	rt.judgeWG.Wait()
 	// watch：cancel（非阻塞）+ join done 通道。
 	for _, w := range watches {
 		if w.cancel != nil {

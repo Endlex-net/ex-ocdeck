@@ -62,6 +62,8 @@ type projectDTO struct {
 // projectTaskSummaryDTO 项目任务摘要 DTO（design.md D4 11 字段 + mode，project-management
 // delta 字段表）。notice 为 NoticeItem[] 原样透传（无 notice 时省略）；agentStatus 水合失败省略；
 // mode 为必有字段（add-local-path-task-mode D7），非法 kind/mode 组装 fail-closed 报错。
+// permission_mode 为必有字段（task-permission-mode D7）：空值输出 ask、未知持久化值
+// fail-closed 报错。
 type projectTaskSummaryDTO struct {
 	ID             string          `json:"id"`
 	Name           string          `json:"name"`
@@ -69,6 +71,7 @@ type projectTaskSummaryDTO struct {
 	InitStatus     string          `json:"init_status"`
 	Branch         string          `json:"branch"`
 	Mode           string          `json:"mode"`
+	PermissionMode string          `json:"permission_mode"`
 	WorktreePath   string          `json:"worktree_path"`
 	LastError      string          `json:"last_error,omitempty"`
 	Notice         json.RawMessage `json:"notice,omitempty"`
@@ -152,9 +155,16 @@ func (s *Server) toProjectTaskSummaryDTOs(projectKind string, summaries []applic
 		if !validTaskModeForKind(projectKind, sm.Mode) {
 			return nil, fmt.Errorf("task %s: invalid mode %q for kind %q", sm.TaskID, sm.Mode, projectKind)
 		}
+		// permission_mode 必有透传（task-permission-mode D7）：空值输出 ask、未知持久化值
+		// fail-closed（调用方 500 / SSE 保留上次快照），不输出坏值元素。
+		permissionMode, ae := permissionModeForOutput(sm.TaskID, sm.PermissionMode)
+		if ae != nil {
+			return nil, ae
+		}
 		dto := projectTaskSummaryDTO{
 			ID: sm.TaskID, Name: sm.Name, Status: sm.Status, InitStatus: sm.InitStatus,
-			Branch: sm.Branch, Mode: sm.Mode, WorktreePath: sm.WorktreePath, LastError: sm.LastError,
+			Branch: sm.Branch, Mode: sm.Mode, PermissionMode: permissionMode, WorktreePath: sm.WorktreePath,
+			LastError: sm.LastError,
 			UpdatedAt: sm.UpdatedAt, AttentionCount: sm.AttentionCount,
 		}
 		if sm.Notice != "" {

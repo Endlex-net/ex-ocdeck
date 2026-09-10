@@ -1,6 +1,7 @@
 package opencode
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,12 +16,29 @@ var ErrCapabilityUnsupported = errors.New("opencode: capability unsupported (end
 
 // PermissionRequest 是 GET /permission 返回的单条 pending 权限请求（opencode 1.18.18 契约）。
 // 字段取自 permission.asked SSE 事件 payload 的可持久子集：id/sessionID/permission/patterns。
-// metadata/always/tool 等展示字段由前端经 SSE 透传，本层只保留 pending 集合所需的最小稳定字段。
+// metadata 为请求详情原始对象（task-permission-mode D12：整体保留仅供内部判定消费，
+// 缺失/null/非法 JSON/合法非 object 一律归 nil，MUST NOT 丢弃请求；always/tool 仍不持久化）。
 type PermissionRequest struct {
-	ID         string   `json:"id"`
-	SessionID  string   `json:"sessionID"`
-	Permission string   `json:"permission"`
-	Patterns   []string `json:"patterns"`
+	ID         string          `json:"id"`
+	SessionID  string          `json:"sessionID"`
+	Permission string          `json:"permission"`
+	Patterns   []string        `json:"patterns"`
+	Metadata   json.RawMessage `json:"metadata,omitempty"`
+}
+
+// normalizePermissionMetadata 归一化请求 metadata（task-permission-mode D12）：
+// 有效形状仅为 JSON object——缺失/null/非法 JSON/合法但非 object 一律归 nil
+//（MUST NOT 丢弃请求；nil 后提取阶段对关键类别记 missing_critical）。
+func normalizePermissionMetadata(raw json.RawMessage) json.RawMessage {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &obj); err != nil {
+		return nil
+	}
+	return trimmed
 }
 
 // QuestionItem 是 question.asked 事件中单条提问的最小稳定字段（design.md D6）。
@@ -66,6 +84,9 @@ type AttentionEvent struct {
 	Permission string         // permission.asked only
 	Patterns   []string       // permission.asked only
 	Questions  []QuestionItem // question.asked only
+	// Metadata 权限请求详情原始对象（task-permission-mode D12，permission.asked only；
+	// 已归一化：nil 或 JSON object）。
+	Metadata json.RawMessage // permission.asked only
 }
 
 // ParseAttentionEvent 将 SSE Event 按其 type 分派解析为 AttentionEvent。
@@ -116,6 +137,14 @@ func parsePermissionAsked(props map[string]interface{}) (AttentionEvent, bool) {
 	if !ok {
 		return AttentionEvent{}, false
 	}
+	// metadata（task-permission-mode D12）：缺省合法 → nil；存在则序列化后归一化
+	//（非 object 一律归 nil，不丢请求）。
+	var metadata json.RawMessage
+	if mv, present := props["metadata"]; present && mv != nil {
+		if b, merr := json.Marshal(mv); merr == nil {
+			metadata = normalizePermissionMetadata(b)
+		}
+	}
 	return AttentionEvent{
 		Kind:       AttentionAsked,
 		Type:       AttentionPermission,
@@ -123,6 +152,7 @@ func parsePermissionAsked(props map[string]interface{}) (AttentionEvent, bool) {
 		SessionID:  sid,
 		Permission: perm,
 		Patterns:   patterns,
+		Metadata:   metadata,
 	}, true
 }
 
@@ -346,6 +376,8 @@ func parsePermissionRequest(raw jsonRawObject) (PermissionRequest, error) {
 	if r.ID == "" || r.SessionID == "" || r.Permission == "" {
 		return PermissionRequest{}, fmt.Errorf("permission request: missing id/sessionID/permission")
 	}
+	// metadata 归一化（task-permission-mode D12）：缺失/null/非法 JSON/非 object → nil。
+	r.Metadata = normalizePermissionMetadata(r.Metadata)
 	return r, nil
 }
 

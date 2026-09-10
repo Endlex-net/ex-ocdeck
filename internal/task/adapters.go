@@ -34,6 +34,7 @@ func (a *StoreAdapter) CreateTask(ctx context.Context, t TaskRow) error {
 	return a.db.CreateTask(ctx, store.TaskRow{
 		ID: t.ID, ProjectID: t.ProjectID, Name: t.Name, Branch: t.Branch,
 		Status: t.Status, WorktreePath: t.WorktreePath, BaseRef: t.BaseRef, Mode: t.Mode,
+		PermissionMode: t.PermissionMode,
 	})
 }
 
@@ -79,7 +80,8 @@ func (a *StoreAdapter) ListActiveTaskOverview(ctx context.Context) ([]ActiveTask
 		out = append(out, ActiveTaskOverviewRow{
 			ID: r.ID, ProjectID: r.ProjectID, ProjectName: r.ProjectName, Name: r.Name,
 			Branch: r.Branch, WorktreePath: r.WorktreePath, Mode: r.Mode, Kind: r.Kind,
-			LastActiveAt: r.LastActiveAt,
+			PermissionMode: r.PermissionMode,
+			LastActiveAt:   r.LastActiveAt,
 		})
 	}
 	return out, nil
@@ -400,6 +402,7 @@ func taskRowToSnapshot(r TaskRow) application.TaskSnapshot {
 		BaseRef:         r.BaseRef,
 		AnchorSessionID: nullStringToPtr(r.AnchorSessionID),
 		Mode:            r.Mode,
+		PermissionMode:  r.PermissionMode,
 	}
 }
 
@@ -497,7 +500,7 @@ func toTaskRow(t store.TaskRow) TaskRow {
 		WorktreePath: t.WorktreePath, LastPort: t.LastPort, LastError: t.LastError, Notice: t.Notice,
 		DeleteMode: t.DeleteMode, EnvSnapshot: t.EnvSnapshot, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
 		ArchivedAt: t.ArchivedAt, InitStatus: t.InitStatus, InitError: t.InitError, BaseRef: t.BaseRef,
-		AnchorSessionID: t.AnchorSessionID, Mode: t.Mode,
+		AnchorSessionID: t.AnchorSessionID, Mode: t.Mode, PermissionMode: t.PermissionMode,
 	}
 }
 
@@ -527,6 +530,7 @@ func taskSnapshotToTaskRow(s application.TaskSnapshot) TaskRow {
 		BaseRef:         s.BaseRef,
 		AnchorSessionID: ptrToNullString(s.AnchorSessionID),
 		Mode:            s.Mode,
+		PermissionMode:  s.PermissionMode,
 	}
 }
 

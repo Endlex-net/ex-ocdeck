@@ -91,6 +91,13 @@ type OCClient interface {
 	ListPermissions(ctx context.Context, dir string) ([]opencode.PermissionRequest, error)
 	// ListQuestions GET /question → pending 问题请求快照（design.md D6）。
 	ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error)
+	// ReplyPermission POST /permission/{id}/reply，对单条权限请求回复 once/reject
+	//（task-permission-mode D6；调用方 MUST NOT 传 always，spec 契约）。
+	// 结果映射见 *opencode.Client.ReplyPermission：竞态 404 →
+	// opencode.ErrPermissionRequestGone（正常忽略）；路由 404 →
+	// opencode.ErrCapabilityUnsupported（唯一允许标记 reply-unsupported 的形态）；
+	// 其余错误一律按「已发送、结果未知」处置（不重试、不补偿、不本地断言状态）。
+	ReplyPermission(ctx context.Context, dir, requestID, reply string) error
 	// PromptAsync 投递一条 text prompt 到目标 session 的异步队列（design.md D1）。
 	// 返回 transport DTO（不返回 error）；签名与 *opencode.Client 逐字一致。
 	// adapter 获取失败（taskOcClient ok=false）由 PromptPort 返回 pre_send_failure（D1），
@@ -147,6 +154,87 @@ type BranchNamer interface {
 	Slug(ctx context.Context, taskName string) string
 }
 
+// PermissionVerdict 权限自动判定三值（task-permission-mode D5）。
+type PermissionVerdict string
+
+const (
+	PermissionVerdictApprove   PermissionVerdict = "approve"
+	PermissionVerdictReject    PermissionVerdict = "reject"
+	PermissionVerdictUncertain PermissionVerdict = "uncertain"
+)
+
+// PermissionJudgeInput 判定输入（task-permission-mode D5/8.2）：平台语境 + 请求
+// （permission/patterns + 按类别从 metadata 提取的 RequestDetail）。
+// 上游顶层 always/tool 字段仍不使用（Non-Goals）。一切文本内容以不可信数据形式
+// 传给判定器（JSON 编码用户消息），MUST NOT 作为指令影响判定。
+type PermissionJudgeInput struct {
+	TaskName   string
+	Permission string
+	Patterns   []string
+
+	// --- 平台语境（D5）---
+	ProjectName string // 项目名
+	ProjectKind string // 项目类型（repo|dir）
+	TaskMode    string // 任务模式（worktree|local-path）
+	TaskDir     string // 任务目录（worktree path）
+	ProjectDir  string // 项目目录
+	Branch      string // 分支
+
+	// Detail 按类别从 metadata 确定性提取的请求详情（D5 提取表）；
+	// Degraded 非空时判定器内短路（先于配置检查）→ UNCERTAIN 转人工。
+	Detail RequestDetail
+}
+
+// PermissionJudge 判定单条权限请求是否可通过（task-permission-mode D5，
+// BranchNamer 同型：本接口只定义抽象，避免 task→infrastructure/ai 依赖；
+// 具体实现（ai.PermJudge）在 main.go wiring 阶段注入。Manager 持有 judge 为 nil 时
+// ai-auto 行为 = 全部转人工（防御回退，同 namer nil 防御）。
+//
+// 实现内部完成 LLM 调用与输出解析；Judge 自其入口派生 10s 总 deadline
+//（初次调用与能力协商重试共用，ai.PermJudge 承担）。
+type PermissionJudge interface {
+	// Judge 返回 approve/reject/uncertain；err 非 nil 一律不回复（转人工）。
+	// 未配置与输出非法返回 uncertain + 非 nil error（供审计区分 FAILED 与真实
+	// UNCERTAIN，见 D11）；合法 UNCERTAIN 返回 uncertain + nil。
+	Judge(ctx context.Context, in PermissionJudgeInput) (PermissionVerdict, error)
+}
+
+// PermAuditRecord 单条 ai-auto 判定审计记录（task-permission-mode D11，
+// 字段与 spec「ai-auto 权限判定审计日志」逐字对应：time/task_id/task_name/request_id/
+// permission/patterns/verdict/reply_result/reply）。
+type PermAuditRecord struct {
+	// Time RFC3339 时间戳（由调用方在判定终结时刻生成）。
+	Time string `json:"time"`
+	// TaskID / TaskName 任务标识与名称。
+	TaskID   string `json:"task_id"`
+	TaskName string `json:"task_name"`
+	// RequestID 权限请求 ID；Permission 工具名；Patterns 请求的模式列表（与观察一致）。
+	RequestID  string   `json:"request_id"`
+	Permission string   `json:"permission"`
+	Patterns   []string `json:"patterns"`
+	// Verdict 判定结论：APPROVE|REJECT|UNCERTAIN|FAILED（FAILED = LLM 未配置、
+	// 调用失败、超时或输出非法）。
+	Verdict string `json:"verdict"`
+	// ReplyResult 回复结果：ok|gone|unknown|unsupported|not_applicable。
+	ReplyResult string `json:"reply_result"`
+	// Reply 实际发送的回复（once/reject）；仅 Verdict 为 APPROVE/REJECT 且
+	// ReplyResult 为 ok 时设置（条件字段，omitempty）。
+	Reply string `json:"reply,omitempty"`
+	// Detail 本次判定使用的同一份 RequestDetail 的摘要文本（≤1024B 含原因前缀与
+	// 截断标记，D11；降级原因作前缀；无详情时空串，字段必有）。由 judgeAndReply
+	// 统一生成，adapter/logger 仅透传。
+	Detail string `json:"detail"`
+}
+
+// PermAuditLogger ai-auto 判定审计端口（task-permission-mode D11，窄端口）：
+// 消费者在每次判定尝试终结时调用恰好一次；写入错误必须返回给调用方
+//（消费者降级为普通日志，旁路——MUST NOT 影响判定/回复）。nil 防御：未装配时
+// 零写入、行为与无审计完全一致；装配侧 MUST 保持 nil 接口，MUST NOT 注入持有
+// nil 指针的非 nil interface。
+type PermAuditLogger interface {
+	Record(PermAuditRecord) error
+}
+
 // PreflightDeleteOpts 删除前置检查选项（B8）。
 type PreflightDeleteOpts struct {
 	RepoPath     string
@@ -193,6 +281,32 @@ const (
 	TaskModeWorktree  = "worktree"
 	TaskModeLocalPath = "local-path"
 )
+
+// PermissionMode 任务级权限模式（task-permission-mode D1，持久化于 tasks.permission_mode，
+// migration 0015）：
+//   - ask（缺省）：人工逐条批准，opencode 原生权限行为不变；
+//   - all-approve：激活时以 --auto 启动 opencode（未被显式 deny 的请求自动批准）；
+//   - ai-auto：权限请求经平台全局 LLM 判定，不可用时转人工（argv 与 ask 一致）。
+const (
+	PermissionModeAsk        = "ask"
+	PermissionModeAllApprove = "all-approve"
+	PermissionModeAIAuto     = "ai-auto"
+)
+
+// resolvePermissionMode 解析任务有效权限模式（task-permission-mode D1，纯函数，单点收口）。
+// 空串（防御：0015 列 NOT NULL DEFAULT 'ask'，存量行不会为空）与 "ask" → ask；
+// 三合法值 → 自身；未知持久化值 → internal error（fail-closed，持久化损坏，
+// 同 resolveTaskMode 哲学）。
+func resolvePermissionMode(t TaskRow) (string, error) {
+	switch t.PermissionMode {
+	case "", PermissionModeAsk:
+		return PermissionModeAsk, nil
+	case PermissionModeAllApprove, PermissionModeAIAuto:
+		return t.PermissionMode, nil
+	default:
+		return "", fmt.Errorf("task %s: invalid permission mode %q", t.ID, t.PermissionMode)
+	}
+}
 
 // resolveTaskMode 解析任务有效运行模式（add-local-path-task-mode D2，纯函数，单点收口）。
 // 穷尽矩阵、kind-first：合法组合仅 (repo,worktree)、(repo,local-path)、(dir,local-path)；

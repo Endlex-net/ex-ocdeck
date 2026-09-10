@@ -182,6 +182,18 @@ func (m *Manager) Create(ctx context.Context, projectID string, opts CreateTaskO
 	if strings.TrimSpace(opts.Name) == "" {
 		return TaskRow{}, newOpErr(codeInvalidInput, errors.New("task name is required"))
 	}
+	// 权限模式缺省归一化与复核（task-permission-mode D2）：空串=缺省 → ask 落库；
+	// 非空非法值 invalid_input 零副作用（与 Mode 的「api 校验 + task 层复核」双闸一致，
+	// 任何状态写入与副作用前拒绝）。
+	permissionMode := opts.PermissionMode
+	if permissionMode == "" {
+		permissionMode = PermissionModeAsk
+	}
+	switch permissionMode {
+	case PermissionModeAsk, PermissionModeAllApprove, PermissionModeAIAuto:
+	default:
+		return TaskRow{}, newOpErr(codeInvalidInput, fmt.Errorf("unknown permission mode %q", opts.PermissionMode))
+	}
 	// 项目存在性检查。
 	proj, err := m.store.GetProject(ctx, projectID)
 	if err != nil {
@@ -194,9 +206,9 @@ func (m *Manager) Create(ctx context.Context, projectID string, opts CreateTaskO
 	case ProjectKindRepo:
 		switch opts.Mode {
 		case "", TaskModeWorktree:
-			return m.createRepo(ctx, projectID, opts.Name, proj, opts.BaseRef)
+			return m.createRepo(ctx, projectID, opts.Name, proj, opts.BaseRef, permissionMode)
 		case TaskModeLocalPath:
-			return m.createInPlace(ctx, projectID, opts.Name, proj, opts.BaseRef)
+			return m.createInPlace(ctx, projectID, opts.Name, proj, opts.BaseRef, permissionMode)
 		default:
 			return TaskRow{}, newOpErr(codeInvalidInput, fmt.Errorf("unknown task mode %q", opts.Mode))
 		}
@@ -207,7 +219,7 @@ func (m *Manager) Create(ctx context.Context, projectID string, opts CreateTaskO
 		if opts.Mode != "" && opts.Mode != TaskModeLocalPath {
 			return TaskRow{}, newOpErr(codeInvalidInput, fmt.Errorf("mode %q is not allowed for dir project", opts.Mode))
 		}
-		return m.createInPlace(ctx, projectID, opts.Name, proj, opts.BaseRef)
+		return m.createInPlace(ctx, projectID, opts.Name, proj, opts.BaseRef, permissionMode)
 	default:
 		// 未知持久化 kind（DB 损坏值）→ internal（D1：区别于用户请求非法 kind 的 invalid_input）。
 		return TaskRow{}, newOpErr(codeInternal, fmt.Errorf("unknown project kind %q", proj.Kind))
@@ -216,7 +228,8 @@ func (m *Manager) Create(ctx context.Context, projectID string, opts CreateTaskO
 
 // createRepo 实现 repo 项目任务创建（ai-worktree-naming D5 + add-plain-dir-project D10）。
 // base_ref 缺省落库 refs/heads/<proj.DefaultBranch>；提供短名则解析为全限定 ref。
-func (m *Manager) createRepo(ctx context.Context, projectID, taskName string, proj ProjectRow, baseRef string) (TaskRow, error) {
+// permissionMode 已由 Create 归一化/复核（task-permission-mode D2），原样落库。
+func (m *Manager) createRepo(ctx context.Context, projectID, taskName string, proj ProjectRow, baseRef, permissionMode string) (TaskRow, error) {
 	taskID := newTaskID()
 	// 分支 slug 经 Namer 提炼（ai-worktree-naming D3/D4）：nil 时回退到本包 Slugify
 	//（构造期或测试未注入时的防御，杜绝 panic）。
@@ -260,7 +273,7 @@ func (m *Manager) createRepo(ctx context.Context, projectID, taskName string, pr
 	if err := m.writeCreateTask(ctx, TaskRow{
 		ID: taskID, ProjectID: projectID, Name: taskName,
 		Branch: branch, Status: StatusCreating, WorktreePath: wtPath, BaseRef: resolvedBaseRef,
-		Mode: TaskModeWorktree,
+		Mode: TaskModeWorktree, PermissionMode: permissionMode,
 	}); err != nil {
 		return TaskRow{}, newOpErr(codeInternal, fmt.Errorf("create task row: %w", err))
 	}
@@ -322,7 +335,7 @@ func (m *Manager) createRepo(ctx context.Context, projectID, taskName string, pr
 	if err != nil {
 		return TaskRow{ID: taskID, ProjectID: projectID, Name: taskName, Branch: branch,
 			Status: StatusSuspended, WorktreePath: wtPath, BaseRef: resolvedBaseRef,
-			Mode: TaskModeWorktree}, newOpErr(codeInternal, err)
+			Mode: TaskModeWorktree, PermissionMode: permissionMode}, newOpErr(codeInternal, err)
 	}
 	return row, nil
 }
@@ -331,10 +344,11 @@ func (m *Manager) createRepo(ctx context.Context, projectID, taskName string, pr
 // add-plain-dir-project D2 + add-local-path-task-mode D3）。
 // 无 worktree/分支/inherit 复制；worktree_path=canonical 项目路径，Branch=""，
 // 落库 mode='local-path'（MUST NOT 落到 DB DEFAULT 'worktree'）。
+// permissionMode 已由 Create 归一化/复核（task-permission-mode D2），原样落库。
 // 落库前做无副作用目录预检（EvalSymlinks+IsDir，否则 invalid_state 不落 creating 行）。
 // 提供 base_ref → invalid_input 零副作用（dir 与 repo local-path 均不接受 base_ref）。
 // creation_failed 仅可能来自 lifecycle 配置读取失败或提交点失败。
-func (m *Manager) createInPlace(ctx context.Context, projectID, taskName string, proj ProjectRow, baseRef string) (TaskRow, error) {
+func (m *Manager) createInPlace(ctx context.Context, projectID, taskName string, proj ProjectRow, baseRef, permissionMode string) (TaskRow, error) {
 	if baseRef != "" {
 		if proj.Kind == ProjectKindRepo {
 			// repo 项目 local-path 模式任务不接受 base_ref（就地运行无基线分支语义）。
@@ -362,7 +376,7 @@ func (m *Manager) createInPlace(ctx context.Context, projectID, taskName string,
 	if err := m.writeCreateTask(ctx, TaskRow{
 		ID: taskID, ProjectID: projectID, Name: taskName,
 		Branch: "", Status: StatusCreating, WorktreePath: canonicalPath, BaseRef: "",
-		Mode: TaskModeLocalPath,
+		Mode: TaskModeLocalPath, PermissionMode: permissionMode,
 	}); err != nil {
 		return TaskRow{}, newOpErr(codeInternal, fmt.Errorf("create task row: %w", err))
 	}
@@ -406,7 +420,8 @@ func (m *Manager) createInPlace(ctx context.Context, projectID, taskName string,
 	row, err := m.store.GetTask(ctx, taskID)
 	if err != nil {
 		return TaskRow{ID: taskID, ProjectID: projectID, Name: taskName, Branch: "",
-			Status: StatusSuspended, WorktreePath: canonicalPath, Mode: TaskModeLocalPath}, newOpErr(codeInternal, err)
+			Status: StatusSuspended, WorktreePath: canonicalPath, Mode: TaskModeLocalPath,
+			PermissionMode: permissionMode}, newOpErr(codeInternal, err)
 	}
 	return row, nil
 }

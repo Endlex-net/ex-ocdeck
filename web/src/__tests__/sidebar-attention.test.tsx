@@ -37,6 +37,7 @@ function makeProjects(attentionCount: number, agentStatus = 'busy'): Project[] {
           branch: 'main',
           worktree_path: '/tmp/wt',
           mode: 'worktree',
+          permission_mode: 'ask',
           updated_at: 2,
           agentStatus,
           attention_count: attentionCount,

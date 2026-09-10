@@ -125,10 +125,13 @@ func (s *Server) registerTaskRoutes(mux *http.ServeMux) {
 // 仅 repo 项目接受；dir 项目提供即 invalid_input，由 task 层校验）。
 // Mode 为任务级运行模式（add-local-path-task-mode D6）：指针保留 presence 语义——
 // null=缺省（repo→worktree；dir→local-path），非 null=显式提供。
+// PermissionMode 为任务级权限模式（task-permission-mode D2）：指针保留 presence 语义——
+// null=缺省（→ask），非 null=显式提供（trim 后须为三合法值）。
 type createTaskReq struct {
-	Name    string  `json:"name"`
-	BaseRef string  `json:"base_ref"`
-	Mode    *string `json:"mode"`
+	Name           string  `json:"name"`
+	BaseRef        string  `json:"base_ref"`
+	Mode           *string `json:"mode"`
+	PermissionMode *string `json:"permission_mode"`
 }
 
 // 任务级运行模式合法值（add-local-path-task-mode D7）。与 internal/task 的 TaskMode
@@ -136,6 +139,14 @@ type createTaskReq struct {
 const (
 	taskModeWorktree  = "worktree"
 	taskModeLocalPath = "local-path"
+)
+
+// 任务级权限模式合法值（task-permission-mode D2）。与 internal/task 的 PermissionMode
+// 常量同源；api 层不经由 task 包，参照 taskMode* 本地常量先例。
+const (
+	permissionModeAsk        = "ask"
+	permissionModeAllApprove = "all-approve"
+	permissionModeAIAuto     = "ai-auto"
 )
 
 // validTaskModeForKind 校验 kind+mode 组合（task-lifecycle delta 决策表：合法组合仅
@@ -152,6 +163,20 @@ func validTaskModeForKind(kind, mode string) bool {
 	}
 }
 
+// permissionModeForOutput 归一化输出权限模式（task-permission-mode D7）：空值输出 ask
+// （存量防御，列 DEFAULT 之前不会出现，此处兜底）；未知持久化值 fail-closed 返回
+// internal（DTO 输出路径不得产出坏值元素，同 validTaskModeForKind 哲学）。
+func permissionModeForOutput(taskID, mode string) (string, *ApiError) {
+	switch mode {
+	case permissionModeAsk, permissionModeAllApprove, permissionModeAIAuto:
+		return mode, nil
+	case "":
+		return permissionModeAsk, nil
+	default:
+		return "", NewError(CodeInternal, fmt.Sprintf("task %s: invalid permission_mode %q", taskID, mode))
+	}
+}
+
 func (r createTaskReq) validate() *ApiError {
 	// ② name 非空（校验顺序见 add-local-path-task-mode D6）：trim 判空，任何空白名称
 	// 均先于 ③mode/④kind 报错；原名称透传 task 层，不在此改写。
@@ -165,6 +190,15 @@ func (r createTaskReq) validate() *ApiError {
 		case taskModeWorktree, taskModeLocalPath:
 		default:
 			return NewError(CodeInvalidInput, "mode must be worktree or local-path")
+		}
+	}
+	// ④ permission_mode 值域（task-permission-mode D2，校验顺序 name → mode →
+	// permission_mode）：显式提供时 trim 后为空串或未知值 → invalid_input；缺省（null）跳过。
+	if r.PermissionMode != nil {
+		switch strings.TrimSpace(*r.PermissionMode) {
+		case permissionModeAsk, permissionModeAllApprove, permissionModeAIAuto:
+		default:
+			return NewError(CodeInvalidInput, "permission_mode must be ask, all-approve or ai-auto")
 		}
 	}
 	return nil
@@ -249,10 +283,17 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		}
 		mode = strings.TrimSpace(*req.Mode)
 	}
+	// permission_mode 透传（task-permission-mode D2）：值域已在 validate 校验，null/缺省
+	// 传空串（task 层归一化为 ask）。
+	permissionMode := ""
+	if req.PermissionMode != nil {
+		permissionMode = strings.TrimSpace(*req.PermissionMode)
+	}
 	t, err := s.tasks.Create(r.Context(), projectID, application.CreateTaskOptions{
-		Name:    req.Name,
-		BaseRef: strings.TrimSpace(req.BaseRef),
-		Mode:    mode,
+		Name:           req.Name,
+		BaseRef:        strings.TrimSpace(req.BaseRef),
+		Mode:           mode,
+		PermissionMode: permissionMode,
 	})
 	if err != nil {
 		writeApiError(w, mapTaskErr(err))
@@ -477,26 +518,29 @@ func (s *Server) handleCloseTerminal(w http.ResponseWriter, r *http.Request) {
 // fail-closed 解析：projs 未注入/项目不存在/未知 kind → 返回错误信封，不输出 DTO。
 // mode 为任务级运行模式（add-local-path-task-mode D7）：必有字段（非 omitempty），
 // 非法 kind/mode 组合 fail-closed 不输出（toTaskDTO 返回错误）。
+// permission_mode 为任务级权限模式（task-permission-mode D7）：必有字段（非 omitempty），
+// 空值输出 ask、未知持久化值 fail-closed 不输出（toTaskDTO 返回错误）。
 type taskRowDTO struct {
-	ID           string          `json:"id"`
-	ProjectID    string          `json:"project_id"`
-	Name         string          `json:"name"`
-	Branch       string          `json:"branch"`
-	Status       string          `json:"status"`
-	WorktreePath string          `json:"worktree_path"`
-	LastPort     int             `json:"last_port,omitempty"`
-	LastError    string          `json:"last_error,omitempty"`
-	Notice       json.RawMessage `json:"notice,omitempty"`
-	DeleteMode   string          `json:"delete_mode,omitempty"`
-	CreatedAt    int64           `json:"created_at"`
-	UpdatedAt    int64           `json:"updated_at"`
-	InitStatus   string          `json:"init_status"`
-	InitError    string          `json:"init_error,omitempty"`
-	ProjectKind  string          `json:"project_kind"`
-	Mode         string          `json:"mode"`
-	Sessions     []sessionRowDTO `json:"sessions,omitempty"`
-	AgentStatus  string          `json:"agentStatus,omitempty"`
-	Attention    attentionDTO    `json:"attention"`
+	ID             string          `json:"id"`
+	ProjectID      string          `json:"project_id"`
+	Name           string          `json:"name"`
+	Branch         string          `json:"branch"`
+	Status         string          `json:"status"`
+	WorktreePath   string          `json:"worktree_path"`
+	LastPort       int             `json:"last_port,omitempty"`
+	LastError      string          `json:"last_error,omitempty"`
+	Notice         json.RawMessage `json:"notice,omitempty"`
+	DeleteMode     string          `json:"delete_mode,omitempty"`
+	CreatedAt      int64           `json:"created_at"`
+	UpdatedAt      int64           `json:"updated_at"`
+	InitStatus     string          `json:"init_status"`
+	InitError      string          `json:"init_error,omitempty"`
+	ProjectKind    string          `json:"project_kind"`
+	Mode           string          `json:"mode"`
+	PermissionMode string          `json:"permission_mode"`
+	Sessions       []sessionRowDTO `json:"sessions,omitempty"`
+	AgentStatus    string          `json:"agentStatus,omitempty"`
+	Attention      attentionDTO    `json:"attention"`
 }
 
 type sessionRowDTO struct {
@@ -556,29 +600,38 @@ func toAttentionDTO(att application.Attention) attentionDTO {
 // Attention 纯读快照（design.md D6），空数组非 null。
 // mode 为必有字段（add-local-path-task-mode D7）；组装遇非法 kind/mode 返回错误
 // （REST → 500；SSE 初始组装 500、update 保持 dirty 重试）。
+// permission_mode 为必有字段（task-permission-mode D7）：空值输出 ask、未知持久化值
+// fail-closed，错误语义与 mode 一致。
 type activeSessionDTO struct {
-	TaskID       string       `json:"task_id"`
-	ProjectID    string       `json:"project_id"`
-	ProjectName  string       `json:"project_name"`
-	Name         string       `json:"name"`
-	Branch       string       `json:"branch"`
-	WorktreePath string       `json:"worktree_path"`
-	Mode         string       `json:"mode"`
-	LastActiveAt int64        `json:"last_active_at"`
-	AgentStatus  string       `json:"agentStatus,omitempty"`
-	Attention    attentionDTO `json:"attention"`
+	TaskID         string       `json:"task_id"`
+	ProjectID      string       `json:"project_id"`
+	ProjectName    string       `json:"project_name"`
+	Name           string       `json:"name"`
+	Branch         string       `json:"branch"`
+	WorktreePath   string       `json:"worktree_path"`
+	Mode           string       `json:"mode"`
+	PermissionMode string       `json:"permission_mode"`
+	LastActiveAt   int64        `json:"last_active_at"`
+	AgentStatus    string       `json:"agentStatus,omitempty"`
+	Attention      attentionDTO `json:"attention"`
 }
 
 // toTaskDTO 任务详情 DTO 纯映射（design.md §21）。mode 为必有字段：非法 kind/mode
 // 组合为持久化损坏，返回 internal ApiError fail-closed，调用方不得输出该 DTO（D7）。
+// permission_mode 为必有字段（task-permission-mode D7）：空值输出 ask（存量防御）、
+// 未知持久化值 fail-closed internal。
 func toTaskDTO(t application.TaskRow, projectKind string) (taskRowDTO, *ApiError) {
 	if !validTaskModeForKind(projectKind, t.Mode) {
 		return taskRowDTO{}, NewError(CodeInternal, fmt.Sprintf("task %s: invalid mode %q", t.ID, t.Mode))
 	}
+	permissionMode, ae := permissionModeForOutput(t.ID, t.PermissionMode)
+	if ae != nil {
+		return taskRowDTO{}, ae
+	}
 	dto := taskRowDTO{
 		ID: t.ID, ProjectID: t.ProjectID, Name: t.Name, Branch: t.Branch, Status: t.Status,
 		WorktreePath: t.WorktreePath, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
-		ProjectKind: projectKind, Mode: t.Mode,
+		ProjectKind: projectKind, Mode: t.Mode, PermissionMode: permissionMode,
 	}
 	if t.LastPort.Valid {
 		dto.LastPort = int(t.LastPort.Int64)

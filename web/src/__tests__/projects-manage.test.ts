@@ -120,6 +120,7 @@ function makeTask(id: string, status: string): Task {
     status,
     worktree_path: '/tmp/x',
     mode: 'worktree',
+    permission_mode: 'ask',
     init_status: 'succeeded',
     created_at: 0,
     updated_at: 0,

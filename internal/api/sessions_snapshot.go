@@ -28,10 +28,16 @@ func (s *Server) buildActiveSessionsSnapshot(ctx context.Context) ([]activeSessi
 		if !validTaskModeForKind(row.Kind, row.Mode) {
 			return nil, fmt.Errorf("task %s: invalid mode %q for kind %q", row.ID, row.Mode, row.Kind)
 		}
+		// permission_mode 必有透传（task-permission-mode D7）：空值输出 ask、未知持久化值
+		// fail-closed，错误语义与 mode 一致（REST 500；SSE 保持 dirty 重试）。
+		permissionMode, ae := permissionModeForOutput(row.ID, row.PermissionMode)
+		if ae != nil {
+			return nil, ae
+		}
 		dto := activeSessionDTO{
 			TaskID: row.ID, ProjectID: row.ProjectID, ProjectName: row.ProjectName,
 			Name: row.Name, Branch: row.Branch, WorktreePath: row.WorktreePath,
-			Mode: row.Mode,
+			Mode: row.Mode, PermissionMode: permissionMode,
 			LastActiveAt: row.LastActiveAt,
 			AgentStatus:  s.tasks.AgentStatusSnapshot(row.ID),
 		}

@@ -129,10 +129,11 @@ func TestListActiveSessions_HappyPath(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("len = %d, want 2", len(got))
 	}
-	// 字段断言 + sort（last_active_at DESC）。
+	// 字段断言 + sort（last_active_at DESC）。permission_mode 为必有字段（task-permission-mode
+	// D7）：overview 行未显式设置 → 空值输出 ask。
 	want := []activeSessionDTO{
-		{TaskID: "t1", ProjectID: "p1", ProjectName: "projA", Name: "taskA", Branch: "bA", WorktreePath: "/wtA", Mode: "worktree", LastActiveAt: 300, AgentStatus: "busy", Attention: attentionDTO{Permissions: []permissionDTO{}, Questions: []questionDTO{}}},
-		{TaskID: "t2", ProjectID: "p2", ProjectName: "projB", Name: "taskB", Branch: "bB", WorktreePath: "/wtB", Mode: "worktree", LastActiveAt: 200, AgentStatus: "idle", Attention: attentionDTO{Permissions: []permissionDTO{}, Questions: []questionDTO{}}},
+		{TaskID: "t1", ProjectID: "p1", ProjectName: "projA", Name: "taskA", Branch: "bA", WorktreePath: "/wtA", Mode: "worktree", PermissionMode: "ask", LastActiveAt: 300, AgentStatus: "busy", Attention: attentionDTO{Permissions: []permissionDTO{}, Questions: []questionDTO{}}},
+		{TaskID: "t2", ProjectID: "p2", ProjectName: "projB", Name: "taskB", Branch: "bB", WorktreePath: "/wtB", Mode: "worktree", PermissionMode: "ask", LastActiveAt: 200, AgentStatus: "idle", Attention: attentionDTO{Permissions: []permissionDTO{}, Questions: []questionDTO{}}},
 	}
 	for i, w := range want {
 		if !reflect.DeepEqual(got[i], w) {

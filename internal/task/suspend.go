@@ -142,6 +142,11 @@ func (m *Manager) suspendRun(ctx context.Context, taskID string, mode AlignMode)
 			ccancel()
 			if rerr == nil && fresh.Status == StatusActive && m.getRuntime(taskID) != nil {
 				m.StartDiffReviewSchedulerForTask(m.lifeCtx, taskID)
+				// task-permission-mode D4 (b1)：幂等成功分支同置就绪并扫描。
+				if rt := m.getRuntime(taskID); rt != nil {
+					rt.setPermJudgeReady()
+					m.judgeScan(rt)
+				}
 				return nil
 			}
 			m.clearRuntime(taskID)
@@ -150,6 +155,12 @@ func (m *Manager) suspendRun(ctx context.Context, taskID string, mode AlignMode)
 		// F3：恢复 active 提交成功后启动 diff review 调度器（tryRepairRuntime 经
 		// setRuntime 注册运行时，但 setRuntime 不再承担启动点）。幂等。
 		m.StartDiffReviewSchedulerForTask(m.lifeCtx, taskID)
+		// task-permission-mode D4 (b1)：挂起修复回 active CAS matched 分支置就绪并扫描
+		//（覆盖修复重建期间经 align/SSE 登记的 pending）。
+		if rt := m.getRuntime(taskID); rt != nil {
+			rt.setPermJudgeReady()
+			m.judgeScan(rt)
+		}
 		return nil
 	}
 	// 修复失败或期间 serve 死亡 → 转分支 a：强制 kill 残余 → suspended。

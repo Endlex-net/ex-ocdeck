@@ -630,6 +630,10 @@ func (m *Manager) commitRuntimeReady(ctx context.Context, taskID, wtPath, runtim
 		// F3：active 提交后才启动 diff review 调度器（此前启动会让首探抢跑，
 		// taskOcClient 拒绝非 active task）。幂等（已运行则 no-op）。
 		m.StartDiffReviewSchedulerForTask(m.lifeCtx, taskID)
+		// task-permission-mode D4 (b1)：先置实例就绪再扫描（覆盖 activating 期经首次
+		// align/SSE 登记的全部 pending，含 AI 快路径；幂等）。
+		rt.setPermJudgeReady()
+		m.judgeScan(rt)
 		return nil
 	}
 	fresh, rerr := m.store.GetTask(ctx, taskID)
@@ -643,6 +647,9 @@ func (m *Manager) commitRuntimeReady(ctx context.Context, taskID, wtPath, runtim
 			// 幂等提交：另一 committer 已完成 CAS（其已启动调度器）；此处补一次
 			// 幂等启动无妨（已运行则 no-op）。
 			m.StartDiffReviewSchedulerForTask(m.lifeCtx, taskID)
+			// task-permission-mode D4 (b1)：幂等成功分支同置就绪并扫描（同接缝，幂等）。
+			rt.setPermJudgeReady()
+			m.judgeScan(rt)
 			return nil
 		}
 	}
@@ -1038,10 +1045,16 @@ func wrapServeWaitCause(waitErr error, finalErr error, parts ...string) error {
 
 // runtimeCmdArgv 构造单进程启动 argv：`opencode --port <p> --hostname 127.0.0.1`，
 // 有锚定时追加 `--session <id>`（D1/D5）。密码经 env 注入，禁止进 argv。
-func runtimeCmdArgv(port int, sessionID string) []string {
+// permissionMode 为已解析的有效权限模式（task-permission-mode D3）：all-approve 追加
+// `--auto`（未被显式 deny 的权限请求自动批准）；ask/ai-auto 与现状逐字一致。
+// 调用方 MUST 先经 resolvePermissionMode 解析（未知值 fail-closed 拒绝启动）。
+func runtimeCmdArgv(port int, sessionID, permissionMode string) []string {
 	argv := []string{"opencode", "--port", strconv.Itoa(port), "--hostname", "127.0.0.1"}
 	if sessionID != "" {
 		argv = append(argv, "--session", sessionID)
+	}
+	if permissionMode == PermissionModeAllApprove {
+		argv = append(argv, "--auto")
 	}
 	return argv
 }
@@ -1062,6 +1075,12 @@ func (m *Manager) startServeWithPortRetry(ctx context.Context, row TaskRow, serv
 // compensation。返回最终可用端口与本次创建实际使用的密码；轮换路径终态错误可携带
 // pendingCleanupError。
 func (m *Manager) startRuntimeWithPortRetry(ctx context.Context, row TaskRow, serveName string, port int, password string, env map[string]string, sessionID string, beforeCreate func() error, freshPassword bool) (int, string, error) {
+	// 权限模式解析（task-permission-mode D3）：单点收口 resolvePermissionMode；未知持久化值
+	// 为持久化损坏，fail-closed 返回 internal error，MUST NOT 启动进程（先于 permit 与任何副作用）。
+	permissionMode, perr := resolvePermissionMode(row)
+	if perr != nil {
+		return port, password, newOpErr(codeInternal, perr)
+	}
 	// prevWaitErr / prevRotateParts 承载上一轮健康失败上下文（G3-4：端口分配移至轮次
 	// 顶部、permit 之后；轮间上下文经此传递，操作顺序与既有一致）。
 	var prevWaitErr error
@@ -1103,7 +1122,7 @@ func (m *Manager) startRuntimeWithPortRetry(ctx context.Context, row TaskRow, se
 			Name:    serveName,
 			Dir:     row.WorktreePath,
 			Env:     serveEnv,
-			CmdArgv: runtimeCmdArgv(port, sessionID),
+			CmdArgv: runtimeCmdArgv(port, sessionID, permissionMode),
 		}); err != nil {
 			return port, password, newOpErr(codeProcessError, fmt.Errorf("runtime session: %w", err))
 		}
@@ -1357,6 +1376,9 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 			}
 			// D6 注意力对账（align 路径）：session align 成功后、drainAndRelease 前。失败不影响任务状态机。
 			m.reconcileTaskAttention(sseCtx, rt, ocWithReady, wtPath)
+			// task-permission-mode D4 (b2)：已 active 实例重连 align 对账完成后扫描。
+			// 该路径不重新 CAS，准入以任务仍 active 为准（对账写回发现的 pending 在此纳入）。
+			m.judgeScan(rt)
 			// P1.8.3：agentStatus 对账（align 成功后、drainAndRelease 前；失败仅保持不可用，
 			// 不影响任务生命周期）。
 			m.reconcileAgentStatus(sseCtx, rt, taskID, wtPath, ocWithReady)
@@ -1522,6 +1544,11 @@ func (m *Manager) handleSSEEvent(ctx context.Context, taskID, wtPath string, ev 
 			if rt := m.getRuntime(taskID); rt != nil {
 				if rt.applyAttentionEvent(aev) {
 					m.commitAttentionChanged(taskID, rt, true)
+				}
+				// task-permission-mode D4 (a)：SSE asked 应用后扫描。准入未过自然拒绝
+				//（暂缓或忽略）；judged-set 保证重放/重复 asked 不放大判定。
+				if aev.Type == opencode.AttentionPermission && aev.Kind == opencode.AttentionAsked {
+					m.judgeScan(rt)
 				}
 			}
 			return nil

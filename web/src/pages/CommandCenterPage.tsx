@@ -7,9 +7,11 @@ import {
   isGitlessTask,
   isTransitional,
   parseNotice,
+  PERMISSION_MODE_LABELS,
   type ActiveSessionItem,
   type Project,
   type TaskMode,
+  type TaskPermissionMode,
   type TaskSummary,
 } from '../types';
 import { StatusBadge } from '../components/StatusBadge';
@@ -459,6 +461,7 @@ function toTask(m: MergedTask) {
     status: m.task.status,
     worktree_path: m.task.worktree_path,
     mode: m.task.mode,
+    permission_mode: m.task.permission_mode,
     last_error: m.task.last_error,
     notice: m.task.notice,
     init_status: m.task.init_status,
@@ -796,6 +799,8 @@ function NewTaskPanel({
   const [baseRef, setBaseRef] = useState('');
   // 工作空间选择器（add-local-path-task-mode）：仅 repo 项目渲染，缺省 worktree。
   const [runMode, setRunMode] = useState<TaskMode>('worktree');
+  // 权限模式选择器（task-permission-mode D8）：全部项目类型渲染，缺省 ask。
+  const [permMode, setPermMode] = useState<TaskPermissionMode>('ask');
   // D9 分支列表状态机：idle|loading|ready|error，与 lastSuccessfulBranches 正交。
   // 仅 ready 计算提交候选；loading/error 禁止提交；dir 项目无此状态机（恒 idle）。
   const [branchPhase, setBranchPhase] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
@@ -808,6 +813,7 @@ function NewTaskPanel({
   const projInputId = useId();
   const branchInputId = useId();
   const modeGroupId = useId();
+  const permGroupId = useId();
   const taskNameRef = useRef<HTMLInputElement>(null);
   const focusedNonceRef = useRef<number | null>(null);
   // 代际防陈旧写回 + 最新选择 ref（异步闭包读最新值而非闭包捕获值）
@@ -868,6 +874,8 @@ function NewTaskPanel({
     if (pid !== lastProjectIdRef.current) {
       lastProjectIdRef.current = pid;
       setRunMode('worktree');
+      // 权限模式重置规则与 runMode 逐字一致（task-permission-mode D8）：项目 ID 变更 → ask
+      setPermMode('ask');
     }
     // 切换项目时重置刷新状态（与旧项目解耦，避免 B 永久处于刷新中，并释放旧刷新所有权）
     setRefreshing(false);
@@ -985,9 +993,11 @@ function NewTaskPanel({
     try {
       // local-path：携带 mode=local-path 且 MUST NOT 携带 base_ref（D6 presence 契约）；
       // worktree/dir 走既有三参调用（mode 缺省 = worktree 语义）。
+      // 权限模式（task-permission-mode D2/D8）：非缺省才传；缺省 ask 不携带 permission_mode 字段。
+      const permArg = permMode === 'ask' ? undefined : permMode;
       const t = isLocalPath
-        ? await api.createTask(proj.id, taskName.trim(), undefined, 'local-path')
-        : await api.createTask(proj.id, taskName.trim(), isDir ? undefined : filteredBranches[0] || undefined);
+        ? await api.createTask(proj.id, taskName.trim(), undefined, 'local-path', permArg)
+        : await api.createTask(proj.id, taskName.trim(), isDir ? undefined : filteredBranches[0] || undefined, undefined, permArg);
       setTaskName('');
       // mutation 成功：跳转工作台（from=home）+ trailing refresh（失败静默，store error 通道承担）
       navigate(`/task/${t.id}?from=home`);
@@ -1131,6 +1141,29 @@ function NewTaskPanel({
             {branchPhase === 'error' && lastSuccessfulBranches.length > 0 && (
               <div className="error-line cc-field-error">本地快照未刷新</div>
             )}
+          </div>
+        )}
+
+        {/* 权限模式（task-permission-mode D8）：三段 segmented control，工作空间控件同型，
+            缺省「人工批准」（ask）；全部项目类型渲染（dir 任务同样适用权限模式），
+            创建后不可修改 */}
+        {selectedProject && (
+          <div className="od-field">
+            <label className="od-label" id={permGroupId}>权限模式</label>
+            <div className="cc-segment" role="radiogroup" aria-labelledby={permGroupId}>
+              {(['ask', 'all-approve', 'ai-auto'] as const).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  role="radio"
+                  aria-checked={permMode === m}
+                  className={`cc-segment-item${permMode === m ? ' on' : ''}`}
+                  onClick={() => setPermMode(m)}
+                >
+                  {PERMISSION_MODE_LABELS[m]}
+                </button>
+              ))}
+            </div>
           </div>
         )}
 

@@ -38,6 +38,7 @@ function item(taskId: string): ActiveSessionItem {
     branch: 'main',
     worktree_path: '/wt',
     mode: 'worktree',
+    permission_mode: 'ask',
     last_active_at: 100,
   };
 }
@@ -52,6 +53,7 @@ function taskObj(id: string): Task {
     status: 'active',
     worktree_path: '/wt',
     mode: 'worktree',
+    permission_mode: 'ask',
     init_status: 'none',
     created_at: 1,
     updated_at: 1,

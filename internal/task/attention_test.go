@@ -86,6 +86,9 @@ func (c *blockingPermOC) PromptAsync(ctx context.Context, dir, sessionID, messag
 func (c *blockingPermOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
 	return c.inner.ProbePromptAsyncCapability(ctx)
 }
+func (c *blockingPermOC) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
+	return c.inner.ReplyPermission(ctx, dir, requestID, reply)
+}
 
 // blockingBothOC 同时阻塞 ListPermissions 与 ListQuestions，各自 entered 信号独立。
 // 用于验证 degraded 后台重试两类型并发启动（任一释放前两者均已进入 REST）。
@@ -145,6 +148,9 @@ func (c *blockingBothOC) PromptAsync(ctx context.Context, dir, sessionID, messag
 }
 func (c *blockingBothOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
 	return c.inner.ProbePromptAsyncCapability(ctx)
+}
+func (c *blockingBothOC) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
+	return c.inner.ReplyPermission(ctx, dir, requestID, reply)
 }
 
 // --- pending 生命周期 ---

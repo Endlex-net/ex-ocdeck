@@ -171,6 +171,9 @@ func (c *countingProbeOC) ProbePromptAsyncCapability(ctx context.Context) openco
 	atomic.AddInt32(c.probeCalls, 1)
 	return c.inner.ProbePromptAsyncCapability(ctx)
 }
+func (c *countingProbeOC) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
+	return c.inner.ReplyPermission(ctx, dir, requestID, reply)
+}
 
 // --- 能力事件模型：instVersion 失效 ---
 
@@ -330,6 +333,9 @@ func (c *dirCaptureOC) PromptAsync(ctx context.Context, dir, sessionID, messageI
 }
 func (c *dirCaptureOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
 	return c.inner.ProbePromptAsyncCapability(ctx)
+}
+func (c *dirCaptureOC) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
+	return c.inner.ReplyPermission(ctx, dir, requestID, reply)
 }
 
 // --- adapter 获取失败=pre_send_failure ---

@@ -71,12 +71,22 @@ type fakeCompleter struct {
 	err    error
 	last   Request
 	mu     sync.Mutex
+	// lastCtxDeadline / hasDeadline 捕获调用方 ctx 的 deadline（PermJudge 判定
+	// 预算派生断言用，task-permission-mode F4）。
+	lastCtxDeadline time.Time
+	hasDeadline     bool
 }
 
 func (f *fakeCompleter) Complete(ctx context.Context, req Request) (Response, error) {
 	f.calls.Add(1)
 	f.mu.Lock()
 	f.last = req
+	if d, ok := ctx.Deadline(); ok {
+		f.lastCtxDeadline = d
+		f.hasDeadline = true
+	} else {
+		f.hasDeadline = false
+	}
 	f.mu.Unlock()
 	if f.err != nil {
 		return Response{}, f.err

@@ -14,6 +14,7 @@ import { GitPanel } from '../components/GitPanel';
 import { EnvEditor } from '../components/EnvEditor';
 import { AgentStatusBadge } from '../components/AgentStatusBadge';
 import { InitStatusBadge } from '../components/InitStatusBadge';
+import { PermissionModeBadge } from '../components/PermissionModeBadge';
 import { LifecycleLogModal } from '../components/LifecycleLogModal';
 import { OpenInEditorMenu } from '../components/OpenInEditorMenu';
 import { RerunInitButton } from '../components/RerunInitButton';
@@ -419,6 +420,8 @@ export function TaskWorkbenchPage({
         {task?.branch && !isBranchless && <span className="header-meta mono"><BranchIcon /> {task.branch}</span>}
         {task && <StatusBadge status={task.status} />}
         {task && <InitStatusBadge task={task} />}
+        {/* 权限模式只读展示（task-permission-mode D7）：与状态徽标同组，创建后不可修改 */}
+        {task && <PermissionModeBadge task={task} />}
         {task?.init_status === 'failed' && !isNarrow && (
           <button
             className="btn btn-small btn-ghost"
