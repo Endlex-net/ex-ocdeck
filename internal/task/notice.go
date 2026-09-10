@@ -72,7 +72,17 @@ func (m *Manager) newRuntime(taskID string) *taskRuntime {
 		groups:       map[string]*runtimeGroup{},
 		watchCancels: map[string]func(){},
 		watchDones:   map[string]<-chan struct{}{},
+		judgedPerms:  map[string]struct{}{},
 	}
+}
+
+// setPermJudgeReady 置实例就绪状态（task-permission-mode D4 触发点 (b1)）：
+// 仅三条就绪提交路径成功且确认当前实例后调用（与 StartDiffReviewSchedulerForTask
+// 同接缝）；幂等。调用方随后先置就绪再调用 judgeScan。
+func (rt *taskRuntime) setPermJudgeReady() {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.permJudgeReady = true
 }
 
 // matchesRegistry 校验回调身份 (instVersion, sessionName) 是否仍匹配当前运行时注册表的

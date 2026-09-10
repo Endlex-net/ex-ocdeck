@@ -113,6 +113,9 @@ func (c *portHealthOC) PromptAsync(ctx context.Context, dir, sessionID, messageI
 func (c *portHealthOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
 	return opencode.CapabilityUnknown
 }
+func (c *portHealthOC) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
+	return nil
+}
 
 // newPortRetryManager 构造一个 Manager，其 ocFactory 在 failPort 上 Health 失败、其他端口成功。
 // 用于 E1 端口重试测试。probeErr 传入 Probe 返回错误（默认 nil=成功）。
@@ -178,6 +181,9 @@ func (c *readyOCWrap) PromptAsync(ctx context.Context, dir, sessionID, messageID
 }
 func (c *readyOCWrap) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
 	return c.inner.ProbePromptAsyncCapability(ctx)
+}
+func (c *readyOCWrap) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
+	return c.inner.ReplyPermission(ctx, dir, requestID, reply)
 }
 
 // --- E1: 端口重写三处一致 ---

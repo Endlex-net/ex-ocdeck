@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"syscall"
@@ -23,6 +24,7 @@ import (
 	apptask "ocdeck/internal/application/task"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/ai"
+	"ocdeck/internal/infrastructure/auditlog"
 	"ocdeck/internal/infrastructure/eventbus"
 	"ocdeck/internal/infrastructure/lifecycle"
 	"ocdeck/internal/infrastructure/notify"
@@ -125,6 +127,22 @@ func run() error {
 	// LoadStore 对不存在/损坏/非法配置均不返回致命错误（保持启动），故无需 err 处理。
 	aiStore := ai.LoadStore(cfg.DataDir)
 	namer := ai.NewSlugNamer(aiStore, task.Slugify) // fallback 用本包 Slugify（避免 ai→task 循环依赖）
+	// task-permission-mode D5 装配：PermJudge 与 SlugNamer 同族（ai 不 import task），
+	// 经 composition root 适配为 task.PermissionJudge 端口注入 Manager；
+	// LLM 未配置/失败时 Judge 返回 uncertain（转人工），Manager nil judge 防御同型。
+	permJudge := ai.NewPermJudge(aiStore)
+
+	// task-permission-mode D11 装配（tasks 7.1）：ai-auto 判定审计日志
+	// <LogDir>/ai-permission-audit.jsonl（与 Manager LogDir 同源 cfg.DataDir+"/logs"）。
+	// 装配失败仅记日志、注入 nil（MUST NOT 注入持有 nil 指针的非 nil interface，
+	// MUST NOT 阻断 server 启动）。
+	var permAudit task.PermAuditLogger
+	if al, aerr := auditlog.NewPermAuditLogger(filepath.Join(cfg.DataDir, "logs", "ai-permission-audit.jsonl")); aerr != nil {
+		log.Printf("warning: ai permission audit logger disabled: %v", aerr)
+	} else {
+		permAudit = permAuditAdapter{inner: al}
+		defer al.Close()
+	}
 
 	// TaskManager 构造（design.md §18）。
 	adapter := task.NewStoreAdapter(db)
@@ -150,9 +168,11 @@ func run() error {
 		DebtStore:       adapter,         // R7：orphan tickets 持久化跨重启恢复（design.md §10）
 		LifecycleRunner: lifecycle.New(), // design.md §7.1：init/pre-delete 脚本与 inherit
 		LogDir:          cfg.DataDir + "/logs",
-		Namer:         namer,        // ai-worktree-naming：Create 经 LLM 提炼分支 slug，未配置时内部回退 Slugify
-		Lifecycle:     lifecycleSvc, // P1.4.4：Get/List/Archive/Restore 委托
-		Publish:       bus,          // idle-reminder-user-activity：用户活动上报经同一 bus 发布 task.user_activity
+		Namer:           namer,                              // ai-worktree-naming：Create 经 LLM 提炼分支 slug，未配置时内部回退 Slugify
+		PermissionJudge: permJudgeAdapter{inner: permJudge}, // task-permission-mode D5：ai-auto 权限请求自动判定
+		PermAuditLogger: permAudit,                          // task-permission-mode D11：ai-auto 判定审计日志（旁路）
+		Lifecycle:       lifecycleSvc,                       // P1.4.4：Get/List/Archive/Restore 委托
+		Publish:         bus,                                // idle-reminder-user-activity：用户活动上报经同一 bus 发布 task.user_activity
 	})
 	// 注入 Manager 生命周期 context（design.md §4：SSE/退出监视挂进程 ctx，非 HTTP request ctx）。
 	tm.SetLifecycleCtx(ctx)
@@ -365,4 +385,75 @@ func spawnWatchdog(cfg *config.Config) (*process.WatchdogManager, error) {
 	}
 	log.Printf("watchdog spawned (kill_immediate): socket=ocdeck tmpdir=%s", tmpdir)
 	return wd, nil
+}
+
+// permJudgeAdapter 将 ai.PermJudge 适配为 task.PermissionJudge 端口
+// （task-permission-mode D5；ai 包不 import internal/task，BranchNamer 同型约束，
+// 端口适配在 composition root 完成）。
+type permJudgeAdapter struct {
+	inner *ai.PermJudge
+}
+
+func (a permJudgeAdapter) Judge(ctx context.Context, in task.PermissionJudgeInput) (task.PermissionVerdict, error) {
+	// 全字段映射（task-permission-mode 8.2：漏映射会静默丢增强数据）。
+	// Detail → Evidence 全字段逐项透传（含 Degraded 降级标记）。
+	ev := ai.PermEvidence{Degraded: in.Detail.Degraded}
+	files := make([]ai.PermFileChange, 0, len(in.Detail.Files))
+	for _, f := range in.Detail.Files {
+		files = append(files, ai.PermFileChange{
+			Type: f.Type, RelativePath: f.RelativePath, Patch: f.Patch, MovePath: f.MovePath,
+		})
+	}
+	ev.Files = files
+	ev.Command = in.Detail.Command
+	ev.Filepath = in.Detail.Filepath
+	ev.Diff = in.Detail.Diff
+	ev.URL = in.Detail.URL
+	ev.Description = in.Detail.Description
+	ev.SubagentType = in.Detail.SubagentType
+	ev.Pattern = in.Detail.Pattern
+	ev.Path = in.Detail.Path
+	ev.Include = in.Detail.Include
+	ev.ParentDir = in.Detail.ParentDir
+	ev.Directories = in.Detail.Directories
+
+	v, err := a.inner.Judge(ctx, ai.PermJudgeInput{
+		Platform: ai.PermPlatformContext{
+			TaskName:    in.TaskName,
+			ProjectName: in.ProjectName,
+			ProjectType: in.ProjectKind,
+			TaskMode:    in.TaskMode,
+			TaskDir:     in.TaskDir,
+			ProjectDir:  in.ProjectDir,
+			Branch:      in.Branch,
+		},
+		Request: ai.PermRequest{
+			Permission: in.Permission,
+			Patterns:   in.Patterns,
+		},
+		Evidence: ev,
+	})
+	return task.PermissionVerdict(v), err
+}
+
+// permAuditAdapter 将 auditlog.Logger 适配为 task.PermAuditLogger 端口
+// （task-permission-mode D11；auditlog 不 import internal/task，组合根适配）。
+// err 原样透传（消费方降级为普通日志）。
+type permAuditAdapter struct {
+	inner *auditlog.Logger
+}
+
+func (a permAuditAdapter) Record(rec task.PermAuditRecord) error {
+	return a.inner.Record(auditlog.Entry{
+		Time:        rec.Time,
+		TaskID:      rec.TaskID,
+		TaskName:    rec.TaskName,
+		RequestID:   rec.RequestID,
+		Permission:  rec.Permission,
+		Patterns:    rec.Patterns,
+		Verdict:     rec.Verdict,
+		ReplyResult: rec.ReplyResult,
+		Reply:       rec.Reply,
+		Detail:      rec.Detail,
+	})
 }

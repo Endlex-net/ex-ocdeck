@@ -422,6 +422,13 @@ func (m *Manager) resumeActive(ctx context.Context, t TaskRow, mode AlignMode) e
 	}
 	// F3：active 提交后才启动 diff review 调度器（避免首探抢跑非 active task）。幂等。
 	m.StartDiffReviewSchedulerForTask(m.lifeCtx, t.ID)
+	// task-permission-mode D4 (b1)：启动恢复路径就绪提交后置就绪并扫描。
+	// 该路径 DB 状态原本就是 active，准入依据是「本次 runtime 已完成就绪提交」——
+	// 恢复期间（提交前）到达的 asked 由本次扫描兜底纳入。
+	if rt := m.getRuntime(t.ID); rt != nil {
+		rt.setPermJudgeReady()
+		m.judgeScan(rt)
+	}
 	return nil
 }
 

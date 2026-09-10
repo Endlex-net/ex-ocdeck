@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -146,6 +147,9 @@ func (a *attentionState) applyQuestLocked(ev opencode.AttentionEvent, observedAt
 
 // upsertPermLocked 登记一条 asked，返回是否改变外部可见集合。已存在且内容同值则保留原
 // since、不视为变化（同值 no-op）；新增或内容变化返回 true。
+// 等值判断修正（task-permission-mode D12）：SessionID/Permission/Patterns 原条件不变；
+// 仅 metadata 单方变化时更新内部存储但不视为外部可见变化（changed=false，不触发
+// attention_changed 发布——前端投影不含 metadata）。
 func (a *attentionState) upsertPermLocked(ev opencode.AttentionEvent, observedAt int64) bool {
 	id := ev.RequestID
 	if id == "" {
@@ -154,14 +158,27 @@ func (a *attentionState) upsertPermLocked(ev opencode.AttentionEvent, observedAt
 	since := observedAt
 	if old, ok := a.perm.perms[id]; ok {
 		since = old.Since
-		if old.SessionID == ev.SessionID && old.Permission == ev.Permission &&
-			equalStringSlices(old.Patterns, ev.Patterns) {
+		sameCore := old.SessionID == ev.SessionID && old.Permission == ev.Permission &&
+			equalStringSlices(old.Patterns, ev.Patterns)
+		if sameCore && equalMetadata(old.Metadata, ev.Metadata) {
+			return false
+		}
+		// 仅 metadata 单方变化 → 更新内部、不发布；否则视为外部可见变化。
+		a.perm.perms[id] = PendingPermission{
+			PermissionRequest: opencode.PermissionRequest{
+				ID: id, SessionID: ev.SessionID, Permission: ev.Permission,
+				Patterns: ev.Patterns, Metadata: copyMetadata(ev.Metadata),
+			},
+			Since: since,
+		}
+		if sameCore {
 			return false
 		}
 	}
 	a.perm.perms[id] = PendingPermission{
 		PermissionRequest: opencode.PermissionRequest{
-			ID: id, SessionID: ev.SessionID, Permission: ev.Permission, Patterns: ev.Patterns,
+			ID: id, SessionID: ev.SessionID, Permission: ev.Permission,
+			Patterns: ev.Patterns, Metadata: copyMetadata(ev.Metadata),
 		},
 		Since: since,
 	}
@@ -169,6 +186,21 @@ func (a *attentionState) upsertPermLocked(ev opencode.AttentionEvent, observedAt
 		a.perm.order = append(a.perm.order, id)
 	}
 	return true
+}
+
+// equalMetadata 比较 metadata 原始 JSON（nil 与空等值）。
+func equalMetadata(x, y json.RawMessage) bool {
+	return string(x) == string(y)
+}
+
+// copyMetadata 深拷贝 metadata RawMessage（快照隔离）。
+func copyMetadata(raw json.RawMessage) json.RawMessage {
+	if raw == nil {
+		return nil
+	}
+	out := make(json.RawMessage, len(raw))
+	copy(out, raw)
+	return out
 }
 
 func (a *attentionState) upsertQuestLocked(ev opencode.AttentionEvent, observedAt int64) bool {
@@ -239,11 +271,14 @@ func (a *attentionState) attentionSnapshotLocked() Attention {
 
 // permSnapshotLocked 返回 permission 集合的有序深拷贝（调用方持 a.mu）。
 // 供对账 apply 前后捕获外部可见快照做 diff（design.md D2 attention 行）。
+// Metadata 深拷贝但 MUST NOT 参与 equalPermSnapshots 等值（外部可见集合不含
+// metadata，task-permission-mode D12：仅 metadata 单方变化不触发发布）。
 func (a *attentionState) permSnapshotLocked() []PendingPermission {
 	perms := make([]PendingPermission, 0, len(a.perm.order))
 	for _, id := range a.perm.order {
 		p := a.perm.perms[id]
 		p.Patterns = copyStrings(p.Patterns)
+		p.Metadata = copyMetadata(p.Metadata)
 		perms = append(perms, p)
 	}
 	return perms
@@ -528,6 +563,9 @@ func (a *attentionState) replacePermLocked(perms []opencode.PermissionRequest, g
 		if old, ok := a.perm.perms[p.ID]; ok {
 			since = old.Since
 		}
+		// F7：REST 返回值与调用方共享底层字节，写入内部状态前拷贝 Metadata
+		//（与 SSE upsert/快照的 copyMetadata 同款，隔离外部修改）。
+		p.Metadata = copyMetadata(p.Metadata)
 		newMap[p.ID] = PendingPermission{PermissionRequest: p, Since: since}
 		newOrder = append(newOrder, p.ID)
 	}
@@ -860,6 +898,13 @@ func (m *Manager) retryAttentionDegraded(ctx context.Context) {
 			}()
 		}
 		wg.Wait()
+		// task-permission-mode D4 (c)：degraded 后台对账（permission 分支）完成后扫描。
+		// 覆盖两种写回变体且不以 REST 成功或 changed 为前提——后台 GET 在途时到达的
+		// SSE asked 只入缓冲，GET 失败重放时才写入 pending，仅在成功时触发会漏掉该请求。
+		// 是否发起仍由 judgeScan 的 active/实例/停止/unsupported/judged-set 门禁决定。
+		if permDegraded {
+			m.judgeScan(rt)
+		}
 	}
 }
 
@@ -906,7 +951,8 @@ func (m *Manager) ListProjectTaskSummaries(ctx context.Context) ([]ProjectTaskSu
 		summary := ProjectTaskSummary{
 			TaskID: t.ID, Name: t.Name, ProjectID: t.ProjectID, Status: t.Status,
 			InitStatus: t.InitStatus, Branch: t.Branch, Mode: t.Mode, WorktreePath: t.WorktreePath,
-			UpdatedAt: t.UpdatedAt,
+			PermissionMode: t.PermissionMode,
+			UpdatedAt:      t.UpdatedAt,
 		}
 		if t.LastError.Valid {
 			summary.LastError = t.LastError.String

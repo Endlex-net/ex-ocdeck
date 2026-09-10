@@ -586,8 +586,10 @@ func (m *Manager) startTempServe(ctx context.Context, row TaskRow) (int, string,
 	password := newRandomPassword()
 	serveName := runtimeSessionName(row.ID)
 	env := map[string]string{"OPENCODE_SERVER_PASSWORD": password, "OCDECK_TASK_ID": row.ID}
+	// 权限模式恒为 ask（task-permission-mode D3）：temp serve 仅用于清理 oc session 数据，
+	// 不承载任务权限语义，argv 与现状逐字一致。
 	if err := m.proc.NewSession(newSessionSpec(serveName, row.WorktreePath, env,
-		runtimeCmdArgv(port, ""))); err != nil {
+		runtimeCmdArgv(port, "", PermissionModeAsk))); err != nil {
 		return 0, "", err
 	}
 	// 等待就绪。

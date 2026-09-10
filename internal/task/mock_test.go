@@ -137,6 +137,11 @@ func (s *mockStore) CreateTask(ctx context.Context, t TaskRow) error {
 	if t.Mode == "" {
 		t.Mode = TaskModeWorktree
 	}
+	// 与 store schema migration 0015 一致：新建任务 permission_mode 默认 ask
+	//（task-permission-mode D1：Create 链显式写入，此处仅为直连 mock 的缺省兜底）。
+	if t.PermissionMode == "" {
+		t.PermissionMode = PermissionModeAsk
+	}
 	s.tasks[t.ID] = t
 	return nil
 }
@@ -161,6 +166,12 @@ func (s *mockStore) GetTask(ctx context.Context, id string) (TaskRow, error) {
 	if t.Mode == "" {
 		t.Mode = TaskModeWorktree
 	}
+	// 与 store schema migration 0015 一致：permission_mode 缺省为 ask
+	//（task-permission-mode D1：列 NOT NULL DEFAULT 'ask'）。测试直接构造 TaskRow 时
+	// 可能未设置，读回时归一化，模拟 DB 不变量「任何行读出必有非空 permission_mode」。
+	if t.PermissionMode == "" {
+		t.PermissionMode = PermissionModeAsk
+	}
 	s.mu.Unlock()
 	// onGetTask 读后回调（锁外，G3-16 屏障：复核取值后、返回前阻塞——期间测试
 	// 可改状态/关通道，模拟「复核读取与判定之间」的交错窗口）。
@@ -180,6 +191,10 @@ func (s *mockStore) ListTasksByProject(ctx context.Context, projectID string) ([
 				// 读回归一化模拟 DB DEFAULT（migration 0013），与 GetTask 一致。
 				t.Mode = TaskModeWorktree
 			}
+			if t.PermissionMode == "" {
+				// 读回归一化模拟 DB DEFAULT（migration 0015），与 GetTask 一致。
+				t.PermissionMode = PermissionModeAsk
+			}
 			out = append(out, t)
 		}
 	}
@@ -194,6 +209,10 @@ func (s *mockStore) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 		if t.Mode == "" {
 			// 读回归一化模拟 DB DEFAULT（migration 0013），与 GetTask 一致。
 			t.Mode = TaskModeWorktree
+		}
+		if t.PermissionMode == "" {
+			// 读回归一化模拟 DB DEFAULT（migration 0015），与 GetTask 一致。
+			t.PermissionMode = PermissionModeAsk
 		}
 		out = append(out, t)
 	}
@@ -240,7 +259,8 @@ func (s *mockStore) ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOve
 		}
 		out = append(out, ActiveTaskOverviewRow{
 			ID: t.ID, ProjectID: t.ProjectID, ProjectName: project.Name,
-			Name: t.Name, Branch: t.Branch, WorktreePath: t.WorktreePath, LastActiveAt: last,
+			Name: t.Name, Branch: t.Branch, WorktreePath: t.WorktreePath,
+			PermissionMode: t.PermissionMode, LastActiveAt: last,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -1204,6 +1224,21 @@ type mockOC struct {
 	// probePromptAsyncResult 控制 ProbePromptAsyncCapability 返回（D1 能力探测）。
 	// 默认 CapabilityUnknown（newMockOC 不预置，零值即 unknown），测试按需覆写。
 	probePromptAsyncResult opencode.CapabilityState
+	// replyPermission 相关（task-permission-mode D6 测试桩）：replyPermissionErr 按
+	// requestID 覆写（ErrByID 优先），调用记录 (dir, requestID, reply) 追加到
+	// replyPermissionCalls；计数 atomic（判定/回复 goroutine 并发）。
+	replyPermissionErr     error
+	replyPermissionErrByID map[string]error
+	replyPermissionCount   int64
+	replyMu                sync.Mutex
+	replyPermissionCalls   []replyPermissionCall
+}
+
+// replyPermissionCall 记录一次 ReplyPermission 调用参数。
+type replyPermissionCall struct {
+	Dir       string
+	RequestID string
+	Reply     string
 }
 
 func newMockOC(healthOK bool) *mockOC {
@@ -1331,6 +1366,26 @@ func (c *mockOC) ProbePromptAsyncCapability(ctx context.Context) opencode.Capabi
 	return c.probePromptAsyncResult
 }
 
+// ReplyPermission 记录调用并按 replyPermissionErr / replyPermissionErrByID 返回
+//（task-permission-mode D6 测试桩）。
+func (c *mockOC) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
+	atomic.AddInt64(&c.replyPermissionCount, 1)
+	c.replyMu.Lock()
+	c.replyPermissionCalls = append(c.replyPermissionCalls, replyPermissionCall{Dir: dir, RequestID: requestID, Reply: reply})
+	c.replyMu.Unlock()
+	if err, ok := c.replyPermissionErrByID[requestID]; ok {
+		return err
+	}
+	return c.replyPermissionErr
+}
+
+// replyPermissionCallsSnapshot 返回已发生的 ReplyPermission 调用记录拷贝（并发安全读）。
+func (c *mockOC) replyPermissionCallsSnapshot() []replyPermissionCall {
+	c.replyMu.Lock()
+	defer c.replyMu.Unlock()
+	return append([]replyPermissionCall(nil), c.replyPermissionCalls...)
+}
+
 // --- test manager builder ---
 
 func newTestManager(t *testing.T, store TaskStore, proc ProcessBackend, wt WorktreeBackend, oc OCClient) *Manager {
@@ -1389,6 +1444,9 @@ func (c *readyOC) ListPermissions(ctx context.Context, dir string) ([]opencode.P
 }
 func (c *readyOC) ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error) {
 	return c.inner.ListQuestions(ctx, dir)
+}
+func (c *readyOC) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
+	return c.inner.ReplyPermission(ctx, dir, requestID, reply)
 }
 func (c *readyOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []opencode.PromptFilePart) opencode.PromptResult {
 	return c.inner.PromptAsync(ctx, dir, sessionID, messageID, text, files)

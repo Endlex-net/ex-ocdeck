@@ -65,6 +65,9 @@ func (c *alwaysUnhealthyOC) PromptAsync(ctx context.Context, dir, sessionID, mes
 func (c *alwaysUnhealthyOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
 	return opencode.CapabilityUnknown
 }
+func (c *alwaysUnhealthyOC) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
+	return nil
+}
 
 // healthThenProbeOC：Health 就绪；Probe 返回注入错误。
 type healthThenProbeOC struct {
@@ -109,6 +112,9 @@ func (c *healthThenProbeOC) PromptAsync(ctx context.Context, dir, sessionID, mes
 }
 func (c *healthThenProbeOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
 	return opencode.CapabilityUnknown
+}
+func (c *healthThenProbeOC) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
+	return nil
 }
 
 func newServeRetryManager(t *testing.T, store TaskStore, proc ProcessBackend, oc OCClient, pr config.PortRange) *Manager {

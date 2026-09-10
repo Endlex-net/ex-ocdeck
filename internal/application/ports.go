@@ -99,6 +99,7 @@ type TaskSnapshot struct {
 	BaseRef         string
 	AnchorSessionID *string
 	Mode            string
+	PermissionMode  string
 }
 
 // SessionRepository 表达会话归属隔离的持久化端口（design.md D0:78-86）。

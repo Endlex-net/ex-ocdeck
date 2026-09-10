@@ -34,11 +34,12 @@ func New(db *store.DB) *Adapter { return &Adapter{db: db} }
 // --- TaskRepository（design.md D0） ---
 
 // CreateTask 委托 store.CreateTask（仅消费 row 的 ID/ProjectID/Name/Branch/Status/
-// WorktreePath/BaseRef/Mode，status 由调用方提供不再校验）。
+// WorktreePath/BaseRef/Mode/PermissionMode，status 由调用方提供不再校验）。
 func (a *Adapter) CreateTask(ctx context.Context, row application.TaskSnapshot) error {
 	return a.db.CreateTask(ctx, store.TaskRow{
 		ID: row.ID, ProjectID: row.ProjectID, Name: row.Name, Branch: row.Branch,
 		Status: row.Status, WorktreePath: row.WorktreePath, BaseRef: row.BaseRef, Mode: row.Mode,
+		PermissionMode: row.PermissionMode,
 	})
 }
 
@@ -210,6 +211,7 @@ func toTaskSnapshot(r store.TaskRow) application.TaskSnapshot {
 		BaseRef:         r.BaseRef,
 		AnchorSessionID: nullStringToPtrSnapshot(r.AnchorSessionID),
 		Mode:            r.Mode,
+		PermissionMode:  r.PermissionMode,
 	}
 }
 

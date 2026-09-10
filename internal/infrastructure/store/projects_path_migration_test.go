@@ -136,13 +136,13 @@ func TestMigration0014_ProjectsPathNotUnique_UpgradeFrom0013(t *testing.T) {
 		t.Errorf("PRAGMA foreign_keys = %d, want 1 (restored)", on)
 	}
 
-	// 版本 14 已记录（migration 文件号有跳号，不以文件数断言总数）。
+	// 最新版本已记录（0015 起；migration 文件号有跳号，不以文件数断言总数）。
 	var maxVer int
 	if err := db.QueryRow("SELECT max(version) FROM schema_version").Scan(&maxVer); err != nil {
 		t.Fatal(err)
 	}
-	if maxVer != 14 {
-		t.Errorf("max schema_version = %d, want 14", maxVer)
+	if maxVer != 15 {
+		t.Errorf("max schema_version = %d, want 15", maxVer)
 	}
 }
 
