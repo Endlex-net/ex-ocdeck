@@ -6,11 +6,13 @@
     <meta name="color-scheme" content="light dark" />
     <title>ocdeck</title>
     <!-- 首帧防闪烁：在 CSS 与首帧绘制前同步应用 data-theme（tasks 2.4，语义参考 docs/design/assets/ocdeck-theme.js）
-         localStorage['od-theme'] ∈ system|light|dark，缺省 system。 -->
+         localStorage['od-theme'] ∈ system|light|dark，缺省 system；
+         同时同步 data-diff-style：localStorage['od-diff-style'] ∈ github|goland，缺省 github。 -->
     <script>
       (function () {
         var STORE = 'od-theme';
         var MODES = ['system', 'light', 'dark'];
+        var DIFF_STORE = 'od-diff-style';
         var mq = window.matchMedia('(prefers-color-scheme: dark)');
         var root = document.documentElement;
         function stored() {
@@ -19,6 +21,12 @@
             return MODES.indexOf(v) >= 0 ? v : 'system';
           } catch (_) { return 'system'; }
         }
+        function diffStored() {
+          try {
+            var v = localStorage.getItem(DIFF_STORE);
+            return v === 'goland' ? 'goland' : 'github';
+          } catch (_) { return 'github'; }
+        }
         function resolve(mode) {
           return mode === 'system' ? (mq.matches ? 'dark' : 'light') : mode;
         }
@@ -26,6 +34,7 @@
           var mode = stored();
           root.setAttribute('data-theme', resolve(mode));
           root.setAttribute('data-theme-mode', mode);
+          root.setAttribute('data-diff-style', diffStored());
         }
         // 系统主题变化时仅 system 模式下跟随
         var onMq = function () { if (stored() === 'system') paint(); };

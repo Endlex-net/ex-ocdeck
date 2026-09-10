@@ -32,7 +32,12 @@ import {
   saveMobileMode,
   TERM_PREFS_CHANGED,
 } from '../terminal/preferences';
-import { useTheme, type ThemePreference } from '../hooks';
+import {
+  useDiffStyle,
+  useTheme,
+  type DiffStylePreference,
+  type ThemePreference,
+} from '../hooks';
 import type { OcConfigContent, OcConfigInfo } from '../types';
 import './settings.css';
 
@@ -56,6 +61,11 @@ const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
   { value: 'system', label: '跟随系统' },
   { value: 'light', label: '浅色' },
   { value: 'dark', label: '深色' },
+];
+
+const DIFF_STYLE_OPTIONS: { value: DiffStylePreference; label: string }[] = [
+  { value: 'github', label: 'GitHub' },
+  { value: 'goland', label: 'GoLand' },
 ];
 
 export function SettingsPage({
@@ -260,6 +270,7 @@ function ClipboardPolicyField() {
 
 function AppearancePanel() {
   const { preference, setPreference } = useTheme();
+  const { preference: diffStyle, setPreference: setDiffStyle } = useDiffStyle();
 
   // 判别式加载（spec「自动模式不展示不读取子开关」）：仅 mode 为 on 时读 caps key。
   const [mobile, setMobile] = useState<{ mode: MobileMode; caps: MobileCaps | null }>(() => {
@@ -332,6 +343,29 @@ function AppearancePanel() {
           ))}
         </div>
         <div className="od-hint">默认跟随系统；终端配色随主题翻转（亮色主题 = 浅色终端）</div>
+      </div>
+      <div className="od-field">
+        <span className="od-label" id="diffStyleSegLabel">
+          Diff 风格
+        </span>
+        <div
+          className="seg"
+          role="group"
+          aria-labelledby="diffStyleSegLabel"
+        >
+          {DIFF_STYLE_OPTIONS.map((opt) => (
+            <button
+              key={opt.value}
+              type="button"
+              className={diffStyle === opt.value ? 'on' : ''}
+              aria-pressed={diffStyle === opt.value}
+              onClick={() => setDiffStyle(opt.value)}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+        <div className="od-hint">任务 diff 视图的配色风格，默认 GitHub</div>
       </div>
       <div className="od-field">
         <span className="od-label" id="mobileModeSegLabel">

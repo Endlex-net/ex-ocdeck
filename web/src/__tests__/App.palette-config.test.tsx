@@ -50,6 +50,7 @@ vi.mock('../api', () => ({
 
 vi.mock('../hooks', () => ({
   useTheme: () => ({ preference: 'system' as const, setPreference: () => {} }),
+  useDiffStyle: () => ({ preference: 'github' as const, setPreference: () => {} }),
   useProjects: () => ({ projects: [], initialized: true, error: '' }),
   useMediaQuery: () => false,
 }));

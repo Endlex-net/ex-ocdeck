@@ -6,7 +6,7 @@ import {
   subscribeNotificationConfigChanged,
   subscribeNotifications,
 } from './notifications';
-import { useTheme } from './hooks';
+import { useDiffStyle, useTheme } from './hooks';
 import { TokenGate } from './components/TokenGate';
 import { AppShell } from './components/AppShell';
 import { CommandPalette } from './components/CommandPalette';
@@ -81,6 +81,9 @@ export function App() {
   const [authed, setAuthed] = useState(() => getToken() !== '');
   const route = useHashRoute();
   const { preference, setPreference } = useTheme();
+  // App 层常驻消费 diff 风格偏好：跨标签页 storage 变更也能同步写 <html data-diff-style>
+  // （设置页未打开时无人接管该属性）
+  useDiffStyle();
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteConfig, setPaletteConfig] = useState<PaletteConfig>(DEFAULT_PALETTE_CONFIG);
   const [paletteLoadState, setPaletteLoadState] = useState<PaletteConfigLoadState>(() =>
