@@ -158,6 +158,7 @@ export function sessionOnlyTask(s: ActiveSessionItem): MergedTask {
       branch: s.branch,
       worktree_path: s.worktree_path,
       mode: s.mode,
+      permission_mode: s.permission_mode,
       updated_at: s.last_active_at,
       agentStatus: s.agentStatus,
       attention_count: 0,

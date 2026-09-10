@@ -40,6 +40,7 @@ function makeTask(over: Partial<Task>): Task {
     status: 'suspended',
     worktree_path: '/tmp/wt',
     mode: 'worktree',
+    permission_mode: 'ask',
     init_status: 'none',
     created_at: 1,
     updated_at: 2,

@@ -9,6 +9,18 @@ export type ProjectKind = 'repo' | 'dir';
  *  任务行分支展示按 isGitlessTask（dir 或 local-path）隐藏。 */
 export type TaskMode = 'worktree' | 'local-path';
 
+/** 任务权限模式（task-permission-mode D1/D7）：ask=人工逐条批准（缺省）；
+ *  all-approve=全部批准（显式 deny 仍生效）；ai-auto=全局 LLM 自动判定、不确定转人工。
+ *  创建后不可修改；DTO/摘要/活跃快照均为必有字段。 */
+export type TaskPermissionMode = 'ask' | 'all-approve' | 'ai-auto';
+
+/** 权限模式三档展示文案（task-permission-mode D8 定稿措辞），新建表单与任务详情共用。 */
+export const PERMISSION_MODE_LABELS: Record<TaskPermissionMode, string> = {
+  ask: '人工批准',
+  'all-approve': '全部批准',
+  'ai-auto': 'AI 自动识别',
+};
+
 export interface Project {
   id: string;
   name: string;
@@ -38,6 +50,8 @@ export interface TaskSummary {
   worktree_path: string;
   /** 任务运行模式（必有）：worktree | local-path。 */
   mode: TaskMode;
+  /** 任务权限模式（必有，task-permission-mode D7）：ask | all-approve | ai-auto。 */
+  permission_mode: TaskPermissionMode;
   last_error?: string;
   /** json.RawMessage 原样透传：客户端收到的是数组而非字符串。 */
   notice?: NoticeItem[];
@@ -98,6 +112,8 @@ export interface Task {
   /** 任务运行模式（必有）：worktree | local-path；任务行分支展示（isGitlessTask）与
    *  删除文案/序列按 mode 判定，Git 能力不再按 mode 判定（仅 dir 隐藏，D8）。 */
   mode: TaskMode;
+  /** 任务权限模式（必有，task-permission-mode D7）：详情页只读展示，创建后不可修改。 */
+  permission_mode: TaskPermissionMode;
   last_port?: number;
   last_error?: string;
   /** 服务端以 json.RawMessage 原样输出，客户端收到的是数组而非字符串。 */
@@ -131,6 +147,8 @@ export interface ActiveSessionItem {
   worktree_path: string;
   /** 任务运行模式（必有）：worktree | local-path；与 projects 摘要同源。 */
   mode: TaskMode;
+  /** 任务权限模式（必有，task-permission-mode D7）：与 projects 摘要同源。 */
+  permission_mode: TaskPermissionMode;
   /** 最近活跃时间（Unix 秒）：task_sessions.last_seen_at 的 MAX，无会话行回退 tasks.updated_at。 */
   last_active_at: number;
   agentStatus?: string;

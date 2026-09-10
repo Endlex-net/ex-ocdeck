@@ -146,7 +146,7 @@ describe('CommandCenterPage 快速新建初始化', () => {
     expect(projectInput(container).value).toBe('ocdeck');
     expect(document.activeElement).toBe(taskInput(container));
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, undefined);
   });
 
   it('唯一子串匹配在 exact-then-substring 预选', async () => {
@@ -157,7 +157,7 @@ describe('CommandCenterPage 快速新建初始化', () => {
     await flushUI();
     expect(projectInput(container).value).toBe('ocdeck');
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, undefined);
   });
 
   it('matchMode=exact 时子串不预选，过滤框填文本', async () => {
@@ -194,7 +194,7 @@ describe('CommandCenterPage 快速新建初始化', () => {
     await flushUI();
     expect(projectInput(container).value).toBe('ocdeck');
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p3', 'task-a', 'main');
+    expect(api.createTask).toHaveBeenCalledWith('p3', 'task-a', 'main', undefined, undefined);
   });
 
   it('失效 projectID 回退文本匹配', async () => {
@@ -205,7 +205,7 @@ describe('CommandCenterPage 快速新建初始化', () => {
     await flushUI();
     expect(projectInput(container).value).toBe('other');
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p2', 'task-a', 'main');
+    expect(api.createTask).toHaveBeenCalledWith('p2', 'task-a', 'main', undefined, undefined);
   });
 
   it('acronym 命中不触发预选，按填过滤词处理（MUST NOT 参与预选推断）', async () => {
@@ -231,7 +231,7 @@ describe('CommandCenterPage 快速新建初始化', () => {
     await flushUI();
     expect(projectInput(container).value).toBe('ocdeck');
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, undefined);
   });
 
   it('预选后任务名为空，提交按钮禁用且不发起创建', async () => {
@@ -290,7 +290,7 @@ describe('CommandCenterPage 快速新建初始化', () => {
     expect(taskInput(container).value).toBe('keep-me');
     expect(projectInput(container).value).toBe('ocdeck');
     await fillTaskAndSubmit(container, 'keep-me');
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'keep-me', 'main');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'keep-me', 'main', undefined, undefined);
   });
 
   it('非法仅 projectID 的 detail 归一为无 payload', async () => {
@@ -329,7 +329,7 @@ describe('CommandCenterPage 快速新建初始化', () => {
     expect(projectInput(container).value).toBe('other');
     expect(document.activeElement).toBe(taskInput(container));
     await fillTaskAndSubmit(container, 'keep-me');
-    expect(api.createTask).toHaveBeenCalledWith('p2', 'keep-me', 'main');
+    expect(api.createTask).toHaveBeenCalledWith('p2', 'keep-me', 'main', undefined, undefined);
   });
 
   it('pending 跨路由：挂载前发出的信号被消费', async () => {
@@ -342,7 +342,7 @@ describe('CommandCenterPage 快速新建初始化', () => {
     expect(projectInput(container).value).toBe('ocdeck');
     expect(document.activeElement).toBe(taskInput(container));
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, undefined);
   });
 
   it('只按到达时快照判定，后续项目加载不自动重试预选', async () => {
@@ -483,7 +483,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
     await flushUI();
     expect(branchInput(container).value).toBe('main');
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main', undefined, undefined);
   });
 
   it('任务名框 Enter 与创建按钮同路径：提交过滤首项', async () => {
@@ -497,7 +497,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
       setInput(taskInput(container), 'task-a');
     });
     await dispatchSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main', undefined, undefined);
   });
 
   it('synthetic 候选排第一时提交 normalizedInput（trim 首尾空白）', async () => {
@@ -511,7 +511,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
       setInput(branchInput(container), '  feature-x  ');
     });
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'feature-x');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'feature-x', undefined, undefined);
   });
 
   it('synthetic 只参与排序不保证第一：输入 main 时提交 origin/main', async () => {
@@ -525,7 +525,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
       setInput(branchInput(container), 'main');
     });
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main', undefined, undefined);
   });
 
   it('dir 项目提交不携带 base_ref', async () => {
@@ -538,7 +538,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
     // dir 无基准分支字段（仅项目一个 combobox）
     expect(container.querySelectorAll('input[role="combobox"]').length).toBe(1);
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('d1', 'task-a', undefined);
+    expect(api.createTask).toHaveBeenCalledWith('d1', 'task-a', undefined, undefined, undefined);
   });
 
   it('初次加载在途：提交禁用且不发起 POST；ready 后提交过滤首项', async () => {
@@ -567,7 +567,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
     await flushUI();
     expect(submitBtn(container).disabled).toBe(false);
     await dispatchSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main', undefined, undefined);
   });
 
   it('初次加载失败：列表为空、禁止提交、不发起 POST', async () => {
@@ -632,7 +632,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
     await flushUI();
     expect(submitBtn(container).disabled).toBe(false);
     await dispatchSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main', undefined, undefined);
   });
 
   it('成功空列表回退 default_branch：提交 base_ref=main', async () => {
@@ -643,7 +643,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
     });
     await flushUI();
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, undefined);
   });
 
   it('候选全空时省略 base_ref：服务端 invalid_input 后页面展示创建失败', async () => {
@@ -661,7 +661,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
     });
     expect(submitBtn(container).disabled).toBe(false);
     await dispatchSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', undefined);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', undefined, undefined, undefined);
     expect(container.textContent).toContain('基准分支不能为空');
   });
 
@@ -735,7 +735,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
       setInput(taskInput(container), 'task-a');
     });
     await dispatchSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p2', 'task-a', 'main');
+    expect(api.createTask).toHaveBeenCalledWith('p2', 'task-a', 'main', undefined, undefined);
   });
 
   it('下拉高亮过滤排序首项：输入 main 时高亮 origin/main 而非输入精确等值项', async () => {

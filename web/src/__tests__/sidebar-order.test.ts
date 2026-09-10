@@ -17,6 +17,7 @@ function task(over: Partial<TaskSummary> & { id: string }): TaskSummary {
     branch: 'main',
     worktree_path: '/tmp/x',
     mode: 'worktree',
+    permission_mode: 'ask',
     updated_at: 0,
     attention_count: 0,
     ...over,

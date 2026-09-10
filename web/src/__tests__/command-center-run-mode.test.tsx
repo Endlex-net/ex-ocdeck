@@ -101,6 +101,17 @@ function radio(container: HTMLElement, label: string) {
   )!;
 }
 
+/** 工作空间 radiogroup（aria-labelledby 指向「工作空间」label）；
+ *  权限模式控件同用 cc-segment 样式（task-permission-mode），显隐断言须按 group 区分。 */
+function modeSegment(container: HTMLElement) {
+  const label = [...container.querySelectorAll('#cc-new-task-panel label')].find(
+    (l) => l.textContent === '工作空间',
+  );
+  return label
+    ? container.querySelector(`#cc-new-task-panel [aria-labelledby="${label.id}"]`)
+    : null;
+}
+
 function modeHint(container: HTMLElement) {
   return container.querySelector('#cc-new-task-panel .cc-mode-hint');
 }
@@ -179,7 +190,7 @@ describe('新建任务面板工作空间三态（add-local-path-task-mode 5.7）
     await openWithProject('ocdeck', 'p1');
 
     // 双段选择器渲染，缺省选中「worktree」
-    expect(container.querySelector('#cc-new-task-panel .cc-segment')).not.toBeNull();
+    expect(modeSegment(container)).not.toBeNull();
     expect(radio(container, 'worktree').getAttribute('aria-checked')).toBe('true');
     expect(radio(container, 'local').getAttribute('aria-checked')).toBe('false');
     expect(hasBranchField(container)).toBe(true);
@@ -192,9 +203,9 @@ describe('新建任务面板工作空间三态（add-local-path-task-mode 5.7）
 
     vi.mocked(api.listBranches).mockResolvedValue(['main']);
     await fillTaskAndSubmit(container);
-    // 三参调用：mode 字段缺席（presence 契约，worktree 走既有缺省语义）
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main');
-    expect(vi.mocked(api.createTask).mock.calls[0]).toHaveLength(3);
+    // 五参调用：mode/permission_mode 字段均缺席（presence 契约，缺省语义不携带）
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, undefined);
+    expect(vi.mocked(api.createTask).mock.calls[0]).toHaveLength(5);
   });
 
   it('local-path 态：隐藏基准分支、逐字灰字提醒与 od-hint、提交 mode=local-path 且无 base_ref', async () => {
@@ -220,8 +231,8 @@ describe('新建任务面板工作空间三态（add-local-path-task-mode 5.7）
 
     vi.mocked(api.createTask).mockResolvedValue({ id: 't1' } as never);
     await fillTaskAndSubmit(container);
-    // 携带 mode=local-path 且 MUST NOT 携带 base_ref
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', undefined, 'local-path');
+    // 携带 mode=local-path 且 MUST NOT 携带 base_ref（permission_mode 缺省不携带）
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', undefined, 'local-path', undefined);
   });
 
   it('local-path 绕过 ready 门禁：分支列表在途（loading）仍可提交', async () => {
@@ -249,7 +260,7 @@ describe('新建任务面板工作空间三态（add-local-path-task-mode 5.7）
     expect(submitBtn(container).disabled).toBe(false);
     vi.mocked(api.createTask).mockResolvedValue({ id: 't1' } as never);
     await dispatchSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', undefined, 'local-path');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', undefined, 'local-path', undefined);
 
     // 在途请求最终完成不破坏断言（防未处理 rejection/泄漏）
     await act(async () => {
@@ -263,7 +274,7 @@ describe('新建任务面板工作空间三态（add-local-path-task-mode 5.7）
     const { container } = renderPage();
     await openWithProject('plain', 'd1');
 
-    expect(container.querySelector('#cc-new-task-panel .cc-segment')).toBeNull();
+    expect(modeSegment(container)).toBeNull();
     expect(container.textContent).not.toContain('local');
     // 现有色块警告原样保留，与 local-path 灰字提醒互斥
     expect(dirWarn(container)).not.toBeNull();
@@ -273,8 +284,8 @@ describe('新建任务面板工作空间三态（add-local-path-task-mode 5.7）
 
     vi.mocked(api.createTask).mockResolvedValue({ id: 't1' } as never);
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('d1', 'task-a', undefined);
-    expect(vi.mocked(api.createTask).mock.calls[0]).toHaveLength(3);
+    expect(api.createTask).toHaveBeenCalledWith('d1', 'task-a', undefined, undefined, undefined);
+    expect(vi.mocked(api.createTask).mock.calls[0]).toHaveLength(5);
   });
 });
 
@@ -300,7 +311,7 @@ describe('选择器状态重置规则（add-local-path-task-mode 5.7）', () => 
     });
     await flushUI();
     await openWithProject('plain', 'd1');
-    expect(container.querySelector('#cc-new-task-panel .cc-segment')).toBeNull();
+    expect(modeSegment(container)).toBeNull();
     await openWithProject('other', 'p2');
     expect(radio(container, 'worktree').getAttribute('aria-checked')).toBe('true');
 
@@ -313,7 +324,7 @@ describe('选择器状态重置规则（add-local-path-task-mode 5.7）', () => 
       setInput(projectInput(container), 'deviate');
     });
     await flushUI();
-    expect(container.querySelector('#cc-new-task-panel .cc-segment')).toBeNull();
+    expect(modeSegment(container)).toBeNull();
     await openWithProject('ocdeck', 'p1');
     expect(radio(container, 'worktree').getAttribute('aria-checked')).toBe('true');
     expect(radio(container, 'local').getAttribute('aria-checked')).toBe('false');
@@ -346,7 +357,7 @@ describe('选择器状态重置规则（add-local-path-task-mode 5.7）', () => 
 
     // 保留的已选分支仍驱动提交（base_ref = 过滤排序首项 = develop）
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'develop');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'develop', undefined, undefined);
   });
 
   it('不改变项目的信号保持 mode：无 payload new（keep）不重置 local 选择', async () => {
