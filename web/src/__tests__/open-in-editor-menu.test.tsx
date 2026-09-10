@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { act } from 'react';
 import { OpenInEditorMenu } from '../components/OpenInEditorMenu';
 import {
+  CUSTOM_TOOLS_KEY,
   DEFAULT_KEY,
   EDITOR_TOOLS_CHANGED,
   GOLAND_KEY,
@@ -306,6 +307,154 @@ describe('事件收敛（EDITOR_TOOLS_CHANGED 与 storage 各覆盖开关与默�
       window.dispatchEvent(new Event('storage'));
     });
     expect(container.innerHTML).toBe('');
+  });
+});
+
+describe('Cursor 内置工具', () => {
+  it('三工具均启用：下拉顺序 VSCode → GoLand → Cursor；选择 Cursor 写默认并唤起 cursor://', async () => {
+    enable(true, true);
+    store.set('ocdeck.editorTools.cursor', '1');
+    const { container } = renderMenu('/tmp/wt');
+    await openMenu(container);
+    expect(itemLabels(container)).toEqual(['VSCode ✓', 'GoLand', 'Cursor']); // 无默认记录 → 回退首个启用
+
+    await clickItem(container, 'Cursor');
+    expect(assignCalls).toEqual(['cursor://file/tmp/wt/']);
+    expect(store.get(DEFAULT_KEY)).toBe('cursor');
+    await openMenu(container);
+    expect(itemLabels(container)).toEqual(['VSCode', 'GoLand', 'Cursor ✓']);
+  });
+
+  it('存储默认 cursor → 主按钮 Cursor（内置分支 URI），关闭后回退 VSCode', async () => {
+    enable(true, false);
+    store.set('ocdeck.editorTools.cursor', '1');
+    store.set(DEFAULT_KEY, 'cursor');
+    const { container } = renderMenu('/Users/me/my project');
+    expect(mainButton(container).getAttribute('aria-label')).toBe('使用 Cursor 打开');
+    await act(async () => {
+      mainButton(container).click();
+    });
+    expect(assignCalls).toEqual(['cursor://file/Users/me/my%20project/']);
+  });
+});
+
+describe('自定义工具（名称 + URI 模板）', () => {
+  const customRow = (id: string, name: string, template: string): string =>
+    JSON.stringify([{ id, name, template }]);
+
+  it('自定义工具出现在下拉（内置之后、存储顺序）；下拉选择写 custom:<id> 默认并按模板唤起', async () => {
+    enable(true, true);
+    store.set(CUSTOM_TOOLS_KEY, customRow('c1', 'My Editor', 'myapp://open?path={path}'));
+    const { container } = renderMenu('/tmp/wt');
+    await openMenu(container);
+    expect(itemLabels(container)).toEqual(['VSCode ✓', 'GoLand', 'My Editor']);
+
+    await clickItem(container, 'My Editor');
+    expect(assignCalls).toEqual(['myapp://open?path=/tmp/wt']);
+    expect(store.get(DEFAULT_KEY)).toBe('custom:c1');
+    await openMenu(container);
+    expect(itemLabels(container)).toEqual(['VSCode', 'GoLand', 'My Editor ✓']);
+  });
+
+  it('默认 custom:<id> → 主按钮用自定义工具名；存储删除该工具后主按钮回退 VSCode', async () => {
+    enable(true, false);
+    store.set(CUSTOM_TOOLS_KEY, customRow('c1', 'My Editor', 'myapp://open?path={path}'));
+    store.set(DEFAULT_KEY, 'custom:c1');
+    const { container } = renderMenu('/Users/me/my project');
+    expect(mainButton(container).getAttribute('aria-label')).toBe('使用 My Editor 打开');
+
+    // 工具被删除（跨标签）→ 主按钮回退 VSCode
+    act(() => {
+      store.delete(CUSTOM_TOOLS_KEY);
+      window.dispatchEvent(new Event('storage'));
+    });
+    expect(mainButton(container).getAttribute('aria-label')).toBe('使用 VSCode 打开');
+  });
+
+  it('非法自定义模板（危险 scheme）→ 不出现在下拉；默认记忆指向它时主按钮回退内置', async () => {
+    enable(true, true);
+    store.set(CUSTOM_TOOLS_KEY, customRow('c1', 'Evil', 'javascript:alert(1){path}'));
+    const { container } = renderMenu('/tmp/wt');
+    await openMenu(container);
+    expect(itemLabels(container)).toEqual(['VSCode ✓', 'GoLand']); // 不可用自定义工具不展示（C1 统一谓词）
+
+    // 默认记忆指向不可用自定义工具 → 主按钮回退内置
+    store.set(DEFAULT_KEY, 'custom:c1');
+    const remount = renderMenu('/tmp/wt');
+    expect(mainButton(remount.container).getAttribute('aria-label')).toBe('使用 VSCode 打开');
+  });
+
+  it('空草稿行排在合法工具之前 → 主按钮跳过空草稿选合法者；默认工具变不可用后回退', async () => {
+    enable(false, false);
+    store.set(
+      CUSTOM_TOOLS_KEY,
+      JSON.stringify([
+        { id: 'draft', name: '', template: '' },
+        { id: 'ok', name: 'My Editor', template: 'myapp://open?path={path}' },
+      ]),
+    );
+    const { container } = renderMenu('/tmp/wt');
+    expect(mainButton(container).getAttribute('aria-label')).toBe('使用 My Editor 打开'); // 空草稿不参与解析
+
+    // 默认记忆指向合法自定义工具，随后模板被改为非法 → 主按钮回退
+    store.set(DEFAULT_KEY, 'custom:ok');
+    const remount = renderMenu('/tmp/wt');
+    expect(mainButton(remount.container).getAttribute('aria-label')).toBe('使用 My Editor 打开');
+    act(() => {
+      store.set(
+        CUSTOM_TOOLS_KEY,
+        JSON.stringify([
+          { id: 'draft', name: '', template: '' },
+          { id: 'ok', name: 'My Editor', template: 'javascript:x{path}' },
+        ]),
+      );
+      window.dispatchEvent(new Event('storage'));
+    });
+    expect(container.querySelector('button[title^="使用"]')).toBeNull(); // 无可用工具 → 隐藏
+  });
+
+  it('菜单打开后自定义工具名称被清空（跨标签）→ 该项从下拉移除', async () => {
+    enable(true, true);
+    store.set(CUSTOM_TOOLS_KEY, customRow('c1', 'My Editor', 'myapp://open?path={path}'));
+    const { container } = renderMenu('/tmp/wt');
+    await openMenu(container);
+    expect(itemLabels(container)).toContain('My Editor');
+
+    act(() => {
+      store.set(CUSTOM_TOOLS_KEY, customRow('c1', '', 'myapp://open?path={path}'));
+      window.dispatchEvent(new Event('storage'));
+    });
+    expect(itemLabels(container)).not.toContain('My Editor');
+  });
+
+  it('菜单渲染后工具变不可用（点击重读校验）→ 点击不唤起、不写默认键（C1 竞态回归）', async () => {
+    enable(true, true);
+    store.set(CUSTOM_TOOLS_KEY, customRow('c1', 'My Editor', 'myapp://open?path={path}'));
+    const { container } = renderMenu('/tmp/wt');
+    await openMenu(container);
+    expect(itemLabels(container)).toContain('My Editor');
+
+    // 渲染后底层模板被改为危险 scheme（未派发事件，渲染快照仍是旧名）
+    await act(async () => {
+      store.set(CUSTOM_TOOLS_KEY, customRow('c1', 'My Editor', 'javascript:alert(1){path}'));
+    });
+    await clickItem(container, 'My Editor');
+    expect(assignCalls).toEqual([]);
+    expect(store.has(DEFAULT_KEY)).toBe(false);
+  });
+
+  it('空名自定义工具行不进下拉；storage 事件收敛新增的自定义工具', () => {
+    enable(false, false);
+    store.set(CUSTOM_TOOLS_KEY, customRow('c0', '', ''));
+    const { container } = renderMenu('/tmp/wt');
+    expect(container.innerHTML).toBe(''); // 内置全关 + 自定义空名（不展示）→ 无可用工具
+
+    // 跨标签新增合法自定义工具 → storage 事件收敛 → 入口出现
+    act(() => {
+      store.set(CUSTOM_TOOLS_KEY, customRow('c1', 'My Editor', 'myapp://open?path={path}'));
+      window.dispatchEvent(new Event('storage'));
+    });
+    expect(mainButton(container).getAttribute('aria-label')).toBe('使用 My Editor 打开');
   });
 });
 

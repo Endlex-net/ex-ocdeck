@@ -4,6 +4,7 @@ import { act } from 'react';
 import { DEFAULT_PALETTE_CONFIG } from '../components/PaletteConfigPanel';
 import { SettingsPage } from '../pages/SettingsPage';
 import {
+  CUSTOM_TOOLS_KEY,
   DEFAULT_KEY,
   EDITOR_TOOLS_CHANGED,
   GOLAND_KEY,
@@ -47,7 +48,7 @@ function mountSettings() {
   return utils;
 }
 
-function toolCheckbox(container: HTMLElement, tool: 'vscode' | 'goland'): HTMLInputElement {
+function toolCheckbox(container: HTMLElement, tool: 'vscode' | 'goland' | 'cursor'): HTMLInputElement {
   return container.querySelector<HTMLInputElement>(`#editor-tool-${tool}`)!;
 }
 
@@ -88,14 +89,28 @@ afterEach(async () => {
 });
 
 describe('设置页「常用工具」子标签', () => {
-  it('深链 tab 渲染面板；缺省（无记录）两个开关均关闭，每行附 hint', () => {
+  it('Cursor 开关持久化；模板 placeholder 为 cursor://file{path}/', async () => {
+    const { container } = mountSettings();
+    expect(
+      container.querySelector<HTMLInputElement>('#editor-tool-template-cursor')!.placeholder,
+    ).toBe('cursor://file{path}/');
+    await act(async () => {
+      toolCheckbox(container, 'cursor').click();
+    });
+    expect(store.get('ocdeck.editorTools.cursor')).toBe('1');
+    expect(store.has(DEFAULT_KEY)).toBe(false);
+  });
+
+  it('深链 tab 渲染面板；缺省（无记录）三个开关均关闭，每行附 hint', () => {
     const { container } = mountSettings();
     expect(container.textContent).toContain('常用工具');
     expect(container.querySelector('#tab-tools')?.getAttribute('aria-selected')).toBe('true');
     expect(toolCheckbox(container, 'vscode').checked).toBe(false);
     expect(toolCheckbox(container, 'goland').checked).toBe(false);
+    expect(toolCheckbox(container, 'cursor').checked).toBe(false);
     expect(container.textContent).toContain('需本机已安装 VSCode');
     expect(container.textContent).toContain('需本机已安装 GoLand');
+    expect(container.textContent).toContain('需本机已安装 Cursor');
   });
 
   it('开启开关写入 localStorage（1）并恰好派发一次事件；另一开关不受影响', async () => {
@@ -237,6 +252,280 @@ describe('设置页「自定义唤起 URI 模板」输入（add-frontend-tool-qu
     await blurSave(container, 'vscode', 'vscode://broken{path}');
     expect(store.get(VSCODE_URI_TEMPLATE_KEY)).toBe('vscode://file{path}');
     expect(templateInput(container, 'vscode').value).toBe('vscode://file{path}');
+    expect(events).toBe(0);
+  });
+});
+
+describe('设置页「自定义工具」子区（C2 跨标签删除复活防护 + C3 脏草稿出口）', () => {
+  /** 受控输入赋值 + 失焦保存（React 受控口径）。 */
+  async function blurCustom(container: HTMLElement, kind: 'name' | 'template', suffix: string, value: string) {
+    const input = container.querySelector<HTMLInputElement>(`#custom-tool-${kind}-${suffix}`)!;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+      setter.call(input, value);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+    });
+  }
+
+  /** 仅输入（不失焦）：制造脏草稿。 */
+  async function typeInput(input: HTMLInputElement, value: string) {
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+      setter.call(input, value);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+  }
+
+  function addButton(container: HTMLElement): HTMLButtonElement {
+    return [...container.querySelectorAll<HTMLButtonElement>('button')].find(
+      (b) => b.textContent === '添加自定义工具',
+    )!;
+  }
+
+  function findButton(container: HTMLElement, text: string): HTMLButtonElement | null {
+    return [...container.querySelectorAll<HTMLButtonElement>('button')].find(
+      (b) => b.textContent === text,
+    ) ?? null;
+  }
+
+  function removeButton(container: HTMLElement): HTMLButtonElement {
+    return [...container.querySelectorAll<HTMLButtonElement>('button')].find(
+      (b) => b.textContent === '删除',
+    )!;
+  }
+
+  function rowHints(container: HTMLElement): string[] {
+    return [...container.querySelectorAll('.od-hint')]
+      .map((n) => n.textContent ?? '')
+      .filter((t) => t.includes('暂不出现在快捷打开列表'));
+  }
+
+  it('外部删除不复活：删除事件后修改另一行/添加，被删除项仍不存在', async () => {
+    store.set(
+      CUSTOM_TOOLS_KEY,
+      JSON.stringify([
+        { id: 'a', name: 'A', template: 'a://x{path}' },
+        { id: 'x', name: 'X', template: 'x://x{path}' },
+      ]),
+    );
+    const { container } = mountSettings();
+    expect(container.querySelector('#custom-tool-name-x')).not.toBeNull();
+
+    // B 标签删除 X → storage 事件 → A 面板移除 X
+    act(() => {
+      store.set(CUSTOM_TOOLS_KEY, JSON.stringify([{ id: 'a', name: 'A', template: 'a://x{path}' }]));
+      window.dispatchEvent(new Event('storage'));
+    });
+    expect(container.querySelector('#custom-tool-name-x')).toBeNull();
+
+    // 修改另一行失焦：以最新存储为基准保存，X 不复活
+    await blurCustom(container, 'name', 'a', 'A2');
+    expect(JSON.parse(store.get(CUSTOM_TOOLS_KEY)!)).toEqual([
+      { id: 'a', name: 'A2', template: 'a://x{path}' },
+    ]);
+    expect(container.querySelector('#custom-tool-name-x')).toBeNull();
+
+    // 添加新行：X 仍不复活
+    await act(async () => {
+      addButton(container).click();
+    });
+    const stored = JSON.parse(store.get(CUSTOM_TOOLS_KEY)!) as { id: string }[];
+    expect(stored.some((t) => t.id === 'x')).toBe(false);
+    expect(stored).toHaveLength(2); // A2 + 新空行
+  });
+
+  it('脏草稿保护：外部删除时正在编辑的行保留草稿（存储不复活）', async () => {
+    store.set(CUSTOM_TOOLS_KEY, JSON.stringify([{ id: 'x', name: 'X', template: 'x://x{path}' }]));
+    const { container } = mountSettings();
+    const input = container.querySelector<HTMLInputElement>('#custom-tool-name-x')!;
+
+    // 输入未失焦（脏草稿）
+    await typeInput(input, 'Typing…');
+    expect(input.value).toBe('Typing…');
+
+    // 外部删除
+    act(() => {
+      store.delete(CUSTOM_TOOLS_KEY);
+      window.dispatchEvent(new Event('storage'));
+    });
+    // 脏草稿行保留（正在编辑的内容不丢），存储不被复活
+    expect(container.querySelector<HTMLInputElement>('#custom-tool-name-x')!.value).toBe('Typing…');
+    expect(store.has(CUSTOM_TOOLS_KEY)).toBe(false);
+  });
+
+  it('C3 外部删除的脏草稿失焦不丢：不写存储、草稿与提示保留、继续编辑另一字段仍在', async () => {
+    store.set(CUSTOM_TOOLS_KEY, JSON.stringify([{ id: 'x', name: 'X', template: 'x://x{path}' }]));
+    const { container } = mountSettings();
+    await typeInput(container.querySelector<HTMLInputElement>('#custom-tool-name-x')!, 'Typing…');
+
+    // 外部删除（脏草稿保护保留行）
+    act(() => {
+      store.delete(CUSTOM_TOOLS_KEY);
+      window.dispatchEvent(new Event('storage'));
+    });
+
+    // 名称失焦：不写存储、不删除草稿
+    await act(async () => {
+      container
+        .querySelector<HTMLInputElement>('#custom-tool-name-x')!
+        .dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+    });
+    expect(store.has(CUSTOM_TOOLS_KEY)).toBe(false);
+    expect(container.querySelector<HTMLInputElement>('#custom-tool-name-x')!.value).toBe('Typing…');
+    expect(container.textContent).toContain('该工具已在其他标签页被删除');
+    expect(findButton(container, '放弃草稿')).not.toBeNull();
+    expect(findButton(container, '另存为新工具')).not.toBeNull();
+
+    // 继续编辑另一字段仍在（模板失焦同样不写存储）
+    await blurCustom(container, 'template', 'x', 'y://y{path}');
+    expect(store.has(CUSTOM_TOOLS_KEY)).toBe(false);
+    expect(container.querySelector<HTMLInputElement>('#custom-tool-template-x')!.value).toBe('y://y{path}');
+  });
+
+  it('C3 操作其他行后草稿仍在且原 id 未复活', async () => {
+    store.set(
+      CUSTOM_TOOLS_KEY,
+      JSON.stringify([
+        { id: 'a', name: 'A', template: 'a://x{path}' },
+        { id: 'x', name: 'X', template: 'x://x{path}' },
+      ]),
+    );
+    const { container } = mountSettings();
+    await typeInput(container.querySelector<HTMLInputElement>('#custom-tool-name-x')!, 'Typing…');
+
+    // 外部删除 X（本面板的 X 草稿保留）
+    act(() => {
+      store.set(CUSTOM_TOOLS_KEY, JSON.stringify([{ id: 'a', name: 'A', template: 'a://x{path}' }]));
+      window.dispatchEvent(new Event('storage'));
+    });
+    expect(container.querySelector<HTMLInputElement>('#custom-tool-name-x')!.value).toBe('Typing…');
+
+    // 修改另一行（A）失焦：X 草稿仍在、x id 不复活
+    await blurCustom(container, 'name', 'a', 'A2');
+    const stored = JSON.parse(store.get(CUSTOM_TOOLS_KEY)!) as { id: string }[];
+    expect(stored).toEqual([{ id: 'a', name: 'A2', template: 'a://x{path}' }]);
+    expect(container.querySelector<HTMLInputElement>('#custom-tool-name-x')!.value).toBe('Typing…');
+  });
+
+  it('C3 出口一「放弃草稿」：移除草稿行，无存储写入', async () => {
+    store.set(CUSTOM_TOOLS_KEY, JSON.stringify([{ id: 'x', name: 'X', template: 'x://x{path}' }]));
+    const { container } = mountSettings();
+    await typeInput(container.querySelector<HTMLInputElement>('#custom-tool-name-x')!, 'Typing…');
+    act(() => {
+      store.delete(CUSTOM_TOOLS_KEY);
+      window.dispatchEvent(new Event('storage'));
+    });
+
+    await act(async () => {
+      findButton(container, '放弃草稿')!.click();
+    });
+    expect(container.querySelector('#custom-tool-name-x')).toBeNull(); // 草稿行移除
+    expect(store.has(CUSTOM_TOOLS_KEY)).toBe(false); // 无存储写入
+  });
+
+  it('C3 出口二「另存为新工具」：新 id 追加入存储（草稿内容完整），原草稿行移除', async () => {
+    store.set(CUSTOM_TOOLS_KEY, JSON.stringify([{ id: 'x', name: 'X', template: 'x://x{path}' }]));
+    const { container } = mountSettings();
+    await typeInput(container.querySelector<HTMLInputElement>('#custom-tool-name-x')!, 'Typing…');
+    act(() => {
+      store.delete(CUSTOM_TOOLS_KEY);
+      window.dispatchEvent(new Event('storage'));
+    });
+    await act(async () => {
+      container
+        .querySelector<HTMLInputElement>('#custom-tool-name-x')!
+        .dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+    });
+
+    await act(async () => {
+      findButton(container, '另存为新工具')!.click();
+    });
+    const stored = JSON.parse(store.get(CUSTOM_TOOLS_KEY)!) as { id: string; name: string; template: string }[];
+    expect(stored).toHaveLength(1);
+    expect(stored[0].id).not.toBe('x'); // 新 id
+    expect(stored[0].name).toBe('Typing…');
+    expect(stored[0].template).toBe('x://x{path}');
+    expect(container.querySelector('#custom-tool-name-x')).toBeNull(); // 原草稿行移除
+    // 新行不再处于外部删除状态
+    expect(container.textContent).not.toContain('该工具已在其他标签页被删除');
+  });
+
+  it('添加 → 空行持久化并派发事件；名称/模板失焦保存整表', async () => {
+    const { container } = mountSettings();
+    await act(async () => {
+      addButton(container).click();
+    });
+    expect(events).toBe(1);
+    const stored0 = JSON.parse(store.get(CUSTOM_TOOLS_KEY)!) as { id: string }[];
+    expect(stored0).toHaveLength(1);
+    const id = stored0[0].id;
+
+    await blurCustom(container, 'name', id, 'My Editor');
+    await blurCustom(container, 'template', id, 'myapp://open?path={path}');
+    expect(events).toBe(3);
+    expect(store.get(CUSTOM_TOOLS_KEY)).toBe(
+      JSON.stringify([{ id, name: 'My Editor', template: 'myapp://open?path={path}' }]),
+    );
+    // 行不再有「不可用」提示
+    expect(rowHints(container)).toHaveLength(0);
+  });
+
+  it('名称为空或模板非法 → od-hint 提示不进入可用列表（草稿保留可继续编辑）', async () => {
+    store.set(CUSTOM_TOOLS_KEY, JSON.stringify([{ id: 'c1', name: '', template: '' }]));
+    const { container } = mountSettings();
+    expect(rowHints(container)).toHaveLength(1);
+    await blurCustom(container, 'name', 'c1', 'Evil');
+    await blurCustom(container, 'template', 'c1', 'javascript:alert(1){path}');
+    expect(rowHints(container)).toHaveLength(1); // 模板危险 scheme → 仍不可用
+    expect(store.get(CUSTOM_TOOLS_KEY)).toBe(
+      JSON.stringify([{ id: 'c1', name: 'Evil', template: 'javascript:alert(1){path}' }]),
+    ); // 草稿原文保留
+    await blurCustom(container, 'template', 'c1', 'myapp://open?path={path}');
+    expect(rowHints(container)).toHaveLength(0); // 名称+合法模板 → 可用
+  });
+
+  it('删除按钮：整表移除该行并持久化', async () => {
+    store.set(
+      CUSTOM_TOOLS_KEY,
+      JSON.stringify([
+        { id: 'c1', name: 'A', template: 'a://x{path}' },
+        { id: 'c2', name: 'B', template: 'b://x{path}' },
+      ]),
+    );
+    const { container } = mountSettings();
+    expect(container.querySelectorAll<HTMLInputElement>('input[id^="custom-tool-name-"]')).toHaveLength(2);
+    await act(async () => {
+      removeButton(container).click();
+    });
+    expect(store.get(CUSTOM_TOOLS_KEY)).toBe(JSON.stringify([{ id: 'c2', name: 'B', template: 'b://x{path}' }]));
+    expect(container.querySelectorAll<HTMLInputElement>('input[id^="custom-tool-name-"]')).toHaveLength(1);
+    expect(events).toBe(1);
+  });
+
+  it('跨标签 storage 事件收敛：外部新增的自定义工具行出现', () => {
+    const { container } = mountSettings();
+    expect(container.querySelectorAll('input[id^="custom-tool-name-"]')).toHaveLength(0);
+    act(() => {
+      store.set(CUSTOM_TOOLS_KEY, JSON.stringify([{ id: 'cx', name: 'Remote', template: 'r://x{path}' }]));
+      window.dispatchEvent(new Event('storage'));
+    });
+    expect(
+      container.querySelector<HTMLInputElement>('#custom-tool-name-cx')!.value,
+    ).toBe('Remote');
+  });
+
+  it('写失败不视为生效：列表收敛回已存值', async () => {
+    store.set(CUSTOM_TOOLS_KEY, JSON.stringify([{ id: 'c1', name: 'A', template: 'a://x{path}' }]));
+    vi.spyOn(localStorage, 'setItem').mockImplementation(() => {
+      throw new Error('quota');
+    });
+    const { container } = mountSettings();
+    await blurCustom(container, 'name', 'c1', 'Changed');
+    expect(store.get(CUSTOM_TOOLS_KEY)).toBe(
+      JSON.stringify([{ id: 'c1', name: 'A', template: 'a://x{path}' }]),
+    );
+    expect(container.querySelector<HTMLInputElement>('#custom-tool-name-c1')!.value).toBe('A');
     expect(events).toBe(0);
   });
 });

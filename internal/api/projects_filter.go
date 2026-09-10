@@ -19,10 +19,22 @@ import (
 //   - task.deleted：任意 from（删除挂起/归档任务也改树）
 //   - task.activity_changed / session.* / serve_runtime.* / resync.requested：
 //     notice/last_error/updated_at/last_active_at/agentStatus/attention_count 呈现变化
+//   - task.user_activity：不标脏（idle-reminder-user-activity D1：一次性用户输入
+//     事实，不影响任务树投影；Topic/Payload 畸形按保守标脏惯例标脏）
 //   - 未知 Type：保守标脏，避免漏推
 //
-// 全部已知 Type 与未知 Type 均标脏，故不解读 Payload（active-only 过滤所需的
-// status 枚举校验在此无增量价值），标脏后一律重组装全量快照重推。
+// 除 task.user_activity 外全部已知 Type 与未知 Type 均标脏，故不解读其余 Payload
+//（active-only 过滤所需的 status 枚举校验在此无增量价值），标脏后一律重组装
+// 全量快照重推。
 func eventDirtiesProjectsTaskTree(ev ocdeckevent.Event) bool {
-	return true
+	switch ev.Type {
+	case ocdeckevent.TypeTaskUserActivity:
+		if ev.Topic != ocdeckevent.TopicTask {
+			return true
+		}
+		_, ok := ev.Payload.(struct{})
+		return !ok
+	default:
+		return true
+	}
 }

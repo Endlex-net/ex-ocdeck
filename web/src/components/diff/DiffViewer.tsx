@@ -31,6 +31,7 @@ import {
 } from './annotation-ext';
 import { EditSession } from './edit-session';
 import MarkdownPreview, { type BlockLineRange } from './MarkdownPreview';
+import { pureAddedLineExtension } from './pure-added-ext';
 import {
   buildSnapshot,
   editGateFor,
@@ -900,6 +901,9 @@ export default function DiffViewer({
               }),
             ]
           : []),
+        // 纯新增行标记放最后：只读 diff 的行级装饰类，不影响上方批注/手势扩展；
+        // a 侧不挂——chunk 偏移是 b 文档坐标，施到 a 文档会误标行
+        ...(side === 'old' ? [] : [pureAddedLineExtension]),
       ];
 
       const editExtensions: Extension[] = [

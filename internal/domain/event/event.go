@@ -4,7 +4,8 @@
 //   - Event{Topic, Type, RID, Payload} 信封类型
 //   - 闭合的 Topic 常量（task / session / serve_runtime / control）
 //   - 闭合的 Type 常量（事件类型目录，逐字对齐 design D0 事件类型目录；
-//     task-notifications D2 显式增量：serve_runtime.session_error）
+//     task-notifications D2 显式增量：serve_runtime.session_error；
+//     idle-reminder-user-activity 显式增量：task.user_activity）
 //   - 各 Type 对应的 typed payload 结构与构造器
 //
 // Bus（基础设施）不做 schema 校验；生产方使用本包的 typed 构造器组装 Event，
@@ -39,6 +40,10 @@ const (
 	// TypeTaskActivityChanged 未伴随 status 迁移的任务行非 status 真实变更（Changed=true）。
 	// 不再要求 updated_at 跨秒推进。RID=task 主键，Payload={}。
 	TypeTaskActivityChanged = "task.activity_changed"
+	// TypeTaskUserActivity 一次性用户主动操作事实（idle-reminder-user-activity 对
+	// D0 封闭目录的显式增量），仅作 idle 通知计时取消信号，不对应任务行变更。
+	// RID=task 主键，Payload={}。
+	TypeTaskUserActivity = "task.user_activity"
 	// TypeSessionClaimed 任务认领了 opencode 会话归属（或归属信息被推进）。
 	// RID=session 主键，Payload={task_id}。
 	TypeSessionClaimed = "session.claimed"
@@ -167,6 +172,11 @@ func NewTaskDeleted(taskID, from string) Event {
 // NewTaskActivityChanged 构造 task.activity_changed 事件。
 func NewTaskActivityChanged(taskID string) Event {
 	return Event{Topic: TopicTask, Type: TypeTaskActivityChanged, RID: taskID, Payload: struct{}{}}
+}
+
+// NewTaskUserActivity 构造 task.user_activity 事件（idle-reminder-user-activity D1）。
+func NewTaskUserActivity(taskID string) Event {
+	return Event{Topic: TopicTask, Type: TypeTaskUserActivity, RID: taskID, Payload: struct{}{}}
 }
 
 // NewSessionClaimed 构造 session.claimed 事件。

@@ -159,6 +159,93 @@ function safeReadTheme(): string | null {
   }
 }
 
+/* ============================ Diff 配色风格 ============================ */
+
+/** Diff 配色风格偏好：与 index.html 内联脚本共用 localStorage['od-diff-style'] 与 <html data-diff-style>。 */
+export type DiffStylePreference = 'github' | 'goland';
+
+export const DIFF_STYLE_KEY = 'od-diff-style';
+
+export function isDiffStylePreference(v: unknown): v is DiffStylePreference {
+  return v === 'github' || v === 'goland';
+}
+
+/** 解析 Diff 风格偏好：localStorage['od-diff-style'] 缺省 github，非法值回退 github。
+ *  纯函数，可独立测试（不直接读 localStorage，接收原始值）。 */
+export function resolveDiffStylePreference(raw: string | null | undefined): DiffStylePreference {
+  return isDiffStylePreference(raw) ? raw : 'github';
+}
+
+/** 写 <html data-diff-style>（与 index.html 内联脚本共用同一 channel，避免脚本与 hook 状态漂移）。 */
+function applyDiffStyle(pref: DiffStylePreference): void {
+  document.documentElement.setAttribute('data-diff-style', pref);
+}
+
+/** Diff 风格 hook：管理 github|goland，与 index.html 内联脚本共用 localStorage['od-diff-style']
+ *  与 <html data-diff-style>。首帧由 index.html 内联脚本已应用，hook 仅在挂载后接管交互。
+ *  跨组件状态共享结构同 useTheme：模块级共享偏好状态 + 订阅通知。 */
+export function useDiffStyle(): {
+  preference: DiffStylePreference;
+  setPreference: (p: DiffStylePreference) => void;
+} {
+  const preference = useSyncExternalStore(diffStyleSubscribe, getDiffStyleSnapshot, getDiffStyleSnapshot);
+
+  // 偏好变化时同步 <html data-diff-style>（与 index.html 脚本一致）。
+  // 多消费者各跑此 effect，幂等写同一 DOM 属性，无副作用冲突。
+  useEffect(() => {
+    applyDiffStyle(preference);
+  }, [preference]);
+
+  return { preference, setPreference: setDiffStylePreference };
+}
+
+/* ---- Diff 风格模块级共享 store ----
+ * preference 在模块级单例持有，setDiffStylePreference 更新后通知所有订阅者。
+ * 跨 tab 一致性由 storage 事件监听（下方）同步进模块状态。 */
+let diffStyleState: DiffStylePreference = resolveDiffStylePreference(safeReadDiffStyle());
+const diffStyleListeners = new Set<() => void>();
+
+function getDiffStyleSnapshot(): DiffStylePreference {
+  return diffStyleState;
+}
+
+function diffStyleSubscribe(cb: () => void): () => void {
+  diffStyleListeners.add(cb);
+  return () => diffStyleListeners.delete(cb);
+}
+
+function setDiffStylePreference(p: DiffStylePreference): void {
+  if (p === diffStyleState) return;
+  diffStyleState = p;
+  try {
+    localStorage.setItem(DIFF_STYLE_KEY, p);
+  } catch {
+    /* localStorage 不可用时静默 */
+  }
+  diffStyleListeners.forEach((l) => l());
+}
+
+// 跨 tab/window Diff 风格变更监听：storage 事件同步进模块状态，通知本页订阅者
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (e: StorageEvent) => {
+    if (e.key === DIFF_STYLE_KEY) {
+      const next = resolveDiffStylePreference(e.newValue);
+      if (next !== diffStyleState) {
+        diffStyleState = next;
+        diffStyleListeners.forEach((l) => l());
+      }
+    }
+  });
+}
+
+function safeReadDiffStyle(): string | null {
+  try {
+    return localStorage.getItem(DIFF_STYLE_KEY);
+  } catch {
+    return null;
+  }
+}
+
  /* ==================== App 层共享 projects store（SSE 订阅 + 兜底轮询） ====================
   * design.md D4 / projects-stream design D6：壳层侧栏、指挥中心与项目管理页同一数据源；
   * 应用内不得存在第二个 /projects 轮询（store 内部的兜底轮询不算）。

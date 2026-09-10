@@ -14,6 +14,7 @@ vi.mock('../api', () => ({
     gitDiff: vi.fn(),
     gitCommit: vi.fn(),
     gitPush: vi.fn(),
+    reportActivity: vi.fn(),
   },
   ApiError: class ApiError extends Error {
     constructor(

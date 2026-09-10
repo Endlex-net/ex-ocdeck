@@ -17,6 +17,17 @@ func eventDirtiesTaskDetail(taskID string) func(ocdeckevent.Event) bool {
 				return true
 			}
 			return ev.RID == taskID
+		case ocdeckevent.TypeTaskUserActivity:
+			// idle-reminder-user-activity D1：一次性用户输入事实（通知触发输入），
+			// 不改变任务详情投影——合法事件无论 RID 是否本任务均不标脏；
+			// Topic/payload 形状异常按本表惯例保守标脏。
+			if ev.Topic != ocdeckevent.TopicTask {
+				return true
+			}
+			if _, ok := ev.Payload.(struct{}); !ok {
+				return true
+			}
+			return false
 		case ocdeckevent.TypeSessionsAligned:
 			if ev.Topic != ocdeckevent.TopicSession || !knownTaskPayload(ev) {
 				return true

@@ -147,6 +147,15 @@ func TestOverflowReconcile_PreservesDedupAndQuota(t *testing.T) {
 		t.Fatalf("prereq sends = %d", got)
 	}
 
+	// user_activity 交付（idle-reminder-user-activity 任务 7.1）：活动事件属 task
+	// topic，经 run loop 的 task 订阅（TopicTask）进入 handleEvent——此处直测同一
+	// 入口：溢出前活动事件取消 t1 已武装的 idle 计时，随后的溢出对账语义不变。
+	n.handleEvent(ctx, runStatusEvent("t1", "busy", "idle", true))
+	n.handleEvent(ctx, userActivityEvent("t1"))
+	if st := n.states["t1"]; st.idleSince != nil {
+		t.Fatal("user activity must cancel armed idle timer before reconcile")
+	}
+
 	// 溢出对账：取消 idle/error 计时（retry 按基线规则对仍 retry 的任务重新计时）、
 	// 保留仍 pending 的去重条目与 t2 episodeConsumed、新 pending 仅播种不补发。
 	snapT1 := attentionSnapWith("idle",

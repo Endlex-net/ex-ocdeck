@@ -288,6 +288,11 @@ type Manager struct {
 	// （保持测试不注入 service 时行为不变）。后续步骤（P1.4.5+）追加更多用例委托。
 	lifecycle *apptask.LifecycleService
 
+	// publish 为用户活动上报的事件端口（idle-reminder-user-activity D5）。
+	// RecordUserActivity/RecordShellUserActivity 经它发布 task.user_activity；
+	// nil 时（测试构造未注入）两方法 no-op。
+	publish application.Publisher
+
 	// runnerCtx 是 InitRunner/pre-delete 脚本执行所用的独立 context（design.md §6.1）：
 	// 不复用 SetLifecycleCtx 的 signal ctx，仅 Shutdown 关 gate 后取消。
 	// runnerWG 登记全部 InitRunner 与 pre-delete 执行 goroutine，Shutdown 在关 gate 后
@@ -401,6 +406,10 @@ type Options struct {
 	// 注入后 Get/List/Archive/Restore 委托本 service；nil 时回退 legacy 直连 store 路径，
 	// 保持测试不注入 service 时行为不变。
 	Lifecycle *apptask.LifecycleService
+	// Publish 可选：用户活动上报事件端口（idle-reminder-user-activity D5）。
+	// 注入后 RecordUserActivity/RecordShellUserActivity 发布 task.user_activity
+	//（生产 wiring 注入与 lifecycleSvc 同一个 bus）；nil 时 no-op。
+	Publish application.Publisher
 }
 
 // New 构造 Manager。OCFactory 为 nil 时用默认 opencode.Client 工厂。
@@ -417,6 +426,7 @@ func New(opts Options) *Manager {
 		logDir:                  opts.LogDir,
 		taskRepo:                opts.TaskRepo,
 		lifecycle:               opts.Lifecycle,
+		publish:                 opts.Publish,
 		runtimes:                make(map[string]*taskRuntime),
 		runtimeRegistry:         runtime.New(),
 		rand4Fn:                 rand4,

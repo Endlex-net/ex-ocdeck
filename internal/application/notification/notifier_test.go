@@ -421,11 +421,19 @@ func TestOnOverflow_DrainsPollutedQueue(t *testing.T) {
 	// 污染队列：两条 gap 前事件（若对账后回放，busy→idle 会重新武装 idle）。
 	subServe.events <- runStatusEvent("t1", "idle", "busy", true)
 	subServe.events <- runStatusEvent("t1", "busy", "idle", true)
+	// task.user_activity 属 task topic（notifier.go run() 订阅 TopicTask 的 subTask，
+	// idle-reminder-user-activity D6/任务 7.1）：进入 task 订阅缓冲，溢出时与既有
+	// 事件一并被排空，不改变既有全局恢复语义（清全部计时 + 对账重建）。
+	subTask.events <- userActivityEvent("t1")
 	subServe.signalOverflow()
+	subTask.signalOverflow()
 
 	n.onOverflow(ctx)
 	if got := len(subServe.events); got != 0 {
-		t.Fatalf("polluted queue must be drained on overflow, %d events left", got)
+		t.Fatalf("polluted serve queue must be drained on overflow, %d events left", got)
+	}
+	if got := len(subTask.events); got != 0 {
+		t.Fatalf("polluted task queue must be drained on overflow, %d events left", got)
 	}
 
 	// 排空后即便事件本应武装，也无计时：远期扫描无投递。

@@ -150,8 +150,9 @@ func run() error {
 		DebtStore:       adapter,         // R7：orphan tickets 持久化跨重启恢复（design.md §10）
 		LifecycleRunner: lifecycle.New(), // design.md §7.1：init/pre-delete 脚本与 inherit
 		LogDir:          cfg.DataDir + "/logs",
-		Namer:           namer,        // ai-worktree-naming：Create 经 LLM 提炼分支 slug，未配置时内部回退 Slugify
-		Lifecycle:       lifecycleSvc, // P1.4.4：Get/List/Archive/Restore 委托
+		Namer:         namer,        // ai-worktree-naming：Create 经 LLM 提炼分支 slug，未配置时内部回退 Slugify
+		Lifecycle:     lifecycleSvc, // P1.4.4：Get/List/Archive/Restore 委托
+		Publish:       bus,          // idle-reminder-user-activity：用户活动上报经同一 bus 发布 task.user_activity
 	})
 	// 注入 Manager 生命周期 context（design.md §4：SSE/退出监视挂进程 ctx，非 HTTP request ctx）。
 	tm.SetLifecycleCtx(ctx)

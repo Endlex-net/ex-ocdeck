@@ -35,6 +35,11 @@ func TestEventDirtiesActiveSessions(t *testing.T) {
 		{"task.activity_changed", ocdeckevent.NewTaskActivityChanged("t1"), true},
 		// task.created 不标脏（只改 projects 树）。
 		{"task.created", ocdeckevent.NewTaskCreated("t1"), false},
+		// task.user_activity：一次性用户输入事实，不影响 active sessions 投影 → 不标脏
+		//（idle-reminder-user-activity D1；Topic/payload 畸形按本表惯例保守标脏）。
+		{"task.user_activity", ocdeckevent.NewTaskUserActivity("t1"), false},
+		{"task.user_activity malformed payload", ocdeckevent.Event{Topic: ocdeckevent.TopicTask, Type: ocdeckevent.TypeTaskUserActivity, RID: "t1", Payload: nil}, true},
+		{"task.user_activity wrong topic", ocdeckevent.Event{Topic: ocdeckevent.TopicSession, Type: ocdeckevent.TypeTaskUserActivity, RID: "t1", Payload: struct{}{}}, true},
 		// task.status_changed：仅进出 active 集合标脏。
 		{"status active→suspending（离开 active）", ocdeckevent.NewTaskStatusChanged("t1", application.StatusActive, application.StatusSuspending), true},
 		{"status suspended→active（进入 active）", ocdeckevent.NewTaskStatusChanged("t1", application.StatusSuspended, application.StatusActive), true},
