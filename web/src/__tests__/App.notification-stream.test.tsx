@@ -59,6 +59,7 @@ vi.mock('../notifications', async (importOriginal) => {
 
 vi.mock('../hooks', () => ({
   useTheme: () => ({ preference: 'system' as const, setPreference: () => {} }),
+  useDiffStyle: () => ({ preference: 'github' as const, setPreference: () => {} }),
 }));
 
 vi.mock('../components/TokenGate', () => ({ TokenGate: () => null }));

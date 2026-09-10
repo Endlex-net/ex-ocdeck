@@ -1186,37 +1186,46 @@ select.input {
   background: var(--bg);
 }
 
-/* 增删语义色派生自 --success/--danger，双类作用域压过 merge 包 baseTheme 的明/暗固定色 */
+/* 行底色直接复用全站软语义变量 --danger-soft/--success-soft（与列表 hover、徽标等同一套
+   淡色语言），双类作用域压过 merge 包 baseTheme 的明/暗固定色；明暗主题随变量自适应。 */
 .diff-view .diff-editor .cm-merge-a .cm-changedLine,
-.diff-view .diff-editor .cm-deletedChunk {
-  background: color-mix(in oklch, var(--danger) 12%, var(--bg));
+.diff-view .diff-editor .cm-deletedChunk,
+.diff-view .diff-editor .cm-deletedLine {
+  background: var(--danger-soft);
 }
 
 .diff-view .diff-editor .cm-merge-b .cm-changedLine,
 .diff-view .diff-editor .cm-insertedLine {
-  background: color-mix(in oklch, var(--success) 12%, var(--bg));
+  background: var(--success-soft);
 }
 
-.diff-view .diff-editor .cm-deletedLine {
-  background: color-mix(in oklch, var(--danger) 12%, var(--bg));
-}
-
+/* 变更词元高亮采用 GitHub 惯例：整行淡底色之上，仅在变更词/词元上叠稍强底色，
+   无下划线、不改文字颜色（保留语法高亮，避免绿底绿字）。同时压过 merge baseTheme
+   的 &light 下划线渐变（#ee4433/#22bb22）与 b 侧删除文本底色（#ff000033）。
+   裸 .cm-deletedText 同时覆盖 unified 删除块（.cm-deletedChunk，渲染在 unified/b 侧
+   编辑器内容内）与并排 b 侧行内展示的删除文本。 */
 .diff-view .diff-editor .cm-merge-a .cm-changedText,
 .diff-view .diff-editor .cm-deletedText {
-  color: color-mix(in oklch, var(--danger) 75%, var(--fg));
+  background: color-mix(in oklch, var(--danger) 30%, transparent);
+  border-radius: 2px;
 }
 
 .diff-view .diff-editor .cm-merge-b .cm-changedText {
-  color: color-mix(in oklch, var(--success) 75%, var(--fg));
+  background: color-mix(in oklch, var(--success) 30%, transparent);
+  border-radius: 2px;
 }
 
+/* gutter 收敛为「浅洗底 + 左缘 2px 语义色条」（box-shadow inset，不占布局、不随字号变化），
+   替代 baseTheme 的大面积浓色块；扫视时靠色条定位变更行，比满底色 gutter 更克制。 */
 .diff-view .diff-editor .cm-merge-a .cm-changedLineGutter,
 .diff-view .diff-editor .cm-deletedLineGutter {
-  background: color-mix(in oklch, var(--danger) 35%, transparent);
+  background: color-mix(in oklch, var(--danger) 20%, transparent);
+  box-shadow: inset 2px 0 0 var(--danger);
 }
 
 .diff-view .diff-editor .cm-merge-b .cm-changedLineGutter {
-  background: color-mix(in oklch, var(--success) 35%, transparent);
+  background: color-mix(in oklch, var(--success) 20%, transparent);
+  box-shadow: inset 2px 0 0 var(--success);
 }
 
 /* 折叠横条（collapseUnchanged 的 .cm-collapsedLines widget）：merge baseTheme 只按 cm 自身
@@ -1233,34 +1242,81 @@ select.input {
   background: linear-gradient(to bottom, transparent 0, var(--surface-hover) 30%, var(--surface-hover) 70%, transparent 100%);
 }
 
-/* baseTheme 其余固定色装饰统一对齐设计变量（明暗主题随变量自适应）：
-   &light 变更文本下划线（#ee4433/#22bb22 渐变）、b 侧删除文本底色（#ff000033）、
-   unified 视图 inline 变更行背景与 gutter 标记（#75d）。 */
-.diff-view .diff-editor .cm-merge-a .cm-changedText,
-.diff-view .diff-editor .cm-deletedChunk .cm-deletedText {
-  background: linear-gradient(color-mix(in oklch, var(--danger) 45%, transparent), color-mix(in oklch, var(--danger) 45%, transparent)) bottom / 100% 2px no-repeat;
-}
-
-.diff-view .diff-editor .cm-merge-b .cm-changedText {
-  background: linear-gradient(color-mix(in oklch, var(--success) 45%, transparent), color-mix(in oklch, var(--success) 45%, transparent)) bottom / 100% 2px no-repeat;
-}
-
-.diff-view .diff-editor .cm-merge-b .cm-deletedText {
-  background: color-mix(in oklch, var(--danger) 22%, transparent);
-}
-
+/* unified 视图：行底色/ gutter 与并排共用同一套语义（baseTheme 原为固定色 #bfb、#75d 等）。 */
 .diff-view .diff-editor .cm-inlineChangedLine {
-  background: color-mix(in oklch, var(--success) 12%, var(--bg));
-}
-
-/* unified 视图无 .cm-merge-b 包装，插入行 gutter 在 baseTheme 中无底色；此处补 success 色。
-   并排 a/b 侧的 gutter 由上方四类作用域规则覆盖（特异性更高），不受此规则影响。 */
-.diff-view .diff-editor .cm-changedLineGutter {
-  background: color-mix(in oklch, var(--success) 35%, transparent);
+  background: var(--success-soft);
 }
 
 .diff-view .diff-editor .cm-inlineChangedLineGutter {
-  background: color-mix(in oklch, var(--accent) 45%, transparent);
+  background: color-mix(in oklch, var(--accent) 20%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* ---------- GoLand（IntelliJ）风格变体 ----------
+   html[data-diff-style="goland"] 时启用；无属性 / ="github" 走上方 GitHub 风格默认规则。
+   与 GitHub 红绿配对的核心差异：修改行两侧统一蓝（--accent 派生）、删除灰调（--muted 派生）、
+   新增维持绿。词级同色系深一档、无下划线、不改文字颜色，gutter 沿用左缘色条只换色。
+   类语义取舍：
+   - 「修改」与「纯新增」行在行类上不可区分（b 侧同为 .cm-changedLine、unified 同为
+     .cm-inlineChangedLine），纯新增行由组件层打 .cm-diff-added 行级类（DiffViewer 按
+     chunk.fromA === chunk.toA 判定纯插入块），CSS 只消费该类标绿。
+   - a 侧修改行与删除行共用 del.cm-deletedLine 包裹、且无稳定的纯删除结构特征
+     （删除行常与修改同 chunk，词元被 diff 切散），故 a 侧统一按「修改」上蓝；
+     灰调删除仅体现在 .cm-deletedChunk 删除块上（渲染在 unified/b 侧编辑器内容内）。
+   - gutter 元素与行内容无 DOM 关联，无法跟随行类型换色，统一按「修改」上蓝。
+   - unified 编辑器根自带 .cm-merge-b，.cm-merge-b 作用域规则天然覆盖 unified。 */
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-merge-a .cm-changedLine,
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-merge-b .cm-changedLine,
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-inlineChangedLine {
+  background: color-mix(in oklch, var(--accent) 11%, var(--bg));
+}
+
+/* 纯新增行（b 侧/unified，组件层 .cm-diff-added 行级类）：绿 */
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-merge-b .cm-diff-added {
+  background: var(--success-soft);
+}
+
+/* 删除块（unified 视图）：中性灰淡底；未高亮文本淡化为灰（不覆盖语法高亮颜色，
+   高亮词元保留原色） */
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-deletedChunk {
+  background: color-mix(in oklch, var(--muted) 9%, var(--bg));
+  color: color-mix(in oklch, var(--muted) 75%, var(--fg));
+}
+
+/* 上方 GitHub 规则给 del/ins 行内标记与删除行也铺了行底色；goland 下透明化，
+   让行级蓝/绿/灰干净透出，避免色块套色块 */
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-merge-a .cm-changedLine > .cm-deletedLine,
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-merge-b .cm-changedLine > .cm-insertedLine,
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-deletedChunk .cm-deletedLine {
+  background: transparent;
+}
+
+/* 词级：修改蓝；纯新增行内词元绿；删除文本灰 */
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-merge-a .cm-changedText,
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-merge-b .cm-changedText,
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-inlineChangedLine .cm-changedText {
+  background: color-mix(in oklch, var(--accent) 30%, transparent);
+}
+
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-merge-b .cm-diff-added .cm-changedText {
+  background: color-mix(in oklch, var(--success) 30%, transparent);
+}
+
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-deletedText {
+  background: color-mix(in oklch, var(--muted) 25%, transparent);
+}
+
+/* gutter：修改蓝、删除灰（色条方案同 GitHub 默认，仅换色） */
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-merge-a .cm-changedLineGutter,
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-merge-b .cm-changedLineGutter,
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-changedLineGutter {
+  background: color-mix(in oklch, var(--accent) 20%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+html[data-diff-style="goland"] .diff-view .diff-editor .cm-deletedLineGutter {
+  background: color-mix(in oklch, var(--muted) 16%, transparent);
+  box-shadow: inset 2px 0 0 var(--muted);
 }
 
 /* ---------- Markdown 渲染预览（markdown-diff-preview design D5） ----------
