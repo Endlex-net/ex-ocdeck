@@ -2,10 +2,14 @@ import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import {
   EDITOR_TOOLS_CHANGED,
+  isUsableCustomTool,
+  loadCustomEditorTools,
   loadEditorTools,
   loadEditorUriTemplate,
+  saveCustomEditorTools,
   saveEditorTool,
   saveEditorUriTemplate,
+  type CustomEditorTool,
   type EditorTool,
 } from '../editor-tools';
 import { GlobalEnvEditor } from '../components/GlobalEnvEditor';
@@ -431,9 +435,10 @@ function AppearancePanel() {
 }
 
 /* ============================ 常用工具子标签（add-frontend-tool-quick-open 2.3） ============================
- * VSCode/GoLand 本机编辑器启用开关（缺省关闭，仅持久化于 localStorage）：
+ * VSCode/GoLand/Cursor 本机编辑器启用开关（缺省关闭，仅持久化于 localStorage）：
  * 开启后任务详情页页头出现对应快捷打开入口。变更走 saveEditorTool（事务语义），
- * 面板监听 EDITOR_TOOLS_CHANGED + storage 收敛外部变更（同 ClipboardPolicyField 模式）。 */
+ * 面板监听 EDITOR_TOOLS_CHANGED + storage 收敛外部变更（同 ClipboardPolicyField 模式）。
+ * 自定义工具（名称 + 唤起 URI 模板）：行内输入失焦保存整表，删除/添加即时持久化。 */
 const EDITOR_TOOLS: { tool: EditorTool; label: string; hint: string }[] = [
   {
     tool: 'vscode',
@@ -445,12 +450,18 @@ const EDITOR_TOOLS: { tool: EditorTool; label: string; hint: string }[] = [
     label: 'GoLand',
     hint: '在任务详情页页头显示 GoLand 快捷打开；需本机已安装 GoLand，使用本机路径打开',
   },
+  {
+    tool: 'cursor',
+    label: 'Cursor',
+    hint: '在任务详情页页头显示 Cursor 快捷打开；需本机已安装 Cursor，使用本机路径打开',
+  },
 ];
 
 /** 各工具内置默认模板（placeholder 展示；模板含 {path} 占位符，缺省/清空即走内置分支）。 */
 const EDITOR_TOOL_DEFAULT_TEMPLATES: Record<EditorTool, string> = {
   vscode: 'vscode://file{path}/',
   goland: 'goland://open?file={path}',
+  cursor: 'cursor://file{path}/',
 };
 
 /** 模板能力说明（spec「自定义唤起 URI 模板」末段原文）。 */
@@ -459,30 +470,68 @@ const EDITOR_TOOL_TEMPLATE_HINT =
   '（需本机已安装 Remote-SSH 扩展且 SSH 可达；该形式为社区实测、非官方文档化）；' +
   'GoLand 不存在通过 URL 打开远程项目的可用形式。';
 
+/** 新增自定义工具行 id（时间戳 + 随机后缀，页面内唯一即可）。 */
+function newCustomToolId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function EditorToolsPanel() {
   const [tools, setTools] = useState(() => loadEditorTools());
-  const [templates, setTemplates] = useState<Record<EditorTool, string>>(() => ({
+  const loadTemplates = (): Record<EditorTool, string> => ({
     vscode: loadEditorUriTemplate('vscode') ?? '',
     goland: loadEditorUriTemplate('goland') ?? '',
-  }));
+    cursor: loadEditorUriTemplate('cursor') ?? '',
+  });
+  const [templates, setTemplates] = useState(loadTemplates);
   // 最近一次同步到的存储快照：事件只收敛「草稿未被本地编辑」的字段，未失焦草稿不丢（评审 F1）。
   const storedRef = useRef(templates);
+
+  // 自定义工具：草稿列表 + 存储快照（行内失焦保存整表；跨标签/入口下拉变更经事件收敛）。
+  // 初始渲染时草稿与存储一致（同源加载）。
+  const [customDrafts, setCustomDrafts] = useState<CustomEditorTool[]>(() => loadCustomEditorTools());
+  const customStoredRef = useRef(customDrafts);
 
   // 外部变更（快捷入口下拉、跨标签页）后按实际存储收敛。
   useEffect(() => {
     const reload = () => {
       setTools(loadEditorTools());
       const prevStored = storedRef.current;
-      const next: Record<EditorTool, string> = {
-        vscode: loadEditorUriTemplate('vscode') ?? '',
-        goland: loadEditorUriTemplate('goland') ?? '',
-      };
+      const next = loadTemplates();
       // updater 惰性执行且必须纯净：与之比较的旧存储快照先捕获到局部变量（不读可变 ref）。
       setTemplates((draft) => ({
         vscode: draft.vscode === prevStored.vscode ? next.vscode : draft.vscode,
         goland: draft.goland === prevStored.goland ? next.goland : draft.goland,
+        cursor: draft.cursor === prevStored.cursor ? next.cursor : draft.cursor,
       }));
       storedRef.current = next;
+      // 自定义工具：逐字段收敛（草稿字段 === 上一存储快照值才收敛，未失焦编辑不丢）。
+      // 旧存储快照里有而新存储没有的行 = 外部已删除：仅当本地草稿相对快照无修改时随之移除
+      // （本地脏草稿独立保留，防误删正在编辑的内容）；从未入存的本地新增行保留。
+      // 与 templates 相同：快照更新在 updater 之外完成。
+      const prevCustom = customStoredRef.current;
+      const nextCustom = loadCustomEditorTools();
+      setCustomDrafts((drafts) => {
+        const merged: CustomEditorTool[] = nextCustom.map((t) => {
+          const prevRow = prevCustom.find((p) => p.id === t.id);
+          const draftRow = drafts.find((d) => d.id === t.id);
+          if (!prevRow || !draftRow) return t;
+          return {
+            id: t.id,
+            name: draftRow.name === prevRow.name ? t.name : draftRow.name,
+            template: draftRow.template === prevRow.template ? t.template : draftRow.template,
+          };
+        });
+        for (const d of drafts) {
+          if (nextCustom.some((t) => t.id === d.id)) continue;
+          const prevRow = prevCustom.find((p) => p.id === d.id);
+          if (prevRow && d.name === prevRow.name && d.template === prevRow.template) {
+            continue; // 外部已删除且本地无修改 → 随之移除（不复活）
+          }
+          merged.push(d); // 本地脏草稿（外部删除时正在编辑）或未入存的本地新增行
+        }
+        return merged;
+      });
+      customStoredRef.current = nextCustom;
     };
     window.addEventListener(EDITOR_TOOLS_CHANGED, reload);
     window.addEventListener('storage', reload);
@@ -512,6 +561,81 @@ function EditorToolsPanel() {
     const stored = loadEditorUriTemplate(tool) ?? '';
     storedRef.current = { ...storedRef.current, [tool]: stored };
     setTemplates((t) => ({ ...t, [tool]: stored }));
+  };
+
+  // 自定义工具草稿收敛：外部已删除但本地脏（正在编辑未失焦）的草稿行独立保留（C3），
+  // 其余收敛为存储全表。updater 纯函数、幂等。
+  const convergeCustomDrafts = (stored: CustomEditorTool[]) => {
+    setCustomDrafts((drafts) => {
+      const deletedDirty = drafts.filter((d) => !stored.some((t) => t.id === d.id));
+      if (deletedDirty.length === 0) return stored;
+      return [...stored, ...deletedDirty];
+    });
+    customStoredRef.current = stored;
+  };
+
+  // 自定义工具行失焦保存（C2）：以最新存储为基准应用本次行操作（不整表恢复草稿）。
+  // 行已被外部删除（C3 脏草稿）：不写存储、不删除草稿——保留独立状态，由用户显式处置（放弃/另存）。
+  // 写失败不视为生效：不派发事件，行内容收敛回已存值。
+  const saveCustomRow = (id: string, patch: Partial<CustomEditorTool>) => {
+    const stored = loadCustomEditorTools();
+    const target = stored.find((t) => t.id === id);
+    if (target) {
+      const next = stored.map((t) => (t.id === id ? { ...t, ...patch } : t));
+      try {
+        saveCustomEditorTools(next);
+      } catch {
+        /* 写失败不派发事件，输入框收敛回已存值 */
+      }
+    }
+    convergeCustomDrafts(loadCustomEditorTools());
+  };
+
+  // 添加：以最新存储为基准追加一条空行（占位草稿持久化，跨事件收敛不丢）；写失败不添加。
+  const addCustomTool = () => {
+    const next = [...loadCustomEditorTools(), { id: newCustomToolId(), name: '', template: '' }];
+    try {
+      saveCustomEditorTools(next);
+    } catch {
+      return;
+    }
+    convergeCustomDrafts(loadCustomEditorTools());
+  };
+
+  // 删除：以最新存储为基准移除并持久化；写失败不删除。
+  const removeCustomTool = (id: string) => {
+    const next = loadCustomEditorTools().filter((d) => d.id !== id);
+    try {
+      saveCustomEditorTools(next);
+    } catch {
+      return;
+    }
+    convergeCustomDrafts(loadCustomEditorTools());
+  };
+
+  // C3 出口一：放弃外部已删除行的草稿（存储中该行已不存在，仅移除本地草稿，无存储写入）。
+  const discardCustomDraft = (id: string) => {
+    setCustomDrafts((drafts) => drafts.filter((d) => d.id !== id));
+  };
+
+  // C3 出口二：草稿另存为新工具（新 id 追加到存储）；成功后原草稿行移除。
+  const saveCustomDraftAsNew = (id: string) => {
+    const draft = customDrafts.find((d) => d.id === id);
+    if (!draft) return;
+    const next = [...loadCustomEditorTools(), { ...draft, id: newCustomToolId() }];
+    try {
+      saveCustomEditorTools(next);
+    } catch {
+      return;
+    }
+    const stored = loadCustomEditorTools();
+    customStoredRef.current = stored;
+    setCustomDrafts((drafts) => {
+      const storedIds = new Set(stored.map((t) => t.id));
+      // 原草稿行移除；其余外部已删除脏草稿行保留
+      const leftover = drafts.filter((d) => d.id !== id && !storedIds.has(d.id));
+      return [...stored, ...leftover];
+    });
   };
 
   return (
@@ -551,6 +675,80 @@ function EditorToolsPanel() {
         </div>
       ))}
       <div className="od-hint">{EDITOR_TOOL_TEMPLATE_HINT}</div>
+      <div className="od-field">
+        <div style={{ display: 'block', margin: '10px 0 4px' }}>自定义工具</div>
+        <div className="od-hint">
+          通过自定义 URL scheme 唤起其他编辑器/工具；名称与模板齐全才出现在快捷打开列表
+          （模板需含 {'{path}'}，scheme 不得为 javascript:/data:/vbscript:/file:）
+        </div>
+        {customDrafts.map((t) => {
+          const usable = isUsableCustomTool(t);
+          // C3：该草稿行已不在存储中 = 其他标签页删除了正在编辑的工具（脏草稿独立保留）
+          const externallyDeleted = !customStoredRef.current.some((s) => s.id === t.id);
+          return (
+            <div key={t.id} style={{ margin: '8px 0' }}>
+              {externallyDeleted && (
+                <div className="od-hint">该工具已在其他标签页被删除；此处草稿已保留，可选择放弃或另存为新工具。</div>
+              )}
+              <label
+                htmlFor={`custom-tool-name-${t.id}`}
+                style={{ display: 'block', margin: '4px 0' }}
+              >
+                名称
+              </label>
+              <input
+                className="od-input"
+                id={`custom-tool-name-${t.id}`}
+                type="text"
+                style={{ maxWidth: 420 }}
+                value={t.name}
+                onChange={(e) => setCustomDrafts((d) => d.map((x) => (x.id === t.id ? { ...x, name: e.target.value } : x)))}
+                onBlur={(e) => saveCustomRow(t.id, { name: e.target.value })}
+              />
+              <label
+                htmlFor={`custom-tool-template-${t.id}`}
+                style={{ display: 'block', margin: '8px 0 4px' }}
+              >
+                唤起 URI 模板
+              </label>
+              <input
+                className="od-input mono"
+                id={`custom-tool-template-${t.id}`}
+                type="text"
+                spellCheck={false}
+                style={{ maxWidth: 420 }}
+                placeholder="myeditor://open?path={path}"
+                value={t.template}
+                onChange={(e) =>
+                  setCustomDrafts((d) => d.map((x) => (x.id === t.id ? { ...x, template: e.target.value } : x)))
+                }
+                onBlur={(e) => saveCustomRow(t.id, { template: e.target.value })}
+              />{' '}
+              <button type="button" className="btn btn-small" onClick={() => removeCustomTool(t.id)}>
+                删除
+              </button>
+              {!usable && (
+                <div className="od-hint">
+                  名称或模板不完整：该工具暂不出现在快捷打开列表（草稿保留，可继续编辑）
+                </div>
+              )}
+              {externallyDeleted && (
+                <div style={{ margin: '4px 0' }}>
+                  <button type="button" className="btn btn-small" onClick={() => discardCustomDraft(t.id)}>
+                    放弃草稿
+                  </button>{' '}
+                  <button type="button" className="btn btn-small" onClick={() => saveCustomDraftAsNew(t.id)}>
+                    另存为新工具
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+        <button type="button" className="btn btn-small" onClick={addCustomTool}>
+          添加自定义工具
+        </button>
+      </div>
     </section>
   );
 }
