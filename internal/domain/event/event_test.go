@@ -15,6 +15,7 @@ func TestTypeConstants(t *testing.T) {
 		{"TaskStatusChanged", TypeTaskStatusChanged, "task.status_changed"},
 		{"TaskDeleted", TypeTaskDeleted, "task.deleted"},
 		{"TaskActivityChanged", TypeTaskActivityChanged, "task.activity_changed"},
+		{"TaskUserActivity", TypeTaskUserActivity, "task.user_activity"},
 		{"SessionClaimed", TypeSessionClaimed, "session.claimed"},
 		{"SessionTouched", TypeSessionTouched, "session.touched"},
 		{"SessionDeleted", TypeSessionDeleted, "session.deleted"},
@@ -54,17 +55,19 @@ func TestTopicConstants(t *testing.T) {
 	}
 }
 
-// Type/Topic 闭合常量目录：12 个 Type、4 个 Topic（task-notifications D2 增量后）。
+// Type/Topic 闭合常量目录：13 个 Type、4 个 Topic（task-notifications D2 与
+// idle-reminder-user-activity 增量后）。
 func TestClosedCatalogSize(t *testing.T) {
 	allTypes := []Type{
 		TypeTaskCreated, TypeTaskStatusChanged, TypeTaskDeleted, TypeTaskActivityChanged,
+		TypeTaskUserActivity,
 		TypeSessionClaimed, TypeSessionTouched, TypeSessionDeleted, TypeSessionsAligned,
 		TypeServeRuntimeAttentionChanged, TypeServeRuntimeRunStatusChanged,
 		TypeServeRuntimeSessionError,
 		TypeResyncRequested,
 	}
-	if len(allTypes) != 12 {
-		t.Fatalf("expected 12 Type constants, got %d", len(allTypes))
+	if len(allTypes) != 13 {
+		t.Fatalf("expected 13 Type constants, got %d", len(allTypes))
 	}
 	// 确认无重复。
 	seen := make(map[Type]bool, len(allTypes))
@@ -117,6 +120,16 @@ func TestNewTaskActivityChanged(t *testing.T) {
 	got := NewTaskActivityChanged("tsk_1")
 	if got.Type != TypeTaskActivityChanged || got.RID != "tsk_1" {
 		t.Fatalf("mismatch: %+v", got)
+	}
+}
+
+func TestNewTaskUserActivity(t *testing.T) {
+	got := NewTaskUserActivity("tsk_1")
+	if got.Topic != TopicTask || got.Type != TypeTaskUserActivity || got.RID != "tsk_1" {
+		t.Fatalf("mismatch: %+v", got)
+	}
+	if _, ok := got.Payload.(struct{}); !ok {
+		t.Fatalf("payload type = %T, want struct{}", got.Payload)
 	}
 }
 

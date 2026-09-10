@@ -32,6 +32,8 @@ var knownTaskStatuses = map[string]struct{}{
 //     两端都非 active 的迁移（suspend/archive/restore 等中间态）不标脏
 //   - task.deleted：仅 from==active 标脏
 //   - task.created：不标脏（只影响 projects 树，active 集合不变）
+//   - task.user_activity：不标脏（idle-reminder-user-activity D1：一次性用户输入
+//     事实，不影响 active sessions 投影；Topic/Payload 畸形按保守标脏惯例标脏）
 //
 // 已知 Type 的 payload 无法按 typed payload 解读时保守标脏：bus 不做 schema 校验，
 // 解读失败的 status/delete 若按零值判非 active 会漏推。类型断言通过但 From/To
@@ -67,6 +69,15 @@ func eventDirtiesActiveSessions(ev ocdeckevent.Event) bool {
 		// 快照（attention/run_status 投影）不受其影响——合法事件不标脏；
 		// payload 非 typed 按本表惯例保守标脏。
 		_, ok := ev.Payload.(ocdeckevent.ServeRuntimeSessionErrorPayload)
+		return !ok
+	case ocdeckevent.TypeTaskUserActivity:
+		// idle-reminder-user-activity D1：一次性用户输入事实，active 集合与
+		// attention/run_status 投影不受其影响——合法事件（Topic task 且 Payload
+		// struct{}{}）不标脏；Topic/payload 形状异常按本表惯例保守标脏。
+		if ev.Topic != ocdeckevent.TopicTask {
+			return true
+		}
+		_, ok := ev.Payload.(struct{})
 		return !ok
 	default:
 		// session.* / sessions.aligned / serve_runtime.* / resync.requested /

@@ -12,13 +12,14 @@
 
 任务详情对象字段 MUST 与 `taskRowDTO` 一致：`id`、`project_id`、`name`、`branch`、`status`、`worktree_path`、`created_at`、`updated_at`、`init_status`、`project_kind`（必有）、`mode`（必有，取值 `worktree`/`local-path`）；`last_port`、`last_error`、`notice`、`delete_mode`、`init_error`、`sessions`、`agentStatus`（按 omitempty 省略）；`attention`（必有，`{permissions[], questions[]}`，空数组非 `null`）。组装 MUST 复用与 REST 详情端点相同的 DTO 组装逻辑，唯一差异：`agentStatus` MUST 读内存快照（`AgentStatusSnapshot`），MUST NOT 实时探测（`AgentStatus`）。推送路径 MUST 为纯读操作，MUST NOT 发起任何 opencode 调用，MUST NOT 产生任何写副作用。
 
-场景事件消费过滤 MUST 按以下决策表判定（优先级自上而下，先匹配先生效）。已知 Type 的合法 Topic/Payload 类型以 `internal/domain/event/event.go` 逐字为准：`task.created`/`task.activity_changed`/`resync.requested` → Payload `struct{}{}`；`task.status_changed` → `TaskStatusChangedPayload`；`task.deleted` → `TaskDeletedPayload`；`session.claimed`/`touched`/`deleted` → `SessionOwnerPayload`；`sessions.aligned` → `SessionsAlignedPayload`；`serve_runtime.attention_changed` → `ServeRuntimeTaskPayload`；`serve_runtime.run_status_changed` → `ServeRuntimeRunStatusChangedPayload`。任一已知 Type 的 Topic 或 Payload 类型与此不符即为畸形事件：
+场景事件消费过滤 MUST 按以下决策表判定（优先级自上而下，先匹配先生效）。已知 Type 的合法 Topic/Payload 类型以 `internal/domain/event/event.go` 逐字为准：`task.created`/`task.activity_changed`/`task.user_activity`/`resync.requested` → Payload `struct{}{}`；`task.status_changed` → `TaskStatusChangedPayload`；`task.deleted` → `TaskDeletedPayload`；`session.claimed`/`touched`/`deleted` → `SessionOwnerPayload`；`sessions.aligned` → `SessionsAlignedPayload`；`serve_runtime.attention_changed` → `ServeRuntimeTaskPayload`；`serve_runtime.run_status_changed` → `ServeRuntimeRunStatusChangedPayload`。任一已知 Type 的 Topic 或 Payload 类型与此不符即为畸形事件：
 
 | 事件形态 | 判定 |
 |---|---|
 | 未知 Type（任何 topic） | 标脏（保守自愈） |
 | 已知 Type 但 Topic 或 Payload 类型不合法（畸形事件） | 标脏（保守自愈） |
 | `task.created`/`task.status_changed`/`task.deleted`/`task.activity_changed` | RID==该 taskID → 标脏，否则不脏 |
+| `task.user_activity` | 合法事件不标脏（一次性用户输入事实，不影响任务详情投影；畸形事件按上行惯例标脏） |
 | `sessions.aligned` | RID==该 taskID → 标脏，否则不脏 |
 | `session.claimed`/`session.touched`/`session.deleted` | Payload `SessionOwnerPayload.TaskID`==该 taskID → 标脏，否则不脏 |
 | `serve_runtime.attention_changed` | Payload `ServeRuntimeTaskPayload.TaskID`==该 taskID → 标脏，否则不脏 |
@@ -41,6 +42,11 @@
 
 - **WHEN** 连接存续期间到达的事件均为合法已知 Type 且 RID/Payload 均不关联本 taskID
 - **THEN** 不触发重组装，不发送 `update` 帧
+
+#### Scenario: 用户活动事件不触发推送
+
+- **WHEN** 连接存续期间到达合法的 `task.user_activity` 事件（无论 RID 是否为本 taskID）
+- **THEN** 不标脏，不触发重组装，不发送 `update` 帧
 
 #### Scenario: 窗口内多次变更合并
 

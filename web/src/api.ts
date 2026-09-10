@@ -188,6 +188,16 @@ export const api = {
       mode,
       ...(confirmDirty ? { confirmDirty: 'true' } : {}),
     }),
+  /** 用户主动操作上报（idle-reminder-user-activity D4）：fire-and-forget——忽略响应与错误
+   *  （含 401，不触发登出事件），不等待、不重试，MUST NOT 阻塞交互。 */
+  reportActivity: (taskID: string): void => {
+    void fetch(`/api/v1/tasks/${taskID}/activity`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${getToken()}` },
+    }).catch(() => {
+      /* 上报失败静默忽略 */
+    });
+  },
 
   listTerminals: (taskID: string) => request<TerminalInfo[]>('GET', `/tasks/${taskID}/terminals`),
   createTerminal: (taskID: string) =>

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -25,7 +26,8 @@ func dialWS(t *testing.T, url string) *websocket.Conn {
 }
 
 // newBridgeHandler 返回一个 handler：acceptWS 后 bridgeTerminal 桥接到给定 PTY。
-func newBridgeHandler(p *pty.Pty) http.HandlerFunc {
+// onInput 透传 bridgeTerminal（idle-reminder-user-activity：输入帧上报回调）。
+func newBridgeHandler(p *pty.Pty, onInput func()) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		c, err := acceptWS(w, r)
 		if err != nil {
@@ -33,7 +35,7 @@ func newBridgeHandler(p *pty.Pty) http.HandlerFunc {
 		}
 		defer c.CloseNow()
 		s := &Server{}
-		s.bridgeTerminal(r.Context(), c, p)
+		s.bridgeTerminal(r.Context(), c, p, onInput)
 	}
 }
 
@@ -53,7 +55,7 @@ func openCatPty(t *testing.T) *pty.Pty {
 func TestWSBridge_PtyCloseClosesWS(t *testing.T) {
 	p := openCatPty(t)
 	defer p.Close()
-	srv := httptest.NewServer(newBridgeHandler(p))
+	srv := httptest.NewServer(newBridgeHandler(p, func() {}))
 	defer srv.Close()
 
 	c := dialWS(t, "ws"+strings.TrimPrefix(srv.URL, "http")+"/ws")
@@ -74,7 +76,7 @@ func TestWSBridge_PtyCloseClosesWS(t *testing.T) {
 func TestWSBridge_WSDisconnectExitsBridge(t *testing.T) {
 	p := openCatPty(t)
 	defer p.Close()
-	srv := httptest.NewServer(newBridgeHandler(p))
+	srv := httptest.NewServer(newBridgeHandler(p, func() {}))
 	defer srv.Close()
 
 	c := dialWS(t, "ws"+strings.TrimPrefix(srv.URL, "http")+"/ws")
@@ -112,7 +114,7 @@ func TestWSBridge_Replace4009_OldConnCancelled(t *testing.T) {
 		defer reg.unregister(key, c)
 		// bridge 使用 bridgeCtx（新连接替换时由新连接的 oldCancel 取消）。
 		s := &Server{}
-		s.bridgeTerminal(bridgeCtx, c, p)
+		s.bridgeTerminal(bridgeCtx, c, p, func() {})
 	}))
 	defer srv.Close()
 
@@ -157,7 +159,7 @@ func TestWSBridge_CtxCancelExitsNoHang(t *testing.T) {
 			cancel()
 		}()
 		s := &Server{}
-		s.bridgeTerminal(ctx, c, p)
+		s.bridgeTerminal(ctx, c, p, func() {})
 	}))
 	defer srv.Close()
 
@@ -205,5 +207,128 @@ func TestHandleDeleteTask_ConfirmDirtyParamName(t *testing.T) {
 	req2 := httptest.NewRequest("DELETE", "/api/v1/tasks/t1?mode=normal&confirm_dirty=true", nil)
 	if got := req2.URL.Query().Get("confirmDirty"); got == "true" {
 		t.Error("confirm_dirty (snake_case) must not satisfy confirmDirty param (case-sensitive)")
+	}
+}
+
+// TestWSBridge_UserActivityOnInputFrames（idle-reminder-user-activity D3/任务 4.1）：
+// 非空 binary 帧与非空非 resize text 帧触发上报回调（接线与 handleWSTUI 一致：
+// RecordUserActivity(taskID)）；resize 控制帧与空帧不上报。
+//
+// 完成屏障：待测帧全部写完后追加一帧 END-MARK binary 帧，cat PTY 逐帧回显——
+// 客户端累计收到的输出中出现 END-MARK（标记可能被 PTY 输出缓冲拆分到多个消息，
+// pumpPTYToWS 按读结果独立转发、不保留输入帧边界）即证明 pumpWSToPTY（单 goroutine
+// 串行读帧）已处理完 END-MARK 之前的全部帧（含 resize/空帧），此后断言最终上报
+// 次数与顺序无并发窗口。
+func TestWSBridge_UserActivityOnInputFrames(t *testing.T) {
+	p := openCatPty(t)
+	tb := &fakeTaskBackend{}
+	s := &Server{tasks: tb}
+	handlerDone := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := acceptWS(w, r)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		defer close(handlerDone)
+		// 与 handleWSTUI 相同的回调接线（记录经 activityMu 保护）。
+		s.bridgeTerminal(r.Context(), c, p, func() {
+			s.tasks.RecordUserActivity(r.Context(), "t1")
+		})
+	}))
+	defer srv.Close()
+
+	var client *websocket.Conn
+	// 统一清理：关连接 → 有界等待 handler 退出 → 释放 PTY。任一步失败（含超时）
+	// 记录错误后继续剩余清理，保证断言失败路径不泄漏连接/PTY/handler goroutine。
+	t.Cleanup(func() {
+		if client != nil {
+			client.CloseNow()
+		}
+		select {
+		case <-handlerDone:
+		case <-time.After(3 * time.Second):
+			t.Error("bridge handler did not exit after WS close")
+		}
+		p.Close()
+	})
+
+	client = dialWS(t, "ws"+strings.TrimPrefix(srv.URL, "http")+"/ws")
+	client.SetReadLimit(wsMaxFrame)
+	ctx := context.Background()
+
+	mustWrite := func(typ websocket.MessageType, payload []byte) {
+		t.Helper()
+		if err := client.Write(ctx, typ, payload); err != nil {
+			t.Fatalf("write frame: %v", err)
+		}
+	}
+	mustWrite(websocket.MessageBinary, []byte("a"))                                // 非空 binary → 上报
+	mustWrite(websocket.MessageText, []byte("hello"))                              // 非空非 resize text → 上报
+	mustWrite(websocket.MessageText, []byte(`{"type":"resize","cols":90,"rows":28}`)) // resize → 不上报
+	mustWrite(websocket.MessageBinary, []byte{})                                   // 空帧 → 不上报
+	mustWrite(websocket.MessageText, []byte{})                                     // 空帧 → 不上报
+	// 屏障帧带换行（PTY canonical 行规程按行回显），cat 回显该帧。
+	mustWrite(websocket.MessageBinary, []byte("END-MARK\n"))
+
+	// 读回显，累计输出字节后搜索 END-MARK（输出帧边界不保留输入帧边界，
+	// 标记可能跨消息拆分）：标记完整出现即此前的 resize/空帧必然已被串行处理完毕。
+	readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	marker := []byte("END-MARK")
+	var echoBuf []byte
+	for {
+		_, payload, err := client.Read(readCtx)
+		if err != nil {
+			t.Fatalf("read echo before END-MARK (accumulated %q): %v", echoBuf, err)
+		}
+		echoBuf = append(echoBuf, payload...)
+		if bytes.Contains(echoBuf, marker) {
+			break
+		}
+	}
+
+	// 处理完成屏障已过：resize/两个空帧均已确认处理且不上报。上报恰为 3 次：
+	// 前两次来自被测输入帧（顺序确定 [t1 t1]），第 3 次来自屏障帧自身
+	//（非空 binary，同样计为输入）。
+	calls := tb.recordedActivityCalls()
+	if len(calls) != 3 || calls[0] != "t1" || calls[1] != "t1" || calls[2] != "t1" {
+		t.Fatalf("activity calls = %v, want [t1 t1 t1] (resize/empty frames must not report; third call is the barrier frame itself)", calls)
+	}
+}
+
+// TestPumpWSToPTY_ReportBeforePTYWriteFailure（DR2：识别点在 PTY 写入之前，写入失败
+// 不撤销已观察到的输入）：PTY 已关闭（写必败）时，非空 binary 帧仍先回调上报再退出。
+func TestPumpWSToPTY_ReportBeforePTYWriteFailure(t *testing.T) {
+	p := openCatPty(t)
+	p.Close() // 写路径必败（ptmx 已关闭）；无 pumpPTYToWS 侧取消，读方向不受影响
+
+	reports := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := acceptWS(w, r)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		pumpWSToPTY(r.Context(), c, p, func() {
+			select {
+			case reports <- struct{}{}:
+			default:
+			}
+		})
+	}))
+	defer srv.Close()
+
+	c := dialWS(t, "ws"+strings.TrimPrefix(srv.URL, "http")+"/ws")
+	defer c.CloseNow()
+	if err := c.Write(context.Background(), websocket.MessageBinary, []byte("x")); err != nil {
+		t.Fatalf("write frame: %v", err)
+	}
+
+	select {
+	case <-reports:
+		// 上报发生在 PTY 写失败之前，符合契约。
+	case <-time.After(3 * time.Second):
+		t.Fatal("input frame must report even when PTY write fails")
 	}
 }

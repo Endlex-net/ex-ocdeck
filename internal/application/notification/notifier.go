@@ -254,6 +254,16 @@ func (n *Notifier) handleEvent(ctx context.Context, ev ocdeckevent.Event) {
 		if p, ok := ev.Payload.(ocdeckevent.TaskDeletedPayload); ok && p.From == application.StatusActive {
 			delete(n.states, ev.RID) // 删除为终态：无条件清空
 		}
+	case ocdeckevent.TypeTaskUserActivity:
+		// idle-reminder-user-activity D2：用户主动操作取消该任务已武装的 idle 计时。
+		// 仅 lookup 既有状态（不创建状态、不读快照——无状态任务 no-op），只置空
+		// idleSince；retry/error 计时、episode、去重集合与抑制态一律不动。活动事件
+		// 仅按任务归属（无实例/周期标识），迟到事件可能取消处理时该任务当前已武装
+		// 的计时（已确认的串行消费顺序，不引入 fencing）。
+		taskID := ev.RID
+		if st, ok := n.states[taskID]; ok && st.idleSince != nil {
+			st.idleSince = nil
+		}
 	}
 }
 
