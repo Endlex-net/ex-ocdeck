@@ -520,11 +520,15 @@ func (s *Server) handleCloseTerminal(w http.ResponseWriter, r *http.Request) {
 // 非法 kind/mode 组合 fail-closed 不输出（toTaskDTO 返回错误）。
 // permission_mode 为任务级权限模式（task-permission-mode D7）：必有字段（非 omitempty），
 // 空值输出 ask、未知持久化值 fail-closed 不输出（toTaskDTO 返回错误）。
+// base_ref 为来源分支全限定 ref（workbench-base-ref-and-overflow D1）：必有字段（非
+// omitempty），toTaskDTO 纯透传落库值；非 worktree 任务与历史空值 worktree 任务为空串，
+// 空串为合法响应。
 type taskRowDTO struct {
 	ID             string          `json:"id"`
 	ProjectID      string          `json:"project_id"`
 	Name           string          `json:"name"`
 	Branch         string          `json:"branch"`
+	BaseRef        string          `json:"base_ref"`
 	Status         string          `json:"status"`
 	WorktreePath   string          `json:"worktree_path"`
 	LastPort       int             `json:"last_port,omitempty"`
@@ -619,7 +623,8 @@ type activeSessionDTO struct {
 // toTaskDTO 任务详情 DTO 纯映射（design.md §21）。mode 为必有字段：非法 kind/mode
 // 组合为持久化损坏，返回 internal ApiError fail-closed，调用方不得输出该 DTO（D7）。
 // permission_mode 为必有字段（task-permission-mode D7）：空值输出 ask（存量防御）、
-// 未知持久化值 fail-closed internal。
+// 未知持久化值 fail-closed internal。base_ref 纯透传落库值（workbench-base-ref-and-overflow
+// D1），不新增校验。
 func toTaskDTO(t application.TaskRow, projectKind string) (taskRowDTO, *ApiError) {
 	if !validTaskModeForKind(projectKind, t.Mode) {
 		return taskRowDTO{}, NewError(CodeInternal, fmt.Sprintf("task %s: invalid mode %q", t.ID, t.Mode))
@@ -629,7 +634,8 @@ func toTaskDTO(t application.TaskRow, projectKind string) (taskRowDTO, *ApiError
 		return taskRowDTO{}, ae
 	}
 	dto := taskRowDTO{
-		ID: t.ID, ProjectID: t.ProjectID, Name: t.Name, Branch: t.Branch, Status: t.Status,
+		ID: t.ID, ProjectID: t.ProjectID, Name: t.Name, Branch: t.Branch, BaseRef: t.BaseRef,
+		Status:       t.Status,
 		WorktreePath: t.WorktreePath, CreatedAt: t.CreatedAt, UpdatedAt: t.UpdatedAt,
 		ProjectKind: projectKind, Mode: t.Mode, PermissionMode: permissionMode,
 	}
