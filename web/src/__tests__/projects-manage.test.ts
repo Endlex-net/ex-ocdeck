@@ -117,6 +117,7 @@ function makeTask(id: string, status: string): Task {
     project_kind: 'repo',
     name: id,
     branch: 'main',
+    base_ref: '',
     status,
     worktree_path: '/tmp/x',
     mode: 'worktree',

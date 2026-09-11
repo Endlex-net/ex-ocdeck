@@ -50,6 +50,7 @@ function taskObj(id: string): Task {
     project_kind: 'repo',
     name: 't-' + id,
     branch: 'main',
+    base_ref: '',
     status: 'active',
     worktree_path: '/wt',
     mode: 'worktree',

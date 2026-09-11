@@ -107,6 +107,10 @@ export interface Task {
   project_kind: ProjectKind;
   name: string;
   branch: string;
+  /** 来源分支全限定 ref（必有，workbench-base-ref-and-overflow D1）：worktree 任务为落库
+   *  全限定 ref（refs/heads/... | refs/remotes/...），非 worktree 与历史空值为空串；
+   *  展示短名转换在前端（baseRefShortName）。旧服务端缺字段时按空串降级（`?? ''`）。 */
+  base_ref: string;
   status: string;
   worktree_path: string;
   /** 任务运行模式（必有）：worktree | local-path；任务行分支展示（isGitlessTask）与
