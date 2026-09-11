@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // ---- PromptAsync 分类（design.md D1 唯一四 Kind 规则） ----
@@ -127,8 +128,13 @@ func TestPromptAsync_TransportUnknown_DoError(t *testing.T) {
 
 func TestPromptAsync_TransportUnknown_CtxCancelled(t *testing.T) {
 	// 阻塞 handler：ctx 取消前 Do 不会返回，ctx 取消后 Do 返回错误 → transport_unknown。
+	// 兜底超时：CI 上「客户端断开 → server 端 r.Context().Done()」的传播存在时序窗口，
+	// 不兜底会让 defer srv.Close() 永久等待 handler（httptest 等待活跃连接）。
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-r.Context().Done()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+		}
 	}))
 	defer srv.Close()
 	c := newTestClient(t, srv, "pw")
