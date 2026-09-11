@@ -458,6 +458,9 @@ function toTask(m: MergedTask) {
     project_kind: m.project_kind,
     name: m.task.name,
     branch: m.task.branch,
+    // 列表摘要不透出/不展示来源分支（workbench-base-ref-and-overflow Non-Goals）；
+    // 适配 Task 形状缺省空串（同旧服务端缺字段降级语义）
+    base_ref: '',
     status: m.task.status,
     worktree_path: m.task.worktree_path,
     mode: m.task.mode,
@@ -799,8 +802,9 @@ function NewTaskPanel({
   const [baseRef, setBaseRef] = useState('');
   // 工作空间选择器（add-local-path-task-mode）：仅 repo 项目渲染，缺省 worktree。
   const [runMode, setRunMode] = useState<TaskMode>('worktree');
-  // 权限模式选择器（task-permission-mode D8）：全部项目类型渲染，缺省 ask。
-  const [permMode, setPermMode] = useState<TaskPermissionMode>('ask');
+  // 权限模式选择器（task-permission-mode D8 + workbench-base-ref-and-overflow D6）：
+  // 全部项目类型渲染，表单缺省 ai-auto（提交时显式携带；手选 ask 沿用省略字段、后端补 ask）。
+  const [permMode, setPermMode] = useState<TaskPermissionMode>('ai-auto');
   // D9 分支列表状态机：idle|loading|ready|error，与 lastSuccessfulBranches 正交。
   // 仅 ready 计算提交候选；loading/error 禁止提交；dir 项目无此状态机（恒 idle）。
   const [branchPhase, setBranchPhase] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
@@ -874,8 +878,9 @@ function NewTaskPanel({
     if (pid !== lastProjectIdRef.current) {
       lastProjectIdRef.current = pid;
       setRunMode('worktree');
-      // 权限模式重置规则与 runMode 逐字一致（task-permission-mode D8）：项目 ID 变更 → ask
-      setPermMode('ask');
+      // 权限模式重置规则与 runMode 逐字一致（task-permission-mode D8）：项目 ID 变更 → 缺省
+      // ai-auto（workbench-base-ref-and-overflow D6：表单缺省从 ask 改为 ai-auto）
+      setPermMode('ai-auto');
     }
     // 切换项目时重置刷新状态（与旧项目解耦，避免 B 永久处于刷新中，并释放旧刷新所有权）
     setRefreshing(false);
@@ -993,7 +998,9 @@ function NewTaskPanel({
     try {
       // local-path：携带 mode=local-path 且 MUST NOT 携带 base_ref（D6 presence 契约）；
       // worktree/dir 走既有三参调用（mode 缺省 = worktree 语义）。
-      // 权限模式（task-permission-mode D2/D8）：非缺省才传；缺省 ask 不携带 permission_mode 字段。
+      // 权限模式（task-permission-mode D2/D8 + workbench-base-ref-and-overflow D6）：
+      // 「非 API 缺省（ask）才传」惯例不变——表单缺省 ai-auto 时显式携带 permission_mode，
+      // 与后端「未提供 → ask」缺省语义解耦（后端契约不变）。
       const permArg = permMode === 'ask' ? undefined : permMode;
       const t = isLocalPath
         ? await api.createTask(proj.id, taskName.trim(), undefined, 'local-path', permArg)
@@ -1144,28 +1151,27 @@ function NewTaskPanel({
           </div>
         )}
 
-        {/* 权限模式（task-permission-mode D8）：三段 segmented control，工作空间控件同型，
-            缺省「人工批准」（ask）；全部项目类型渲染（dir 任务同样适用权限模式），
+        {/* 权限模式（task-permission-mode D8 + workbench-base-ref-and-overflow D6）：三段
+            segmented control，工作空间控件同型，表单缺省「AI 自动识别」（ai-auto——提交时
+            显式携带；手选 ask 沿用省略字段惯例、后端补 ask）。面板打开即渲染（含未选项目），
             创建后不可修改 */}
-        {selectedProject && (
-          <div className="od-field">
-            <label className="od-label" id={permGroupId}>权限模式</label>
-            <div className="cc-segment" role="radiogroup" aria-labelledby={permGroupId}>
-              {(['ask', 'all-approve', 'ai-auto'] as const).map((m) => (
-                <button
-                  key={m}
-                  type="button"
-                  role="radio"
-                  aria-checked={permMode === m}
-                  className={`cc-segment-item${permMode === m ? ' on' : ''}`}
-                  onClick={() => setPermMode(m)}
-                >
-                  {PERMISSION_MODE_LABELS[m]}
-                </button>
-              ))}
-            </div>
+        <div className="od-field">
+          <label className="od-label" id={permGroupId}>权限模式</label>
+          <div className="cc-segment" role="radiogroup" aria-labelledby={permGroupId}>
+            {(['ask', 'all-approve', 'ai-auto'] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                role="radio"
+                aria-checked={permMode === m}
+                className={`cc-segment-item${permMode === m ? ' on' : ''}`}
+                onClick={() => setPermMode(m)}
+              >
+                {PERMISSION_MODE_LABELS[m]}
+              </button>
+            ))}
           </div>
-        )}
+        </div>
 
         {/* 任务名（data-od-id 对齐 design new-task-name，供 palette-focus 语义） */}
         <div className="od-field">
