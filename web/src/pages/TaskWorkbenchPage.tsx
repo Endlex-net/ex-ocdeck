@@ -6,7 +6,9 @@ import { useMediaQuery, useProjects, useProjectsRefresh } from '../hooks';
 import { debugMark } from '../debug';
 import { subscribeTask } from '../sse';
 import { isGitlessTask, isTransitional, initActivateBlockReason, parseNotice, type Task } from '../types';
-import { shouldCloseOverflowOnBlur } from './workbench-overflow';
+import { shouldCloseOverflowOnBlur, visibleOverflowItems } from './workbench-overflow';
+import { baseRefShortName, currentBranchTooltip, sourceBranchTooltip } from './workbench-branch';
+import { writeTextToClipboard } from '../clipboard';
 import { StatusBadge } from '../components/StatusBadge';
 import { TaskActions } from '../components/TaskActions';
 import { DeleteTaskModal } from '../components/DeleteTaskModal';
@@ -25,11 +27,14 @@ import {
   requestTerminalFocus,
   subscribeTerminalFocus,
 } from '../terminal/focus-request';
-import { BranchIcon, CaretDownIcon, MoreIcon, WarnIcon, InfoIcon } from '../icons';
+import { BranchIcon, CaretDownIcon, MoreIcon, SourceRefIcon, WarnIcon, InfoIcon } from '../icons';
 
 const TUI_TAB = 'tui';
 const GIT_TAB = 'git';
 const SETTINGS_TAB = 'settings';
+
+/** 页头分支复制反馈时长（design D3 点击复制）：复用 .od-toast 2000ms 重显模式。 */
+const BRANCH_TOAST_MS = 2000;
 
 /** 页头「⋯」溢出菜单（design task-workbench.html wb-overflow）：删除等次级操作。
  *  桌面与窄屏同一入口；窄屏主操作图标化由 TaskActions compact 承担。
@@ -47,6 +52,9 @@ function WorkbenchOverflow({
   const [menuOpen, setMenuOpen] = useState(false);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  // 可见菜单项（design D4）：可见性仅由显示条件决定（visibleOverflowItems），
+  // 删除项禁用态（isTransitional）不参与入口显隐；顺序"日志→删除"。
+  const items = visibleOverflowItems(task.init_status, task.status);
 
   // disclosure 模式：打开后焦点进入菜单内首个可用项
   useEffect(() => {
@@ -55,11 +63,20 @@ function WorkbenchOverflow({
     }
   }, [menuOpen]);
 
+  // design D4：可见项由非空变为空（下方 return null）时 MUST 同时关闭展开状态；
+  // 后续恢复时仅显示关闭的触发器，不自动展开、不调用任何操作回调。
+  useEffect(() => {
+    if (items.length === 0) setMenuOpen(false);
+  }, [items.length]);
+
   // 关闭溢出菜单；键盘取消（Escape）/失焦兜底后焦点恢复触发器
   const closeMenu = (restoreFocus: boolean) => {
     setMenuOpen(false);
     if (restoreFocus) menuTriggerRef.current?.focus();
   };
+
+  // 空态（design D4）：无可见菜单项时整个入口不渲染（所有 hook 之后，同 OpenInEditorMenu）
+  if (items.length === 0) return null;
 
   return (
     <span
@@ -103,29 +120,31 @@ function WorkbenchOverflow({
               }
             }}
           >
-            {task.init_status === 'failed' && (
-              <button
-                className="overflow-item"
-                onClick={() => {
-                  setMenuOpen(false);
-                  onShowInitLog();
-                }}
-              >
-                查看 init 日志
-              </button>
-            )}
-            {/* 活跃态不出现删除（design D9） */}
-            {task.status !== 'active' && (
-              <button
-                className="overflow-item overflow-item-danger"
-                disabled={isTransitional(task.status)}
-                onClick={() => {
-                  setMenuOpen(false);
-                  onDelete();
-                }}
-              >
-                删除任务
-              </button>
+            {items.map((item) =>
+              item === 'init-log' ? (
+                <button
+                  key="init-log"
+                  className="overflow-item"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    onShowInitLog();
+                  }}
+                >
+                  查看 init 日志
+                </button>
+              ) : (
+                <button
+                  key="delete"
+                  className="overflow-item overflow-item-danger"
+                  disabled={isTransitional(task.status)}
+                  onClick={() => {
+                    setMenuOpen(false);
+                    onDelete();
+                  }}
+                >
+                  删除任务
+                </button>
+              ),
             )}
           </div>
         </>
@@ -260,6 +279,57 @@ export function TaskWorkbenchPage({
   const isGitless = task?.project_kind === 'dir';
   // 任务分支展示判定：dir 或 repo local-path 任务无分支概念（task.branch 恒空），页头/任务行分支名隐藏
   const isBranchless = !!task && isGitlessTask(task.project_kind, task.mode);
+
+  // local-path（repo 项目）页头当前分支（design D3）：任务详情就绪后经既有 api.gitStatus
+  // 一次性获取，按任务身份隔离、随 taskID 切换重新获取、不轮询。请求条件 MUST 为
+  // project_kind==='repo' && mode==='local-path'（MUST NOT 用 isGitlessTask 门控——
+  // 其同时覆盖 dir 与 local-path）；非 401 失败/空串静默降级不展示（不设置页面错误、
+  // 不自动重试），401 沿用共享 API 客户端的既有认证失效流程（客户端内清 token + 全局事件）。
+  const isLocalPathRepo = !!task && task.project_kind === 'repo' && task.mode === 'local-path';
+  const [localPathBranch, setLocalPathBranch] = useState('');
+  useEffect(() => {
+    setLocalPathBranch('');
+    if (!isLocalPathRepo) return;
+    let cancelled = false;
+    api.gitStatus(taskID).then(
+      (s) => {
+        if (!cancelled) setLocalPathBranch(s.branch ?? '');
+      },
+      () => {
+        /* 静默降级：本次页面停留期间不展示页头分支 */
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [taskID, isLocalPathRepo]);
+
+  // 页头分支名点击复制反馈（design D3）：复用 .od-toast（2000ms、clearTimeout 重显），
+  // 手动点击 MUST NOT 套用 takeToastSlot 节流；连续点击重置计时器重显，不排队不叠加。
+  const [branchToast, setBranchToast] = useState('');
+  const branchToastTimer = useRef<ReturnType<typeof setTimeout>>();
+  // 组件存活守卫（oracle I2）：卸载后迟到的复制回调不再 setState/创建定时器；
+  // 卸载时清掉在途 toast 计时器。
+  const aliveRef = useRef(true);
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      if (branchToastTimer.current !== undefined) clearTimeout(branchToastTimer.current);
+    };
+  }, []);
+  const showBranchToast = (msg: string) => {
+    if (!aliveRef.current) return;
+    setBranchToast(msg);
+    if (branchToastTimer.current !== undefined) clearTimeout(branchToastTimer.current);
+    branchToastTimer.current = setTimeout(() => setBranchToast(''), BRANCH_TOAST_MS);
+  };
+  const copyBranchName = (name: string) => {
+    void writeTextToClipboard(name).then(
+      () => showBranchToast(`已复制 ${name}`),
+      () => showBranchToast('复制失败，完整分支名见悬浮提示'),
+    );
+  };
   // dir 任务无 git 能力时若正停在 Git tab，回退到 TUI tab（repo local-path 不回退）
   useEffect(() => {
     if (isGitless && tab === GIT_TAB) setTab(TUI_TAB);
@@ -336,6 +406,8 @@ export function TaskWorkbenchPage({
   }
 
   const notices = parseNotice(task?.notice);
+  // 来源分支展示短名（design D2）：空串→空串；异常形态原样返回（baseRefShortName 契约）
+  const baseShort = baseRefShortName(task?.base_ref ?? '');
   const status = task?.status ?? '';
   // single-process（tasks 5.3）：原「TUI 可重开」标记语义改为「进程在不在」——
   // 任务 active 即任务进程在（TUI 与进程同体），非 active 即进程不在。
@@ -417,7 +489,59 @@ export function TaskWorkbenchPage({
         ) : (
           <span className="page-title">{task?.name ?? '…'}</span>
         )}
-        {task?.branch && !isBranchless && <span className="header-meta mono"><BranchIcon /> {task.branch}</span>}
+        {/* 页头分支区（两行布局 v3：上行当前 / 下行来源）：dir 整段不渲染；local-path
+            （repo 项目）展示文件系统当前分支（仅当前行；空串/获取失败静默降级不展示）；
+            worktree 保留 branch 非空外层条件（branch 为空整段不渲染，即使 base_ref 非空），
+            base_ref 非空时两行「上当前（提亮 --fg）/ 下来源（弱化 muted·0.7 + ↳ 静态图标）」，
+            空串仅当前行。10px meta 级，⎇ 图标对齐首行。
+            分支名 button 化点击复制（所见即所得；截断显示不影响复制完整名）；同名不去重。
+            tooltip 下沉到各 button（唯一模板集），容器 span 不挂 title。 */}
+        {task && isLocalPathRepo && localPathBranch !== '' && (
+          <span className="header-meta mono header-meta-branches">
+            <BranchIcon />
+            <span className="branch-rows">
+              <button
+                type="button"
+                className="branch-copy branch-copy-cur"
+                aria-label={`复制当前分支 ${localPathBranch}`}
+                title={currentBranchTooltip(localPathBranch)}
+                onClick={() => copyBranchName(localPathBranch)}
+              >
+                {localPathBranch}
+              </button>
+            </span>
+          </span>
+        )}
+        {task && !isBranchless && !!task.branch && (
+          <span className="header-meta mono header-meta-branches">
+            <BranchIcon />
+            <span className="branch-rows">
+              <button
+                type="button"
+                className="branch-copy branch-copy-cur"
+                aria-label={`复制当前分支 ${task.branch}`}
+                title={currentBranchTooltip(task.branch)}
+                onClick={() => copyBranchName(task.branch)}
+              >
+                {task.branch}
+              </button>
+              {baseShort !== '' && (
+                <span className="branch-src-row">
+                  <SourceRefIcon />
+                  <button
+                    type="button"
+                    className="branch-copy branch-copy-src"
+                    aria-label={`复制来源分支 ${baseShort}`}
+                    title={sourceBranchTooltip(baseShort, task.base_ref ?? '')}
+                    onClick={() => copyBranchName(baseShort)}
+                  >
+                    {baseShort}
+                  </button>
+                </span>
+              )}
+            </span>
+          </span>
+        )}
         {task && <StatusBadge status={task.status} />}
         {task && <InitStatusBadge task={task} />}
         {/* 权限模式只读展示（task-permission-mode D7）：与状态徽标同组，创建后不可修改 */}
@@ -649,6 +773,13 @@ export function TaskWorkbenchPage({
             navigate(resolveBackHref(from, task.project_id));
           }}
         />
+      )}
+
+      {/* 页头分支复制反馈（design D3）：.od-toast 固定底部居中；连续点击重显不节流 */}
+      {branchToast !== '' && (
+        <div className="od-toast mono" role="status">
+          {branchToast}
+        </div>
       )}
     </div>
   );

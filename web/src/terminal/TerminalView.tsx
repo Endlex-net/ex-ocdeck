@@ -27,6 +27,7 @@ import {
   loadClipboardPolicy,
   saveClipboardPolicy,
 } from './clipboard';
+import { writeTextToClipboard } from '../clipboard';
 import { debugMark } from '../debug';
 import { useMediaQuery } from '../hooks';
 import '@xterm/xterm/css/xterm.css';
@@ -66,33 +67,8 @@ function tuiTaskIDFromWsPath(wsPath: string): string | null {
   return rest === '' || rest.startsWith('shell/') ? null : rest;
 }
 
-/** 用户手势内复制：有 Clipboard API 走 writeText，否则 execCommand；失败则保留可选中文本。 */
-function writeTextToClipboard(text: string): Promise<void> {
-  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-    return navigator.clipboard.writeText(text);
-  }
-  return copyViaExecCommand(text);
-}
-
-function copyViaExecCommand(text: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.setAttribute('readonly', '');
-    ta.style.position = 'fixed';
-    ta.style.left = '-9999px';
-    document.body.appendChild(ta);
-    ta.select();
-    try {
-      if (document.execCommand('copy')) resolve();
-      else reject(new Error('copy failed'));
-    } catch (err) {
-      reject(err);
-    } finally {
-      ta.remove();
-    }
-  });
-}
+/** 用户手势内复制走共享 util（web/src/clipboard.ts，workbench-base-ref-and-overflow D5）：
+ *  有 Clipboard API 走 writeText，否则 execCommand；失败则保留可选中文本。 */
 
 export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
   const hostRef = useRef<HTMLDivElement>(null);

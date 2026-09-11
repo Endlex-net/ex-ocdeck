@@ -93,6 +93,7 @@ function makeTask(over: Partial<Task>): Task {
     project_kind: 'repo',
     name: 'demo-task',
     branch: '',
+    base_ref: '',
     status: 'active',
     worktree_path: '/tmp/wt',
     mode: 'worktree',

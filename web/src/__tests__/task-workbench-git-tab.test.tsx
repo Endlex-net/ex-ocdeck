@@ -8,8 +8,9 @@ import type { Project, Task } from '../types';
 
 /* ==================== 工作台 Git 能力判定（add-local-path-task-mode 6.2/D8 反向） ====================
  * 判定拆分：Git tab/面板入口仅按 project_kind==='dir' 隐藏——repo local-path 任务显示 Git tab
- * （已驻留不回退 TUI）；页头分支名按分支展示判定 isGitlessTask（kind+mode）隐藏——local-path
- * 任务即使异常携带非空 branch 也不展示（D3 落库恒空），实时分支由 GitPanel 内提供。 */
+ * （已驻留不回退 TUI）；workbench-base-ref-and-overflow D3 起，local-path 页头分支区改由
+ * api.gitStatus 当前分支驱动（本测试 mock 返回空串——降级形态下不展示，聚焦 Git 能力判定；
+ * task.branch 异常非空也不再成为页头数据源），非空分支展示见 task-workbench-header-branch.test.tsx。 */
 
 type TaskSubOpts = {
   onData: (t: Task) => void;
@@ -27,7 +28,11 @@ vi.mock('../sse', () => ({
 }));
 
 vi.mock('../api', () => ({
-  api: { listTerminals: vi.fn(async () => []) },
+  api: {
+    listTerminals: vi.fn(async () => []),
+    // 页头分支区数据源（workbench-base-ref-and-overflow D3）：空串 = 降级不展示
+    gitStatus: vi.fn(async () => ({ branch: '', files: [] })),
+  },
   ApiError: class ApiError extends Error {
     constructor(
       public code: string,
@@ -56,6 +61,7 @@ function makeTask(over: Partial<Task>): Task {
     project_kind: 'repo',
     name: 'demo-task',
     branch: 'ocdeck/demo',
+    base_ref: '',
     status: 'active',
     worktree_path: '/tmp/wt',
     mode: 'worktree',
@@ -92,7 +98,7 @@ describe('TaskWorkbenchPage Git 能力判定（add-local-path-task-mode 6.2）',
     unmount();
   });
 
-  it('repo local-path：Git tab 显示、页头不展示分支名（落库 branch 恒空，GitPanel 内实时分支）', () => {
+  it('repo local-path：Git tab 显示；页头分支区由 gitStatus 驱动（空串降级不展示）', () => {
     const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
     // 现实帧：branch 恒为空（D3）
     act(() => taskSub!.onData(makeTask({ mode: 'local-path', branch: '' })));
@@ -100,7 +106,7 @@ describe('TaskWorkbenchPage Git 能力判定（add-local-path-task-mode 6.2）',
     expect(container.querySelector('.header-meta')).toBeNull();
     expect(activeTab(container)!.textContent).toBe('终端');
 
-    // 防御：异常携带非空 branch 时页头仍隐藏（分支展示按 isGitlessTask），Git tab 不受影响
+    // 防御：异常携带非空 branch 时页头仍不以其为数据源（按 kind+mode 判定），Git tab 不受影响
     act(() => taskSub!.onData(makeTask({ mode: 'local-path', branch: 'ocdeck/demo' })));
     expect(container.querySelector('.header-meta')).toBeNull();
     expect(gitTab(container)).not.toBeUndefined();

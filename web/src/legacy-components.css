@@ -241,12 +241,101 @@ select.input {
   font-size: 14px;
 }
 
+/* 工作台页头标题全宽度档可收缩截断（oracle I9）：分支区容器有宽度下限后，页头空间不足
+   由标题收缩吸收（既有 ≤767px 规则同款处理提升到全断点），不产生横向溢出。 */
+.workbench .page-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .header-meta {
   color: var(--muted);
   font-size: 11px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 页头分支区专用布局（两行 v3：上行当前 / 下行来源）：inline-flex 行容器 + 列方向两行——
+   上行当前分支（提亮 --fg）、下行来源分支（弱化 muted·0.7，前缀 ↳ 静态图标表达"派生自"）；
+   ⎇ 图标对齐首行（当前分支 = "我在哪"第一诉求）。字号 10px（比页头 meta 11px 再小一档），
+   两行总高与单行接近；页头 align-items:center 保持整体垂直平衡。间距由 column-gap/gap
+   盒模型呈现（flex 中空白文本节点会被折叠）。截断下沉到各按钮（min-width:6ch + ellipsis）；
+   容器解除外层裁切（overflow:visible），:focus-visible 焦点环不被裁掉。容器宽度下限 =
+   图标 1em + 间距 + 按钮 6ch ≈ 10ch；页头空间不足由 .workbench .page-title 收缩吸收。 */
+.header-meta-branches {
+  display: inline-flex;
+  align-items: flex-start;
+  overflow: visible;
+  column-gap: 0.6ch;
+  min-width: 10ch;
+  font-size: 10px;
+  line-height: 1.4;
+}
+.header-meta-branches svg {
+  flex: none;
+}
+/* ⎇ 图标光学对齐首行文本中线（10px 字形 vs 14px 行盒） */
+.header-meta-branches > svg {
+  margin-top: 0.2em;
+}
+/* 两行容器：列方向堆叠（上当前 / 下来源），行宽随内容（flex-start），容器内允许收缩截断 */
+.header-meta-branches .branch-rows {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+}
+/* 来源行：↳ 静态图标 + 分支名按钮（图标不可点击，点击复制只作用于分支名 button）；
+   字号再降一档（9px，上行当前 10px）——层级进一步增强（小+弱化 vs 大+提亮）；
+   ↳ 图标 1em 随字号自适应缩放。按钮 min-width:6ch 的 ch 随字号缩小（≈32px），
+   meta 级元素命中区域可接受（试验迭代，浏览器复核）。 */
+.header-meta-branches .branch-src-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4ch;
+  min-width: 0;
+  max-width: 100%;
+  font-size: 9px;
+}
+
+/* 页头分支名复制按钮（workbench-base-ref-and-overflow D3）：视觉归零——透明背景、
+   无边框、padding 0，继承 .header-meta 的 11px mono 与颜色层级，渲染与纯展示文本无差别；
+   可点性信号 = cursor:copy + hover 提亮一档 + underline dotted（不新增图标）；
+   :focus-visible 焦点环由全局规则保留（此处不移除 outline）。 */
+.header-meta .branch-copy {
+  appearance: none;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  cursor: copy;
+  /* 两行内独立截断（min-width 下限 + 行宽上限 + ellipsis） */
+  min-width: 6ch;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.header-meta .branch-copy:hover {
+  color: var(--fg);
+  text-decoration: underline dotted;
+}
+/* 来源分支弱化一档（muted 基础上 opacity≈0.7）；hover 提亮恢复。 */
+.header-meta .branch-copy-src {
+  opacity: 0.7;
+}
+.header-meta .branch-copy-src:hover {
+  opacity: 1;
+}
+/* 当前分支 = "我在哪"第一诉求（视觉 polish）：提亮到正文色 --fg，与弱化来源（muted·0.7）
+   形成一眼可辨的层级对比；字重字号不变，保持 meta 级克制。 */
+.header-meta .branch-copy-cur {
+  color: var(--fg);
 }
 
 .header-spacer {
