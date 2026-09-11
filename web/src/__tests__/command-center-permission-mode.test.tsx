@@ -8,11 +8,12 @@ import { emitPaletteFocus, __resetPaletteFocusForTest } from '../palette-focus';
 import { mount, flushUI, stubMatchMedia } from './cm-test-env';
 import type { Project } from '../types';
 
-/* ==================== 新建任务面板权限模式（task-permission-mode tasks 5.2） ====================
- * 覆盖 spec「Web 新建任务权限模式选择」三个 scenario 与 design D8：
- * - 表单缺省 ask（三段 segmented control，工作空间控件同型，缺省选中「人工批准」）；
- * - 选择 all-approve / ai-auto 提交 → createTask 第 5 参透传；缺省 ask 不传（presence）；
- * - 重置规则与 runMode 逐字一致：项目 ID 变更（切换/清除/切到 dir）→ ask；同项目信号保持。 */
+/* ==================== 新建任务面板权限模式（task-permission-mode 5.2 + workbench-base-ref-and-overflow D6） ====================
+ * 覆盖 spec「Web 新建任务权限模式选择（缺省 AI 自动识别）」三个 scenario 与 design D8/D6：
+ * - 表单缺省 ai-auto（三段 segmented control，工作空间控件同型，缺省选中「AI 自动识别」）；
+ *   缺省提交显式携带 permission_mode: 'ai-auto'（与后端「未提供 → ask」缺省解耦，API 契约不变）；
+ * - 选择 all-approve 提交 → createTask 第 5 参透传；改选 ask 按既有惯例不携带（presence）；
+ * - 重置规则与 runMode 逐字一致：项目 ID 变更（切换/清除/切到 dir）→ ai-auto；同项目信号保持。 */
 
 type SessionsSubOpts = {
   onData: (items: never[]) => void;
@@ -166,7 +167,21 @@ function renderPage(ui: React.ReactElement = <CommandCenterPage />) {
 }
 
 describe('新建任务面板权限模式三档（task-permission-mode 5.2）', () => {
-  it('表单缺省 ask：三段选择器渲染、缺省选中「人工批准」，提交不携带 permission_mode（presence）', async () => {
+  // oracle I12：独立保护初始 state——先选项目的用例会被项目重置 effect 掩盖初始 state 错误；
+  // 本用例在未选项目时直接观察（控件面板打开即渲染，不经项目重置路径）
+  it('不带项目 payload 打开面板、尚未选项目：权限模式已缺省选中 ai-auto（初始 state）', async () => {
+    const { container } = renderPage();
+    act(() => {
+      emitPaletteFocus('new-task-name');
+    });
+    await flushUI();
+
+    expect(permRadio(container, 'AI 自动识别').getAttribute('aria-checked')).toBe('true');
+    expect(permRadio(container, '人工批准').getAttribute('aria-checked')).toBe('false');
+    expect(permRadio(container, '全部批准').getAttribute('aria-checked')).toBe('false');
+  });
+
+  it('表单缺省 ai-auto：三段选择器渲染、缺省选中「AI 自动识别」，提交显式携带 permission_mode: ai-auto', async () => {
     const { container } = renderPage();
     await openWithProject('ocdeck', 'p1');
 
@@ -174,14 +189,14 @@ describe('新建任务面板权限模式三档（task-permission-mode 5.2）', (
     expect(permRadio(container, '人工批准')).not.toBeNull();
     expect(permRadio(container, '全部批准')).not.toBeNull();
     expect(permRadio(container, 'AI 自动识别')).not.toBeNull();
-    // 缺省选中 ask
-    expect(permRadio(container, '人工批准').getAttribute('aria-checked')).toBe('true');
+    // 缺省选中 ai-auto（workbench-base-ref-and-overflow D6）
+    expect(permRadio(container, 'AI 自动识别').getAttribute('aria-checked')).toBe('true');
+    expect(permRadio(container, '人工批准').getAttribute('aria-checked')).toBe('false');
     expect(permRadio(container, '全部批准').getAttribute('aria-checked')).toBe('false');
-    expect(permRadio(container, 'AI 自动识别').getAttribute('aria-checked')).toBe('false');
 
     await fillTaskAndSubmit(container);
-    // 缺省 ask 不传：第 5 参为 undefined（api 层缺省不携带 permission_mode 字段）
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, undefined);
+    // 缺省 ai-auto 显式携带：第 5 参为 'ai-auto'（与后端「未提供 → ask」缺省解耦）
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto');
   });
 
   it('选择「全部批准」提交 → 第 5 参透传 all-approve', async () => {
@@ -223,21 +238,21 @@ describe('新建任务面板权限模式三档（task-permission-mode 5.2）', (
     expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, undefined);
   });
 
-  it('dir 项目同样渲染权限模式控件并可透传选择', async () => {
+  it('dir 项目同样渲染权限模式控件并可透传选择（非缺省值）', async () => {
     storeProjects = [proj('d1', 'plain', { kind: 'dir' })];
     const { container } = renderPage();
     await openWithProject('plain', 'd1');
 
     expect(permGroup(container)).not.toBeNull();
-    await clickPerm(container, 'AI 自动识别');
+    await clickPerm(container, '全部批准');
 
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('d1', 'task-a', undefined, undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('d1', 'task-a', undefined, undefined, 'all-approve');
   });
 });
 
-describe('权限模式选择器重置规则（与 runMode 逐字一致，task-permission-mode D8）', () => {
-  it('项目 ID 变更（切换项目/切到 dir/清除选择）重置为「人工批准」', async () => {
+describe('权限模式选择器重置规则（与 runMode 逐字一致，task-permission-mode D8 + D6 缺省 ai-auto）', () => {
+  it('项目 ID 变更（切换项目/切到 dir/清除选择）重置为「AI 自动识别」', async () => {
     storeProjects = [proj('p1', 'ocdeck'), proj('p2', 'other'), proj('d1', 'plain', { kind: 'dir' })];
     const { container } = renderPage();
     await openWithProject('ocdeck', 'p1');
@@ -246,38 +261,43 @@ describe('权限模式选择器重置规则（与 runMode 逐字一致，task-pe
 
     // ① 切换项目：p1 → p2（repo → repo）
     await openWithProject('other', 'p2');
-    expect(permRadio(container, '人工批准').getAttribute('aria-checked')).toBe('true');
+    expect(permRadio(container, 'AI 自动识别').getAttribute('aria-checked')).toBe('true');
     expect(permRadio(container, '全部批准').getAttribute('aria-checked')).toBe('false');
 
     // ② repo → dir：权限模式随项目 ID 变更重置；切回 repo 后验证未继承此前选择
-    await clickPerm(container, 'AI 自动识别');
+    await clickPerm(container, '人工批准');
     await openWithProject('plain', 'd1');
-    expect(permRadio(container, '人工批准').getAttribute('aria-checked')).toBe('true');
+    expect(permRadio(container, 'AI 自动识别').getAttribute('aria-checked')).toBe('true');
     await openWithProject('other', 'p2');
-    expect(permRadio(container, '人工批准').getAttribute('aria-checked')).toBe('true');
+    expect(permRadio(container, 'AI 自动识别').getAttribute('aria-checked')).toBe('true');
 
-    // ③ 清除项目选择（偏离已选输入）→ 重选另一 repo：仍缺省 ask
+    // ③ 清除项目选择（偏离已选输入）→ flush 后、重选之前立即断言已重置为 ai-auto
+    // （oracle I12：独立保护"清除时重置"，不被后续重选的再次重置掩盖）
     await clickPerm(container, '全部批准');
     await act(async () => {
       setInput(projectInput(container), 'deviate');
     });
     await flushUI();
+    expect(permRadio(container, 'AI 自动识别').getAttribute('aria-checked')).toBe('true');
+    expect(permRadio(container, '全部批准').getAttribute('aria-checked')).toBe('false');
+
+    // 重选另一 repo：仍为缺省 ai-auto
     await openWithProject('ocdeck', 'p1');
-    expect(permRadio(container, '人工批准').getAttribute('aria-checked')).toBe('true');
+    expect(permRadio(container, 'AI 自动识别').getAttribute('aria-checked')).toBe('true');
     expect(permRadio(container, '全部批准').getAttribute('aria-checked')).toBe('false');
   });
 
   it('不改变项目的信号保持选择：无 payload new（keep）不重置权限模式', async () => {
     const { container } = renderPage();
     await openWithProject('ocdeck', 'p1');
-    await clickPerm(container, 'AI 自动识别');
+    await clickPerm(container, '全部批准');
 
     act(() => {
       emitPaletteFocus('new-task-name');
     });
     await flushUI();
 
-    expect(permRadio(container, 'AI 自动识别').getAttribute('aria-checked')).toBe('true');
-    expect(permRadio(container, '人工批准').getAttribute('aria-checked')).toBe('false');
+    expect(permRadio(container, '全部批准').getAttribute('aria-checked')).toBe('true');
+    expect(permRadio(container, 'AI 自动识别').getAttribute('aria-checked')).toBe('false');
   });
 });

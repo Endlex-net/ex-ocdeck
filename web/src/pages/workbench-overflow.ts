@@ -14,3 +14,17 @@ export function shouldCloseOverflowOnBlur(
 ): boolean {
   return next !== null && !contains(next);
 }
+
+/** 溢出菜单可见项标识（design D4）。 */
+export type WorkbenchOverflowItem = 'init-log' | 'delete';
+
+/** 溢出菜单可见项计算（design D4/D5）：可见性仅由显示条件决定——init 日志项仅
+ *  init_status==='failed' 时可见，删除项仅 status!=='active' 时可见（活跃态不出现删除，
+ *  design D9）；顺序保持"日志→删除"。删除项的禁用状态（isTransitional）不参与可见性。
+ *  列表为空时整个 .header-overflow 入口不渲染（组件层 return null）。 */
+export function visibleOverflowItems(initStatus: string, status: string): WorkbenchOverflowItem[] {
+  const items: WorkbenchOverflowItem[] = [];
+  if (initStatus === 'failed') items.push('init-log');
+  if (status !== 'active') items.push('delete');
+  return items;
+}

@@ -143,6 +143,16 @@ export function BranchIcon(props: IconProps) {
   );
 }
 
+/** 派生自 ↳（workbench 页头来源分支行前缀）：拐角引出箭头，表达"从…分出"，静态不可点击。 */
+export function SourceRefIcon(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M5 4v7a5 5 0 0 0 5 5h8" />
+      <path d="M14 12l4 4-4 4" />
+    </Svg>
+  );
+}
+
 /** 主题-暗色（月亮） */
 export function MoonIcon(props: IconProps) {
   return (

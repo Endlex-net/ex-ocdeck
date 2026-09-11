@@ -54,6 +54,7 @@ function makeTask(permission_mode: TaskPermissionMode): Task {
     project_kind: 'repo',
     name: 'demo-task',
     branch: 'main',
+    base_ref: '',
     status: 'active',
     worktree_path: '/tmp/wt',
     mode: 'worktree',

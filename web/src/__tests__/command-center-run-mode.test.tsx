@@ -203,8 +203,8 @@ describe('新建任务面板工作空间三态（add-local-path-task-mode 5.7）
 
     vi.mocked(api.listBranches).mockResolvedValue(['main']);
     await fillTaskAndSubmit(container);
-    // 五参调用：mode/permission_mode 字段均缺席（presence 契约，缺省语义不携带）
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, undefined);
+    // 五参调用：mode 缺席（presence 契约）；权限模式表单缺省 ai-auto → 显式携带（D6）
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto');
     expect(vi.mocked(api.createTask).mock.calls[0]).toHaveLength(5);
   });
 
@@ -231,8 +231,8 @@ describe('新建任务面板工作空间三态（add-local-path-task-mode 5.7）
 
     vi.mocked(api.createTask).mockResolvedValue({ id: 't1' } as never);
     await fillTaskAndSubmit(container);
-    // 携带 mode=local-path 且 MUST NOT 携带 base_ref（permission_mode 缺省不携带）
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', undefined, 'local-path', undefined);
+    // 携带 mode=local-path 且 MUST NOT 携带 base_ref（权限模式表单缺省 ai-auto → 显式携带，D6）
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', undefined, 'local-path', 'ai-auto');
   });
 
   it('local-path 绕过 ready 门禁：分支列表在途（loading）仍可提交', async () => {
@@ -260,7 +260,7 @@ describe('新建任务面板工作空间三态（add-local-path-task-mode 5.7）
     expect(submitBtn(container).disabled).toBe(false);
     vi.mocked(api.createTask).mockResolvedValue({ id: 't1' } as never);
     await dispatchSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', undefined, 'local-path', undefined);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', undefined, 'local-path', 'ai-auto');
 
     // 在途请求最终完成不破坏断言（防未处理 rejection/泄漏）
     await act(async () => {
@@ -284,7 +284,7 @@ describe('新建任务面板工作空间三态（add-local-path-task-mode 5.7）
 
     vi.mocked(api.createTask).mockResolvedValue({ id: 't1' } as never);
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('d1', 'task-a', undefined, undefined, undefined);
+    expect(api.createTask).toHaveBeenCalledWith('d1', 'task-a', undefined, undefined, 'ai-auto');
     expect(vi.mocked(api.createTask).mock.calls[0]).toHaveLength(5);
   });
 });
@@ -357,7 +357,7 @@ describe('选择器状态重置规则（add-local-path-task-mode 5.7）', () => 
 
     // 保留的已选分支仍驱动提交（base_ref = 过滤排序首项 = develop）
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'develop', undefined, undefined);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'develop', undefined, 'ai-auto');
   });
 
   it('不改变项目的信号保持 mode：无 payload new（keep）不重置 local 选择', async () => {
