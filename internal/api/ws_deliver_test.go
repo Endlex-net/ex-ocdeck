@@ -461,6 +461,12 @@ func TestWSDeliver_SuccessReceiptOnBoundedQueue(t *testing.T) {
 	defer p.Close()
 	fake := &fakeDeliverOrch{}
 	s := newDeliverTestServer(fake, time.Second)
+	// 本用例是唯一走真实 (*pty.Pty).WriteTimeout 的 deliver 用例：注入写期限必须大于
+	// pty.WriteTimeout 的原生 deadline 预留（writeAbortGrace=500ms），否则原生写
+	// deadline 落在过去、写立即以 i/o timeout 失败（Linux CI write_failed 0.00s 的
+	// 根因：Linux ptmx 经 os.OpenFile 创建、受 runtime poller 管理，deadline 生效；
+	// darwin ptmx 不受 poller 管理、SetWriteDeadline 被静默忽略，会掩盖该配置错误）。
+	s.deliverWriteDeadline = 2 * time.Second
 	url, done := startDeliverBridge(t, s, p, "t1")
 	defer awaitHandlerDone(t, done, 3*time.Second)
 
@@ -476,13 +482,14 @@ func TestWSDeliver_SuccessReceiptOnBoundedQueue(t *testing.T) {
 		t.Fatalf("write deliver: %v", err)
 	}
 
-	// 回执帧形状逐字符合同（成功无 error 字段）。
+	// 回执帧形状逐字符合同（成功无 error 字段）；失败输出附最近一次注入错误，
+	// 避免 receipt 断言先 fatal 掩盖真实写入失败原因。
 	wantReceipt := fmt.Sprintf(`{"type":"deliver_result","uploadId":%q,"ok":true}`, testUploadID)
 	w.readFramesUntil(3*time.Second, func(typ websocket.MessageType, payload []byte) bool {
 		return typ == websocket.MessageText && strings.Contains(string(payload), "deliver_result")
 	})
 	if !w.hasTextFrame(wantReceipt) {
-		t.Fatalf("receipt %v, want exact frame %q", w.textFrames(), wantReceipt)
+		t.Fatalf("receipt %v, want exact frame %q (last inject err = %v)", w.textFrames(), wantReceipt, fake.lastInjectErr())
 	}
 
 	// 编排调用绑定 (taskID, connId, uploadId)。

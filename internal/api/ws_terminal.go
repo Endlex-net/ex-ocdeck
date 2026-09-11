@@ -447,7 +447,13 @@ func (s *Server) deliverFrameHandler(connCtx context.Context, queue chan<- wsOut
 			return false
 		}
 		inject := func(ctx context.Context) error {
-			return s.injectDeliverPaste(ctx, p)
+			// 注入失败即编排层 write_failed 的唯一来源：记录真实错误详情，
+			// 避免回执仅报 code 时丢失底层失败原因（deadline/取消/EIO 等）。
+			err := s.injectDeliverPaste(ctx, p)
+			if err != nil {
+				log.Printf("ws: deliver %s inject failed: %v", uploadID, err)
+			}
+			return err
 		}
 		ok, code := s.deliverOrch.Deliver(connCtx, scope.taskID, scope.connID, uploadID, inject)
 		if ok {
