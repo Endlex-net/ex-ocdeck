@@ -37,6 +37,21 @@ import type {
 const TOKEN_KEY = 'ocdeck.token';
 export const UNAUTHORIZED_EVENT = 'ocdeck:unauthorized';
 
+/** 上传接口 404 固定提示（terminal-file-paste-drop：业务 404——任务已删除——与旧 server
+ *  无该路由不可区分，前端按此固定文案反馈，仅终止当前上传项、不永久降级）。 */
+export const UPLOAD_TARGET_UNAVAILABLE_MESSAGE = '上传目标不可用，任务可能已删除或服务端不支持该接口';
+
+/** 文件读取失效类别（FileReader/FormData 读取路径的 DOMException 名）：
+ *  size 可访问不代表读取路径可用，这类失败重试同样读取无效，须重新选择文件。
+ *  uploadAttachment 的 fetch 包装据此保留原始错误（不吞成普通网络错误），
+ *  文件投递状态机据此转入"重新选择文件"重试路径。 */
+const FILE_READ_ERROR_NAMES = new Set(['NotAllowedError', 'NotFoundError', 'NotReadableError', 'SecurityError']);
+
+export function isFileReadFailure(err: unknown): boolean {
+  const name = (err as { name?: unknown } | null)?.name;
+  return typeof name === 'string' && FILE_READ_ERROR_NAMES.has(name);
+}
+
 export function getToken(): string {
   return localStorage.getItem(TOKEN_KEY) ?? '';
 }
@@ -206,6 +221,55 @@ export const api = {
   createTerminal: (taskID: string) =>
     request<TerminalInfo>('POST', `/tasks/${taskID}/terminals`),
   closeTerminal: (tid: string) => request<void>('DELETE', `/terminals/${tid}`),
+
+  /** 文件上传（terminal-file-paste-drop D1）：multipart FormData 顺序固定——
+   *  首 part MUST 为 connId 文本字段，随后唯一 file part；不手动设置 Content-Type
+   *  （multipart boundary 由浏览器生成）。201 返回服务端签发的 32hex uploadId。 */
+  uploadAttachment: async (taskID: string, file: File, connId: string): Promise<{ uploadId: string }> => {
+    const form = new FormData();
+    form.append('connId', connId); // 顺序契约：先 connId 后 file
+    form.append('file', file);
+    let res: Response;
+    try {
+      res = await fetch(`/api/v1/tasks/${taskID}/attachments`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${getToken()}` },
+        body: form,
+      });
+    } catch (err) {
+      // FormData 序列化时才真正读取 File：文件读取失效（如原 File 已失效的
+      // NotReadableError）在此以 fetch 拒绝浮出——原样上抛保留 name，供投递
+      // 状态机转入"重新选择文件"路径；其余拒绝归普通网络错误。
+      if (isFileReadFailure(err)) throw err;
+      throw new ApiError(0, 'network_error', '无法连接服务端（ocdeck-server 未运行？）');
+    }
+    if (res.status === 401) {
+      clearToken();
+      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+      throw new ApiError(401, 'unauthorized', '认证失败，请重新输入 token');
+    }
+    const text = await res.text();
+    let data: unknown = undefined;
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        /* 非 JSON 响应 */
+      }
+    }
+    if (!res.ok) {
+      const errObj = (data as { error?: { code?: string; message?: string } } | undefined)?.error;
+      if (res.status === 404) {
+        throw new ApiError(404, errObj?.code ?? 'not_found', UPLOAD_TARGET_UNAVAILABLE_MESSAGE);
+      }
+      throw new ApiError(
+        res.status,
+        errObj?.code ?? 'unknown',
+        errObj?.message ?? `请求失败（HTTP ${res.status}）`,
+      );
+    }
+    return data as { uploadId: string };
+  },
 
   serverStatus: () => request<ServerStatus>('GET', '/server/status'),
 

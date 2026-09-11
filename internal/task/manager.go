@@ -301,6 +301,11 @@ type Manager struct {
 	// nil 时（测试构造未注入）两方法 no-op。
 	publish application.Publisher
 
+	// uploadCoordination 为 terminal-file-paste-drop 2.5 的 per-task 协调锁端口
+	//（design D5）：任务离开 active 的提交经 inUploadCoordination 在协调锁临界区内
+	// 执行，与上传提交/投递/清理串行化。nil 时（测试构造未注入）直接执行提交。
+	uploadCoordination UploadCoordination
+
 	// runnerCtx 是 InitRunner/pre-delete 脚本执行所用的独立 context（design.md §6.1）：
 	// 不复用 SetLifecycleCtx 的 signal ctx，仅 Shutdown 关 gate 后取消。
 	// runnerWG 登记全部 InitRunner 与 pre-delete 执行 goroutine，Shutdown 在关 gate 后
@@ -442,6 +447,11 @@ type Options struct {
 	// 注入后 RecordUserActivity/RecordShellUserActivity 发布 task.user_activity
 	//（生产 wiring 注入与 lifecycleSvc 同一个 bus）；nil 时 no-op。
 	Publish application.Publisher
+	// UploadCoordination 可选：per-task 协调锁端口（terminal-file-paste-drop 2.5，
+	// design D5）。注入后任务离开 active 的提交在协调锁临界区内执行，与上传提交/
+	// 投递/清理串行化；生产 wiring 注入 *appuploads.Coordination。nil 时提交直接
+	// 执行（测试未注入时行为不变）。
+	UploadCoordination UploadCoordination
 }
 
 // New 构造 Manager。OCFactory 为 nil 时用默认 opencode.Client 工厂。
@@ -461,6 +471,7 @@ func New(opts Options) *Manager {
 		taskRepo:                opts.TaskRepo,
 		lifecycle:               opts.Lifecycle,
 		publish:                 opts.Publish,
+		uploadCoordination:      opts.UploadCoordination,
 		runtimes:                make(map[string]*taskRuntime),
 		runtimeRegistry:         runtime.New(),
 		rand4Fn:                 rand4,

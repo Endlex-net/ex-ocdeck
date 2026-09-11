@@ -69,17 +69,17 @@ func TestWSClientRegistry_Replace4009(t *testing.T) {
 	c1, _ := net.Pipe()
 	defer c1.Close()
 	wsC1 := &websocket.Conn{} // 仅用于 key 标识，不实际使用
-	old, oldCancel, ctx1 := reg.register(key, wsC1)
-	if old != nil {
-		t.Fatal("first register should have no old conn")
+	old, oldGuard, oldCancel, ctx1 := reg.register(key, wsC1, &wsCloseGuard{}, "")
+	if old != nil || oldGuard != nil {
+		t.Fatal("first register should have no old conn/guard")
 	}
 	if oldCancel != nil {
 		t.Fatal("first register should have nil oldCancel")
 	}
 	wsC2 := &websocket.Conn{}
-	old2, old2Cancel, ctx2 := reg.register(key, wsC2)
-	if old2 != wsC1 {
-		t.Errorf("second register should return first conn as old")
+	old2, old2Guard, old2Cancel, ctx2 := reg.register(key, wsC2, &wsCloseGuard{}, "")
+	if old2 == nil || old2Guard == nil {
+		t.Fatal("second register should return first conn and its guard")
 	}
 	if old2Cancel == nil {
 		t.Fatal("second register should return non-nil oldCancel")
@@ -111,9 +111,9 @@ func TestWSClientRegistry_UnregisterMatch(t *testing.T) {
 	reg := newWSClientRegistry()
 	key := terminalKey("s1", true)
 	wsC1 := &websocket.Conn{}
-	reg.register(key, wsC1)
+	reg.register(key, wsC1, &wsCloseGuard{}, "")
 	wsC2 := &websocket.Conn{}
-	reg.register(key, wsC2) // wsC2 替换 wsC1
+	reg.register(key, wsC2, &wsCloseGuard{}, "") // wsC2 替换 wsC1
 	// 用旧 conn unregister 不应移除当前项。
 	reg.unregister(key, wsC1)
 	reg.mu.Lock()
@@ -184,7 +184,7 @@ func TestWSAuthHandshake_TokenValidation(t *testing.T) {
 	auth := NewTokenAuthenticator("secret-token")
 	s := &Server{auth: auth}
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := acceptWS(w, r)
+		c, _, err := acceptWS(w, r)
 		if err != nil {
 			return
 		}
@@ -247,7 +247,7 @@ func TestWSAuthHandshake_TokenValidation(t *testing.T) {
 // TestWSEcho_RoundTrip 验证 WS 二进制帧往返（基于 coder/websocket，验证 mask/FIN 由库处理）。
 func TestWSEcho_RoundTrip(t *testing.T) {
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := acceptWS(w, r)
+		c, _, err := acceptWS(w, r)
 		if err != nil {
 			return
 		}
@@ -293,7 +293,7 @@ func TestWSEcho_RoundTrip(t *testing.T) {
 // TestWSUpgrade_RejectBadHandshake 验证非 WebSocket 请求被拒（库内置校验）。
 func TestWSUpgrade_RejectBadHandshake(t *testing.T) {
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := acceptWS(w, r)
+		c, _, err := acceptWS(w, r)
 		if err != nil {
 			// 库会自行写 400 响应。
 			return
@@ -318,7 +318,7 @@ func TestWSUpgrade_RejectBadHandshake(t *testing.T) {
 // TestWSMask_LargePayload 验证大 payload（触发长度扩展 126/127 编码）mask 解码正确。
 func TestWSMask_LargePayload(t *testing.T) {
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := acceptWS(w, r)
+		c, _, err := acceptWS(w, r)
 		if err != nil {
 			return
 		}
@@ -356,7 +356,7 @@ func TestWSMask_LargePayload(t *testing.T) {
 // TestWSPingPong 验证 ping/pong 由库自动处理（不阻塞读循环）。
 func TestWSPingPong(t *testing.T) {
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := acceptWS(w, r)
+		c, _, err := acceptWS(w, r)
 		if err != nil {
 			return
 		}

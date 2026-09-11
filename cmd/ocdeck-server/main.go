@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -15,14 +16,19 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
 	"ocdeck/internal/api"
+	"ocdeck/internal/application"
 	"ocdeck/internal/application/diffreview"
 	appnotification "ocdeck/internal/application/notification"
 	apptask "ocdeck/internal/application/task"
+	appuploads "ocdeck/internal/application/uploads"
 	"ocdeck/internal/config"
+	"ocdeck/internal/domain/event"
+	ocdecktask "ocdeck/internal/domain/task"
 	"ocdeck/internal/infrastructure/ai"
 	"ocdeck/internal/infrastructure/auditlog"
 	"ocdeck/internal/infrastructure/eventbus"
@@ -32,6 +38,7 @@ import (
 	"ocdeck/internal/infrastructure/process"
 	sqlite "ocdeck/internal/infrastructure/sqlite"
 	"ocdeck/internal/infrastructure/store"
+	uploads "ocdeck/internal/infrastructure/uploads"
 	"ocdeck/internal/infrastructure/worktree"
 	"ocdeck/internal/task"
 )
@@ -160,19 +167,25 @@ func run() error {
 		Sessions: appAdapter,
 		Publish:  bus,
 	})
+	// terminal-file-paste-drop 2.4：受管上传编排器（存储 + 编排 + 事件订阅/清理器）。
+	// 构造先于 Manager：其 per-task 协调锁与 Manager 生命周期提交共享（2.5）。
+	// Conns 数据源（api WS 注册表）构造晚于此处，serveAndShutdown 中 setServer 回填。
+	uploadConns := &currentConnPort{}
+	uploadOrch := newUploadOrchestrator(cfg, appAdapter, bus, uploadConns)
 	tm := task.New(task.Options{
-		Cfg:             cfg,
-		Store:           adapter,
-		Proc:            task.NewProcessAdapter(procMgr),
-		Worktree:        task.NewWorktreeAdapter(wtMgr),
-		DebtStore:       adapter,         // R7：orphan tickets 持久化跨重启恢复（design.md §10）
-		LifecycleRunner: lifecycle.New(), // design.md §7.1：init/pre-delete 脚本与 inherit
-		LogDir:          cfg.DataDir + "/logs",
-		Namer:           namer,                              // ai-worktree-naming：Create 经 LLM 提炼分支 slug，未配置时内部回退 Slugify
-		PermissionJudge: permJudgeAdapter{inner: permJudge}, // task-permission-mode D5：ai-auto 权限请求自动判定
-		PermAuditLogger: permAudit,                          // task-permission-mode D11：ai-auto 判定审计日志（旁路）
-		Lifecycle:       lifecycleSvc,                       // P1.4.4：Get/List/Archive/Restore 委托
-		Publish:         bus,                                // idle-reminder-user-activity：用户活动上报经同一 bus 发布 task.user_activity
+		Cfg:                cfg,
+		Store:              adapter,
+		Proc:               task.NewProcessAdapter(procMgr),
+		Worktree:           task.NewWorktreeAdapter(wtMgr),
+		DebtStore:          adapter,         // R7：orphan tickets 持久化跨重启恢复（design.md §10）
+		LifecycleRunner:    lifecycle.New(), // design.md §7.1：init/pre-delete 脚本与 inherit
+		LogDir:             cfg.DataDir + "/logs",
+		Namer:              namer,                              // ai-worktree-naming：Create 经 LLM 提炼分支 slug，未配置时内部回退 Slugify
+		PermissionJudge:    permJudgeAdapter{inner: permJudge}, // task-permission-mode D5：ai-auto 权限请求自动判定
+		PermAuditLogger:    permAudit,                          // task-permission-mode D11：ai-auto 判定审计日志（旁路）
+		Lifecycle:          lifecycleSvc,                       // P1.4.4：Get/List/Archive/Restore 委托
+		Publish:            bus,                                // idle-reminder-user-activity：用户活动上报经同一 bus 发布 task.user_activity
+		UploadCoordination: uploadOrch.Coordination(),          // terminal-file-paste-drop 2.5：离开 active 的提交入协调锁
 	})
 	// 注入 Manager 生命周期 context（design.md §4：SSE/退出监视挂进程 ctx，非 HTTP request ctx）。
 	tm.SetLifecycleCtx(ctx)
@@ -203,18 +216,29 @@ func run() error {
 	// F12①：收敛→开放序列收口在 diffReviewStartupGate，run() 与 main_test.go 共用同一函数
 	//（测试断言的是生产编排的 fail-closed 语义，而非复制模拟编排）。
 	return diffReviewStartupGate(ctx, tm, func() error {
-		return serveAndShutdown(ctx, tm, cfg, db, bus, aiStore, wd, diffSvc)
+		return serveAndShutdown(ctx, tm, cfg, db, bus, aiStore, wd, diffSvc, uploadOrch, uploadConns)
 	})
 }
 
 // serveAndShutdown 执行收敛通过后的启动序列（design.md §5/§10）：
-// Reconcile（失败 fail-closed 拒绝开放 HTTP）→ 后台周期重试 → API 装配与阻塞服务 → 关停序列。
+// 上传编排启动（扫描/订阅/清理器）→ Reconcile（失败 fail-closed 拒绝开放 HTTP）→
+// 后台周期重试 → API 装配与阻塞服务 → 关停序列。
 // diffSvc 注入 API 层（diff-review-workbench D8 路由），须在 RebuildRoutes 前生效。
-func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config, db *store.DB, bus *eventbus.Bus, aiStore *ai.Store, wd *process.WatchdogManager, diffSvc *diffreview.Service) error {
+func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config, db *store.DB, bus *eventbus.Bus, aiStore *ai.Store, wd *process.WatchdogManager, diffSvc *diffreview.Service, uploadOrch *appuploads.Orchestrator, uploadConns *currentConnPort) error {
+	// 受管上传启动序列（terminal-file-paste-drop 2.4）：启动恢复扫描（失败记日志，
+	// 不阻断启动——遗留产物按孤儿规则由周期清理收敛）→ 订阅 task.deleted 与周期清理。
+	// 先扫描后订阅：订阅起点覆盖 Reconcile 期间的删除事件。Reconcile 失败提前返回时
+	// 同步 Stop（订阅不泄漏）。
+	if err := uploadOrch.StartupScan(ctx); err != nil {
+		log.Printf("warning: uploads startup scan: %v (deferred to periodic cleanup)", err)
+	}
+	uploadOrch.Start(ctx)
+
 	// 启动 reconciliation（design.md §5/§10，HTTP 就绪前完成对账）。
 	// Reconcile 失败 MUST 拒绝开放 HTTP（fail-closed）：状态不确定时开放管理面会让用户操作
 	// 建立在错误状态上（会话/DB 失同步，后续操作可能破坏数据安全边界）。
 	if err := tm.Reconcile(ctx); err != nil {
+		uploadOrch.Stop()
 		return fmt.Errorf("reconcile: %w", err)
 	}
 	// 后台周期重试（design.md §5：30s 消化 retryable notice）。
@@ -222,6 +246,17 @@ func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config,
 
 	srv := api.New(cfg, db)
 	srv.SetTaskBackend(tm)
+	// terminal-file-paste-drop：Conns 端口数据源回填（api WS 注册表）与投递编排注入
+	//（(bool, DeliverErrorCode) → api 窄接口 (bool, string)），须在 RebuildRoutes 前生效。
+	uploadConns.setServer(srv)
+	srv.SetDeliverOrchestrator(deliverOrchAdapter{inner: uploadOrch})
+	// terminal-file-paste-drop：TUI 连接替换提交接入同一把 per-task 协调锁（与投递
+	// 准入/finalize 临界区互斥，D5 原子边界；等待 4009 握手不持锁）。
+	srv.SetDeliverReplaceCoordination(uploadOrch.Coordination())
+	// terminal-file-paste-drop 3.2：上传编排与限额注入（handler 准入决策归编排层，
+	// 请求总量兜底 M+1MiB 的 M 与投递路径计算同源 cfg），须在 RebuildRoutes 前生效。
+	srv.SetUploadAdmission(uploadOrch)
+	srv.SetUploadLimits(cfg.UploadMaxBytes, cfg.UploadDir)
 	// P1.6.5：消费侧注入同一 bus（经 eventSubscriberAdapter 适配 api.EventSubscriber；
 	// SSE 端点消费在 Phase 2 建立），须在 RebuildRoutes 前生效。
 	srv.SetEventSubscriber(eventSubscriberAdapter{bus})
@@ -274,11 +309,12 @@ func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config,
 	}
 
 	return shutdownRuntime(shutdownRuntimeArgs{
-		notifier: notifier,
-		tm:       tm,
-		bgStop:   bgStop,
-		wd:       wd,
-		serveErr: serveErr,
+		notifier:   notifier,
+		tm:         tm,
+		bgStop:     bgStop,
+		uploadStop: uploadOrch.Stop, // terminal-file-paste-drop 2.4：订阅/清理器收尾
+		wd:         wd,
+		serveErr:   serveErr,
 	})
 }
 
@@ -291,11 +327,12 @@ type runtimeShutdowner interface {
 
 // shutdownRuntimeArgs 统一关停所需运行时句柄（G1：Listen 失败与 Serve 返回共用）。
 type shutdownRuntimeArgs struct {
-	notifier runtimeStopper
-	tm       runtimeShutdowner
-	bgStop   func()
-	wd       *process.WatchdogManager
-	serveErr error
+	notifier   runtimeStopper
+	tm         runtimeShutdowner
+	bgStop     func()
+	uploadStop func() // terminal-file-paste-drop 2.4：上传编排器订阅/清理器收尾
+	wd         *process.WatchdogManager
+	serveErr   error
 }
 
 func shutdownRuntime(a shutdownRuntimeArgs) error {
@@ -322,6 +359,11 @@ func shutdownRuntime(a shutdownRuntimeArgs) error {
 	}
 	if a.bgStop != nil {
 		a.bgStop()
+	}
+	// terminal-file-paste-drop 2.4：uploadStop 在 tm.Shutdown/bgStop 之后——
+	// 关停序列期间的 task.deleted 删除事件仍被消费回收，随后才关闭订阅。
+	if a.uploadStop != nil {
+		a.uploadStop()
 	}
 	wd := a.wd
 	if wd != nil {
@@ -385,6 +427,89 @@ func spawnWatchdog(cfg *config.Config) (*process.WatchdogManager, error) {
 	}
 	log.Printf("watchdog spawned (kill_immediate): socket=ocdeck tmpdir=%s", tmpdir)
 	return wd, nil
+}
+
+// newUploadOrchestrator 构造受管上传编排器（terminal-file-paste-drop 2.4）：
+// infrastructure 存储注入 StorePort，sqlite adapter 视图注入 TaskPort，bus 适配注入
+// task 事件订阅，currentConnPort 注入 Conns 端口（deliver ①连接当前性判定）。
+func newUploadOrchestrator(cfg *config.Config, repo application.TaskRepository, bus *eventbus.Bus, conns appuploads.ConnPort) *appuploads.Orchestrator {
+	return appuploads.New(appuploads.Options{
+		Cfg:    appuploads.Config{UploadDir: cfg.UploadDir, MaxBytes: cfg.UploadMaxBytes, Retention: cfg.UploadRetention},
+		Store:  uploads.NewStore(cfg.UploadDir),
+		Tasks:  uploadTaskViewPort{inner: repo},
+		Conns:  conns,
+		Events: uploadEventSubscriber{bus: bus},
+	})
+}
+
+// currentConnSource 是组合根侧对 api 当前 TUI 连接查询的窄视图
+// （*api.Server.CurrentTUIConnID 结构性满足；测试可注 fake）。
+type currentConnSource interface {
+	CurrentTUIConnID(taskID string) (string, bool)
+}
+
+// currentConnPort 将 api WS 注册表适配为 uploads.ConnPort。HTTP 服务构造晚于编排器，
+// setServer 回填数据源；回填前（监听前无任何上传/投递流量）按未注册处理。
+type currentConnPort struct {
+	mu  sync.RWMutex
+	src currentConnSource
+}
+
+func (p *currentConnPort) setServer(s currentConnSource) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.src = s
+}
+
+func (p *currentConnPort) CurrentTUIConn(ctx context.Context, taskID string) (string, bool, error) {
+	p.mu.RLock()
+	src := p.src
+	p.mu.RUnlock()
+	if src == nil {
+		return "", false, nil
+	}
+	connID, ok := src.CurrentTUIConnID(taskID)
+	return connID, ok, nil
+}
+
+// deliverOrchAdapter 将编排器 Deliver 的 (bool, DeliverErrorCode) 适配为 api 层
+// 窄接口的 (bool, string)（api 不依赖 application 的 Deliver 签名）。
+type deliverOrchAdapter struct {
+	inner *appuploads.Orchestrator
+}
+
+func (a deliverOrchAdapter) Deliver(ctx context.Context, taskID, connID, uploadID string, inject func(ctx context.Context) error) (bool, string) {
+	ok, code := a.inner.Deliver(ctx, taskID, connID, uploadID, inject)
+	return ok, string(code)
+}
+
+// uploadTaskViewPort 将 application.TaskRepository 适配为 uploads.TaskPort
+// （任务存在/活跃查询；sql.ErrNoRows 已被 adapter 归一化为 application.ErrTaskNotFound）。
+type uploadTaskViewPort struct {
+	inner application.TaskRepository
+}
+
+func (p uploadTaskViewPort) TaskActive(ctx context.Context, taskID string) (bool, bool, error) {
+	t, err := p.inner.GetTask(ctx, taskID)
+	if errors.Is(err, application.ErrTaskNotFound) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	// 任务状态准入表共享：仅 status==active 视为活跃。
+	return true, t.Status() == ocdecktask.StatusActive, nil
+}
+
+// uploadEventSubscriber 将 eventbus.Bus 适配为 uploads.EventSubscriber
+// （Bus.Subscribe 返回 *eventbus.Sub 具体类型，经接口适配，同 notification 模式；
+// *eventbus.Sub 的 C/Overflow/Close 结构性满足 uploads.EventSubscription）。
+type uploadEventSubscriber struct {
+	bus *eventbus.Bus
+}
+
+func (s uploadEventSubscriber) Subscribe(topic event.Topic) appuploads.EventSubscription {
+	return s.bus.Subscribe(topic)
 }
 
 // permJudgeAdapter 将 ai.PermJudge 适配为 task.PermissionJudge 端口

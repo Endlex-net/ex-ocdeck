@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { TermSession, type TermConnState } from './session';
 import {
+  createFileDeliveryController,
+  extractDropFiles,
+  extractPasteFiles,
+  type FileDeliveryController,
+  type FileDeliverySnapshot,
+} from './file-delivery';
+import { api } from '../api';
+import {
   clearTerminalFocus,
   isFocusRequestTargetAllowed,
   isTerminalFocusExpired,
@@ -23,6 +31,7 @@ import { debugMark } from '../debug';
 import { useMediaQuery } from '../hooks';
 import '@xterm/xterm/css/xterm.css';
 import './mobile.css';
+import './file-delivery.css'; // 文件投递 UI 视觉层（terminal-file-paste-drop 5.3 精修）
 import './fonts.css'; // Nerd Font 图标字形 @font-face（terminal-links-emoji-icons design D3）
 
 interface TerminalViewProps {
@@ -100,6 +109,13 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
   const clipSeq = useRef(0);
   const toastTimer = useRef<ReturnType<typeof setTimeout>>();
   const onClipboardWriteRef = useRef<(text: string) => void>(() => {});
+
+  // 文件投递（terminal-file-paste-drop 5.3）：仅 TUI 实例挂载；shell 终端不挂任何入口。
+  const fdRef = useRef<FileDeliveryController | null>(null);
+  const [fdSnapshot, setFdSnapshot] = useState<FileDeliverySnapshot | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const dragDepth = useRef(0);
+  const [dropHover, setDropHover] = useState(false);
 
   // 导航焦点请求（design D3，唯一消费方 = 目标任务 TUI TerminalView）：
   // shell 实例不订阅不消费；本地不持有请求状态，等待/取消期间的请求有效性
@@ -205,12 +221,90 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
       lockedRef.current = v;
       setLocked(v);
     });
+
+    // 文件投递（terminal-file-paste-drop 5.3）：仅 TUI 实例挂载 controller 与全部事件
+    // listener（paste capture/dragover/dragenter/dragleave/drop），shell 终端零注册零清理；
+    // 随终端实例生命周期挂载/清理。
+    let fd: FileDeliveryController | null = null;
+    let unsubFd: (() => void) | null = null;
+    let detachFileListeners: (() => void) | null = null;
+    if (tuiTaskID) {
+      fd = createFileDeliveryController({
+        taskID: tuiTaskID,
+        port: session,
+        upload: (taskID, file, connId) => api.uploadAttachment(taskID, file, connId),
+        openFilePicker: () => fileInputRef.current?.click(),
+      });
+      fdRef.current = fd;
+      unsubFd = fd.subscribe(() => setFdSnapshot(fd!.snapshot()));
+      setFdSnapshot(fd.snapshot());
+
+      // paste：终端容器 capture 阶段 listener（先于 xterm textarea）；纯文本不拦截，
+      // 确认含文件后同步 preventDefault + stopPropagation（D7）。
+      const onPaste = (e: Event) => {
+        const files = extractPasteFiles((e as ClipboardEvent).clipboardData);
+        if (files.length === 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        fd!.handleCapturedFiles(files);
+      };
+      // drop/dragover：阻止浏览器导航；dropEffect='copy'；dragenter/leave 计数防闪烁（D7）。
+      const onDragOver = (e: Event) => {
+        e.preventDefault();
+        const dt = (e as DragEvent).dataTransfer;
+        if (dt) dt.dropEffect = 'copy';
+      };
+      const onDragEnter = (e: Event) => {
+        e.preventDefault();
+        dragDepth.current += 1;
+        setDropHover(true);
+      };
+      const onDragLeave = () => {
+        dragDepth.current = Math.max(0, dragDepth.current - 1);
+        if (dragDepth.current === 0) setDropHover(false);
+      };
+      const onDrop = (e: Event) => {
+        e.preventDefault();
+        dragDepth.current = 0;
+        setDropHover(false);
+        const { files, directories } = extractDropFiles((e as DragEvent).dataTransfer);
+        if (files.length === 0 && directories.length === 0) return;
+        fd!.handleDroppedFiles(files, directories);
+      };
+      host.addEventListener('paste', onPaste, true);
+      host.addEventListener('dragover', onDragOver);
+      host.addEventListener('dragenter', onDragEnter);
+      host.addEventListener('dragleave', onDragLeave);
+      host.addEventListener('drop', onDrop);
+      detachFileListeners = () => {
+        host.removeEventListener('paste', onPaste, true);
+        host.removeEventListener('dragover', onDragOver);
+        host.removeEventListener('dragenter', onDragEnter);
+        host.removeEventListener('dragleave', onDragLeave);
+        host.removeEventListener('drop', onDrop);
+      };
+    }
+
     return () => {
       sessionRef.current = null;
       unsubLock();
+      detachFileListeners?.();
+      if (unsubFd) unsubFd();
+      fd?.dispose();
+      fdRef.current = null;
       session.dispose();
     };
   }, [wsPath, tryConsumeFocusRequest]);
+
+  // 文件选择器「取消」事件（input 的 cancel，React types 未覆盖）：解除绑定重试意图，
+  // 该项保持原状态（未知项所在共享队列保持暂停）。
+  useEffect(() => {
+    const input = fileInputRef.current;
+    if (!tuiTaskID || !input) return;
+    const onCancel = () => fdRef.current?.handlePickerResult(null);
+    input.addEventListener('cancel', onCancel);
+    return () => input.removeEventListener('cancel', onCancel);
+  }, [tuiTaskID]);
 
   // 焦点请求订阅（design D3）：挂载即可能同步交付 pending 快照（早于挂载的发布）；
   // 回调仅在已 connected 时立即按门禁消费，否则等待 onState('connected')。
@@ -302,9 +396,10 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
   };
 
   const showOverlay = state !== 'connected' && state !== 'idle';
+  const wrapClass = dropHover ? 'terminal-wrap terminal-drop-hover' : 'terminal-wrap';
 
   return (
-    <div className="terminal-wrap" ref={wrapRef}>
+    <div className={wrapClass} ref={wrapRef}>
       <div className="terminal-host" ref={hostRef} />
       {lockCap && (
         <button
@@ -377,6 +472,80 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
       {toastVisible && (
         <div className="od-toast" role="status">
           已复制
+        </div>
+      )}
+      {tuiTaskID && (
+        <div className="terminal-file-bar">
+          {/* 「选择文件」保持 DOM 首位（测试选择器钉死）；视觉锚定底角由
+              file-delivery.css 的 column-reverse 负责，浮层向上展开。 */}
+          <button
+            type="button"
+            className="terminal-file-pick"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            选择文件
+          </button>
+          {fdSnapshot && (fdSnapshot.items.length > 0 || fdSnapshot.notice) && (
+            <div className="terminal-file-panel" aria-live="polite">
+              {fdSnapshot.notice && <div className="terminal-file-notice">{fdSnapshot.notice}</div>}
+              {fdSnapshot.items.length > 0 && (
+                <>
+                  <div className="terminal-file-panel-title">
+                    文件投递
+                    {fdSnapshot.paused && (
+                      <span className="terminal-file-paused">（队列已暂停）</span>
+                    )}
+                  </div>
+                  <ul className="terminal-file-list">
+                    {fdSnapshot.items.map((it) => (
+                      <li key={it.id} className={`terminal-file-item terminal-file-item-${it.status}`}>
+                        <div className="terminal-file-row">
+                          <span className="terminal-file-name" title={it.name}>
+                            {it.name}
+                          </span>
+                          <span className={`terminal-file-status terminal-file-status-${it.status}`}>
+                            <span className="terminal-file-dot" aria-hidden />
+                            {it.label}
+                          </span>
+                          {it.canRetry && (
+                            <button
+                              type="button"
+                              className="terminal-file-retry"
+                              disabled={
+                                fdSnapshot.pickerPendingItem !== null &&
+                                fdSnapshot.pickerPendingItem !== it.id
+                              }
+                              onClick={() => fdRef.current?.retryItem(it.id)}
+                            >
+                              重试
+                            </button>
+                          )}
+                        </div>
+                        {(it.detail || it.hint) && (
+                          <div className="terminal-file-sub">
+                            {it.detail && <span className="terminal-file-detail">{it.detail}</span>}
+                            {it.hint && <span className="terminal-file-hint">{it.hint}</span>}
+                          </div>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </div>
+          )}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            hidden
+            onChange={(e) => {
+              const input = e.currentTarget;
+              const files = Array.from(input.files ?? []);
+              input.value = '';
+              fdRef.current?.handlePickerResult(files.length > 0 ? files : null);
+            }}
+          />
         </div>
       )}
     </div>

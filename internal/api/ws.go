@@ -1,8 +1,11 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/url"
 	"sync"
@@ -47,25 +50,98 @@ type wsCtrlFrame struct {
 	Rows int    `json:"rows"`
 }
 
-// wsAuthResp 认证结果控制帧。
+// wsAuthResp 认证结果控制帧。connId 为 server 为该连接签发的连接 ID
+//（terminal-file-paste-drop terminal-streaming delta：auth_ok MUST 携带 connId）。
 type wsAuthResp struct {
-	Type string `json:"type"`
-	Code string `json:"code,omitempty"`
+	Type   string `json:"type"`
+	Code   string `json:"code,omitempty"`
+	ConnID string `json:"connId,omitempty"`
 }
 
 // acceptWS 升级 HTTP 连接为 WebSocket（基于 coder/websocket，design.md §7）。
 // Origin 校验由调用方在调用前完成（checkWSOrigin），这里关闭库内置 origin 校验
 // （InsecureSkipVerify）以使用自定义策略，保留 token/Origin 的显式控制流。
 // 设置读上限为 wsMaxFrame，超过即断开（design.md §7：有界帧防 DoS）。
-func acceptWS(w http.ResponseWriter, r *http.Request) (*websocket.Conn, error) {
-	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+//
+// 返回的 wsTransportHandle 保留底层连接句柄：bridge 收尾 1s 预算耗尽时经它强制关闭
+// 底层 transport（coder/websocket 的 Close/CloseNow 不可互相抢占，见 wsFinishTimeout）。
+func acceptWS(w http.ResponseWriter, r *http.Request) (*websocket.Conn, *wsTransportHandle, error) {
+	handle := &wsTransportHandle{}
+	c, err := websocket.Accept(&wsHijackRecorder{ResponseWriter: w, handle: handle}, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: true, // Origin 由 checkWSOrigin 在调用前校验
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	c.SetReadLimit(int64(wsMaxFrame))
-	return c, nil
+	return c, handle, nil
+}
+
+// wsTransportHandle 保留 WS 连接底层 transport 句柄，支持独立于 Conn.Close 的强制关闭。
+// coder/websocket（v1.8.15）Close 写关闭帧最多等 5s、CloseNow 不可抢占进行中的 Close
+//（走 waitGoroutines 上限 15s），bridge 收尾 1s 预算经本适配边界兑现：预算耗尽直接关
+// 底层连接，不依赖对端关闭握手（delivery spec bridge 收尾预算冻结段）。
+type wsTransportHandle struct {
+	mu   sync.Mutex
+	conn net.Conn
+}
+
+func (h *wsTransportHandle) set(c net.Conn) {
+	h.mu.Lock()
+	h.conn = c
+	h.mu.Unlock()
+}
+
+// clear 解除句柄（真实 Close 已发生，幂等强关不再动作）。
+func (h *wsTransportHandle) clear(c net.Conn) {
+	h.mu.Lock()
+	if h.conn == c {
+		h.conn = nil
+	}
+	h.mu.Unlock()
+}
+
+// forceClose 强制关闭底层 transport（幂等；与 Conn.Close 状态无关）。
+func (h *wsTransportHandle) forceClose() {
+	h.mu.Lock()
+	c := h.conn
+	h.conn = nil
+	h.mu.Unlock()
+	if c != nil {
+		_ = c.Close()
+	}
+}
+
+// wsHijackRecorder 拦截 Hijack：把 coder/websocket Accept 取得的 net.Conn 换成记录
+// 句柄的包装（Accept 内部经 http.Hijacker 取底层连接，包装直接实现该接口）。
+type wsHijackRecorder struct {
+	http.ResponseWriter
+	handle *wsTransportHandle
+}
+
+func (w *wsHijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("response writer does not implement http.Hijacker")
+	}
+	conn, brw, err := hj.Hijack()
+	if err != nil {
+		return nil, nil, err
+	}
+	tc := &trackedConn{Conn: conn, handle: w.handle}
+	w.handle.set(tc)
+	return tc, brw, nil
+}
+
+// trackedConn 记录到 wsTransportHandle 的底层连接；Close 时先解除句柄。
+type trackedConn struct {
+	net.Conn
+	handle *wsTransportHandle
+}
+
+func (c *trackedConn) Close() error {
+	c.handle.clear(c)
+	return c.Conn.Close()
 }
 
 // checkWSOrigin 校验 Origin（design.md §7：默认 http://localhost:* / http://127.0.0.1:* + OCDECK_ALLOWED_ORIGINS，不信 X-Forwarded-*）。
@@ -152,16 +228,64 @@ const wsCloseReplacedTimeout = time.Second
 
 // --- 单交互客户端注册表（design.md §21：同一终端新连接替换旧连接，4009） ---
 
+// closeOwner 关闭原因提交者（唯一关闭所有者，先提交者为准）。
+type closeOwner int
+
+const (
+	closeOwnerNone    closeOwner = iota // 未提交
+	closeOwnerReplace                   // 替换流程拥有关闭（4009）
+	closeOwnerFault                     // bridge 故障收尾拥有关闭（1011）
+)
+
+// wsCloseGuard 每连接关闭原因仲裁（delivery spec bridge 收尾表「故障与替换并发」行）：
+// 终止原因在 per-conn 提交点内提交，先提交者拥有关闭；后提交方 MUST NOT 另发关闭帧
+// 覆盖关闭码（coder/websocket 仅第一次 Close 执行握手，第二次无法改写关闭码）。
+type wsCloseGuard struct {
+	mu    sync.Mutex
+	owner closeOwner
+}
+
+// commitReplace 提交替换关闭意图。true=替换方拥有关闭（发送 4009）；false=故障已先
+// 提交（bridge 完成 1011 收尾，替换方 MUST NOT 对该连接另发 4009）。
+func (g *wsCloseGuard) commitReplace() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.owner != closeOwnerNone {
+		return false
+	}
+	g.owner = closeOwnerReplace
+	return true
+}
+
+// commitFault 提交故障关闭意图。true=bridge 拥有关闭（1011 收尾）；false=替换已先
+// 提交（4009），后续取消/超时产生的写失败 MUST NOT 覆盖该原因。
+func (g *wsCloseGuard) commitFault() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.owner != closeOwnerNone {
+		return false
+	}
+	g.owner = closeOwnerFault
+	return true
+}
+
 // wsClientRegistry 维护按终端 key 的活跃 WS 连接，新连接替换旧连接（4009）。
 // key = terminalKey(taskID/terminalID, isShell)。
+//
+// 写路径边界（刻意保留的内部边界）：TUI key（terminalKey(taskID, false)）的注册
+// 唯一入口为 Server.registerTUIConn（per-task 协调锁内提交替换，与投递准入/finalize
+// 线性化，见 ws_terminal.go）；本类型的通用 register 仅限 shell key 与测试直接构造
+//（shell key 与 TUI key 不同空间，不影响 TUI 当前连接归属）。
 type wsClientRegistry struct {
 	mu      sync.Mutex
 	clients map[string]*wsClientEntry
 }
 
-// wsClientEntry 记录活跃连接及其取消句柄。
+// wsClientEntry 记录活跃连接及其取消句柄与关闭仲裁 guard。
 type wsClientEntry struct {
 	conn   *websocket.Conn
+	connID string // 服务端签发的连接 ID（auth_ok 下发；shell 与 TUI 均有但仅 TUI 参与 deliver 准入）
+	guard  *wsCloseGuard
 	cancel context.CancelFunc // 取消该连接桥接的 replaceCtx（触发旧连接 bridge 退出）
 }
 
@@ -169,25 +293,31 @@ func newWSClientRegistry() *wsClientRegistry {
 	return &wsClientRegistry{clients: map[string]*wsClientEntry{}}
 }
 
-// register 注册新连接，若 key 已有旧连接则返回旧 conn 与旧 bridge 的 cancel。
-// 不在此取消旧 bridge：调用方 MUST 先向旧连接发送 4009 close frame（等待写出或短超时），
-// 再调用返回的 oldCancel 取消旧 bridge——保证旧连接稳定收到 4009，且旧 bridge 在被取消
-// 路径不抢先发 1000（区分"被替换"与"正常结束"，见 bridgeTerminal）。
+// register 注册新连接，若 key 已有旧连接则返回旧 conn、旧 guard 与旧 bridge 的 cancel。
+// 不在此取消旧 bridge：调用方 MUST 先经 oldGuard.commitReplace 赢得关闭所有权后发送
+// 4009 close frame（等待写出或短超时），再调用返回的 oldCancel 取消旧 bridge——保证
+// 旧连接稳定收到 4009，且故障先提交时由旧 bridge 完成 1011 收尾、替换方不另发 4009
+//（见 wsCloseGuard）。
 //
-// 返回：oldConn（可能 nil）、oldCancel（oldConn 非 nil 时非 nil，否则 nil）、新连接 bridge 用的 ctx。
-func (r *wsClientRegistry) register(key string, conn *websocket.Conn) (*websocket.Conn, context.CancelFunc, context.Context) {
+// 边界：生产 TUI 注册 MUST 经 Server.registerTUIConn（per-task 协调锁内提交，D5
+// 原子边界）；本方法仅限 shell 连接（不同 key 空间）与测试直接构造。
+//
+// 返回：oldConn（可能 nil）、oldGuard（oldConn 非 nil 时非 nil）、oldCancel、新连接 bridge 用的 ctx。
+func (r *wsClientRegistry) register(key string, conn *websocket.Conn, guard *wsCloseGuard, connID string) (*websocket.Conn, *wsCloseGuard, context.CancelFunc, context.Context) {
 	ctx, cancel := context.WithCancel(context.Background())
 	r.mu.Lock()
 	old := r.clients[key]
-	r.clients[key] = &wsClientEntry{conn: conn, cancel: cancel}
+	r.clients[key] = &wsClientEntry{conn: conn, connID: connID, guard: guard, cancel: cancel}
 	var oldConn *websocket.Conn
+	var oldGuard *wsCloseGuard
 	var oldCancel context.CancelFunc
 	if old != nil {
 		oldConn = old.conn
+		oldGuard = old.guard
 		oldCancel = old.cancel
 	}
 	r.mu.Unlock()
-	return oldConn, oldCancel, ctx
+	return oldConn, oldGuard, oldCancel, ctx
 }
 
 // unregister 移除 key 对应连接（仅当 conn 匹配，避免误删新连接）。
@@ -205,4 +335,16 @@ func terminalKey(id string, isShell bool) string {
 		return "shell:" + id
 	}
 	return "tui:" + id
+}
+
+// currentTUIConnID 返回 task 当前 TUI 连接的 connID（换代即失效，shell 连接
+// 不参与）。未注册返回 ("", false)。供 deliver/上传准入的连接当前性判定。
+func (r *wsClientRegistry) currentTUIConnID(taskID string) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.clients[terminalKey(taskID, false)]
+	if !ok {
+		return "", false
+	}
+	return e.connID, true
 }

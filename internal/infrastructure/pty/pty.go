@@ -54,6 +54,12 @@ type Pty struct {
 	buffer  *ringBuffer
 	closed  bool
 
+	// ioMu 写入/关闭生命周期协调：WriteTimeout 全程持有（底层写、deadline 清理、
+	// 后备终止在同一临界区内完成，互不穿插）；Close 先获锁再关闭 ptmx/回收进程。
+	// 由此建立顺序：Close 先发生则后续 WriteTimeout 立即失败；WriteTimeout 进行中
+	// Close 有界等待（≤ 其写期限）后再关闭。
+	ioMu sync.Mutex
+
 	// flushCh 由读循环写入与 ticker 共同触发，通知 Read 可消费 buffer。
 	// 只在读循环实际写入数据、或 ticker 到期且 buffer 非空时才发信号，
 	// 保证空 buffer 的 ticker 唤醒不会误报 io.EOF（安静终端每 16ms 不被误判关闭）。
@@ -264,6 +270,138 @@ func (p *Pty) Write(b []byte) (int, error) {
 	return n, nil
 }
 
+// writeAbortGrace 原生写 deadline 相对统一绝对截止提前的量：为后备终止与底层写退出
+// 确认在预算内预留的时间；也是取消路径等待压缩 deadline 生效使写自行退出的宽限上限。
+const writeAbortGrace = 500 * time.Millisecond
+
+// errWriteDeadline 统一绝对截止超期的终止原因（取消路径使用 ctx.Err()）。
+var errWriteDeadline = errors.New("pty: write deadline exceeded")
+
+// setPTMXWriteDeadline 原生写 deadline 设置入口（生产为 (*os.File).SetWriteDeadline）。
+// 变量为注入「平台不支持原生写 deadline」的可控测试边界（与 api 层 deliverPTYWrite
+// 同型）；生产路径恒为真实实现。
+var setPTMXWriteDeadline = (*os.File).SetWriteDeadline
+
+// WriteTimeout 向 PTY master 写入单个完整消息，整个调用（写尝试 + 必要时的后备终止
+// 与退出确认）受 timeout 与 ctx 双重约束（terminal-file-paste-drop 写入退出契约）：
+//
+//   - 从调用起点取统一绝对截止时刻 deadlineAt（5s 写期限覆盖底层写退出、后备终止与
+//     锁释放，不得超支）；写尝试的原生 deadline 设为 deadlineAt-writeAbortGrace，为
+//     终止与退出确认预留预算；平台不支持原生 deadline（SetWriteDeadline 报错）时
+//     静默忽略，依赖后备终止在预算内解除阻塞；
+//   - deadlineAt 到期或 ctx 取消（连接取消）时写入 MUST 终止：先压缩原生 deadline
+//     促使写退出，宽限窗口（不超过剩余预算）内仍未退出则后备终止——SIGKILL attach
+//     客户端并关闭 ptmx 解除阻塞（任务本体 tmux 会话不随 attach 客户端终止）；
+//   - 取消或超期后的底层结果不得冒充按期成功（未在期限内完整成功统一未完整成功）；
+//   - 返回前 MUST 确认底层写已结束（MUST NOT 让调用方带着仍在写 PTY 的后台 goroutine
+//     返回，破坏串行写语义/协调锁线性化）；
+//   - 全程持有 ioMu（写入/关闭生命周期协调）：Close 与本调用串行，见 ioMu 注释。
+//     所有返回路径都先消费底层写结果再返回，故写 goroutine 必然在 ioMu 释放前结束。
+//
+// 仅 n == len(b) && err == nil 为完整成功；超时/取消/立即错误/短写均为未完整成功，
+// 由调用方统一分类（write_failed）。与普通 Write 共用 pump goroutine 串行调用。
+func (p *Pty) WriteTimeout(ctx context.Context, b []byte, timeout time.Duration) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
+	if timeout <= 0 {
+		return 0, errors.New("pty: write timeout must be positive")
+	}
+
+	p.ioMu.Lock()
+	defer p.ioMu.Unlock()
+
+	// Close 已先执行：写入生命周期已终止，立即失败返回，不再触碰 ptmx。
+	p.flushMu.Lock()
+	closed := p.closed
+	p.flushMu.Unlock()
+	if closed {
+		return 0, errors.New("pty: write on closed pty")
+	}
+
+	type writeResult struct {
+		n   int
+		err error
+	}
+	result := make(chan writeResult, 1)
+	writeDone := make(chan struct{})
+	deadlineAt := time.Now().Add(timeout)
+	writeDeadline := deadlineAt.Add(-writeAbortGrace)
+	go func() {
+		defer close(writeDone)
+		// 平台不支持原生 deadline（SetWriteDeadline 报错）时静默忽略，依赖后备终止。
+		_ = setPTMXWriteDeadline(p.ptmx, writeDeadline)
+		n, err := p.ptmx.Write(b)
+		_ = setPTMXWriteDeadline(p.ptmx, time.Time{})
+		result <- writeResult{n: n, err: err}
+	}()
+
+	select {
+	case r := <-result:
+		return finishWriteResult(r.n, r.err)
+	case <-ctx.Done():
+		// 连接取消：压缩 deadline 使可 poll fd 上的写立刻退出。
+		_ = setPTMXWriteDeadline(p.ptmx, time.Now())
+	case <-time.After(time.Until(deadlineAt)):
+	}
+
+	// 走到此处即已超期或取消（完整结果分支已在 select 内返回）：后续到达的底层
+	// 结果不得再按按期成功返回。
+	cause := ctx.Err()
+	if cause == nil {
+		cause = errWriteDeadline
+	}
+	// 宽限窗口（不超过剩余预算）内等原生/压缩 deadline 生效使写退出，仍未退出才
+	// 执行后备终止——超期路径剩余预算为 0，立即后备终止，不得超支。
+	grace := writeAbortGrace
+	if remaining := time.Until(deadlineAt); remaining < grace {
+		grace = remaining
+	}
+	if grace > 0 {
+		graceTimer := time.NewTimer(grace)
+		defer graceTimer.Stop()
+		select {
+		case r := <-result:
+			return terminateWriteResult(r.n, r.err, cause)
+		case <-graceTimer.C:
+		}
+	}
+	p.abortWrite()
+	// 确认底层写已结束才返回（per-task 协调锁释放前提）。abort 后 SIGKILL + 关闭
+	// ptmx 必然解除阻塞，此处等待有界。
+	<-writeDone
+	r := <-result
+	return terminateWriteResult(r.n, r.err, cause)
+}
+
+// finishWriteResult 归一化底层写结果（错误带上下文）。
+func finishWriteResult(n int, err error) (int, error) {
+	if err != nil {
+		return n, fmt.Errorf("pty: write: %w", err)
+	}
+	return n, nil
+}
+
+// terminateWriteResult 归一化终止路径（取消/超期/后备终止）的写结果：终止后到达的
+// 底层结果不得冒充按期成功——err 为空时以终止原因代替（调用方统一分类 write_failed）。
+func terminateWriteResult(n int, err, cause error) (int, error) {
+	if err == nil {
+		err = cause
+	}
+	return finishWriteResult(n, err)
+}
+
+// abortWrite 后备终止：SIGKILL attach 客户端子进程并关闭 ptmx，解除阻塞中的底层写。
+// 仅终止 attach 客户端（等于 detach），任务本体 tmux 会话不受影响。
+// 生产调用方为 WriteTimeout 终止路径（已持有 ioMu，与 Close 有定义的顺序）；
+// 测试可直接调用。
+func (p *Pty) abortWrite() {
+	if p.cmd != nil && p.cmd.Process != nil {
+		_ = p.cmd.Process.Kill()
+	}
+	_ = p.ptmx.Close()
+}
+
 // Resize 调整 PTY 窗口尺寸。tmux attach 客户端的 winsize 变化会自动
 // 传播到会话窗口（design.md §7）。
 func (p *Pty) Resize(cols, rows int) error {
@@ -278,7 +416,15 @@ func (p *Pty) Resize(cols, rows int) error {
 
 // Close 终止子进程并释放 PTY fd。幂等。带超时（design.md §18：close master 后
 // 子进程未退出则 Kill，不得永久阻塞）。
+//
+// 写入生命周期协调（ioMu）：与在途 WriteTimeout 串行——Close 先发生时后续
+// WriteTimeout 立即失败返回；WriteTimeout 进行中 Close 有界等待（≤ 其写期限，
+// 写自身按期限终止）后再执行关闭，与底层写、deadline 清理、abortWrite 之间
+// 有定义的顺序，无并发关闭 ptmx / 回收进程的竞争。
 func (p *Pty) Close() error {
+	p.ioMu.Lock()
+	defer p.ioMu.Unlock()
+
 	p.flushMu.Lock()
 	if p.closed {
 		p.flushMu.Unlock()
@@ -291,7 +437,7 @@ func (p *Pty) Close() error {
 	// 先终止子进程：子进程退出关闭 PTY slave 端，触发 master 端阻塞 Read
 	// 返回 EOF，从而让 readLoop 退出。直接 Close ptmx 在子进程仍持有时
 	// 不一定能唤醒阻塞 Read（平台差异），故先发 SIGHUP 再 Close。
-	if p.cmd.Process != nil {
+	if p.cmd != nil && p.cmd.Process != nil {
 		_ = p.cmd.Process.Signal(os.Signal(syscall.SIGTERM))
 	}
 	// 关闭 ptmx 触发子进程 SIGHUP（attach 客户端退出 = detach），
@@ -300,7 +446,7 @@ func (p *Pty) Close() error {
 	// 等待读循环退出。
 	<-p.readerDone
 	// 等待子进程回收，避免僵尸；超时则 Kill 防止永久阻塞。
-	if p.cmd.Process != nil {
+	if p.cmd != nil && p.cmd.Process != nil {
 		done := make(chan struct{})
 		go func() {
 			_ = p.cmd.Wait()

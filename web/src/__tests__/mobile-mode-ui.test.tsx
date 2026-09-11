@@ -56,6 +56,25 @@ const sessionMock = vi.hoisted(() => {
       this.lockCbs.add(cb);
       return () => this.lockCbs.delete(cb);
     }
+    // 文件投递端口（TerminalView 挂载 TUI 实例时会订阅；本套件不触发投递流程）
+    getConnId(): string | null {
+      return null;
+    }
+    fileGateOpen(): boolean {
+      return false;
+    }
+    fileGateMessage(): string {
+      return '';
+    }
+    sendDeliver(_uploadId: string): boolean {
+      return false;
+    }
+    onConnEvent(_cb: (ev: unknown) => void): () => void {
+      return () => {};
+    }
+    onDeliverResult(_cb: (r: unknown) => void): () => void {
+      return () => {};
+    }
   }
   return FakeTermSession;
 });

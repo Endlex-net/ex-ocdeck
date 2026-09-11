@@ -12,16 +12,18 @@ import (
 type ErrorCode string
 
 const (
-	CodeUnauthorized   ErrorCode = "unauthorized"
-	CodeNotFound       ErrorCode = "not_found"
-	CodeConflict       ErrorCode = "conflict"
-	CodeInvalidState   ErrorCode = "invalid_state"
-	CodeInvalidInput   ErrorCode = "invalid_input"
-	CodeOCIncompatible ErrorCode = "oc_incompatible"
-	CodeGitError       ErrorCode = "git_error"
-	CodeProcessError   ErrorCode = "process_error"
-	CodeInternal       ErrorCode = "internal"
-	CodeRecovering     ErrorCode = "recovering"
+	CodeUnauthorized    ErrorCode = "unauthorized"
+	CodeForbidden       ErrorCode = "forbidden"
+	CodeNotFound        ErrorCode = "not_found"
+	CodeConflict        ErrorCode = "conflict"
+	CodeInvalidState    ErrorCode = "invalid_state"
+	CodeInvalidInput    ErrorCode = "invalid_input"
+	CodePayloadTooLarge ErrorCode = "payload_too_large"
+	CodeOCIncompatible  ErrorCode = "oc_incompatible"
+	CodeGitError        ErrorCode = "git_error"
+	CodeProcessError    ErrorCode = "process_error"
+	CodeInternal        ErrorCode = "internal"
+	CodeRecovering      ErrorCode = "recovering"
 )
 
 // errorBody 统一错误响应体 `{"error":{"code","message"}}`（design.md §21）。
@@ -39,6 +41,8 @@ func httpStatusFor(code ErrorCode) int {
 	switch code {
 	case CodeUnauthorized:
 		return http.StatusUnauthorized
+	case CodeForbidden:
+		return http.StatusForbidden
 	case CodeNotFound:
 		return http.StatusNotFound
 	case CodeConflict, CodeRecovering:
@@ -47,6 +51,8 @@ func httpStatusFor(code ErrorCode) int {
 		return http.StatusUnprocessableEntity
 	case CodeInvalidInput:
 		return http.StatusUnprocessableEntity
+	case CodePayloadTooLarge:
+		return http.StatusRequestEntityTooLarge
 	case CodeOCIncompatible:
 		return http.StatusUnprocessableEntity
 	case CodeGitError:
