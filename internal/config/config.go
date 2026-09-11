@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -50,6 +51,20 @@ type PortRange struct {
 // DefaultPortRange 默认 50000-50999（design.md §3）。
 var DefaultPortRange = PortRange{Min: 50000, Max: 50999}
 
+// 上传大小上限边界（terminal-file-paste-drop D4）：
+// OCDECK_UPLOAD_MAX_BYTES 合法区间 [UploadMaxBytesMin, UploadMaxBytesLimit]，
+// 默认 DefaultUploadMaxBytes（20MiB）。
+const (
+	DefaultUploadMaxBytes = 20 << 20
+	UploadMaxBytesMin     = 1 << 20
+	UploadMaxBytesLimit   = 100 << 20
+)
+
+// UploadDirDefault 返回 dataDir 下的受管上传存储根目录（terminal-file-paste-drop D4）。
+func UploadDirDefault(dataDir string) string {
+	return filepath.Join(dataDir, "uploads")
+}
+
 // Config 服务端配置，启动期一次性加载并校验，运行时只读。
 type Config struct {
 	// Token 访问令牌，MUST 非空（design.md §14）。
@@ -66,6 +81,14 @@ type Config struct {
 	ShutdownPolicy ShutdownPolicy
 	// AllowedOrigins WS Origin 白名单（design.md §7），空表示默认 localhost。
 	AllowedOrigins []string
+	// UploadDir 受管上传存储根目录（terminal-file-paste-drop D4）。
+	// 默认 <DataDir>/uploads；显式配置在加载期绝对化。
+	UploadDir string
+	// UploadMaxBytes 单文件上传大小上限（字节，terminal-file-paste-drop D4）。
+	UploadMaxBytes int64
+	// UploadRetention 上传投递成功后的保留时长（terminal-file-paste-drop D4）。
+	// 0 表示 TTL 关闭（文件保留至任务删除/孤儿回收）。
+	UploadRetention time.Duration
 	// OpenCodeVersion 启动时 `opencode --version` 记录（design.md §11），仅告警非门禁。
 	OpenCodeVersion string
 	// VersionVerified OpenCodeVersion 落在 [ContractMinVersion, ContractBaseline] 的比较结果（design.md §11）。
@@ -188,9 +211,50 @@ func Load(opts Options) (*Config, func(), error) {
 		}
 	}
 
+	// 受管上传配置（terminal-file-paste-drop 2.1）。
+	uploadDir := UploadDirDefault(dataDir)
+	if v, ok := opts.EnvLookup("OCDECK_UPLOAD_DIR"); ok && v != "" {
+		// 与 dataDir 同型：启动期绝对化，避免相对路径随进程 CWD 漂移。
+		absUpload, err := filepath.Abs(v)
+		if err != nil {
+			return nil, nil, fmt.Errorf("resolve absolute upload dir %s: %w", v, err)
+		}
+		uploadDir = filepath.Clean(absUpload)
+	}
+	if err := validateUploadDir(uploadDir); err != nil {
+		return nil, nil, err
+	}
+	uploadMaxBytes := int64(DefaultUploadMaxBytes)
+	if v, ok := opts.EnvLookup("OCDECK_UPLOAD_MAX_BYTES"); ok && v != "" {
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid OCDECK_UPLOAD_MAX_BYTES %q", v)
+		}
+		if parsed < UploadMaxBytesMin || parsed > UploadMaxBytesLimit {
+			return nil, nil, fmt.Errorf("invalid OCDECK_UPLOAD_MAX_BYTES %d (want [%d, %d])", parsed, UploadMaxBytesMin, UploadMaxBytesLimit)
+		}
+		uploadMaxBytes = parsed
+	}
+	// TTL 默认关闭：缺省/显式 0 均为关闭；负值拒绝。
+	uploadRetention := time.Duration(0)
+	if v, ok := opts.EnvLookup("OCDECK_UPLOAD_RETENTION"); ok && v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid OCDECK_UPLOAD_RETENTION %q", v)
+		}
+		if parsed < 0 {
+			return nil, nil, fmt.Errorf("invalid OCDECK_UPLOAD_RETENTION %q (negative)", v)
+		}
+		uploadRetention = parsed
+	}
+
 	// 数据目录创建（0700）。
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return nil, nil, fmt.Errorf("create data dir %s: %w", dataDir, err)
+	}
+	// 上传存储根目录创建（0700，与 dataDir 同级保护）。
+	if err := os.MkdirAll(uploadDir, 0o700); err != nil {
+		return nil, nil, fmt.Errorf("create upload dir %s: %w", uploadDir, err)
 	}
 
 	// 单实例 flock（design.md §10）：MUST 在任何版本探测与 store 打开之前获取，
@@ -224,6 +288,9 @@ func Load(opts Options) (*Config, func(), error) {
 		ServePortRange:  portRange,
 		ShutdownPolicy:  policy,
 		AllowedOrigins:  allowedOrigins,
+		UploadDir:       uploadDir,
+		UploadMaxBytes:  uploadMaxBytes,
+		UploadRetention: uploadRetention,
 		OpenCodeVersion: ocVersion,
 		VersionVerified: VersionSupported(ocVersion),
 		TmuxVersion:     tmuxVersion,
@@ -310,6 +377,21 @@ func parseEnvFile(content string) map[string]string {
 		out[key] = strings.TrimSpace(val)
 	}
 	return out
+}
+
+// validateUploadDir 校验受管上传根目录（terminal-file-paste-drop D4）：
+// 拒绝反斜杠与控制字符（rune<0x20 或 DEL）——该目录名会与受管文件名/任务目录拼接，
+// 含此类字符的路径无法被启动恢复扫描与投递路径校验可靠处理。
+func validateUploadDir(dir string) error {
+	if strings.ContainsRune(dir, '\\') {
+		return fmt.Errorf("invalid OCDECK_UPLOAD_DIR %q: backslash not allowed", dir)
+	}
+	for _, r := range dir {
+		if r < 0x20 || r == 0x7F {
+			return fmt.Errorf("invalid OCDECK_UPLOAD_DIR %q: control character not allowed", dir)
+		}
+	}
+	return nil
 }
 
 func parseShutdownPolicy(s string) (ShutdownPolicy, error) {

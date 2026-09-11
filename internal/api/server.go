@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"ocdeck/internal/application/diffreview"
+	appuploads "ocdeck/internal/application/uploads"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/ai"
 	"ocdeck/internal/infrastructure/notify"
@@ -63,6 +64,32 @@ type Server struct {
 
 	// wsClients 单交互客户端注册表（design.md §21：同一终端新连接替换旧连接，4009）。
 	wsClients *wsClientRegistry
+
+	// deliverOrch 投递编排消费方窄接口（terminal-file-paste-drop 4.2：Lane A application
+	// 编排，组合根经 SetDeliverOrchestrator 注入；deliver 帧的准入决策归编排层）。
+	deliverOrch deliverOrchestrator
+	// replaceCoord TUI 连接替换提交共用的 per-task 协调锁（terminal-file-paste-drop D5
+	// 原子边界：注册表替换提交与投递准入/finalize 在同一把锁内线性化；组合根注入
+	// *appuploads.Orchestrator 的 Coordination）。
+	replaceCoord *appuploads.Coordination
+	// deliverWriteDeadline/wsFinishBudget 投递写 deadline 与 bridge 收尾预算
+	//（零值用生产默认 5s/1s；测试注入短值，不改变生产语义）。
+	deliverWriteDeadline time.Duration
+	wsFinishBudget       time.Duration
+
+	// uploadOrch/uploadLimits 上传编排与限额（terminal-file-paste-drop 3.2/3.3：
+	// 组合根经 SetUploadAdmission / SetUploadLimits 注入；handler 仅做 multipart
+	// 协议解析、三段计量与错误映射，准入决策归 application 编排）。
+	uploadOrch   uploadOrchestrator
+	uploadLimits UploadLimits
+}
+
+// UploadLimits 上传限额（组合根从 cfg 裁剪注入）。MaxBytes 为单文件上限 M
+// （三段计量的请求总量兜底 = M+1MiB）；UploadsDir 为受管存储根目录——落盘归
+// infrastructure，api 层不消费，随配置整体注入以保持组合根单点装配。
+type UploadLimits struct {
+	MaxBytes   int64
+	UploadsDir string
 }
 
 // StoreRO store 包的只读接口占位；本任务只挂 server/status，
@@ -120,6 +147,37 @@ func WithProjectStore(cfg *config.Config, store StoreRO, projs ProjectStore) *Se
 // 注意：task 路由在 registerRoutes 时按 s.tasks != nil 注册；延迟注入需调用 RebuildRoutes。
 func (s *Server) SetTaskBackend(tb TaskBackend) {
 	s.tasks = tb
+}
+
+// SetDeliverOrchestrator 注入投递编排（terminal-file-paste-drop 4.2：Lane A application
+// 编排；组合根显式构造注入）。
+func (s *Server) SetDeliverOrchestrator(o deliverOrchestrator) {
+	s.deliverOrch = o
+}
+
+// SetDeliverReplaceCoordination 注入 TUI 连接替换提交共用的 per-task 协调锁
+//（组合根注入 uploadOrch.Coordination()，使替换提交与投递准入/finalize 临界区互斥）。
+func (s *Server) SetDeliverReplaceCoordination(c *appuploads.Coordination) {
+	s.replaceCoord = c
+}
+
+// SetUploadAdmission 注入上传编排（terminal-file-paste-drop 3.2：application 编排，
+// 组合根显式构造注入；*appuploads.Orchestrator 结构性满足）。
+func (s *Server) SetUploadAdmission(o uploadOrchestrator) {
+	s.uploadOrch = o
+}
+
+// SetUploadLimits 注入上传限额（terminal-file-paste-drop 3.2：请求总量兜底
+// M+1MiB 的 M 与受管存储根；须在组合根 RebuildRoutes 前调用）。
+func (s *Server) SetUploadLimits(maxBytes int64, uploadsDir string) {
+	s.uploadLimits = UploadLimits{MaxBytes: maxBytes, UploadsDir: uploadsDir}
+}
+
+// CurrentTUIConnID 返回 task 当前 TUI 连接的服务端 connID（换代即失效，shell
+// 连接不参与；未注册返回 ("", false)）。terminal-file-paste-drop：组合根将其
+// 适配为 application/uploads 的 ConnPort（Deliver 步骤①连接当前性判定）。
+func (s *Server) CurrentTUIConnID(taskID string) (string, bool) {
+	return s.wsClients.currentTUIConnID(taskID)
 }
 
 // SetEnvStore 注入 EnvStore（design.md §21 env 路由）。延迟注入需调用 RebuildRoutes。
@@ -198,6 +256,7 @@ func (s *Server) registerRoutes() {
 	s.registerAIConfigRoutes(apiMux)        // 全局 AI provider 配置（design.md D6）
 	s.registerNotificationRoutes(apiMux)    // 通知配置/测试通知/SSE 流（task-notifications D7）
 	s.registerPaletteConfigRoutes(apiMux)   // 命令面板配置（quick-create-shortcut-support D6）
+	s.registerUploadRoutes(apiMux)          // 上传接口（terminal-file-paste-drop 3.3）
 
 	// /api/v1 前缀统一挂认证中间件（design.md §14/§21）。
 	// 已认证请求的未知路由/方法返回统一 JSON 404/405（design.md §21 错误结构）。

@@ -93,7 +93,19 @@ func (m *Manager) beginActivation(ctx context.Context, id, fromStatus string) (a
 }
 
 // writeBeginDeleteIntent 写入删除意图（deleting 迁移，fromStatuses 守卫）。
+// terminal-file-paste-drop 2.5：提交在 per-task 协调锁临界区内执行（调用方持任务锁，
+// 锁顺序：任务锁 → 协调锁），与上传 finalize/投递临界区互斥。
 func (m *Manager) writeBeginDeleteIntent(ctx context.Context, id, mode string, fromStatuses []string) (application.TransitionResult, error) {
+	var res application.TransitionResult
+	err := m.inUploadCoordination(ctx, id, func() error {
+		var werr error
+		res, werr = m.writeBeginDeleteIntentLocked(ctx, id, mode, fromStatuses)
+		return werr
+	})
+	return res, err
+}
+
+func (m *Manager) writeBeginDeleteIntentLocked(ctx context.Context, id, mode string, fromStatuses []string) (application.TransitionResult, error) {
 	if m.lifecycle != nil {
 		statuses := make([]ocdecktask.Status, len(fromStatuses))
 		for i, s := range fromStatuses {
@@ -107,7 +119,18 @@ func (m *Manager) writeBeginDeleteIntent(ctx context.Context, id, mode string, f
 // writeRetryDeleteIntent 写入删除重入意图（Retry 专用，deletion_failed → deleting）：
 // delete_mode + status + last_error=NULL 单事务原子生效（评审 C-F3：意图提交即发布状态事件，
 // stale 错误 MUST 随意图清空；首删入口 writeBeginDeleteIntent 不清 last_error，行为逐字保持）。
+// terminal-file-paste-drop 2.5：提交在 per-task 协调锁临界区内执行（同 writeBeginDeleteIntent）。
 func (m *Manager) writeRetryDeleteIntent(ctx context.Context, id, mode string) (application.TransitionResult, error) {
+	var res application.TransitionResult
+	err := m.inUploadCoordination(ctx, id, func() error {
+		var werr error
+		res, werr = m.writeRetryDeleteIntentLocked(ctx, id, mode)
+		return werr
+	})
+	return res, err
+}
+
+func (m *Manager) writeRetryDeleteIntentLocked(ctx context.Context, id, mode string) (application.TransitionResult, error) {
 	if m.lifecycle != nil {
 		return m.lifecycle.BeginRetryDeleteIntent(ctx, id, ocdecktask.DeleteMode(mode))
 	}
@@ -115,7 +138,20 @@ func (m *Manager) writeRetryDeleteIntent(ctx context.Context, id, mode string) (
 }
 
 // writeDeleteTask 删除任务行（级联剩余会话；commit 先发 session.deleted 再 task.deleted）。
+// terminal-file-paste-drop 2.5：删行提交在 per-task 协调锁临界区内执行——
+// task.deleted 触发的上传目录回收与投递/finalize 临界区互斥，删除提交先行时
+// finalize 复查必见任务已删、不发布 uploadId。
 func (m *Manager) writeDeleteTask(ctx context.Context, id string) (application.DeleteResult, error) {
+	var res application.DeleteResult
+	err := m.inUploadCoordination(ctx, id, func() error {
+		var werr error
+		res, werr = m.writeDeleteTaskLocked(ctx, id)
+		return werr
+	})
+	return res, err
+}
+
+func (m *Manager) writeDeleteTaskLocked(ctx context.Context, id string) (application.DeleteResult, error) {
 	if m.lifecycle != nil {
 		return m.lifecycle.DeleteTask(ctx, id)
 	}

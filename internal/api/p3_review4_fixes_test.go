@@ -299,14 +299,16 @@ func TestWS_Replace4009_OldConnReceives4009(t *testing.T) {
 	key := terminalKey("t1", false)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := acceptWS(w, r)
+		c, _, err := acceptWS(w, r)
 		if err != nil {
 			return
 		}
 		// 不启动 bridge，仅注册 + 在新连接注册时对旧连接发 4009 再 cancel。
-		oldConn, oldCancel, bridgeCtx := reg.register(key, c)
+		oldConn, oldGuard, oldCancel, bridgeCtx := reg.register(key, c, &wsCloseGuard{}, "")
 		if oldConn != nil {
-			wsCloseReplacedWait(oldConn)
+			if oldGuard.commitReplace() {
+				wsCloseReplacedWait(oldConn)
+			}
 			oldCancel()
 		}
 		defer reg.unregister(key, c)
@@ -370,7 +372,7 @@ func TestWSBridge_CtxCancel_PtyReadBlockingExits(t *testing.T) {
 	p := openSleepPty(t)
 	defer p.Close()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := acceptWS(w, r)
+		c, transport, err := acceptWS(w, r)
 		if err != nil {
 			return
 		}
@@ -381,7 +383,7 @@ func TestWSBridge_CtxCancel_PtyReadBlockingExits(t *testing.T) {
 			cancel()
 		}()
 		s := &Server{}
-		s.bridgeTerminal(ctx, c, p, func() {})
+		s.bridgeTerminal(ctx, c, p, wsBridgeDeps{transport: transport, guard: &wsCloseGuard{}})
 	}))
 	defer srv.Close()
 

@@ -189,7 +189,17 @@ func (m *Manager) convergeCommitCAS(ctx context.Context, taskID, reason string, 
 	if envErr != nil {
 		le = sql.NullString{String: fmt.Sprintf("%s; clear env snapshot: %v", le.String, envErr), Valid: true}
 	}
-	committed, statusErr := m.writeStatusConditional(ctx, taskID, StatusActive, StatusSuspended, le)
+	// terminal-file-paste-drop 2.5：active→suspended 提交（离开 active）在 per-task
+	// 协调锁临界区内执行（调用方持任务锁，锁顺序：任务锁 → 协调锁）。
+	var committed application.TransitionResult
+	var statusErr error
+	if cerr := m.inUploadCoordination(ctx, taskID, func() error {
+		var werr error
+		committed, werr = m.writeStatusConditional(ctx, taskID, StatusActive, StatusSuspended, le)
+		return werr
+	}); cerr != nil {
+		statusErr = cerr
+	}
 	if statusErr != nil {
 		log.Printf("convergeToSuspended: commit suspended failed (task %s): %v; last_error=%s", taskID, statusErr, le.String)
 	}

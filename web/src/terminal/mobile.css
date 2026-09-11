@@ -108,3 +108,7 @@
   gap: 8px;
   flex-wrap: wrap;
 }
+
+/* 文件投递入口/状态浮层/拖拽悬停反馈（terminal-file-paste-drop 5.3）：
+ * 功能骨架样式已整体迁入 file-delivery.css（视觉精修层），本文件不再重复定义；
+ * 层级沿用上方注释秩序（文件栏 z-index 5，拖拽悬停 z-index 6）。 */

@@ -29,13 +29,13 @@ func dialWS(t *testing.T, url string) *websocket.Conn {
 // onInput 透传 bridgeTerminal（idle-reminder-user-activity：输入帧上报回调）。
 func newBridgeHandler(p *pty.Pty, onInput func()) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		c, err := acceptWS(w, r)
+		c, transport, err := acceptWS(w, r)
 		if err != nil {
 			return
 		}
 		defer c.CloseNow()
 		s := &Server{}
-		s.bridgeTerminal(r.Context(), c, p, onInput)
+		s.bridgeTerminal(r.Context(), c, p, wsBridgeDeps{onInput: onInput, transport: transport, guard: &wsCloseGuard{}})
 	}
 }
 
@@ -101,20 +101,23 @@ func TestWSBridge_Replace4009_OldConnCancelled(t *testing.T) {
 	key := terminalKey("t1", false)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := acceptWS(w, r)
+		c, transport, err := acceptWS(w, r)
 		if err != nil {
 			return
 		}
 		defer c.CloseNow()
-		oldConn, oldCancel, bridgeCtx := reg.register(key, c)
+		guard := &wsCloseGuard{}
+		oldConn, oldGuard, oldCancel, bridgeCtx := reg.register(key, c, guard, "")
 		if oldConn != nil {
-			wsCloseReplacedWait(oldConn)
+			if oldGuard.commitReplace() {
+				wsCloseReplacedWait(oldConn)
+			}
 			oldCancel()
 		}
 		defer reg.unregister(key, c)
 		// bridge 使用 bridgeCtx（新连接替换时由新连接的 oldCancel 取消）。
 		s := &Server{}
-		s.bridgeTerminal(bridgeCtx, c, p, func() {})
+		s.bridgeTerminal(bridgeCtx, c, p, wsBridgeDeps{transport: transport, guard: guard})
 	}))
 	defer srv.Close()
 
@@ -147,7 +150,7 @@ func TestWSBridge_CtxCancelExitsNoHang(t *testing.T) {
 
 	// 用 net.Pipe 构造一个可控的 ws-like 连接较重，这里用 httptest + 真实 WS。
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := acceptWS(w, r)
+		c, transport, err := acceptWS(w, r)
 		if err != nil {
 			return
 		}
@@ -159,7 +162,7 @@ func TestWSBridge_CtxCancelExitsNoHang(t *testing.T) {
 			cancel()
 		}()
 		s := &Server{}
-		s.bridgeTerminal(ctx, c, p, func() {})
+		s.bridgeTerminal(ctx, c, p, wsBridgeDeps{transport: transport, guard: &wsCloseGuard{}})
 	}))
 	defer srv.Close()
 
@@ -210,9 +213,11 @@ func TestHandleDeleteTask_ConfirmDirtyParamName(t *testing.T) {
 	}
 }
 
-// TestWSBridge_UserActivityOnInputFrames（idle-reminder-user-activity D3/任务 4.1）：
-// 非空 binary 帧与非空非 resize text 帧触发上报回调（接线与 handleWSTUI 一致：
-// RecordUserActivity(taskID)）；resize 控制帧与空帧不上报。
+// TestWSBridge_UserActivityOnInputFrames（idle-reminder-user-activity D3/任务 4.1；
+// terminal-file-paste-drop D2 更新文本帧分发规则）：
+// 非空 binary 帧与合法 deliver 文本帧触发上报回调（接线与 handleWSTUI 一致：
+// RecordUserActivity(taskID)）；resize 控制帧与空帧不上报；非法 JSON 文本帧
+//（D2 行为变更：原回落写 PTY 并上报，现丢弃+日志，不上报、不写 PTY）。
 //
 // 完成屏障：待测帧全部写完后追加一帧 END-MARK binary 帧，cat PTY 逐帧回显——
 // 客户端累计收到的输出中出现 END-MARK（标记可能被 PTY 输出缓冲拆分到多个消息，
@@ -225,15 +230,19 @@ func TestWSBridge_UserActivityOnInputFrames(t *testing.T) {
 	s := &Server{tasks: tb}
 	handlerDone := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := acceptWS(w, r)
+		c, transport, err := acceptWS(w, r)
 		if err != nil {
 			return
 		}
 		defer c.CloseNow()
 		defer close(handlerDone)
 		// 与 handleWSTUI 相同的回调接线（记录经 activityMu 保护）。
-		s.bridgeTerminal(r.Context(), c, p, func() {
-			s.tasks.RecordUserActivity(r.Context(), "t1")
+		s.bridgeTerminal(r.Context(), c, p, wsBridgeDeps{
+			onInput: func() {
+				s.tasks.RecordUserActivity(r.Context(), "t1")
+			},
+			transport: transport,
+			guard:     &wsCloseGuard{},
 		})
 	}))
 	defer srv.Close()
@@ -264,10 +273,10 @@ func TestWSBridge_UserActivityOnInputFrames(t *testing.T) {
 		}
 	}
 	mustWrite(websocket.MessageBinary, []byte("a"))                                // 非空 binary → 上报
-	mustWrite(websocket.MessageText, []byte("hello"))                              // 非空非 resize text → 上报
+	mustWrite(websocket.MessageText, []byte("hello"))                              // 非法 JSON → 丢弃（D2），不上报
 	mustWrite(websocket.MessageText, []byte(`{"type":"resize","cols":90,"rows":28}`)) // resize → 不上报
 	mustWrite(websocket.MessageBinary, []byte{})                                   // 空帧 → 不上报
-	mustWrite(websocket.MessageText, []byte{})                                     // 空帧 → 不上报
+	mustWrite(websocket.MessageText, []byte{})                                     // 空帧（非法 JSON）→ 不上报
 	// 屏障帧带换行（PTY canonical 行规程按行回显），cat 回显该帧。
 	mustWrite(websocket.MessageBinary, []byte("END-MARK\n"))
 
@@ -288,12 +297,17 @@ func TestWSBridge_UserActivityOnInputFrames(t *testing.T) {
 		}
 	}
 
-	// 处理完成屏障已过：resize/两个空帧均已确认处理且不上报。上报恰为 3 次：
-	// 前两次来自被测输入帧（顺序确定 [t1 t1]），第 3 次来自屏障帧自身
-	//（非空 binary，同样计为输入）。
+	// 处理完成屏障已过：resize/两个空帧/非法 JSON 帧均已确认处理且不上报。上报恰为
+	// 2 次：第 1 次来自被测 binary 帧，第 2 次来自屏障帧自身（非空 binary，同样计为
+	// 输入）。"hello" 为非法 JSON，按 D2 丢弃且不上报。
 	calls := tb.recordedActivityCalls()
-	if len(calls) != 3 || calls[0] != "t1" || calls[1] != "t1" || calls[2] != "t1" {
-		t.Fatalf("activity calls = %v, want [t1 t1 t1] (resize/empty frames must not report; third call is the barrier frame itself)", calls)
+	if len(calls) != 2 || calls[0] != "t1" || calls[1] != "t1" {
+		t.Fatalf("activity calls = %v, want [t1 t1] (malformed/resize/empty frames must not report; second call is the barrier frame itself)", calls)
+	}
+	// D2 行为变更回归：非法 JSON 文本帧 MUST NOT 回落写 PTY——屏障前唯一被写 PTY 的
+	// 内容是 END-MARK（见上方 marker 断言，回显中不含 "hello"）。
+	if bytes.Contains(echoBuf, []byte("hello")) {
+		t.Errorf("malformed text frame %q must not be forwarded to PTY", "hello")
 	}
 }
 
@@ -305,12 +319,12 @@ func TestPumpWSToPTY_ReportBeforePTYWriteFailure(t *testing.T) {
 
 	reports := make(chan struct{}, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := acceptWS(w, r)
+		c, _, err := acceptWS(w, r)
 		if err != nil {
 			return
 		}
 		defer c.CloseNow()
-		pumpWSToPTY(r.Context(), c, p, func() {
+		pumpWSToPTY(r.Context(), c, p, nil, nil, func() {
 			select {
 			case reports <- struct{}{}:
 			default:

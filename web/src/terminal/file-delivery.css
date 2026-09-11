@@ -1,0 +1,295 @@
+/*
+ * 文件投递 UI 视觉层（terminal-file-paste-drop 5.3 精修）。
+ *
+ * 功能骨架原在 mobile.css，视觉规则独立成此文件；状态机/挂载逻辑不动。
+ * 层叠沿用 mobile.css 头注的秩序：终端画面 < 锁定 overlay(4) < 文件栏/浮动按钮(5)
+ * < 连接状态 overlay(6)；拖拽悬停反馈同为 6（pointer-events:none，纯视觉）。
+ * 颜色全部走 --term-* / 语义 token，与 clipboard popover、锁定按钮同一语汇。
+ */
+
+/* ---------- 容器：锚定左下，仅承载状态浮层与隐藏 file input ----------
+ * 无常驻入口按钮（粘贴/拖拽为主路径，不遮挡输入区）；隐藏 input 服务于
+ * 失败/未知项的重试重选路径（openFilePicker → input.click()）。 */
+.terminal-file-bar {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  max-width: calc(100% - 20px);
+}
+
+/* ---------- 状态浮层：clipboard popover 同款表面（实底 + 细边 + pop 阴影） ---------- */
+.terminal-file-panel {
+  width: min(400px, 100%);
+  max-height: min(45%, 320px);
+  overflow: auto;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--term-fg);
+  background: var(--term-bg);
+  border: 1px solid var(--term-border);
+  border-radius: 6px;
+  box-shadow: var(--shadow-pop);
+  animation: term-file-panel-in 0.16s ease-out;
+}
+
+@keyframes term-file-panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* 面板标题：弱化为小号大写字距的「区段标签」，不喧宾夺主 */
+.terminal-file-panel-title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--term-muted);
+}
+
+/* 队列暂停是异常态，用 warn 色从标题里挑出来 */
+.terminal-file-paused {
+  color: var(--warn);
+  letter-spacing: normal;
+}
+
+/* 入口级提示（能力降级 / 上传不可用）：warn 色单行，不重不吵 */
+.terminal-file-notice {
+  margin-bottom: 8px;
+  color: var(--warn);
+}
+
+.terminal-file-notice:last-child {
+  margin-bottom: 0;
+}
+
+/* ---------- 文件列表：逐项两行结构（主行 = 文件名 + 状态丸 + 重试；副行 = 详情/提示） ---------- */
+.terminal-file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.terminal-file-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 0;
+  border-top: 1px solid color-mix(in oklch, var(--term-border) 60%, transparent);
+}
+
+.terminal-file-item:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+.terminal-file-item:last-child {
+  padding-bottom: 0;
+}
+
+.terminal-file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 文件名用等宽字体（终端语汇），长名截断并保留 title 悬浮全文 */
+.terminal-file-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* 状态丸：状态即视觉语言（od-badge 同款 pill），左侧色点承载语义色 */
+.terminal-file-status {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.terminal-file-dot {
+  width: 5px;
+  height: 5px;
+  flex: 0 0 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* 排队/待投递：中性 muted——还没发生任何事，不抢注意 */
+.terminal-file-status-queued,
+.terminal-file-status-ready {
+  color: var(--term-muted);
+  border-color: var(--term-border);
+}
+
+/* 上传中/等待回执：accent + 呼吸脉冲点（进行态） */
+.terminal-file-status-uploading,
+.terminal-file-status-awaiting {
+  color: var(--accent);
+  border-color: color-mix(in oklch, var(--accent) 30%, var(--term-border));
+  background: color-mix(in oklch, var(--accent) 10%, var(--term-bg));
+}
+
+.terminal-file-status-uploading .terminal-file-dot,
+.terminal-file-status-awaiting .terminal-file-dot {
+  animation: term-file-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes term-file-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 color-mix(in oklch, var(--accent) 30%, transparent);
+  }
+  50% {
+    opacity: 0.65;
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 14%, transparent);
+  }
+}
+
+/* 已发送：term 绿，克制（成功不需要庆祝，只需要确认） */
+.terminal-file-status-sent {
+  color: var(--term-green);
+  border-color: color-mix(in oklch, var(--term-green) 30%, var(--term-border));
+}
+
+/* 明确失败：term 红 */
+.terminal-file-status-failed {
+  color: var(--term-red);
+  border-color: color-mix(in oklch, var(--term-red) 30%, var(--term-border));
+}
+
+/* 结果未知：warn 琥珀，与失败的红色明确区分（未知 ≠ 失败，重试可能重复） */
+.terminal-file-status-unknown {
+  color: var(--warn);
+  border-color: color-mix(in oklch, var(--warn) 32%, var(--term-border));
+}
+
+/* 副行：失败原因 / 未知重试提示，缩进对齐文件名 */
+.terminal-file-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 11.5px;
+}
+
+.terminal-file-detail {
+  color: var(--term-muted);
+}
+
+/* 失败项的原因用淡红（不是纯红，避免与状态丸争抢）；未知项原因保持 muted */
+.terminal-file-item-failed .terminal-file-detail {
+  color: color-mix(in oklch, var(--term-red) 78%, var(--term-muted));
+}
+
+/* 未知项的重试提示（「可能重复，请先检查终端」）与未知状态丸同色系呼应 */
+.terminal-file-hint {
+  color: var(--warn);
+}
+
+/* 重试按钮：行内小 ghost，悬停走 accent；禁用态降透明度 */
+.terminal-file-retry {
+  flex: 0 0 auto;
+  min-height: 24px;
+  padding: 1px 10px;
+  font-size: 11px;
+  color: var(--term-fg);
+  background: transparent;
+  border: 1px solid var(--term-border);
+  border-radius: 6px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.terminal-file-retry:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.terminal-file-retry:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ---------- 拖拽悬停反馈：虚线框 scrim + 居中提示丸 ----------
+ * dragenter/leave 计数防闪烁由功能层负责，这里只管视觉。
+ * ::before = 全幅虚线框 + accent 薄染色；::after = 居中提示丸（实底，压得住终端文字）。 */
+.terminal-wrap.terminal-drop-hover::before {
+  content: '';
+  position: absolute;
+  inset: 8px;
+  z-index: 6;
+  border: 1.5px dashed color-mix(in oklch, var(--accent) 65%, var(--term-border));
+  border-radius: 8px;
+  background: color-mix(in oklch, var(--accent) 8%, transparent);
+  pointer-events: none;
+}
+
+.terminal-wrap.terminal-drop-hover::after {
+  content: '松开鼠标，投递文件到终端';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 6;
+  padding: 8px 16px;
+  white-space: nowrap;
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  color: var(--accent);
+  background: var(--term-bg);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  box-shadow: var(--shadow-pop);
+  pointer-events: none;
+}
+
+/* ---------- 触控 / 移动端：重试 ≥32px；窄视口下浮层再收一点 ---------- */
+@media (pointer: coarse), (max-width: 767px) {
+  .terminal-file-retry {
+    min-height: 32px;
+    padding: 4px 12px;
+  }
+
+  /* 窄视口下浮层再收一点，给终端画面留位 */
+  .terminal-file-panel {
+    max-height: min(50%, 300px);
+  }
+}
+
+/* 减弱动效偏好：去掉浮层入场与脉冲，状态仍可由色彩区分 */
+@media (prefers-reduced-motion: reduce) {
+  .terminal-file-panel {
+    animation: none;
+  }
+
+  .terminal-file-status-uploading .terminal-file-dot,
+  .terminal-file-status-awaiting .terminal-file-dot {
+    animation: none;
+  }
+}

@@ -38,6 +38,23 @@ export type TermConnState =
   | 'gone' // 4004：终端已不存在（如挂起后 shell 已消失）
   | 'auth_failed'; // 4001：token 失效
 
+/**
+ * 文件投递连接事件（terminal-file-paste-drop D5/D7）：auth_ok 携带本连接 connId
+ * （缺失/非法形态归一为 null → 前端文件能力降级）；closed 为连接断开。
+ */
+export type TermConnEvent = { type: 'auth_ok'; connId: string | null } | { type: 'closed' };
+
+/** deliver_result 回执帧（terminal-streaming delta：{uploadId, ok} / {uploadId, ok:false, error}）。 */
+export interface DeliverResult {
+  uploadId: string;
+  ok: boolean;
+  /** ok:false 时的错误码枚举：not_found|expired|forbidden|task_inactive|write_failed|invalid_input。 */
+  error?: string;
+}
+
+/** connId 合法形态（uuid）；空串/非 uuid → 文件能力降级（D7）。 */
+const CONN_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const encoder = new TextEncoder();
 
 /** 键盘避让收缩阈值（CSS px，mobile-terminal-mode-settings design D4）：
@@ -164,6 +181,10 @@ export class TermSession {
   private imeListenersAttached = false;
   /** webgl 渲染器实例引用（图标字体加载成功后 clearTextureAtlas 用；加载失败/不可用时 null）。 */
   private webgl: WebglAddon | null = null;
+  /** 当前连接 connId（server 经 auth_ok 签发；缺失/非法为 null → 文件功能降级）。 */
+  private connId: string | null = null;
+  private connEventCallbacks = new Set<(ev: TermConnEvent) => void>();
+  private deliverResultCallbacks = new Set<(r: DeliverResult) => void>();
 
   constructor(
     private host: HTMLElement,
@@ -318,6 +339,11 @@ export class TermSession {
           const msg = JSON.parse(ev.data) as { type?: string };
           if (msg.type === 'auth_ok') {
             debugMark('odterm:auth-ok');
+            // connId：server 为本连接签发的连接 ID（上传/投递授权绑定依据）；
+            // 缺失或非 uuid 形态归一为 null（文件功能降级，普通终端功能不受影响）。
+            const raw = (msg as { connId?: unknown }).connId;
+            this.connId = typeof raw === 'string' && CONN_ID_RE.test(raw) ? raw : null;
+            this.emitConnEvent({ type: 'auth_ok', connId: this.connId });
             // 任何 WS 连接建立/auth_ok（含重连、Tab 切换）→ 锁定能力启用即强制 LOCKED
             // （design D3：边沿保护的唯一例外，入参为 appliedCaps.lock 而非 pointerCoarse）。
             // 必须先于 authed/connected 状态暴露与任何外部回调/fit，防门禁未就绪窗口泄漏。
@@ -327,6 +353,13 @@ export class TermSession {
               this.setState('connected');
               this.fitNow(); // 以握手尺寸再校准一次
             });
+          } else if (msg.type === 'deliver_result') {
+            const r = msg as { uploadId?: unknown; ok?: unknown; error?: unknown };
+            if (typeof r.uploadId === 'string' && typeof r.ok === 'boolean') {
+              const result: DeliverResult = { uploadId: r.uploadId, ok: r.ok };
+              if (typeof r.error === 'string') result.error = r.error;
+              for (const cb of this.deliverResultCallbacks) cb(result);
+            }
           }
           // type=error 的帧等待随后的关闭帧统一处理
         } catch {
@@ -345,8 +378,13 @@ export class TermSession {
       // this.ws——陈旧连接（connect 重入后 closeSocket 关闭的旧 socket）的延迟
       // onclose 不得清空新连接、不得触发误重连。
       if (gen !== this.wsGen) return;
+      // 自然断线（非 closeSocket 路径：server 关闭/网络异常/被替换/认证失效）：
+      // 与 closeSocket 同款收尾——认证与 connId 立即失效，并向文件投递状态机
+      // 准确发出一次 closed，等待回执项据此即时归"结果未知"，不等待 10s 回执超时。
       this.authed = false;
       this.ws = null;
+      this.connId = null;
+      this.emitConnEvent({ type: 'closed' });
       if (this.disposed || this.closedByUs) return;
       switch (ev.code) {
         case 1013:
@@ -431,6 +469,8 @@ export class TermSession {
     this.pointerMql = null;
     this.lockOrchestrator.dispose();
     this.lockChangeCallbacks.clear();
+    this.connEventCallbacks.clear();
+    this.deliverResultCallbacks.clear();
     this.lockController.dispose();
     this.osc52Disposable?.dispose();
     this.osc52Disposable = null;
@@ -475,6 +515,54 @@ export class TermSession {
     return () => this.lockChangeCallbacks.delete(cb);
   }
 
+  // ---------- 文件投递（terminal-file-paste-drop D6/D7） ----------
+
+  /** 当前连接 connId；auth_ok 缺失/非法（旧 server）为 null → 文件能力降级。 */
+  getConnId(): string | null {
+    return this.connId;
+  }
+
+  /**
+   * 文件投递门禁（D6）：与 sendInput 同款 shouldSendInput 判定，
+   * 但 syntheticInFlight 固定传 false——文件投递是非合成输入，锁定例外 MUST NOT 复用。
+   */
+  fileGateOpen(): boolean {
+    return shouldSendInput({
+      authed: this.authed,
+      wsOpen: this.ws?.readyState === WebSocket.OPEN,
+      locked: this.lockController.isLocked(),
+      syntheticInFlight: false,
+    });
+  }
+
+  /** 门禁不通过时的用户提示（锁定 → 提示解锁；未连接 → 提示连接）。 */
+  fileGateMessage(): string {
+    return this.lockController.isLocked() ? '终端已锁定，请先解锁后重试' : '终端未连接，请连接后重试';
+  }
+
+  /** 发送 deliver 文本帧（{"type":"deliver","uploadId"}）；发送前复查门禁，不通过返回 false 且不发送。 */
+  sendDeliver(uploadId: string): boolean {
+    if (!this.fileGateOpen()) return false;
+    this.ws!.send(JSON.stringify({ type: 'deliver', uploadId }));
+    return true;
+  }
+
+  /** 连接事件订阅（auth_ok 携带 connId / closed 断开），供文件投递状态机消费。 */
+  onConnEvent(cb: (ev: TermConnEvent) => void): () => void {
+    this.connEventCallbacks.add(cb);
+    return () => this.connEventCallbacks.delete(cb);
+  }
+
+  /** deliver_result 回执订阅（仅当前连接的合法帧；迟到/畸形由消费方丢弃）。 */
+  onDeliverResult(cb: (r: DeliverResult) => void): () => void {
+    this.deliverResultCallbacks.add(cb);
+    return () => this.deliverResultCallbacks.delete(cb);
+  }
+
+  private emitConnEvent(ev: TermConnEvent): void {
+    for (const cb of this.connEventCallbacks) cb(ev);
+  }
+
   // ---------- 内部 ----------
 
   private closeSocket(): void {
@@ -486,8 +574,10 @@ export class TermSession {
         /* ignore */
       }
       this.ws = null;
+      this.emitConnEvent({ type: 'closed' }); // 等待回执的投递项据此归"结果未知"
     }
     this.authed = false;
+    this.connId = null;
   }
 
   private clearTimer(): void {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"ocdeck/internal/application"
 	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
 )
@@ -43,8 +44,15 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 		return newOpErr(codeInternal, kerr)
 	}
 	// P1.4.7：DB 写入经 write* helper 路由（注入 LifecycleService 时走 persist+commit 封装）。
-	updated, err := m.writeStatusConditional(ctx, taskID, StatusActive, StatusSuspending, sql.NullString{})
-	if err != nil {
+	// terminal-file-paste-drop 2.5：active→suspending 提交（离开 active）在 per-task
+	// 协调锁临界区内执行（本方法已持任务锁，锁顺序：任务锁 → 协调锁），与上传
+	// finalize/投递临界区互斥——挂起提交先行时 finalize 复查必见非 active、不发布。
+	var updated application.TransitionResult
+	if err := m.inUploadCoordination(ctx, taskID, func() error {
+		var werr error
+		updated, werr = m.writeStatusConditional(ctx, taskID, StatusActive, StatusSuspending, sql.NullString{})
+		return werr
+	}); err != nil {
 		return newOpErr(codeInternal, err)
 	}
 	if !updated.Matched {
