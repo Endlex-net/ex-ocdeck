@@ -58,6 +58,10 @@ const STATE_LABEL: Record<TermConnState, string> = {
 
 const TOAST_MS = 2000;
 
+/** 成功项瞬时反馈驻留时长：「已发送到终端」在浮层停留该时长后仅从呈现层隐去
+ * （状态机不删项），避免浮层持续遮挡终端输入区；失败/结果未知项保留待重试。 */
+export const FILE_SENT_FEEDBACK_MS = 1200;
+
 /** wsPath 形态区分（design D3）：/ws/terminal/<taskID> 为 TUI（返回 taskID，可消费焦点请求）；
  * /ws/terminal/shell/... 为 shell 实例（返回 null，MUST NOT 消费）。 */
 function tuiTaskIDFromWsPath(wsPath: string): string | null {
@@ -92,6 +96,10 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepth = useRef(0);
   const [dropHover, setDropHover] = useState(false);
+  // 成功项驻留隐去（呈现层语义，状态机契约不变）：已进入「已发送到终端」且
+  // 驻留期满的项 id 集合；定时器按项 id 管理，项消失/实例切换时清理。
+  const [dismissedSentIds, setDismissedSentIds] = useState<readonly string[]>([]);
+  const sentDismissTimers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
 
   // 导航焦点请求（design D3，唯一消费方 = 目标任务 TUI TerminalView）：
   // shell 实例不订阅不消费；本地不持有请求状态，等待/取消期间的请求有效性
@@ -282,6 +290,42 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
     return () => input.removeEventListener('cancel', onCancel);
   }, [tuiTaskID]);
 
+  // 成功项驻留调度：项进入 sent 即起 FILE_SENT_FEEDBACK_MS 定时器，到期把 id 记入
+  // dismissedSentIds（仅呈现层过滤，不触碰 controller 内部状态）；项被移除时清理其定时器。
+  useEffect(() => {
+    const timers = sentDismissTimers.current;
+    if (!fdSnapshot) return;
+    const liveIds = new Set(fdSnapshot.items.map((it) => it.id));
+    for (const [id, timer] of timers) {
+      if (!liveIds.has(id)) {
+        clearTimeout(timer);
+        timers.delete(id);
+      }
+    }
+    for (const it of fdSnapshot.items) {
+      if (it.status !== 'sent' || timers.has(it.id) || dismissedSentIds.includes(it.id)) continue;
+      timers.set(
+        it.id,
+        setTimeout(() => {
+          sentDismissTimers.current.delete(it.id);
+          setDismissedSentIds((prev) => (prev.includes(it.id) ? prev : [...prev, it.id]));
+        }, FILE_SENT_FEEDBACK_MS),
+      );
+    }
+  }, [fdSnapshot, dismissedSentIds]);
+
+  // 终端实例切换（wsPath 变化 → controller 重建、项 id 重新计数）：清空驻留标记与在途
+  // 定时器，避免旧 id 命中新会话的成功项；卸载时一并清理全部定时器。
+  useEffect(() => {
+    for (const timer of sentDismissTimers.current.values()) clearTimeout(timer);
+    sentDismissTimers.current.clear();
+    setDismissedSentIds([]);
+    return () => {
+      for (const timer of sentDismissTimers.current.values()) clearTimeout(timer);
+      sentDismissTimers.current.clear();
+    };
+  }, [wsPath]);
+
   // 焦点请求订阅（design D3）：挂载即可能同步交付 pending 快照（早于挂载的发布）；
   // 回调仅在已 connected 时立即按门禁消费，否则等待 onState('connected')。
   // 等待期的取消不在这里：输入区取消由请求层全局 focusin 守卫负责、路由离开取消由
@@ -373,6 +417,13 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
 
   const showOverlay = state !== 'connected' && state !== 'idle';
   const wrapClass = dropHover ? 'terminal-wrap terminal-drop-hover' : 'terminal-wrap';
+  // 呈现层可见项：驻留期满的成功项被过滤（浮层无待关注内容时整体消失，不遮挡输入区）；
+  // 失败/结果未知项始终保留（重试入口）。
+  const visibleFdItems = fdSnapshot
+    ? fdSnapshot.items.filter(
+        (it) => !(it.status === 'sent' && dismissedSentIds.includes(it.id)),
+      )
+    : [];
 
   return (
     <div className={wrapClass} ref={wrapRef}>
@@ -452,19 +503,12 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
       )}
       {tuiTaskID && (
         <div className="terminal-file-bar">
-          {/* 「选择文件」保持 DOM 首位（测试选择器钉死）；视觉锚定底角由
-              file-delivery.css 的 column-reverse 负责，浮层向上展开。 */}
-          <button
-            type="button"
-            className="terminal-file-pick"
-            onClick={() => fileInputRef.current?.click()}
-          >
-            选择文件
-          </button>
-          {fdSnapshot && (fdSnapshot.items.length > 0 || fdSnapshot.notice) && (
+          {/* 无常驻入口按钮（粘贴/拖拽为主路径，不遮挡输入区）；隐藏 file input 必须保留：
+              失败/未知项的重试重选路径（绑定重试意图的选择器）仍经 openFilePicker 触发它。 */}
+          {fdSnapshot && (visibleFdItems.length > 0 || fdSnapshot.notice) && (
             <div className="terminal-file-panel" aria-live="polite">
               {fdSnapshot.notice && <div className="terminal-file-notice">{fdSnapshot.notice}</div>}
-              {fdSnapshot.items.length > 0 && (
+              {visibleFdItems.length > 0 && (
                 <>
                   <div className="terminal-file-panel-title">
                     文件投递
@@ -473,7 +517,7 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
                     )}
                   </div>
                   <ul className="terminal-file-list">
-                    {fdSnapshot.items.map((it) => (
+                    {visibleFdItems.map((it) => (
                       <li key={it.id} className={`terminal-file-item terminal-file-item-${it.status}`}>
                         <div className="terminal-file-row">
                           <span className="terminal-file-name" title={it.name}>

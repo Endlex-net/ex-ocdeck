@@ -30,7 +30,7 @@
 
 **Goals:**
 
-- 粘贴、拖拽、文件选择三种入口共用的"浏览器文件 → server 受管存储 → 终端注入"链路，仅覆盖 opencode TUI 终端。
+- 粘贴、拖拽常态入口（文件选择器仅用于失败/未知项重试重选）共用的"浏览器文件 → server 受管存储 → 终端注入"链路，仅覆盖 opencode TUI 终端。
 - 复用现有鉴权、输入门禁、串行写路径；WS 协议向后兼容（新旧 client/server 任意组合无异常行为）。
 - 上传按 task 归属管理：task 删除触发该任务上传目录的失效与回收；单文件大小上限强制；保留 TTL 可配置且**默认关闭**。
 
@@ -61,13 +61,13 @@
 |---|---|---|
 | ① 契约冻结 + spike | 本文档契约冻结；D8 端到端 spike | 契约冻结后前后端可分 lane |
 | ② 后端存储/投递闭环 + WS 协议重构 | uploads 存储、上传 handler、deliver/deliver_result、auth_ok connId、清理器、per-task 协调锁、PTY 可中断写入能力 | `ws_terminal.go` 与 bridge 由**单一 lane** 负责 |
-| ③ 前端入口/状态机 | paste/drop/picker 捕获、上传、投递状态 UI | 依赖 ① 的冻结契约 |
+| ③ 前端入口/状态机 | paste/drop 捕获（picker 仅重试重选）、上传、投递状态 UI | 依赖 ① 的冻结契约 |
 | ④ Linux 端到端验收 | 目标环境全链路验收（含多文件完整性） | — |
 
 **步骤图（主路径 + 局部分支）：**
 
 ```
-浏览器捕获 (paste / drop / file picker)
+浏览器捕获 (paste / drop)
   → 门禁 (shouldSendInput 同款判定; syntheticInFlight 固定 false)
   → HTTP 上传 (multipart 分阶段解析: 先 connId part 后 file part; 三段计量, 见 D4)
       ├─ 上传失败 → 明确失败(手动重试 = 重新上传取得新 uploadId)
@@ -203,13 +203,13 @@ deliver 校验通过后向 PTY 写入 `ESC[200~` + 文件绝对路径 + `ESC[201
 
 终端锁定状态是浏览器侧状态（input-gate.ts `locked`），server 无感知。因此：
 
-- 三个入口共用门禁：上传前检查 `shouldSendInput` 同款判定（authed/wsOpen/locked），发送 deliver 前复查。
+- 两个常态入口共用门禁：上传前检查 `shouldSendInput` 同款判定（authed/wsOpen/locked），发送 deliver 前复查。
 - 文件投递是**非合成输入**：门禁调用中 `syntheticInFlight` 固定传 `false`。input-gate.ts 对合成输入有锁定例外（`locked && !syntheticInFlight` 才拦截），该例外 MUST NOT 被无差别复用——锁定状态下文件上传与 deliver 都 MUST 被拦截并提示解锁。
 - server 侧不依赖客户端门禁，仍以 D5 校验为权威；门禁是 UX 层防误操作，不是安全边界。
 
 ### D7: 前端捕获与投递状态机
 
-- 新模块 `web/src/terminal/file-delivery.ts`：三个入口（paste/drop/file picker）进入**同一个文件队列**，共用门禁、归属（connId）、状态机与重试逻辑。仅挂在 `TerminalView` 的 **TUI 实例**上，shell 终端不挂载任何入口；随终端实例生命周期挂载/清理。
+- 新模块 `web/src/terminal/file-delivery.ts`：两个常态入口（paste/drop）进入**同一个文件队列**，共用门禁、归属（connId）、状态机与重试逻辑；文件选择器无常驻入口按钮，仅用于失败/未知项的重试重选（隐藏 input 保留）。仅挂在 `TerminalView` 的 **TUI 实例**上，shell 终端不挂载任何入口；随终端实例生命周期挂载/清理。
 - **paste**：终端容器 capture 阶段原生 listener（先于 xterm textarea）；首个 `await` 前同步提取；确认含文件后同步 `preventDefault()` + `stopPropagation()`；按 `clipboardData.items` 顺序提取有效 File，存在有效 items 时**不合并** `files` 兜底，仅当 items 无有效 File 时才读 `files`；**禁止按文件名/大小推断重复**。纯文本不拦截；文件+文本混合以文件为准。
 - **drop**：`dragover` 阻止默认 + `dropEffect='copy'` + 悬停视觉反馈（dragenter/leave 计数防闪烁）；`drop` 阻止默认防浏览器导航；混合拖入逐项判定：目录项（`DataTransferItem.webkitGetAsEntry()?.isDirectory`）分项拒绝并提示，普通文件继续处理，不遍历目录；拖拽阶段 `files` 可能为空，只在 drop 时读取。
 - **投递状态机（每项）**：
@@ -218,10 +218,10 @@ deliver 校验通过后向 PTY 写入 `ESC[200~` + 文件绝对路径 + `ESC[201
   - `结果未知`：**已发送 deliver 但无确定回执**——回执等待超时 10s / 等待回执期间 WS 断线 / `write_failed`（可能部分写入）；**不自动补发**；可手动重试，UI 提示可能重复。
   - 普通 WS 断线 MUST NOT 把已成功项改为未知。
   - 同一 uploadId 同时最多一个待确认投递；状态已迁移的迟到回执丢弃并记录日志。
-- **connId 能力降级**：auth_ok 缺失或 connId 非法（空串/非 uuid 形态）时，WS 连接照常建立、普通终端功能不受影响；文件功能置为不可用——三种入口捕获到文件时提示"当前 server 版本不支持文件投递"，MUST NOT 发起 HTTP 上传、MUST NOT 发送 deliver 帧，MUST NOT 以空串/undefined/自造值充当 connId。另一条失败路径（非能力降级）：connId 有效但上传接口返回 404（业务 404——如任务已删除——与旧 server 无该路由不可区分）→ 提示"上传目标不可用，任务可能已删除或服务端不支持该接口"，仅终止当前上传项；MUST NOT 把整个连接的文件能力永久降级（后续新上传仍可尝试）。
+- **connId 能力降级**：auth_ok 缺失或 connId 非法（空串/非 uuid 形态）时，WS 连接照常建立、普通终端功能不受影响；文件功能置为不可用——常态入口捕获到文件时提示"当前 server 版本不支持文件投递"，MUST NOT 发起 HTTP 上传、MUST NOT 发送 deliver 帧，MUST NOT 以空串/undefined/自造值充当 connId。另一条失败路径（非能力降级）：connId 有效但上传接口返回 404（业务 404——如任务已删除——与旧 server 无该路由不可区分）→ 提示"上传目标不可用，任务可能已删除或服务端不支持该接口"，仅终止当前上传项；MUST NOT 把整个连接的文件能力永久降级（后续新上传仍可尝试）。
 - **手动重试 = 重新上传**：取得新 uploadId，旧尝试永久结束，旧 uploadId 的回执到达只丢弃 + 日志；重新上传须满足当前 connId（D6 门禁 + D5 代次）；原 File 对象已不可用时 UI 提示用户重新选择文件：打开**绑定该项重试意图的文件选择器**，选中后为该项创建新尝试（新 uploadId，进入暂停期间允许执行的重试调度），用户取消选择则该项保持原状态（未知项所在共享队列保持暂停；完整状态路径见 delivery spec「多文件完整性与投递节奏」共享队列状态表，暂停期间新增项不隐式替代未知项）。
-- **多文件投递节奏（队列级）**：三个入口共享单一队列。队列级暂停/恢复、未知项不因队列恢复补发、单项失败（含本地门禁拒绝——锁定态/未连接，未调用上传/发送接口，归"明确失败"）的分类与后续项继续判定，均以 delivery spec「多文件完整性与投递节奏」的共享队列状态表为唯一来源，design 不重复维护。
-- **状态 UI**：终端区域内的轻量浮层列表，逐项展示文件名/状态/重试；成功文案为"已发送到终端"。浮层"明确失败/结果未知"仅为分项反馈状态，MUST NOT 替代文件消费完整性验收——正常链路、有效文件、目标 TUI 可接收时，每个文件 MUST 在 TUI 实际出现对应结果（附件占位/内联/路径文本）；最终附件**排列顺序**不承诺（spike 实测记录，见 D8）。
+- **多文件投递节奏（队列级）**：常态入口共享单一队列（重试重选路径同样进入该队列）。队列级暂停/恢复、未知项不因队列恢复补发、单项失败（含本地门禁拒绝——锁定态/未连接，未调用上传/发送接口，归"明确失败"）的分类与后续项继续判定，均以 delivery spec「多文件完整性与投递节奏」的共享队列状态表为唯一来源，design 不重复维护。
+- **状态 UI**：终端区域内的轻量浮层列表，逐项展示文件名/状态/重试；成功文案为"已发送到终端"。项进入"已发送到终端"后经约 1200ms 呈现层驻留供用户确认，随后从浮层隐去（仅呈现层，状态机不删项）；浮层仅在存在可见项或提示时呈现——仅剩已隐去的成功项时整个浮层消失，不持续遮挡终端输入区；失败与"结果未知"项始终保留。浮层"明确失败/结果未知"仅为分项反馈状态，MUST NOT 替代文件消费完整性验收——正常链路、有效文件、目标 TUI 可接收时，每个文件 MUST 在 TUI 实际出现对应结果（附件占位/内联/路径文本）；最终附件**排列顺序**不承诺（spike 实测记录，见 D8）。
 - **重连代次**：上传回调闭包捕获上传时 connId（异步完成后仍须满足 D5 代次要求）；auth_ok 更新 connId 后旧回调不得转投新连接。
 
 ### D8: Spike 先行与验证记录
@@ -245,7 +245,7 @@ deliver 校验通过后向 PTY 写入 `ESC[200~` + 文件绝对路径 + `ESC[201
 | 位置 | 职责 |
 |---|---|
 | `web/src/terminal/file-delivery.ts`（新） | 事件捕获、上传、deliver、投递状态机（D7） |
-| `web/src/terminal/TerminalView.tsx` | 仅 TUI 实例挂载/清理 listener、状态浮层、"选择文件"入口 |
+| `web/src/terminal/TerminalView.tsx` | 仅 TUI 实例挂载/清理 listener、状态浮层（成功项驻留后隐去）、隐藏文件选择器（仅重试重选路径使用） |
 | `web/src/terminal/session.ts` | 新增 `sendDeliver(uploadId)`（门禁复查 + connId 代次 + deliver 文本帧） |
 | `web/src/terminal/input-gate.ts` | 复用 `shouldSendInput`；文件投递固定 `syntheticInFlight=false`（D6） |
 | `web/src/api.ts` | 新增 `uploadAttachment(taskID, file, connId)` |

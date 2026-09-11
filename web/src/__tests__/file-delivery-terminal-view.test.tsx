@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { act } from 'react';
-import { TerminalView } from '../terminal/TerminalView';
+import { TerminalView, FILE_SENT_FEEDBACK_MS } from '../terminal/TerminalView';
 import { mount, stubMatchMedia } from './cm-test-env';
 
 /* ==================== terminal-file-paste-drop 5.3：TerminalView 文件投递 UI 骨架 ====================
@@ -175,9 +175,11 @@ afterEach(() => {
 });
 
 describe('TerminalView 文件投递入口挂载（仅 TUI）', () => {
-  it('TUI 实例：挂载「选择文件」按钮与隐藏 file input', () => {
+  it('TUI 实例：无常驻入口按钮（不遮挡输入区），挂载隐藏 file input（重试重选路径）', () => {
     const { container, unmount } = mountTerminal('/ws/terminal/task-1');
-    expect(container.querySelector('.terminal-file-bar button')!.textContent).toBe('选择文件');
+    // 「选择文件」按钮已移除：粘贴/拖拽为主路径；bar 内无任何可见按钮
+    expect(container.querySelector('.terminal-file-bar button')).toBeNull();
+    // 隐藏 file input 必须保留：失败/未知项的重试重选路径经 openFilePicker 触发
     expect(container.querySelector('input[type="file"]')).not.toBeNull();
     unmount();
   });
@@ -472,5 +474,102 @@ describe('文件选择器取消路径（W4）', () => {
     expect(fileStatuses(container)).toEqual(['明确失败']);
     expect(container.querySelector('.terminal-file-item')!.textContent).toContain('不支持目录');
     unmount();
+  });
+});
+
+describe('成功项瞬时反馈（上传成功后浮层不持续遮挡输入区）', () => {
+  // 微任务冲刷：fake timers 下泵循环（upload→deliver 的 promise 链）靠多轮 microtask 推进
+  const flushMicro = async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  };
+
+  it('仅剩成功项：驻留 FILE_SENT_FEEDBACK_MS 瞬时反馈后项隐去、整个浮层消失', async () => {
+    vi.useFakeTimers();
+    try {
+      const { container, unmount } = mountTerminal('/ws/terminal/task-1');
+      const session = sessionMock.instances[0];
+      await act(async () => {
+        host(container).dispatchEvent(
+          pasteEvent([new File(['x'], 'ok.png', { type: 'image/png' })]),
+        );
+        await flushMicro();
+      });
+      expect(session.sentDelivers).toEqual([UPLOAD_A]);
+      await act(async () => {
+        session.emitResult({ uploadId: UPLOAD_A, ok: true });
+      });
+      // 瞬时反馈：成功状态仍可见，供用户确认
+      expect(fileStatuses(container)).toEqual(['已发送到终端']);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(FILE_SENT_FEEDBACK_MS);
+      });
+      // 驻留期满：成功项隐去，浮层无待关注内容整体消失
+      expect(filePanel(container)).toBeNull();
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('失败项保留：成功项隐去后失败项与重试入口仍在（浮层不消失）', async () => {
+    vi.useFakeTimers();
+    try {
+      const { container, unmount } = mountTerminal('/ws/terminal/task-1');
+      const session = sessionMock.instances[0];
+      apiMock.uploadAttachment.mockRejectedValueOnce(new Error('boom'));
+      await act(async () => {
+        host(container).dispatchEvent(
+          pasteEvent([
+            new File(['x'], 'fail.png', { type: 'image/png' }),
+            new File(['x'], 'ok.png', { type: 'image/png' }),
+          ]),
+        );
+        await flushMicro();
+      });
+      await act(async () => {
+        session.emitResult({ uploadId: UPLOAD_A, ok: true });
+      });
+      expect(fileStatuses(container)).toEqual(['明确失败', '已发送到终端']);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(FILE_SENT_FEEDBACK_MS);
+      });
+      // 成功项隐去；失败项保留重试入口，浮层仍在
+      expect(fileStatuses(container)).toEqual(['明确失败']);
+      expect(container.querySelector('.terminal-file-item button')!.textContent).toBe('重试');
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('结果未知项保留（重试可能重复提示不随成功项一并隐去）', async () => {
+    vi.useFakeTimers();
+    try {
+      const { container, unmount } = mountTerminal('/ws/terminal/task-1');
+      const session = sessionMock.instances[0];
+      await act(async () => {
+        host(container).dispatchEvent(
+          pasteEvent([new File(['x'], 'a.png', { type: 'image/png' })]),
+        );
+        await flushMicro();
+      });
+      // 等待回执期间断线 → 结果未知（write_failed 之外同样保留）
+      await act(async () => {
+        session.emitClosed();
+      });
+      expect(fileStatuses(container)).toEqual(['结果未知']);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(FILE_SENT_FEEDBACK_MS * 3);
+      });
+      // 非成功项不受驻留隐去影响：未知项与其提示、重试入口保留
+      expect(fileStatuses(container)).toEqual(['结果未知']);
+      expect(container.querySelector('.terminal-file-item')!.textContent).toContain('重试可能重复');
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -33,7 +33,7 @@
 
 - [x] 5.1 `web/src/terminal/file-delivery.ts`（新）：paste（capture listener 先于 xterm textarea、同步提取 File 后 preventDefault+stopPropagation、items/files 主+fallback、纯文本不拦截）、drop/dragover（防导航、防闪烁）、文件选择器入口；共享队列状态机（排队中（待上传）/上传中/待投递/等待回执 10s/已发送/明确失败/结果未知；write_failed 或回执超时/断线 → 结果未知 + 队列级暂停；仅未知项恢复尝试解除暂停；手动重试 = 重新上传新 uploadId、File 不可用打开绑定该项重试意图的选择器；迟到回执只丢弃+日志）。验证方式：前端单元测试（状态机迁移、暂停/恢复、迟到回执、门禁失败分类）通过
 - [x] 5.2 `web/src/terminal/session.ts` + `web/src/api.ts`：`sendDeliver(uploadId)`（门禁复查 `shouldSendInput` 同款判定、`syntheticInFlight` 固定 false、connId 代次绑定、deliver 文本帧）；`uploadAttachment(taskID, file, connId)`（FormData 先 append connId 后 append file）；auth_ok connId 接收与能力降级（无 connId → 提示不支持、不发起上传/投递；有效 connId 上传 404 → 单项失败文案、不永久降级）。验证方式：session/api 单元测试（帧格式、代次过期丢弃、降级路径）通过
-- [x] 5.3 `web/src/terminal/TerminalView.tsx`：仅 TUI 实例挂载/清理 listener 与状态浮层（逐项文件名/状态/重试，成功文案"已发送到终端"）、"选择文件"入口；shell 终端不挂任何入口。验证方式：组件测试（TUI 挂载/shell 不挂载、浮层状态呈现、拖拽视觉反馈）通过
+- [x] 5.3 `web/src/terminal/TerminalView.tsx`：仅 TUI 实例挂载/清理 listener 与状态浮层（逐项文件名/状态/重试，成功文案"已发送到终端"，成功项约 1200ms 驻留后从浮层隐去、仅剩成功项时浮层消失）、隐藏文件选择器（仅失败/未知项重试重选路径使用，无常驻按钮）；shell 终端不挂任何入口。验证方式：组件测试（TUI 挂载/shell 不挂载、浮层状态呈现、成功项隐去、拖拽视觉反馈）通过
 
 ## 6. 端到端验收（目标 Linux）
 
