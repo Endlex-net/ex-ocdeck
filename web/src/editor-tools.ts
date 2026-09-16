@@ -233,6 +233,11 @@ export function buildCustomEditorUri(tool: CustomEditorTool, path: string): stri
   return tool.template.split('{path}').join(encodeTemplatePath(normalized));
 }
 
+/** 唤起 URI 是否为 http/https scheme（大小写不敏感）：是则调用侧以新标签页打开，其余 scheme 保持同标签导航（vscode:// 等本机唤起）。 */
+export function isHttpUri(uri: string): boolean {
+  return /^https?:/i.test(uri);
+}
+
 /**
  * 编辑器唤起 URI 构造（design.md D3/D7，spec 逐字同一契约）：
  * template 合法（含 {path} 且 scheme 前缀属于该工具族）→ 全部 {path} 替换为注入值，

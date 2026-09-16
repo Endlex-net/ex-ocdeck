@@ -3,6 +3,7 @@ import {
   buildCustomEditorUri,
   buildEditorUri,
   EDITOR_TOOLS_CHANGED,
+  isHttpUri,
   isUsableCustomTool,
   loadCustomEditorTools,
   loadDefaultTool,
@@ -130,8 +131,13 @@ export function OpenInEditorMenu({ worktreePath }: { worktreePath: string }) {
       setStored(storedKeyOf(tool));
     }
     // ③ 同一用户手势调用链内同步唤起；同步异常捕获、页面保持可用、已保存默认不回滚。
+    // http(s) URI（自定义工具当网页用）以新标签页打开；其余 scheme（vscode:// 等本机编辑器）同标签导航。
     try {
-      window.location.assign(uri);
+      if (isHttpUri(uri)) {
+        window.open(uri, '_blank', 'noopener,noreferrer');
+      } else {
+        window.location.assign(uri);
+      }
     } catch {
       /* 唤起失败不可观测（design D2 行为边界），不做状态变更 */
     }
