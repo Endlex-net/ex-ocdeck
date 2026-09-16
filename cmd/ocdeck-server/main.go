@@ -31,6 +31,7 @@ import (
 	ocdecktask "ocdeck/internal/domain/task"
 	"ocdeck/internal/infrastructure/ai"
 	"ocdeck/internal/infrastructure/auditlog"
+	"ocdeck/internal/infrastructure/branchprefix"
 	"ocdeck/internal/infrastructure/eventbus"
 	"ocdeck/internal/infrastructure/lifecycle"
 	"ocdeck/internal/infrastructure/notify"
@@ -151,6 +152,10 @@ func run() error {
 		defer al.Close()
 	}
 
+	// task-info-editable D4 装配：分支前缀配置 Store。LoadStore 对不存在/损坏配置均降级
+	// 缺省 ocdeck 并记日志（不拒绝启动），无需 err 处理；单实例同时注入创建路径与 API 层。
+	prefixStore := branchprefix.LoadStore(cfg.DataDir)
+
 	// TaskManager 构造（design.md §18）。
 	adapter := task.NewStoreAdapter(db)
 	// P1.4.4/P1.4.5 wiring：sqlite adapter 实现 application ports（TaskRepository +
@@ -186,6 +191,7 @@ func run() error {
 		Lifecycle:          lifecycleSvc,                       // P1.4.4：Get/List/Archive/Restore 委托
 		Publish:            bus,                                // idle-reminder-user-activity：用户活动上报经同一 bus 发布 task.user_activity
 		UploadCoordination: uploadOrch.Coordination(),          // terminal-file-paste-drop 2.5：离开 active 的提交入协调锁
+		BranchPrefix:       prefixStore.Prefix,                 // task-info-editable D4/D5：创建路径前缀快照
 	})
 	// 注入 Manager 生命周期 context（design.md §4：SSE/退出监视挂进程 ctx，非 HTTP request ctx）。
 	tm.SetLifecycleCtx(ctx)
@@ -216,7 +222,7 @@ func run() error {
 	// F12①：收敛→开放序列收口在 diffReviewStartupGate，run() 与 main_test.go 共用同一函数
 	//（测试断言的是生产编排的 fail-closed 语义，而非复制模拟编排）。
 	return diffReviewStartupGate(ctx, tm, func() error {
-		return serveAndShutdown(ctx, tm, cfg, db, bus, aiStore, wd, diffSvc, uploadOrch, uploadConns)
+		return serveAndShutdown(ctx, tm, cfg, db, bus, aiStore, wd, diffSvc, uploadOrch, uploadConns, prefixStore)
 	})
 }
 
@@ -224,7 +230,7 @@ func run() error {
 // 上传编排启动（扫描/订阅/清理器）→ Reconcile（失败 fail-closed 拒绝开放 HTTP）→
 // 后台周期重试 → API 装配与阻塞服务 → 关停序列。
 // diffSvc 注入 API 层（diff-review-workbench D8 路由），须在 RebuildRoutes 前生效。
-func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config, db *store.DB, bus *eventbus.Bus, aiStore *ai.Store, wd *process.WatchdogManager, diffSvc *diffreview.Service, uploadOrch *appuploads.Orchestrator, uploadConns *currentConnPort) error {
+func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config, db *store.DB, bus *eventbus.Bus, aiStore *ai.Store, wd *process.WatchdogManager, diffSvc *diffreview.Service, uploadOrch *appuploads.Orchestrator, uploadConns *currentConnPort, prefixStore *branchprefix.Store) error {
 	// 受管上传启动序列（terminal-file-paste-drop 2.4）：启动恢复扫描（失败记日志，
 	// 不阻断启动——遗留产物按孤儿规则由周期清理收敛）→ 订阅 task.deleted 与周期清理。
 	// 先扫描后订阅：订阅起点覆盖 Reconcile 期间的删除事件。Reconcile 失败提前返回时
@@ -291,6 +297,9 @@ func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config,
 	srv.SetNotificationStore(notifyStore)
 	srv.SetNotificationTester(notifier)
 	srv.SetPaletteConfigStore(palette.LoadStore(cfg.DataDir))
+	// task-info-editable D4：分支前缀配置注入 API 层（GET/PUT /config/branch-prefix），
+	// 与创建路径共用 run() 装配的同一 Store 实例（保存后新任务立即可见）。
+	srv.SetBranchPrefixStore(prefixStore)
 
 	srv.RebuildRoutes()
 	if wd != nil {

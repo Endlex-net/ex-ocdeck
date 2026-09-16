@@ -65,20 +65,21 @@ func TestProjectDirSlug_TruncatesDashedNameStripsTrailingDash(t *testing.T) {
 }
 
 func TestBranchDirSlug_StripsOcdeckPrefix(t *testing.T) {
-	if got := branchDirSlug("ocdeck/my-feature"); got != "my-feature" {
+	if got := branchDirSlug("ocdeck/my-feature", "ocdeck"); got != "my-feature" {
 		t.Errorf("branchDirSlug = %q, want my-feature", got)
 	}
 }
 
 func TestBranchDirSlug_NoOcdeckPrefix(t *testing.T) {
-	if got := branchDirSlug("feature/x"); got != "feature-x" {
+	// 分支名不以 <prefix>/ 开头时原样进入 normalize（显式 slug 含 / 在此折叠为目录段）。
+	if got := branchDirSlug("feature/x", "ocdeck"); got != "feature-x" {
 		t.Errorf("branchDirSlug = %q, want feature-x", got)
 	}
 }
 
 func TestBranchDirSlug_TruncatesAndStripsTrailingDash(t *testing.T) {
 	long := "ocdeck/" + strings.Repeat("a", 60)
-	got := branchDirSlug(long)
+	got := branchDirSlug(long, "ocdeck")
 	if len(got) != 50 {
 		t.Errorf("branchDirSlug len = %d, want 50", len(got))
 	}
@@ -89,7 +90,7 @@ func TestBranchDirSlug_TruncatesAndStripsTrailingDash(t *testing.T) {
 
 func TestBranchDirSlug_EmptyAfterNormalizeFallsBackToTask(t *testing.T) {
 	// 纯中文分支名（去 ocdeck/ 前缀后 normalize 为空）→ 兜底 task
-	if got := branchDirSlug("ocdeck/中文分支"); got != "task" {
+	if got := branchDirSlug("ocdeck/中文分支", "ocdeck"); got != "task" {
 		t.Errorf("branchDirSlug = %q, want task", got)
 	}
 }
@@ -100,7 +101,7 @@ func TestNewWorktreePath_Format(t *testing.T) {
 	m := newManagerWithDataDir(t, t.TempDir())
 	proj := ProjectRow{ID: "abcdef1234567890", Name: "My Project", DefaultBranch: "main"}
 	branch := "ocdeck/my-feature"
-	dest, err := m.newWorktreePath(proj, branch)
+	dest, err := m.newWorktreePath(proj, branch, "ocdeck")
 	if err != nil {
 		t.Fatalf("newWorktreePath: %v", err)
 	}
@@ -130,7 +131,7 @@ func TestNewWorktreePath_PureChineseProjectNameFallsBackToProjectIDPrefix(t *tes
 	m := newManagerWithDataDir(t, t.TempDir())
 	proj := ProjectRow{ID: "abcdef1234567890abcdef1234567890", Name: "纯中文项目"}
 	branch := "ocdeck/feat"
-	dest, err := m.newWorktreePath(proj, branch)
+	dest, err := m.newWorktreePath(proj, branch, "ocdeck")
 	if err != nil {
 		t.Fatalf("newWorktreePath: %v", err)
 	}
@@ -149,7 +150,7 @@ func TestNewWorktreePath_LongBranchNameTruncatedBranchUnchanged(t *testing.T) {
 	proj := ProjectRow{ID: "id1234567890", Name: "proj"}
 	longSeg := strings.Repeat("a", 80)
 	branch := "ocdeck/" + longSeg
-	dest, err := m.newWorktreePath(proj, branch)
+	dest, err := m.newWorktreePath(proj, branch, "ocdeck")
 	if err != nil {
 		t.Fatalf("newWorktreePath: %v", err)
 	}
@@ -213,7 +214,7 @@ func TestNewWorktreePath_CollisionRetryPicksNewSuffix(t *testing.T) {
 	}
 	m := newManagerWithRand(t, tmp, (&seqRand4{seq: []string{first, second}}).Next)
 
-	dest, err := m.newWorktreePath(proj, branch)
+	dest, err := m.newWorktreePath(proj, branch, "ocdeck")
 	if err != nil {
 		t.Fatalf("newWorktreePath: %v", err)
 	}
@@ -236,7 +237,7 @@ func TestNewWorktreePath_CollisionExhaustedAfterThreeAttempts(t *testing.T) {
 	}
 	m := newManagerWithRand(t, tmp, (&seqRand4{seq: []string{"aaaa", "bbbb", "cccc"}}).Next)
 
-	_, err := m.newWorktreePath(proj, branch)
+	_, err := m.newWorktreePath(proj, branch, "ocdeck")
 	if err == nil {
 		t.Fatal("expected error after 3 collisions")
 	}
@@ -256,7 +257,7 @@ func TestNewWorktreePath_RandFailureNoSideEffect(t *testing.T) {
 	randErr := errors.New("entropy source broken")
 	m := newManagerWithRand(t, tmp, func() (string, error) { return "", randErr })
 
-	_, err := m.newWorktreePath(proj, branch)
+	_, err := m.newWorktreePath(proj, branch, "ocdeck")
 	if err == nil {
 		t.Fatal("expected error on rand failure")
 	}
@@ -288,7 +289,7 @@ func TestNewWorktreePath_StatErrorNonNotExist(t *testing.T) {
 	})
 	proj := ProjectRow{ID: "abcdef1234567890", Name: "proj"}
 	branch := "ocdeck/feat"
-	_, err := m.newWorktreePath(proj, branch)
+	_, err := m.newWorktreePath(proj, branch, "ocdeck")
 	if err == nil {
 		t.Fatal("newWorktreePath should fail when os.Stat returns non-IsNotExist error")
 	}

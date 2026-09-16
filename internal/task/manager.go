@@ -101,6 +101,17 @@ type TaskStore interface {
 	// ListActiveTaskOverview 聚合全部 active 任务的跨项目概览
 	//（cross-project-active-sessions D2：JOIN projects + LEFT JOIN task_sessions）。
 	ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOverviewRow, error)
+	// --- 任务信息修改 + 改名恢复意图（task-info-editable D6；签名与 application.TaskRepository 对齐） ---
+
+	// CommitTaskInfoUpdate 单事务原子提交任务信息业务列（presence 语义 nil=不修改）并清除
+	// rename_pending 意图；Changed 仅由业务列真实变化决定，意图清除不推进 updated_at。
+	CommitTaskInfoUpdate(ctx context.Context, id string, update application.TaskInfoUpdate) (application.MutationResult, error)
+	// SetTaskRenamePending / ClearTaskRenamePending 写入/清除改名恢复意图 JSON 元数据
+	//（MUST NOT 推进 updated_at）。
+	SetTaskRenamePending(ctx context.Context, id string, pendingJSON string) (application.MutationResult, error)
+	ClearTaskRenamePending(ctx context.Context, id string) (application.MutationResult, error)
+	// GetTaskRenamePending 读取未收敛改名意图 JSON（nil = 无意图）。仅供内部收敛编排消费。
+	GetTaskRenamePending(ctx context.Context, id string) (*string, error)
 }
 
 // AcquirePermitResult 是 AcquireRecoveryPermit 的结构化结果（对齐 store.AcquirePermitResult）。
@@ -301,6 +312,22 @@ type Manager struct {
 	// nil 时（测试构造未注入）两方法 no-op。
 	publish application.Publisher
 
+	// titleSync 为任务名称提交后的会话标题同步 seam（task-info-editable D3）。
+	// New 时未注入则接线生产实现 syncSessionTitle（best-effort：无 runtime/锚定时 no-op，
+	// 404/网络降级 notice）；测试可显式覆盖以观察 seam 调用。
+	titleSync func(ctx context.Context, taskID, title string)
+
+	// branchPrefixFn 读取全局 worktree 分支前缀配置快照（task-info-editable D4/D5）。
+	// 创建流程在分支命名前读取一次，以该快照值驱动分支命名与 worktree 路径段生成。
+	// nil 时（测试构造未装配）回退缺省 defaultBranchPrefix。
+	branchPrefixFn func() string
+
+	// titleCaps 为标题能力缓存 + inflight 合并注册表（task-info-editable D3：capRegistry
+	// 同构；挂 Manager 实例内，随 Manager 回收，无全局清理需求）。经 getTitleCapRegistry
+	// 懒初始化（防御未走 New 的直构路径）。
+	titleCapMu sync.Mutex
+	titleCaps  *titleCapRegistry
+
 	// uploadCoordination 为 terminal-file-paste-drop 2.5 的 per-task 协调锁端口
 	//（design D5）：任务离开 active 的提交经 inUploadCoordination 在协调锁临界区内
 	// 执行，与上传提交/投递/清理串行化。nil 时（测试构造未注入）直接执行提交。
@@ -452,6 +479,13 @@ type Options struct {
 	// 投递/清理串行化；生产 wiring 注入 *appuploads.Coordination。nil 时提交直接
 	// 执行（测试未注入时行为不变）。
 	UploadCoordination UploadCoordination
+	// TitleSync 可选：任务名称提交后的会话标题同步 seam（task-info-editable D3）。
+	// 仅在名称实际变更的本地提交成功后被调用（参数为重读后的最新名称）。
+	// nil 时 New 接线生产实现 syncSessionTitle；测试可注入以观察 seam 调用。
+	TitleSync func(ctx context.Context, taskID, title string)
+	// BranchPrefix 可选：全局 worktree 分支前缀配置快照读取器（task-info-editable D4/D5）。
+	// 生产 wiring 注入 branchprefix.Store.Prefix；nil 时创建路径回退缺省前缀。
+	BranchPrefix func() string
 }
 
 // New 构造 Manager。OCFactory 为 nil 时用默认 opencode.Client 工厂。
@@ -471,6 +505,8 @@ func New(opts Options) *Manager {
 		taskRepo:                opts.TaskRepo,
 		lifecycle:               opts.Lifecycle,
 		publish:                 opts.Publish,
+		titleSync:               opts.TitleSync,
+		branchPrefixFn:          opts.BranchPrefix,
 		uploadCoordination:      opts.UploadCoordination,
 		runtimes:                make(map[string]*taskRuntime),
 		runtimeRegistry:         runtime.New(),
@@ -482,6 +518,11 @@ func New(opts Options) *Manager {
 	}
 	if m.ocFactory == nil {
 		m.ocFactory = defaultOCFactory
+	}
+	// task-info-editable D3：titleSync seam 未注入时接线生产实现（best-effort，
+	// 无 runtime/锚定时 no-op——测试构造未激活任务的路径行为与 Phase 2 一致）。
+	if m.titleSync == nil {
+		m.titleSync = m.syncSessionTitle
 	}
 	if m.logDir == "" && m.cfg != nil {
 		m.logDir = m.cfg.DataDir + "/logs"
@@ -918,6 +959,16 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	// kill 模式：按 shutdownPolicy 清理全部任务会话，确认 runtime 已空。
 	policy := m.cfg.ShutdownPolicy
 	if policy == config.ShutdownKillOnStart || policy == config.ShutdownKillImmediate {
+		// task-info-editable D2 仲裁表：kill 模式关停清理将状态/快照写入与进程终止分离——
+		// 先执行 R1；不可收敛 → 保留意图、任务状态与快照不变，但既有进程终止与 goroutine
+		// join 照常执行；R1 错误与清理错误聚合后以非 nil 返回 Shutdown（watchdog 按既有
+		// 契约保留兜底，本次退出不报告为干净成功）。
+		tasks, terr := m.store.ListAllTasks(ctx)
+		if terr != nil {
+			killErr = errors.Join(killErr, fmt.Errorf("shutdown: list tasks for rename pending converge: %w", terr))
+		} else if rerr := m.convergeAllRenamePendings(ctx, tasks); rerr != nil {
+			killErr = errors.Join(killErr, fmt.Errorf("shutdown: converge rename pendings: %w", rerr))
+		}
 		killErr = errors.Join(killErr, m.shutdownKillAllSessions(ctx))
 		if killErr != nil {
 			// 记录但继续停 runtime goroutine，避免 goroutine 泄漏；错误向上传播。

@@ -238,42 +238,71 @@ func (m *Manager) Create(ctx context.Context, projectID string, opts CreateTaskO
 
 	// 按 kind + mode 分叉（add-local-path-task-mode D2/D3：未提交意图入口，
 	// 任何状态写入与副作用前拒绝、零副作用）。
+	// branch_slug presence/trim 判定在 Manager 侧统一执行（task-info-editable D5 字段传递链）：
+	// 缺失/null/trim 后空串 = 未提供；非空 trim 后原样透传。
+	branchSlug := ""
+	if opts.BranchSlug != nil {
+		branchSlug = strings.TrimSpace(*opts.BranchSlug)
+	}
 	switch proj.Kind {
 	case ProjectKindRepo:
 		switch opts.Mode {
 		case "", TaskModeWorktree:
-			return m.createRepo(ctx, projectID, opts.Name, proj, opts.BaseRef, permissionMode)
+			return m.createRepo(ctx, projectID, opts.Name, proj, opts.BaseRef, permissionMode, branchSlug)
 		case TaskModeLocalPath:
-			return m.createInPlace(ctx, projectID, opts.Name, proj, opts.BaseRef, permissionMode)
+			return m.createInPlace(ctx, projectID, opts.Name, proj, opts.BaseRef, permissionMode, branchSlug)
 		default:
 			return TaskRow{}, newOpErr(codeInvalidInput, fmt.Errorf("unknown task mode %q", opts.Mode))
 		}
 	case ProjectKindDir:
 		// dir 项目恒为就地运行；显式 worktree 组合在入口拒绝（defensive，API 层 3.1 亦有组合校验）。
-		// base_ref 原样传入：dir + 非空 base_ref → invalid_input（决策表「现状不变」，
+		// base_ref/branch_slug 原样传入：dir + 非空值 → invalid_input（决策表「现状不变」，
 		// 由 createInPlace 入口统一拒绝）。
 		if opts.Mode != "" && opts.Mode != TaskModeLocalPath {
 			return TaskRow{}, newOpErr(codeInvalidInput, fmt.Errorf("mode %q is not allowed for dir project", opts.Mode))
 		}
-		return m.createInPlace(ctx, projectID, opts.Name, proj, opts.BaseRef, permissionMode)
+		return m.createInPlace(ctx, projectID, opts.Name, proj, opts.BaseRef, permissionMode, branchSlug)
 	default:
 		// 未知持久化 kind（DB 损坏值）→ internal（D1：区别于用户请求非法 kind 的 invalid_input）。
 		return TaskRow{}, newOpErr(codeInternal, fmt.Errorf("unknown project kind %q", proj.Kind))
 	}
 }
 
-// createRepo 实现 repo 项目任务创建（ai-worktree-naming D5 + add-plain-dir-project D10）。
+// defaultBranchPrefix 缺省分支前缀（task-info-editable D4；branchPrefixFn 未装配时回退）。
+const defaultBranchPrefix = "ocdeck"
+
+// branchPrefixSnapshot 读取全局分支前缀配置快照（D5：创建流程单次读取）。
+// 未装配（nil）或读到空串时回退缺省 ocdeck。
+func (m *Manager) branchPrefixSnapshot() string {
+	if m.branchPrefixFn != nil {
+		if p := m.branchPrefixFn(); p != "" {
+			return p
+		}
+	}
+	return defaultBranchPrefix
+}
+
+// createRepo 实现 repo 项目任务创建（ai-worktree-naming D5 + add-plain-dir-project D10
+// + task-info-editable D5）。
 // base_ref 缺省落库 refs/heads/<proj.DefaultBranch>；提供短名则解析为全限定 ref。
 // permissionMode 已由 Create 归一化/复核（task-permission-mode D2），原样落库。
-func (m *Manager) createRepo(ctx context.Context, projectID, taskName string, proj ProjectRow, baseRef, permissionMode string) (TaskRow, error) {
+// branchSlug 为 Create 已 trim 的显式分支 slug（空 = 未提供）：非空时直接使用（跳过 LLM
+// 与机械 slugify），沿既有 check-ref-format + 冲突检查。分支前缀在命名前单次读取快照
+//（D5：以同一快照值驱动分支命名与 worktree 路径段生成）。
+func (m *Manager) createRepo(ctx context.Context, projectID, taskName string, proj ProjectRow, baseRef, permissionMode, branchSlug string) (TaskRow, error) {
 	taskID := newTaskID()
-	// 分支 slug 经 Namer 提炼（ai-worktree-naming D3/D4）：nil 时回退到本包 Slugify
-	//（构造期或测试未注入时的防御，杜绝 panic）。
-	slug := Slugify(taskName)
-	if m.namer != nil {
-		slug = m.namer.Slug(ctx, taskName)
+	// 分支命名：显式 slug 直接使用（跳过 LLM/slugify）；未提供经 Namer 提炼
+	//（ai-worktree-naming D3/D4）：nil 时回退到本包 Slugify（构造期或测试未注入的防御，杜绝 panic）。
+	if branchSlug == "" {
+		if m.namer != nil {
+			branchSlug = m.namer.Slug(ctx, taskName)
+		} else {
+			branchSlug = Slugify(taskName)
+		}
 	}
-	branch := "ocdeck/" + slug
+	// 前缀快照单次读取（D5）：同一值驱动分支命名与目录段派生。
+	prefix := m.branchPrefixSnapshot()
+	branch := prefix + "/" + branchSlug
 	repoPath := proj.Path
 
 	// P1：Create 前置检查（design.md §19：项目存在、分支名 check-ref-format、分支名不冲突）
@@ -300,7 +329,7 @@ func (m *Manager) createRepo(ctx context.Context, projectID, taskName string, pr
 
 	// dest 生成循环（D5：分支检查通过后再生成路径）：rand4+os.Stat≤3 次碰撞重试。
 	// 碰撞/rand/stat 异常 → 直接返回错误，零副作用（无落库、无 Add）。
-	wtPath, err := m.newWorktreePath(proj, branch)
+	wtPath, err := m.newWorktreePath(proj, branch, prefix)
 	if err != nil {
 		return TaskRow{}, newOpErr(codeInternal, fmt.Errorf("compute worktree path: %w", err))
 	}
@@ -382,9 +411,10 @@ func (m *Manager) createRepo(ctx context.Context, projectID, taskName string, pr
 // 落库 mode='local-path'（MUST NOT 落到 DB DEFAULT 'worktree'）。
 // permissionMode 已由 Create 归一化/复核（task-permission-mode D2），原样落库。
 // 落库前做无副作用目录预检（EvalSymlinks+IsDir，否则 invalid_state 不落 creating 行）。
-// 提供 base_ref → invalid_input 零副作用（dir 与 repo local-path 均不接受 base_ref）。
+// 提供 base_ref / 非空 branch_slug → invalid_input 零副作用（dir 与 repo local-path 均不接受，
+// task-info-editable D5：与 base_ref 组合校验同位）。
 // creation_failed 仅可能来自 lifecycle 配置读取失败或提交点失败。
-func (m *Manager) createInPlace(ctx context.Context, projectID, taskName string, proj ProjectRow, baseRef, permissionMode string) (TaskRow, error) {
+func (m *Manager) createInPlace(ctx context.Context, projectID, taskName string, proj ProjectRow, baseRef, permissionMode, branchSlug string) (TaskRow, error) {
 	if baseRef != "" {
 		if proj.Kind == ProjectKindRepo {
 			// repo 项目 local-path 模式任务不接受 base_ref（就地运行无基线分支语义）。
@@ -392,6 +422,14 @@ func (m *Manager) createInPlace(ctx context.Context, projectID, taskName string,
 		}
 		// dir 项目不接受 base_ref（add-plain-dir-project D10/spec：提供即 invalid_input）。
 		return TaskRow{}, newOpErr(codeInvalidInput, errors.New("base_ref is not allowed for dir project"))
+	}
+	if branchSlug != "" {
+		if proj.Kind == ProjectKindRepo {
+			// repo 项目 local-path 模式任务不接受 branch_slug（task-info-editable D5）。
+			return TaskRow{}, newOpErr(codeInvalidInput, errors.New("branch_slug is not allowed for local-path task"))
+		}
+		// dir 项目任务不接受 branch_slug（无分支命名语义，task-info-editable D5）。
+		return TaskRow{}, newOpErr(codeInvalidInput, errors.New("branch_slug is not allowed for dir project"))
 	}
 	// 目录存在性预检（无副作用，落库前完成）：存在且为目录，否则 invalid_state。
 	canonicalPath, err := filepath.EvalSymlinks(proj.Path)
@@ -1007,12 +1045,16 @@ func projectDirSlug(proj ProjectRow) string {
 	return slug
 }
 
-// branchDirSlug 由分支名派生目录段：去 ocdeck/ 前缀，normalizeSlug 截断 ≤50，
-// 去尾部 -，截空兜底 task。分支名本身不变——目录段只是派生展示。
-func branchDirSlug(branch string) string {
+// branchDirSlug 由分支名派生目录段（task-info-editable D5 参数化）：去 <prefix>/ 前缀，
+// normalizeSlug 截断 ≤50，去尾部 -，截空兜底 task。显式 slug 含 /、大写、非 ASCII 字符
+// 在此折叠为合法目录段（规范化只作用于目录段，分支名本身保留 git 合法字符）。
+// 分支名本身不变——目录段只是派生展示。
+func branchDirSlug(branch, prefix string) string {
 	seg := branch
-	if strings.HasPrefix(seg, "ocdeck/") {
-		seg = strings.TrimPrefix(seg, "ocdeck/")
+	if prefix != "" {
+		if p := prefix + "/"; strings.HasPrefix(seg, p) {
+			seg = strings.TrimPrefix(seg, p)
+		}
 	}
 	seg = normalizeSlug(seg)
 	if len(seg) > 50 {
@@ -1025,13 +1067,14 @@ func branchDirSlug(branch string) string {
 	return seg
 }
 
-// newWorktreePath 计算并校验新 worktree 路径（task 包唯一计算点，ai-worktree-naming）：
-// <dataDir>/worktrees/<projectNameSlug>/<branchPathSlug>-<rand4>。
+// newWorktreePath 计算并校验新 worktree 路径（task 包唯一计算点，ai-worktree-naming
+// + task-info-editable D5）：<dataDir>/worktrees/<projectNameSlug>/<branchPathSlug>-<rand4>。
+// prefix 为创建时刻读取的前缀快照（与分支命名同一值，避免并发配置更新致派生不一致）。
 // 碰撞预检（落库前、无副作用）：rand4 → dest → os.Stat(dest) 已存在则重生（≤3 次）；
 // 3 次均碰撞 → 返回错误；os.Stat 返回 IsNotExist 以外错误 → 直接返回错误。
-func (m *Manager) newWorktreePath(proj ProjectRow, branch string) (string, error) {
+func (m *Manager) newWorktreePath(proj ProjectRow, branch, prefix string) (string, error) {
 	projSlug := projectDirSlug(proj)
-	branchSlug := branchDirSlug(branch)
+	branchSlug := branchDirSlug(branch, prefix)
 	base := filepath.Join(m.cfg.DataDir, "worktrees", projSlug)
 	// rand4Fn 默认由 New 注入为 crypto/rand 实现；直接构造 &Manager{} 的测试需经
 	// newManagerWithDataDir 等助手或显式赋值，此处 nil 防御回退包级 rand4 杜绝 panic。

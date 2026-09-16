@@ -31,6 +31,33 @@ type fakeTaskBackend struct {
 	activityMu         sync.Mutex
 	activityCalls      []string
 	shellActivityCalls []string
+	// --- task-info-editable 3.4：UpdateTaskInfo 桩（槽位 + 调用记录，PATCH handler 测试用） ---
+	updateInfoRes    application.TaskRow
+	updateInfoErr    error
+	updateInfoTaskID string
+	updateInfoMu     sync.Mutex
+	updateInfoCalls  []application.UpdateTaskInfoOptions
+}
+
+func (f *fakeTaskBackend) UpdateTaskInfo(ctx context.Context, taskID string, opts application.UpdateTaskInfoOptions) (application.TaskRow, error) {
+	f.updateInfoMu.Lock()
+	f.updateInfoTaskID = taskID
+	f.updateInfoCalls = append(f.updateInfoCalls, opts)
+	f.updateInfoMu.Unlock()
+	if f.updateInfoErr != nil {
+		return application.TaskRow{}, f.updateInfoErr
+	}
+	if f.updateInfoRes.ID == "" {
+		return application.TaskRow{ID: taskID, ProjectID: "p1", Name: "n", Status: "suspended", Mode: "worktree", PermissionMode: "ask"}, nil
+	}
+	return f.updateInfoRes, nil
+}
+
+// updateInfoCallsSnapshot 返回已发生的 UpdateTaskInfo 调用选项拷贝（并发安全读）。
+func (f *fakeTaskBackend) updateInfoCallsSnapshot() []application.UpdateTaskInfoOptions {
+	f.updateInfoMu.Lock()
+	defer f.updateInfoMu.Unlock()
+	return append([]application.UpdateTaskInfoOptions(nil), f.updateInfoCalls...)
 }
 
 func (f *fakeTaskBackend) Create(ctx context.Context, projectID string, opts application.CreateTaskOptions) (application.TaskRow, error) {
