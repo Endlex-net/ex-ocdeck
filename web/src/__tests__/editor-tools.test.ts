@@ -9,6 +9,7 @@ import {
   GOLAND_KEY,
   GOLAND_URI_TEMPLATE_KEY,
   isUsableCustomTool,
+  isHttpUri,
   isValidCustomUriTemplate,
   isValidUriTemplate,
   loadCustomEditorTools,
@@ -326,6 +327,28 @@ describe('buildCustomEditorUri（自定义工具唤起 URI）', () => {
 
   it('空路径 → 空串', () => {
     expect(buildCustomEditorUri(tool, '')).toBe('');
+  });
+});
+
+describe('isHttpUri（唤起 URI scheme 谓词：http/https → 新标签页，其余 → 同标签导航）', () => {
+  it('http/https → true（大小写不敏感）', () => {
+    expect(isHttpUri('http://example.com/x')).toBe(true);
+    expect(isHttpUri('https://example.com/x')).toBe(true);
+    expect(isHttpUri('HTTP://EXAMPLE.COM')).toBe(true);
+    expect(isHttpUri('Https://Example.Com/x')).toBe(true);
+  });
+
+  it('非 http scheme → false', () => {
+    expect(isHttpUri('vscode://file/Users/me/proj/')).toBe(false);
+    expect(isHttpUri('goland://open?file=/tmp/wt')).toBe(false);
+    expect(isHttpUri('myapp://open?path=/tmp/wt')).toBe(false);
+    expect(isHttpUri('file:///tmp/wt')).toBe(false);
+  });
+
+  it('边界：空串、无 scheme、非 http(s) 开头的相似前缀 → false', () => {
+    expect(isHttpUri('')).toBe(false);
+    expect(isHttpUri('/tmp/wt')).toBe(false);
+    expect(isHttpUri('httpx://x')).toBe(false); // 前缀必须是 http: / https:（含冒号）
   });
 });
 

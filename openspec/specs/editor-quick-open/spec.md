@@ -213,7 +213,7 @@ Cursor 分支 MUST 与 VSCode 分支同构：`cursor://file/` 前缀 + 分段编
 
 自定义工具模板的安全边界 MUST 为：模板包含至少一个 `{path}` 占位符，且 scheme 匹配通用 URI scheme 语法（`^[a-zA-Z][a-zA-Z0-9+.-]*:`）且 scheme（大小写不敏感）不属于危险名单 `javascript:`、`data:`、`vbscript:`、`file:`。不满足条件的模板 MUST 按不可用处理：该工具不出现在快捷打开列表的可用集合中，设置面板保留原文（便于草稿修正）并给出提示；存储值 MUST NOT 因此被改写。
 
-自定义工具的唤起 URI MUST 为：模板中全部 `{path}` 替换为模板路径注入值（与内置模板注入同一编码语义）；自定义工具 MUST NOT 回退到任何内置分支——不可用时点击即零副作用（不唤起、不写默认、仅关闭菜单）。
+自定义工具的唤起 URI MUST 为：模板中全部 `{path}` 替换为模板路径注入值（与内置模板注入同一编码语义）；自定义工具 MUST NOT 回退到任何内置分支——不可用时点击即零副作用（不唤起、不写默认、仅关闭菜单）。构造出的 URI scheme（大小写不敏感）为 http/https 时 MUST 以新标签页打开（`window.open` + `noopener,noreferrer`）；其余 scheme MUST 保持顶层同标签导航（`window.location.assign`）。两类唤起 MUST 均在同一用户手势调用链内同步执行，MUST NOT 插入异步等待。
 
 设置面板 SHALL 提供自定义工具的添加、逐行名称/模板编辑（失焦保存）、删除能力；名称为空或模板非法的行 MUST 给出提示（该行不进入快捷打开可用列表）。
 
