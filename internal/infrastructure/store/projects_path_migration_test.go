@@ -141,8 +141,8 @@ func TestMigration0014_ProjectsPathNotUnique_UpgradeFrom0013(t *testing.T) {
 	if err := db.QueryRow("SELECT max(version) FROM schema_version").Scan(&maxVer); err != nil {
 		t.Fatal(err)
 	}
-	if maxVer != 15 {
-		t.Errorf("max schema_version = %d, want 15", maxVer)
+	if maxVer != 16 {
+		t.Errorf("max schema_version = %d, want 16", maxVer)
 	}
 }
 

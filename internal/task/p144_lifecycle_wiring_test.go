@@ -181,6 +181,24 @@ func (a *mockAppAdapter) ConvergeInterruptedInitRuns(ctx context.Context) (int64
 	return a.s.ConvergeInterruptedInitRuns(ctx)
 }
 
+// --- 任务信息修改端口（task-info-editable；Phase 2 起 lifecycle 入口读意图需要，委托 TaskStore） ---
+
+func (a *mockAppAdapter) CommitTaskInfoUpdate(ctx context.Context, id string, update application.TaskInfoUpdate) (application.MutationResult, error) {
+	return a.s.CommitTaskInfoUpdate(ctx, id, update)
+}
+
+func (a *mockAppAdapter) SetTaskRenamePending(ctx context.Context, id, pendingJSON string) (application.MutationResult, error) {
+	return a.s.SetTaskRenamePending(ctx, id, pendingJSON)
+}
+
+func (a *mockAppAdapter) ClearTaskRenamePending(ctx context.Context, id string) (application.MutationResult, error) {
+	return a.s.ClearTaskRenamePending(ctx, id)
+}
+
+func (a *mockAppAdapter) GetTaskRenamePending(ctx context.Context, id string) (*string, error) {
+	return a.s.GetTaskRenamePending(ctx, id)
+}
+
 // taskRowToSnapshot / nullable ptr 映射复用生产 adapters.go 中的同名实现
 //（P1.4.5 storeAlignPortsAdapter 引入），此处不再维护平行拷贝。
 

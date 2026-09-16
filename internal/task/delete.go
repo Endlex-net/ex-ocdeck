@@ -36,6 +36,14 @@ func (m *Manager) Delete(ctx context.Context, taskID string, mode DeleteMode, co
 	if err != nil {
 		return newOpErr(codeNotFound, fmt.Errorf("task not found: %w", err))
 	}
+	// task-info-editable D2 仲裁表：任务删除在存在未收敛改名意图时 conflict 拒绝
+	//（不自动收敛——删除与改名意图语义冲突，要求先经信息修改入口收敛或人工修复
+	// worktree；PreflightDelete 依赖 row.Branch）。意图存在即拒绝，不区分可否收敛。
+	if pending, perr := m.readRenamePending(ctx, taskID); perr != nil {
+		return newOpErr(codeInternal, perr)
+	} else if pending != nil {
+		return newOpErr(codeConflict, fmt.Errorf("task %s has unresolved rename pending; resolve it before delete", taskID))
+	}
 	// guard 委托 domain/task.CanDelete(mode)（design D0 P1.4.2 strangler 第二步）。
 	// gating MUST 与持久化 delete_mode 一致（design.md §19）：
 	//   - Normal：状态 ∈ {suspended, archived, creation_failed}（deletion_failed 不得直接重入 Normal 流程，

@@ -107,6 +107,10 @@ type OCClient interface {
 	// GET /doc 结构化解析，返回 supported/unsupported/unknown 三值。
 	// 签名与 *opencode.Client 逐字一致；adapter 在 RuntimePort.ProbeCapability 复用。
 	ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState
+	// UpdateSessionTitle PATCH /session/{id}?directory=...（task-info-editable D3）。
+	// body {"title": ...}，成功响应校验 ID；404 → opencode.ErrSessionTitleUnsupported
+	//（能力降级判定，D3 404 二分取消）。签名与 *opencode.Client 逐字一致。
+	UpdateSessionTitle(ctx context.Context, dir, id, title string) error
 }
 
 // 编译期断言：*opencode.Client 实现 OCClient（签名 MUST 与 *Client 逐字一致，
@@ -136,6 +140,13 @@ type WorktreeBackend interface {
 	// design.md §19 Create Retry 行）。校验：路径存在 + .git 文件 + rev-parse --is-inside-work-tree
 	// + 检出分支匹配 + 属预期 repo。全部通过返回 nil，否则返回明确错误。
 	VerifyWorktreeProduct(ctx context.Context, repoPath, wtPath, branch string) error
+	// WorktreeHeadBranch 返回 worktree 的 symbolic HEAD 短分支名并校验其归属 repoPath 仓库
+	//（task-info-editable D2：HEAD 身份验证/R1 共用检查）。路径缺失/不归属/detached/读取失败
+	// 均返回错误——调用方按「无法明确判定」处置。
+	WorktreeHeadBranch(ctx context.Context, repoPath, wtPath string) (string, error)
+	// RenameBranch 原子重命名本地分支（git branch -m；task-info-editable D2）。
+	// 锁由编排层持有，本原语不加锁；冲突/非法名由 git 报错返回，零副作用。
+	RenameBranch(ctx context.Context, wtPath, oldName, newName string) error
 	// PreflightDelete 在删除副作用前做静态安全检查（B8：包含性/dirty/分支占用先于 oc session 清理）。
 	// ConfirmDirty=true 表示调用方已确认 dirty（API 层 confirmDirty=true 或 task 层 force 删除不再自动确认）。
 	PreflightDelete(ctx context.Context, wtPath string, opts PreflightDeleteOpts) error

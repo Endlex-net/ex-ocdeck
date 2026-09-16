@@ -159,6 +159,11 @@ func (c *overflowOC) ReplyPermission(ctx context.Context, dir, requestID, reply 
 	return nil
 }
 
+// UpdateSessionTitle 满足 OCClient 新端口（task-info-editable 3.2；本 fake 不消费标题能力）。
+func (c *overflowOC) UpdateSessionTitle(ctx context.Context, dir, id, title string) error {
+	return nil
+}
+
 // TestAllocatePort_RotationCursor 验证端口轮转游标（B5）：连续分配不每次从头扫。
 func TestAllocatePort_RotationCursor(t *testing.T) {
 	store := newMockStore()

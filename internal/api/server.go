@@ -17,6 +17,7 @@ import (
 	appuploads "ocdeck/internal/application/uploads"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/ai"
+	"ocdeck/internal/infrastructure/branchprefix"
 	"ocdeck/internal/infrastructure/notify"
 	"ocdeck/internal/infrastructure/palette"
 	storepkg "ocdeck/internal/infrastructure/store"
@@ -36,6 +37,7 @@ type Server struct {
 	ocCfgs          OCConfigService
 	aiConfig        *ai.Store
 	paletteConfig   *palette.Store
+	branchPrefix    *branchprefix.Store
 	eventSubscriber EventSubscriber
 	httpSrv         *http.Server
 
@@ -256,6 +258,7 @@ func (s *Server) registerRoutes() {
 	s.registerAIConfigRoutes(apiMux)        // 全局 AI provider 配置（design.md D6）
 	s.registerNotificationRoutes(apiMux)    // 通知配置/测试通知/SSE 流（task-notifications D7）
 	s.registerPaletteConfigRoutes(apiMux)   // 命令面板配置（quick-create-shortcut-support D6）
+	s.registerBranchPrefixRoutes(apiMux)    // 分支前缀配置（task-info-editable D4）
 	s.registerUploadRoutes(apiMux)          // 上传接口（terminal-file-paste-drop 3.3）
 
 	// /api/v1 前缀统一挂认证中间件（design.md §14/§21）。

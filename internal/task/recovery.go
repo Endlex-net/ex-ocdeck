@@ -300,8 +300,19 @@ func (m *Manager) ensureRecovery(taskID string, tok runtime.InstVersion) {
 	}
 
 	ctx := m.lifecycleCtx()
-	// G3-18：激活准入原子拒绝未清 recovery debt（Complete 成功但删除失败遗留 /
-	// CAS mismatch 留存的旧 intent 不得误伤本次恢复）。
+	// task-info-editable D2 仲裁表：运行期 Recovery 在状态 CAS 之前先执行 R1 收敛。
+	// 不可收敛 → 跳过该任务本次恢复并记录 last_error（fail-closed 到任务级，不阻断其他任务）。
+	if cerr := m.convergePendingBeforeLifecycle(ctx, row, proj); cerr != nil {
+		log.Printf("ensureRecovery: task %s rename pending not converged; skip this recovery: %v", taskID, cerr)
+		le := sql.NullString{String: cerr.Error(), Valid: true}
+		if _, werr := m.writeStatus(ctx, taskID, StatusActive, le); werr != nil {
+			log.Printf("ensureRecovery: task %s record last_error: %v", taskID, werr)
+		}
+		unlock()
+		return
+	}
+	// G3-18：激活准入原子拒绝未清 recovery debt（Complete 成功
+	// 但删除失败遗留 / CAS mismatch 留存的旧 intent 不得误伤本次恢复）。
 	cas, cerr := m.beginActivation(ctx, taskID, StatusActive)
 	if cerr != nil {
 		if errors.Is(cerr, store.ErrRecoveryDebtPresent) {
@@ -405,6 +416,17 @@ func (m *Manager) ensureRecoveryFromAttach(taskID string) {
 	}
 
 	ctx := m.lifecycleCtx()
+	// task-info-editable D2 仲裁表：attach 触发的运行期 Recovery 同样在状态 CAS 之前先执行
+	// R1 收敛。不可收敛 → 跳过本次恢复并记录 last_error（不阻断其他任务）。
+	if cerr := m.convergePendingBeforeLifecycle(ctx, row, proj); cerr != nil {
+		log.Printf("ensureRecovery: attach task %s rename pending not converged; skip this recovery: %v", taskID, cerr)
+		le := sql.NullString{String: cerr.Error(), Valid: true}
+		if _, werr := m.writeStatus(ctx, taskID, StatusActive, le); werr != nil {
+			log.Printf("ensureRecovery: attach task %s record last_error: %v", taskID, werr)
+		}
+		unlock()
+		return
+	}
 	cas, cerr := m.beginActivation(ctx, taskID, StatusActive)
 	if cerr != nil {
 		if errors.Is(cerr, store.ErrRecoveryDebtPresent) {

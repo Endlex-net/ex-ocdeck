@@ -34,6 +34,14 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		return newOpErr(codeInternal, fmt.Errorf("reconcile: preflight task modes: %w", perr))
 	}
 
+	// task-info-editable D2：启动 reconcile 在只读模式预检之后、生命周期恢复/清理之前
+	// 逐任务执行 R1 收敛。任一未收敛错误（HEAD 无法判定 / 补提交失败 / 清意图失败）→
+	// fail-closed 拒开 HTTP、不进入后续生命周期恢复/清理；收敛产生补提交后的任务列表
+	// 重读由下方既有 refresh 快照步骤承担（业务快照 MUST 在 converge 类步骤后重新读取，P1-F4）。
+	if rerr := m.convergeAllRenamePendings(ctx, tasks); rerr != nil {
+		return newOpErr(codeInternal, fmt.Errorf("reconcile: converge rename pendings: %w", rerr))
+	}
+
 	// tasks 3.8：ConvergeInterruptedInitRuns MUST 先于既有启动恢复步骤执行——
 	// 把 init_status∈{pending,running} 的任务收敛为 failed（interrupted by server restart）。
 	// 更新失败 MUST fail-closed 阻止 HTTP 开放。

@@ -1,9 +1,12 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -15,6 +18,10 @@ import (
 // api handler 只做 DTO/HTTP 语义，不做编排。返回 application.TaskRow + error（api 做 DTO 转换）。
 type TaskBackend interface {
 	Create(ctx context.Context, projectID string, opts application.CreateTaskOptions) (application.TaskRow, error)
+	// UpdateTaskInfo 修改任务名称/分支 slug（task-info-editable D1）：presence 语义 nil=不修改，
+	// 全部同值幂等成功返回当前行；错误经 application.OpError（invalid_input/invalid_state/
+	// conflict/git_error/internal），由 mapTaskErr 统一映射。
+	UpdateTaskInfo(ctx context.Context, taskID string, opts application.UpdateTaskInfoOptions) (application.TaskRow, error)
 	Activate(ctx context.Context, taskID string) error
 	Suspend(ctx context.Context, taskID string) error
 	Archive(ctx context.Context, taskID string) error
@@ -92,6 +99,7 @@ func (s *Server) registerTaskRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/projects/{id}/tasks", s.handleListTasks)
 	mux.HandleFunc("POST /api/v1/projects/{id}/tasks", s.handleCreateTask)
 	mux.HandleFunc("GET /api/v1/tasks/{id}", s.handleGetTask)
+	mux.HandleFunc("PATCH /api/v1/tasks/{id}", s.handleUpdateTaskInfo)
 	mux.HandleFunc("GET /api/v1/tasks/{id}/stream", s.handleTaskStream)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/activate", s.handleTaskAction(s.tasks.Activate))
 	mux.HandleFunc("POST /api/v1/tasks/{id}/suspend", s.handleTaskAction(s.tasks.Suspend))
@@ -127,11 +135,15 @@ func (s *Server) registerTaskRoutes(mux *http.ServeMux) {
 // null=缺省（repo→worktree；dir→local-path），非 null=显式提供。
 // PermissionMode 为任务级权限模式（task-permission-mode D2）：指针保留 presence 语义——
 // null=缺省（→ask），非 null=显式提供（trim 后须为三合法值）。
+// BranchSlug 为可选显式分支 slug（task-info-editable D5）：指针保留 presence 语义——
+// 缺失/null/trim 后空 = 未提供（走 LLM/slugify）；非空 trim 后原样透传 task 层
+//（trim/presence 判定在 Manager 侧统一执行，handler 不改写）。
 type createTaskReq struct {
 	Name           string  `json:"name"`
 	BaseRef        string  `json:"base_ref"`
 	Mode           *string `json:"mode"`
 	PermissionMode *string `json:"permission_mode"`
+	BranchSlug     *string `json:"branch_slug"`
 }
 
 // 任务级运行模式合法值（add-local-path-task-mode D7）。与 internal/task 的 TaskMode
@@ -294,6 +306,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		BaseRef:        strings.TrimSpace(req.BaseRef),
 		Mode:           mode,
 		PermissionMode: permissionMode,
+		BranchSlug:     req.BranchSlug,
 	})
 	if err != nil {
 		writeApiError(w, mapTaskErr(err))
@@ -690,4 +703,87 @@ func mapTaskErr(err error) *ApiError {
 		return NewError(CodeInternal, "internal error")
 	}
 	return NewError(ErrorCode(code), err.Error())
+}
+
+// taskInfoPatchBodyMax 限制 PATCH 请求体上限为 4 KiB（与 palette/branch-prefix 同构）。
+const taskInfoPatchBodyMax = 4096
+
+// updateTaskInfoReq 任务信息修改请求体（task-info-editable D1）：字段缺失（JSON 中不存在
+// 或为 null）= 不修改该项；*string 保留 presence。未知字段忽略（沿既有 decoder 行为）。
+type updateTaskInfoReq struct {
+	Name       *string `json:"name"`
+	BranchSlug *string `json:"branch_slug"`
+}
+
+// decodeOptionalTaskInfoPatchJSON 按 D1 错误矩阵解码（本端点专用 helper——既有 decodeJSON
+// （projects.go）对空 body/解码失败返回 invalid_input，与本端点空 body 幂等语义冲突，
+// MUST NOT 复用或修改影响其他调用方）：
+//   - 空 body（含纯空白）→ 零值 req（视为 {}，幂等 200 返回当前任务）；
+//   - 合法 JSON（含 {}）→ *string presence 保留；
+//   - 非法 JSON / 尾随内容 / 类型错误 → invalid_input。
+func decodeOptionalTaskInfoPatchJSON(data []byte) (updateTaskInfoReq, *ApiError) {
+	if isEmptyOrWhitespace(data) {
+		return updateTaskInfoReq{}, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	var req updateTaskInfoReq
+	if err := dec.Decode(&req); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) {
+			return updateTaskInfoReq{}, NewError(CodeInvalidInput, err.Error())
+		}
+		return updateTaskInfoReq{}, NewError(CodeInvalidInput, "invalid JSON body")
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		return updateTaskInfoReq{}, NewError(CodeInvalidInput, "invalid JSON body")
+	}
+	return req, nil
+}
+
+// handleUpdateTaskInfo PATCH /api/v1/tasks/{id}（task-info-editable D1）：
+// 空 body / {} / 全 null → 幂等 200 返回当前任务；字段矩阵与门禁归 task 层
+//（UpdateTaskInfo 用例），错误经 mapTaskErr 统一映射
+//（invalid_input/invalid_state/conflict/git_error/internal）；成功 200 + 任务 DTO。
+func (s *Server) handleUpdateTaskInfo(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("id")
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, taskInfoPatchBodyMax))
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeApiError(w, NewError(CodeInvalidInput, "request body exceeds 4096 bytes"))
+			return
+		}
+		writeApiError(w, NewError(CodeInvalidInput, "invalid request body"))
+		return
+	}
+	req, ae := decodeOptionalTaskInfoPatchJSON(body)
+	if ae != nil {
+		writeApiError(w, ae)
+		return
+	}
+	row, err := s.tasks.UpdateTaskInfo(r.Context(), taskID, application.UpdateTaskInfoOptions{
+		Name:       req.Name,
+		BranchSlug: req.BranchSlug,
+	})
+	if err != nil {
+		writeApiError(w, mapTaskErr(err))
+		return
+	}
+	// fail-closed（D7 同款）：DTO 组装按项目 kind 校验后才提交 200。
+	kind, ke := s.requireProjectKind(r.Context(), row.ProjectID)
+	if ke != nil {
+		writeApiError(w, ke)
+		return
+	}
+	dto, de := toTaskDTO(row, kind)
+	if de != nil {
+		writeApiError(w, de)
+		return
+	}
+	// attention 为必有字段（无 omitempty）：与 GET 同款纯读快照填充，空数组非 null。
+	att, _ := s.tasks.Attention(row.ID)
+	dto.Attention = toAttentionDTO(att)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(dto)
 }

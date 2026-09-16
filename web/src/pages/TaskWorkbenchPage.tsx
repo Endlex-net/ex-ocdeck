@@ -18,6 +18,7 @@ import { AgentStatusBadge } from '../components/AgentStatusBadge';
 import { InitStatusBadge } from '../components/InitStatusBadge';
 import { PermissionModeBadge } from '../components/PermissionModeBadge';
 import { LifecycleLogModal } from '../components/LifecycleLogModal';
+import { TaskInfoCard } from '../components/TaskInfoCard';
 import { OpenInEditorMenu } from '../components/OpenInEditorMenu';
 import { RerunInitButton } from '../components/RerunInitButton';
 import { TerminalView } from '../terminal/TerminalView';
@@ -731,6 +732,21 @@ export function TaskWorkbenchPage({
         {visited.has(SETTINGS_TAB) && (
           <div className={`pane pane-scroll ${tab === SETTINGS_TAB ? '' : 'pane-hidden'}`}>
             <div className="settings-pane">
+              {task && (
+                <TaskInfoCard
+                  task={task}
+                  projectName={
+                    projects.find((p) => p.id === task.project_id)?.name ?? task.project_id
+                  }
+                  onSaved={(updated) => {
+                    // 保存成功：本地任务态立即收敛为服务端 DTO（SSE 帧随后覆盖同源），
+                    // 并触发共享 store refresh（侧栏/指挥中心同步）
+                    setTask(updated);
+                    void refreshShared().catch(() => {});
+                  }}
+                  onRefreshed={(fresh) => setTask(fresh)}
+                />
+              )}
               <div className="settings-section">
                 <div className="settings-title">任务级环境变量</div>
                 <EnvEditor base={`/tasks/${taskID}/env`} />

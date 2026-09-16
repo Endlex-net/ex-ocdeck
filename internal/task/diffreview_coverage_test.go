@@ -175,6 +175,11 @@ func (c *countingProbeOC) ReplyPermission(ctx context.Context, dir, requestID, r
 	return c.inner.ReplyPermission(ctx, dir, requestID, reply)
 }
 
+// UpdateSessionTitle 满足 OCClient 新端口（task-info-editable 3.2；本 fake 不消费标题能力）。
+func (c *countingProbeOC) UpdateSessionTitle(ctx context.Context, dir, id, title string) error {
+	return c.inner.UpdateSessionTitle(ctx, dir, id, title)
+}
+
 // --- 能力事件模型：instVersion 失效 ---
 
 // TestCapabilityCacheInvalidatedOnInstVersionChange 验证 instVersion 变化（runtime 替换）后
@@ -336,6 +341,11 @@ func (c *dirCaptureOC) ProbePromptAsyncCapability(ctx context.Context) opencode.
 }
 func (c *dirCaptureOC) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
 	return c.inner.ReplyPermission(ctx, dir, requestID, reply)
+}
+
+// UpdateSessionTitle 满足 OCClient 新端口（task-info-editable 3.2；本 fake 不消费标题能力）。
+func (c *dirCaptureOC) UpdateSessionTitle(ctx context.Context, dir, id, title string) error {
+	return c.inner.UpdateSessionTitle(ctx, dir, id, title)
 }
 
 // --- adapter 获取失败=pre_send_failure ---

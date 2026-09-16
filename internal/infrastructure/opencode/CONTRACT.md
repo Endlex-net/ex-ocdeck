@@ -114,6 +114,7 @@ ocdeck 对 opencode 的兼容性按**已验证版本区间**声明，当前为 *
 | `GET /session?directory=&limit=` | `[]Session`，顶层 `id` / `time.updated` / `parentID` |
 | `POST /session?directory=` | 单个 Session，同上 |
 | `DELETE /session/:id?directory=` | **200 + JSON `true`**（非 204）；404 视为已删除 |
+| `PATCH /session/:id?directory=` | **目标契约（task-info-editable D3，截至撰写时未经 live probe 核验）**：body `{"title": <string>}`；成功 200 + Session JSON（顶层 `id` 须与请求一致）；404 = 不支持/不可用（客户端归一 `ErrSessionTitleUnsupported`，不区分路由级与会话级 404） |
 | `GET /session/status?directory=` | `{sessionID: {type}}`，`type ∈ {idle, busy, retry}` |
 | `GET /event?directory=` (SSE) | envelope `{type, properties}`；首事件 `server.connected` |
 | `GET /permission` | experimental pending 列表 |
