@@ -136,6 +136,18 @@ export interface Task {
   attention?: Attention;
 }
 
+/** PATCH /tasks/:id 请求体（task-info-editable）：presence 语义——仅提供的字段参与更新；
+ *  空对象 `{}` 幂等返回当前任务 DTO。 */
+export interface TaskInfoPatch {
+  name?: string;
+  branch_slug?: string;
+}
+
+/** GET/PUT /config/branch-prefix DTO（worktree-branch-prefix）：仅前缀字符串，不含 `/`。 */
+export interface BranchPrefixConfig {
+  prefix: string;
+}
+
 export interface TerminalInfo {
   terminal_id: string;
 }

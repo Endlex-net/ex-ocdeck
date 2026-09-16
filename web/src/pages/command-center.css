@@ -240,6 +240,19 @@
   margin-top: 10px;
 }
 
+/* 高级选项（task-info-editable）：折叠区与表单字段同节奏，展开体去掉默认大 padding */
+.cc-advanced {
+  margin: 4px 0 10px;
+}
+
+.cc-advanced .od-collapse-body {
+  padding: 12px 16px;
+}
+
+.cc-advanced .od-field:last-child {
+  margin-bottom: 0;
+}
+
 /* 工作空间 segmented control（add-local-path-task-mode）：与 od-input 同一 32px 字段节奏；
    选中段用 od-btn-primary 同款 accent 底色，未选中段 surface 底 + muted 文字。
    宽度贴合内容：od-field 是纵向 flex 容器，子项默认 align-self: stretch 会把本容器

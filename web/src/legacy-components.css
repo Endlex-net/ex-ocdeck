@@ -736,6 +736,62 @@ select.input {
   color: var(--fg);
 }
 
+/* ---------- 任务信息卡片（task-info-editable） ---------- */
+
+.task-info-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.task-info-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.task-info-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  font-size: 12.5px;
+}
+
+.task-info-label {
+  width: 76px;
+  flex-shrink: 0;
+  color: var(--muted);
+}
+
+.task-info-value {
+  min-width: 0;
+  flex: 1;
+  word-break: break-all;
+}
+
+.task-info-value .od-input {
+  width: 100%;
+  max-width: 360px;
+}
+
+.task-info-preview {
+  display: block;
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.task-info-error {
+  margin-top: 10px;
+}
+
+.task-info-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
 /* ---------- 终端外观 ---------- */
 
 .term-appearance {

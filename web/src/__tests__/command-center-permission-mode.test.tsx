@@ -196,7 +196,7 @@ describe('新建任务面板权限模式三档（task-permission-mode 5.2）', (
 
     await fillTaskAndSubmit(container);
     // 缺省 ai-auto 显式携带：第 5 参为 'ai-auto'（与后端「未提供 → ask」缺省解耦）
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto', undefined);
   });
 
   it('选择「全部批准」提交 → 第 5 参透传 all-approve', async () => {
@@ -208,7 +208,7 @@ describe('新建任务面板权限模式三档（task-permission-mode 5.2）', (
     expect(permRadio(container, '人工批准').getAttribute('aria-checked')).toBe('false');
 
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'all-approve');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'all-approve', undefined);
   });
 
   it('选择「AI 自动识别」提交 → 第 5 参透传 ai-auto（local-path 路径同样透传）', async () => {
@@ -225,7 +225,7 @@ describe('新建任务面板权限模式三档（task-permission-mode 5.2）', (
     expect(permRadio(container, 'AI 自动识别').getAttribute('aria-checked')).toBe('true');
 
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', undefined, 'local-path', 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', undefined, 'local-path', 'ai-auto', undefined);
   });
 
   it('选择后显式选回「人工批准」→ 按缺省处理，不携带 permission_mode', async () => {
@@ -235,7 +235,7 @@ describe('新建任务面板权限模式三档（task-permission-mode 5.2）', (
     await clickPerm(container, '人工批准');
 
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, undefined);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, undefined, undefined);
   });
 
   it('dir 项目同样渲染权限模式控件并可透传选择（非缺省值）', async () => {
@@ -247,7 +247,7 @@ describe('新建任务面板权限模式三档（task-permission-mode 5.2）', (
     await clickPerm(container, '全部批准');
 
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('d1', 'task-a', undefined, undefined, 'all-approve');
+    expect(api.createTask).toHaveBeenCalledWith('d1', 'task-a', undefined, undefined, 'all-approve', undefined);
   });
 });
 

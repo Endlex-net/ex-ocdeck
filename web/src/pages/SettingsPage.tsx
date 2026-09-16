@@ -15,6 +15,7 @@ import {
 import { GlobalEnvEditor } from '../components/GlobalEnvEditor';
 import { SystemEnvPanel } from '../components/SystemEnvPanel';
 import { NotificationConfigPanel } from '../components/NotificationConfigPanel';
+import { BranchPrefixPanel } from '../components/BranchPrefixPanel';
 import { PaletteConfigPanel, type PaletteConfigLoadState } from '../components/PaletteConfigPanel';
 import { TermAppearanceEditor } from '../components/TermAppearanceEditor';
 import type { PaletteConfig } from '../palette-focus';
@@ -54,6 +55,7 @@ const TABS: { key: ConfigsTab; label: string; id: string; panel: string }[] = [
   { key: 'ai', label: 'AI 配置', id: 'tab-ai', panel: 'panel-ai' },
   { key: 'notifications', label: '通知', id: 'tab-notifications', panel: 'panel-notifications' },
   { key: 'palette', label: '命令面板', id: 'tab-palette', panel: 'panel-palette' },
+  { key: 'branch-prefix', label: '工作空间', id: 'tab-branch-prefix', panel: 'panel-branch-prefix' },
   { key: 'tools', label: '常用工具', id: 'tab-tools', panel: 'panel-tools' },
 ];
 
@@ -181,6 +183,11 @@ export function SettingsPage({
             loadState={paletteLoadState}
             loadError={paletteLoadError}
           />
+        </div>
+      )}
+      {tab === 'branch-prefix' && (
+        <div role="tabpanel" id="panel-branch-prefix" aria-labelledby="tab-branch-prefix">
+          <BranchPrefixPanel />
         </div>
       )}
       {tab === 'tools' && (

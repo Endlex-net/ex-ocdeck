@@ -28,6 +28,7 @@ vi.mock('../api', () => ({
     listBranches: vi.fn(async () => ['main']),
     refreshBranches: vi.fn(async () => ['main']),
     createTask: vi.fn(),
+    getBranchPrefix: vi.fn(async () => ({ prefix: 'ocdeck' })),
   },
   // 与 api.ts 真实签名同形（status, code, message），避免测试替身参数错位
   ApiError: class ApiError extends Error {
@@ -117,6 +118,8 @@ beforeEach(() => {
   vi.mocked(api.listBranches).mockResolvedValue(['main']);
   vi.mocked(api.refreshBranches).mockReset();
   vi.mocked(api.refreshBranches).mockResolvedValue(['main']);
+  vi.mocked(api.getBranchPrefix).mockReset();
+  vi.mocked(api.getBranchPrefix).mockResolvedValue({ prefix: 'ocdeck' });
 });
 
 afterEach(async () => {
@@ -146,7 +149,7 @@ describe('CommandCenterPage 快速新建初始化', () => {
     expect(projectInput(container).value).toBe('ocdeck');
     expect(document.activeElement).toBe(taskInput(container));
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto', undefined);
   });
 
   it('唯一子串匹配在 exact-then-substring 预选', async () => {
@@ -157,7 +160,7 @@ describe('CommandCenterPage 快速新建初始化', () => {
     await flushUI();
     expect(projectInput(container).value).toBe('ocdeck');
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto', undefined);
   });
 
   it('matchMode=exact 时子串不预选，过滤框填文本', async () => {
@@ -194,7 +197,7 @@ describe('CommandCenterPage 快速新建初始化', () => {
     await flushUI();
     expect(projectInput(container).value).toBe('ocdeck');
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p3', 'task-a', 'main', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p3', 'task-a', 'main', undefined, 'ai-auto', undefined);
   });
 
   it('失效 projectID 回退文本匹配', async () => {
@@ -205,7 +208,7 @@ describe('CommandCenterPage 快速新建初始化', () => {
     await flushUI();
     expect(projectInput(container).value).toBe('other');
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p2', 'task-a', 'main', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p2', 'task-a', 'main', undefined, 'ai-auto', undefined);
   });
 
   it('acronym 命中不触发预选，按填过滤词处理（MUST NOT 参与预选推断）', async () => {
@@ -231,7 +234,7 @@ describe('CommandCenterPage 快速新建初始化', () => {
     await flushUI();
     expect(projectInput(container).value).toBe('ocdeck');
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto', undefined);
   });
 
   it('预选后任务名为空，提交按钮禁用且不发起创建', async () => {
@@ -290,7 +293,7 @@ describe('CommandCenterPage 快速新建初始化', () => {
     expect(taskInput(container).value).toBe('keep-me');
     expect(projectInput(container).value).toBe('ocdeck');
     await fillTaskAndSubmit(container, 'keep-me');
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'keep-me', 'main', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'keep-me', 'main', undefined, 'ai-auto', undefined);
   });
 
   it('非法仅 projectID 的 detail 归一为无 payload', async () => {
@@ -329,7 +332,7 @@ describe('CommandCenterPage 快速新建初始化', () => {
     expect(projectInput(container).value).toBe('other');
     expect(document.activeElement).toBe(taskInput(container));
     await fillTaskAndSubmit(container, 'keep-me');
-    expect(api.createTask).toHaveBeenCalledWith('p2', 'keep-me', 'main', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p2', 'keep-me', 'main', undefined, 'ai-auto', undefined);
   });
 
   it('pending 跨路由：挂载前发出的信号被消费', async () => {
@@ -342,7 +345,7 @@ describe('CommandCenterPage 快速新建初始化', () => {
     expect(projectInput(container).value).toBe('ocdeck');
     expect(document.activeElement).toBe(taskInput(container));
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto', undefined);
   });
 
   it('只按到达时快照判定，后续项目加载不自动重试预选', async () => {
@@ -483,7 +486,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
     await flushUI();
     expect(branchInput(container).value).toBe('main');
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main', undefined, 'ai-auto', undefined);
   });
 
   it('任务名框 Enter 与创建按钮同路径：提交过滤首项', async () => {
@@ -497,7 +500,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
       setInput(taskInput(container), 'task-a');
     });
     await dispatchSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main', undefined, 'ai-auto', undefined);
   });
 
   it('synthetic 候选排第一时提交 normalizedInput（trim 首尾空白）', async () => {
@@ -511,7 +514,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
       setInput(branchInput(container), '  feature-x  ');
     });
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'feature-x', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'feature-x', undefined, 'ai-auto', undefined);
   });
 
   it('synthetic 只参与排序不保证第一：输入 main 时提交 origin/main', async () => {
@@ -525,7 +528,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
       setInput(branchInput(container), 'main');
     });
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main', undefined, 'ai-auto', undefined);
   });
 
   it('dir 项目提交不携带 base_ref', async () => {
@@ -538,7 +541,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
     // dir 无基准分支字段（仅项目一个 combobox）
     expect(container.querySelectorAll('input[role="combobox"]').length).toBe(1);
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('d1', 'task-a', undefined, undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('d1', 'task-a', undefined, undefined, 'ai-auto', undefined);
   });
 
   it('初次加载在途：提交禁用且不发起 POST；ready 后提交过滤首项', async () => {
@@ -567,7 +570,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
     await flushUI();
     expect(submitBtn(container).disabled).toBe(false);
     await dispatchSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main', undefined, 'ai-auto', undefined);
   });
 
   it('初次加载失败：列表为空、禁止提交、不发起 POST', async () => {
@@ -632,7 +635,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
     await flushUI();
     expect(submitBtn(container).disabled).toBe(false);
     await dispatchSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'origin/main', undefined, 'ai-auto', undefined);
   });
 
   it('成功空列表回退 default_branch：提交 base_ref=main', async () => {
@@ -643,7 +646,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
     });
     await flushUI();
     await fillTaskAndSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto', undefined);
   });
 
   it('候选全空时省略 base_ref：服务端 invalid_input 后页面展示创建失败', async () => {
@@ -661,7 +664,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
     });
     expect(submitBtn(container).disabled).toBe(false);
     await dispatchSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', undefined, undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', undefined, undefined, 'ai-auto', undefined);
     expect(container.textContent).toContain('基准分支不能为空');
   });
 
@@ -735,7 +738,7 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
       setInput(taskInput(container), 'task-a');
     });
     await dispatchSubmit(container);
-    expect(api.createTask).toHaveBeenCalledWith('p2', 'task-a', 'main', undefined, 'ai-auto');
+    expect(api.createTask).toHaveBeenCalledWith('p2', 'task-a', 'main', undefined, 'ai-auto', undefined);
   });
 
   it('下拉高亮过滤排序首项：输入 main 时高亮 origin/main 而非输入精确等值项', async () => {
@@ -752,5 +755,161 @@ describe('CommandCenterPage 基准分支排序与分支列表状态机（task-ba
     const hl = () => container.querySelector('.cc-combo-item.hl');
     expect(hl()).not.toBeNull();
     expect(hl()!.textContent).toBe('origin/main');
+  });
+});
+
+/* ==================== 分支 slug 高级选项（task-info-editable command-center spec / tasks.md 4.3） ==================== */
+
+function advancedDetails(container: HTMLElement) {
+  return container.querySelector<HTMLDetailsElement>('.cc-advanced');
+}
+
+function slugInput(container: HTMLElement) {
+  return container.querySelector<HTMLInputElement>('#cc-branch-slug');
+}
+
+function slugPreview(container: HTMLElement) {
+  return container.querySelector('[data-testid="cc-slug-preview"]');
+}
+
+async function expandAdvanced(container: HTMLElement) {
+  const d = advancedDetails(container)!;
+  await act(async () => {
+    d.open = true;
+    d.dispatchEvent(new Event('toggle'));
+  });
+  await flushUI();
+}
+
+async function selectProject(_container: HTMLElement, name: string, id: string) {
+  act(() => {
+    emitPaletteFocus('new-task-name', { projectName: name, projectID: id });
+  });
+  await flushUI();
+}
+
+function modeRadio(container: HTMLElement, label: string) {
+  return [...container.querySelectorAll<HTMLButtonElement>('#cc-new-task-panel button[role="radio"]')].find(
+    (b) => b.textContent?.includes(label),
+  )!;
+}
+
+describe('新建任务分支 slug 高级选项', () => {
+  it('默认折叠且不携带 slug：创建请求第 6 参为 undefined（既有命名行为不变）', async () => {
+    const { container } = renderPage();
+    await selectProject(container, 'ocdeck', 'p1');
+    expect(advancedDetails(container)).not.toBeNull();
+    expect(advancedDetails(container)!.open).toBe(false);
+    await fillTaskAndSubmit(container);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto', undefined);
+    // 未展开 → 不拉取前缀
+    expect(api.getBranchPrefix).not.toHaveBeenCalled();
+  });
+
+  it('展开输入 slug：实时预览 <prefix>/<slug>，提交携带 slug', async () => {
+    const { container } = renderPage();
+    await selectProject(container, 'ocdeck', 'p1');
+    await expandAdvanced(container);
+    expect(api.getBranchPrefix).toHaveBeenCalledTimes(1);
+    expect(slugPreview(container)).toBeNull(); // 空 slug 不渲染预览
+    await act(async () => {
+      setInput(slugInput(container)!, 'my-feature');
+    });
+    expect(slugPreview(container)!.textContent).toContain('ocdeck/my-feature');
+    await fillTaskAndSubmit(container);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto', 'my-feature');
+  });
+
+  it('前缀 GET 失败：预览显示「前缀未加载」占位、不伪造预览，且不作为提交门禁', async () => {
+    vi.mocked(api.getBranchPrefix).mockRejectedValue(new ApiError(0, 'network_error', '无法连接服务端'));
+    const { container } = renderPage();
+    await selectProject(container, 'ocdeck', 'p1');
+    await expandAdvanced(container);
+    await act(async () => {
+      setInput(slugInput(container)!, 'my-feature');
+    });
+    const preview = slugPreview(container)!;
+    expect(preview.textContent).toContain('前缀未加载');
+    expect(preview.textContent).not.toContain('ocdeck/my-feature');
+    // 前缀加载失败不构成门禁：slug 仍可随提交发送
+    await fillTaskAndSubmit(container);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', 'main', undefined, 'ai-auto', 'my-feature');
+  });
+
+  it('slug 非法被服务端拒绝：沿既有失败路径展示错误，slug 输入保留', async () => {
+    const { container } = renderPage();
+    await selectProject(container, 'ocdeck', 'p1');
+    await expandAdvanced(container);
+    await act(async () => {
+      setInput(slugInput(container)!, 'bad slug');
+    });
+    vi.mocked(api.createTask).mockRejectedValue(new ApiError(422, 'invalid_input', '分支名非法'));
+    await act(async () => {
+      setInput(taskInput(container), 'task-a');
+    });
+    await dispatchSubmit(container);
+    expect(container.textContent).toContain('分支名非法');
+    expect(slugInput(container)!.value).toBe('bad slug');
+  });
+
+  it('dir 项目不渲染高级选项区（slug 输入不出现）', async () => {
+    storeProjects = [proj('d1', 'dirproj', { kind: 'dir' })];
+    const { container } = renderPage();
+    await selectProject(container, 'dirproj', 'd1');
+    expect(advancedDetails(container)).toBeNull();
+    expect(slugInput(container)).toBeNull();
+  });
+
+  it('切到 local 模式：slug 输入不渲染、已输入 slug 不随提交发送（提交契约不变）', async () => {
+    const { container } = renderPage();
+    await selectProject(container, 'ocdeck', 'p1');
+    await expandAdvanced(container);
+    await act(async () => {
+      setInput(slugInput(container)!, 'my-feature');
+    });
+    // 切到 local：slug 输入与高级选项区整体不渲染
+    await act(async () => {
+      modeRadio(container, 'local').click();
+    });
+    await flushUI();
+    expect(advancedDetails(container)).toBeNull();
+    vi.mocked(api.createTask).mockResolvedValue({ id: 't1' } as never);
+    await act(async () => {
+      setInput(taskInput(container), 'task-a');
+    });
+    await dispatchSubmit(container);
+    expect(api.createTask).toHaveBeenCalledWith('p1', 'task-a', undefined, 'local-path', 'ai-auto', undefined);
+  });
+
+  it('运行模式切换 slug 输入保留（与 taskName 保留语义一致）', async () => {
+    const { container } = renderPage();
+    await selectProject(container, 'ocdeck', 'p1');
+    await expandAdvanced(container);
+    await act(async () => {
+      setInput(slugInput(container)!, 'my-feature');
+    });
+    await act(async () => {
+      modeRadio(container, 'local').click();
+    });
+    await flushUI();
+    expect(advancedDetails(container)).toBeNull();
+    await act(async () => {
+      modeRadio(container, 'worktree').click();
+    });
+    await flushUI();
+    await expandAdvanced(container);
+    expect(slugInput(container)!.value).toBe('my-feature');
+  });
+
+  it('切换项目 slug 输入保留', async () => {
+    const { container } = renderPage();
+    await selectProject(container, 'ocdeck', 'p1');
+    await expandAdvanced(container);
+    await act(async () => {
+      setInput(slugInput(container)!, 'keep-slug');
+    });
+    await selectProject(container, 'other', 'p2');
+    await expandAdvanced(container);
+    expect(slugInput(container)!.value).toBe('keep-slug');
   });
 });

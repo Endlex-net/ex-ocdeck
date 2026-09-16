@@ -5,6 +5,7 @@ import type {
   Annotation,
   AnnotationCreateInput,
   AnnotationsListResponse,
+  BranchPrefixConfig,
   EnvResponse,
   FileEditRead,
   FileEditWriteInput,
@@ -29,6 +30,7 @@ import type {
   SubmissionAnnotationRef,
   SubmissionsListResponse,
   Task,
+  TaskInfoPatch,
   TaskMode,
   TaskPermissionMode,
   TerminalInfo,
@@ -185,15 +187,22 @@ export const api = {
   /** baseRef 仅 repo 项目 worktree 模式可选（短名，空 = 项目默认分支）；dir 项目不提供。
    *  mode 仅 repo 项目 local-path 模式显式传 'local-path'（此时 MUST NOT 携带 base_ref）；
    *  worktree/dir 不传（缺省语义，add-local-path-task-mode D6 presence 契约）。
-   *  permissionMode 仅非缺省时传（task-permission-mode D2 presence 契约）：缺省 ask 不携带该字段。 */
-  createTask: (projectID: string, name: string, baseRef?: string, mode?: TaskMode, permissionMode?: TaskPermissionMode) =>
+   *  permissionMode 仅非缺省时传（task-permission-mode D2 presence 契约）：缺省 ask 不携带该字段。
+   *  branchSlug 仅 repo 项目 worktree 模式可选（task-info-editable）：trim 后非空才携带，
+   *  缺省时走既有 LLM/slugify 命名；dir/local-path MUST NOT 携带。 */
+  createTask: (projectID: string, name: string, baseRef?: string, mode?: TaskMode, permissionMode?: TaskPermissionMode, branchSlug?: string) =>
     request<Task>('POST', `/projects/${projectID}/tasks`, {
       name,
       ...(baseRef ? { base_ref: baseRef } : {}),
       ...(mode ? { mode } : {}),
       ...(permissionMode ? { permission_mode: permissionMode } : {}),
+      ...(branchSlug ? { branch_slug: branchSlug } : {}),
     }),
   getTask: (id: string) => request<Task>('GET', `/tasks/${id}`),
+  /** 任务信息修改（task-info-editable）：presence 语义——仅 patch 中出现的字段参与更新；
+   *  空 patch（{}）幂等返回当前任务 DTO。成功返回更新后的任务 DTO。 */
+  updateTask: (id: string, patch: TaskInfoPatch) =>
+    request<Task>('PATCH', `/tasks/${id}`, patch),
   taskAction: (id: string, action: 'activate' | 'suspend' | 'archive' | 'restore' | 'retry') =>
     request<void>('POST', `/tasks/${id}/${action}`),
   /** 带 confirmDirty 的重试：deletion_failed 且 worktree dirty 时 409 拒绝后需显式确认。 */
@@ -385,4 +394,10 @@ export const api = {
   /** 命令面板配置：GET/PUT 均为 camelCase 三键 {hotkey, triggerWord, matchMode}。 */
   getPaletteConfig: () => request<PaletteConfig>('GET', '/palette/config'),
   putPaletteConfig: (body: PaletteConfig) => request<PaletteConfig>('PUT', '/palette/config', body),
+
+  /** worktree 分支默认前缀（worktree-branch-prefix）：GET/PUT 同构 {prefix}；
+   *  非法值 PUT 422/invalid_input。 */
+  getBranchPrefix: () => request<BranchPrefixConfig>('GET', '/config/branch-prefix'),
+  putBranchPrefix: (prefix: string) =>
+    request<BranchPrefixConfig>('PUT', '/config/branch-prefix', { prefix }),
 };

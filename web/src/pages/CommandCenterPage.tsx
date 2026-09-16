@@ -805,6 +805,12 @@ function NewTaskPanel({
   // 权限模式选择器（task-permission-mode D8 + workbench-base-ref-and-overflow D6）：
   // 全部项目类型渲染，表单缺省 ai-auto（提交时显式携带；手选 ask 沿用省略字段、后端补 ask）。
   const [permMode, setPermMode] = useState<TaskPermissionMode>('ai-auto');
+  // 高级选项（task-info-editable command-center spec）：可选分支 slug。
+  // slug 保留语义同 taskName——切换运行模式/项目、消费命令面板初始化信号均不重置；
+  // 不参与提交门禁。前缀经 getBranchPrefix 拉取（首次展开时），GET 未成功不伪造预览。
+  const [branchSlug, setBranchSlug] = useState('');
+  const [prefixPhase, setPrefixPhase] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [branchPrefix, setBranchPrefix] = useState('');
   // D9 分支列表状态机：idle|loading|ready|error，与 lastSuccessfulBranches 正交。
   // 仅 ready 计算提交候选；loading/error 禁止提交；dir 项目无此状态机（恒 idle）。
   const [branchPhase, setBranchPhase] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
@@ -1002,9 +1008,12 @@ function NewTaskPanel({
       // 「非 API 缺省（ask）才传」惯例不变——表单缺省 ai-auto 时显式携带 permission_mode，
       // 与后端「未提供 → ask」缺省语义解耦（后端契约不变）。
       const permArg = permMode === 'ask' ? undefined : permMode;
+      // 分支 slug（task-info-editable）：仅 repo worktree 且 trim 后非空才携带；
+      // dir/local-path 恒 undefined（MUST NOT 携带，presence 契约）
+      const slugArg = !isDir && !isLocalPath && branchSlug.trim() !== '' ? branchSlug.trim() : undefined;
       const t = isLocalPath
-        ? await api.createTask(proj.id, taskName.trim(), undefined, 'local-path', permArg)
-        : await api.createTask(proj.id, taskName.trim(), isDir ? undefined : filteredBranches[0] || undefined, undefined, permArg);
+        ? await api.createTask(proj.id, taskName.trim(), undefined, 'local-path', permArg, slugArg)
+        : await api.createTask(proj.id, taskName.trim(), isDir ? undefined : filteredBranches[0] || undefined, undefined, permArg, slugArg);
       setTaskName('');
       // mutation 成功：跳转工作台（from=home）+ trailing refresh（失败静默，store error 通道承担）
       navigate(`/task/${t.id}?from=home`);
@@ -1186,6 +1195,66 @@ function NewTaskPanel({
             onChange={(e) => setTaskName(e.target.value)}
           />
         </div>
+
+        {/* 高级选项（task-info-editable）：折叠区 + 可选分支 slug，仅 repo + worktree 渲染；
+            前缀 GET 未成功时预览显示「前缀未加载」占位（MUST NOT 伪造预览、不构成提交门禁） */}
+        {selectedProject && !isDir && !isLocalPath && (
+          <details
+            className="od-collapse cc-advanced"
+            onToggle={(e) => {
+              // 首次展开才拉取前缀（lazy）；失败保留 error 态供预览占位判定
+              if (e.currentTarget.open && prefixPhase === 'idle') {
+                setPrefixPhase('loading');
+                api.getBranchPrefix().then(
+                  (c) => {
+                    setBranchPrefix(c.prefix);
+                    setPrefixPhase('ready');
+                  },
+                  () => setPrefixPhase('error'),
+                );
+              }
+            }}
+          >
+            <summary>
+              <svg
+                className="od-collapse-caret"
+                width="12"
+                height="12"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+              >
+                <polyline points="9 5 16 12 9 19" />
+              </svg>
+              高级选项
+            </summary>
+            <div className="od-collapse-body">
+              <div className="od-field">
+                <label className="od-label" htmlFor="cc-branch-slug">
+                  分支 slug（可选）
+                </label>
+                <input
+                  id="cc-branch-slug"
+                  className="od-input mono"
+                  spellCheck={false}
+                  style={{ maxWidth: 280 }}
+                  placeholder="留空自动命名"
+                  value={branchSlug}
+                  onChange={(e) => setBranchSlug(e.target.value)}
+                />
+                {branchSlug.trim() !== '' && (
+                  <div className="od-hint mono" data-testid="cc-slug-preview">
+                    {prefixPhase === 'ready'
+                      ? `最终分支名：${branchPrefix}/${branchSlug.trim()}`
+                      : '最终分支名：前缀未加载'}
+                  </div>
+                )}
+              </div>
+            </div>
+          </details>
+        )}
 
         {/* dir 警告 */}
         {isDir && (
