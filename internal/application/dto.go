@@ -80,11 +80,23 @@ type TaskRow struct {
 // 非空时 MUST 为任务包定义的合法模式值（非法值由 task 层 invalid_input 拒绝）。
 // PermissionMode 为任务级权限模式（task-permission-mode D2）：空串=缺省（→ ask），
 // 非空时 MUST 为任务包定义的合法取值（非法值由 task 层 invalid_input 拒绝）。
+// BranchSlug 为可选显式分支 slug（task-info-editable D5）：nil/trim 后空 = 未提供
+//（走 LLM/slugify 命名）；非空 trim 后直接使用（跳过 LLM 与机械 slugify）。
 type CreateTaskOptions struct {
 	Name           string
 	BaseRef        string
 	Mode           string
 	PermissionMode string
+	BranchSlug     *string
+}
+
+// UpdateTaskInfoOptions 任务信息修改的请求选项（task-info-editable D1）。
+// 字段 presence 语义：nil = 不修改该项（JSON 缺失或 null）；Name 原值存储（保留首尾空白）；
+// BranchSlug trim 后为空视为未提供。定义在 application 锁定 api → application import 方向
+//（与 CreateTaskOptions 同型）。
+type UpdateTaskInfoOptions struct {
+	Name       *string
+	BranchSlug *string
 }
 
 // SessionRow 会话归属行（解耦 store 包结构，design.md §18）。

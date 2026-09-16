@@ -59,6 +59,19 @@ type TaskRepository interface {
 	FinishInitRun(ctx context.Context, taskID string, status ocdecktask.InitStatus, initError *string) (MutationResult, error)
 	ConvergeInterruptedInitRuns(ctx context.Context) (int64, error)
 
+	// 任务信息修改（task-info-editable D6）
+	// CommitTaskInfoUpdate 单事务原子提交任务信息业务列（name/branch/env 快照，presence
+	// 语义 nil=不修改该字段）并清除 rename_pending 意图。Changed 仅由业务列真实变化决定，
+	// 意图清除不参与 Changed 计算、不推进 updated_at。
+	CommitTaskInfoUpdate(ctx context.Context, id string, update TaskInfoUpdate) (MutationResult, error)
+	// SetTaskRenamePending / ClearTaskRenamePending 写入/清除改名恢复意图 JSON 元数据。
+	// 意图元数据写入与清除 MUST NOT 推进 updated_at（pending-only 事务）。
+	SetTaskRenamePending(ctx context.Context, id string, pendingJSON string) (MutationResult, error)
+	ClearTaskRenamePending(ctx context.Context, id string) (MutationResult, error)
+	// GetTaskRenamePending 读取未收敛改名意图 JSON（nil = 无意图）。仅供内部收敛编排
+	//（R1）消费，MUST NOT 进入公共 Task DTO / TaskSnapshot。
+	GetTaskRenamePending(ctx context.Context, id string) (*string, error)
+
 	// 读取（供 application 编排用）
 	GetTask(ctx context.Context, id string) (*ocdecktask.Task, error)
 }
@@ -100,6 +113,17 @@ type TaskSnapshot struct {
 	AnchorSessionID *string
 	Mode            string
 	PermissionMode  string
+}
+
+// TaskInfoUpdate 表达任务信息业务列的目标值（task-info-editable D6）。
+//
+// 字段用 presence 语义：nil = 不修改该字段；非 nil = 在 CommitTaskInfoUpdate 单事务内
+// 原子写入目标值（同时清除 rename_pending 意图）。EnvSnapshot 为改写后的快照 JSON 全文
+//（D3 快照矩阵预计算结果），不表达「置 NULL」语义。
+type TaskInfoUpdate struct {
+	Name        *string
+	Branch      *string
+	EnvSnapshot *string
 }
 
 // SessionRepository 表达会话归属隔离的持久化端口（design.md D0:78-86）。

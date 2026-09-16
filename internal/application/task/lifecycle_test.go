@@ -49,6 +49,16 @@ type fakeTaskRepo struct {
 	deleteErr   error
 	convergeN   int64
 	convergeErr error
+	// task-info-editable Phase 1（task_info_test.go）：infoRes/infoErr 控制
+	// CommitTaskInfoUpdate；pendingRes/pendingErr 控制 SetTaskRenamePending/
+	// ClearTaskRenamePending；pendingValue/getPendingErr 控制 GetTaskRenamePending。
+	commitUpdates []application.TaskInfoUpdate
+	infoRes       application.MutationResult
+	infoErr       error
+	pendingRes    application.MutationResult
+	pendingErr    error
+	pendingValue  *string
+	getPendingErr error
 }
 
 func (r *fakeTaskRepo) GetTask(ctx context.Context, id string) (*ocdecktask.Task, error) {

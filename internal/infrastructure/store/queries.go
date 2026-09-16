@@ -60,6 +60,8 @@ type ProjectRow struct {
 // worktree | local-path（dir 项目任务恒为 local-path）。
 // PermissionMode 对应 migration 0015 新增列（task-permission-mode D1）：任务级权限模式，
 // ask | all-approve | ai-auto（存量行由列 DEFAULT 'ask' 覆盖，无需回填）。
+// RenamePending 对应 migration 0016 新增列（task-info-editable D2/D6）：未收敛的改名恢复
+// 意图 JSON，NULL = 无意图。仅供内部收敛编排消费，MUST NOT 进入公共任务 DTO。
 type TaskRow struct {
 	ID              string
 	ProjectID       string
@@ -81,6 +83,7 @@ type TaskRow struct {
 	AnchorSessionID sql.NullString
 	Mode            string
 	PermissionMode  string
+	RenamePending   sql.NullString
 }
 
 // LifecycleConfigRow project_lifecycle_configs 表行映射（design.md §2，migration 0007）。
@@ -360,12 +363,12 @@ func (q *Queries) CreateTask(ctx context.Context, t TaskRow) error {
 	return err
 }
 
-// GetTask 按 ID 查询任务（含 env_snapshot、init_status/init_error、base_ref、mode、permission_mode）。
+// GetTask 按 ID 查询任务（含 env_snapshot、init_status/init_error、base_ref、mode、permission_mode、rename_pending）。
 func (q *Queries) GetTask(ctx context.Context, id string) (TaskRow, error) {
 	row := q.db.QueryRowContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
 		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
-		        anchor_session_id, mode, permission_mode
+		        anchor_session_id, mode, permission_mode, rename_pending
 		 FROM tasks WHERE id = ?`, id)
 	return scanTaskRow(row)
 }
@@ -375,7 +378,7 @@ func (q *Queries) ListTasksByProject(ctx context.Context, projectID string) ([]T
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
 		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
-		        anchor_session_id, mode, permission_mode
+		        anchor_session_id, mode, permission_mode, rename_pending
 		 FROM tasks WHERE project_id = ? ORDER BY created_at ASC`, projectID)
 	if err != nil {
 		return nil, err
@@ -389,7 +392,7 @@ func (q *Queries) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
 		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
-		        anchor_session_id, mode, permission_mode
+		        anchor_session_id, mode, permission_mode, rename_pending
 		 FROM tasks ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
@@ -1563,7 +1566,7 @@ func scanTaskRow(row rowScanner) (TaskRow, error) {
 	err := row.Scan(&t.ID, &t.ProjectID, &t.Name, &t.Branch, &t.Status, &t.WorktreePath,
 		&t.LastPort, &t.LastError, &t.Notice, &t.DeleteMode, &t.EnvSnapshot,
 		&t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.InitStatus, &t.InitError, &t.BaseRef,
-		&t.AnchorSessionID, &t.Mode, &t.PermissionMode)
+		&t.AnchorSessionID, &t.Mode, &t.PermissionMode, &t.RenamePending)
 	return t, err
 }
 

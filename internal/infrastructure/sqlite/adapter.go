@@ -128,6 +128,34 @@ func (a *Adapter) ConvergeInterruptedInitRuns(ctx context.Context) (int64, error
 	return a.db.ConvergeInterruptedInitRuns(ctx)
 }
 
+// CommitTaskInfoUpdate 委托 store.CommitTaskInfoUpdate（单事务业务列 + 意图清除）。
+func (a *Adapter) CommitTaskInfoUpdate(ctx context.Context, id string, update application.TaskInfoUpdate) (application.MutationResult, error) {
+	return a.db.CommitTaskInfoUpdate(ctx, id, update)
+}
+
+// SetTaskRenamePending 委托 store.SetTaskRenamePending（意图元数据不推进 updated_at）。
+func (a *Adapter) SetTaskRenamePending(ctx context.Context, id string, pendingJSON string) (application.MutationResult, error) {
+	return a.db.SetTaskRenamePending(ctx, id, pendingJSON)
+}
+
+// ClearTaskRenamePending 委托 store.ClearTaskRenamePending（意图清除不推进 updated_at）。
+func (a *Adapter) ClearTaskRenamePending(ctx context.Context, id string) (application.MutationResult, error) {
+	return a.db.ClearTaskRenamePending(ctx, id)
+}
+
+// GetTaskRenamePending 委托 store.GetTaskRenamePending；未命中行归一化为
+// application.ErrTaskNotFound（与 GetTask 同型）。仅供内部收敛编排消费。
+func (a *Adapter) GetTaskRenamePending(ctx context.Context, id string) (*string, error) {
+	pending, err := a.db.GetTaskRenamePending(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, application.ErrTaskNotFound
+		}
+		return nil, err
+	}
+	return pending, nil
+}
+
 // GetTask 读侧：返回领域 Task 聚合的 guard 视图（design.md D0 P1.4.2）。
 //
 // 从 store.TaskRow 行值经 domain/task.Rehydrate 重建，填入 guard 所需字段
