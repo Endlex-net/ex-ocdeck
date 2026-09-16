@@ -63,6 +63,13 @@ type mockStore struct {
 	onLastPort func(taskID string)
 	// onGetTask 在 GetTask 读取后回调（G3-16 复核屏障：拦截 checkRecoveryContinuable）。
 	onGetTask func(taskID string)
+	// --- task-info-editable：rename_pending 镜像与 failpoint ---
+	// renamePending 镜像 tasks.rename_pending（taskID → JSON）。setRenamePendingErr /
+	// commitInfoErr / clearRenamePendingErr 非空时对应方法返回该错误（失败矩阵 failpoint）。
+	renamePending         map[string]string
+	setRenamePendingErr   error
+	commitInfoErr         error
+	clearRenamePendingErr error
 }
 
 type statusCall struct {
@@ -78,6 +85,7 @@ func newMockStore() *mockStore {
 		sessions:         map[string][]SessionRow{},
 		recoveryAttempts: map[string][]int64{},
 		recoveryDebts:    map[string]RecoveryDebtRow{},
+		renamePending:    map[string]string{},
 	}
 }
 
@@ -360,6 +368,149 @@ func (s *mockStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected
 	t.Notice = newNotice
 	s.tasks[id] = t
 	return application.MutationResult{Matched: true, Changed: true}, nil
+}
+
+// --- task-info-editable：任务信息提交 + rename_pending 镜像 ---
+
+// GetTaskRenamePending 返回任务行上的意图 JSON（nil = 无意图；行不存在返回错误）。
+func (s *mockStore) GetTaskRenamePending(ctx context.Context, id string) (*string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.tasks[id]; !ok {
+		return nil, fmt.Errorf("not found")
+	}
+	if p, ok := s.renamePending[id]; ok {
+		v := p
+		return &v, nil
+	}
+	return nil, nil
+}
+
+// SetTaskRenamePending 写入意图 JSON。镜像 store 契约：意图元数据写入 MUST NOT 推进
+// updated_at，恒 Matched+!Changed。
+func (s *mockStore) SetTaskRenamePending(ctx context.Context, id, pendingJSON string) (application.MutationResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.setRenamePendingErr != nil {
+		return application.MutationResult{}, s.setRenamePendingErr
+	}
+	if _, ok := s.tasks[id]; !ok {
+		return application.MutationResult{}, fmt.Errorf("not found")
+	}
+	s.renamePending[id] = pendingJSON
+	return application.MutationResult{Matched: true}, nil
+}
+
+// ClearTaskRenamePending 清除意图（幂等；MUST NOT 推进 updated_at）。
+func (s *mockStore) ClearTaskRenamePending(ctx context.Context, id string) (application.MutationResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.clearRenamePendingErr != nil {
+		return application.MutationResult{}, s.clearRenamePendingErr
+	}
+	if _, ok := s.tasks[id]; !ok {
+		return application.MutationResult{}, fmt.Errorf("not found")
+	}
+	delete(s.renamePending, id)
+	return application.MutationResult{Matched: true}, nil
+}
+
+// CommitTaskInfoUpdate 镜像 store 单事务语义：presence 字段（nil=不修改）同值跳过、
+// 真实变化才写业务列并推进 updated_at；同事务清除意图（意图清除不参与 Changed 计算）。
+func (s *mockStore) CommitTaskInfoUpdate(ctx context.Context, id string, update application.TaskInfoUpdate) (application.MutationResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.commitInfoErr != nil {
+		return application.MutationResult{}, s.commitInfoErr
+	}
+	t, ok := s.tasks[id]
+	if !ok {
+		return application.MutationResult{}, nil
+	}
+	changed := false
+	if update.Name != nil && *update.Name != t.Name {
+		t.Name = *update.Name
+		changed = true
+	}
+	if update.Branch != nil && *update.Branch != t.Branch {
+		t.Branch = *update.Branch
+		changed = true
+	}
+	if update.EnvSnapshot != nil && (!t.EnvSnapshot.Valid || t.EnvSnapshot.String != *update.EnvSnapshot) {
+		t.EnvSnapshot = sql.NullString{String: *update.EnvSnapshot, Valid: true}
+		changed = true
+	}
+	if changed {
+		t.UpdatedAt++
+	}
+	delete(s.renamePending, id)
+	s.tasks[id] = t
+	return application.MutationResult{Matched: true, Changed: changed}, nil
+}
+
+// pendingOf 返回任务当前意图 JSON 拷贝（测试断言用）。
+func (s *mockStore) pendingOf(id string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.renamePending[id]
+	return p, ok
+}
+
+// seedRenamePending 直接预置任务意图 JSON（R1/仲裁测试入口）。
+func (s *mockStore) seedRenamePending(id, pendingJSON string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.renamePending[id] = pendingJSON
+}
+
+// --- task-info-editable 3.2：notice 断言 helper ---
+
+// noticeEntries 解析任务当前 notice（测试断言用；解析失败返回 nil）。
+func (s *mockStore) noticeEntries(id string) []noticeEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := parseNotices(s.tasks[id].Notice)
+	if err != nil {
+		return nil
+	}
+	return entries
+}
+
+// pendingOfNotice 返回任务 notice 中首个指定 code 项（测试断言用）。
+func (s *mockStore) pendingOfNotice(code string) (noticeEntry, bool) {
+	return s.pendingOfNoticeFor("t1", code)
+}
+
+// pendingOfNoticeFor 同 pendingOfNotice，显式指定任务。
+func (s *mockStore) pendingOfNoticeFor(taskID, code string) (noticeEntry, bool) {
+	for _, e := range s.noticeEntries(taskID) {
+		if e.Code == code {
+			return e, true
+		}
+	}
+	return noticeEntry{}, false
+}
+
+// countNotices 返回任务 notice 中指定 code 的条数（去重断言用）。
+func (s *mockStore) countNotices(code string) int {
+	n := 0
+	for _, e := range s.noticeEntries("t1") {
+		if e.Code == code {
+			n++
+		}
+	}
+	return n
+}
+
+// seedNotice 预置一条指定 code 的 notice（清除路径测试用）。
+func (s *mockStore) seedNotice(taskID, code string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tk := s.tasks[taskID]
+	entries, _ := parseNotices(tk.Notice)
+	entries = append(entries, noticeEntry{Code: code, Message: "seed", TS: 1})
+	tk.Notice = encodeNotices(entries)
+	s.tasks[taskID] = tk
 }
 
 // --- recovery tagged debt mock（G3-3/G3-10：镜像 store.recovery_debts 按
@@ -1102,6 +1253,20 @@ type mockWorktree struct {
 	dirtyFiles      map[string]map[string]struct{} // wtPath -> dirty file set (B7c 二次门禁)
 	dirtyErr        error
 	removeCallCount int // Remove 调用计数（pre-delete admission 失败测试断言未调用 wt.Remove）
+	// --- task-info-editable：分支改名 / HEAD 身份桩 ---
+	// headBranch: wtPath -> symbolic HEAD 短分支名；无条目 = worktree 缺失（错误）。
+	headBranch map[string]string
+	// renameErr 非空时 RenameBranch 返回该错误（failpoint，git 明确失败）；nil 时模拟成功改名
+	//（HEAD 跟随 + branches map 同步）。renameCalls 记录 "old->new" 调用序列。
+	// renameErrFor 按调用键注入「明确失败、零副作用」错误（如仅补偿改回报错），优先于 renameErr；
+	// renameAppliedErrFor 按调用键注入「报错但效果已应用」错误（模拟结果未知：进程被杀/部分生效），
+	// 优先于 renameErrFor。
+	renameErr           error
+	renameErrFor        map[string]error
+	renameAppliedErrFor map[string]error
+	renameCalls         []string
+	// validateErr 非空时 ValidateBranchName 返回该错误（模拟 check-ref-format 拒绝）。
+	validateErr error
 }
 
 func newMockWorktree() *mockWorktree {
@@ -1110,6 +1275,7 @@ func newMockWorktree() *mockWorktree {
 		branches:   map[string]bool{},
 		products:   map[string]bool{},
 		dirtyFiles: map[string]map[string]struct{}{},
+		headBranch: map[string]string{},
 	}
 }
 
@@ -1145,7 +1311,7 @@ func (w *mockWorktree) BranchExists(ctx context.Context, repoPath, branch string
 }
 
 func (w *mockWorktree) ValidateBranchName(ctx context.Context, repoPath, branch string) error {
-	return nil
+	return w.validateErr
 }
 
 // ResolveBaseRef 满足 WorktreeBackend 新增端口（add-plain-dir-project D10）。
@@ -1186,6 +1352,59 @@ func (w *mockWorktree) DirtyFiles(ctx context.Context, wtPath string) (map[strin
 		out[k] = struct{}{}
 	}
 	return out, nil
+}
+
+// WorktreeHeadBranch 返回预置的 symbolic HEAD 短分支名（task-info-editable）；
+// 无条目 = worktree 缺失/无法判定（错误）。
+func (w *mockWorktree) WorktreeHeadBranch(ctx context.Context, repoPath, wtPath string) (string, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	b, ok := w.headBranch[wtPath]
+	if !ok {
+		return "", fmt.Errorf("worktree missing: %s", wtPath)
+	}
+	return b, nil
+}
+
+// RenameBranch 模拟 git branch -m：renameAppliedErrFor（报错但效果已应用，结果未知）优先于
+// renameErrFor（明确失败零副作用），再次全局 renameErr；无 failpoint 时模拟成功（HEAD 跟随 +
+// branches map 同步）。调用序列记录 "old->new"。
+func (w *mockWorktree) RenameBranch(ctx context.Context, wtPath, oldName, newName string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	call := oldName + "->" + newName
+	w.renameCalls = append(w.renameCalls, call)
+	applied, hasApplied := w.renameAppliedErrFor[call]
+	if hasApplied {
+		w.applyRename(wtPath, oldName, newName)
+		return applied
+	}
+	if err, ok := w.renameErrFor[call]; ok {
+		return err
+	}
+	if w.renameErr != nil {
+		return w.renameErr
+	}
+	w.applyRename(wtPath, oldName, newName)
+	return nil
+}
+
+// applyRename 模拟改名生效：HEAD 跟随 + branches map 同步（调用方已持 w.mu）。
+func (w *mockWorktree) applyRename(wtPath, oldName, newName string) {
+	if cur, ok := w.headBranch[wtPath]; ok && cur == oldName {
+		w.headBranch[wtPath] = newName
+	}
+	if w.branches[oldName] {
+		delete(w.branches, oldName)
+		w.branches[newName] = true
+	}
+}
+
+// renameCallsSnapshot 返回 RenameBranch 调用记录拷贝（并发安全读）。
+func (w *mockWorktree) renameCallsSnapshot() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.renameCalls...)
 }
 
 // --- mock OCClient ---
@@ -1232,6 +1451,23 @@ type mockOC struct {
 	replyPermissionCount   int64
 	replyMu                sync.Mutex
 	replyPermissionCalls   []replyPermissionCall
+	// --- task-info-editable：会话标题更新桩 ---
+	// updateTitleErrByID 按 sessionID 返回特定错误；updateTitleErr 全局兜底；nil 成功。
+	// updateTitleCalls 记录 (dir, id, title) 调用序列；updateTitleCount 原子计数
+	//（并发合并测试的确定性断言：首测 gate 内计数先于结果处理）。
+	// updateTitleBlock 非空时 UpdateSessionTitle 阻塞直至该 channel 关闭（放大并发窗口）。
+	updateTitleErrByID map[string]error
+	updateTitleErr     error
+	updateTitleCalls   []updateTitleCall
+	updateTitleCount   int64
+	updateTitleBlock   chan struct{}
+}
+
+// updateTitleCall 记录一次 UpdateSessionTitle 调用参数。
+type updateTitleCall struct {
+	Dir   string
+	ID    string
+	Title string
 }
 
 // replyPermissionCall 记录一次 ReplyPermission 调用参数。
@@ -1243,10 +1479,11 @@ type replyPermissionCall struct {
 
 func newMockOC(healthOK bool) *mockOC {
 	return &mockOC{
-		healthOK:          healthOK,
-		onReadyCh:         make(chan struct{}, 1),
-		deleteErrByID:     map[string]error{},
-		promptAsyncResult: opencode.PromptResult{Kind: opencode.ResultPreSendFailure, Detail: "mockOC: prompt_async not configured"},
+		healthOK:           healthOK,
+		onReadyCh:          make(chan struct{}, 1),
+		deleteErrByID:      map[string]error{},
+		updateTitleErrByID: map[string]error{},
+		promptAsyncResult:  opencode.PromptResult{Kind: opencode.ResultPreSendFailure, Detail: "mockOC: prompt_async not configured"},
 	}
 }
 
@@ -1367,7 +1604,7 @@ func (c *mockOC) ProbePromptAsyncCapability(ctx context.Context) opencode.Capabi
 }
 
 // ReplyPermission 记录调用并按 replyPermissionErr / replyPermissionErrByID 返回
-//（task-permission-mode D6 测试桩）。
+// （task-permission-mode D6 测试桩）。
 func (c *mockOC) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
 	atomic.AddInt64(&c.replyPermissionCount, 1)
 	c.replyMu.Lock()
@@ -1384,6 +1621,35 @@ func (c *mockOC) replyPermissionCallsSnapshot() []replyPermissionCall {
 	c.replyMu.Lock()
 	defer c.replyMu.Unlock()
 	return append([]replyPermissionCall(nil), c.replyPermissionCalls...)
+}
+
+// UpdateSessionTitle 记录调用并按 updateTitleErrByID / updateTitleErr 返回
+// （task-info-editable 3.2 测试桩）；opencode.ErrSessionTitleUnsupported 由测试直接预置。
+// updateTitleBlock 非空时先阻塞（并发合并测试：leader 停在 PATCH 内放大窗口）。
+func (c *mockOC) UpdateSessionTitle(ctx context.Context, dir, id, title string) error {
+	c.mu.Lock()
+	c.updateTitleCalls = append(c.updateTitleCalls, updateTitleCall{Dir: dir, ID: id, Title: title})
+	c.mu.Unlock()
+	atomic.AddInt64(&c.updateTitleCount, 1)
+	if c.updateTitleBlock != nil {
+		<-c.updateTitleBlock
+	}
+	if err, ok := c.updateTitleErrByID[id]; ok {
+		return err
+	}
+	return c.updateTitleErr
+}
+
+// updateTitleCountLoad 返回 PATCH 调用的原子计数（并发安全读）。
+func (c *mockOC) updateTitleCountLoad() int64 {
+	return atomic.LoadInt64(&c.updateTitleCount)
+}
+
+// updateTitleCallsSnapshot 返回已发生的 UpdateSessionTitle 调用记录拷贝（并发安全读）。
+func (c *mockOC) updateTitleCallsSnapshot() []updateTitleCall {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]updateTitleCall(nil), c.updateTitleCalls...)
 }
 
 // --- test manager builder ---
@@ -1453,6 +1719,11 @@ func (c *readyOC) PromptAsync(ctx context.Context, dir, sessionID, messageID, te
 }
 func (c *readyOC) ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState {
 	return c.inner.ProbePromptAsyncCapability(ctx)
+}
+
+// UpdateSessionTitle 透传标题更新（task-info-editable 3.2；inner 未实现时 fail-closed 错误）。
+func (c *readyOC) UpdateSessionTitle(ctx context.Context, dir, id, title string) error {
+	return c.inner.UpdateSessionTitle(ctx, dir, id, title)
 }
 
 // ListMessages 透传可选消息拉取能力（agentMessageLister；inner 未实现时

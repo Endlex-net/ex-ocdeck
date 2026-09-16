@@ -90,6 +90,11 @@ func (c *blockingPermOC) ReplyPermission(ctx context.Context, dir, requestID, re
 	return c.inner.ReplyPermission(ctx, dir, requestID, reply)
 }
 
+// UpdateSessionTitle 满足 OCClient 新端口（task-info-editable 3.2；本 fake 不消费标题能力）。
+func (c *blockingPermOC) UpdateSessionTitle(ctx context.Context, dir, id, title string) error {
+	return c.inner.UpdateSessionTitle(ctx, dir, id, title)
+}
+
 // blockingBothOC 同时阻塞 ListPermissions 与 ListQuestions，各自 entered 信号独立。
 // 用于验证 degraded 后台重试两类型并发启动（任一释放前两者均已进入 REST）。
 type blockingBothOC struct {
@@ -151,6 +156,11 @@ func (c *blockingBothOC) ProbePromptAsyncCapability(ctx context.Context) opencod
 }
 func (c *blockingBothOC) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
 	return c.inner.ReplyPermission(ctx, dir, requestID, reply)
+}
+
+// UpdateSessionTitle 满足 OCClient 新端口（task-info-editable 3.2；本 fake 不消费标题能力）。
+func (c *blockingBothOC) UpdateSessionTitle(ctx context.Context, dir, id, title string) error {
+	return c.inner.UpdateSessionTitle(ctx, dir, id, title)
 }
 
 // --- pending 生命周期 ---

@@ -120,6 +120,62 @@ func WorktreePrune(ctx context.Context, repoPath string) error {
 	return err
 }
 
+// RenameBranch 原子重命名本地分支（git branch -m <old> <new>，task-info-editable D2）。
+// 在 wtPath（worktree 或主仓库）执行：检出该分支的 worktree HEAD 引用跟随新名、reflog
+// 保留、磁盘路径不变（单条 git 命令原子；跨 git/DB 的中断恢复由调用方的恢复意图承担）。
+// 目标分支已存在（冲突）或名称非法由 git 报错返回，零副作用（旧分支与 HEAD 保持原状）。
+// 不加锁：repo 写锁由编排层持有（与 worktree add/remove、fetch 串行）。
+// `--` 终止选项，防止分支名被解释为选项（同 DeleteBranch）。
+func RenameBranch(ctx context.Context, wtPath, oldName, newName string) error {
+	if oldName == "" || newName == "" {
+		return errors.New("git: empty branch name")
+	}
+	_, _, err := run(ctx, wtPath, "branch", "-m", "--", oldName, newName)
+	if err != nil {
+		return fmt.Errorf("git: rename branch %s -> %s: %w", oldName, newName, err)
+	}
+	return nil
+}
+
+// WorktreeHeadBranch 返回 wtPath 的 symbolic HEAD 短分支名，并校验其归属 repoPath 仓库
+//（task-info-editable D2：HEAD 身份验证/R1 的共用检查 = 仓库归属 + symbolic HEAD 读取）。
+// worktree 路径缺失、不属于 repoPath、detached HEAD、HEAD 读取失败均返回错误——调用方
+// 按「无法明确判定」处置（R1 保留恢复意图；普通改名入口映射 invalid_state）。
+func WorktreeHeadBranch(ctx context.Context, repoPath, wtPath string) (string, error) {
+	if info, err := os.Stat(wtPath); err != nil || !info.IsDir() {
+		return "", fmt.Errorf("git: worktree missing: %s", wtPath)
+	}
+	// 仓库归属：repoPath 的 worktree list 须包含 wtPath（canonical 路径比较，同
+	// BranchCheckedOutByOther 的归一方式）。
+	out, _, err := run(ctx, repoPath, "worktree", "list", "--porcelain")
+	if err != nil {
+		return "", fmt.Errorf("git: worktree list in %s: %w", repoPath, err)
+	}
+	wtCanon := wtPath
+	if r, e := filepath.EvalSymlinks(wtPath); e == nil {
+		wtCanon = r
+	}
+	belongs := false
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "worktree ") {
+			continue
+		}
+		p := strings.TrimSpace(strings.TrimPrefix(line, "worktree "))
+		pCanon := p
+		if r, e := filepath.EvalSymlinks(p); e == nil {
+			pCanon = r
+		}
+		if pCanon == wtCanon {
+			belongs = true
+			break
+		}
+	}
+	if !belongs {
+		return "", fmt.Errorf("git: worktree %s does not belong to repo %s", wtPath, repoPath)
+	}
+	return CurrentBranch(ctx, wtPath)
+}
+
 // DeleteBranch 删除本地分支（-D 强制）。需在主仓库或非该分支检出的 worktree 中执行。
 // 分支不存在视为已成功（幂等，design.md §19 资源不存在视为已成功）。
 // `--` 终止选项，防止 branch 名被解释为选项。

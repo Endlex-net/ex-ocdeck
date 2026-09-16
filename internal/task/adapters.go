@@ -167,6 +167,24 @@ func (a *StoreAdapter) ConvergeInterruptedInitRuns(ctx context.Context) (int64, 
 	return a.db.ConvergeInterruptedInitRuns(ctx)
 }
 
+// --- 任务信息修改 + 改名恢复意图（task-info-editable D6；委托 store 同名事务方法） ---
+
+func (a *StoreAdapter) CommitTaskInfoUpdate(ctx context.Context, id string, update application.TaskInfoUpdate) (application.MutationResult, error) {
+	return a.db.CommitTaskInfoUpdate(ctx, id, update)
+}
+
+func (a *StoreAdapter) SetTaskRenamePending(ctx context.Context, id string, pendingJSON string) (application.MutationResult, error) {
+	return a.db.SetTaskRenamePending(ctx, id, pendingJSON)
+}
+
+func (a *StoreAdapter) ClearTaskRenamePending(ctx context.Context, id string) (application.MutationResult, error) {
+	return a.db.ClearTaskRenamePending(ctx, id)
+}
+
+func (a *StoreAdapter) GetTaskRenamePending(ctx context.Context, id string) (*string, error) {
+	return a.db.GetTaskRenamePending(ctx, id)
+}
+
 func (a *StoreAdapter) ListProjectEnvVars(ctx context.Context, projectID string) ([]EnvVarRow, error) {
 	rows, err := a.db.ListProjectEnvVars(ctx, projectID)
 	if err != nil {
@@ -578,6 +596,18 @@ func (a *WorktreeAdapter) BranchExists(ctx context.Context, repoPath, branch str
 // design.md §19）。委托 internal/infrastructure/git.ValidateBranchName，保持 worktree 包不引入新公开方法。
 func (a *WorktreeAdapter) ValidateBranchName(ctx context.Context, repoPath, branch string) error {
 	return git.ValidateBranchName(ctx, repoPath, branch)
+}
+
+// WorktreeHeadBranch 返回 worktree 的 symbolic HEAD 短分支名并校验仓库归属
+//（task-info-editable D2）。委托 internal/infrastructure/git.WorktreeHeadBranch。
+func (a *WorktreeAdapter) WorktreeHeadBranch(ctx context.Context, repoPath, wtPath string) (string, error) {
+	return git.WorktreeHeadBranch(ctx, repoPath, wtPath)
+}
+
+// RenameBranch 原子重命名本地分支（task-info-editable D2）。锁由编排层持有，
+// 委托 internal/infrastructure/git.RenameBranch（不加锁）。
+func (a *WorktreeAdapter) RenameBranch(ctx context.Context, wtPath, oldName, newName string) error {
+	return git.RenameBranch(ctx, wtPath, oldName, newName)
 }
 
 // ResolveBaseRef 将 base_ref 短名解析为全限定 ref（add-plain-dir-project D10）。

@@ -69,6 +69,11 @@ func (c *alwaysUnhealthyOC) ReplyPermission(ctx context.Context, dir, requestID,
 	return nil
 }
 
+// UpdateSessionTitle 满足 OCClient 新端口（task-info-editable 3.2；本 fake 不消费标题能力）。
+func (c *alwaysUnhealthyOC) UpdateSessionTitle(ctx context.Context, dir, id, title string) error {
+	return nil
+}
+
 // healthThenProbeOC：Health 就绪；Probe 返回注入错误。
 type healthThenProbeOC struct {
 	probeErr error
@@ -114,6 +119,11 @@ func (c *healthThenProbeOC) ProbePromptAsyncCapability(ctx context.Context) open
 	return opencode.CapabilityUnknown
 }
 func (c *healthThenProbeOC) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
+	return nil
+}
+
+// UpdateSessionTitle 满足 OCClient 新端口（task-info-editable 3.2；本 fake 不消费标题能力）。
+func (c *healthThenProbeOC) UpdateSessionTitle(ctx context.Context, dir, id, title string) error {
 	return nil
 }
 

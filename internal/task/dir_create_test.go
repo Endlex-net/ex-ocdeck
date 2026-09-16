@@ -504,6 +504,12 @@ func (w *baseRefRejectValidate) PreflightDelete(ctx context.Context, wtPath stri
 func (w *baseRefRejectValidate) DirtyFiles(ctx context.Context, wtPath string) (map[string]struct{}, error) {
 	return w.inner.DirtyFiles(ctx, wtPath)
 }
+func (w *baseRefRejectValidate) WorktreeHeadBranch(ctx context.Context, repoPath, wtPath string) (string, error) {
+	return w.inner.WorktreeHeadBranch(ctx, repoPath, wtPath)
+}
+func (w *baseRefRejectValidate) RenameBranch(ctx context.Context, wtPath, oldName, newName string) error {
+	return w.inner.RenameBranch(ctx, wtPath, oldName, newName)
+}
 
 func containsDotDot(s string) bool { return len(s) > 0 && indexDotDot(s) >= 0 }
 

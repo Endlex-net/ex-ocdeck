@@ -43,6 +43,11 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 	if kerr != nil {
 		return newOpErr(codeInternal, kerr)
 	}
+	// task-info-editable D2 仲裁表：Suspend 在 active→suspending 状态流转前先执行 R1 收敛
+	//（防止清快照后恢复补提交复活快照）。不可收敛 → conflict 拒绝挂起（状态与快照不变）。
+	if cerr := m.convergePendingBeforeLifecycle(ctx, row, proj); cerr != nil {
+		return newOpErr(codeConflict, cerr)
+	}
 	// P1.4.7：DB 写入经 write* helper 路由（注入 LifecycleService 时走 persist+commit 封装）。
 	// terminal-file-paste-drop 2.5：active→suspending 提交（离开 active）在 per-task
 	// 协调锁临界区内执行（本方法已持任务锁，锁顺序：任务锁 → 协调锁），与上传

@@ -117,6 +117,11 @@ func (c *portHealthOC) ReplyPermission(ctx context.Context, dir, requestID, repl
 	return nil
 }
 
+// UpdateSessionTitle 满足 OCClient 新端口（task-info-editable 3.2；本 fake 不消费标题能力）。
+func (c *portHealthOC) UpdateSessionTitle(ctx context.Context, dir, id, title string) error {
+	return nil
+}
+
 // newPortRetryManager 构造一个 Manager，其 ocFactory 在 failPort 上 Health 失败、其他端口成功。
 // 用于 E1 端口重试测试。probeErr 传入 Probe 返回错误（默认 nil=成功）。
 func newPortRetryManager(t *testing.T, store TaskStore, proc ProcessBackend, failPort int, probeErr error) *Manager {
@@ -184,6 +189,9 @@ func (c *readyOCWrap) ProbePromptAsyncCapability(ctx context.Context) opencode.C
 }
 func (c *readyOCWrap) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
 	return c.inner.ReplyPermission(ctx, dir, requestID, reply)
+}
+func (c *readyOCWrap) UpdateSessionTitle(ctx context.Context, dir, id, title string) error {
+	return c.inner.UpdateSessionTitle(ctx, dir, id, title)
 }
 
 // --- E1: 端口重写三处一致 ---

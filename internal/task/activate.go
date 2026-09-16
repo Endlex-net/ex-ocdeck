@@ -365,6 +365,17 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 		}
 	}
 
+	// task-info-editable D2 仲裁表：Activate 在 suspended 前置校验之后、beginActivation 之前
+	// 先执行 R1 收敛。不可收敛 → 保持 suspended、仅记录 last_error，MUST NOT 进入
+	// 通常会清理快照的激活失败补偿路径（本处直接返回，不经 runActivateFailureCompensation）。
+	if cerr := m.convergePendingBeforeLifecycle(ctx, row, proj); cerr != nil {
+		le := sql.NullString{String: cerr.Error(), Valid: true}
+		if _, werr := m.writeStatus(ctx, taskID, StatusSuspended, le); werr != nil {
+			return newOpErr(codeInternal, errors.Join(cerr, fmt.Errorf("record last_error: %w", werr)))
+		}
+		return newOpErr(codeConflict, cerr)
+	}
+
 	// ① 置 activating。G3-18：激活准入原子拒绝未清 recovery debt（Complete 成功
 	// 但删除失败遗留 / CAS mismatch 留存的旧 intent 不得被重放误伤本次激活）。
 	updated, err := m.beginActivation(ctx, taskID, StatusSuspended)
