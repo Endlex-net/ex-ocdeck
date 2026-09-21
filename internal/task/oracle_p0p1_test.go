@@ -140,6 +140,8 @@ func TestP0_ResumeActive_RestoresWatchersBeforeActive(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
 	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActivating })
+	// 启动事实（D5 三路径矩阵②）：读校验通过，让失败点落在 watcher 恢复阶段（本测试目标）。
+	store.seedPermissionModeAtStart("t1", PermissionModeAIAuto)
 	// env snapshot 供 loadEnvSnapshot。
 	snap := envSnapshot{Vars: map[string]string{"OCDECK_TASK_ID": "t1"}}
 	snapBytes, _ := encodeEnvSnapshot(snap)

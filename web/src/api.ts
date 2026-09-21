@@ -30,9 +30,11 @@ import type {
   SubmissionAnnotationRef,
   SubmissionsListResponse,
   Task,
+  TaskDetail,
   TaskInfoPatch,
   TaskMode,
   TaskPermissionMode,
+  TaskPermissionModeView,
   TerminalInfo,
 } from './types';
 
@@ -198,11 +200,19 @@ export const api = {
       ...(permissionMode ? { permission_mode: permissionMode } : {}),
       ...(branchSlug ? { branch_slug: branchSlug } : {}),
     }),
-  getTask: (id: string) => request<Task>('GET', `/tasks/${id}`),
+  /** 任务详情（fix-ai-auto-permission-and-tab-focus D4/D8）：详情读模型含 effective_permission_mode。 */
+  getTask: (id: string) => request<TaskDetail>('GET', `/tasks/${id}`),
   /** 任务信息修改（task-info-editable）：presence 语义——仅 patch 中出现的字段参与更新；
-   *  空 patch（{}）幂等返回当前任务 DTO。成功返回更新后的任务 DTO。 */
+   *  空 patch（{}）幂等返回当前任务 DTO。成功返回更新后的任务 DTO（通用 Task，
+   *  不含 effective_permission_mode——回写页面任务须 mergeTaskInfoPatch 合并保留，D8）。 */
   updateTask: (id: string, patch: TaskInfoPatch) =>
     request<Task>('PATCH', `/tasks/${id}`, patch),
+  /** 权限模式修改（fix-ai-auto-permission-and-tab-focus D4）：独立子资源端点，与任务名称/
+   *  分支修改（updateTask）互不相干；三档互转，同值保存同样 200。响应固定两模式字段。 */
+  updateTaskPermissionMode: (id: string, mode: TaskPermissionMode) =>
+    request<TaskPermissionModeView>('PATCH', `/tasks/${id}/permission-mode`, {
+      permission_mode: mode,
+    }),
   taskAction: (id: string, action: 'activate' | 'suspend' | 'archive' | 'restore' | 'retry') =>
     request<void>('POST', `/tasks/${id}/${action}`),
   /** 带 confirmDirty 的重试：deletion_failed 且 worktree dirty 时 409 拒绝后需显式确认。 */

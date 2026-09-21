@@ -11,7 +11,8 @@ export type TaskMode = 'worktree' | 'local-path';
 
 /** 任务权限模式（task-permission-mode D1/D7）：ask=人工逐条批准（缺省）；
  *  all-approve=全部批准（显式 deny 仍生效）；ai-auto=全局 LLM 自动判定、不确定转人工。
- *  创建后不可修改；DTO/摘要/活跃快照均为必有字段。 */
+ *  DTO/摘要/活跃快照均为必有字段；创建后可经专用端点三档互转
+ *  （fix-ai-auto-permission-and-tab-focus D4，与任务名称/分支修改互不相干）。 */
 export type TaskPermissionMode = 'ask' | 'all-approve' | 'ai-auto';
 
 /** 权限模式三档展示文案（task-permission-mode D8 定稿措辞），新建表单与任务详情共用。 */
@@ -116,7 +117,8 @@ export interface Task {
   /** 任务运行模式（必有）：worktree | local-path；任务行分支展示（isGitlessTask）与
    *  删除文案/序列按 mode 判定，Git 能力不再按 mode 判定（仅 dir 隐藏，D8）。 */
   mode: TaskMode;
-  /** 任务权限模式（必有，task-permission-mode D7）：详情页只读展示，创建后不可修改。 */
+  /** 任务权限模式（必有）：已保存值；修改走专用模式端点（updateTaskPermissionMode），
+   *  通用 PATCH 不涉及该字段。运行中进程的实际生效值见 TaskDetail.effective_permission_mode。 */
   permission_mode: TaskPermissionMode;
   last_port?: number;
   last_error?: string;
@@ -134,6 +136,40 @@ export interface Task {
   agentStatus?: string;
   /** 注意力信号快照（design.md D6 GET /tasks/:id 透出）。空数组非 null；unsupported 为空数组。 */
   attention?: Attention;
+}
+
+/** 任务详情（详情 GET /tasks/:id 与详情 SSE 帧，fix-ai-auto-permission-and-tab-focus D4/D8）：
+ *  通用 Task 全字段 + effective_permission_mode。effective 仅存在于详情读模型与模式端点
+ *  响应；通用 Task（列表/摘要/通用 PATCH 响应）MUST NOT 含该字段。 */
+export interface TaskDetail extends Task {
+  /** 当前实际生效的权限模式（必有，按运行进程推导）：无运行进程时与 permission_mode 一致；
+   *  差异仅出现在涉及 all-approve 的转换（新模式下次激活生效）。 */
+  effective_permission_mode: TaskPermissionMode;
+}
+
+/** PATCH /tasks/:id/permission-mode 响应（fix-ai-auto-permission-and-tab-focus D4 外部契约）：
+ *  固定两模式字段（同值保存同样 200）。 */
+export interface TaskPermissionModeView {
+  permission_mode: TaskPermissionMode;
+  effective_permission_mode: TaskPermissionMode;
+}
+
+/** 通用任务信息 PATCH 响应回写页面任务（D8 合并保留）：响应不含 effective_permission_mode，
+ *  整体替换会丢失「下次激活生效」提示——MUST 保留回写前页面上的当前 effective 值。 */
+export function mergeTaskInfoPatch(prev: TaskDetail, updated: Task): TaskDetail {
+  return { ...updated, effective_permission_mode: prev.effective_permission_mode };
+}
+
+/** 权限模式端点响应回写页面任务：仅合并两个模式字段，其余字段保持不变（D8）。 */
+export function mergePermissionModeView(
+  prev: TaskDetail,
+  view: TaskPermissionModeView,
+): TaskDetail {
+  return {
+    ...prev,
+    permission_mode: view.permission_mode,
+    effective_permission_mode: view.effective_permission_mode,
+  };
 }
 
 /** PATCH /tasks/:id 请求体（task-info-editable）：presence 语义——仅提供的字段参与更新；

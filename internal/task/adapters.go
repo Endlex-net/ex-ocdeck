@@ -185,6 +185,24 @@ func (a *StoreAdapter) GetTaskRenamePending(ctx context.Context, id string) (*st
 	return a.db.GetTaskRenamePending(ctx, id)
 }
 
+// --- 启动权限事实 + 权限模式（task-permission-mode D5/D8；委托 store 同名方法） ---
+
+func (a *StoreAdapter) BackfillPermissionModeAtStart(ctx context.Context) error {
+	return a.db.BackfillPermissionModeAtStart(ctx)
+}
+
+func (a *StoreAdapter) SetPermissionModeAtStart(ctx context.Context, taskID, mode string) error {
+	return a.db.SetPermissionModeAtStart(ctx, taskID, mode)
+}
+
+func (a *StoreAdapter) GetPermissionModeAtStart(ctx context.Context, taskID string) (*string, error) {
+	return a.db.GetPermissionModeAtStart(ctx, taskID)
+}
+
+func (a *StoreAdapter) UpdateTaskPermissionMode(ctx context.Context, taskID, mode string) (application.MutationResult, error) {
+	return a.db.UpdateTaskPermissionMode(ctx, taskID, mode)
+}
+
 func (a *StoreAdapter) ListProjectEnvVars(ctx context.Context, projectID string) ([]EnvVarRow, error) {
 	rows, err := a.db.ListProjectEnvVars(ctx, projectID)
 	if err != nil {

@@ -220,15 +220,14 @@ func (m *Manager) Create(ctx context.Context, projectID string, opts CreateTaskO
 	}
 	// 权限模式缺省归一化与复核（task-permission-mode D2）：空串=缺省 → ask 落库；
 	// 非空非法值 invalid_input 零副作用（与 Mode 的「api 校验 + task 层复核」双闸一致，
-	// 任何状态写入与副作用前拒绝）。
+	// 任何状态写入与副作用前拒绝）。值域校验经共享函数（tasks 1.2，创建与模式端点同构）。
 	permissionMode := opts.PermissionMode
 	if permissionMode == "" {
 		permissionMode = PermissionModeAsk
 	}
-	switch permissionMode {
-	case PermissionModeAsk, PermissionModeAllApprove, PermissionModeAIAuto:
-	default:
-		return TaskRow{}, newOpErr(codeInvalidInput, fmt.Errorf("unknown permission mode %q", opts.PermissionMode))
+	permissionMode, err := normalizePermissionModeInput(permissionMode)
+	if err != nil {
+		return TaskRow{}, newOpErr(codeInvalidInput, err)
 	}
 	// 项目存在性检查。
 	proj, err := m.store.GetProject(ctx, projectID)

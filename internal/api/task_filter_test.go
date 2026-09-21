@@ -45,6 +45,16 @@ func TestEventDirtiesTaskDetail(t *testing.T) {
 		{"serve_runtime.session_error other", ocdeckevent.NewServeRuntimeSessionError("iv1", "t2", "s1", "APIError", "boom", nil, nil), false},
 		{"serve_runtime.session_error malformed payload", ocdeckevent.Event{Topic: ocdeckevent.TopicServeRuntime, Type: ocdeckevent.TypeServeRuntimeSessionError, RID: "iv", Payload: nil}, true},
 		{"serve_runtime.session_error wrong topic", ocdeckevent.Event{Topic: ocdeckevent.TopicTask, Type: ocdeckevent.TypeServeRuntimeSessionError, RID: "iv", Payload: ocdeckevent.ServeRuntimeSessionErrorPayload{TaskID: "t2"}}, true},
+		// task-permission-mode D7 消费矩阵：两唤醒事件不改变详情投影（详情 effective
+		// 刷新仅依赖 task.activity_changed）→ 无论 TaskID 是否本任务均不标脏；
+		// Topic/payload 形状异常按本表惯例保守标脏。
+		{"serve_runtime.permission_verdict self", ocdeckevent.NewServeRuntimePermissionVerdict("iv1", "t1"), false},
+		{"serve_runtime.permission_verdict other", ocdeckevent.NewServeRuntimePermissionVerdict("iv1", "t2"), false},
+		{"serve_runtime.permission_mode_changed self", ocdeckevent.NewServeRuntimePermissionModeChanged("iv1", "t1"), false},
+		{"serve_runtime.permission_mode_changed other", ocdeckevent.NewServeRuntimePermissionModeChanged("iv1", "t2"), false},
+		{"serve_runtime.permission_verdict malformed payload", ocdeckevent.Event{Topic: ocdeckevent.TopicServeRuntime, Type: ocdeckevent.TypeServeRuntimePermissionVerdict, RID: "iv", Payload: nil}, true},
+		{"serve_runtime.permission_verdict wrong topic", ocdeckevent.Event{Topic: ocdeckevent.TopicTask, Type: ocdeckevent.TypeServeRuntimePermissionVerdict, RID: "iv", Payload: ocdeckevent.ServeRuntimeTaskPayload{TaskID: "t1"}}, true},
+		{"serve_runtime.permission_mode_changed malformed payload", ocdeckevent.Event{Topic: ocdeckevent.TopicServeRuntime, Type: ocdeckevent.TypeServeRuntimePermissionModeChanged, RID: "iv", Payload: "x"}, true},
 		{"resync.requested", ocdeckevent.NewResyncRequested(), true},
 		{"unknown type", ocdeckevent.Event{Topic: ocdeckevent.TopicTask, Type: "task.unknown_future", RID: "t2"}, true},
 		{"unknown type other topic", ocdeckevent.Event{Topic: "future.topic", Type: "future.thing", RID: "x"}, true},

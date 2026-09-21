@@ -201,6 +201,8 @@ func TestSuspend_BranchC_PartialFailRepair(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
 	store.mutTask("t1", func(t *TaskRow) { t.Status = StatusActive })
+	// 启动事实（D5 三路径矩阵②）：tryRepairRuntime 注册前读校验，NULL 拒绝注册。
+	store.seedPermissionModeAtStart("t1", PermissionModeAIAuto)
 	store.mutTask("t1", func(t *TaskRow) {
 		t.EnvSnapshot = sql.NullString{String: `{"vars":{"PATH":"/usr/bin"}}`, Valid: true}
 		t.LastPort = sql.NullInt64{Int64: 50001, Valid: true}
@@ -245,6 +247,8 @@ func TestSuspend_BranchC_RestoreCommitCtxCancel_ConvergesSuspended(t *testing.T)
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
 	store.mutTask("t1", func(t *TaskRow) { t.Status = StatusActive })
+	// 启动事实（D5 三路径矩阵②）：tryRepairRuntime 注册前读校验，NULL 拒绝注册。
+	store.seedPermissionModeAtStart("t1", PermissionModeAIAuto)
 	store.mutTask("t1", func(t *TaskRow) {
 		t.EnvSnapshot = sql.NullString{String: `{"vars":{"PATH":"/usr/bin"}}`, Valid: true}
 		t.LastPort = sql.NullInt64{Int64: 50001, Valid: true}

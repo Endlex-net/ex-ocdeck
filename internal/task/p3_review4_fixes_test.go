@@ -379,6 +379,8 @@ func TestReconcileResumeActive_FullPath(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
 	store.mutTask("t1", func(r *TaskRow) { r.Status = StatusActive })
+	// 启动事实（D5 三路径矩阵②）：resumeActive 注册前读校验，NULL 拒绝注册。
+	store.seedPermissionModeAtStart("t1", PermissionModeAIAuto)
 	snap := envSnapshot{Vars: map[string]string{"OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1"}}
 	snapBytes, _ := encodeEnvSnapshot(snap)
 	store.mutTask("t1", func(r *TaskRow) { r.EnvSnapshot = snapBytes })

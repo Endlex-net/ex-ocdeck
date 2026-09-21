@@ -1245,6 +1245,8 @@ func TestLocalPath_RuntimeEntries_AlignOwnedOnly(t *testing.T) {
 			r.Status = StatusActive
 			r.EnvSnapshot = snapBytes
 		})
+		// 启动事实（D5 三路径矩阵②）：persist 前进程经 startRuntimeWithPortRetry 写入。
+		capStore.seedPermissionModeAtStart("t1", PermissionModeAIAuto)
 		proc.sessions[runtimeSessionName("t1")] = true
 		proc.envValues[runtimeSessionName("t1")] = map[string]string{
 			"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",

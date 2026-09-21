@@ -4,14 +4,14 @@ import { act } from 'react';
 import { TaskWorkbenchPage } from '../pages/TaskWorkbenchPage';
 import { subscribeTask } from '../sse';
 import { mount } from './cm-test-env';
-import type { Project, Task } from '../types';
+import type { Project, TaskDetail } from '../types';
 
 /* ============================ TaskWorkbenchPage「等待人工」数据链路实证 ============================
  * 用户实测反馈「task 页面没有生效」——本文件构造 pending question 场景走真实页面渲染路径，
  * 验证：详情流 attention.questions 非空 → 页头徽标变蓝；共享 store attention_count>0 → 切换器行蓝点。 */
 
 type TaskSubOpts = {
-  onData: (t: Task) => void;
+  onData: (t: TaskDetail) => void;
   onError: (m: string) => void;
   onGone: () => void;
 };
@@ -51,7 +51,7 @@ vi.mock('../terminal/TerminalView', () => ({ TerminalView: () => null }));
 vi.mock('../components/GitPanel', () => ({ GitPanel: () => null }));
 vi.mock('../components/EnvEditor', () => ({ EnvEditor: () => null }));
 
-function makeTask(over: Partial<Task>): Task {
+function makeTask(over: Partial<TaskDetail>): TaskDetail {
   return {
     id: 't1',
     project_id: 'p1',
@@ -63,6 +63,7 @@ function makeTask(over: Partial<Task>): Task {
     worktree_path: '/tmp/wt',
     mode: 'worktree',
     permission_mode: 'ask',
+    effective_permission_mode: 'ask',
     init_status: 'none',
     created_at: 1,
     updated_at: 2,

@@ -14,6 +14,7 @@ package task
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"ocdeck/internal/application"
 	"ocdeck/internal/infrastructure/opencode"
@@ -316,6 +317,20 @@ func resolvePermissionMode(t TaskRow) (string, error) {
 		return t.PermissionMode, nil
 	default:
 		return "", fmt.Errorf("task %s: invalid permission mode %q", t.ID, t.PermissionMode)
+	}
+}
+
+// normalizePermissionModeInput 校验外部输入的权限模式值域（task-permission-mode tasks 1.2，
+// 创建与模式端点共用）：trim 后必须恰为三值之一，成功返回 trim 后的值。
+// 仅做值域校验——JSON 层缺失/null/类型错误/未知字段拒绝属端点语义，由调用方先行处理；
+// 创建路径「缺省（空串）归 ask」的入口语义同样留在调用方，不在本函数兜底。
+func normalizePermissionModeInput(mode string) (string, error) {
+	mode = strings.TrimSpace(mode)
+	switch mode {
+	case PermissionModeAsk, PermissionModeAllApprove, PermissionModeAIAuto:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unknown permission mode %q", mode)
 	}
 }
 

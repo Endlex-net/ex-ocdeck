@@ -5,7 +5,7 @@ import { TaskWorkbenchPage } from '../pages/TaskWorkbenchPage';
 import { api } from '../api';
 import { subscribeTask } from '../sse';
 import { mount, flushUI, stubMatchMedia } from './cm-test-env';
-import type { Task } from '../types';
+import type { TaskDetail } from '../types';
 
 /* ============ 工作台页头分支区与溢出菜单空态（workbench-base-ref-and-overflow tasks 3.x / 4.1） ============
  * 页头分支区渲染矩阵（design D3 判定顺序）：dir 不渲染 / local-path 经 api.gitStatus 一次性
@@ -16,7 +16,7 @@ import type { Task } from '../types';
  * 任务切换 deferred 隔离（旧任务卸载后结果到达被丢弃）。 */
 
 type TaskSubOpts = {
-  onData: (t: Task) => void;
+  onData: (t: TaskDetail) => void;
   onError: (m: string) => void;
   onGone: () => void;
 };
@@ -56,7 +56,7 @@ vi.mock('../terminal/TerminalView', () => ({ TerminalView: () => null }));
 vi.mock('../components/GitPanel', () => ({ GitPanel: () => null }));
 vi.mock('../components/EnvEditor', () => ({ EnvEditor: () => null }));
 
-function makeTask(over: Partial<Task>): Task {
+function makeTask(over: Partial<TaskDetail>): TaskDetail {
   return {
     id: 't1',
     project_id: 'p1',
@@ -68,6 +68,7 @@ function makeTask(over: Partial<Task>): Task {
     worktree_path: '/tmp/wt',
     mode: 'worktree',
     permission_mode: 'ask',
+    effective_permission_mode: 'ask',
     init_status: 'none',
     created_at: 1,
     updated_at: 2,
@@ -90,7 +91,7 @@ function renderWorkbench(taskID = 't1') {
   return { container: utils.container, unmount };
 }
 
-async function pushTask(task: Task) {
+async function pushTask(task: TaskDetail) {
   await act(async () => taskSubs.get(task.id)!.onData(task));
   await flushUI();
 }
@@ -192,11 +193,11 @@ describe('页头分支区渲染矩阵（tasks 3.1 / design D3）', () => {
   });
 
   it('旧服务端缺 base_ref 字段：按空串降级，仅当前分支', async () => {
-    const legacy = makeTask({ branch: 'feature-x' }) as Partial<Task>;
+    const legacy = makeTask({ branch: 'feature-x' }) as Partial<TaskDetail>;
     delete legacy.base_ref;
     const { container } = renderWorkbench();
     await flushUI();
-    await pushTask(legacy as Task);
+    await pushTask(legacy as TaskDetail);
 
     const btns = branchButtons(container);
     expect(btns).toHaveLength(1);

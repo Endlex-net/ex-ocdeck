@@ -29,6 +29,12 @@ func TestEventDirtiesActiveSessions(t *testing.T) {
 		// 不受影响 → 不标脏（task-notifications D2）；payload 非 typed 按本表惯例保守标脏。
 		{"serve_runtime.session_error", ocdeckevent.NewServeRuntimeSessionError("iv1", "t1", "s1", "APIError", "boom", nil, nil), false},
 		{"serve_runtime.session_error malformed payload", ocdeckevent.Event{Topic: ocdeckevent.TopicServeRuntime, Type: ocdeckevent.TypeServeRuntimeSessionError, RID: "iv1", Payload: "x"}, true},
+		// task-permission-mode D7：两唤醒事件不改变 active sessions 投影 → 不标脏；
+		// Topic/payload 形状异常按本表惯例保守标脏。
+		{"serve_runtime.permission_verdict", ocdeckevent.NewServeRuntimePermissionVerdict("iv1", "t1"), false},
+		{"serve_runtime.permission_mode_changed", ocdeckevent.NewServeRuntimePermissionModeChanged("iv1", "t1"), false},
+		{"serve_runtime.permission_verdict malformed payload", ocdeckevent.Event{Topic: ocdeckevent.TopicServeRuntime, Type: ocdeckevent.TypeServeRuntimePermissionVerdict, RID: "iv1", Payload: "x"}, true},
+		{"serve_runtime.permission_mode_changed wrong topic", ocdeckevent.Event{Topic: ocdeckevent.TopicTask, Type: ocdeckevent.TypeServeRuntimePermissionModeChanged, RID: "iv1", Payload: ocdeckevent.ServeRuntimeTaskPayload{TaskID: "t1"}}, true},
 		// resync.requested 标脏（强制重拉全量）。
 		{"resync.requested", ocdeckevent.NewResyncRequested(), true},
 		// task.activity_changed 标脏。

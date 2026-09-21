@@ -6,7 +6,7 @@
 
 ### Requirement: 任务权限模式选择与持久化
 
-系统 SHALL 支持在创建任务时提供可选的权限模式参数：请求 JSON 字段为 `permission_mode`，合法取值为 `ask`、`all-approve`、`ai-auto`。未提供或为 null 视为缺省 → `ask`，与既有创建行为完全一致；非 null 字符串 trim 后为三值之一 MUST 接受；显式空串、纯空白或未知值 MUST 以 invalid_input 拒绝且 MUST NOT 产生落库或 worktree 等任何副作用。值域校验顺序为 name → mode → permission_mode（name 空白先于本参数报错）。权限模式 MUST 随任务持久化，任务后续激活 MUST 使用落库值，MUST NOT 从其他来源重算。权限模式创建后不可修改：系统 MUST NOT 提供修改入口。既有存量任务（无落库值）MUST 按 `ask` 处理，不做数据迁移改写。
+系统 SHALL 支持在创建任务时提供可选的权限模式参数：请求 JSON 字段为 `permission_mode`，合法取值为 `ask`、`all-approve`、`ai-auto`。未提供或为 null 视为缺省 → `ask`，与既有创建行为完全一致；非 null 字符串 trim 后为三值之一 MUST 接受；显式空串、纯空白或未知值 MUST 以 invalid_input 拒绝且 MUST NOT 产生落库或 worktree 等任何副作用。值域校验顺序为 name → mode → permission_mode（name 空白先于本参数报错）。权限模式 MUST 随任务持久化，任务后续激活 MUST 使用落库值，MUST NOT 从其他来源重算。权限模式创建后的修改行为见「权限模式创建后变更」。既有存量任务（无落库值）MUST 按 `ask` 处理，不做数据迁移改写。
 
 #### Scenario: 缺省创建为 ask
 
@@ -25,8 +25,10 @@
 
 #### Scenario: 创建后不可修改
 
+（原语义废止，保留场景名以兼容 delta 合并）原「创建后不可修改」要求自本变更起废止。
+
 - **WHEN** 任务已创建
-- **THEN** 系统不提供修改其权限模式的入口；任务生命周期内权限模式保持落库值不变
+- **THEN** 系统 SHALL 提供修改其权限模式的入口，修改行为见「权限模式创建后变更」
 
 ### Requirement: 激活时按权限模式施加权限行为
 
@@ -44,13 +46,13 @@
 
 ### Requirement: ai-auto 权限请求自动判定
 
-`ai-auto` 模式任务产生权限请求时，系统 SHALL 调用平台全局 LLM 配置（可用性判定见 ai-provider-config spec）对该请求做通过/拒绝判定：判定通过 MUST 回复 `once`（仅当次请求生效），判定拒绝 MUST 回复 `reject`；系统 MUST NOT 使用 `always` 回复。自动判定 MUST 覆盖全部观察路径——无论权限请求经 SSE 事件还是 REST 对账发现，均纳入判定。**计数契约：同一 runtime 实例内，每个请求最多发起一次自动判定尝试；满足准入且仍为待处理的请求 MUST 纳入判定扫描。runtime 重建（含 server 重启）后仍待处理的同一请求可被重新判定——系统不保证跨 runtime 的全局恰好一次。**任务运行时未就绪期间（activating、启动恢复重建、挂起失败修复重建）产生的权限请求 MUST 在该次 runtime 就绪提交后纳入判定（提交前不发起判定），MUST NOT 遗漏。仅判定通过/拒绝才回复；判定不确定、失败、实例停止或回复能力不可用时 MUST NOT 回复。LLM 未配置、调用失败、超时或输出非法时，系统 MUST NOT 回复该请求——请求保持待处理并转人工（退化为 `ask` 体验），判定失败本身 MUST NOT 影响任务进程与其他权限请求的处理。回复时请求已被了结（如人工已在终端批准/拒绝）时，系统 MUST 视为正常竞态忽略，MUST NOT 报错或重试。回复请求已发出但结果未知（超时/连接失败/服务端 5xx，回复可能已被受理）时，系统 MUST NOT 重试、MUST NOT 补偿、MUST NOT 本地断言该请求已批准或已拒绝——其后续状态由既有 SSE/REST 对账收敛，若仍为待处理则照常供人工处理。
+`ai-auto` 模式任务产生权限请求时，系统 SHALL 调用平台全局 LLM 配置（可用性判定见 ai-provider-config spec）对该请求做通过/拒绝判定：判定通过 MUST 回复 `once`（仅当次请求生效）；判定拒绝 MUST NOT 自动回复——与判定不确定一致，请求保持待处理并转人工（判定结论留痕于审计，见「ai-auto 权限判定审计日志」）；系统 MUST NOT 使用 `always` 回复，自动回复仅限 `once`。自动判定 MUST 覆盖全部观察路径——无论权限请求经 SSE 事件还是 REST 对账发现，均纳入判定。**计数契约：同一 runtime 实例的同一判定 epoch 内，每个请求最多发起一次自动判定尝试；满足准入且仍为待处理的请求 MUST 纳入判定扫描。runtime 重建（含 server 重启）或切入有效 ai-auto 创建新 epoch（见「权限模式创建后变更」）后，仍待处理的同一请求可被重新判定——系统不保证跨 runtime/epoch 的全局恰好一次；同值保存 MUST NOT 创建新 epoch。**任务运行时未就绪期间（activating、启动恢复重建、挂起失败修复重建）产生的权限请求 MUST 在该次 runtime 就绪提交后纳入判定（提交前不发起判定），MUST NOT 遗漏。仅判定通过才回复；判定拒绝、不确定、失败、实例停止或回复能力不可用时 MUST NOT 回复。LLM 未配置、调用失败、超时或输出非法时，系统 MUST NOT 回复该请求——请求保持待处理并转人工（退化为 `ask` 体验），判定失败本身 MUST NOT 影响任务进程与其他权限请求的处理。回复时请求已被了结（如人工已在终端批准/拒绝）时，系统 MUST 视为正常竞态忽略，MUST NOT 报错或重试。回复请求已发出但结果未知（超时/连接失败/服务端 5xx，回复可能已被受理）时，系统 MUST NOT 重试、MUST NOT 补偿、MUST NOT 本地断言该请求已批准或已拒绝——其后续状态由既有 SSE/REST 对账收敛，若仍为待处理则照常供人工处理。
 
-判定输入 SHALL 包含平台语境与请求详情：平台语境为任务名、项目名、项目类型、任务模式、任务目录、项目目录、分支；请求详情为 permission、patterns 与按权限类别从请求 metadata 提取的详情（bash→完整命令 command；edit/write/apply_patch→文件目标与有界 diff；webfetch→完整 URL；task→子任务描述与类型；grep/glob→搜索范围；read→路径（patterns 即路径）；external_directory→越界目录信息；未识别类别→仅 permission 与 patterns；**字段级提取矩阵、界值与截断语义的唯一来源是 design D5 提取表，本节不复述**）。任务名、项目名、分支、命令、diff、描述等一切请求相关内容 MUST 以不可信数据形式传入判定器（JSON 编码的用户消息），MUST NOT 作为指令影响判定器行为。
+判定输入 SHALL 包含平台语境与请求详情：平台语境为任务名、项目名、项目类型、任务模式、任务目录、项目目录、分支；请求详情为 permission、patterns 与按权限类别从请求 metadata 提取的详情（bash→完整命令 command；edit/write/apply_patch→文件目标与有界 diff；webfetch→完整 URL；task→子任务描述与类型；grep/glob→搜索范围；read→路径（patterns 即路径）；external_directory→越界目录信息；未识别类别→仅 permission 与 patterns；**字段级提取矩阵、界值与截断语义的唯一来源是 archived change 2026-09-10-task-permission-mode 的 design D5 提取表（openspec/changes/archive/2026-09-10-task-permission-mode/design.md），本节不复述**）。任务名、项目名、分支、命令、diff、描述等一切请求相关内容 MUST 以不可信数据形式传入判定器（JSON 编码的用户消息），MUST NOT 作为指令影响判定器行为。
 
 判定输出格式：判定器 SHALL 要求模型在恰好一个 `<verdict>` 标签对内输出 `APPROVE` / `REJECT` / `UNCERTAIN` 之一（标签外允许简短理由）。**解析采用有限标签协议（不做完整 XML 解析）**：`<verdict` 与 `</verdict>` 字面子串各恰好出现一次、无属性、固定小写，标签内容 trim 后逐字等于三值之一时按内容处理；缺失任一侧标签、计数不为 1、嵌套、自闭合、带属性、大小写变体、内容非三值，MUST 一律视为判定失败（不回复、转人工、审计记 FAILED）。
 
-证据降级规则：确定性降级原因三值——`missing_critical` / `malformed_critical` / `truncated_critical`（类别关键字段缺失 / 有效 metadata object 内字段形状错误 / 因截断或裁剪丢失，关键字段集合与界值见 design D5 提取表）。metadata 有效形状仅为 JSON object；absent/null/非法 JSON/合法但非 object 一律在观察层归 nil，关键类别统一记 `missing_critical`。多原因并存时按固定优先级取单值：`malformed_critical` > `missing_critical` > `truncated_critical`（全量扫描后统一选取，不依赖校验先后）。存在降级原因时系统 MUST 判定 UNCERTAIN 转人工（判定器内短路、不调用 LLM），MUST NOT 依据残缺证据批准；**降级短路先于 LLM 配置检查**（未配置与降级并存时结果为 UNCERTAIN 而非 FAILED）。webfetch/read/grep/glob/task 的详情缺失时以 permission+patterns 判定（这些类别 patterns 已含主要信息）。metadata 整体缺失或畸形时 MUST NOT 丢弃该 pending 请求——注意力集合与人工处理行为不变，仅判定信息质量按上述规则降级。
+证据降级规则：确定性降级原因三值——`missing_critical` / `malformed_critical` / `truncated_critical`（类别关键字段缺失 / 有效 metadata object 内字段形状错误 / 因截断或裁剪丢失，关键字段集合与界值见 archived change 2026-09-10-task-permission-mode 的 design D5 提取表）。metadata 有效形状仅为 JSON object；absent/null/非法 JSON/合法但非 object 一律在观察层归 nil，关键类别统一记 `missing_critical`。多原因并存时按固定优先级取单值：`malformed_critical` > `missing_critical` > `truncated_critical`（全量扫描后统一选取，不依赖校验先后）。存在降级原因时系统 MUST 判定 UNCERTAIN 转人工（判定器内短路、不调用 LLM），MUST NOT 依据残缺证据批准；**降级短路先于 LLM 配置检查**（未配置与降级并存时结果为 UNCERTAIN 而非 FAILED）。webfetch/read/grep/glob/task 的详情缺失时以 permission+patterns 判定（这些类别 patterns 已含主要信息）。metadata 整体缺失或畸形时 MUST NOT 丢弃该 pending 请求——注意力集合与人工处理行为不变，仅判定信息质量按上述规则降级。
 
 #### Scenario: AI 判定通过
 
@@ -59,8 +61,8 @@
 
 #### Scenario: AI 判定拒绝
 
-- **WHEN** `ai-auto` 任务的 opencode 产生权限请求，LLM 判定不可通过
-- **THEN** 系统以 `reject` 回复该请求，该次操作被拒绝
+- **WHEN** `ai-auto` 任务的 opencode 产生权限请求，LLM 判定不可通过（REJECT）
+- **THEN** 系统 MUST NOT 回复该请求，请求保持待处理，由人工按 `ask` 体验处理；审计留痕判定结论 REJECT
 
 #### Scenario: LLM 不可用转人工
 
@@ -75,7 +77,7 @@
 #### Scenario: 就绪提交前产生的请求在提交后纳入判定
 
 - **WHEN** `ai-auto` 任务在 runtime 就绪提交完成前（activating / 启动恢复重建 / 挂起失败修复重建）已产生权限请求（经 SSE 或对账观察登记），随后该次 runtime 就绪提交成功
-- **THEN** 提交前系统不发起判定；提交后若该请求仍为待处理，系统将其纳入一次判定尝试；是否回复遵循判定结果规则（判定通过/拒绝才回复，不确定或失败不回复）
+- **THEN** 提交前系统不发起判定；提交后若该请求仍为待处理，系统将其纳入一次判定尝试；是否回复遵循判定结果规则（仅判定通过才回复，拒绝、不确定或失败不回复）
 
 #### Scenario: 回复结果未知不重试
 
@@ -85,7 +87,7 @@
 #### Scenario: XML verdict 正常提取
 
 - **WHEN** 模型输出包含恰好一个 `<verdict>` 标签且内容为 APPROVE/REJECT/UNCERTAIN 之一（标签外可有简短理由）
-- **THEN** 系统按标签内容作为判定结论处理（APPROVE→once，REJECT→reject，UNCERTAIN→不回复转人工）
+- **THEN** 系统按标签内容作为判定结论处理（APPROVE→once，REJECT→不回复转人工，UNCERTAIN→不回复转人工）
 
 #### Scenario: XML verdict 缺失或伪造按失败处理
 
@@ -106,14 +108,14 @@
 
 `ai-auto` 模式下，每次自动判定尝试终结时（含判定失败、不确定与未回复分支），系统 SHALL 向 `<数据目录>/logs/ai-permission-audit.jsonl` 追加恰好一条 JSONL 记录（一行一条 JSON 对象，文件权限 0600，单文件追加、不做滚动）。同一请求跨 runtime 重新判定时，各次判定尝试各自产生独立记录（与 per-runtime 判定计数契约一致）。记录计数从调用判定器起算：调用判定器之前被准入门禁拒绝的请求不产生审计记录；一旦调用判定器，无论判定结论如何、后续是否实际发送回复，该次尝试恰好产生一条记录。
 
-每条记录 SHALL 包含字段：`time`（RFC3339 时间戳）、`task_id`、`task_name`、`request_id`、`permission`（工具名）、`patterns`（请求的模式列表，与观察到的权限请求一致）、`verdict`（`APPROVE` / `REJECT` / `UNCERTAIN` / `FAILED`，FAILED 表示 LLM 未配置、调用失败、超时或输出非法）、`reply_result`（`ok`：回复已被服务端接受；`gone`：请求已被了结的正常竞态；`unknown`：回复结果未知；`unsupported`：回复能力不可用；`not_applicable`：未实际发送回复——verdict 为 UNCERTAIN/FAILED 时，或 verdict 为 APPROVE/REJECT 但回复未实际发送（实例失效、实例停止、ctx 取消、发送前门禁拒绝或回复客户端构造失败）时）。verdict 为 APPROVE/REJECT 且 reply_result 为 `ok` 时，记录 SHALL 额外包含 `reply`（`once` / `reject`）。记录 SHALL 额外包含 `detail` 字段（string：本次判定使用的同一份提取详情的摘要文本，含完整命令或文件目标等，**最终字符串 UTF-8 长度 ≤ 1024 字节（降级原因前缀与截断标记均计入；生成时先预留前缀与标记空间再截断主体）**，供人工阅读判定依据；无详情时为空字符串、字段必有）；证据降级（关键字段缺失/畸形/超限）时 `detail` SHALL 标注降级原因。
+每条记录 SHALL 包含字段：`time`（RFC3339 时间戳）、`task_id`、`task_name`、`request_id`、`permission`（工具名）、`patterns`（请求的模式列表，与观察到的权限请求一致）、`verdict`（`APPROVE` / `REJECT` / `UNCERTAIN` / `FAILED`，FAILED 表示 LLM 未配置、调用失败、超时或输出非法）、`reply_result`（`ok`：回复已被服务端接受；`gone`：请求已被了结的正常竞态；`unknown`：回复结果未知；`unsupported`：回复能力不可用；`not_applicable`：未实际发送回复——verdict 为 REJECT/UNCERTAIN/FAILED 时（REJECT 按「ai-auto 权限请求自动判定」不发送回复），或 verdict 为 APPROVE 但回复未实际发送（实例失效、实例停止、ctx 取消、发送前门禁拒绝或回复客户端构造失败）时）。verdict 为 APPROVE 且 reply_result 为 `ok` 时，记录 SHALL 额外包含 `reply`（`once`）；REJECT 不再发送回复，`reply` 取值 `reject` MUST NOT 出现于新记录。记录 SHALL 额外包含 `detail` 字段（string：本次判定使用的同一份提取详情的摘要文本，含完整命令或文件目标等，**最终字符串 UTF-8 长度 ≤ 1024 字节（降级原因前缀与截断标记均计入；生成时先预留前缀与标记空间再截断主体）**，供人工阅读判定依据；无详情时为空字符串、字段必有）；证据降级（关键字段缺失/畸形/超限）时 `detail` SHALL 标注降级原因。
 
 审计写入是旁路：写入失败 MUST NOT 影响判定、回复与任务进程——仅记录普通日志，该请求的判定与回复行为与无审计时完全一致。
 
 #### Scenario: 放行与拒绝留痕
 
-- **WHEN** `ai-auto` 任务的权限请求被判定通过并以 `once` 回复（或被判定拒绝并以 `reject` 回复）
-- **THEN** 审计文件追加一条记录，含该请求的工具名、具体模式（patterns）、判定结论与回复结果 `ok`
+- **WHEN** `ai-auto` 任务的权限请求被判定通过并以 `once` 回复，或被判定拒绝（REJECT，不回复转人工）
+- **THEN** 审计文件各追加一条记录：前者含判定结论 APPROVE、回复结果 `ok` 与 `reply` 为 `once`；后者 verdict 为 REJECT、`reply_result` 为 `not_applicable`、不含 `reply` 字段
 
 #### Scenario: 转人工与失败留痕
 
@@ -122,7 +124,7 @@
 
 #### Scenario: 判定后未发送回复留痕
 
-- **WHEN** 判定结论为 APPROVE/REJECT，但回复未实际发送（实例失效、停止、ctx 取消、发送前门禁拒绝或回复客户端构造失败）
+- **WHEN** 判定结论为 APPROVE，但回复未实际发送（实例失效、停止、ctx 取消、发送前门禁拒绝或回复客户端构造失败）
 - **THEN** 审计文件追加一条记录，`reply_result` 为 `not_applicable`，不含 `reply` 字段
 
 #### Scenario: 审计写入失败不影响行为
@@ -132,7 +134,7 @@
 
 ### Requirement: 权限模式只读输出
 
-系统 SHALL 在任务相关读模型中透出权限模式：创建响应、任务详情、项目任务摘要、active 任务概览均 MUST 包含 `permission_mode` 字段，取值为 `ask` / `all-approve` / `ai-auto` 三值枚举。存量空值 MUST 输出 `ask`；未知持久化值 MUST fail-closed 返回 internal error，MUST NOT 产出缺/坏值元素。该字段为只读输出，系统 MUST NOT 提供修改入口。
+系统 SHALL 在任务相关读模型中透出权限模式：创建响应、任务详情、项目任务摘要、active 任务概览均 MUST 包含 `permission_mode` 字段，取值为 `ask` / `all-approve` / `ai-auto` 三值枚举。存量空值 MUST 输出 `ask`；未知持久化值 MUST fail-closed 返回 internal error，MUST NOT 产出缺/坏值元素。上述读模型中该字段为只读输出；修改入口见「权限模式创建后变更」。
 
 #### Scenario: 读模型透出三值
 
@@ -172,3 +174,50 @@ Web 新建任务表单 SHALL 提供权限模式选择项，三档取值与创建
 
 - **WHEN** 用户在新建任务面板改变已选项目（含切换项目、清除选择、切到 dir 项目）
 - **THEN** 权限模式选择重置为 `ai-auto`；不改变已选项目的面板信号保持当前选择
+
+### Requirement: 权限模式创建后变更
+
+系统 SHALL 支持在任务创建后修改权限模式：系统提供独立的权限模式修改入口（专用更新接口 `PATCH /api/v1/tasks/{id}/permission-mode`，与任务名称/分支修改互不影响），请求 body 必须提供 `permission_mode`，值域校验规则同创建（`ask` / `all-approve` / `ai-auto` 三值；缺失、null、显式空串、纯空白、类型错误、未知字段或未知值 MUST 以 invalid_input 拒绝且 MUST NOT 产生任何副作用），三档之间 SHALL 允许任意互转。响应 SHALL 包含 `permission_mode`（已保存值）与 `effective_permission_mode`（当前有效值）；同值保存 SHALL 返回成功且零副作用（不推进 `updated_at`、不触发任何运行时行为），真实变更 MUST 推进 `updated_at`（按 task-lifecycle 的 Unix 秒精度规则：跨秒推进；同秒真实变更仍提交但数值不变）。单次模式修改 MUST 原子生效：持久化与平台侧 ai-auto 判定行为切换 MUST 在接口返回成功前完成收敛。修改成功后平台侧 ai-auto 判定行为 SHALL 即时切换：切入 `ai-auto` 时，当前仍为 pending 的权限请求 MUST 立即纳入一次判定（等价全量补判，不受「ai-auto 权限请求自动判定」per-runtime 判定计数契约的一次限制）；切出 `ai-auto` 时，尚未发送回复的在途判定 MUST NOT 再自动回复（已发出的回复不可撤回，沿用既有「回复结果未知」边界）。**例外（启动时为 all-approve 的运行进程）：以 `all-approve` 启动的运行中进程保存为 `ai-auto` 时，MUST NOT 启用 AI 判定、MUST NOT 补判——该进程继续按自动批准运行直至下次激活（其有效模式保持 `all-approve`）**；`all-approve` 的自动批准行为 MUST 仅在任务下次激活时按最新模式生效——运行中进程的权限行为不随修改改变。模式变更 MUST NOT 清除或改写既有判定审计记录。
+
+任务详情读模型 SHALL 额外透出当前实际生效的权限模式字段 `effective_permission_mode`，取值三值枚举，按当前实际权限行为推导：无运行中进程时为已保存模式；运行中进程处于自动批准状态时（启动时为 `all-approve` 模式）输出 `all-approve`；运行中进程非自动批准时，已保存模式为 `ai-auto` 输出 `ai-auto`（平台判定即时生效），否则输出 `ask`（含已保存 `all-approve` 但当前进程非自动批准的情形）。已保存模式与有效模式仅在涉及 `all-approve` 的转换中存在差异。Web 任务详情页设置标签页 SHALL 提供权限模式修改入口（三档选择，与名称/分支一致采用查看态/编辑态：查看态只读展示当前已保存模式，编辑态选择后随统一「保存」提交、「取消」还原；模式变更经专用端点提交，MUST NOT 走通用任务信息 PATCH）；已保存模式与运行生效模式不一致时 MUST 向用户展示新模式将在下次激活生效的提示。
+
+#### Scenario: 修改模式成功
+
+- **WHEN** 用户对已创建任务提交合法的权限模式修改
+- **THEN** 新模式随任务持久化，任务详情读模型输出更新后的 `permission_mode`
+
+#### Scenario: 非法模式修改拒绝
+
+- **WHEN** 用户提交显式空串、纯空白或三值之外的权限模式修改
+- **THEN** 系统返回 invalid_input，任务权限模式与其他字段保持不变，无任何副作用
+
+#### Scenario: 切入 ai-auto 立即补判
+
+- **WHEN** 运行中任务由非 `all-approve` 启动态切入 `ai-auto`（当前进程非自动批准）且存在 pending 权限请求
+- **THEN** 该 pending 请求立即纳入一次 AI 判定，判定行为与「ai-auto 权限请求自动判定」一致
+
+#### Scenario: all-approve 启动进程切入 ai-auto 不启用 AI
+
+- **WHEN** 以 `all-approve` 启动的运行中进程将权限模式保存为 `ai-auto`，且存在 pending 权限请求
+- **THEN** 系统 MUST NOT 启用 AI 判定、MUST NOT 补判；该进程继续按自动批准运行，有效模式保持 `all-approve`，下次激活才按 `ai-auto` 启动
+
+#### Scenario: 切出 ai-auto 在途判定不回复
+
+- **WHEN** 运行中任务由 `ai-auto` 切出，且存在尚未发送回复的在途判定
+- **THEN** 在途判定 MUST NOT 自动回复，相关请求保持待处理转人工
+
+#### Scenario: all-approve 变更下次激活生效
+
+- **WHEN** 运行中任务的权限模式在 `all-approve` 与其他模式间变更
+- **THEN** 运行中进程权限行为保持不变；任务下次激活按最新模式启动；变更后至下次激活前，任务详情读模型透出的 `effective_permission_mode` 与已保存 `permission_mode` 不同
+
+#### Scenario: 无运行进程时两值一致
+
+- **WHEN** 任务无运行中进程（未激活/已挂起/已停止），查询任务详情
+- **THEN** `effective_permission_mode` 与已保存 `permission_mode` 一致
+
+#### Scenario: 模式不一致时 UI 提示
+
+- **WHEN** 任务已保存模式与运行生效模式不一致，用户查看任务详情页设置标签页
+- **THEN** 界面展示新模式将在下次激活生效的提示
+- **AND** 保存成功且响应两值不一致（无法立即生效）时展示瞬时确认「已保存，将在下次激活后生效。」，下一次保存开始或两值转为一致后消失

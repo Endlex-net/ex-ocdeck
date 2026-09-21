@@ -37,6 +37,61 @@ type fakeTaskBackend struct {
 	updateInfoTaskID string
 	updateInfoMu     sync.Mutex
 	updateInfoCalls  []application.UpdateTaskInfoOptions
+	// --- task-permission-mode 4.1/4.6：权限模式端点桩（槽位 + 调用记录） ---
+	permModeView    application.PermissionModeView
+	permModeErr     error
+	permModeTaskID  string
+	permModeSaved   string
+	permModeMu      sync.Mutex
+	permModeDefault bool // true：未显式注入 view 时返回默认两字段视图（ask/ask）
+}
+
+// UpdateTaskPermissionMode 桩：记录 (taskID, mode)，返回注入视图或错误。
+func (f *fakeTaskBackend) UpdateTaskPermissionMode(ctx context.Context, taskID, mode string) (application.PermissionModeView, error) {
+	f.permModeMu.Lock()
+	f.permModeTaskID = taskID
+	f.permModeSaved = mode
+	view := f.permModeView
+	def := f.permModeDefault
+	err := f.permModeErr
+	f.permModeMu.Unlock()
+	if err != nil {
+		return application.PermissionModeView{}, err
+	}
+	if !def && view == (application.PermissionModeView{}) {
+		view = application.PermissionModeView{PermissionMode: mode, EffectivePermissionMode: mode}
+	}
+	return view, nil
+}
+
+// PermissionModeView 桩：返回注入视图或错误。
+func (f *fakeTaskBackend) PermissionModeView(ctx context.Context, taskID string) (application.PermissionModeView, error) {
+	f.permModeMu.Lock()
+	view := f.permModeView
+	def := f.permModeDefault
+	err := f.permModeErr
+	f.permModeMu.Unlock()
+	if err != nil {
+		return application.PermissionModeView{}, err
+	}
+	if !def && view == (application.PermissionModeView{}) {
+		view = application.PermissionModeView{PermissionMode: "ask", EffectivePermissionMode: "ask"}
+	}
+	return view, nil
+}
+
+// SetPermissionModeView 注入权限模式视图与错误（默认 ask/ask，可注入错误模拟 fail）。
+func (f *fakeTaskBackend) SetPermissionModeView(view application.PermissionModeView, err error) {
+	f.permModeMu.Lock()
+	defer f.permModeMu.Unlock()
+	f.permModeView, f.permModeErr, f.permModeDefault = view, err, true
+}
+
+// permissionModeCallsSnapshot 返回已发生的权限模式保存调用（并发安全读）。
+func (f *fakeTaskBackend) permissionModeCallsSnapshot() (taskID, mode string) {
+	f.permModeMu.Lock()
+	defer f.permModeMu.Unlock()
+	return f.permModeTaskID, f.permModeSaved
 }
 
 func (f *fakeTaskBackend) UpdateTaskInfo(ctx context.Context, taskID string, opts application.UpdateTaskInfoOptions) (application.TaskRow, error) {

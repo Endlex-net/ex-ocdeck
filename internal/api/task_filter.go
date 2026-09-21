@@ -60,17 +60,28 @@ func eventDirtiesTaskDetail(taskID string) func(ocdeckevent.Event) bool {
 				return true
 			}
 			return p.TaskID == taskID
-		case ocdeckevent.TypeServeRuntimeSessionError:
-			// task-notifications D2：一次性错误事实（通知触发输入），不改变任务详情
-			// 投影——合法事件无论 TaskID 是否本任务均不标脏；Topic/payload 形状异常
-			// 按本表惯例保守标脏。
-			if ev.Topic != ocdeckevent.TopicServeRuntime {
-				return true
-			}
-			if _, ok := ev.Payload.(ocdeckevent.ServeRuntimeSessionErrorPayload); !ok {
-				return true
-			}
-			return false
+	case ocdeckevent.TypeServeRuntimeSessionError:
+		// task-notifications D2：一次性错误事实（通知触发输入），不改变任务详情
+		// 投影——合法事件无论 TaskID 是否本任务均不标脏；Topic/payload 形状异常
+		// 按本表惯例保守标脏。
+		if ev.Topic != ocdeckevent.TopicServeRuntime {
+			return true
+		}
+		if _, ok := ev.Payload.(ocdeckevent.ServeRuntimeSessionErrorPayload); !ok {
+			return true
+		}
+		return false
+	case ocdeckevent.TypeServeRuntimePermissionVerdict, ocdeckevent.TypeServeRuntimePermissionModeChanged:
+		// task-permission-mode D7 消费矩阵：两唤醒事件不改变详情投影（详情 effective
+		// 刷新仅依赖 task.activity_changed）——合法事件无论 TaskID 是否本任务均不标脏；
+		// Topic/payload 形状异常按本表惯例保守标脏。
+		if ev.Topic != ocdeckevent.TopicServeRuntime {
+			return true
+		}
+		if _, ok := ev.Payload.(ocdeckevent.ServeRuntimeTaskPayload); !ok {
+			return true
+		}
+		return false
 		case ocdeckevent.TypeResyncRequested:
 			if ev.Topic != ocdeckevent.TopicControl {
 				return true

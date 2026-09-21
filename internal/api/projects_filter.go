@@ -34,6 +34,16 @@ func eventDirtiesProjectsTaskTree(ev ocdeckevent.Event) bool {
 		}
 		_, ok := ev.Payload.(struct{})
 		return !ok
+	case ocdeckevent.TypeServeRuntimePermissionVerdict, ocdeckevent.TypeServeRuntimePermissionModeChanged:
+		// task-permission-mode D7 消费矩阵：两唤醒事件不改变任务树投影（树呈现的
+		// permission_mode 刷新仅依赖 task.activity_changed）——合法事件（Topic
+		// serve_runtime 且 Payload 为 ServeRuntimeTaskPayload）不标脏；Topic/payload
+		// 形状异常按本表惯例保守标脏。
+		if ev.Topic != ocdeckevent.TopicServeRuntime {
+			return true
+		}
+		_, ok := ev.Payload.(ocdeckevent.ServeRuntimeTaskPayload)
+		return !ok
 	default:
 		return true
 	}

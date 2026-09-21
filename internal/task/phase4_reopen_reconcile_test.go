@@ -112,6 +112,9 @@ func seedPersistRuntime(t *testing.T, store *mockStore, proc *mockProc) {
 	snap := envSnapshot{Vars: map[string]string{"OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1"}}
 	snapBytes, _ := encodeEnvSnapshot(snap)
 	store.mutTask("t1", func(r *TaskRow) { r.EnvSnapshot = snapBytes })
+	// 启动事实（D5 三路径矩阵②）：persist 前进程经 startRuntimeWithPortRetry 写入，
+	// resumeActive 注册前读校验。
+	store.seedPermissionModeAtStart("t1", PermissionModeAIAuto)
 	proc.sessions[runtimeSessionName("t1")] = true
 	proc.envValues[runtimeSessionName("t1")] = map[string]string{
 		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",

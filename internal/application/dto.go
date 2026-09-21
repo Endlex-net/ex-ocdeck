@@ -53,20 +53,20 @@ const (
 // PermissionMode 为任务级权限模式（task-permission-mode D1）：ask | all-approve | ai-auto，
 // 取值常量定义于 internal/task。
 type TaskRow struct {
-	ID           string
-	ProjectID    string
-	Name         string
-	Branch       string
-	Status       string
-	WorktreePath string
-	LastPort     sql.NullInt64
-	LastError    sql.NullString
-	Notice       sql.NullString
-	DeleteMode   sql.NullString
-	EnvSnapshot  sql.NullString
-	CreatedAt    int64
-	UpdatedAt    int64
-	ArchivedAt   sql.NullInt64
+	ID              string
+	ProjectID       string
+	Name            string
+	Branch          string
+	Status          string
+	WorktreePath    string
+	LastPort        sql.NullInt64
+	LastError       sql.NullString
+	Notice          sql.NullString
+	DeleteMode      sql.NullString
+	EnvSnapshot     sql.NullString
+	CreatedAt       int64
+	UpdatedAt       int64
+	ArchivedAt      sql.NullInt64
 	InitStatus      string
 	InitError       sql.NullString
 	BaseRef         string
@@ -81,7 +81,7 @@ type TaskRow struct {
 // PermissionMode 为任务级权限模式（task-permission-mode D2）：空串=缺省（→ ask），
 // 非空时 MUST 为任务包定义的合法取值（非法值由 task 层 invalid_input 拒绝）。
 // BranchSlug 为可选显式分支 slug（task-info-editable D5）：nil/trim 后空 = 未提供
-//（走 LLM/slugify 命名）；非空 trim 后直接使用（跳过 LLM 与机械 slugify）。
+// （走 LLM/slugify 命名）；非空 trim 后直接使用（跳过 LLM 与机械 slugify）。
 type CreateTaskOptions struct {
 	Name           string
 	BaseRef        string
@@ -93,10 +93,19 @@ type CreateTaskOptions struct {
 // UpdateTaskInfoOptions 任务信息修改的请求选项（task-info-editable D1）。
 // 字段 presence 语义：nil = 不修改该项（JSON 缺失或 null）；Name 原值存储（保留首尾空白）；
 // BranchSlug trim 后为空视为未提供。定义在 application 锁定 api → application import 方向
-//（与 CreateTaskOptions 同型）。
+// （与 CreateTaskOptions 同型）。
 type UpdateTaskInfoOptions struct {
 	Name       *string
 	BranchSlug *string
+}
+
+// PermissionModeView 任务权限模式视图（task-permission-mode D6/D8，tasks 1.4）：
+// PermissionMode 为已保存的持久化值；EffectivePermissionMode 为按运行事实推导的
+// 有效模式（--auto 进程恒 all-approve，DR1）。由 task 层单一推导函数产出，
+// 供详情 GET/详情 SSE/PATCH 响应/通知快照复用。
+type PermissionModeView struct {
+	PermissionMode          string
+	EffectivePermissionMode string
 }
 
 // SessionRow 会话归属行（解耦 store 包结构，design.md §18）。

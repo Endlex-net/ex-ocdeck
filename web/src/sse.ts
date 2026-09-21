@@ -1,6 +1,6 @@
 import { clearToken, getToken, UNAUTHORIZED_EVENT } from './api';
 import { debugMark } from './debug';
-import type { ActiveSessionItem, Project, Task } from './types';
+import type { ActiveSessionItem, Project, TaskDetail } from './types';
 
 /** 连接状态（连接状态 UI 用）：connecting = 连接/重连尝试中；open = 已收到有效帧。 */
 export type StreamConnState = 'connecting' | 'open';
@@ -262,8 +262,9 @@ export function subscribeProjects(opts: SubscribeProjectsOptions): { close(): vo
 }
 
 export interface SubscribeTaskOptions {
-  /** snapshot 与 update 同构：data 为单个 Task 对象，整对象替换。 */
-  onData(task: Task): void;
+  /** snapshot 与 update 同构：data 为单个 TaskDetail 对象（含 effective_permission_mode，
+   *  fix-ai-auto-permission-and-tab-focus D8），整对象替换。 */
+  onData(task: TaskDetail): void;
   onError(message: string): void;
   onStateChange?(state: StreamConnState): void;
   /** HTTP 404：任务不存在/已删除，永久终态。 */
@@ -272,14 +273,16 @@ export interface SubscribeTaskOptions {
 
 /** 订阅任务详情 SSE 流（task-detail-stream D5）：单对象帧，validate 仅校验信封形状。 */
 export function subscribeTask(taskID: string, opts: SubscribeTaskOptions): { close(): void } {
-  return subscribeStream<Task>(`/api/v1/tasks/${taskID}/stream`, {
+  return subscribeStream<TaskDetail>(`/api/v1/tasks/${taskID}/stream`, {
     onError: opts.onError,
     onStateChange: opts.onStateChange,
     onGone: opts.onGone,
     reportEndAsError: true,
     errorLabel: '任务详情',
     validate: (data) =>
-      typeof data === 'object' && data !== null && !Array.isArray(data) ? [data as Task] : null,
+      typeof data === 'object' && data !== null && !Array.isArray(data)
+        ? [data as TaskDetail]
+        : null,
     onData: (items) => opts.onData(items[0]),
   });
 }

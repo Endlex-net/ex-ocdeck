@@ -7,7 +7,7 @@ import { mount } from './cm-test-env';
 import type { Task, TaskPermissionMode } from '../types';
 
 /* ==================== 任务详情权限模式只读展示（task-permission-mode tasks 5.2 / D7） ====================
- * 详情页头按 task.permission_mode 只读展示定稿三档文案；创建后不可修改，无修改入口。 */
+ * 详情页头按 task.permission_mode 只读展示定稿三档文案（修改入口在任务信息卡）。 */
 
 function makeTask(permission_mode: TaskPermissionMode): Task {
   return {
@@ -49,8 +49,8 @@ describe('PermissionModeBadge（task-permission-mode 5.2）', () => {
     const badge = container.querySelector('.badge')!;
     expect(badge.textContent).toBe(label);
     expect(badge.className).toContain('badge-muted');
-    // 只读标记：非交互元素，title 透出原始枚举值与不可修改语义
+    // 只读标记：非交互元素，title 透出原始枚举值
     expect(badge.tagName).toBe('SPAN');
-    expect(badge.getAttribute('title')).toBe(`权限模式（创建后不可修改）：${mode}`);
+    expect(badge.getAttribute('title')).toBe(`权限模式：${mode}`);
   });
 });

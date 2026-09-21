@@ -22,6 +22,14 @@ type TaskBackend interface {
 	// 全部同值幂等成功返回当前行；错误经 application.OpError（invalid_input/invalid_state/
 	// conflict/git_error/internal），由 mapTaskErr 统一映射。
 	UpdateTaskInfo(ctx context.Context, taskID string, opts application.UpdateTaskInfoOptions) (application.TaskRow, error)
+	// UpdateTaskPermissionMode 保存任务权限模式并协调运行态收敛（task-permission-mode
+	// D4/tasks 4.2，唯一协调器，签名钉死）：同值零副作用返回当前视图；错误经
+	// application.OpError（invalid_input/not_found/conflict/internal），由 mapTaskErr 统一映射。
+	UpdateTaskPermissionMode(ctx context.Context, taskID, mode string) (application.PermissionModeView, error)
+	// PermissionModeView 返回权限模式视图（已保存值 + D6 推导有效值）。透出范围钉死：
+	// 仅任务详情 GET、详情流 SSE 与模式端点响应（D6/D8）；列表/摘要/概览/创建响应
+	// MUST NOT 消费。
+	PermissionModeView(ctx context.Context, taskID string) (application.PermissionModeView, error)
 	Activate(ctx context.Context, taskID string) error
 	Suspend(ctx context.Context, taskID string) error
 	Archive(ctx context.Context, taskID string) error
@@ -100,6 +108,8 @@ func (s *Server) registerTaskRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/projects/{id}/tasks", s.handleCreateTask)
 	mux.HandleFunc("GET /api/v1/tasks/{id}", s.handleGetTask)
 	mux.HandleFunc("PATCH /api/v1/tasks/{id}", s.handleUpdateTaskInfo)
+	// 权限模式独立端点（task-permission-mode D4/tasks 4.1）。
+	mux.HandleFunc("PATCH /api/v1/tasks/{id}/permission-mode", s.handleUpdateTaskPermissionMode)
 	mux.HandleFunc("GET /api/v1/tasks/{id}/stream", s.handleTaskStream)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/activate", s.handleTaskAction(s.tasks.Activate))
 	mux.HandleFunc("POST /api/v1/tasks/{id}/suspend", s.handleTaskAction(s.tasks.Suspend))
@@ -357,6 +367,17 @@ func (s *Server) buildTaskDetailDTOBase(ctx context.Context, t application.TaskR
 	dto.Sessions = toSessionDTOs(sessions)
 	att, _ := s.tasks.Attention(t.ID)
 	dto.Attention = toAttentionDTO(att)
+	// effective_permission_mode（task-permission-mode D6/D8）：经 PermissionModeView
+	// 推导 + permissionModeForOutput 归一化（fail-closed）。仅详情 GET/详情流 SSE 填充。
+	view, err := s.tasks.PermissionModeView(ctx, t.ID)
+	if err != nil {
+		return taskRowDTO{}, mapTaskErr(err)
+	}
+	epm, ae := permissionModeForOutput(t.ID, view.EffectivePermissionMode)
+	if ae != nil {
+		return taskRowDTO{}, ae
+	}
+	dto.EffectivePermissionMode = epm
 	return dto, nil
 }
 
@@ -555,9 +576,13 @@ type taskRowDTO struct {
 	ProjectKind    string          `json:"project_kind"`
 	Mode           string          `json:"mode"`
 	PermissionMode string          `json:"permission_mode"`
-	Sessions       []sessionRowDTO `json:"sessions,omitempty"`
-	AgentStatus    string          `json:"agentStatus,omitempty"`
-	Attention      attentionDTO    `json:"attention"`
+	// EffectivePermissionMode 有效权限模式（task-permission-mode D6 推导值）。透出范围
+	// 钉死（D6/D8）：仅详情 GET/详情流 SSE 填充（buildTaskDetailDTOBase）；列表/创建/
+	// 摘要/概览不填充，omitempty 省略。
+	EffectivePermissionMode string          `json:"effective_permission_mode,omitempty"`
+	Sessions                []sessionRowDTO `json:"sessions,omitempty"`
+	AgentStatus             string          `json:"agentStatus,omitempty"`
+	Attention               attentionDTO    `json:"attention"`
 }
 
 type sessionRowDTO struct {
@@ -786,4 +811,81 @@ func (s *Server) handleUpdateTaskInfo(w http.ResponseWriter, r *http.Request) {
 	dto.Attention = toAttentionDTO(att)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(dto)
+}
+
+// permissionModePatchReq 权限模式保存请求体（task-permission-mode D4）：permission_mode
+// 必填（缺失/null 均为 invalid_input）；*string 保留 presence。
+type permissionModePatchReq struct {
+	PermissionMode *string `json:"permission_mode"`
+}
+
+// decodePermissionModePatchJSON 按 D4 错误矩阵解码（本端点专用，MUST NOT 复用
+// decodeOptionalTaskInfoPatchJSON——语义冲突：本端点必填 + 未知字段拒绝）：
+//   - 空 body（含纯空白）/ 缺失 / null → invalid_input（必填）；
+//   - 类型错误（非字符串）/ 未知字段（显式收紧，与通用 PATCH 的忽略语义不同）→ invalid_input；
+//   - 尾随 JSON → invalid_input；
+//   - 值域校验（trim 后恰为三值之一）归 task 层协调器（normalizePermissionModeInput）。
+func decodePermissionModePatchJSON(data []byte) (string, *ApiError) {
+	if isEmptyOrWhitespace(data) {
+		return "", NewError(CodeInvalidInput, "permission_mode is required")
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var req permissionModePatchReq
+	if err := dec.Decode(&req); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &typeErr) {
+			return "", NewError(CodeInvalidInput, err.Error())
+		}
+		return "", NewError(CodeInvalidInput, "invalid JSON body")
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		return "", NewError(CodeInvalidInput, "invalid JSON body")
+	}
+	if req.PermissionMode == nil {
+		return "", NewError(CodeInvalidInput, "permission_mode is required")
+	}
+	return *req.PermissionMode, nil
+}
+
+// handleUpdateTaskPermissionMode PATCH /api/v1/tasks/{id}/permission-mode
+//（task-permission-mode D4/tasks 4.1）：body 4KiB 上限；解码错误矩阵（必填/类型/
+// 未知字段/尾随 JSON）→ 422；严格序列（校验→互斥→读行→同值→DB 提交→收敛→发布）
+// 归 task 层唯一协调器，错误经 mapTaskErr 统一映射。成功 200 + 固定两字段
+//（输出归一化复用 permissionModeForOutput，fail-closed）。
+func (s *Server) handleUpdateTaskPermissionMode(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("id")
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, taskInfoPatchBodyMax))
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeApiError(w, NewError(CodeInvalidInput, "request body exceeds 4096 bytes"))
+			return
+		}
+		writeApiError(w, NewError(CodeInvalidInput, "invalid request body"))
+		return
+	}
+	mode, ae := decodePermissionModePatchJSON(body)
+	if ae != nil {
+		writeApiError(w, ae)
+		return
+	}
+	view, err := s.tasks.UpdateTaskPermissionMode(r.Context(), taskID, mode)
+	if err != nil {
+		writeApiError(w, mapTaskErr(err))
+		return
+	}
+	pm, ae := permissionModeForOutput(taskID, view.PermissionMode)
+	if ae != nil {
+		writeApiError(w, ae)
+		return
+	}
+	epm, ae := permissionModeForOutput(taskID, view.EffectivePermissionMode)
+	if ae != nil {
+		writeApiError(w, ae)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"permission_mode": pm, "effective_permission_mode": epm})
 }

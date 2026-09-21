@@ -107,3 +107,25 @@ func TestEventDirtiesProjectsTaskTree_UserActivityException(t *testing.T) {
 		}
 	}
 }
+
+// TestEventDirtiesProjectsTaskTree_PermissionWakeEvents 两唤醒事件例外行
+//（task-permission-mode D7 消费矩阵：合法事件不标脏任何读模型流，projects 树的
+// permission_mode 刷新仅依赖 task.activity_changed）；畸形保守标脏。
+func TestEventDirtiesProjectsTaskTree_PermissionWakeEvents(t *testing.T) {
+	cases := []struct {
+		name string
+		ev   ocdeckevent.Event
+		want bool
+	}{
+		{"permission_verdict legal", ocdeckevent.NewServeRuntimePermissionVerdict("iv1", "t1"), false},
+		{"permission_mode_changed legal", ocdeckevent.NewServeRuntimePermissionModeChanged("iv1", "t1"), false},
+		{"permission_verdict malformed payload", ocdeckevent.Event{Topic: ocdeckevent.TopicServeRuntime, Type: ocdeckevent.TypeServeRuntimePermissionVerdict, RID: "iv1", Payload: nil}, true},
+		{"permission_mode_changed wrong topic", ocdeckevent.Event{Topic: ocdeckevent.TopicTask, Type: ocdeckevent.TypeServeRuntimePermissionModeChanged, RID: "iv1", Payload: ocdeckevent.ServeRuntimeTaskPayload{TaskID: "t1"}}, true},
+		{"task.activity_changed still dirty", ocdeckevent.NewTaskActivityChanged("t1"), true},
+	}
+	for _, c := range cases {
+		if got := eventDirtiesProjectsTaskTree(c.ev); got != c.want {
+			t.Errorf("%s: eventDirtiesProjectsTaskTree = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

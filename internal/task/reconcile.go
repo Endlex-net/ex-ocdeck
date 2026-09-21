@@ -398,7 +398,16 @@ func (m *Manager) resumeActive(ctx context.Context, t TaskRow, mode AlignMode) e
 	if alive, _ := m.proc.HasSession(runtimeName); !alive {
 		return fmt.Errorf("runtime session gone before runtime register")
 	}
+	// 启动事实读校验（task-permission-mode D5 三路径矩阵②）：有存活进程但启动事实
+	// NULL/非法 MUST 失败不注册（fail-closed，错误经 Reconcile 拒开 HTTP）。
+	startMode, serr := m.readStartFactForRegister(ctx, t.ID)
+	if serr != nil {
+		return serr
+	}
 	rt := m.newRuntime(t.ID)
+	if err := initPermState(rt, t, startMode); err != nil {
+		return err
+	}
 	m.setRuntime(t.ID, rt)
 	rt.registerGroup(roleRuntime, runtimeName)
 	if err := m.startSSE(ctx, rt, t.ID, t.WorktreePath, port, pw, mode); err != nil {

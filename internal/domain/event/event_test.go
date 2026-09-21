@@ -237,3 +237,25 @@ func TestNewResyncRequested(t *testing.T) {
 		t.Fatalf("mismatch: %+v", got)
 	}
 }
+
+func TestNewServeRuntimePermissionVerdict(t *testing.T) {
+	got := NewServeRuntimePermissionVerdict("inst_1", "tsk_1")
+	if got.Topic != TopicServeRuntime || got.Type != TypeServeRuntimePermissionVerdict || got.RID != "inst_1" {
+		t.Fatalf("mismatch: %+v", got)
+	}
+	p, ok := got.Payload.(ServeRuntimeTaskPayload)
+	if !ok || p.TaskID != "tsk_1" {
+		t.Fatalf("payload = %+v", got.Payload)
+	}
+}
+
+func TestNewServeRuntimePermissionModeChanged(t *testing.T) {
+	got := NewServeRuntimePermissionModeChanged("inst_1", "tsk_1")
+	if got.Topic != TopicServeRuntime || got.Type != TypeServeRuntimePermissionModeChanged || got.RID != "inst_1" {
+		t.Fatalf("mismatch: %+v", got)
+	}
+	p, ok := got.Payload.(ServeRuntimeTaskPayload)
+	if !ok || p.TaskID != "tsk_1" {
+		t.Fatalf("payload = %+v", got.Payload)
+	}
+}

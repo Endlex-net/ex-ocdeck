@@ -9,9 +9,11 @@
 //   - (c) degraded 后台对账完成后（retryAttentionDegraded permission 分支，
 //     覆盖成功替换与非 404 失败缓冲重放，不以 REST 成功或 changed 为前提）。
 //
-// 准入与 judged-set 登记在 rt.mu 同一同步域完成；LLM 调用、客户端构造、HTTP 发送全部
-// 在锁外；回复发送前复核同实例 && 未停止 && 未 unsupported。计数契约（D4）：同一 runtime
-// 实例内每个 requestID 最多发起一次判定尝试，失败不清除；runtime 销毁即释放。
+// 准入与 judged-set/inflight 登记在 rt.mu 同一同步域完成；LLM 调用、客户端构造、HTTP
+// 发送全部在锁外；回复发送前复核同实例 && epoch 一致 && AIAutoEnabled && 未停止 &&
+// 未 unsupported（D5 epoch 屏障：切出/切入使在途判定捕获失效）。计数契约（D4/D5）：
+// 同一 runtime 实例同一 epoch 内每个 requestID 最多发起一次判定尝试，失败不清除；
+// runtime 销毁即释放。
 package task
 
 import (
@@ -23,6 +25,7 @@ import (
 	"time"
 
 	"ocdeck/internal/application/runtime"
+	ocdeckevent "ocdeck/internal/domain/event"
 	"ocdeck/internal/infrastructure/opencode"
 )
 
@@ -60,21 +63,25 @@ func (m *Manager) judgeScan(rt *taskRuntime) {
 	}
 	judgeCtx := rt.judgeCtx
 	tok := rt.instVersion
+	epoch := rt.permEpoch
 	rt.judgeWG.Add(1)
 	rt.mu.Unlock()
 
-	// 扫描 goroutine（绑定 rt + instVersion + 判定 ctx）：DB 预检与登记全部在锁外/
-	// goroutine 内，调用方（含 SSE 事件流）不被阻塞。
+	// 扫描 goroutine（绑定 rt + instVersion + permEpoch + 判定 ctx）：DB 预检与登记全部
+	// 在锁外/goroutine 内，调用方（含 SSE 事件流）不被阻塞。迟到判定按 epoch 失配在
+	// permGate/终态提交处丢弃（D5/D1）。
 	go func() {
 		defer rt.judgeWG.Done()
-		m.judgeScanAsync(judgeCtx, rt, tok)
+		m.judgeScanAsync(judgeCtx, rt, tok, epoch)
 	}()
 }
 
 // judgeScanAsync 扫描 goroutine 主体（F1）：DB 预检（judgeCtx 随 runtime 停止取消）
-// → pending 快照 → rt.mu 第二临界区（复核门禁含实例一致性 + 同域登记 judged-set）
-// → 逐条判定/回复（沿用 judgeAndReply 的条间/构造前/最终发送准入三道复核）。
-func (m *Manager) judgeScanAsync(ctx context.Context, rt *taskRuntime, tok runtime.InstVersion) {
+// → pending 快照 → rt.mu 第二临界区（复核门禁含实例/epoch 一致性 + 同域登记 judged-set
+// 与 inflight 判定状态）→ 逐条判定/回复（沿用 judgeAndReply 的条间/构造前/最终发送
+// 准入三道复核）。预检后模式判定路径零 DB 重读（无 mode TOCTOU）；项目语境组装与
+// 回复客户端构造为异步锁外的非 mode 读（D5），全部复核门禁纯内存。
+func (m *Manager) judgeScanAsync(ctx context.Context, rt *taskRuntime, tok runtime.InstVersion, epoch uint64) {
 	row, err := m.store.GetTask(ctx, rt.taskID)
 	if err != nil {
 		log.Printf("task %s: ai-auto scan: get task: %v", rt.taskID, err)
@@ -104,9 +111,13 @@ func (m *Manager) judgeScanAsync(ctx context.Context, rt *taskRuntime, tok runti
 		return
 	}
 
-	// rt.mu 第二临界区：复核门禁 + 同域登记未判定 ID（judged-set 原子去重）。
+	// rt.mu 第二临界区：复核门禁 + 同域登记未判定 ID（judged-set 原子去重）与 inflight
+	// 判定状态（D1：登记时写入当前 epoch；per-runtime/per-epoch/per-request 一次）。
+	// 准入条件与 permGate 同构（含 AIAutoEnabled——DR1：--auto runtime 保存 ai-auto
+	// 时不启用 AI，持久化模式预检放行的扫描在此拦截，不登记不判定）。
 	rt.mu.Lock()
-	if !rt.permJudgeReady || rt.judgeStopping || rt.replyUnsupported || rt.instVersion != tok {
+	if !rt.permJudgeReady || rt.judgeStopping || rt.replyUnsupported || rt.instVersion != tok || rt.permEpoch != epoch ||
+		rt.permState == nil || !rt.permState.AIAutoEnabled {
 		rt.mu.Unlock()
 		return
 	}
@@ -116,6 +127,7 @@ func (m *Manager) judgeScanAsync(ctx context.Context, rt *taskRuntime, tok runti
 			continue
 		}
 		rt.judgedPerms[p.ID] = struct{}{}
+		rt.permVerdicts[p.ID] = permVerdictRecord{epoch: epoch, state: permVerdictInflight}
 		pending = append(pending, p)
 	}
 	rt.mu.Unlock()
@@ -141,15 +153,43 @@ func (m *Manager) judgeScanAsync(ctx context.Context, rt *taskRuntime, tok runti
 		Branch:      row.Branch,
 	}
 	for _, p := range pending {
-		m.judgeAndReply(ctx, rt, tok, platform, p)
+		m.judgeAndReply(ctx, rt, tok, epoch, platform, p)
 	}
 }
 
-// permGate 判定/发送共用准入复核（task-permission-mode F1/F2）：
-// Manager 当前实例仍是 rt（旧实例/被替换实例 MUST NOT 判定或发送）且捕获令牌一致、
-// 实例就绪、未停止、未标记 reply-unsupported、ctx 未取消。
+// commitPermVerdict 提交判定终态（D1：状态提交先于事件发布）：rt.mu 内比较捕获 epoch，
+// 失配 MUST NOT 写状态（旧 epoch 判定迟到不得污染新 epoch）。返回是否已提交。
+func (rt *taskRuntime) commitPermVerdict(epoch uint64, requestID, state string) bool {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.permEpoch != epoch {
+		return false
+	}
+	rt.permVerdicts[requestID] = permVerdictRecord{epoch: epoch, state: state}
+	return true
+}
+
+// settlePermVerdict judgeAndReply 终结分支共用出口（task-permission-mode tasks 3.2）：
+// 先（rt.mu 内）提交判定状态，提交成功后才发布 serve_runtime.permission_verdict
+// 唤醒事件（Topic=serve_runtime、RID=instVersion、Payload=ServeRuntimeTaskPayload{TaskID}，
+// D1 事件契约）；epoch 失配不写状态也不发事件。publish 未注入（测试构造）时 no-op
+//（与 RecordUserActivity 同一注入约定）。
+func (m *Manager) settlePermVerdict(rt *taskRuntime, epoch uint64, requestID, state string) {
+	if !rt.commitPermVerdict(epoch, requestID, state) {
+		return
+	}
+	if m.publish == nil {
+		return
+	}
+	m.publish.Publish(ocdeckevent.NewServeRuntimePermissionVerdict(string(rt.instVersion), rt.taskID))
+}
+
+// permGate 判定/发送共用准入复核（task-permission-mode F1/F2/D5）：
+// Manager 当前实例仍是 rt（旧实例/被替换实例 MUST NOT 判定或发送）、捕获令牌与 epoch
+// 一致、AIAutoEnabled（AI 启用唯一事实源，纯内存读）、实例就绪、未停止、未标记
+// reply-unsupported、ctx 未取消。零 DB IO。
 // 注册表读取（getRuntime 自持 rtMu）在 rt.mu 外；状态读取在 rt.mu 内。
-func (m *Manager) permGate(ctx context.Context, rt *taskRuntime, tok runtime.InstVersion) bool {
+func (m *Manager) permGate(ctx context.Context, rt *taskRuntime, tok runtime.InstVersion, epoch uint64) bool {
 	if ctx.Err() != nil {
 		return false
 	}
@@ -158,7 +198,9 @@ func (m *Manager) permGate(ctx context.Context, rt *taskRuntime, tok runtime.Ins
 	}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	return rt.permJudgeReady && !rt.judgeStopping && !rt.replyUnsupported && rt.instVersion == tok
+	return rt.permJudgeReady && !rt.judgeStopping && !rt.replyUnsupported &&
+		rt.instVersion == tok && rt.permEpoch == epoch &&
+		rt.permState != nil && rt.permState.AIAutoEnabled
 }
 
 // permAuditVerdict 把端口判定值映射为审计 verdict 枚举（task-permission-mode D11）。
@@ -251,9 +293,13 @@ func (m *Manager) recordPermAudit(taskID, taskName string, perm PendingPermissio
 	}
 }
 
-// judgeAndReply 对单条权限请求执行判定与回复（task-permission-mode D4/D5/D6/D11）。
-// 仅判定通过/拒绝才回复（approve→once、reject→reject，MUST NOT always）；
-// 判定不确定/失败/实例复核失败一律不回复（D6 分类 ①未发送）。
+// judgeAndReply 对单条权限请求执行判定与回复（task-permission-mode D1/D2/D4/D5/D6/D11）。
+// 仅判定通过才回复（approve→once，MUST NOT always）；REJECT/uncertain/失败/实例或
+// epoch 复核失败一律不回复（D6 分类 ①未发送，D2：REJECT 永不进入回复路径）。
+// 判定状态（tasks 3.2，D1 分支表，终态提交先于事件发布；epoch 失配不写状态不发事件）：
+// APPROVE+ok/gone → settled_no_notify；REJECT/UNCERTAIN/FAILED/unknown/unsupported/
+// 发送前门禁失败未发送 → manual_required。提交成功后发布 serve_runtime.permission_verdict
+// 唤醒事件（settlePermVerdict）。
 // 审计（D11）：记录计数从调用判定器起算——调用 Judge 前门禁拒绝零记录；调用后所有
 // 终结路径恰好一条：UNCERTAIN/FAILED 判定终结即写（not_applicable）；APPROVE/REJECT
 // 已发送按结果写（ok 含 reply 字段 / gone / unknown / unsupported），未实际发送写
@@ -261,11 +307,11 @@ func (m *Manager) recordPermAudit(taskID, taskName string, perm PendingPermissio
 //（统一生成，禁止重读 metadata 另生成），所有终结分支含 detail。审计写入自身不再受
 // permGate 拦截，写入失败仅记日志；审计文件 IO 无独立取消/deadline，Record 同步执行
 //（极端缓慢 Write 会拖住本 goroutine 与停止 join，见 recordPermAudit 生命周期界限）。
-func (m *Manager) judgeAndReply(ctx context.Context, rt *taskRuntime, tok runtime.InstVersion, platform PermissionJudgeInput, perm PendingPermission) {
+func (m *Manager) judgeAndReply(ctx context.Context, rt *taskRuntime, tok runtime.InstVersion, epoch uint64, platform PermissionJudgeInput, perm PendingPermission) {
 	// 条间复核（F2）：批内逐条进入 Judge 前复核——终止（stop/unsupported）、实例被替换
 	// 或 ctx 已取消时剩余条目不再进入 Judge（外层循环继续、逐条在本检查处返回；
 	// 新实例经自身触发位重新纳入）。调用 Judge 前门禁拒绝：零审计记录。
-	if !m.permGate(ctx, rt, tok) {
+	if !m.permGate(ctx, rt, tok, epoch) {
 		return
 	}
 	// 请求详情提取（D5 提取表，确定性纯函数零 IO）：Judge 输入与审计 detail 同源。
@@ -286,6 +332,7 @@ func (m *Manager) judgeAndReply(ctx context.Context, rt *taskRuntime, tok runtim
 	if err != nil {
 		// 判定失败按 uncertain：不回复、不重试（judged-set 已登记，不反复烧 LLM）。
 		// 审计：非 nil error → verdict=FAILED（D5 返回语义接缝），判定终结即写。
+		m.settlePermVerdict(rt, epoch, perm.ID, permVerdictManualRequired)
 		log.Printf("task %s: ai-auto judge %s (%s): %v", rt.taskID, perm.ID, perm.Permission, err)
 		m.recordPermAudit(rt.taskID, platform.TaskName, perm, "FAILED", "not_applicable", "", auditDetail)
 		return
@@ -294,17 +341,18 @@ func (m *Manager) judgeAndReply(ctx context.Context, rt *taskRuntime, tok runtim
 	switch verdict {
 	case PermissionVerdictApprove:
 		reply = "once"
-	case PermissionVerdictReject:
-		reply = "reject"
 	default:
-		// uncertain（无 error，合法输出）：不回复，转人工；审计留痕 not_applicable。
+		// REJECT 与 uncertain 同语义（D2）：不回复、转人工；审计留痕
+		// REJECT/UNCERTAIN + not_applicable（映射见 permAuditVerdict）。
+		m.settlePermVerdict(rt, epoch, perm.ID, permVerdictManualRequired)
 		m.recordPermAudit(rt.taskID, platform.TaskName, perm, permAuditVerdict(verdict), "not_applicable", "", auditDetail)
 		return
 	}
 	auditVerdict := permAuditVerdict(verdict)
 
 	// 发送前复核：permGate（含 Manager 当前实例校验——旧实例延迟返回的结果 MUST NOT 发送）。
-	if !m.permGate(ctx, rt, tok) {
+	if !m.permGate(ctx, rt, tok, epoch) {
+		m.settlePermVerdict(rt, epoch, perm.ID, permVerdictManualRequired)
 		m.recordPermAudit(rt.taskID, platform.TaskName, perm, auditVerdict, "not_applicable", "", auditDetail)
 		return
 	}
@@ -313,26 +361,31 @@ func (m *Manager) judgeAndReply(ctx context.Context, rt *taskRuntime, tok runtim
 	// 构造含 DB 读与两次会话 env 读，可阻塞。
 	oc, dir, ok := m.taskOcClient(ctx, rt.taskID)
 	if !ok {
+		m.settlePermVerdict(rt, epoch, perm.ID, permVerdictManualRequired)
 		m.recordPermAudit(rt.taskID, platform.TaskName, perm, auditVerdict, "not_applicable", "", auditDetail)
 		return
 	}
-	// 最终发送准入（F1）：客户端构造期间发生的停止/unsupported/实例替换/ctx 取消
-	// MUST NOT 发送；此点之后才停止的请求按「已发送、结果未知」收敛（D6 分类 ②）。
-	if !m.permGate(ctx, rt, tok) {
+	// 最终发送准入（F1）：客户端构造期间发生的停止/unsupported/实例替换/epoch 切换/
+	// ctx 取消 MUST NOT 发送；此点之后才停止的请求按「已发送、结果未知」收敛（D6 分类 ②）。
+	if !m.permGate(ctx, rt, tok, epoch) {
+		m.settlePermVerdict(rt, epoch, perm.ID, permVerdictManualRequired)
 		m.recordPermAudit(rt.taskID, platform.TaskName, perm, auditVerdict, "not_applicable", "", auditDetail)
 		return
 	}
 	rerr := oc.ReplyPermission(ctx, dir, perm.ID, reply)
 	switch {
 	case rerr == nil:
+		m.settlePermVerdict(rt, epoch, perm.ID, permVerdictSettledNoNotify)
 		log.Printf("task %s: ai-auto replied %s to %s (%s)", rt.taskID, reply, perm.ID, perm.Permission)
 		m.recordPermAudit(rt.taskID, platform.TaskName, perm, auditVerdict, "ok", reply, auditDetail)
 	case errors.Is(rerr, opencode.ErrPermissionRequestGone):
 		// 人工竞态：请求已了结，正常忽略（D6 分类 ③）。
+		m.settlePermVerdict(rt, epoch, perm.ID, permVerdictSettledNoNotify)
 		log.Printf("task %s: ai-auto reply %s: request already resolved (race), ignored", rt.taskID, perm.ID)
 		m.recordPermAudit(rt.taskID, platform.TaskName, perm, auditVerdict, "gone", "", auditDetail)
 	case errors.Is(rerr, opencode.ErrCapabilityUnsupported):
 		// 路由 404：该 runtime 无回复端点 → 标记 reply-unsupported，停止后续判定（D6 分类 ③）。
+		m.settlePermVerdict(rt, epoch, perm.ID, permVerdictManualRequired)
 		rt.mu.Lock()
 		rt.replyUnsupported = true
 		rt.mu.Unlock()
@@ -340,7 +393,8 @@ func (m *Manager) judgeAndReply(ctx context.Context, rt *taskRuntime, tok runtim
 		m.recordPermAudit(rt.taskID, platform.TaskName, perm, auditVerdict, "unsupported", "", auditDetail)
 	default:
 		// 已发送、结果未知（超时/连接失败/5xx 等）：不重试、不补偿、不本地断言状态；
-		// 该请求后续由既有 SSE/REST 对账收敛（D6 分类 ②）。
+		// 该请求后续由既有 SSE/REST 对账收敛（D6 分类 ②）。回复可能未受理 → 转人工。
+		m.settlePermVerdict(rt, epoch, perm.ID, permVerdictManualRequired)
 		log.Printf("task %s: ai-auto reply %s: unknown result (no retry): %v", rt.taskID, perm.ID, rerr)
 		m.recordPermAudit(rt.taskID, platform.TaskName, perm, auditVerdict, "unknown", "", auditDetail)
 	}

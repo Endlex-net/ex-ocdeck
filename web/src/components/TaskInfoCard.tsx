@@ -2,7 +2,15 @@ import { useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { baseRefShortName } from '../pages/workbench-branch';
 import { StatusBadge } from './StatusBadge';
-import { isGitlessTask, type Task, type TaskInfoPatch } from '../types';
+import {
+  isGitlessTask,
+  PERMISSION_MODE_LABELS,
+  type Task,
+  type TaskDetail,
+  type TaskInfoPatch,
+  type TaskPermissionMode,
+  type TaskPermissionModeView,
+} from '../types';
 
 /** 由当前分支名拆出「原前缀 + slug」：前缀 = 最后一个 `/` 之前部分；
  *  分支无 `/` 时整支视为 slug、前缀为空（新分支名即 slug 本身，task-lifecycle spec）。 */
@@ -32,19 +40,33 @@ function resolveBranchName(prefix: string, slug: string): string {
  *   baseline 可能已失效。保留原始错误展示，先空 PATCH {}（仅 R1 收敛）+ GET 刷新，
  *   以收敛后的当前分支重置基准并重新确认 slug 后才允许再次提交，MUST NOT 自动重发草稿；
  *   恢复失败保持门禁。取消/重新编辑只放弃草稿，MUST NOT 解除该门禁（P4-2）。
+ *
+ * 权限模式（查看态/编辑态与名称/分支一致）：查看态只读展示已保存模式，无选择器；
+ * 点「编辑」进入编辑态才出现选择器（当前已保存值为初始值），「取消」还原未保存选择，
+ * 「保存」时仅当模式值变更才调专用模式端点（MUST NOT 并入通用 PATCH；同次编辑中
+ * 名称/分支通用 PATCH 与模式端点各自提交——先通用 PATCH 后模式端点——各自保留既有
+ * 错误/结果不确定门禁）：保存期间禁用选择器、禁止重叠请求、序列令牌旧响应不覆盖；
+ * 失败（网络/结果不确定）先 GET 复验服务端当前状态后才解禁，复验失败「重试复验」。
+ * 已保存模式与生效模式不一致时常驻提示「新模式将在下次激活生效」（查看态/编辑态都展示）；
+ * 保存成功且无法立即生效时另给瞬时确认「已保存，将在下次激活后生效。」（下一次模式
+ * 保存开始或两值一致后消失）。
  */
 export function TaskInfoCard({
   task,
   projectName,
   onSaved,
+  onPermissionModeSaved,
   onRefreshed,
 }: {
-  task: Task;
+  task: TaskDetail;
   projectName: string;
-  /** 保存成功：updated 为服务端返回的最新 DTO（调用方同步任务态并刷新共享 store）。 */
+  /** 保存成功：updated 为服务端返回的最新 DTO（调用方同步任务态并刷新共享 store）。
+   *  通用 PATCH 响应不含 effective_permission_mode，调用方 MUST 合并保留（D8）。 */
   onSaved: (updated: Task) => void;
+  /** 权限模式保存成功：仅两模式字段视图（调用方合并进页面任务，D8）。 */
+  onPermissionModeSaved: (view: TaskPermissionModeView) => void;
   /** 不确定结果后的强制刷新结果回传（调用方同步任务态，不改变编辑态）。 */
-  onRefreshed?: (fresh: Task) => void;
+  onRefreshed?: (fresh: TaskDetail) => void;
 }) {
   // gitless（dir / repo local-path）：无分支概念，分支行与 slug 输入均不渲染
   const gitless = isGitlessTask(task.project_kind, task.mode);
@@ -74,6 +96,8 @@ export function TaskInfoCard({
     setBaseline({ name: task.name, branch: task.branch });
     setDraftName(task.name);
     setDraftSlug(gitless ? '' : splitBranch(task.branch).slug);
+    setDraftMode(task.permission_mode); // 选择器以当前已保存值为初始值
+    setModeBaseline(task.permission_mode);
     // 门禁与草稿分离（P4-2）：再次编辑 MUST NOT 解除结果不确定门禁——
     // 恢复成功取得可信新基准前，保存保持禁用
     if (!uncertain) {
@@ -121,18 +145,95 @@ export function TaskInfoCard({
     }
   };
 
+  // —— 权限模式随编辑态「保存」提交（专用模式端点，MUST NOT 并入通用 PATCH）。
+  // draftMode 为编辑态草稿（进编辑态时以当前已保存值初始化，取消即放弃）；模式端点
+  // 竞态门禁沿用既有保存竞态约束：modeSaving 覆盖「保存+复验」全程（期间选择器禁用、
+  // 保存按钮 busy 禁止重叠请求）；新保存流即刻作废任何在途保存/复验流（序列令牌）：
+  // 旧响应/旧复验 MUST NOT 覆盖更新状态。失败按结果不确定处理：先 GET 复验服务端
+  // 当前状态再解禁（服务端可能在失败响应前已提交，MUST NOT 直接放行重发）。
+  const [draftMode, setDraftMode] = useState<TaskPermissionMode>('ask');
+  // 模式编辑基准（I5）：进入编辑态时捕获的已保存模式——「用户是否改了模式」一律以
+  // draftMode 与 modeBaseline 比较判定；编辑期间 SSE/复验更新 task.permission_mode
+  // MUST NOT 改变未修改草稿的提交语义（用户未动选择器则不产生模式端点调用）
+  const [modeBaseline, setModeBaseline] = useState<TaskPermissionMode>('ask');
+  const [modeSaving, setModeSaving] = useState(false);
+  const [modeRechecking, setModeRechecking] = useState(false);
+  const [modeUncertain, setModeUncertain] = useState(false);
+  const [modeError, setModeError] = useState('');
+  // 保存后瞬时确认（无法立即生效场景）：保存成功且响应两值不一致时展示，
+  // 下一次保存开始或两值转为一致（下次激活）时消失；常驻提示独立保留。
+  const [modeNotice, setModeNotice] = useState('');
+  const modeSaveSeqRef = useRef(0);
+
+  /** 结果不确定后的复验（与名称/分支恢复门禁同型）：GET 详情以服务端当前两模式字段收敛，
+   *  收敛成功才解禁选择器；失败保持门禁，由「重试复验」再收敛。 */
+  const recheckMode = async (seq: number) => {
+    setModeRechecking(true);
+    try {
+      const fresh = await api.getTask(task.id);
+      if (seq !== modeSaveSeqRef.current) return;
+      onRefreshed?.(fresh);
+      setModeUncertain(false);
+      setModeError('权限模式保存结果不确定，已按服务端当前状态收敛。');
+      setModeSaving(false);
+    } catch {
+      if (seq !== modeSaveSeqRef.current) return;
+      setModeError('权限模式保存结果不确定，且复验失败。请点击「重试复验」后再修改。');
+    } finally {
+      if (seq === modeSaveSeqRef.current) setModeRechecking(false);
+    }
+  };
+
+  const saveMode = async (next: TaskPermissionMode) => {
+    const seq = ++modeSaveSeqRef.current; // 超越在途流：旧响应 MUST NOT 覆盖更新状态
+    setModeSaving(true);
+    setModeError('');
+    setModeUncertain(false);
+    setModeNotice('');
+    try {
+      const view = await api.updateTaskPermissionMode(task.id, next);
+      if (seq !== modeSaveSeqRef.current) return; // 旧响应不覆盖
+      onPermissionModeSaved(view);
+      if (view.permission_mode !== view.effective_permission_mode) {
+        setModeNotice('已保存，将在下次激活后生效。');
+      }
+      setModeSaving(false);
+    } catch {
+      if (seq !== modeSaveSeqRef.current) return;
+      setModeUncertain(true);
+      setModeError('权限模式保存结果不确定，正在复验服务端状态…');
+      await recheckMode(seq);
+    }
+  };
+
+  const retryModeRecheck = async () => {
+    if (!modeUncertain || modeRechecking) return;
+    const seq = ++modeSaveSeqRef.current;
+    setModeError('权限模式保存结果不确定，正在复验服务端状态…');
+    await recheckMode(seq);
+  };
+
   const submit = async () => {
     if (busy || uncertain || refreshing) return;
     const patch: TaskInfoPatch = { name: draftName };
     if (!gitless && trimmedSlug !== '') patch.branch_slug = trimmedSlug;
+    // 模式草稿相对「编辑开始时的基准」实际变更且模式门禁未激活时，才随本次保存调专用
+    // 模式端点（I5：与实时 task.permission_mode 比较会被编辑期间 SSE 更新污染；模式值
+    // 未变不调；modeUncertain 期间 MUST NOT 重发模式请求，先复验收敛）
+    const modeChanged = !modeUncertain && draftMode !== modeBaseline;
     setBusy(true);
     setError('');
     setSaveError('');
+    // I6：瞬时确认随「下一次保存开始」消失（不限于模式保存——仅改名称/分支的保存也清除）
+    setModeNotice('');
     try {
       const updated = await api.updateTask(task.id, patch);
       setConfirmOpen(false);
       setEditing(false);
       onSaved(updated);
+      // 通用 PATCH 成功后再提交模式端点（两路径各自保留错误/结果不确定门禁）；
+      // 模式保存失败时已退出编辑态，错误与「重试复验」在展示态常驻错误行可见
+      if (modeChanged) await saveMode(draftMode);
     } catch (err) {
       setConfirmOpen(false);
       // 所有 PATCH 错误（无论错误码）统一进入结果不确定恢复门禁（P4-4）：
@@ -170,7 +271,14 @@ export function TaskInfoCard({
       <div className="settings-title task-info-head">
         <span>任务信息</span>
         {!editing && (
-          <button className="btn btn-small" onClick={startEdit}>
+          // I4：模式保存/复验进行中禁止重新进入编辑态（与选择器/保存按钮同一 busy
+          // 覆盖）——否则 draftMode 会按旧 task.permission_mode 初始化，专用请求收敛后
+          // 草稿不同步，再保存可能把刚保存的模式改回旧值
+          <button
+            className="btn btn-small"
+            onClick={startEdit}
+            disabled={busy || modeSaving || modeRechecking || modeUncertain}
+          >
             编辑
           </button>
         )}
@@ -241,7 +349,59 @@ export function TaskInfoCard({
             )}
           </div>
         )}
+        <div className="task-info-row">
+          <span className="task-info-label">权限模式</span>
+          <span className="task-info-value">
+            {/* 查看态只读展示已保存模式；编辑态才出现选择器（草稿 draftMode，
+                随「保存」走专用模式端点提交，「取消」还原）；结果不确定门禁期间禁用 */}
+            {editing ? (
+              <select
+                className="od-input"
+                id="task-info-permission-mode"
+                value={draftMode}
+                disabled={busy || modeSaving || modeRechecking || modeUncertain}
+                onChange={(e) => setDraftMode(e.target.value as TaskPermissionMode)}
+              >
+                {(['ask', 'all-approve', 'ai-auto'] as const).map((m) => (
+                  <option key={m} value={m}>
+                    {PERMISSION_MODE_LABELS[m]}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              PERMISSION_MODE_LABELS[task.permission_mode]
+            )}
+            {/* 常驻提示（非 toast，D6）：已保存模式与运行进程实际生效模式不一致时展示，
+                查看态与编辑态均展示 */}
+            {task.permission_mode !== task.effective_permission_mode && (
+              <span className="task-info-preview">
+                当前运行进程仍按「{PERMISSION_MODE_LABELS[task.effective_permission_mode]}
+                」处理，新模式将在下次激活生效
+              </span>
+            )}
+            {/* 保存后瞬时确认（D6）：保存成功且无法立即生效时展示，两值一致后消失 */}
+            {modeNotice && task.permission_mode !== task.effective_permission_mode && (
+              <span className="task-info-preview">{modeNotice}</span>
+            )}
+          </span>
+        </div>
       </div>
+
+      {/* 权限模式保存/复验错误：独立于名称分支编辑态，展示态也可见 */}
+      {modeError && (
+        <div className="error-line task-info-error">
+          {modeError}{' '}
+          {modeUncertain && (
+            <button
+              className="btn btn-small"
+              disabled={modeRechecking}
+              onClick={() => void retryModeRecheck()}
+            >
+              {modeRechecking ? '复验中…' : '重试复验'}
+            </button>
+          )}
+        </div>
+      )}
 
       {editing && (
         <>

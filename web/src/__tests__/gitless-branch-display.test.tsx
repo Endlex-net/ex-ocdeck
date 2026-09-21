@@ -8,7 +8,7 @@ import { TaskWorkbenchPage } from '../pages/TaskWorkbenchPage';
 import { api } from '../api';
 import { subscribeTask } from '../sse';
 import { mount, flushUI, stubMatchMedia } from './cm-test-env';
-import type { Project, Task, TaskSummary } from '../types';
+import type { Project, TaskDetail, TaskSummary } from '../types';
 
 /* ==================== gitless 任务分支名防御（Z-F1，git-operations delta） ====================
  * 防御性契约：mode=local-path（或 dir）任务即使携带非空 branch（合法数据下恒空，此处钉住
@@ -19,7 +19,7 @@ import type { Project, Task, TaskSummary } from '../types';
 
 type SessionsSubOpts = { onData: (items: never[]) => void; onError: (m: string) => void };
 type TaskSubOpts = {
-  onData: (t: Task) => void;
+  onData: (t: TaskDetail) => void;
   onError: (m: string) => void;
   onGone: () => void;
 };
@@ -86,7 +86,7 @@ function summary(id: string, over: Partial<TaskSummary>): TaskSummary {
   };
 }
 
-function makeTask(over: Partial<Task>): Task {
+function makeTask(over: Partial<TaskDetail>): TaskDetail {
   return {
     id: 't1',
     project_id: 'p1',
@@ -98,6 +98,7 @@ function makeTask(over: Partial<Task>): Task {
     worktree_path: '/tmp/wt',
     mode: 'worktree',
     permission_mode: 'ask',
+    effective_permission_mode: 'ask',
     init_status: 'none',
     created_at: 1,
     updated_at: 2,
