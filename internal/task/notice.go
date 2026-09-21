@@ -73,6 +73,7 @@ func (m *Manager) newRuntime(taskID string) *taskRuntime {
 		watchCancels: map[string]func(){},
 		watchDones:   map[string]<-chan struct{}{},
 		judgedPerms:  map[string]struct{}{},
+		permVerdicts: map[string]permVerdictRecord{},
 	}
 }
 

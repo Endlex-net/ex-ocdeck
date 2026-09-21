@@ -344,7 +344,16 @@ func (m *Manager) tryRepairRuntime(ctx context.Context, taskID string, mode Alig
 		return false, fmt.Errorf("health check: %w", err)
 	}
 	// 重建运行时 → SSE 订阅 + 全量对齐（B7：恢复完整运行时）。mode 由 Suspend 入口传入。
+	// 启动事实读校验（task-permission-mode D5 三路径矩阵②）：有存活进程但启动事实
+	// NULL/非法 MUST 失败不注册（fail-closed）。
+	startMode, serr := m.readStartFactForRegister(ctx, taskID)
+	if serr != nil {
+		return false, serr
+	}
 	rt := m.newRuntime(taskID)
+	if err := initPermState(rt, row, startMode); err != nil {
+		return false, err
+	}
 	m.setRuntime(taskID, rt)
 	rt.registerGroup(roleRuntime, serveName)
 	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode); err != nil {

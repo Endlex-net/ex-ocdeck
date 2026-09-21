@@ -4,7 +4,7 @@ import { act } from 'react';
 import { TaskWorkbenchPage } from '../pages/TaskWorkbenchPage';
 import { subscribeTask } from '../sse';
 import { mount, flushUI } from './cm-test-env';
-import type { Project, Task } from '../types';
+import type { Project, TaskDetail } from '../types';
 
 /* ==================== 工作台 Git 能力判定（add-local-path-task-mode 6.2/D8 反向） ====================
  * 判定拆分：Git tab/面板入口仅按 project_kind==='dir' 隐藏——repo local-path 任务显示 Git tab
@@ -13,7 +13,7 @@ import type { Project, Task } from '../types';
  * task.branch 异常非空也不再成为页头数据源），非空分支展示见 task-workbench-header-branch.test.tsx。 */
 
 type TaskSubOpts = {
-  onData: (t: Task) => void;
+  onData: (t: TaskDetail) => void;
   onError: (m: string) => void;
   onGone: () => void;
 };
@@ -54,7 +54,7 @@ vi.mock('../terminal/TerminalView', () => ({ TerminalView: () => null }));
 vi.mock('../components/GitPanel', () => ({ GitPanel: () => null }));
 vi.mock('../components/EnvEditor', () => ({ EnvEditor: () => null }));
 
-function makeTask(over: Partial<Task>): Task {
+function makeTask(over: Partial<TaskDetail>): TaskDetail {
   return {
     id: 't1',
     project_id: 'p1',
@@ -66,6 +66,7 @@ function makeTask(over: Partial<Task>): Task {
     worktree_path: '/tmp/wt',
     mode: 'worktree',
     permission_mode: 'ask',
+    effective_permission_mode: 'ask',
     init_status: 'none',
     created_at: 1,
     updated_at: 2,

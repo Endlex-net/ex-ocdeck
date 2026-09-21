@@ -66,6 +66,14 @@ const (
 	// RID=ServeRuntime 主键 instVersion，
 	// Payload={task_id, session_id, name, message, status_code *int, is_retryable *bool}。
 	TypeServeRuntimeSessionError = "serve_runtime.session_error"
+	// TypeServeRuntimePermissionVerdict AI 自动权限判定终结唤醒事件（task-permission-mode
+	// D1/D7：事件仅唤醒，通知层按 task 重读权威快照定论，不信任载荷）。
+	// RID=ServeRuntime 主键 instVersion，Payload={task_id}。
+	TypeServeRuntimePermissionVerdict = "serve_runtime.permission_verdict"
+	// TypeServeRuntimePermissionModeChanged 权限模式变更收敛后的 waiting 重评估唤醒事件
+	// （task-permission-mode D7：仅当任务存在 runtime 时发布；通知层 waiting 重评估只由此驱动）。
+	// RID=ServeRuntime 主键 instVersion，Payload={task_id}。
+	TypeServeRuntimePermissionModeChanged = "serve_runtime.permission_mode_changed"
 	// TypeResyncRequested 控制事件：要求订阅方重拉其场景全量。RID 允许空，Payload={}。
 	TypeResyncRequested = "resync.requested"
 )
@@ -274,4 +282,26 @@ func NewServeRuntimeSessionError(instVersion, taskID, sessionID, name, message s
 // 事件无主体，RID 固定为空字符串；诊断 triggerID 不进入本事件模型（不另加字段）。
 func NewResyncRequested() Event {
 	return Event{Topic: TopicControl, Type: TypeResyncRequested, RID: "", Payload: struct{}{}}
+}
+
+// NewServeRuntimePermissionVerdict 构造 serve_runtime.permission_verdict 唤醒事件
+// （task-permission-mode D1/D7）。RID 为 ServeRuntime 主键 instVersion。
+func NewServeRuntimePermissionVerdict(instVersion, taskID string) Event {
+	return Event{
+		Topic:   TopicServeRuntime,
+		Type:    TypeServeRuntimePermissionVerdict,
+		RID:     instVersion,
+		Payload: ServeRuntimeTaskPayload{TaskID: taskID},
+	}
+}
+
+// NewServeRuntimePermissionModeChanged 构造 serve_runtime.permission_mode_changed
+// 唤醒事件（task-permission-mode D7）。RID 为 ServeRuntime 主键 instVersion。
+func NewServeRuntimePermissionModeChanged(instVersion, taskID string) Event {
+	return Event{
+		Topic:   TopicServeRuntime,
+		Type:    TypeServeRuntimePermissionModeChanged,
+		RID:     instVersion,
+		Payload: ServeRuntimeTaskPayload{TaskID: taskID},
+	}
 }

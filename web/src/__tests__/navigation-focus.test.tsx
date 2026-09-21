@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { act } from 'react';
 import { mount, flushUI, stubMatchMedia } from './cm-test-env';
 import type * as FR from '../terminal/focus-request';
-import type { ActiveSessionItem, Project, Task } from '../types';
+import type { ActiveSessionItem, Project, TaskDetail } from '../types';
 
 /* ============ 导航焦点请求：三个生产点 + 工作台标签激活（fix-terminal-input-panel-resize D3） ============
  * 导航本身仍走原生 href/navigate（jsdom 不真正路由），这里断言点击后单例收到请求信号；
@@ -75,7 +75,7 @@ const sessionMock = vi.hoisted(() => {
 vi.mock('../terminal/session', () => ({ TermSession: sessionMock }));
 
 type TaskSubOpts = {
-  onData: (t: Task) => void;
+  onData: (t: TaskDetail) => void;
   onError: (m: string) => void;
   onGone: () => void;
 };
@@ -184,7 +184,7 @@ function makeProjects(): Project[] {
   ];
 }
 
-function makeTask(over: Partial<Task>): Task {
+function makeTask(over: Partial<TaskDetail>): TaskDetail {
   return {
     id: 't1',
     project_id: 'p1',
@@ -196,6 +196,7 @@ function makeTask(over: Partial<Task>): Task {
     worktree_path: '/tmp/wt',
     mode: 'worktree',
     permission_mode: 'ask',
+    effective_permission_mode: 'ask',
     init_status: 'none',
     created_at: 1,
     updated_at: 2,

@@ -406,12 +406,27 @@ func (a *agentStatusState) statusAndDetailLocked() (string, appnotif.RetryDetail
 // notifyComposite 组合快照的运行态原子拷贝（Lane B B5）：rt.mu 捕获实例令牌与
 // 状态指针后，固定锁序 attention.mu → agentStatus.mu 同时持有完成 attention
 // 与 agent 聚合/详情拷贝；与 clearNotifyState 互斥——快照不会观察到半清理态
-// （attention 已清而 agent 未清的交错）。
-func (rt *taskRuntime) notifyComposite() (inst string, att Attention, runStatus string, detail appnotif.RetryDetail, hasDetail bool) {
+// （attention 已清而 agent 未清的交错）。permState/verdicts（task-permission-mode
+// D1：判定状态映射仅输出当前 epoch，旧 epoch 残余不输出）在 rt.mu 同一临界区
+// 捕获，与 attention 同一代际。
+func (rt *taskRuntime) notifyComposite() (inst string, att Attention, runStatus string, detail appnotif.RetryDetail, hasDetail bool, permState *RuntimePermissionState, verdicts map[string]appnotif.PermissionVerdict) {
 	rt.mu.Lock()
 	inst = string(rt.instVersion)
 	attState := rt.attention
 	agState := rt.agentStatus
+	if rt.permState != nil {
+		ps := *rt.permState
+		permState = &ps
+	}
+	if len(rt.permVerdicts) > 0 {
+		verdicts = make(map[string]appnotif.PermissionVerdict, len(rt.permVerdicts))
+		for id, rec := range rt.permVerdicts {
+			if rec.epoch != rt.permEpoch {
+				continue // 旧 epoch 残余 MUST NOT 输出（D1）
+			}
+			verdicts[id] = appnotif.PermissionVerdict{Epoch: rec.epoch, State: rec.state}
+		}
+	}
 	rt.mu.Unlock()
 
 	if attState != nil {
@@ -430,7 +445,7 @@ func (rt *taskRuntime) notifyComposite() (inst string, att Attention, runStatus 
 	if agState != nil {
 		runStatus, detail, hasDetail = agState.statusAndDetailLocked()
 	}
-	return inst, att, runStatus, detail, hasDetail
+	return inst, att, runStatus, detail, hasDetail, permState, verdicts
 }
 
 // clearNotifyState 原子清理 attention 与 agentStatus（Lane B B5）：固定锁序
@@ -803,15 +818,28 @@ func (m *Manager) TaskNotificationSnapshot(ctx context.Context, taskID string) (
 	snap := appnotif.TaskSnapshot{Task: appnotif.TaskRef{ID: row.ID, Name: row.Name, Status: row.Status}}
 	rt := m.getRuntime(taskID)
 	if rt == nil {
+		// 无 runtime：有效模式读 DB 持久化行（D5/D6）。
+		view, verr := derivePermissionModeView(nil, row)
+		if verr != nil {
+			return appnotif.TaskSnapshot{}, verr
+		}
+		snap.Task.EffectivePermissionMode = view.EffectivePermissionMode
 		return snap, nil
 	}
-	inst, att, runStatus, detail, hasDetail := rt.notifyComposite()
+	inst, att, runStatus, detail, hasDetail, permState, verdicts := rt.notifyComposite()
 	snap.InstVersion = inst
 	snap.Attention = att
 	snap.RunStatus = runStatus
 	if hasDetail {
 		snap.RetryDetail, snap.HasRetryDetail = detail, true
 	}
+	snap.Verdicts = verdicts
+	// 有效模式与判定状态同源：permState 为 nil（注册前窗口）时按无 runtime 读 DB 行。
+	view, verr := derivePermissionModeView(permState, row)
+	if verr != nil {
+		return appnotif.TaskSnapshot{}, verr
+	}
+	snap.Task.EffectivePermissionMode = view.EffectivePermissionMode
 	return snap, nil
 }
 

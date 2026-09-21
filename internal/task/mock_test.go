@@ -70,6 +70,13 @@ type mockStore struct {
 	setRenamePendingErr   error
 	commitInfoErr         error
 	clearRenamePendingErr error
+	// --- task-permission-mode：启动事实镜像与 failpoint ---
+	// permissionModeAtStart 镜像 tasks.permission_mode_at_start（taskID → mode）；
+	// 缺 key 即 NULL。setPermModeAtStartErr / backfillPermModeErr 非空时对应方法返回
+	// 该错误（写失败不建进程 / 回填失败 failpoint）。
+	permissionModeAtStart map[string]string
+	setPermModeAtStartErr error
+	backfillPermModeErr   error
 }
 
 type statusCall struct {
@@ -80,12 +87,13 @@ type statusCall struct {
 
 func newMockStore() *mockStore {
 	return &mockStore{
-		projects:         map[string]ProjectRow{},
-		tasks:            map[string]TaskRow{},
-		sessions:         map[string][]SessionRow{},
-		recoveryAttempts: map[string][]int64{},
-		recoveryDebts:    map[string]RecoveryDebtRow{},
-		renamePending:    map[string]string{},
+		projects:              map[string]ProjectRow{},
+		tasks:                 map[string]TaskRow{},
+		sessions:              map[string][]SessionRow{},
+		recoveryAttempts:      map[string][]int64{},
+		recoveryDebts:         map[string]RecoveryDebtRow{},
+		renamePending:         map[string]string{},
+		permissionModeAtStart: map[string]string{},
 	}
 }
 
@@ -413,6 +421,80 @@ func (s *mockStore) ClearTaskRenamePending(ctx context.Context, id string) (appl
 	}
 	delete(s.renamePending, id)
 	return application.MutationResult{Matched: true}, nil
+}
+
+// --- task-permission-mode：启动事实 + 权限模式镜像 ---
+
+// seedPermissionModeAtStart 直接写入启动事实镜像（缺 key 即 NULL 的行不能经此表达）。
+func (s *mockStore) seedPermissionModeAtStart(taskID, mode string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.permissionModeAtStart[taskID] = mode
+}
+
+// BackfillPermissionModeAtStart 镜像 store 语义：仅 active 且 NULL 行按持久化
+// permission_mode 回填，幂等，不推进 updated_at。
+func (s *mockStore) BackfillPermissionModeAtStart(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.backfillPermModeErr != nil {
+		return s.backfillPermModeErr
+	}
+	for id, t := range s.tasks {
+		if t.Status != StatusActive {
+			continue
+		}
+		if _, ok := s.permissionModeAtStart[id]; ok {
+			continue
+		}
+		s.permissionModeAtStart[id] = t.PermissionMode
+	}
+	return nil
+}
+
+// SetPermissionModeAtStart 写入启动事实（不推进 updated_at；行不存在报错）。
+func (s *mockStore) SetPermissionModeAtStart(ctx context.Context, taskID, mode string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.setPermModeAtStartErr != nil {
+		return s.setPermModeAtStartErr
+	}
+	if _, ok := s.tasks[taskID]; !ok {
+		return fmt.Errorf("not found")
+	}
+	s.permissionModeAtStart[taskID] = mode
+	return nil
+}
+
+// GetPermissionModeAtStart 读取启动事实（缺 key = NULL → nil；行不存在报错）。
+func (s *mockStore) GetPermissionModeAtStart(ctx context.Context, taskID string) (*string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.tasks[taskID]; !ok {
+		return nil, fmt.Errorf("not found")
+	}
+	if v, ok := s.permissionModeAtStart[taskID]; ok {
+		return &v, nil
+	}
+	return nil, nil
+}
+
+// UpdateTaskPermissionMode 镜像 store 单列条件更新：未命中 Matched=false；同值
+// Matched+!Changed；变更推进 updated_at（秒精度）。
+func (s *mockStore) UpdateTaskPermissionMode(ctx context.Context, taskID, mode string) (application.MutationResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.tasks[taskID]
+	if !ok {
+		return application.MutationResult{}, nil
+	}
+	if t.PermissionMode == mode {
+		return application.MutationResult{Matched: true}, nil
+	}
+	t.PermissionMode = mode
+	t.UpdatedAt = time.Now().Unix()
+	s.tasks[taskID] = t
+	return application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: true}, nil
 }
 
 // CommitTaskInfoUpdate 镜像 store 单事务语义：presence 字段（nil=不修改）同值跳过、

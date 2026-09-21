@@ -112,6 +112,18 @@ type TaskStore interface {
 	ClearTaskRenamePending(ctx context.Context, id string) (application.MutationResult, error)
 	// GetTaskRenamePending 读取未收敛改名意图 JSON（nil = 无意图）。仅供内部收敛编排消费。
 	GetTaskRenamePending(ctx context.Context, id string) (*string, error)
+	// --- 启动权限事实 + 权限模式（task-permission-mode D5/D8；签名与 store.Queries 对齐） ---
+
+	// BackfillPermissionModeAtStart 对存量 active 且启动事实为 NULL 的行按持久化
+	// permission_mode 一次性回填（幂等；不推进 updated_at、不发事件）。进程启动入口调用。
+	BackfillPermissionModeAtStart(ctx context.Context) error
+	// SetPermissionModeAtStart 写入启动事实列（不推进 updated_at、不发事件）；行不存在 → sql.ErrNoRows。
+	SetPermissionModeAtStart(ctx context.Context, taskID, mode string) error
+	// GetPermissionModeAtStart 读取启动事实列（NULL → nil；行不存在 → sql.ErrNoRows）。
+	GetPermissionModeAtStart(ctx context.Context, taskID string) (*string, error)
+	// UpdateTaskPermissionMode 单列条件更新持久化权限模式（updated_at 按 task-lifecycle
+	// Unix 秒精度推进；同值 Matched+!Changed；未命中 Matched=false）。
+	UpdateTaskPermissionMode(ctx context.Context, taskID, mode string) (application.MutationResult, error)
 }
 
 // AcquirePermitResult 是 AcquireRecoveryPermit 的结构化结果（对齐 store.AcquirePermitResult）。
@@ -399,6 +411,16 @@ type taskRuntime struct {
 	// judgedPerms per-runtime judged-set（D4 计数契约）：requestID → 已发起判定尝试。
 	// 失败不清除；runtime 销毁即释放。
 	judgedPerms map[string]struct{}
+	// --- 权限判定 epoch 与状态记录（task-permission-mode D5/D1）---
+	// permEpoch 权限纪元：runtime 创建起 0 计数，模式切换（stopAll→再激活）即换新
+	// runtime，同 runtime 内不推进；judgeScan 入口捕获，迟到判定按 epoch 失配丢弃。
+	permEpoch uint64
+	// permState 权限判定状态（可空：三条注册路径 initPermState 前为 nil）。AI 自动判定
+	// 启用的唯一事实源是 AIAutoEnabled（MUST NOT 另设独立布尔）。
+	permState *RuntimePermissionState
+	// permVerdicts 判定状态记录（D1）：requestID → {捕获 epoch, 终态}。登记 inflight
+	// 时写入当前 epoch；终态提交比较捕获 epoch，失配不写。
+	permVerdicts map[string]permVerdictRecord
 	// judgeCancel/judgeWG 判定/回复 goroutine 生命周期（与 sseCancel 同族接入停止路径）：
 	// 首次准入通过时从 Manager 生命周期 ctx 派生；stopAll/stopAllJoin cancel + join。
 	judgeCtx    context.Context // 判定/回复 goroutine 共用的 runtime 生命周期 ctx

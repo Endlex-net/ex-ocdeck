@@ -221,8 +221,12 @@ func run() error {
 	// 写库失败 fail-closed：不开放 API/调度器。未注入 diffreview.Service → no-op。
 	// F12①：收敛→开放序列收口在 diffReviewStartupGate，run() 与 main_test.go 共用同一函数
 	//（测试断言的是生产编排的 fail-closed 语义，而非复制模拟编排）。
+	// task-permission-mode D8/tasks 4.5：回填→开放序列同样收口在 permissionModeStartupGate
+	//（顺序钉死 SQL add column → Backfill → Reconcile → HTTP open，回填失败拒开 HTTP）。
 	return diffReviewStartupGate(ctx, tm, func() error {
-		return serveAndShutdown(ctx, tm, cfg, db, bus, aiStore, wd, diffSvc, uploadOrch, uploadConns, prefixStore)
+		return permissionModeStartupGate(ctx, tm, func() error {
+			return serveAndShutdown(ctx, tm, cfg, db, bus, aiStore, wd, diffSvc, uploadOrch, uploadConns, prefixStore)
+		})
 	})
 }
 
@@ -243,6 +247,8 @@ func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config,
 	// 启动 reconciliation（design.md §5/§10，HTTP 就绪前完成对账）。
 	// Reconcile 失败 MUST 拒绝开放 HTTP（fail-closed）：状态不确定时开放管理面会让用户操作
 	// 建立在错误状态上（会话/DB 失同步，后续操作可能破坏数据安全边界）。
+	// （启动权限事实回填已先于本函数执行：permissionModeStartupGate，D8 顺序
+	// SQL add column → Backfill → Reconcile → HTTP open。）
 	if err := tm.Reconcile(ctx); err != nil {
 		uploadOrch.Stop()
 		return fmt.Errorf("reconcile: %w", err)
@@ -415,6 +421,23 @@ func diffReviewStartupGate(ctx context.Context, converger startupConverger, open
 // startupConverger 收敛门禁依赖的最小端口（task.Manager 与 store.DiffReviewRepoAdapter 均满足）。
 type startupConverger interface {
 	ConvergeDiffReviewOnStartup(ctx context.Context) (int64, error)
+}
+
+// permissionBackfiller 回填门禁依赖的最小端口（task.Manager 满足）。
+type permissionBackfiller interface {
+	BackfillPermissionModeAtStart(ctx context.Context) error
+}
+
+// permissionModeStartupGate 启动权限事实回填门禁（task-permission-mode D8/tasks 4.5）：
+// 开放后续启动序列（Reconcile → HTTP open）前执行 Backfill（存量 active 且 NULL 行按
+// 持久化 permission_mode 回填），任何 DB 错误 → fail-closed 拒绝启动（MUST NOT 调用
+// open）；成功 → 调用 open 并透传其返回错误。顺序钉死：SQL add column（Migrate，更早）→
+// Backfill（本门禁）→ Reconcile → HTTP open。
+func permissionModeStartupGate(ctx context.Context, tm permissionBackfiller, open func() error) error {
+	if err := tm.BackfillPermissionModeAtStart(ctx); err != nil {
+		return fmt.Errorf("backfill permission_mode_at_start: %w", err)
+	}
+	return open()
 }
 
 // spawnWatchdog 构造并启动 watchdog 子进程（design.md §10）。

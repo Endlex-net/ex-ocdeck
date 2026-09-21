@@ -167,13 +167,30 @@ func newAutoTaskEnv(t *testing.T, judge PermissionJudge) (*Manager, *mockStore, 
 	oc := newMockOC(true)
 	m := newTestManager(t, store, proc, newMockWorktree(), oc)
 	m.judge = judge
-	rt := m.newRuntime("t1")
-	m.setRuntime("t1", rt)
+	rt := initAutoPermState(t, m, store, "t1")
 	rt.ensureAttentionState()
 	rt.setPermJudgeReady()
 	cleanup := func() { rt.stopAll() }
 	t.Cleanup(cleanup)
 	return m, store, oc, rt, cleanup
+}
+
+// initAutoPermState 重建 runtime 并按 D5 统一初始化表挂载 permState（测试等价生产
+// 注册路径完成读校验后的状态：非 --auto 启动的 ai-auto 进程——启动事实 ai-auto、
+// SavedMode=ai-auto → AIAutoEnabled=true）。仅用于 judge 流程直接构造 runtime 的用例。
+func initAutoPermState(t *testing.T, m *Manager, store *mockStore, taskID string) *taskRuntime {
+	t.Helper()
+	store.seedPermissionModeAtStart(taskID, PermissionModeAIAuto)
+	row, err := store.GetTask(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	rt := m.newRuntime(taskID)
+	if err := initPermState(rt, row, PermissionModeAIAuto); err != nil {
+		t.Fatalf("initPermState: %v", err)
+	}
+	m.setRuntime(taskID, rt)
+	return rt
 }
 
 // --- 准入矩阵与计数契约（D4/D9） ---
@@ -322,7 +339,8 @@ func TestJudgeScan_VerdictContract(t *testing.T) {
 		wantReply string // "" = 不回复
 	}{
 		{name: "approve→once", verdict: PermissionVerdictApprove, wantReply: "once"},
-		{name: "reject→reject", verdict: PermissionVerdictReject, wantReply: "reject"},
+		// D2：REJECT 不回复转人工（reply 变量无 reject 赋值分支），与 uncertain 同路径。
+		{name: "reject 不回复转人工", verdict: PermissionVerdictReject},
 		{name: "uncertain 不回复", verdict: PermissionVerdictUncertain},
 		{name: "judge 失败不回复", verdict: PermissionVerdictApprove, judgeErr: errors.New("llm down")},
 	}
@@ -482,7 +500,7 @@ func TestJudgeScan_StopRuntime_NoSend(t *testing.T) {
 // 新实例重新判定一次（judged-set 随 runtime 销毁释放，计数契约 per-runtime）。
 func TestJudgeScan_RuntimeRebuild_SameID_RejudgedOnce(t *testing.T) {
 	judge := newFakeJudge(PermissionVerdictApprove)
-	m, _, oc, rt1, _ := newAutoTaskEnv(t, judge)
+	m, store, oc, rt1, _ := newAutoTaskEnv(t, judge)
 	rt1.ensureAttentionState().applyAttentionEvent(permAsked("r1", "s1", "bash", "rm"))
 	m.judgeScan(rt1)
 	// 等第一代「判定+回复」完整收敛再替换（Judge 进入不代表回复已发出——生产在
@@ -491,8 +509,7 @@ func TestJudgeScan_RuntimeRebuild_SameID_RejudgedOnce(t *testing.T) {
 	eventually(t, 2*time.Second, func() bool { return len(oc.replyPermissionCallsSnapshot()) == 1 })
 
 	// runtime 销毁（挂起/重建）→ 重建后同 ID 仍 pending → 恰好再判定一次。
-	rt2 := m.newRuntime("t1")
-	m.setRuntime("t1", rt2)
+	rt2 := initAutoPermState(t, m, store, "t1")
 	rt2.ensureAttentionState().applyAttentionEvent(permAsked("r1", "s1", "bash", "rm"))
 	rt2.setPermJudgeReady()
 	m.judgeScan(rt2)
@@ -574,6 +591,8 @@ func TestResumeActive_AIAuto_CommitGating(t *testing.T) {
 			r.Status = StatusActive
 			r.PermissionMode = PermissionModeAIAuto
 		})
+		// 启动事实（D5 三路径矩阵②）：ai-auto 进程在位 → AIAutoEnabled=true。
+		store.seedPermissionModeAtStart("t1", PermissionModeAIAuto)
 		snap := envSnapshot{Vars: map[string]string{"OCDECK_TASK_ID": "t1"}}
 		snapBytes, _ := encodeEnvSnapshot(snap)
 		store.mutTask("t1", func(r *TaskRow) { r.EnvSnapshot = snapBytes })
@@ -642,6 +661,8 @@ func TestSuspendRepair_AIAuto_JudgesAfterRepair(t *testing.T) {
 		t.EnvSnapshot = sql.NullString{String: `{"vars":{"PATH":"/usr/bin"}}`, Valid: true}
 		t.LastPort = sql.NullInt64{Int64: 50001, Valid: true}
 	})
+	// 启动事实（D5 三路径矩阵②）：ai-auto 进程在位 → AIAutoEnabled=true。
+	store.seedPermissionModeAtStart("t1", PermissionModeAIAuto)
 	proc := newMockProc()
 	proc.sessions[serveSessionName("t1")] = true
 	proc.envValues[serveSessionName("t1")] = map[string]string{"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001"}
@@ -1107,6 +1128,8 @@ func TestResumeActive_AIAuto_PreCommitAskedGating(t *testing.T) {
 			r.Status = StatusActive
 			r.PermissionMode = PermissionModeAIAuto
 		})
+		// 启动事实（D5 三路径矩阵②）：ai-auto 进程在位 → AIAutoEnabled=true。
+		store.seedPermissionModeAtStart("t1", PermissionModeAIAuto)
 		snap := envSnapshot{Vars: map[string]string{"OCDECK_TASK_ID": "t1"}}
 		snapBytes, _ := encodeEnvSnapshot(snap)
 		store.mutTask("t1", func(r *TaskRow) { r.EnvSnapshot = snapBytes })
@@ -1374,6 +1397,8 @@ func TestSuspendRepair_AIAuto_CommitFailure_NoReply(t *testing.T) {
 		t.EnvSnapshot = sql.NullString{String: `{"vars":{"PATH":"/usr/bin"}}`, Valid: true}
 		t.LastPort = sql.NullInt64{Int64: 50001, Valid: true}
 	})
+	// 启动事实（D5 三路径矩阵②）：ai-auto 进程在位 → AIAutoEnabled=true。
+	store.seedPermissionModeAtStart("t1", PermissionModeAIAuto)
 	proc := newMockProc()
 	proc.sessions[serveSessionName("t1")] = true
 	proc.envValues[serveSessionName("t1")] = map[string]string{"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001"}
@@ -1485,8 +1510,7 @@ func TestJudgeScan_SSEPathNotBlockedByDBPrecheck(t *testing.T) {
 	judge := newFakeJudge(PermissionVerdictApprove)
 	m := newTestManager(t, store, proc, newMockWorktree(), oc)
 	m.judge = judge
-	rt := m.newRuntime("t1")
-	m.setRuntime("t1", rt)
+	rt := initAutoPermState(t, m, store.mockStore, "t1")
 	rt.ensureAttentionState()
 	rt.setPermJudgeReady()
 
@@ -1531,8 +1555,7 @@ func TestJudgeScan_StopDuringBlockedDBRead(t *testing.T) {
 	judge := newFakeJudge(PermissionVerdictApprove)
 	m := newTestManager(t, store, proc, newMockWorktree(), oc)
 	m.judge = judge
-	rt := m.newRuntime("t1")
-	m.setRuntime("t1", rt)
+	rt := initAutoPermState(t, m, store.mockStore, "t1")
 	rt.ensureAttentionState()
 	rt.setPermJudgeReady()
 	rt.ensureAttentionState().applyAttentionEvent(permAsked("r1", "s1", "bash", "rm"))
@@ -1588,8 +1611,8 @@ func (f *fakePermAudit) snapshot() []PermAuditRecord {
 }
 
 // TestJudgeAndReply_AuditMatrix 四 verdict × reply_result 全分支恰好一条记录
-//（tasks 7.2）：ok 含 reply 字段；gone/unknown/unsupported/not_applicable 不含；
-// FAILED/UNCERTAIN 判定终结即写 not_applicable。
+//（tasks 7.2）：ok 仅 APPROVE（D2：REJECT 不回复）且含 reply 字段；gone/unknown/
+// unsupported/not_applicable 不含；FAILED/UNCERTAIN/REJECT 判定终结即写 not_applicable。
 func TestJudgeAndReply_AuditMatrix(t *testing.T) {
 	newEnv := func(t *testing.T, verdict PermissionVerdict, judgeErr error) (*Manager, *mockOC, *taskRuntime, *fakePermAudit) {
 		judge := newFakeJudge(verdict)
@@ -1612,7 +1635,8 @@ func TestJudgeAndReply_AuditMatrix(t *testing.T) {
 		wantReplyPresent bool
 	}{
 		{name: "APPROVE+ok 含 reply=once", verdict: PermissionVerdictApprove, wantVerdict: "APPROVE", wantReplyResult: "ok", wantReply: "once", wantReplyPresent: true},
-		{name: "REJECT+ok 含 reply=reject", verdict: PermissionVerdictReject, wantVerdict: "REJECT", wantReplyResult: "ok", wantReply: "reject", wantReplyPresent: true},
+		// D2：REJECT 不回复转人工，审计 REJECT + not_applicable（映射不变，如实留痕）。
+		{name: "REJECT 不回复 not_applicable", verdict: PermissionVerdictReject, wantVerdict: "REJECT", wantReplyResult: "not_applicable"},
 		{name: "APPROVE+gone", verdict: PermissionVerdictApprove, replyErr: opencode.ErrPermissionRequestGone, wantVerdict: "APPROVE", wantReplyResult: "gone"},
 		{name: "APPROVE+unknown", verdict: PermissionVerdictApprove, replyErr: errors.New("conn reset"), wantVerdict: "APPROVE", wantReplyResult: "unknown"},
 		{name: "APPROVE+unsupported", verdict: PermissionVerdictApprove, replyErr: opencode.ErrCapabilityUnsupported, wantVerdict: "APPROVE", wantReplyResult: "unsupported"},

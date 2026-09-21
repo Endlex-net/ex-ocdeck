@@ -37,6 +37,8 @@ func (n *Notifier) onAttentionChanged(ctx context.Context, taskID, instVersion s
 	// 了结移除：去重集合以当前 pending 集合为上界，不得无限增长。
 	pruneDedup(st.notifiedQuestions, snap.Attention.Questions, func(pq application.PendingQuestion) string { return pq.ID })
 	pruneDedup(st.notifiedPermissions, snap.Attention.Permissions, func(pp application.PendingPermission) string { return pp.ID })
+	// waiting 条目随 pending 消失剪枝（task-permission-mode D1）。
+	pruneDedup(st.waitingPerms, snap.Attention.Permissions, func(pp application.PendingPermission) string { return pp.ID })
 
 	// 新增触发：先记去重（触发条件按已消费处理——无论门禁结果），再门禁投递；
 	// 门禁复验即本快照（单次组合读取）。B6：每个 pending request 各读一次配置
@@ -57,6 +59,14 @@ func (n *Notifier) onAttentionChanged(ctx context.Context, taskID, instVersion s
 		if _, done := st.notifiedPermissions[pp.ID]; done {
 			continue
 		}
+		if snap.aiAutoEffective() {
+			// ai-auto 延迟触发（task-permission-mode D1）：首次观察不写去重，登记
+			// waiting 等待判定结论；重复观察 MUST NOT 延长 deadline。
+			if _, waiting := st.waitingPerms[pp.ID]; !waiting {
+				st.waitingPerms[pp.ID] = n.opts.Now().Add(permissionVerdictWindow)
+			}
+			continue
+		}
 		st.notifiedPermissions[pp.ID] = struct{}{}
 		cfg := n.opts.Cfg.Config()
 		if e := n.evaluate(taskID, notification.CategoryPermission, cfg, snap, func(s TaskSnapshot) bool {
@@ -67,8 +77,114 @@ func (n *Notifier) onAttentionChanged(ctx context.Context, taskID, instVersion s
 	}
 }
 
-// pruneDedup 移除已从 pending 集合消失的去重条目（了结）。
-func pruneDedup[T any](dedup map[string]struct{}, pending []T, id func(T) string) {
+// --- ai-auto 延迟触发（task-permission-mode D1/D7，tasks 3.3-3.5） ---
+//
+// onPermissionVerdict / onPermissionModeChanged 为两类唤醒事件（事件仅唤醒、
+// 不信任载荷）：重读权威快照并重评该任务全部 waiting 条目。fencing（B3）与
+// attention 同构：快照实例与事件 RID 不一致丢弃；读取失败保守保留现状
+//（MUST NOT 误发，条目待后续事件/tick 重评）。
+
+// onPermissionVerdict 判定结论唤醒（serve_runtime.permission_verdict）。
+func (n *Notifier) onPermissionVerdict(ctx context.Context, taskID, instVersion string) {
+	snap, err := n.readSnapshot(ctx, taskID)
+	if err != nil {
+		log.Printf("notify: task %s: verdict snapshot read failed, keep waiting: %v", taskID, err)
+		return
+	}
+	if snap.InstVersion != instVersion {
+		return // 旧 runtime 迟到唤醒
+	}
+	st := n.stateFor(taskID, snap.InstVersion, snap)
+	if st == nil {
+		return
+	}
+	n.reevaluateWaitingWithSnapshot(ctx, taskID, st, snap, n.opts.Now())
+}
+
+// onPermissionModeChanged 模式变更唤醒（serve_runtime.permission_mode_changed，
+// D7：waiting 重评估只由此事件驱动）：有效模式仍 ai-auto 时按快照判定状态立即
+// 重评；已非 ai-auto 时全部 waiting 条目按非 ai-auto 语义立即处理（仍 pending 且
+// 未通知 → 正常门禁投递）。
+func (n *Notifier) onPermissionModeChanged(ctx context.Context, taskID, instVersion string) {
+	snap, err := n.readSnapshot(ctx, taskID)
+	if err != nil {
+		log.Printf("notify: task %s: mode-changed snapshot read failed, keep waiting: %v", taskID, err)
+		return
+	}
+	if snap.InstVersion != instVersion {
+		return
+	}
+	st := n.stateFor(taskID, snap.InstVersion, snap)
+	if st == nil {
+		return
+	}
+	n.reevaluateWaitingWithSnapshot(ctx, taskID, st, snap, n.opts.Now())
+}
+
+// reevaluateWaiting 事件唤醒后的全量 waiting 重评（重读快照定论）。
+func (n *Notifier) reevaluateWaiting(ctx context.Context, taskID string, st *taskState) {
+	snap, err := n.readSnapshot(ctx, taskID)
+	if err != nil {
+		log.Printf("notify: task %s: waiting re-eval snapshot read failed, keep waiting: %v", taskID, err)
+		return
+	}
+	if snap.InstVersion != st.instVersion {
+		return
+	}
+	n.reevaluateWaitingWithSnapshot(ctx, taskID, st, snap, n.opts.Now())
+}
+
+// reevaluateWaitingWithSnapshot 按给定快照重评全部 waiting 条目（D1 分支表）：
+// 请求消失或 settled_no_notify → 清 waiting 不通知；manual_required 或（有效模式
+// 已非 ai-auto）→ 立即按正常门禁投递（不等 deadline）；未定论（inflight/无状态）
+// 仅 deadline 到期兜底，未到期继续等待（重复观察不延长）。
+func (n *Notifier) reevaluateWaitingWithSnapshot(ctx context.Context, taskID string, st *taskState, snap TaskSnapshot, now time.Time) {
+	for id, deadline := range st.waitingPerms {
+		pp := findPendingPermission(snap, id)
+		rec, hasState := snap.Verdicts[id]
+		switch {
+		case pp == nil:
+			delete(st.waitingPerms, id) // 请求消失：清 waiting 不通知
+		case hasState && rec.State == VerdictSettledNoNotify:
+			delete(st.waitingPerms, id) // 已自动放行：清 waiting 不通知（即使 attention 瞬时仍 pending）
+		case !snap.aiAutoEffective():
+			n.fireWaitingPermission(ctx, taskID, st, snap, *pp) // 非 ai-auto：立即正常门禁投递
+		case hasState && rec.State == VerdictManualRequired:
+			n.fireWaitingPermission(ctx, taskID, st, snap, *pp) // 转人工：立即通知（不等 deadline）
+		case !now.Before(deadline):
+			n.fireWaitingPermission(ctx, taskID, st, snap, *pp) // 未定论到期：兜底通知
+		default:
+			// 未定论未到期：继续等待。
+		}
+	}
+}
+
+// fireWaitingPermission waiting 条目定论为需通知时的投递（与直接触发同一记账
+// 语义：先记去重再门禁投递，触发条件按已消费处理）。发送前复核：本快照仍
+// pending、未通知、非 settled_no_notify（evaluate 条件统一复验）。
+func (n *Notifier) fireWaitingPermission(ctx context.Context, taskID string, st *taskState, snap TaskSnapshot, pp application.PendingPermission) {
+	delete(st.waitingPerms, pp.ID)
+	if _, done := st.notifiedPermissions[pp.ID]; done {
+		return
+	}
+	st.notifiedPermissions[pp.ID] = struct{}{}
+	cfg := n.opts.Cfg.Config()
+	if e := n.evaluate(taskID, notification.CategoryPermission, cfg, snap, func(s TaskSnapshot) bool {
+		if findPendingPermission(s, pp.ID) == nil {
+			return false // 仍 pending
+		}
+		if rec, ok := s.Verdicts[pp.ID]; ok && rec.State == VerdictSettledNoNotify {
+			return false // 未被自动放行
+		}
+		return true
+	}); e.stage == gatePass {
+		n.dispatch(ctx, e.plan, permissionIntent(snap, pp, e.plan.URL))
+	}
+}
+
+// pruneDedup 移除已从 pending 集合消失的条目（了结；V 为 struct{} 去重集合或
+// time.Time waiting deadline）。
+func pruneDedup[T any, V any](dedup map[string]V, pending []T, id func(T) string) {
 	pendingIDs := make(map[string]struct{}, len(pending))
 	for _, p := range pending {
 		pendingIDs[id(p)] = struct{}{}
@@ -205,6 +321,12 @@ func (n *Notifier) scan(ctx context.Context) {
 				st.idleSuppressed = true // 本周期以消费结束
 				n.fireIdle(ctx, id, st, cfg)
 			}
+		}
+		if len(st.waitingPerms) > 0 {
+			// ai-auto waiting deadline 到期检查（task-permission-mode D1）：有等待
+			// 条目才读快照；重评函数内按快照判定状态定论（manual_required 不等
+			// deadline、settled/消失清除、未定论到期兜底）。
+			n.reevaluateWaiting(ctx, id, st)
 		}
 	}
 }

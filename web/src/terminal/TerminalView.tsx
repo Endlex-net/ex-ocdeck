@@ -15,6 +15,12 @@ import {
   pendingTerminalFocus,
   subscribeTerminalFocus,
 } from './focus-request';
+import {
+  isTabFocusIntentExpired,
+  isTabFocusTargetAllowed,
+  tabFocusTargetFromWsPath,
+  type TabFocusIntent,
+} from './tab-focus-intent';
 import { DEFAULT_CAPS, resolveMobileCaps } from './mobile-mode';
 import {
   loadMobileCaps,
@@ -40,6 +46,9 @@ interface TerminalViewProps {
   wsPath: string;
   /** 是否建立连接（标签可见 && 任务允许连接）。 */
   active: boolean;
+  /** tab-local 聚焦 intent（design D3，TaskWorkbenchPage tabstrip 真实点击生成）：
+   * 仅 target 匹配自身标识时消费；shell 消费导航请求禁令不变。 */
+  focusIntent?: TabFocusIntent | null;
   onState?: (s: TermConnState) => void;
 }
 
@@ -74,7 +83,7 @@ function tuiTaskIDFromWsPath(wsPath: string): string | null {
 /** 用户手势内复制走共享 util（web/src/clipboard.ts，workbench-base-ref-and-overflow D5）：
  *  有 Clipboard API 走 writeText，否则 execCommand；失败则保留可选中文本。 */
 
-export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
+export function TerminalView({ wsPath, active, focusIntent, onState }: TerminalViewProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const sessionRef = useRef<TermSession | null>(null);
@@ -105,6 +114,11 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
   // shell 实例不订阅不消费；本地不持有请求状态，等待/取消期间的请求有效性
   // 一律以单例 pendingTerminalFocus() 快照校验（被取消/覆盖后自然失效）。
   const tuiTaskID = tuiTaskIDFromWsPath(wsPath);
+  // tab-local 聚焦身份（design D3 target 键）：'tui' 或 shell 稳定 id；null 不参与。
+  const focusTarget = tabFocusTargetFromWsPath(wsPath);
+  // 已处理 intent 记账：消费（含锁定不聚焦）与取消（过期/输入区）都记 seq——
+  // 同一 intent 不二次生效，active 恢复、重连后不补抢。
+  const handledIntentSeq = useRef(0);
   const connStateRef = useRef<TermConnState>('idle');
   const lockedRef = useRef(false);
 
@@ -334,6 +348,29 @@ export function TerminalView({ wsPath, active, onState }: TerminalViewProps) {
     if (!tuiTaskID) return;
     return subscribeTerminalFocus(() => tryConsumeFocusRequest());
   }, [tuiTaskID, tryConsumeFocusRequest]);
+
+  // tab-local 聚焦 intent 消费（design D3）：仅 target 匹配自身标识时处理，且只在
+  // active && connected 时消费（门禁内核与 tryConsumeFocusRequest 同构：未锁定、
+  // 未过期、tab-local 白名单）。未就绪时挂起等待，connected 后经 state 变化重评估；
+  // 切走取消由页面层「当前 tab ≠ target 即清除」负责；过期 / 用户焦点已进入输入区
+  // 在此取消；锁定消费但不聚焦（不等待解锁补抢）。
+  useEffect(() => {
+    if (!focusIntent || focusIntent.target !== focusTarget) return;
+    if (focusIntent.seq <= handledIntentSeq.current) return;
+    if (!active) return;
+    if (state !== 'connected') return;
+    handledIntentSeq.current = focusIntent.seq;
+    const session = sessionRef.current;
+    if (
+      !session ||
+      lockedRef.current ||
+      isTabFocusIntentExpired(focusIntent) ||
+      !isTabFocusTargetAllowed(document.activeElement)
+    ) {
+      return;
+    }
+    session.focus();
+  }, [focusIntent, focusTarget, active, state]);
 
   useEffect(() => {
     const session = sessionRef.current;

@@ -587,13 +587,13 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 	if err != nil {
 		return err
 	}
-	return m.commitRuntimeReady(ctx, taskID, row.WorktreePath, runtimeName, port, password, mode, nil)
+	return m.commitRuntimeReady(ctx, taskID, row, runtimeName, port, password, mode, nil)
 }
 
 // commitRuntimeReady 成功提交序列（D3/Phase 2）：token/group/watcher → SSE+align → final health → last_port → CAS active。
 // onRegister（仅 Recovery 传入，G3-19）：runtime 发布前回调，把本 attempt 的新
 // token 显式绑定到发起 incident（不经 setRuntime 通用挂钩，避免误绑新代 token）。
-func (m *Manager) commitRuntimeReady(ctx context.Context, taskID, wtPath, runtimeName string, port int, password string, mode AlignMode, onRegister func(rt *taskRuntime)) error {
+func (m *Manager) commitRuntimeReady(ctx context.Context, taskID string, row TaskRow, runtimeName string, port int, password string, mode AlignMode, onRegister func(rt *taskRuntime)) error {
 	// 注册前探活：HasSession infra 与 absent 必须拆开。本函数 MUST NOT 本地
 	// KillSession——KillResult（含 nil error + reap_failed tickets，reaper.go）
 	// 若在此丢弃，会话已删后外层补偿只看到 absent，tickets 永久丢失。
@@ -606,14 +606,24 @@ func (m *Manager) commitRuntimeReady(ctx context.Context, taskID, wtPath, runtim
 	if !alive {
 		return newOpErr(codeProcessError, fmt.Errorf("runtime session gone before runtime register"))
 	}
+	// 启动事实读校验 + permState 初始化（task-permission-mode D5 三路径矩阵①②）：
+	// 启动事实由 startRuntimeWithPortRetry 建进程前写入，此处读回必须存在且合法，
+	// 异常 fail-closed 拒绝注册。
+	startMode, serr := m.readStartFactForRegister(ctx, taskID)
+	if serr != nil {
+		return newOpErr(codeInternal, serr)
+	}
 	rt := m.newRuntime(taskID)
+	if err := initPermState(rt, row, startMode); err != nil {
+		return newOpErr(codeInternal, err)
+	}
 	if onRegister != nil {
 		onRegister(rt)
 	}
 	m.setRuntime(taskID, rt)
 	rt.registerGroup(roleRuntime, runtimeName)
 	m.watchServeExit(taskID, runtimeName)
-	if err := m.startSSE(ctx, rt, taskID, wtPath, port, password, mode); err != nil {
+	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode); err != nil {
 		return newOpErr(codeProcessError, fmt.Errorf("sse subscribe: %w", err))
 	}
 	oc := m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 10 * time.Second})
@@ -1091,6 +1101,11 @@ func (m *Manager) startRuntimeWithPortRetry(ctx context.Context, row TaskRow, se
 	permissionMode, perr := resolvePermissionMode(row)
 	if perr != nil {
 		return port, password, newOpErr(codeInternal, perr)
+	}
+	// 启动事实写入（task-permission-mode D5 三路径矩阵①）：仅本入口在建进程前写入
+	// 本次 argv 实际模式值；写失败 MUST NOT 建进程（fail-closed，先于 permit 与轮询）。
+	if serr := m.store.SetPermissionModeAtStart(ctx, row.ID, permissionMode); serr != nil {
+		return port, password, newOpErr(codeInternal, fmt.Errorf("set permission_mode_at_start: %w", serr))
 	}
 	// prevWaitErr / prevRotateParts 承载上一轮健康失败上下文（G3-4：端口分配移至轮次
 	// 顶部、permit 之后；轮间上下文经此传递，操作顺序与既有一致）。

@@ -34,6 +34,34 @@ type TaskRef struct {
 	ID     string
 	Name   string
 	Status string
+	// EffectivePermissionMode 有效权限模式（task-permission-mode D6 推导值，非原始
+	// 持久化值——--auto 运行进程保存 ai-auto 时仍为 all-approve，DR1）。与 attention
+	// 同一代际原子读出。
+	EffectivePermissionMode string
+}
+
+// PermissionVerdict 单条权限请求的判定状态（task-permission-mode D1：由 task 层
+// runtime 状态经 TaskNotificationSnapshot 组合原子读出，仅输出当前 epoch，旧 epoch
+// 残余 MUST NOT 输出）。
+type PermissionVerdict struct {
+	Epoch uint64
+	State string
+}
+
+// 判定状态三值闭合枚举（task-permission-mode D1 分支表）。
+const (
+	VerdictInflight        = "inflight"
+	VerdictManualRequired  = "manual_required"
+	VerdictSettledNoNotify = "settled_no_notify"
+)
+
+// aiAutoMode 有效权限模式的 ai-auto 字面值（D6 推导值域三值之一）。
+const aiAutoMode = "ai-auto"
+
+// aiAutoEffective 快照的有效权限行为是否为 ai-auto（延迟触发语义的适用判定；
+// DR1：--auto 进程有效恒为 all-approve，不适用）。
+func (s TaskSnapshot) aiAutoEffective() bool {
+	return s.Task.EffectivePermissionMode == aiAutoMode
 }
 
 // RetryDetail 每 session 最近一次 retry 详情（design D3 类型定义；缺失以
@@ -56,6 +84,9 @@ type TaskSnapshot struct {
 	RetryDetail    RetryDetail
 	HasRetryDetail bool
 	InstVersion    string
+	// Verdicts per-request 判定状态映射（requestID → {epoch, state}，D1）。仅含当前
+	// epoch 的状态；无 runtime / 无状态记录为 nil。与 Attention 同一代际原子读出。
+	Verdicts map[string]PermissionVerdict
 }
 
 // TaskSnapshotReader 任务侧组合快照端口（task.Manager 实现）。

@@ -523,3 +523,31 @@ func TestGetTask_RESTNotFoundForwardsHandlerMessage(t *testing.T) {
 		t.Errorf("handler envelope rewritten to mux copy: %s", body)
 	}
 }
+
+// TestTaskStream_SnapshotIncludesEffectivePermissionMode 详情 SSE 快照帧携带
+// effective_permission_mode（task-permission-mode tasks 4.3；与详情 GET 共用
+// buildTaskDetailDTOBase，输出经 permissionModeForOutput fail-closed）。
+func TestTaskStream_SnapshotIncludesEffectivePermissionMode(t *testing.T) {
+	row := fixtureTaskRow("t1")
+	row.PermissionMode = "ai-auto"
+	tb := newTaskStreamBackend(row)
+	// DR1 不一致透出：--auto 运行进程保存 ai-auto 时有效仍 all-approve。
+	tb.SetPermissionModeView(application.PermissionModeView{
+		PermissionMode:          "ai-auto",
+		EffectivePermissionMode: "all-approve",
+	}, nil)
+	sub := &fakeStreamSubscriber{}
+	s := newTaskStreamTestServer(t, tb, sub, 50*time.Millisecond, 5*time.Second)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	resp := openTaskStream(t, ts.URL, "t1")
+	defer resp.Body.Close()
+	frames := startSSEFrameReader(resp.Body)
+	snap := nextFrame(t, frames, "snapshot")
+	dto := decodeTaskDTO(t, snap.data)
+	if dto.PermissionMode != "ai-auto" || dto.EffectivePermissionMode != "all-approve" {
+		t.Fatalf("snapshot modes = (%q, %q), want (ai-auto, all-approve)",
+			dto.PermissionMode, dto.EffectivePermissionMode)
+	}
+}

@@ -220,11 +220,11 @@ func seedSendingSubmission(ctx context.Context, db *store.DB, id, taskID string)
 // --- task-permission-mode 装配测试（tasks 3.3 / F4.7）：Judge 注入路径 ---
 
 // 编译期断言：composition root 的 permJudgeAdapter 满足 task.PermissionJudge 端口
-//（ai.PermJudge 经适配注入 Manager 的路径与生产 main.go 逐字一致）。
+// （ai.PermJudge 经适配注入 Manager 的路径与生产 main.go 逐字一致）。
 var _ task.PermissionJudge = permJudgeAdapter{}
 
 // TestPermJudgeAdapter_Unconfigured_UncertainErr 未配置 → uncertain + 非 nil error
-//（D5/D11 返回语义接缝：adapter 原样透传 error，消费方审计记 FAILED 并转人工）。
+// （D5/D11 返回语义接缝：adapter 原样透传 error，消费方审计记 FAILED 并转人工）。
 func TestPermJudgeAdapter_Unconfigured_UncertainErr(t *testing.T) {
 	adapter := permJudgeAdapter{inner: ai.NewPermJudge(ai.LoadStore(t.TempDir()))}
 	v, err := adapter.Judge(context.Background(), task.PermissionJudgeInput{
@@ -291,10 +291,10 @@ func TestPermJudgeAdapter_FieldMapping(t *testing.T) {
 		ProjectName: "proj", ProjectKind: "repo", TaskMode: "worktree",
 		TaskDir: "/wt/t1", ProjectDir: "/repo", Branch: "ocdeck/t1",
 		Detail: task.RequestDetail{
-			Command: "rm -rf build",
+			Command:  "rm -rf build",
 			Filepath: "a.go", Diff: "-x\n+y",
-			Files:       []task.RequestFileChange{{Type: "update", RelativePath: "b.go", Patch: "p"}},
-			URL:         "https://x", Description: "desc", SubagentType: "sub",
+			Files: []task.RequestFileChange{{Type: "update", RelativePath: "b.go", Patch: "p"}},
+			URL:   "https://x", Description: "desc", SubagentType: "sub",
 			Pattern: "pat", Path: "/p", Include: "*.go", ParentDir: "/pd",
 			Directories: []string{"/d1", "/d2"},
 		},
@@ -399,7 +399,7 @@ func TestPermJudgeAdapter_DegradedReachesJudge(t *testing.T) {
 
 // TestPermJudgeAdapter_DegradedDirectoriesNull R1-F1：directories 字面 null 成员
 // （直接构造 metadata RawMessage）→ 真实提取记 malformed_critical → 经真实 adapter 短路零 LLM
-//（uncertain + nil），不得绕过降级自动回复。
+// （uncertain + nil），不得绕过降级自动回复。
 func TestPermJudgeAdapter_DegradedDirectoriesNull(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -506,7 +506,7 @@ func TestPermJudgeAdapter_FiveStateMapping(t *testing.T) {
 
 // TestPermAuditAdapter_RecordPassthrough 组合根审计适配器字段透传（tasks 7.1/D11）：
 // task.PermAuditRecord 经 adapter 落入临时 JSONL 文件，逐字段断言行内容
-//（task → auditlog.Entry → 单行 JSONL，含 ok 记录的 reply 字段与 patterns）。
+// （task → auditlog.Entry → 单行 JSONL，含 ok 记录的 reply 字段与 patterns）。
 func TestPermAuditAdapter_RecordPassthrough(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "logs", "ai-permission-audit.jsonl")
 	al, err := auditlog.NewPermAuditLogger(path)
@@ -663,5 +663,62 @@ func TestPermissionChain_RESTExtractToAdapter(t *testing.T) {
 	}
 	if atomic.LoadInt32(&hits) != before {
 		t.Error("degraded chain MUST NOT call LLM (short-circuit)")
+	}
+}
+
+// 编译期断言：store adapter 满足启动回填门禁端口（task-permission-mode D8/tasks 4.5）。
+var _ permissionBackfiller = (*task.StoreAdapter)(nil)
+
+// TestPermissionModeStartupGate 启动回填门禁（D8 顺序：SQL add column（Migrate，更早）→
+// Backfill → Reconcile → HTTP open；本测试经生产 gate 函数验证 fail-closed 与回填语义，
+// 与 main.go run() 共用同一函数）。
+func TestPermissionModeStartupGate(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	if err := seedTaskForSubmissions(ctx, db); err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	// 存量 active 任务（启动事实 NULL、持久化模式 ai-auto）。
+	if _, err := db.ExecContext(ctx,
+		`UPDATE tasks SET status='active', permission_mode='ai-auto' WHERE id='t1'`); err != nil {
+		t.Fatalf("seed active: %v", err)
+	}
+	adapter := task.NewStoreAdapter(db)
+
+	// 成功路径：回填执行且 open 被调用。
+	opened := false
+	if err := permissionModeStartupGate(ctx, adapter, func() error { opened = true; return nil }); err != nil {
+		t.Fatalf("gate: %v", err)
+	}
+	if !opened {
+		t.Fatal("gate must call open on backfill success")
+	}
+	var mode string
+	if err := db.QueryRowContext(ctx,
+		`SELECT permission_mode_at_start FROM tasks WHERE id='t1'`).Scan(&mode); err != nil {
+		t.Fatalf("read start fact: %v", err)
+	}
+	if mode != "ai-auto" {
+		t.Fatalf("permission_mode_at_start = %q, want ai-auto（active 且 NULL 行回填）", mode)
+	}
+
+	// 失败路径：DB 关闭后回填报错 → fail-closed 不调用 open。
+	db2, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store2: %v", err)
+	}
+	adapter2 := task.NewStoreAdapter(db2)
+	db2.Close()
+	opened2 := false
+	gateErr := permissionModeStartupGate(ctx, adapter2, func() error { opened2 = true; return nil })
+	if gateErr == nil {
+		t.Fatal("gate must fail on backfill error (fail-closed)")
+	}
+	if opened2 {
+		t.Fatal("gate MUST NOT open on backfill error")
 	}
 }

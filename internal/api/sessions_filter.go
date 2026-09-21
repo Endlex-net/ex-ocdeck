@@ -70,6 +70,16 @@ func eventDirtiesActiveSessions(ev ocdeckevent.Event) bool {
 		// payload 非 typed 按本表惯例保守标脏。
 		_, ok := ev.Payload.(ocdeckevent.ServeRuntimeSessionErrorPayload)
 		return !ok
+	case ocdeckevent.TypeServeRuntimePermissionVerdict, ocdeckevent.TypeServeRuntimePermissionModeChanged:
+		// task-permission-mode D7 消费矩阵：两唤醒事件不改变 active sessions 投影
+		//（attention/run_status/permission_mode 摘要刷新仅依赖 task.activity_changed）
+		// ——合法事件（Topic serve_runtime 且 Payload 为 ServeRuntimeTaskPayload）
+		// 不标脏；Topic/payload 形状异常按本表惯例保守标脏。
+		if ev.Topic != ocdeckevent.TopicServeRuntime {
+			return true
+		}
+		_, ok := ev.Payload.(ocdeckevent.ServeRuntimeTaskPayload)
+		return !ok
 	case ocdeckevent.TypeTaskUserActivity:
 		// idle-reminder-user-activity D1：一次性用户输入事实，active 集合与
 		// attention/run_status 投影不受其影响——合法事件（Topic task 且 Payload

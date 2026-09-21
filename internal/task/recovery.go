@@ -798,7 +798,7 @@ func (m *Manager) runRecoveryAttempt(ctx context.Context, taskID string, trigger
 	}
 	// G3-19：runtime 发布前把本 attempt token 显式绑定到 inc（取消/回退据此
 	// 精确匹配；不绑新代 token——Activate 等外部注册不经此回调）。
-	cerr := m.commitRuntimeReady(ctx, taskID, row.WorktreePath, runtimeName, port, password, mode, func(rt *taskRuntime) {
+	cerr := m.commitRuntimeReady(ctx, taskID, row, runtimeName, port, password, mode, func(rt *taskRuntime) {
 		inc.noteAttemptToken(rt.instVersion)
 	})
 	if cerr == nil {

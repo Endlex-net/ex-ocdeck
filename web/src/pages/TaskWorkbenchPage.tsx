@@ -5,7 +5,16 @@ import { resolveBackHref, type FromSource } from '../router';
 import { useMediaQuery, useProjects, useProjectsRefresh } from '../hooks';
 import { debugMark } from '../debug';
 import { subscribeTask } from '../sse';
-import { isGitlessTask, isTransitional, initActivateBlockReason, parseNotice, type Task } from '../types';
+import {
+  isGitlessTask,
+  isTransitional,
+  initActivateBlockReason,
+  mergePermissionModeView,
+  mergeTaskInfoPatch,
+  parseNotice,
+  type Task,
+  type TaskDetail,
+} from '../types';
 import { shouldCloseOverflowOnBlur, visibleOverflowItems } from './workbench-overflow';
 import { baseRefShortName, currentBranchTooltip, sourceBranchTooltip } from './workbench-branch';
 import { writeTextToClipboard } from '../clipboard';
@@ -28,9 +37,15 @@ import {
   requestTerminalFocus,
   subscribeTerminalFocus,
 } from '../terminal/focus-request';
+import {
+  nextTabFocusIntent,
+  TAB_FOCUS_TARGET_TUI,
+  type TabFocusIntent,
+} from '../terminal/tab-focus-intent';
 import { BranchIcon, CaretDownIcon, MoreIcon, SourceRefIcon, WarnIcon, InfoIcon } from '../icons';
 
-const TUI_TAB = 'tui';
+// tab 键即 tab-local intent target 键（fix-ai-auto-permission-and-tab-focus design D3 闭合定义）
+const TUI_TAB = TAB_FOCUS_TARGET_TUI;
 const GIT_TAB = 'git';
 const SETTINGS_TAB = 'settings';
 
@@ -163,11 +178,16 @@ export function TaskWorkbenchPage({
    *  legacy fromActive 已废弃（P8 路由归一：active → home）。 */
   from?: FromSource;
 }) {
-  const [task, setTask] = useState<Task | null>(null);
+  // 页面任务 = 详情读模型（详情 SSE 帧 / 详情 GET / 两次专用保存合并，D8）：
+  // 通用 PATCH 响应不含 effective_permission_mode，回写须 mergeTaskInfoPatch 合并保留
+  const [task, setTask] = useState<TaskDetail | null>(null);
   const [shells, setShells] = useState<string[]>([]);
   // 区分"无 shell 终端"与"列表获取失败"：失败时给出错误提示并可重试
   const [shellsError, setShellsError] = useState('');
   const [tab, setTab] = useState<string>(TUI_TAB);
+  // tab-local 聚焦 intent（design D3）：仅 tabstrip「终端」/「shell N」真实点击生成
+  // （新覆盖旧），经 prop 下发给各 TerminalView；Git/设置 tab 与程序性 switchTab 不生成。
+  const [focusIntent, setFocusIntent] = useState<TabFocusIntent | null>(null);
   const [error, setError] = useState('');
   const [notFound, setNotFound] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -212,6 +232,13 @@ export function TaskWorkbenchPage({
     // switchTab 仅包装 setTab/setVisited（稳定 setter），首帧闭包语义不变
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [taskID]);
+
+  // 切走取消（design D3）：当前 tab 不再是 intent 目标（用户切到其他 tab 或程序性
+  // 切换，含 closeShell 回退 TUI）即清除未消费 intent——随目标 tab 生命周期取消，
+  // 不误投递到其他终端。setFocusIntent 同值时 bail out，不产生额外渲染。
+  useEffect(() => {
+    setFocusIntent((it) => (it !== null && it.target !== tab ? null : it));
+  }, [tab]);
 
   useEffect(() => {
     const sub = subscribeTask(taskID, {
@@ -626,13 +653,24 @@ export function TaskWorkbenchPage({
       <div className="tabstrip">
         <button
           className={`tab ${tab === TUI_TAB ? 'tab-active' : ''}`}
-          onClick={() => switchTab(TUI_TAB)}
+          onClick={() => {
+            switchTab(TUI_TAB);
+            // 真实点击「终端」生成 tab-local 聚焦 intent（重复点击已激活 tab 也生成新 seq）
+            setFocusIntent(nextTabFocusIntent(TUI_TAB));
+          }}
         >
           终端
         </button>
         {shells.map((tid, i) => (
           <span key={tid} className={`tab ${tab === tid ? 'tab-active' : ''}`}>
-            <button className="tab-label" onClick={() => switchTab(tid)}>
+            <button
+              className="tab-label"
+              onClick={() => {
+                switchTab(tid);
+                // target 为 shell tab 稳定 id（与 active={tab===tid} 同一键，非显示序号）
+                setFocusIntent(nextTabFocusIntent(tid));
+              }}
+            >
               shell {i + 1}
             </button>
             <button
@@ -684,6 +722,7 @@ export function TaskWorkbenchPage({
           <TerminalView
             wsPath={`/ws/terminal/${taskID}`}
             active={tab === TUI_TAB && processReady}
+            focusIntent={focusIntent}
           />
           {tab === TUI_TAB && task && !processReady && (
             <div className="terminal-overlay">
@@ -717,7 +756,7 @@ export function TaskWorkbenchPage({
         </div>
         {shells.map((tid) => (
           <div key={tid} className={`pane ${tab === tid ? '' : 'pane-hidden'}`}>
-            <TerminalView wsPath={`/ws/terminal/shell/${tid}`} active={tab === tid} />
+            <TerminalView wsPath={`/ws/terminal/shell/${tid}`} active={tab === tid} focusIntent={focusIntent} />
           </div>
         ))}
         {visited.has(GIT_TAB) && !isGitless && (
@@ -739,10 +778,15 @@ export function TaskWorkbenchPage({
                     projects.find((p) => p.id === task.project_id)?.name ?? task.project_id
                   }
                   onSaved={(updated) => {
-                    // 保存成功：本地任务态立即收敛为服务端 DTO（SSE 帧随后覆盖同源），
+                    // 保存成功：通用 PATCH 响应不含 effective，合并保留当前值
+                    //（整体替换会丢失「下次激活生效」提示，D8）；SSE 帧随后覆盖同源，
                     // 并触发共享 store refresh（侧栏/指挥中心同步）
-                    setTask(updated);
+                    setTask((prev) => (prev ? mergeTaskInfoPatch(prev, updated) : prev));
                     void refreshShared().catch(() => {});
+                  }}
+                  onPermissionModeSaved={(view) => {
+                    // 模式端点响应仅合并两个模式字段（D8）
+                    setTask((prev) => (prev ? mergePermissionModeView(prev, view) : prev));
                   }}
                   onRefreshed={(fresh) => setTask(fresh)}
                 />

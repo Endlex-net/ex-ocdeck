@@ -268,7 +268,7 @@ func TestNotifyCompositeBlockedByStateLocks(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			inst, attSnap, rs, d, ok := rt.notifyComposite()
+			inst, attSnap, rs, d, ok, _, _ := rt.notifyComposite()
 			// 完整性：同代完整形态（retry + 详情 + pending q1）。
 			if inst == "" || rs != "retry" || !ok || d.Message != "locked" ||
 				len(attSnap.Questions) != 1 || attSnap.Questions[0].ID != "q1" {

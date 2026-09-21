@@ -1,375 +1,599 @@
+// permission_mode_test.go 验证任务权限模式运行态（task-permission-mode tasks 2.4-2.8，
+// design D5/D6/D8）：共享校验、D5 统一初始化表与有效模式推导全分支（含 DR1）、
+// converge epoch 矩阵（同值不开 epoch）、启动事实三路径矩阵（写入/写失败不建进程/
+// shell 与 temp serve 负向/NULL 与非法值拒绝注册）、epoch 屏障（切出在途不回复、
+// 切入补判、旧 epoch 迟到不写状态）、gate 与 PermissionModeView 同源 AIAutoEnabled。
 package task
 
 import (
 	"context"
-	"reflect"
-	"strconv"
-	"strings"
-	"sync"
+	"database/sql"
+	"errors"
 	"testing"
+	"time"
 
 	"ocdeck/internal/application"
-	apptask "ocdeck/internal/application/task"
-	"ocdeck/internal/infrastructure/opencode"
 )
 
-// task-permission-mode D9 测试：
-//   - resolvePermissionMode 表驱动（三值/空串防御/未知值 fail-closed）；
-//   - runtimeCmdArgv 表驱动（all-approve 含 --auto，ask/ai-auto 与旧 argv 逐字一致）；
-//   - Create 缺省归一化 ask 落库、显式三值 roundtrip、非法值 invalid_input 零副作用；
-//   - 激活 argv 按落库值施加（all-approve → --auto）与未知持久化值 fail-closed 不启动进程。
+// --- tasks 1.2：共享三值校验（创建与模式端点同构） ---
 
-func TestResolvePermissionMode(t *testing.T) {
+func TestNormalizePermissionModeInput(t *testing.T) {
 	cases := []struct {
-		stored string
-		want   string
-		wantEr bool
+		name    string
+		in      string
+		want    string
+		wantErr bool
 	}{
-		{stored: "ask", want: "ask"},
-		{stored: "all-approve", want: "all-approve"},
-		{stored: "ai-auto", want: "ai-auto"},
-		// 空串防御（0015 列 NOT NULL DEFAULT 'ask'，存量行不会为空，仍兜底 ask）。
-		{stored: "", want: "ask"},
-		// 未知持久化值 = 持久化损坏 → fail-closed internal error。
-		{stored: "bogus", wantEr: true},
-		{stored: "always", wantEr: true},
+		{name: "ask", in: "ask", want: "ask"},
+		{name: "all-approve", in: "all-approve", want: "all-approve"},
+		{name: "ai-auto", in: "ai-auto", want: "ai-auto"},
+		{name: "trim 后三值", in: "  ai-auto  ", want: "ai-auto"},
+		{name: "空串拒绝（缺省归 ask 属端点语义）", in: "", wantErr: true},
+		{name: "纯空白拒绝", in: "   ", wantErr: true},
+		{name: "未知值拒绝", in: "bogus", wantErr: true},
+		{name: "trim 后未知值拒绝", in: " always-approve ", wantErr: true},
 	}
 	for _, tc := range cases {
-		got, err := resolvePermissionMode(TaskRow{ID: "t1", PermissionMode: tc.stored})
-		if tc.wantEr {
-			if err == nil {
-				t.Errorf("resolvePermissionMode(%q) err = nil, want error (fail-closed)", tc.stored)
-			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("resolvePermissionMode(%q) err = %v, want nil", tc.stored, err)
-			continue
-		}
-		if got != tc.want {
-			t.Errorf("resolvePermissionMode(%q) = %q, want %q", tc.stored, got, tc.want)
-		}
-	}
-}
-
-// legacyRuntimeArgv 旧实现 argv 基线（task-permission-mode D3：ask/ai-auto MUST 逐字一致）。
-func legacyRuntimeArgv(port int, sessionID string) []string {
-	argv := []string{"opencode", "--port", strconv.Itoa(port), "--hostname", "127.0.0.1"}
-	if sessionID != "" {
-		argv = append(argv, "--session", sessionID)
-	}
-	return argv
-}
-
-func TestRuntimeCmdArgv_PermissionMode(t *testing.T) {
-	cases := []struct {
-		permissionMode string
-		wantAuto       bool
-	}{
-		{permissionMode: PermissionModeAsk},
-		{permissionMode: PermissionModeAIAuto},
-		{permissionMode: PermissionModeAllApprove, wantAuto: true},
-	}
-	for _, tc := range cases {
-		argv := runtimeCmdArgv(50505, "sess-1", tc.permissionMode)
-		want := legacyRuntimeArgv(50505, "sess-1")
-		if tc.wantAuto {
-			want = append(want, "--auto")
-		}
-		if !reflect.DeepEqual(argv, want) {
-			t.Errorf("runtimeCmdArgv(permissionMode=%q) = %v, want %v", tc.permissionMode, argv, want)
-		}
-	}
-	// 行为有效性证据：all-approve 的差异仅在 --auto，且位于既有 argv 之后（不破坏锚定语义）。
-	argv := runtimeCmdArgv(1, "", PermissionModeAllApprove)
-	if len(argv) == 0 || argv[len(argv)-1] != "--auto" {
-		t.Errorf("all-approve argv tail = %v, want --auto appended", argv)
-	}
-}
-
-// TestCreate_PermissionMode_CreateChain 创建链三态（task-permission-mode tasks 1.4）：
-// 缺省归一化 ask 落库、显式三值 roundtrip、非法值 invalid_input 零落库/零 worktree 副作用。
-func TestCreate_PermissionMode_CreateChain(t *testing.T) {
-	newManager := func(t *testing.T) (*Manager, *mockStore, *mockWorktree) {
-		store := newMockStore()
-		store.seedProject(ProjectRow{ID: "p1", Name: "proj", Path: "/repo", DefaultBranch: "main"})
-		wt := newMockWorktree()
-		m := newTestManager(t, store, newMockProc(), wt, newMockOC(true))
-		return m, store, wt
-	}
-
-	t.Run("default_normalizes_to_ask", func(t *testing.T) {
-		m, store, wt := newManager(t)
-		row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "task"})
-		if err != nil {
-			t.Fatalf("Create: %v", err)
-		}
-		if row.PermissionMode != PermissionModeAsk {
-			t.Errorf("row permission_mode = %q, want ask (缺省归一化)", row.PermissionMode)
-		}
-		stored, _ := store.GetTask(context.Background(), row.ID)
-		if stored.PermissionMode != PermissionModeAsk {
-			t.Errorf("stored permission_mode = %q, want ask (落库值)", stored.PermissionMode)
-		}
-		if len(wt.addedPaths) == 0 {
-			t.Fatal("precondition: worktree add must have happened (非零副作用基线)")
-		}
-	})
-
-	t.Run("explicit_values_roundtrip", func(t *testing.T) {
-		for _, mode := range []string{PermissionModeAsk, PermissionModeAllApprove, PermissionModeAIAuto} {
-			m, store, _ := newManager(t)
-			row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "task", PermissionMode: mode})
-			if err != nil {
-				t.Fatalf("Create(permission_mode=%q): %v", mode, err)
-			}
-			if row.PermissionMode != mode {
-				t.Errorf("row permission_mode = %q, want %q", row.PermissionMode, mode)
-			}
-			stored, _ := store.GetTask(context.Background(), row.ID)
-			if stored.PermissionMode != mode {
-				t.Errorf("stored permission_mode = %q, want %q (roundtrip)", stored.PermissionMode, mode)
-			}
-		}
-	})
-
-	t.Run("invalid_value_invalid_input_zero_side_effects", func(t *testing.T) {
-		for _, mode := range []string{"bogus", "always", "  "} {
-			m, store, wt := newManager(t)
-			_, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "task", PermissionMode: mode})
-			if err == nil {
-				t.Fatalf("Create(permission_mode=%q) err = nil, want invalid_input", mode)
-			}
-			if OpErrorCode(err) != codeInvalidInput {
-				t.Errorf("Create(permission_mode=%q) code = %s, want invalid_input", mode, OpErrorCode(err))
-			}
-			if len(store.tasks) != 0 {
-				t.Errorf("Create(permission_mode=%q) persisted %d task rows, want 0 (零落库)", mode, len(store.tasks))
-			}
-			if len(wt.addedPaths) != 0 {
-				t.Errorf("Create(permission_mode=%q) worktree add called: %v, want none (零副作用)", mode, wt.addedPaths)
-			}
-		}
-	})
-}
-
-// TestActivate_PermissionModeArgvApplied 激活 argv 按落库权限模式施加（task-permission-mode
-// tasks 2.1）：all-approve → 追加 --auto（旧行为下缺失该断言即失败——行为有效性证据）；
-// ask/ai-auto → 与旧 argv 逐字一致。
-func TestActivate_PermissionModeArgvApplied(t *testing.T) {
-	cases := []struct {
-		permissionMode string
-		wantAuto       bool
-	}{
-		{permissionMode: PermissionModeAsk},
-		{permissionMode: PermissionModeAIAuto},
-		{permissionMode: PermissionModeAllApprove, wantAuto: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.permissionMode, func(t *testing.T) {
-			store := newMockStore()
-			seedSuspendedTask(store, "t1", "p1")
-			store.mutTask("t1", func(tr *TaskRow) { tr.PermissionMode = tc.permissionMode })
-			proc := newMockProc()
-			oc := newMockOC(true)
-			oc.createSessionResult = opencode.Session{ID: "sess-fresh", Time: opencode.SessionTime{Created: 10, Updated: 20}}
-			m := newTestManager(t, store, proc, newMockWorktree(), oc)
-
-			if err := m.Activate(context.Background(), "t1"); err != nil {
-				t.Fatalf("Activate: %v", err)
-			}
-			argv := runtimeCmdArgvOf(proc, "t1")
-			// argv[2] 为激活时实际分配的端口（50000-50999 范围内），据其构造期望基线。
-			port, perr := strconv.Atoi(argv[2])
-			if perr != nil {
-				t.Fatalf("argv port = %q: %v", argv[2], perr)
-			}
-			want := legacyRuntimeArgv(port, "sess-fresh")
-			if tc.wantAuto {
-				want = append(want, "--auto")
-			}
-			if !reflect.DeepEqual(argv, want) {
-				t.Errorf("activate argv (permission_mode=%q) = %v, want %v", tc.permissionMode, argv, want)
-			}
-			hasAuto := false
-			for _, a := range argv {
-				if a == "--auto" {
-					hasAuto = true
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := normalizePermissionModeInput(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("normalize(%q) = %q, want error", tc.in, got)
 				}
+				return
 			}
-			if hasAuto != tc.wantAuto {
-				t.Errorf("argv contains --auto = %v, want %v", hasAuto, tc.wantAuto)
+			if err != nil {
+				t.Fatalf("normalize(%q): %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Errorf("normalize(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
 }
 
-// TestActivate_UnknownPermissionMode_FailClosedNoProcess 未知持久化权限模式 = 持久化损坏：
-// 激活 fail-closed 返回 internal error，MUST NOT 启动任何进程（task-permission-mode D3）。
-func TestActivate_UnknownPermissionMode_FailClosedNoProcess(t *testing.T) {
+// --- tasks 2.4/2.8：D5 统一初始化表 + D6 有效模式推导（全分支含 DR1） ---
+
+// newPermModeEnv 构造带 (启动事实, 持久化模式) 任务与 runtime 的最小环境。
+func newPermModeEnv(t *testing.T, startFact, savedMode string) (*Manager, *mockStore, *taskRuntime) {
+	t.Helper()
+	store := newMockStore()
+	seedActiveTask(store, "t1", "p1")
+	store.mutTask("t1", func(r *TaskRow) { r.PermissionMode = savedMode })
+	store.seedPermissionModeAtStart("t1", startFact)
+	m := newTestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
+	row, err := store.GetTask(context.Background(), "t1")
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	rt := m.newRuntime("t1")
+	if err := initPermState(rt, row, startFact); err != nil {
+		t.Fatalf("initPermState: %v", err)
+	}
+	m.setRuntime("t1", rt)
+	return m, store, rt
+}
+
+// TestInitPermState_AndDerive_Table D5 统一初始化表 × D6 推导全分支（三条注册路径
+// 共用 initPermState 单一公式；DR1：--auto 进程恒 all-approve）。
+func TestInitPermState_AndDerive_Table(t *testing.T) {
+	cases := []struct {
+		name            string
+		startFact       string
+		savedMode       string
+		wantStartedAuto bool
+		wantAIAuto      bool
+		wantView        application.PermissionModeView
+	}{
+		{name: "ask 进程 + ask", startFact: "ask", savedMode: "ask",
+			wantView: application.PermissionModeView{PermissionMode: "ask", EffectivePermissionMode: "ask"}},
+		{name: "ask 进程 + 保存 ai-auto", startFact: "ask", savedMode: "ai-auto",
+			wantAIAuto: true, wantView: application.PermissionModeView{PermissionMode: "ai-auto", EffectivePermissionMode: "ai-auto"}},
+		{name: "ask 进程 + 保存 all-approve 直至下次激活为 ask", startFact: "ask", savedMode: "all-approve",
+			wantView: application.PermissionModeView{PermissionMode: "all-approve", EffectivePermissionMode: "ask"}},
+		{name: "ai-auto 进程 + 保存 ask 重启恢复不启用", startFact: "ai-auto", savedMode: "ask",
+			wantView: application.PermissionModeView{PermissionMode: "ask", EffectivePermissionMode: "ask"}},
+		{name: "ai-auto 进程 + 保存 all-approve 重启恢复不启用", startFact: "ai-auto", savedMode: "all-approve",
+			wantView: application.PermissionModeView{PermissionMode: "all-approve", EffectivePermissionMode: "ask"}},
+		{name: "DR1：--auto 进程保存 ai-auto 仍不启用（有效 all-approve）", startFact: "all-approve", savedMode: "ai-auto",
+			wantStartedAuto: true, wantView: application.PermissionModeView{PermissionMode: "ai-auto", EffectivePermissionMode: "all-approve"}},
+		{name: "--auto 进程 + all-approve", startFact: "all-approve", savedMode: "all-approve",
+			wantStartedAuto: true, wantView: application.PermissionModeView{PermissionMode: "all-approve", EffectivePermissionMode: "all-approve"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _, _ := newPermModeEnv(t, tc.startFact, tc.savedMode)
+			state := m.permStateSnapshot("t1")
+			if state == nil {
+				t.Fatal("permState must be initialized")
+			}
+			if state.StartedWithAuto != tc.wantStartedAuto || state.AIAutoEnabled != tc.wantAIAuto {
+				t.Errorf("state = %+v, want StartedWithAuto=%v AIAutoEnabled=%v",
+					state, tc.wantStartedAuto, tc.wantAIAuto)
+			}
+			view, err := derivePermissionModeView(state, TaskRow{})
+			if err != nil {
+				t.Fatalf("derive: %v", err)
+			}
+			if view != tc.wantView {
+				t.Errorf("view = %+v, want %+v", view, tc.wantView)
+			}
+			// Manager.PermissionModeView 同源（同一 state 指针读取）。
+			got, err := m.PermissionModeView(context.Background(), "t1")
+			if err != nil {
+				t.Fatalf("PermissionModeView: %v", err)
+			}
+			if got != tc.wantView {
+				t.Errorf("Manager view = %+v, want %+v", got, tc.wantView)
+			}
+		})
+	}
+}
+
+// TestDerivePermissionModeView_NoRuntime 无 runtime（state=nil）时读 DB 行推导；
+// 持久化值非法 fail-closed。
+func TestDerivePermissionModeView_NoRuntime(t *testing.T) {
+	view, err := derivePermissionModeView(nil, TaskRow{ID: "t1", PermissionMode: ""})
+	if err != nil || view != (application.PermissionModeView{PermissionMode: "ask", EffectivePermissionMode: "ask"}) {
+		t.Fatalf("view=(%+v,%v), want ask/ask（空串归 ask）", view, err)
+	}
+	view, err = derivePermissionModeView(nil, TaskRow{ID: "t1", PermissionMode: "ai-auto"})
+	if err != nil || view != (application.PermissionModeView{PermissionMode: "ai-auto", EffectivePermissionMode: "ai-auto"}) {
+		t.Fatalf("view=(%+v,%v), want ai-auto/ai-auto", view, err)
+	}
+	if _, err := derivePermissionModeView(nil, TaskRow{ID: "t1", PermissionMode: "bogus"}); err == nil {
+		t.Fatal("unknown persisted mode must fail closed")
+	}
+}
+
+// --- tasks 2.8：converge epoch 矩阵 + gate/view 同源 ---
+
+// TestConvergePermissionModeSave_EpochMatrix D5 算法：仅真实「有效 ai-auto 行为」切换
+// 才 permEpoch+1；同值保存不开 epoch；切入清空 judgedPerms 并返回 needScan；DR1 不动 epoch。
+func TestConvergePermissionModeSave_EpochMatrix(t *testing.T) {
+	cases := []struct {
+		name       string
+		startFact  string
+		savedMode  string
+		saveMode   string
+		wantScan   bool
+		wantEpoch  uint64
+		wantAIAuto bool
+	}{
+		{name: "同值保存不开 epoch", startFact: "ai-auto", savedMode: "ai-auto", saveMode: "ai-auto",
+			wantScan: false, wantEpoch: 0, wantAIAuto: true},
+		{name: "切入 ai-auto epoch+1 补判", startFact: "ask", savedMode: "ask", saveMode: "ai-auto",
+			wantScan: true, wantEpoch: 1, wantAIAuto: true},
+		{name: "切出 ask epoch+1", startFact: "ai-auto", savedMode: "ai-auto", saveMode: "ask",
+			wantScan: false, wantEpoch: 1, wantAIAuto: false},
+		{name: "切出 all-approve epoch+1", startFact: "ai-auto", savedMode: "ai-auto", saveMode: "all-approve",
+			wantScan: false, wantEpoch: 1, wantAIAuto: false},
+		{name: "ask→all-approve 非 ai-auto 行为切换不动 epoch", startFact: "ask", savedMode: "ask", saveMode: "all-approve",
+			wantScan: false, wantEpoch: 0, wantAIAuto: false},
+		{name: "DR1：--auto 进程保存 ai-auto 不动 epoch 不补判", startFact: "all-approve", savedMode: "ask", saveMode: "ai-auto",
+			wantScan: false, wantEpoch: 0, wantAIAuto: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _, rt := newPermModeEnv(t, tc.startFact, tc.savedMode)
+			rt.judgedPerms["r1"] = struct{}{}
+			needScan := m.convergePermissionModeSave("t1", tc.saveMode)
+			if needScan != tc.wantScan {
+				t.Errorf("needScan = %v, want %v", needScan, tc.wantScan)
+			}
+			rt.mu.Lock()
+			epoch, aiAuto := rt.permEpoch, rt.permState.AIAutoEnabled
+			_, judged := rt.judgedPerms["r1"]
+			rt.mu.Unlock()
+			if epoch != tc.wantEpoch || aiAuto != tc.wantAIAuto {
+				t.Errorf("epoch/AIAuto = %d/%v, want %d/%v", epoch, aiAuto, tc.wantEpoch, tc.wantAIAuto)
+			}
+			if tc.wantScan && judged {
+				t.Error("切入 MUST 清空 judgedPerms（per-epoch 计数契约）")
+			}
+			if !tc.wantScan && !judged {
+				t.Error("非切换 MUST NOT 清空 judgedPerms")
+			}
+		})
+	}
+}
+
+// TestConvergePermissionModeSave_NoRuntime 无 runtime 时 no-op。
+func TestConvergePermissionModeSave_NoRuntime(t *testing.T) {
+	m, _, _ := newPermModeEnv(t, "ask", "ask")
+	m.clearRuntime("t1")
+	if m.convergePermissionModeSave("t1", "ai-auto") {
+		t.Fatal("no runtime must be a no-op returning false")
+	}
+}
+
+// TestJudgeScan_DR1_NoRegisterNoJudge 评审 I1 回归：DR1 runtime（StartedWithAuto=
+// true、持久化模式 ai-auto、AIAutoEnabled=false）的持久化模式预检放行，但登记前
+// 准入（与 permGate 同构）必须拦截——不登记 judgedPerms、不登记 inflight、不调 LLM、
+// 无 verdict 事件；对照组：AIAutoEnabled=true 的 runtime 同一扫描正常登记并判定。
+func TestJudgeScan_DR1_NoRegisterNoJudge(t *testing.T) {
+	setup := func(t *testing.T, startFact string) (*Manager, *taskRuntime, *fakeJudge, *recordingPublisher) {
+		t.Helper()
+		m, _, rt := newPermModeEnv(t, startFact, "ai-auto")
+		judge := newFakeJudge(PermissionVerdictApprove)
+		m.judge = judge
+		rec := &recordingPublisher{}
+		m.publish = rec
+		rt.setPermJudgeReady()
+		rt.ensureAttentionState().applyAttentionEvent(permAsked("r1", "s1", "bash", "rm"))
+		return m, rt, judge, rec
+	}
+	t.Run("AIAutoEnabled=false（DR1）不登记不判定", func(t *testing.T) {
+		// StartedWithAuto=true 的 runtime：持久化模式预检（mode==ai-auto）放行，
+		// 但登记前准入按 AIAutoEnabled=false 拦截（D5 DR1：不启用 AI、不补判）。
+		m, rt, judge, rec := setup(t, PermissionModeAllApprove)
+		if st := m.permStateSnapshot("t1"); st == nil || !st.StartedWithAuto || st.AIAutoEnabled {
+			t.Fatalf("prereq state = %+v, want StartedWithAuto=true AIAutoEnabled=false", st)
+		}
+		m.judgeScan(rt)
+		time.Sleep(50 * time.Millisecond)
+		if got := len(judge.judgeCalls()); got != 0 {
+			t.Fatalf("DR1 runtime MUST NOT judge, calls = %d", got)
+		}
+		rt.mu.Lock()
+		_, judged := rt.judgedPerms["r1"]
+		rec1, inflight := rt.permVerdicts["r1"]
+		rt.mu.Unlock()
+		if judged {
+			t.Error("DR1 runtime MUST NOT register judgedPerms")
+		}
+		if inflight {
+			t.Errorf("DR1 runtime MUST NOT register inflight state, got %+v", rec1)
+		}
+		if got := len(rec.snapshot()); got != 0 {
+			t.Fatalf("events = %d, want 0（无终态即无唤醒事件）", got)
+		}
+	})
+	t.Run("对照组 AIAutoEnabled=true 正常登记", func(t *testing.T) {
+		m, rt, judge, _ := setup(t, PermissionModeAIAuto)
+		if st := m.permStateSnapshot("t1"); st == nil || !st.AIAutoEnabled {
+			t.Fatalf("prereq state = %+v, want AIAutoEnabled=true", st)
+		}
+		m.judgeScan(rt)
+		eventually(t, 2*time.Second, func() bool { return len(judge.judgeCalls()) == 1 })
+		rt.mu.Lock()
+		_, judged := rt.judgedPerms["r1"]
+		rec2, _ := rt.permVerdicts["r1"]
+		rt.mu.Unlock()
+		if !judged {
+			t.Fatal("enabled runtime must register judgedPerms")
+		}
+		if rec2.epoch != 0 {
+			t.Errorf("verdict record epoch = %d, want 0", rec2.epoch)
+		}
+	})
+}
+
+// TestPermissionModeView_GateReadsSameAIAutoEnabled 模式切换后 permGate 与
+// PermissionModeView 读取同一 AIAutoEnabled 结论（D5：唯一事实源）。
+func TestPermissionModeView_GateReadsSameAIAutoEnabled(t *testing.T) {
+	judge := newFakeJudge(PermissionVerdictApprove)
+	m, _, _, rt, _ := newAutoTaskEnv(t, judge)
+	ctx := context.Background()
+	tok := rt.instVersion
+
+	assertConsistent := func(wantAIAuto bool, epoch uint64) {
+		t.Helper()
+		view, err := m.PermissionModeView(ctx, "t1")
+		if err != nil {
+			t.Fatalf("PermissionModeView: %v", err)
+		}
+		if (view.EffectivePermissionMode == PermissionModeAIAuto) != wantAIAuto {
+			t.Fatalf("view = %+v, want effective ai-auto=%v", view, wantAIAuto)
+		}
+		if got := m.permGate(ctx, rt, tok, epoch); got != wantAIAuto {
+			t.Errorf("permGate(epoch=%d) = %v, want %v（与 view 同源）", epoch, got, wantAIAuto)
+		}
+	}
+
+	assertConsistent(true, 0)
+	// 切出：gate 立即拒绝（AIAutoEnabled=false 且 epoch 失配），view 同步 ask。
+	if m.convergePermissionModeSave("t1", PermissionModeAsk) {
+		t.Fatal("切出 must not request scan")
+	}
+	assertConsistent(false, 1)
+	// 切入：gate 以新 epoch 放行，旧 epoch 捕获仍拒绝。
+	if !m.convergePermissionModeSave("t1", PermissionModeAIAuto) {
+		t.Fatal("切入 must request scan")
+	}
+	assertConsistent(true, 2)
+	if m.permGate(ctx, rt, tok, 0) {
+		t.Error("旧 epoch 捕获 MUST 被拒绝")
+	}
+}
+
+// TestPermGate_NilState 无状态 runtime 拒绝判定。
+func TestPermGate_NilState(t *testing.T) {
+	m, _, rt := newPermModeEnv(t, "ask", "ask")
+	// 直接构造一个未初始化 permState 的替代 runtime（模拟注册前窗口）。
+	blank := m.newRuntime("t1")
+	m.setRuntime("t1", blank)
+	blank.setPermJudgeReady()
+	if m.permGate(context.Background(), blank, blank.instVersion, 0) {
+		t.Fatal("nil permState must reject (AIAutoEnabled 无独立布尔，nil 即未启用)")
+	}
+	_ = rt
+}
+
+// --- tasks 2.7：epoch 屏障判定流 ---
+
+// TestEpochBarrier_SwitchedOutLateVerdictThenSwitchIn 切出后在途判定不回复、
+// 不写终态（迟到判定按 epoch 失配丢弃，无事件接缝触发）；切回 ai-auto 后 judged-set
+// 清空重判恰好一次，终态以新 epoch 提交。
+func TestEpochBarrier_SwitchedOutLateVerdictThenSwitchIn(t *testing.T) {
+	judge := newFakeJudge(PermissionVerdictApprove)
+	release := make(chan struct{})
+	judge.block = release
+	m, _, oc, rt, _ := newAutoTaskEnv(t, judge)
+	fake := &fakePermAudit{}
+	m.permAudit = fake
+	rt.ensureAttentionState().applyAttentionEvent(permAsked("r1", "s1", "bash", "rm"))
+
+	m.judgeScan(rt)
+	<-judge.entered // 判定在途（捕获 epoch 0）
+	// 切出（保存 ask，仅收敛内存态——DB 提交先于收敛属协调器序，此处聚焦屏障本身）。
+	if m.convergePermissionModeSave("t1", PermissionModeAsk) {
+		t.Fatal("切出 must not request scan")
+	}
+	close(release)
+	// 迟到终态：发送前 gate 拒绝（epoch 失配 + AIAutoEnabled=false）→ 零回复、
+	// 审计留痕 APPROVE + not_applicable、判定状态保持旧 epoch inflight。
+	eventually(t, 2*time.Second, func() bool { return len(fake.snapshot()) == 1 })
+	if got := len(oc.replyPermissionCallsSnapshot()); got != 0 {
+		t.Fatalf("switched-out late verdict MUST NOT reply, replies = %d", got)
+	}
+	rec := fake.snapshot()[0]
+	if rec.Verdict != "APPROVE" || rec.ReplyResult != "not_applicable" {
+		t.Errorf("audit = %+v, want APPROVE + not_applicable（留痕不受 gate 拦截）", rec)
+	}
+	rt.mu.Lock()
+	got := rt.permVerdicts["r1"]
+	rt.mu.Unlock()
+	if got.epoch != 0 || got.state != permVerdictInflight {
+		t.Errorf("verdict record = %+v, want {epoch 0, inflight}（旧 epoch 终态不写）", got)
+	}
+
+	// 切回 ai-auto：judged-set 清空 → 重判恰好一次，本次回复并以新 epoch 提交 settled。
+	if !m.convergePermissionModeSave("t1", PermissionModeAIAuto) {
+		t.Fatal("切入 must request scan")
+	}
+	m.judgeScan(rt) // 锁外（converge 返回即已释放 rt.mu）
+	eventually(t, 2*time.Second, func() bool {
+		return len(judge.judgeCalls()) == 2 && len(oc.replyPermissionCallsSnapshot()) == 1
+	})
+	rt.mu.Lock()
+	got = rt.permVerdicts["r1"]
+	rt.mu.Unlock()
+	if got.epoch != 2 || got.state != permVerdictSettledNoNotify {
+		t.Errorf("verdict record = %+v, want {epoch 2, settled_no_notify}", got)
+	}
+	// 稳定后不重复判定（per-epoch/per-request 计数契约）。
+	time.Sleep(50 * time.Millisecond)
+	if got := len(judge.judgeCalls()); got != 2 {
+		t.Errorf("judge calls = %d, want 2", got)
+	}
+}
+
+// TestCommitPermVerdict_EpochMismatch 终态提交单元级屏障：epoch 失配 MUST NOT 写状态。
+func TestCommitPermVerdict_EpochMismatch(t *testing.T) {
+	_, _, rt := newPermModeEnv(t, "ai-auto", "ai-auto")
+	if rt.commitPermVerdict(1, "r1", permVerdictManualRequired) {
+		t.Fatal("epoch mismatch commit must return false")
+	}
+	rt.mu.Lock()
+	_, exists := rt.permVerdicts["r1"]
+	rt.mu.Unlock()
+	if exists {
+		t.Fatal("epoch mismatch MUST NOT write verdict state")
+	}
+	if !rt.commitPermVerdict(0, "r1", permVerdictManualRequired) {
+		t.Fatal("matching epoch commit must return true")
+	}
+}
+
+// --- tasks 2.5：启动事实写入矩阵 ---
+
+// TestStartFact_StartRuntimeWritesResolvedMode startRuntimeWithPortRetry 建进程前写入
+// 本次 argv 实际模式值。
+func TestStartFact_StartRuntimeWritesResolvedMode(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
-	store.mutTask("t1", func(tr *TaskRow) { tr.PermissionMode = "bogus" })
+	store.mutTask("t1", func(r *TaskRow) { r.PermissionMode = PermissionModeAIAuto })
+	// mutTask 后重取行（startRuntimeWithPortRetry 以传入行解析 argv 模式）。
+	row, err := store.GetTask(context.Background(), "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	proc := newMockProc()
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
-
-	err := m.Activate(context.Background(), "t1")
-	if err == nil {
-		t.Fatal("Activate err = nil, want internal error (fail-closed)")
+	withFastServeReady(m)
+	env, err := m.mergeEnvSnapshot(context.Background(), row, 50000)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if OpErrorCode(err) != codeInternal {
-		t.Errorf("code = %s, want internal", OpErrorCode(err))
+	if _, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, ""); err != nil {
+		t.Fatalf("startServeWithPortRetry: %v", err)
 	}
-	if !strings.Contains(err.Error(), "bogus") {
-		t.Errorf("err = %v, want diagnostic containing persisted value", err)
-	}
-	if len(proc.newSessionNames) != 0 {
-		t.Errorf("NewSession called for %v, want none (MUST NOT 启动进程)", proc.newSessionNames)
-	}
-	if proc.sessions[runtimeSessionName("t1")] {
-		t.Error("runtime session must not exist (MUST NOT 启动进程)")
+	store.mu.Lock()
+	got, ok := store.permissionModeAtStart["t1"]
+	store.mu.Unlock()
+	if !ok || got != PermissionModeAIAuto {
+		t.Errorf("permission_mode_at_start = %q (present=%v), want ai-auto", got, ok)
 	}
 }
 
-// --- F2：提交边界 spy（防 mockStore 兜底掩盖 Manager 归一化回归）与双路径透传 ---
-
-// createTaskSpyStore 在 mockStore.CreateTask 兜底（空串→ask）之前捕获 Manager 经 legacy
-// 路径实际提交的创建行；其余方法/字段提升至内嵌 mockStore。
-type createTaskSpyStore struct {
-	*mockStore
-	mu        sync.Mutex
-	submitted []TaskRow
+// TestStartFact_WriteFailureNoProcess 写失败 MUST NOT 建进程（fail-closed 先于副作用）。
+func TestStartFact_WriteFailureNoProcess(t *testing.T) {
+	store := newMockStore()
+	row := seedSuspendedTask(store, "t1", "p1")
+	proc := newMockProc()
+	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
+	withFastServeReady(m)
+	store.setPermModeAtStartErr = errors.New("db down")
+	env, err := m.mergeEnvSnapshot(context.Background(), row, 50000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.startServeWithPortRetry(context.Background(), row, runtimeSessionName("t1"), 50000, "pw", env, ""); err == nil {
+		t.Fatal("start fact write failure must fail the start")
+	}
+	if got := len(proc.newSessionNames); got != 0 {
+		t.Errorf("NewSession calls = %d, want 0（写失败不建进程）", got)
+	}
 }
 
-func (s *createTaskSpyStore) CreateTask(ctx context.Context, t TaskRow) error {
-	s.mu.Lock()
-	s.submitted = append(s.submitted, t)
-	s.mu.Unlock()
-	return s.mockStore.CreateTask(ctx, t)
+// TestStartFact_ShellAndTempServeDoNotWrite shell 与 temp serve 的 NewSession 不写启动事实。
+func TestStartFact_ShellAndTempServeDoNotWrite(t *testing.T) {
+	judge := newFakeJudge(PermissionVerdictApprove)
+	m, store, _, rt, _ := newAutoTaskEnv(t, judge)
+	rt.setPermJudgeReady()
+	// CreateShell 读 env 快照（与启动事实无关）。
+	snapBytes, _ := encodeEnvSnapshot(envSnapshot{Vars: map[string]string{"OCDECK_TASK_ID": "t1"}})
+	store.mutTask("t1", func(r *TaskRow) { r.EnvSnapshot = snapBytes })
+	store.mu.Lock()
+	before := len(store.permissionModeAtStart)
+	store.mu.Unlock()
+	if _, err := m.CreateShell(context.Background(), "t1"); err != nil {
+		t.Fatalf("CreateShell: %v", err)
+	}
+	store.mu.Lock()
+	after := len(store.permissionModeAtStart)
+	store.mu.Unlock()
+	if after != before {
+		t.Errorf("start fact map size %d -> %d（shell NewSession MUST NOT 写启动事实）", before, after)
+	}
+
+	// temp serve：直接调用删除清理路径的一次性 serve（无 runtime 场景）。
+	store2 := newMockStore()
+	row := seedSuspendedTask(store2, "t2", "p1")
+	m2 := newTestManager(t, store2, newMockProc(), newMockWorktree(), newMockOC(true))
+	if _, _, err := m2.startTempServe(context.Background(), row); err != nil {
+		t.Fatalf("startTempServe: %v", err)
+	}
+	store2.mu.Lock()
+	_, written := store2.permissionModeAtStart["t2"]
+	store2.mu.Unlock()
+	if written {
+		t.Error("temp serve NewSession MUST NOT write start fact")
+	}
 }
 
-func (s *createTaskSpyStore) submittedRows() []TaskRow {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]TaskRow(nil), s.submitted...)
-}
+// --- tasks 2.6：注册前读校验（NULL/非法 fail-closed，合法值恢复 StartedWithAuto） ---
 
-// createSnapshotSpyAdapter 在 mockAppAdapter（taskSnapshotToTaskRow / mockStore 兜底）之前
-// 捕获 Manager 经 lifecycle 路径实际提交的创建快照；其余方法提升至内嵌 adapter。
-type createSnapshotSpyAdapter struct {
-	*mockAppAdapter
-	mu        sync.Mutex
-	snapshots []application.TaskSnapshot
-}
-
-func (a *createSnapshotSpyAdapter) CreateTask(ctx context.Context, row application.TaskSnapshot) error {
-	a.mu.Lock()
-	a.snapshots = append(a.snapshots, row)
-	a.mu.Unlock()
-	return a.mockAppAdapter.CreateTask(ctx, row)
-}
-
-func (a *createSnapshotSpyAdapter) submittedSnapshots() []application.TaskSnapshot {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return append([]application.TaskSnapshot(nil), a.snapshots...)
-}
-
-// newPermissionLifecycleManager 构造注入 LifecycleService 的 Manager，写路径经 spy adapter
-//（与 p144 newTestManagerWithLifecycleService 同构，仅插入捕获层，不重构既有 mock 体系）。
-// Sessions 端口同注入：Create 成功后异步 triggerActivate 的 SSE align 会经
-// LifecycleService.AlignSessions 到达（缺注入会 nil panic）。
-func newPermissionLifecycleManager(t *testing.T, store *mockStore, spy *createSnapshotSpyAdapter) *Manager {
+// newResumeStartFactEnv 构造 resumeActive 前置（active 任务 + env 快照 + 存活健康 runtime 会话）。
+func newResumeStartFactEnv(t *testing.T) (*Manager, *mockStore, *mockProc) {
 	t.Helper()
-	svc := apptask.New(apptask.Options{
-		Tasks:    spy,
-		Read:     spy.mockAppAdapter,
-		Sessions: spy.mockAppAdapter,
-		Publish:  apptask.NoopPublisher{},
+	store := newMockStore()
+	seedSuspendedTask(store, "t1", "p1")
+	store.mutTask("t1", func(r *TaskRow) {
+		r.Status = StatusActive
+		r.PermissionMode = PermissionModeAsk
 	})
-	m := newTestManager(t, store, newMockProc(), newMockWorktree(), newMockOC(true))
-	m.lifecycle = svc
-	return m
+	snap := envSnapshot{Vars: map[string]string{"OCDECK_TASK_ID": "t1"}}
+	snapBytes, _ := encodeEnvSnapshot(snap)
+	store.mutTask("t1", func(r *TaskRow) { r.EnvSnapshot = snapBytes })
+	proc := newMockProc()
+	proc.sessions[runtimeSessionName("t1")] = true
+	proc.envValues[runtimeSessionName("t1")] = map[string]string{
+		"OPENCODE_SERVER_PASSWORD": "pw",
+		"OCDECK_SERVE_PORT":        "50001",
+		"OCDECK_TASK_ID":           "t1",
+	}
+	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
+	m.SetLifecycleCtx(context.Background())
+	return m, store, proc
 }
 
-// TestCreate_PermissionMode_SubmissionSpy 缺省创建时 Manager 实际提交 ask（而非空串穿透）：
-// spy 位于 mockStore 兜底之前，若 Manager 未归一化，提交值将以 "" 暴露。
-func TestCreate_PermissionMode_SubmissionSpy(t *testing.T) {
-	t.Run("legacy_path_submits_ask", func(t *testing.T) {
-		store := newMockStore()
-		store.seedProject(ProjectRow{ID: "p1", Name: "proj", Path: "/repo", DefaultBranch: "main"})
-		spy := &createTaskSpyStore{mockStore: store}
-		m := newTestManager(t, spy, newMockProc(), newMockWorktree(), newMockOC(true))
-
-		if _, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "task"}); err != nil {
-			t.Fatalf("Create: %v", err)
+func TestResumeActive_StartFactGate(t *testing.T) {
+	t.Run("NULL 拒绝注册", func(t *testing.T) {
+		m, store, _ := newResumeStartFactEnv(t) // 不 seed 启动事实
+		row, _ := store.GetTask(context.Background(), "t1")
+		if err := m.resumeActive(context.Background(), row, AlignModeRepo); err == nil {
+			t.Fatal("resumeActive with NULL start fact must fail")
 		}
-		submitted := spy.submittedRows()
-		if len(submitted) != 1 {
-			t.Fatalf("CreateTask submitted %d rows, want 1", len(submitted))
-		}
-		if submitted[0].PermissionMode != PermissionModeAsk {
-			t.Errorf("legacy 提交 PermissionMode = %q, want ask（空串穿透即回归）", submitted[0].PermissionMode)
+		if m.getRuntime("t1") != nil {
+			t.Error("runtime MUST NOT be registered on NULL start fact")
 		}
 	})
-	t.Run("lifecycle_path_submits_ask", func(t *testing.T) {
-		store := newMockStore()
-		store.seedProject(ProjectRow{ID: "p1", Name: "proj", Path: "/repo", DefaultBranch: "main"})
-		spy := &createSnapshotSpyAdapter{mockAppAdapter: &mockAppAdapter{s: store}}
-		m := newPermissionLifecycleManager(t, store, spy)
-
-		if _, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "task"}); err != nil {
-			t.Fatalf("Create: %v", err)
+	t.Run("非法值 fail-closed", func(t *testing.T) {
+		m, store, _ := newResumeStartFactEnv(t)
+		store.seedPermissionModeAtStart("t1", "bogus")
+		row, _ := store.GetTask(context.Background(), "t1")
+		if err := m.resumeActive(context.Background(), row, AlignModeRepo); err == nil {
+			t.Fatal("resumeActive with invalid start fact must fail")
 		}
-		submitted := spy.submittedSnapshots()
-		if len(submitted) != 1 {
-			t.Fatalf("lifecycle CreateTask submitted %d snapshots, want 1", len(submitted))
+		if m.getRuntime("t1") != nil {
+			t.Error("runtime MUST NOT be registered on invalid start fact")
 		}
-		if submitted[0].PermissionMode != PermissionModeAsk {
-			t.Errorf("lifecycle 提交 PermissionMode = %q, want ask（空串穿透即回归）", submitted[0].PermissionMode)
+	})
+	t.Run("合法 all-approve 恢复 StartedWithAuto", func(t *testing.T) {
+		m, store, _ := newResumeStartFactEnv(t)
+		store.seedPermissionModeAtStart("t1", PermissionModeAllApprove)
+		row, _ := store.GetTask(context.Background(), "t1")
+		if err := m.resumeActive(context.Background(), row, AlignModeRepo); err != nil {
+			t.Fatalf("resumeActive: %v", err)
+		}
+		rt := m.getRuntime("t1")
+		if rt == nil {
+			t.Fatal("runtime must be registered")
+		}
+		state := m.permStateSnapshot("t1")
+		if state == nil || !state.StartedWithAuto || state.AIAutoEnabled {
+			t.Errorf("state = %+v, want StartedWithAuto=true AIAutoEnabled=false", state)
+		}
+		view, err := m.PermissionModeView(context.Background(), "t1")
+		if err != nil {
+			t.Fatalf("PermissionModeView: %v", err)
+		}
+		if view.EffectivePermissionMode != PermissionModeAllApprove {
+			t.Errorf("effective = %q, want all-approve", view.EffectivePermissionMode)
 		}
 	})
 }
 
-// TestCreate_PermissionMode_DualPathPassthrough lifecycle/legacy 双创建分支各以非默认值
-//（ai-auto）透传：字段在快照/行两条路径均不丢失（丢失即被 mock 兜底为 ask，断言变红）。
-func TestCreate_PermissionMode_DualPathPassthrough(t *testing.T) {
-	t.Run("legacy_path", func(t *testing.T) {
+func TestTryRepairRuntime_StartFactGate(t *testing.T) {
+	newRepairEnv := func(t *testing.T) (*Manager, *mockStore) {
+		t.Helper()
 		store := newMockStore()
-		store.seedProject(ProjectRow{ID: "p1", Name: "proj", Path: "/repo", DefaultBranch: "main"})
-		spy := &createTaskSpyStore{mockStore: store}
-		m := newTestManager(t, spy, newMockProc(), newMockWorktree(), newMockOC(true))
-
-		row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "task", PermissionMode: PermissionModeAIAuto})
-		if err != nil {
-			t.Fatalf("Create: %v", err)
+		seedSuspendedTask(store, "t1", "p1")
+		store.mutTask("t1", func(r *TaskRow) {
+			r.Status = StatusActive
+			r.PermissionMode = PermissionModeAsk
+			r.EnvSnapshot = sql.NullString{String: `{"vars":{"PATH":"/usr/bin"}}`, Valid: true}
+			r.LastPort = sql.NullInt64{Int64: 50001, Valid: true}
+		})
+		proc := newMockProc()
+		proc.sessions[serveSessionName("t1")] = true
+		proc.envValues[serveSessionName("t1")] = map[string]string{
+			"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
 		}
-		submitted := spy.submittedRows()
-		if len(submitted) != 1 || submitted[0].PermissionMode != PermissionModeAIAuto {
-			t.Errorf("legacy 提交 = %+v, want PermissionMode ai-auto 原样透传", submitted)
+		m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
+		return m, store
+	}
+	t.Run("NULL 拒绝注册", func(t *testing.T) {
+		m, _ := newRepairEnv(t)
+		if fixed, err := m.tryRepairRuntime(context.Background(), "t1", AlignModeRepo); err == nil || fixed {
+			t.Fatalf("tryRepairRuntime = (%v, %v), want (false, err)", fixed, err)
 		}
-		stored, _ := store.GetTask(context.Background(), row.ID)
-		if stored.PermissionMode != PermissionModeAIAuto {
-			t.Errorf("legacy 落库 = %q, want ai-auto", stored.PermissionMode)
+		if m.getRuntime("t1") != nil {
+			t.Error("runtime MUST NOT be registered on NULL start fact")
 		}
 	})
-	t.Run("lifecycle_path", func(t *testing.T) {
-		store := newMockStore()
-		store.seedProject(ProjectRow{ID: "p1", Name: "proj", Path: "/repo", DefaultBranch: "main"})
-		spy := &createSnapshotSpyAdapter{mockAppAdapter: &mockAppAdapter{s: store}}
-		m := newPermissionLifecycleManager(t, store, spy)
-
-		row, err := m.Create(context.Background(), "p1", CreateTaskOptions{Name: "task", PermissionMode: PermissionModeAIAuto})
-		if err != nil {
-			t.Fatalf("Create: %v", err)
+	t.Run("合法值修复并恢复 StartedWithAuto", func(t *testing.T) {
+		m, store := newRepairEnv(t)
+		store.seedPermissionModeAtStart("t1", PermissionModeAllApprove)
+		fixed, err := m.tryRepairRuntime(context.Background(), "t1", AlignModeRepo)
+		if err != nil || !fixed {
+			t.Fatalf("tryRepairRuntime = (%v, %v), want (true, nil)", fixed, err)
 		}
-		submitted := spy.submittedSnapshots()
-		if len(submitted) != 1 || submitted[0].PermissionMode != PermissionModeAIAuto {
-			t.Errorf("lifecycle 提交快照 = %+v, want PermissionMode ai-auto（丢失字段即回归）", submitted)
-		}
-		stored, _ := store.GetTask(context.Background(), row.ID)
-		if stored.PermissionMode != PermissionModeAIAuto {
-			t.Errorf("lifecycle 落库 = %q, want ai-auto（快照丢字段会经兜底落为 ask）", stored.PermissionMode)
+		state := m.permStateSnapshot("t1")
+		if state == nil || !state.StartedWithAuto {
+			t.Errorf("state = %+v, want StartedWithAuto=true", state)
 		}
 	})
 }

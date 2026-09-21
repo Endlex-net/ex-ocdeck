@@ -16,6 +16,10 @@ const (
 // retryErrorWindow retry/error 计时窗口（spec「通知触发」：1 分钟固定，不可配置）。
 const retryErrorWindow = 60 * time.Second
 
+// permissionVerdictWindow ai-auto 延迟触发等待窗口（task-permission-mode D1：deadline
+// = 首次观察 + 15s，重复观察 MUST NOT 延长；tick 周期 10s → 实际触发区间 [15s, 25s)）。
+const permissionVerdictWindow = 15 * time.Second
+
 // taskState 每任务触发器内存态（design D3 字段表，逐字段对齐）。进程内存态、
 // MUST NOT 持久化；仅 run loop goroutine 串行触达（无锁——事件处理、计时判定、
 // 门禁复验与消费标记全部在同一串行化上下文，spec「通知抑制、启动基线与对账」）。
@@ -34,6 +38,11 @@ type taskState struct {
 	notifiedQuestions   map[string]struct{} //（注意力类型, request ID）去重；大小以当前 pending 集合为上界
 	notifiedPermissions map[string]struct{} // 与 question 去重键相互独立
 
+	// waitingPerms ai-auto 延迟触发的等待判定条目（task-permission-mode D1）：
+	// requestID → deadline（首次观察 + 15s）。与 notifiedPermissions 互斥存在
+	//（waiting 期间未通知、通知即移入去重）；随 pending 消失剪枝。
+	waitingPerms map[string]time.Time
+
 	lastError ocdeckevent.ServeRuntimeSessionErrorPayload // episode 内最新一条 session.error（重复不延长计时，仅更新详情）
 }
 
@@ -42,6 +51,7 @@ func newTaskState(instVersion string) *taskState {
 		instVersion:         instVersion,
 		notifiedQuestions:   map[string]struct{}{},
 		notifiedPermissions: map[string]struct{}{},
+		waitingPerms:        map[string]time.Time{},
 	}
 }
 

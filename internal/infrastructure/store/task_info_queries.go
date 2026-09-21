@@ -201,3 +201,47 @@ func (q *Queries) GetTaskRenamePending(ctx context.Context, id string) (*string,
 	v := cur.String
 	return &v, nil
 }
+
+// UpdateTaskPermissionMode 单列 UPDATE 持久化权限模式（task-permission-mode D4 步骤 5，
+// tasks 2.3；协调器在 task 层，本原语只管落库）。
+//
+// updated_at 按 task-lifecycle Unix 秒精度规则：真实变更跨秒推进、同秒真实变更提交但
+// 数值不变（UpdatedAtAdvanced=false）；同值保存 no-op（Matched+!Changed）。
+// 同值排除下推到 UPDATE WHERE（permission_mode NOT NULL 列，<> 原子）；RowsAffected=0
+// 分类对齐 SetTaskDeleteMode 先例（行存在同值 → Matched+!Changed）；行不存在 → 零值
+//（Matched=false 可区分，与 CommitTaskInfoUpdate 一致）。
+func (q *Queries) UpdateTaskPermissionMode(ctx context.Context, id string, mode string) (application.MutationResult, error) {
+	return runTx(ctx, q, func(qx *Queries) (application.MutationResult, error) {
+		row := qx.db.QueryRowContext(ctx, `SELECT permission_mode, updated_at FROM tasks WHERE id = ?`, id)
+		var curMode string
+		var curUpdatedAt int64
+		if err := row.Scan(&curMode, &curUpdatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				return application.MutationResult{}, nil
+			}
+			return application.MutationResult{}, err
+		}
+		if curMode == mode {
+			return application.MutationResult{Matched: true}, nil
+		}
+		now := nowUnix()
+		updClause, updArgs := buildUpdateOnAdvance(curUpdatedAt, now)
+		qry := "UPDATE tasks SET permission_mode = ?, " + updClause + " WHERE id = ? AND permission_mode <> ?"
+		args := []any{mode}
+		args = append(args, updArgs...)
+		args = append(args, id, mode)
+		res, err := qx.db.ExecContext(ctx, qry, args...)
+		if err != nil {
+			return application.MutationResult{}, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return application.MutationResult{}, err
+		}
+		if n == 0 {
+			// 同值（并发下被写为同值）。
+			return application.MutationResult{Matched: true}, nil
+		}
+		return application.MutationResult{Matched: true, Changed: true, UpdatedAtAdvanced: now != curUpdatedAt}, nil
+	})
+}

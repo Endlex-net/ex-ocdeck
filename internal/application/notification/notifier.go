@@ -243,6 +243,17 @@ func (n *Notifier) handleEvent(ctx context.Context, ev ocdeckevent.Event) {
 		if p, ok := ev.Payload.(ocdeckevent.ServeRuntimeSessionErrorPayload); ok && n.mode == modeRunning {
 			n.onSessionError(ctx, p, ev.RID)
 		}
+	case ocdeckevent.TypeServeRuntimePermissionVerdict:
+		// ai-auto 判定结论唤醒（task-permission-mode D1/D7，tasks 3.5）：事件仅
+		// 唤醒，重读权威快照并重评该任务全部 waiting 条目，不信任载荷。
+		if p, ok := ev.Payload.(ocdeckevent.ServeRuntimeTaskPayload); ok && n.mode == modeRunning {
+			n.onPermissionVerdict(ctx, p.TaskID, ev.RID)
+		}
+	case ocdeckevent.TypeServeRuntimePermissionModeChanged:
+		// 模式变更唤醒（D7）：waiting 重评估只由此事件驱动；重读快照定论。
+		if p, ok := ev.Payload.(ocdeckevent.ServeRuntimeTaskPayload); ok && n.mode == modeRunning {
+			n.onPermissionModeChanged(ctx, p.TaskID, ev.RID)
+		}
 	case ocdeckevent.TypeTaskStatusChanged:
 		// 任务离开 active：取消该任务全部待决计时并清空触发态（含去重集合——
 		// 离开 active 后 pending 快照为空，上界约束要求同步清空；重新激活后
@@ -381,7 +392,13 @@ func (n *Notifier) drainQueued(ctx context.Context, subs []EventSubscription) {
 
 // attemptReconcile 以当前快照按启动基线同规则重建（pending 仅播种不补发、idle
 // 不武装、retry 重新计时、error 不恢复）；保留仍 pending 的去重条目与
-// episodeConsumed（MUST NOT 重发已消费的条件）。任一枚举/快照失败 → 保持
+// episodeConsumed（MUST NOT 重发已消费的条件）。ai-auto 延迟触发例外
+//（task-permission-mode D1，tasks 3.4）：有效模式 ai-auto 的 pending permission
+// 既未通知也无 waiting 条目时 MUST NOT 播种去重——新建 waiting（deadline 从对账
+// 观察时刻起算）；既有 waiting 条目保留原 deadline 并在对账成功后按快照判定状态
+// 立即重评；有效模式已非 ai-auto（切换事件溢出丢失）的既有 waiting 条目在对账
+// 成功退出 reconciling 后立即按正常门禁投递（不播种去重压掉）。启动基线无此例外
+//（进程重启 waiting 不恢复、按基线播种不补发）。任一枚举/快照失败 → 保持
 // reconciling（抑制全部发送，每 tick 重试），返回 false。
 func (n *Notifier) attemptReconcile(ctx context.Context) bool {
 	ids, err := n.opts.ListActive.ListAllActiveTaskIDs(ctx)
@@ -391,6 +408,7 @@ func (n *Notifier) attemptReconcile(ctx context.Context) bool {
 	}
 	now := n.opts.Now()
 	next := make(map[string]*taskState, len(ids))
+	var postReeval []string // 对账成功后立即重评 waiting 的任务（仅保留 waiting 的任务）
 	for _, id := range ids {
 		snap, err := n.readSnapshot(ctx, id)
 		if err != nil {
@@ -398,7 +416,11 @@ func (n *Notifier) attemptReconcile(ctx context.Context) bool {
 			return false
 		}
 		st := newTaskState(snap.InstVersion)
-		if prev := n.states[id]; prev != nil && prev.instVersion == snap.InstVersion && snap.RunStatus != runStatusBusy {
+		var prev *taskState
+		if p := n.states[id]; p != nil && p.instVersion == snap.InstVersion {
+			prev = p
+		}
+		if prev != nil && snap.RunStatus != runStatusBusy {
 			// 同实例存续 episode（B1/B3/B4，design D3 overflow 字段清单）：保留
 			// episodeActive（error episode 持续到 busy，idle 门禁依赖其抑制）、
 			// episodeConsumed 与 errorSeen；换代或快照 busy 时全部清除（busy =
@@ -414,7 +436,28 @@ func (n *Notifier) attemptReconcile(ctx context.Context) bool {
 			st.notifiedQuestions[pq.ID] = struct{}{}
 		}
 		for _, pp := range snap.Attention.Permissions {
-			st.notifiedPermissions[pp.ID] = struct{}{}
+			_, wasNotified := prevDedupEntry(prev, pp.ID)
+			_, wasWaiting := prevWaitingEntry(prev, pp.ID)
+			switch {
+			case snap.aiAutoEffective():
+				switch {
+				case wasWaiting:
+					// waiting 条目保留原 deadline（对账成功后按快照判定状态立即重评）。
+					st.waitingPerms[pp.ID] = prev.waitingPerms[pp.ID]
+				case wasNotified:
+					st.notifiedPermissions[pp.ID] = struct{}{} // 仍 pending 已通知：保留去重
+				default:
+					// 既未通知也无 waiting（事件在 waiting 建立前丢失）：新建
+					// waiting，deadline 从本次对账观察时刻起算；MUST NOT 播种去重。
+					st.waitingPerms[pp.ID] = now.Add(permissionVerdictWindow)
+				}
+			case wasWaiting:
+				// 有效模式已非 ai-auto（切换事件溢出丢失）：不播种去重压掉，对账
+				// 成功后立即按正常门禁投递（仍 pending 且未通知由重评定论）。
+				st.waitingPerms[pp.ID] = prev.waitingPerms[pp.ID]
+			default:
+				st.notifiedPermissions[pp.ID] = struct{}{} // 非 ai-auto 现状：播种去重不补发
+			}
 		}
 		if snap.RunStatus == runStatusRetry {
 			st.episodeActive = true
@@ -422,8 +465,34 @@ func (n *Notifier) attemptReconcile(ctx context.Context) bool {
 			st.retryDeadline = &dl
 		}
 		next[id] = st
+		if len(st.waitingPerms) > 0 {
+			postReeval = append(postReeval, id)
+		}
 	}
 	n.states = next
 	n.mode = modeRunning
+	// 对账成功并退出 reconciling 后，保留 waiting 条目的任务立即重评定论
+	//（manual_required / 非 ai-auto 切换 → 立即投递；settled → 清除；未定论继续等待）。
+	for _, id := range postReeval {
+		n.reevaluateWaiting(ctx, id, n.states[id])
+	}
 	return true
+}
+
+// prevDedupEntry 读取前状态的同实例去重条目（prev 为 nil 或换代时视为无）。
+func prevDedupEntry(prev *taskState, requestID string) (struct{}, bool) {
+	if prev == nil {
+		return struct{}{}, false
+	}
+	v, ok := prev.notifiedPermissions[requestID]
+	return v, ok
+}
+
+// prevWaitingEntry 读取前状态的同实例 waiting 条目。
+func prevWaitingEntry(prev *taskState, requestID string) (time.Time, bool) {
+	if prev == nil {
+		return time.Time{}, false
+	}
+	v, ok := prev.waitingPerms[requestID]
+	return v, ok
 }
