@@ -215,6 +215,9 @@ export default function DiffViewer({
   const sessionRef = useRef<EditSession | null>(null);
   /** D7：当前 side-by-side MergeView 实例（比例应用目标；销毁-重建时同步替换）。 */
   const mergeViewRef = useRef<MergeView | null>(null);
+  /** D1：横向滚动协同在途 echo 偏移（按 pane 分离、允许同侧多个在途值）。
+   *  组件级 ref 而非创建 effect 闭包：创建 effect cleanup 与启用谓词 effect 两条独立清理路径均可触达。 */
+  const pendingRef = useRef<{ a: Set<number>; b: Set<number> }>({ a: new Set(), b: new Set() });
   /** F3：退出事务期间经 compartment 把新侧编辑器切只读过渡态（保留 session 直至刷新完成）。 */
   const editLockCompartment = useRef(new Compartment());
 
@@ -871,6 +874,8 @@ export default function DiffViewer({
     const container = containerRef.current;
     let destroyed = false;
     let view: MergeView | EditorView | null = null;
+    // D1：协同监听移除句柄（async 安装完成前 cleanup 触发时为 null，无监听可移除）
+    let removeScrollSync: (() => void) | null = null;
     void (async () => {
       const lang = await loadLanguage(path);
       if (destroyed) return;
@@ -935,6 +940,47 @@ export default function DiffViewer({
         view = mergeView;
         editorsRef.current = { a: mergeView.a, b: mergeView.b };
         mergeViewRef.current = mergeView;
+
+        // D1 横向滚动协同：scrollDOM 双向 passive 监听 + clamp + 程序性 echo 抑制（不用布尔
+        // guard / domEventHandlers / rAF / 比例同步；不触碰 scrollTop，不调 syncInlineHostWidth）。
+        // sync = clamp + 相等短路；实际位移时把写入值记入 to 侧 pending（浏览器将异步派发 echo）。
+        const sync = (from: HTMLElement, to: HTMLElement, toSide: 'a' | 'b') => {
+          const next = Math.max(0, Math.min(from.scrollLeft, to.scrollWidth - to.clientWidth));
+          if (to.scrollLeft === next) return; // 相等短路：两侧已对齐（回环防护之一）
+          const prev = to.scrollLeft;
+          to.scrollLeft = next;
+          if (to.scrollLeft !== prev) pendingRef.current[toSide].add(to.scrollLeft);
+        };
+        // 启用态判定 MUST 先于 pending membership；禁用态兜底清空两侧在途 echo。
+        // singleSided 经 ref 取实时值（存在性不进重建 deps，单侧坍缩不重建编辑器）。
+        const onPaneScroll =
+          (side: 'a' | 'b', other: 'a' | 'b') => () => {
+            if (
+              mode !== 'side-by-side' ||
+              wrapOverride ||
+              singleSidedRef.current ||
+              state.kind !== 'merge'
+            ) {
+              pendingRef.current.a.clear();
+              pendingRef.current.b.clear();
+              return;
+            }
+            const pending = pendingRef.current[side];
+            if (pending.has(mergeView[side].scrollDOM.scrollLeft)) {
+              pending.clear(); // 程序性 echo：消费即可，MUST NOT 反向改写另一侧（同值竞态例外见 spec）
+              return;
+            }
+            pending.clear(); // 用户事件：迟到旧 echo 已被浏览器合并/覆盖（值不匹配落入此分支）
+            sync(mergeView[side].scrollDOM, mergeView[other].scrollDOM, other);
+          };
+        const onScrollA = onPaneScroll('a', 'b');
+        const onScrollB = onPaneScroll('b', 'a');
+        mergeView.a.scrollDOM.addEventListener('scroll', onScrollA, { passive: true });
+        mergeView.b.scrollDOM.addEventListener('scroll', onScrollB, { passive: true });
+        removeScrollSync = () => {
+          mergeView.a.scrollDOM.removeEventListener('scroll', onScrollA);
+          mergeView.b.scrollDOM.removeEventListener('scroll', onScrollB);
+        };
       } else {
         view = new EditorView({
           parent: container,
@@ -966,6 +1012,9 @@ export default function DiffViewer({
     })();
     return () => {
       destroyed = true;
+      removeScrollSync?.();
+      pendingRef.current.a.clear();
+      pendingRef.current.b.clear();
       view?.destroy();
       editorsRef.current = {};
       mergeViewRef.current = null;
@@ -975,6 +1024,19 @@ export default function DiffViewer({
     // 编辑模式进出与 discard/restore（docEpoch）走同一销毁-重建路径；进出预览经 previewActive 短路/重建（D3）
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.kind, mode, wrapOverride, diff.oldContent, diff.newContent, path, editPhase, docEpoch, previewActive]);
+
+  // D1 启用谓词 effect（pending 清理路径之二，与创建 effect cleanup 独立）：谓词变 false 时
+  // 渲染提交后无条件清空两侧在途 echo——不依赖 scroll 事件，保证「双侧→单侧→双侧（单侧期间
+  // 零滚动事件）」重新启用前 pending 必为空。MUST NOT 触碰 editor 实例与监听安装：
+  // 存在性不进重建 deps，单侧坍缩不触发编辑器重建；依赖渲染期 singleSided 布尔而非 ref。
+  // preview 激活走创建 effect 的销毁-重建路径（previewActive 在重建 deps 中）。
+  const scrollSyncEnabled =
+    state.kind === 'merge' && mode === 'side-by-side' && !wrapOverride && !singleSided;
+  useEffect(() => {
+    if (scrollSyncEnabled) return;
+    pendingRef.current.a.clear();
+    pendingRef.current.b.clear();
+  }, [scrollSyncEnabled]);
 
   const editStatusText = (s: EditSession | null): string => {
     if (!s) return '';

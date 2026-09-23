@@ -773,8 +773,9 @@ describe('GitPanel 集成：预览选择不跨文件保留（D3）', () => {
 
     // F4：交互与 async diff 加载同轮 flush 在 act 内，避免未包裹 act 的状态更新警告
     const clickFile = async (path: string) => {
+      // tasks 6.2 两段式条目：textContent 不再是完整路径，改按 title 前缀匹配
       const el = [...container.querySelectorAll('.git-file-path')].find((n) =>
-        n.textContent?.includes(path),
+        (n.getAttribute('title') ?? '').startsWith(path),
       );
       expect(el, `file entry ${path}`).toBeTruthy();
       await act(async () => {
@@ -807,8 +808,9 @@ describe('GitPanel 集成：预览选择不跨文件保留（D3）', () => {
     await until(() => container.querySelectorAll('.git-file-path').length === 2);
 
     const clickFile = async (path: string) => {
+      // tasks 6.2 两段式条目：textContent 不再是完整路径，改按 title 前缀匹配
       const el = [...container.querySelectorAll('.git-file-path')].find((n) =>
-        n.textContent?.includes(path),
+        (n.getAttribute('title') ?? '').startsWith(path),
       );
       expect(el, `file entry ${path}`).toBeTruthy();
       await act(async () => {

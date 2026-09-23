@@ -23,6 +23,10 @@ func (s *Server) registerGitRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/tasks/{id}/git/diff", s.handleGitDiff)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/git/commit", s.handleGitCommit)
 	mux.HandleFunc("POST /api/v1/tasks/{id}/git/push", s.handleGitPush)
+	// 分支对比（three-dot）只读端点（git-page-enhancements D2）：base 为唯一用户提供
+	// 的 ref 输入，merge-base 语义唯一由服务端执行；files 不接收 path，file 另接收 path。
+	mux.HandleFunc("GET /api/v1/tasks/{id}/git/branch-diff/files", s.handleGitBranchDiffFiles)
+	mux.HandleFunc("GET /api/v1/tasks/{id}/git/branch-diff/file", s.handleGitBranchDiffFile)
 	// diff-review-workbench D8：文件编辑读取/写回（3.9/3.10 的 HTTP 面）。
 	// 依赖 diffreview.Service 注入；未注入时仅注册既有 git 路由。
 	if s.diffreview != nil {
@@ -74,6 +78,37 @@ func (s *Server) handleGitDiff(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d, err := s.tasks.GitDiff(r.Context(), taskID, ref, path, untracked)
+	if err != nil {
+		writeApiError(w, mapTaskErr(err))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(d)
+}
+
+// handleGitBranchDiffFiles GET /api/v1/tasks/:id/git/branch-diff/files?base=
+//（git-page-enhancements D2）。base 必填（空 → Manager 词法校验 invalid_input 零 git 调用）。
+// 响应复用 application.GitBranchDiffFilesDTO（baseRef + files，MUST NOT 含任何 OID 字段）。
+func (s *Server) handleGitBranchDiffFiles(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("id")
+	base := r.URL.Query().Get("base")
+	res, err := s.tasks.GitBranchDiffFiles(r.Context(), taskID, base)
+	if err != nil {
+		writeApiError(w, mapTaskErr(err))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(res)
+}
+
+// handleGitBranchDiffFile GET /api/v1/tasks/:id/git/branch-diff/file?base=&path=
+//（git-page-enhancements D2/D4）。base 与 path 必填；path 归属校验（须在变更集合中）与
+// 词法校验均在 Manager 层。响应复用 application.GitDiffDTO 八字段契约，逐字段不变。
+func (s *Server) handleGitBranchDiffFile(w http.ResponseWriter, r *http.Request) {
+	taskID := r.PathValue("id")
+	base := r.URL.Query().Get("base")
+	path := r.URL.Query().Get("path")
+	d, err := s.tasks.GitBranchDiffFile(r.Context(), taskID, base, path)
 	if err != nil {
 		writeApiError(w, mapTaskErr(err))
 		return

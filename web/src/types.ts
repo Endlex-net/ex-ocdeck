@@ -242,6 +242,21 @@ export interface GitDiffResult {
   truncated: boolean;
 }
 
+/** GET /tasks/:id/git/branch-diff/files 条目（git-page-enhancements D2/D3）。 */
+export interface GitBranchDiffFileEntry {
+  path: string;
+  additions: number;
+  deletions: number;
+  isBinary: boolean;
+}
+
+/** GET /tasks/:id/git/branch-diff/files 响应：baseRef 为用户输入原值；
+ *  MUST NOT 携带 headOID/mergeBaseOID 等裸 OID 字段（D2 信任边界）。 */
+export interface GitBranchDiffFilesResult {
+  baseRef: string;
+  files: GitBranchDiffFileEntry[];
+}
+
 export interface EnvVar {
   key: string;
   value: string;

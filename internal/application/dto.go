@@ -220,3 +220,20 @@ type GitDiffDTO struct {
 	OldTruncated bool `json:"-"`
 	NewTruncated bool `json:"-"`
 }
+
+// GitBranchDiffFileEntry 分支对比（three-dot）文件列表单条目（git-page-enhancements D2/D3），
+// json tag 风格与 GitFileDTO 一致。字段为 numstat 统计：二进制条目增删行数恒 0 且 IsBinary=true。
+type GitBranchDiffFileEntry struct {
+	Path      string `json:"path"`
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+	IsBinary  bool   `json:"isBinary"`
+}
+
+// GitBranchDiffFilesDTO 分支对比文件列表响应（git-page-enhancements D2）。
+// BaseRef 写入用户输入的原始 base 值（不规范化改写）；MUST NOT 含任何 OID 字段
+//（OID 仅为服务端内部值，不暴露给前端）。
+type GitBranchDiffFilesDTO struct {
+	BaseRef string                   `json:"baseRef"`
+	Files   []GitBranchDiffFileEntry `json:"files"`
+}

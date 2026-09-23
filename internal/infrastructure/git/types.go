@@ -53,5 +53,25 @@ var ErrWorktreeEscape = errors.New("worktree path escape")
 // 否则丢失 -dirty 可见语义），errors.Is 判定。
 var ErrSubmoduleDirtyProbe = errors.New("submodule dirty probe failed")
 
+// BranchDiffFile 为分支对比（three-dot）单文件统计条目（git-page-enhancements D3）。
+type BranchDiffFile struct {
+	// Path 为变更路径（rename/copy 按新路径登记，与变更集合归属校验口径一致）。
+	Path string
+	// Additions / Deletions 为 numstat 增删行数；二进制文件不计行（恒 0）。
+	Additions int
+	Deletions int
+	// IsBinary 当 numstat 报告二进制（'-' '-'）时为 true。
+	IsBinary bool
+}
+
+// ErrNoMergeBase 表示两个 OID 无共同祖先（git merge-base exit 1，仅以 exit code 判定，
+// git-page-enhancements D2）。调用方据此映射 invalid_state，errors.Is 判定。
+var ErrNoMergeBase = errors.New("no merge base")
+
+// ErrUnbornHead 表示仓库 HEAD 无任何提交（git rev-parse --verify --quiet HEAD exit 1，
+// 仅以 exit code 判定，git-page-enhancements D2）。调用方据此映射 invalid_state，
+// errors.Is 判定，MUST NOT 匹配 stderr 文案。
+var ErrUnbornHead = errors.New("unborn HEAD")
+
 // MaxStatusFiles 变更文件数上限。
 const MaxStatusFiles = 10000

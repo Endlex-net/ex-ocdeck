@@ -220,6 +220,172 @@ func (m *Manager) gitDiffLocked(ctx context.Context, row TaskRow, ref, path stri
 	return dto, nil
 }
 
+// resolveBranchDiffRefs 解析分支对比（three-dot）三个 ref 坐标（git-page-enhancements D2）。
+// 仅接收 base（path 非 helper 输入）：依次 ResolveRefOID(base) → git.ResolveHeadOID →
+// git.MergeBase(baseOID, headOID)——先解析两个 OID 再执行 merge-base，避免 ref 在请求期间
+// 移动导致两次解析不一致。错误映射（复用 application/operror.go 集合）：
+//   - base 解析失败 → invalid_input（其后 MUST NOT 执行 ResolveHeadOID/MergeBase/
+//     BranchDiffFiles/blob 读取）；
+//   - git.ErrUnbornHead → invalid_state（唯一判定来源为 typed sentinel，MUST NOT 匹配 stderr 文案）；
+//   - git.ErrNoMergeBase → invalid_state（无共同祖先，typed sentinel）；
+//   - 其他非零 exit → git_error 透传 stderr。
+func resolveBranchDiffRefs(ctx context.Context, worktree, base string) (baseOID, headOID, mergeBaseOID string, err error) {
+	baseOID, err = git.ResolveRefOID(ctx, worktree, base)
+	if err != nil {
+		return "", "", "", newOpErr(codeInvalidInput, err)
+	}
+	headOID, err = git.ResolveHeadOID(ctx, worktree)
+	if err != nil {
+		if errors.Is(err, git.ErrUnbornHead) {
+			return "", "", "", newOpErr(codeInvalidState, err)
+		}
+		return "", "", "", newOpErr(codeGitError, fmt.Errorf("%s", git.StderrOf(err)))
+	}
+	mergeBaseOID, err = git.MergeBase(ctx, worktree, baseOID, headOID)
+	if err != nil {
+		if errors.Is(err, git.ErrNoMergeBase) {
+			return "", "", "", newOpErr(codeInvalidState, err)
+		}
+		return "", "", "", newOpErr(codeGitError, fmt.Errorf("%s", git.StderrOf(err)))
+	}
+	return baseOID, headOID, mergeBaseOID, nil
+}
+
+// GitBranchDiffFiles 返回任务 worktree 中 base（merge-base，three-dot）到 HEAD 的变更文件列表
+//（git-page-enhancements D2/D3）。持任务锁（与生命周期操作互斥，冲突 409）。
+// 门禁链与 GitStatus/GitDiff 一致：base 词法校验（空 → invalid_input 零 git 调用）→
+// tryLockTask → GetTask（not_found）→ worktree_path 空（invalid_state）→ assertGitRepoTask
+// → helper → git.BranchDiffFiles。只读，不进 repo 写锁。
+// BaseRef 写入用户输入的原始 base 值；ErrTooManyFilesChanged 与 numstat 执行失败 →
+// git_error 透传（既有 status 口径）。
+func (m *Manager) GitBranchDiffFiles(ctx context.Context, taskID, base string) (application.GitBranchDiffFilesDTO, error) {
+	if base == "" {
+		return application.GitBranchDiffFilesDTO{}, newOpErr(codeInvalidInput, errors.New("base is required"))
+	}
+
+	unlock, err := m.tryLockTask(taskID)
+	if err != nil {
+		return application.GitBranchDiffFilesDTO{}, err
+	}
+	defer unlock()
+
+	row, err := m.store.GetTask(ctx, taskID)
+	if err != nil {
+		return application.GitBranchDiffFilesDTO{}, newOpErr(codeNotFound, fmt.Errorf("task not found: %w", err))
+	}
+	if row.WorktreePath == "" {
+		return application.GitBranchDiffFilesDTO{}, newOpErr(codeInvalidState, fmt.Errorf("task %s has no worktree", taskID))
+	}
+	if _, err := m.assertGitRepoTask(ctx, row); err != nil {
+		return application.GitBranchDiffFilesDTO{}, err
+	}
+
+	_, headOID, mbOID, err := resolveBranchDiffRefs(ctx, row.WorktreePath, base)
+	if err != nil {
+		return application.GitBranchDiffFilesDTO{}, err
+	}
+
+	files, err := git.BranchDiffFiles(ctx, row.WorktreePath, mbOID, headOID)
+	if err != nil {
+		return application.GitBranchDiffFilesDTO{}, newOpErr(codeGitError, fmt.Errorf("%s", git.StderrOf(err)))
+	}
+	entries := make([]application.GitBranchDiffFileEntry, 0, len(files))
+	for _, f := range files {
+		entries = append(entries, application.GitBranchDiffFileEntry{
+			Path:      f.Path,
+			Additions: f.Additions,
+			Deletions: f.Deletions,
+			IsBinary:  f.IsBinary,
+		})
+	}
+	return application.GitBranchDiffFilesDTO{BaseRef: base, Files: entries}, nil
+}
+
+// GitBranchDiffFile 返回 base（merge-base，three-dot）到 HEAD 单文件 path 两侧内容
+//（git-page-enhancements D4）。门禁链同 GitBranchDiffFiles；path 词法校验
+//（git.ValidateDiffPath）先于锁与任何 git 调用。helper 后先做归属校验：经 BranchDiffFiles
+// 取得变更集合，path 不在集合（rename 按列表新路径判定）→ invalid_input 且零 blob 读取。
+// 归属通过后旧侧（merge-base）先读：失败 git_error 透传且 MUST NOT 读新侧；再读新侧
+//（失败 git_error）。两侧 normalizeDiffSideContent 后按既有组装规则产出 GitDiffDTO
+//（isBinary 清空两侧、truncated 或运算）。只读，不进 repo 写锁。
+func (m *Manager) GitBranchDiffFile(ctx context.Context, taskID, base, path string) (application.GitDiffDTO, error) {
+	if base == "" {
+		return application.GitDiffDTO{}, newOpErr(codeInvalidInput, errors.New("base is required"))
+	}
+	if err := git.ValidateDiffPath(path); err != nil {
+		return application.GitDiffDTO{}, newOpErr(codeInvalidInput, err)
+	}
+
+	unlock, err := m.tryLockTask(taskID)
+	if err != nil {
+		return application.GitDiffDTO{}, err
+	}
+	defer unlock()
+
+	row, err := m.store.GetTask(ctx, taskID)
+	if err != nil {
+		return application.GitDiffDTO{}, newOpErr(codeNotFound, fmt.Errorf("task not found: %w", err))
+	}
+	if row.WorktreePath == "" {
+		return application.GitDiffDTO{}, newOpErr(codeInvalidState, fmt.Errorf("task %s has no worktree", taskID))
+	}
+	if _, err := m.assertGitRepoTask(ctx, row); err != nil {
+		return application.GitDiffDTO{}, err
+	}
+
+	_, headOID, mbOID, err := resolveBranchDiffRefs(ctx, row.WorktreePath, base)
+	if err != nil {
+		return application.GitDiffDTO{}, err
+	}
+
+	files, err := git.BranchDiffFiles(ctx, row.WorktreePath, mbOID, headOID)
+	if err != nil {
+		return application.GitDiffDTO{}, newOpErr(codeGitError, fmt.Errorf("%s", git.StderrOf(err)))
+	}
+	// 归属校验先于一切侧读取（D4）：path 不在变更集合 → invalid_input，零 blob 读取。
+	changed := false
+	for _, f := range files {
+		if f.Path == path {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return application.GitDiffDTO{}, newOpErr(codeInvalidInput, fmt.Errorf("path %q is not changed between %s and HEAD", path, base))
+	}
+
+	// 旧侧（merge-base）先读：失败 git_error 透传且 MUST NOT 读新侧（D2 错误出口）。
+	oldSide, err := git.ReadRefSideContent(ctx, row.WorktreePath, mbOID, path)
+	if err != nil {
+		return application.GitDiffDTO{}, newOpErr(codeGitError, fmt.Errorf("%s", git.StderrOf(err)))
+	}
+	newSide, err := git.ReadRefSideContent(ctx, row.WorktreePath, headOID, path)
+	if err != nil {
+		return application.GitDiffDTO{}, newOpErr(codeGitError, fmt.Errorf("%s", git.StderrOf(err)))
+	}
+
+	oldNorm, oldTrunc := normalizeDiffSideContent(oldSide.Content, oldSide.Truncated)
+	newNorm, newTrunc := normalizeDiffSideContent(newSide.Content, newSide.Truncated)
+
+	dto := GitDiffDTO{
+		OldContent:   oldNorm,
+		NewContent:   newNorm,
+		OldExists:    oldSide.Exists,
+		NewExists:    newSide.Exists,
+		OldMode:      oldSide.Mode,
+		NewMode:      newSide.Mode,
+		IsBinary:     oldSide.IsBinary || newSide.IsBinary,
+		Truncated:    oldTrunc || newTrunc,
+		OldTruncated: oldTrunc,
+		NewTruncated: newTrunc,
+	}
+	if dto.IsBinary {
+		dto.OldContent = ""
+		dto.NewContent = ""
+	}
+	return dto, nil
+}
+
 // normalizeDiffSideContent 对单侧内容施加 UTF-8 规范化与 rune 边界 524288 byte 上限
 //（specs/git-operations「文件 diff 查看」单侧内容处理管线后两步）。
 // rawTruncated 为 git 包 finalizeSideContent 已判定的原始读取超限标志。

@@ -200,6 +200,15 @@ func (f *fakeTaskBackend) GitCommit(ctx context.Context, taskID, message string,
 }
 func (f *fakeTaskBackend) GitPush(ctx context.Context, taskID string) error { return nil }
 
+// 分支对比（git-page-enhancements 2.6）默认实现（noop / 零值）：
+// 具体 API 契约由 git_api_branch_diff_test.go 注入 mockGitBackend 覆盖。
+func (f *fakeTaskBackend) GitBranchDiffFiles(ctx context.Context, taskID, base string) (application.GitBranchDiffFilesDTO, error) {
+	return application.GitBranchDiffFilesDTO{}, nil
+}
+func (f *fakeTaskBackend) GitBranchDiffFile(ctx context.Context, taskID, base, path string) (application.GitDiffDTO, error) {
+	return application.GitDiffDTO{}, nil
+}
+
 // Lifecycle config / init rerun / logs 默认实现（noop / 空值）：
 // 实际行为由 lifecycle_config_api_test.go 与具体场景注入 mock 覆盖。
 func (f *fakeTaskBackend) RerunInit(ctx context.Context, taskID string) (application.TaskRow, error) {

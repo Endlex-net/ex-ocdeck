@@ -1098,6 +1098,80 @@ select.input {
   border-bottom: 1px solid var(--border);
 }
 
+/* D8（git-page-enhancements）：未提交变更 / 分支对比 双视图切换 */
+.git-view-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.git-view-tab {
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: none;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.git-view-tab:hover {
+  background: var(--surface-hover);
+  color: var(--fg);
+}
+
+.git-view-tab-active {
+  background: var(--accent-soft);
+  border-color: var(--border-strong);
+  color: var(--fg);
+}
+
+/* D8：分支对比基础 ref 输入（draft/applied 分离，失焦或 Enter 生效） */
+.git-base-ref {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.git-base-ref .input {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+}
+
+/* branch 列表区提示（请输入基础 ref / 无差异 / stale 手动重载） */
+.git-files-hint {
+  color: var(--muted);
+  padding: 16px 12px;
+  text-align: center;
+}
+
+.git-files-stale {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 12px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* branch diff 失败/stale：错误 + 手动重试入口（MUST NOT 自动重试） */
+.git-diff-retry {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 14px;
+}
+
 .git-branch {
   color: var(--accent);
   font-size: 12px;
@@ -1140,6 +1214,12 @@ select.input {
   padding: 6px 0;
 }
 
+/* D7（git-page-enhancements）：横向滚动唯一归属 .git-files 容器；内容层按内容撑开，
+   行 min-width:100% 保证 hover 高亮至少铺满可视宽度 */
+.git-files-inner {
+  min-width: max-content;
+}
+
 .git-clean {
   color: var(--muted);
   padding: 24px 12px;
@@ -1171,6 +1251,9 @@ select.input {
   gap: 8px;
   padding: 3px 12px;
   cursor: default;
+  /* D7：行宽随内容（长路径完整可滚动），不低于容器可视宽 */
+  min-width: 100%;
+  width: max-content;
 }
 
 .git-file:hover {
@@ -1182,22 +1265,89 @@ select.input {
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
+/* D5 三色状态（git-page-enhancements tasks 6.1 三次裁决映射：staged→成功绿 / unstaged→teal /
+   untracked→警告琥珀，色值 token 见 design-system.css --git-staged/--git-unstaged/--git-untracked）；
+   颜色非唯一状态信息，条目附 title/aria-label 状态文本 */
+.git-file-staged {
+  color: var(--git-staged);
+}
+
+.git-file-unstaged {
+  color: var(--git-unstaged);
+}
+
+.git-file-untracked {
+  color: var(--git-untracked);
+}
+
+/* 分支对比已提交条目（tasks 6.1 用户裁决 3）：中性灰蓝（--muted），与三色状态明确不冲突；
+   非颜色提示 = 行内「已提交」badge + title/aria-label 文本 */
+.git-file-committed {
+  color: var(--muted);
+}
+
+.git-file-badge {
+  flex-shrink: 0;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 16px;
+}
+
 .git-file input[type='checkbox'] {
   accent-color: var(--accent);
   margin: 0;
   flex-shrink: 0;
 }
 
+/* D7：正常 LTR 展示（横向滚动兜底）；两段式条目仅 flat 形态使用（文件名主视觉在前、
+   目录路径次要层级随后）；tree 形态文件节点仅文件名（二次裁决，tasks 6.8） */
 .git-file-path {
   flex: 1;
-  min-width: 0;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
   font-size: 12px;
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
-  direction: rtl;
-  text-align: left;
   cursor: pointer;
+}
+
+/* 文件名：主视觉，继承条目状态色 */
+.git-file-name {
+  flex-shrink: 0;
+}
+
+/* 目录路径：次要视觉层级——更小、更淡，不随状态色变化 */
+.git-file-dir {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* D6 tree 目录节点（会话级折叠） */
+.git-tree-dir {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 12px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  min-width: 100%;
+  width: max-content;
+}
+
+.git-tree-dir:hover {
+  background: var(--surface-hover);
+}
+
+.git-tree-toggle {
+  flex-shrink: 0;
+  width: 12px;
+  text-align: center;
 }
 
 .git-stat {

@@ -81,10 +81,11 @@ async function until(cond: () => boolean, timeoutMs = 4000) {
   }
 }
 
-/** 面板 DOM 中点击指定文件路径打开 diff。 */
+/** 面板 DOM 中点击指定文件路径打开 diff。tasks 6.2 两段式条目（文件名+目录路径）后
+ *  textContent 不再是完整路径，改按 title（全路径 + 状态文本）前缀匹配。 */
 function clickFile(container: HTMLElement, path: string) {
   const el = [...container.querySelectorAll('.git-file-path')].find((n) =>
-    n.textContent?.includes(path),
+    (n.getAttribute('title') ?? '').startsWith(path),
   );
   expect(el, `file entry ${path}`).toBeTruthy();
   act(() => el!.dispatchEvent(new MouseEvent('click', { bubbles: true })));

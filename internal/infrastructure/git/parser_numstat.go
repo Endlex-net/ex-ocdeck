@@ -17,11 +17,13 @@ type numstatEntry struct {
 // -z 格式（条目以 NUL 分隔）：
 //   - 普通文件：单个记录 "<add>\t<del>\t<path>"，路径为前两个 tab 之后到记录结尾的全部字节
 //     （-z 关闭 core.quotePath 引号，故 tab/newline/非 ASCII/冒号均原样保留）。
-//   - rename/copy：三个记录 "<add>\t<del>" + "<oldPath>" + "<newPath>"（stat 头无第三个字段）。
-//   - 二进制："-\t-\t<path>"（普通）或 "-\t-" + old + new（rename）。
+//   - rename/copy：三个记录 "<add>\t<del>\t" + "<oldPath>" + "<newPath>"——stat 头带尾随 tab、
+//     路径字段为空后直接 NUL（git 2.55 实测 od 逐字节："0\t0\t\0old\0new\0"）。
+//   - 二进制："-\t-\t<path>"（普通）或 "-\t-\t" + old + new（rename）。
 //
 // 返回 byPath（按路径索引，rename 时同时登记 newPath）与 byRename（按 "old\x00new" 复合键索引）。
-// 同路径多次出现时累加 add/del。
+// 同路径多次出现时累加 add/del。消费方注意：rename 检测生效时 byPath[newPath] 与 byRename
+// 同时登记，rename 条目只应取其一（见 ops.go applyRenameNumstat 的查找顺序）。
 func parseNumstatZ(stdout []byte) (byPath map[string]*numstatEntry, byRename map[string]*numstatEntry) {
 	byPath = make(map[string]*numstatEntry)
 	byRename = make(map[string]*numstatEntry)
@@ -36,7 +38,7 @@ func parseNumstatZ(stdout []byte) (byPath map[string]*numstatEntry, byRename map
 			i++
 			continue
 		}
-		// rec 至少含两个 tab 才可能是普通 stat 行；rename 头只有 "add\tdel"（一个 tab）。
+		// rec 至少含两个 tab 才可能是 stat 头。
 		firstTab := bytes.IndexByte(rec, '\t')
 		if firstTab == -1 {
 			i++
@@ -44,25 +46,29 @@ func parseNumstatZ(stdout []byte) (byPath map[string]*numstatEntry, byRename map
 		}
 		secondTab := bytes.IndexByte(rec[firstTab+1:], '\t')
 		if secondTab == -1 {
-			// 仅 "add\tdel"（一个 tab）→ rename 头：接下两条记录为 old/new。
-			addStr := string(rec[:firstTab])
-			delStr := string(rec[firstTab+1:])
-			binary := addStr == "-" || delStr == "-"
-			add := numOrZero(addStr)
-			del := numOrZero(delStr)
+			// 仅 "add\tdel"（一个 tab）：git 不产出该形态，防御性跳过。
+			i++
+			continue
+		}
+		addStr := string(rec[:firstTab])
+		delStr := string(rec[firstTab+1 : firstTab+1+secondTab])
+		path := string(rec[firstTab+1+secondTab+1:])
+		binary := addStr == "-" || delStr == "-"
+		add := numOrZero(addStr)
+		del := numOrZero(delStr)
 
+		if len(path) == 0 {
+			// rename/copy：stat 头路径字段为空（尾随 tab），接 old/new 两条记录。
 			if i+2 >= len(records) {
 				break
 			}
 			oldPath := string(records[i+1])
 			newPath := string(records[i+2])
+			i += 3
 			if len(oldPath) == 0 || len(newPath) == 0 {
 				// 不完整的 rename 条目，跳过。
-				i += 3
 				continue
 			}
-			i += 3
-
 			key := oldPath + "\x00" + newPath
 			mergeRename(byRename, key, add, del, binary)
 			mergeRename(byPath, newPath, add, del, binary)
@@ -70,17 +76,7 @@ func parseNumstatZ(stdout []byte) (byPath map[string]*numstatEntry, byRename map
 		}
 
 		// 普通文件："add\tdel\tpath"。
-		addStr := string(rec[:firstTab])
-		delStr := string(rec[firstTab+1 : firstTab+1+secondTab])
-		path := string(rec[firstTab+1+secondTab+1:])
 		i++
-
-		if len(path) == 0 {
-			continue
-		}
-		binary := addStr == "-" || delStr == "-"
-		add := numOrZero(addStr)
-		del := numOrZero(delStr)
 		mergeInto(byPath, path, add, del, binary)
 	}
 	return byPath, byRename
