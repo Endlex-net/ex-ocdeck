@@ -119,6 +119,11 @@ func TestStatusRename(t *testing.T) {
 	if rename.Rename != "orig.txt" || rename.Path != "moved.txt" {
 		t.Errorf("rename: want orig.txt -> moved.txt, got %+v", rename)
 	}
+	// 行数真实统计且无双计：numstat 对该 rename 报 +1 -0（新增 "more\n" 一行）。
+	// 修复前 byRename/byPath 全 miss → 0/0；只修 parser 不改查找顺序 → byRename+byPath[newPath] 双计 → 2/0。
+	if rename.Additions != 1 || rename.Deletions != 0 {
+		t.Errorf("rename stats: want +1 -0, got +%d -%d (%+v)", rename.Additions, rename.Deletions, rename)
+	}
 }
 
 func TestStatusSpecialFilename(t *testing.T) {
@@ -317,8 +322,9 @@ func TestParseNumstatZBinary(t *testing.T) {
 }
 
 func TestParseNumstatZRename(t *testing.T) {
-	// rename: "add\tdel\0old\0new\0"
-	input := "3\t1\x00old.txt\x00new.txt\x00"
+	// rename（git 2.55 实测 od 逐字节）：stat 头带尾随 tab 后直接 NUL，再 old\0new\0：
+	// "add\tdel\t\0old\0new\0"。旧假设（stat 头无第三个字段）形态 git 从未产出。
+	input := "3\t1\t\x00old.txt\x00new.txt\x00"
 	byPath, byRename := parseNumstatZ([]byte(input))
 	key := "old.txt\x00new.txt"
 	if byRename[key] == nil || byRename[key].additions != 3 || byRename[key].deletions != 1 {
@@ -326,6 +332,15 @@ func TestParseNumstatZRename(t *testing.T) {
 	}
 	if byPath["new.txt"] == nil || byPath["new.txt"].additions != 3 {
 		t.Errorf("rename newPath mapping wrong: %+v", byPath["new.txt"])
+	}
+
+	// 二进制 rename："-\t-\t\0old\0new\0"。
+	byPath, byRename = parseNumstatZ([]byte("-\t-\t\x00a\x00b\x00"))
+	if byRename["a\x00b"] == nil || !byRename["a\x00b"].isBinary {
+		t.Errorf("binary rename entry wrong: %+v", byRename["a\x00b"])
+	}
+	if byPath["b"] == nil || !byPath["b"].isBinary {
+		t.Errorf("binary rename newPath mapping wrong: %+v", byPath["b"])
 	}
 }
 

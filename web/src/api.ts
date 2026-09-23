@@ -10,6 +10,7 @@ import type {
   FileEditRead,
   FileEditWriteInput,
   FileEditWriteResult,
+  GitBranchDiffFilesResult,
   GitDiffResult,
   GitStatus,
   GlobalEnvMode,
@@ -307,6 +308,19 @@ export const api = {
   gitCommit: (taskID: string, message: string, paths: string[]) =>
     request<void>('POST', `/tasks/${taskID}/git/commit`, { message, paths }),
   gitPush: (taskID: string) => request<void>('POST', `/tasks/${taskID}/git/push`),
+
+  /** 分支对比变更文件列表（git-page-enhancements D2）：three-dot 语义唯一由服务端执行，
+   *  base 为用户输入原值；响应 baseRef 精确回显、无任何 OID 字段。 */
+  gitBranchDiffFiles: (taskID: string, base: string) =>
+    request<GitBranchDiffFilesResult>('GET', `/tasks/${taskID}/git/branch-diff/files`, undefined, {
+      base,
+    }),
+  /** 分支对比单文件 diff：旧侧 merge-base 版本、新侧 HEAD 版本，复用 GitDiffResult 八字段契约。 */
+  gitBranchDiffFile: (taskID: string, base: string, path: string) =>
+    request<GitDiffResult>('GET', `/tasks/${taskID}/git/branch-diff/file`, undefined, {
+      base,
+      path,
+    }),
 
   /** 批注列表 + 提交能力（diff-review-workbench D8）；submitCapability.state 非 supported 禁用提交。 */
   listAnnotations: (taskID: string) =>

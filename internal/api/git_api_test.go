@@ -23,6 +23,9 @@ type mockGitBackend struct {
 	pushFn    func(ctx context.Context, taskID string) error
 	commitMsg string
 	commitPth []string
+	// 分支对比（git-page-enhancements 2.6）：以 statusFn/diffFn 同款注入模式覆盖为可注入。
+	branchFilesFn func(ctx context.Context, taskID, base string) (application.GitBranchDiffFilesDTO, error)
+	branchFileFn  func(ctx context.Context, taskID, base, path string) (application.GitDiffDTO, error)
 }
 
 func newMockGitBackend() *mockGitBackend {
@@ -57,6 +60,20 @@ func (m *mockGitBackend) GitPush(ctx context.Context, taskID string) error {
 		return m.pushFn(ctx, taskID)
 	}
 	return nil
+}
+
+func (m *mockGitBackend) GitBranchDiffFiles(ctx context.Context, taskID, base string) (application.GitBranchDiffFilesDTO, error) {
+	if m.branchFilesFn != nil {
+		return m.branchFilesFn(ctx, taskID, base)
+	}
+	return application.GitBranchDiffFilesDTO{}, nil
+}
+
+func (m *mockGitBackend) GitBranchDiffFile(ctx context.Context, taskID, base, path string) (application.GitDiffDTO, error) {
+	if m.branchFileFn != nil {
+		return m.branchFileFn(ctx, taskID, base, path)
+	}
+	return application.GitDiffDTO{}, nil
 }
 
 // gitTaskBackend 为 env/task API 测试提供可返回固定 TaskRow 的 TaskBackend。

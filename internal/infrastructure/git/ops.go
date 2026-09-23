@@ -285,19 +285,21 @@ func isGitPath(p string) bool {
 
 func applyRenameNumstat(e *FileStatus, stagedByPath, stagedByRename, unstagedByPath, unstagedByRename map[string]*numstatEntry) {
 	key := e.Rename + "\x00" + e.Path
-	if e.Staged {
-		if s, ok := stagedByRename[key]; ok {
-			mergeEntry(e, s)
+	// rename 检测生效时 parser 同时登记 byRename[key] 与 byPath[e.Path]，只取其一避免双计；
+	// byPath 兜底覆盖 rename 检测关闭的输出形态（新旧路径各自独立条目，byPath[newPath] 为纯新增统计）。
+	lookup := func(byPath, byRename map[string]*numstatEntry) *numstatEntry {
+		if s, ok := byRename[key]; ok {
+			return s
 		}
-		if s, ok := stagedByPath[e.Path]; ok {
+		return byPath[e.Path]
+	}
+	if e.Staged {
+		if s := lookup(stagedByPath, stagedByRename); s != nil {
 			mergeEntry(e, s)
 		}
 	}
 	if e.Unstaged {
-		if s, ok := unstagedByRename[key]; ok {
-			mergeEntry(e, s)
-		}
-		if s, ok := unstagedByPath[e.Path]; ok {
+		if s := lookup(unstagedByPath, unstagedByRename); s != nil {
 			mergeEntry(e, s)
 		}
 	}

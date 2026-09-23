@@ -29,6 +29,13 @@
   --danger: oklch(0.56 0.19 27);
   --info: var(--accent);
 
+  /* git 评审文件列表状态色（git-page-enhancements tasks 6.1 三次裁决，覆盖前两轮映射）：
+     已暂存取 --success 成功绿、未跟踪取 --warn 警告琥珀（明暗主题随各 token 提亮规则自动适配）；
+     未暂存 teal 为硬裁决 rgb 值（明暗主题同一色值，不得改）。 */
+  --git-staged: var(--success);
+  --git-unstaged: rgb(128, 203, 196);
+  --git-untracked: var(--warn);
+
   /* 派生表面 */
   --accent-soft: color-mix(in oklch, var(--accent) 9%, var(--bg));
   --accent-hover: color-mix(in oklch, var(--accent) 88%, var(--mix-dark));

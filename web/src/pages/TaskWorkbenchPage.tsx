@@ -765,6 +765,7 @@ export function TaskWorkbenchPage({
               taskID={taskID}
               active={tab === GIT_TAB}
               agentBusy={task?.agentStatus === 'busy' || task?.agentStatus === 'retry'}
+              baseRef={task?.base_ref ?? ''}
             />
           </div>
         )}

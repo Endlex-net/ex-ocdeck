@@ -79,6 +79,12 @@ type TaskBackend interface {
 	GitDiff(ctx context.Context, taskID, ref, path string, untracked bool) (application.GitDiffDTO, error)
 	GitCommit(ctx context.Context, taskID, message string, paths []string) error
 	GitPush(ctx context.Context, taskID string) error
+	// 分支对比（three-dot）只读端点（git-page-enhancements D2）：base 为用户提供的唯一
+	// ref/object identity 输入，three-dot 语义（merge-base）唯一由服务端执行，不暴露裸 OID。
+	// 门禁链与 GitStatus/GitDiff 一致；错误语义经 *application.OpError 携带
+	//（not_found/conflict/invalid_input/invalid_state/git_error），由 mapTaskErr 统一映射。
+	GitBranchDiffFiles(ctx context.Context, taskID, base string) (application.GitBranchDiffFilesDTO, error)
+	GitBranchDiffFile(ctx context.Context, taskID, base, path string) (application.GitDiffDTO, error)
 	// RerunInit 手动重跑 init 脚本（design.md §8，tasks 3.6）。
 	// 返回 claim 后的任务行（init_status=running），供 API 层 200+DTO。
 	// application.OpError 映射：invalid_state → 422、conflict → 409。
