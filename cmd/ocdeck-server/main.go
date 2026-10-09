@@ -223,9 +223,16 @@ func run() error {
 	//（测试断言的是生产编排的 fail-closed 语义，而非复制模拟编排）。
 	// task-permission-mode D8/tasks 4.5：回填→开放序列同样收口在 permissionModeStartupGate
 	//（顺序钉死 SQL add column → Backfill → Reconcile → HTTP open，回填失败拒开 HTTP）。
-	return diffReviewStartupGate(ctx, tm, func() error {
-		return permissionModeStartupGate(ctx, tm, func() error {
-			return serveAndShutdown(ctx, tm, cfg, db, bus, aiStore, wd, diffSvc, uploadOrch, uploadConns, prefixStore)
+	// 命名空间防御性补齐门禁（opencode-v1-spi-provider tasks 2.2 / design D6 阶段 1）：
+	// 每次启动、在任何命名空间消费者（diffreview 收敛、权限事实回填、Reconcile、
+	// HTTP）运行前执行；补齐失败 fail-closed 拒绝启动。顺序钉死：
+	// migration 0018 加列（Open→Migrate，更早）→ 命名空间补齐（本门禁）→ 既有收敛
+	// 门禁序列 → Reconcile → HTTP open。与 binding 导入 runner（阶段 3）相互独立。
+	return namespaceBackfillGate(ctx, db, func() error {
+		return diffReviewStartupGate(ctx, tm, func() error {
+			return permissionModeStartupGate(ctx, tm, func() error {
+				return serveAndShutdown(ctx, tm, cfg, db, bus, aiStore, wd, diffSvc, uploadOrch, uploadConns, prefixStore)
+			})
 		})
 	})
 }
@@ -426,6 +433,22 @@ type startupConverger interface {
 // permissionBackfiller 回填门禁依赖的最小端口（task.Manager 满足）。
 type permissionBackfiller interface {
 	BackfillPermissionModeAtStart(ctx context.Context) error
+}
+
+// namespaceBackfiller 命名空间补齐门禁依赖的最小端口（*store.DB 满足）。
+type namespaceBackfiller interface {
+	BackfillProviderNamespaces(ctx context.Context) error
+}
+
+// namespaceBackfillGate 命名空间防御性补齐启动门禁（opencode-v1-spi-provider
+// tasks 2.2）：BackfillProviderNamespaces 失败 → fail-closed 拒绝启动（MUST NOT
+// 调用 open，任何命名空间消费者不得运行在补齐前）；成功 → 调用 open 并透传
+// 其返回错误。
+func namespaceBackfillGate(ctx context.Context, nb namespaceBackfiller, open func() error) error {
+	if err := nb.BackfillProviderNamespaces(ctx); err != nil {
+		return fmt.Errorf("backfill provider namespaces: %w", err)
+	}
+	return open()
 }
 
 // permissionModeStartupGate 启动权限事实回填门禁（task-permission-mode D8/tasks 4.5）：

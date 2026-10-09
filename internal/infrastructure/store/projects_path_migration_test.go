@@ -137,13 +137,13 @@ func TestMigration0014_ProjectsPathNotUnique_UpgradeFrom0013(t *testing.T) {
 	}
 
 	// 最新版本已记录（0015 起；migration 文件号有跳号，不以文件数断言总数；
-	// task-permission-mode 0017 加列后最新版本为 17）。
+	// opencode-v1-spi-provider 0018 provider 命名空间加列后最新版本为 18）。
 	var maxVer int
 	if err := db.QueryRow("SELECT max(version) FROM schema_version").Scan(&maxVer); err != nil {
 		t.Fatal(err)
 	}
-	if maxVer != 17 {
-		t.Errorf("max schema_version = %d, want 17", maxVer)
+	if maxVer != 18 {
+		t.Errorf("max schema_version = %d, want 18", maxVer)
 	}
 }
 

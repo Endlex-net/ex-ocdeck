@@ -722,3 +722,90 @@ func TestPermissionModeStartupGate(t *testing.T) {
 		t.Fatal("gate MUST NOT open on backfill error")
 	}
 }
+
+// 编译期断言：*store.DB 满足命名空间补齐门禁端口（opencode-v1-spi-provider tasks 2.2）。
+var _ namespaceBackfiller = (*store.DB)(nil)
+
+// TestNamespaceBackfillGate 命名空间防御性补齐启动门禁直测（B3；形态参照
+// TestPermissionModeStartupGate，但被测函数是 namespaceBackfillGate）：
+//   - 成功路径：open 回调内断言命名空间已补齐（补齐先于任何命名空间消费者）；
+//   - 失败路径（DB 关闭）：gate 错误返回且 open 调用次数为零（fail-closed）；
+//   - open 错误原样透传。
+func TestNamespaceBackfillGate(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	if err := seedTaskForSubmissions(ctx, db); err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	// 预置待补齐行：tasks.provider_id/anchor 两列空串 + 非空锚定 + session 两列空串。
+	if _, err := db.ExecContext(ctx,
+		`UPDATE tasks SET provider_id = '', anchor_session_id = 'sess-g', anchor_provider_id = '', anchor_provider_instance_id = ''
+		 WHERE id = 't1'`); err != nil {
+		t.Fatalf("seed broken namespaces: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO task_sessions (task_id, session_id, session_created_at, first_seen_at, last_seen_at, provider_id, provider_instance_id)
+		 VALUES ('t1', 'sess-g', 1, 1, 1, '', '')`); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+
+	// 成功路径：open 回调运行时命名空间已补齐（补齐先于 open 内的任何消费者）。
+	opened := 0
+	if err := namespaceBackfillGate(ctx, db, func() error {
+		opened++
+		var pid, apid, aiid string
+		if err := db.QueryRowContext(ctx,
+			`SELECT provider_id, anchor_provider_id, anchor_provider_instance_id FROM tasks WHERE id='t1'`).
+			Scan(&pid, &apid, &aiid); err != nil {
+			return fmt.Errorf("read task namespaces in open: %w", err)
+		}
+		if pid != store.ProviderIDV1 || apid != store.ProviderIDV1 || aiid != store.ProviderInstanceV1Default {
+			return fmt.Errorf("task namespaces in open = (%q,%q,%q), want backfilled defaults", pid, apid, aiid)
+		}
+		var spid, siid string
+		if err := db.QueryRowContext(ctx,
+			`SELECT provider_id, provider_instance_id FROM task_sessions WHERE task_id='t1' AND session_id='sess-g'`).
+			Scan(&spid, &siid); err != nil {
+			return fmt.Errorf("read session namespaces in open: %w", err)
+		}
+		if spid != store.ProviderIDV1 || siid != store.ProviderInstanceV1Default {
+			return fmt.Errorf("session namespaces in open = (%q,%q), want backfilled defaults", spid, siid)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("gate success path: %v", err)
+	}
+	if opened != 1 {
+		t.Fatalf("open called %d times, want 1", opened)
+	}
+
+	// 失败路径：DB 关闭 → 补齐报错 → fail-closed（open 调用次数为零）。
+	db2, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store2: %v", err)
+	}
+	db2.Close()
+	opened2 := 0
+	gateErr := namespaceBackfillGate(ctx, db2, func() error { opened2++; return nil })
+	if gateErr == nil || !strings.Contains(gateErr.Error(), "backfill provider namespaces") {
+		t.Fatalf("gate error = %v, want wrapped backfill failure", gateErr)
+	}
+	if opened2 != 0 {
+		t.Fatal("gate MUST NOT call open on backfill error")
+	}
+
+	// 透传路径：open 的错误原样返回（不被 gate 吞掉或改写语义）。
+	openErr := fmt.Errorf("open-boom-sentinel")
+	if got := namespaceBackfillGate(ctx, okNamespaceBackfiller{}, func() error { return openErr }); got != openErr {
+		t.Fatalf("gate must pass through open error, got %v", got)
+	}
+}
+
+// okNamespaceBackfiller 始终成功的补齐桩（透传路径用）。
+type okNamespaceBackfiller struct{}
+
+func (okNamespaceBackfiller) BackfillProviderNamespaces(ctx context.Context) error { return nil }
