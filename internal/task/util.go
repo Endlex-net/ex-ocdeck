@@ -60,10 +60,11 @@ func parsePort(s string) (int, bool) {
 }
 
 // derivedServePassword 返回任务的派生运行时密码（D3 固定公式；同任务恒定——
-// D3 批准的内部变更：派生密码不再随重启/轮换轮换）。主密钥缺失/空值
-// fail-closed（涉及凭据的操作不得继续——不建进程）。
+// D3 批准的内部变更：派生密码不再随重启/轮换轮换）。主密钥解析失败 fail-closed
+// （涉及凭据的操作不得继续——不建进程；文件缺失时 EnsureMasterSecret 首启自动
+// 生成，D3 修订；env 显式空/空文件等显式配置错误仍 fail-closed）。
 func derivedServePassword(taskID string) (string, error) {
-	master, err := appagent.ResolveMasterSecret()
+	master, err := appagent.EnsureMasterSecret()
 	if err != nil {
 		return "", fmt.Errorf("resolve master secret: %w", err)
 	}

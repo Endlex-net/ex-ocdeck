@@ -306,12 +306,12 @@ func TestCharxContract_MigrationImportRunner(t *testing.T) {
 	t.Run("master_gate_fails_server_readiness", func(t *testing.T) {
 		e := newCharxEnv(t, charxEnvOpts{deadPorts: true})
 		seedImportTask(e, "mi-gate", "ses-anchor-mi-gate", legacyEnv("pw", e.portHealthy()))
-		// 主密钥不可用：runner 整体失败（server 拒绝就绪）；任务零修改、零网络、
-		// 候选屏障不释放（结论先于 gate 的任何动作）。
-		os.Unsetenv(appagent.MasterSecretEnv)
-		t.Cleanup(func() { _ = os.Setenv(appagent.MasterSecretEnv, charxMasterSecret) })
+		// 主密钥显式配置错误（env 显式空串）→ gate fail-closed：runner 整体失败
+		//（server 拒绝就绪）；任务零修改、零网络、候选屏障不释放（结论先于 gate
+		// 的任何动作）。D3 修订后「不可用」仅剩显式配置错误形态——文件缺失已改
+		// 为首启自动供给（见本用例后半段正向断言）。
+		t.Setenv(appagent.MasterSecretEnv, "")
 		err := e.m.RunMigrationImport(ctx)
-		_ = os.Setenv(appagent.MasterSecretEnv, charxMasterSecret)
 		if err == nil || !strings.Contains(err.Error(), "master secret gate") {
 			t.Fatalf("gate error = %v, want master secret gate failure", err)
 		}
@@ -321,6 +321,18 @@ func TestCharxContract_MigrationImportRunner(t *testing.T) {
 		}
 		if _, ok := e.store.rawBindingOf("mi-gate"); ok {
 			t.Error("gate 失败 MUST NOT 写 binding")
+		}
+
+		// D3 修订正向：文件缺失且 env 未设置 → gate 自动供给通过（不再整体失败），
+		// runner 进入候选处理——mi-gate legacy 导入成功写 binding；HOME 落盘
+		// master_secret 文件（EnsureMasterSecret 自动生成证据）。
+		os.Unsetenv(appagent.MasterSecretEnv)
+		t.Cleanup(func() { os.Unsetenv(appagent.MasterSecretEnv) })
+		if err := e.m.RunMigrationImport(ctx); err != nil {
+			t.Fatalf("gate after auto-provision = %v, want nil（文件缺失自动生成）", err)
+		}
+		if _, ok := e.store.rawBindingOf("mi-gate"); !ok {
+			t.Fatal("自动供给后 runner 应进入候选处理并完成 legacy 导入")
 		}
 	})
 

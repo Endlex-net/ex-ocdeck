@@ -7,6 +7,7 @@ package agentprovider
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -81,5 +82,86 @@ func TestResolveMasterSecret_OrderAndFailClosed(t *testing.T) {
 	}
 	if _, err := ResolveMasterSecret(); err == nil {
 		t.Fatal("缺失必须 fail-closed 返回错误")
+	}
+}
+
+// TestEnsureMasterSecret_AutoGenerateOnMissing D3 修订：文件缺失（且 env 未设置）
+// → 首启自动生成（随机 32 字节 hex、0600），再次调用读到同一值（同任务恒定的
+// 前提）； ResolveMasterSecret 本体语义不变（仍 fail-closed——Ensure 是唯一
+// 自动供给入口）。
+func TestEnsureMasterSecret_AutoGenerateOnMissing(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	os.Unsetenv(MasterSecretEnv)
+	t.Cleanup(func() { os.Unsetenv(MasterSecretEnv) })
+
+	got, err := EnsureMasterSecret()
+	if err != nil {
+		t.Fatalf("EnsureMasterSecret(缺失): %v", err)
+	}
+	if len(got) != 64 {
+		t.Fatalf("len = %d, want 64（32 字节 hex）", len(got))
+	}
+	for _, c := range got {
+		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
+			t.Fatalf("非 hex 字符 %q in %q", c, got)
+		}
+	}
+	// 文件落盘形态：0600 权限 + 内容与返回值一致（TrimSpace 语义）。
+	home, herr := os.UserHomeDir()
+	if herr != nil {
+		t.Fatalf("home: %v", herr)
+	}
+	raw, rerr := os.ReadFile(filepath.Join(home, masterSecretFile))
+	if rerr != nil {
+		t.Fatalf("read generated file: %v", rerr)
+	}
+	if strings.TrimSpace(string(raw)) != got {
+		t.Fatalf("file content %q != returned %q", strings.TrimSpace(string(raw)), got)
+	}
+	fi, serr := os.Stat(filepath.Join(home, masterSecretFile))
+	if serr != nil {
+		t.Fatalf("stat: %v", serr)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("perm = %v, want 0600", fi.Mode().Perm())
+	}
+	// 再次调用：读到同一值（不重复生成）。
+	again, err := EnsureMasterSecret()
+	if err != nil || again != got {
+		t.Fatalf("second call = (%q, %v), want same %q", again, err, got)
+	}
+	// ResolveMasterSecret 本体语义不变：文件缺失时仍 fail-closed（自动供给仅经 Ensure）。
+	t.Setenv("HOME", t.TempDir())
+	if _, err := ResolveMasterSecret(); err == nil {
+		t.Fatal("ResolveMasterSecret 对缺失文件必须仍 fail-closed（语义不变）")
+	}
+}
+
+// TestEnsureMasterSecret_EnvExplicitEmptyStillFails：env 显式空串属显式配置错误，
+// 不自动生成（维持 fail-closed，D3 原语义）。
+func TestEnsureMasterSecret_EnvExplicitEmptyStillFails(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(MasterSecretEnv, "   ")
+	if _, err := EnsureMasterSecret(); err == nil {
+		t.Fatal("env 显式空必须维持 fail-closed（不自动生成）")
+	}
+}
+
+// TestEnsureMasterSecret_BlankFileStillFails：文件存在但空白属配置错误，
+// 不自动生成（维持 fail-closed）。
+func TestEnsureMasterSecret_BlankFileStillFails(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	os.Unsetenv(MasterSecretEnv)
+	t.Cleanup(func() { os.Unsetenv(MasterSecretEnv) })
+	secretFile := filepath.Join(home, masterSecretFile)
+	if err := os.MkdirAll(filepath.Dir(secretFile), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(secretFile, []byte("  \n"), 0o600); err != nil {
+		t.Fatalf("write blank: %v", err)
+	}
+	if _, err := EnsureMasterSecret(); err == nil {
+		t.Fatal("空白文件必须维持 fail-closed（不自动生成）")
 	}
 }

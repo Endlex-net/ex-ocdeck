@@ -137,7 +137,7 @@ func (d *opencodeBindingData) password() (string, error) {
 			return "", appagent.NewError("resolve binding", appagent.ErrKindBindingInvalid,
 				errors.New("derived binding 缺少 taskId（派生入参）"))
 		}
-		master, err := appagent.ResolveMasterSecret()
+		master, err := appagent.EnsureMasterSecret()
 		if err != nil {
 			return "", appagent.NewError("resolve binding", appagent.ErrKindBindingInvalid, err)
 		}

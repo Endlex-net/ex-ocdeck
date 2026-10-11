@@ -991,8 +991,9 @@ func TestMigrationImportGate(t *testing.T) {
 	if _, err := db2.ExecContext(ctx, `UPDATE tasks SET status='active', last_error=NULL WHERE id='t1'`); err != nil {
 		t.Fatalf("seed active2: %v", err)
 	}
-	os.Unsetenv(appagent.MasterSecretEnv)
-	t.Cleanup(func() { os.Unsetenv(appagent.MasterSecretEnv) })
+	// D3 修订后 gate fail-closed 形态 = env 显式空串（显式配置错误）；文件缺失已
+	// 改为首启自动供给（EnsureMasterSecret），不再触发 gate 失败。
+	t.Setenv(appagent.MasterSecretEnv, "")
 	tm2 := task.New(task.Options{
 		Cfg:       &config.Config{DataDir: t.TempDir(), ServePortRange: config.PortRange{Min: 50000, Max: 50099}},
 		Store:     task.NewStoreAdapter(db2),

@@ -217,7 +217,7 @@ func decodeV1Binding(b domain.TaskBinding) (v1BindingData, string, error) {
 			return v1BindingData{}, "", appagent.NewError("resolve binding", appagent.ErrKindBindingInvalid,
 				errors.New("derived binding 缺少 taskId（派生入参）"))
 		}
-		master, merr := appagent.ResolveMasterSecret()
+		master, merr := appagent.EnsureMasterSecret()
 		if merr != nil {
 			return v1BindingData{}, "", appagent.NewError("resolve binding", appagent.ErrKindBindingInvalid, merr)
 		}

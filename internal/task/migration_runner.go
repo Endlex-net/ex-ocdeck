@@ -41,7 +41,9 @@ import (
 // last_error 落账后继续其余候选。
 func (m *Manager) RunMigrationImport(ctx context.Context) error {
 	// 主密钥准入门：先于一切网络验证与桥接（零 env 读取在 gate 之前）。
-	master, err := appagent.ResolveMasterSecret()
+	// EnsureMasterSecret：文件缺失时首启自动生成（D3 修订）；env 显式空/空文件
+	// 等显式配置错误仍 fail-closed（拒绝就绪）。
+	master, err := appagent.EnsureMasterSecret()
 	if err != nil {
 		return fmt.Errorf("migration import: master secret gate: %w", err)
 	}

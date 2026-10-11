@@ -104,7 +104,7 @@ func (d *SupervisorDeps) passwordFor(taskID string) (string, error) {
 	if d.PasswordFor != nil {
 		return d.PasswordFor(taskID)
 	}
-	master, err := appagent.ResolveMasterSecret()
+	master, err := appagent.EnsureMasterSecret()
 	if err != nil {
 		return "", appagent.NewError("supervisor.derive_password", appagent.ErrKindBindingInvalid, err)
 	}
@@ -164,7 +164,7 @@ func decodeV1BindingEndpoint(b domain.TaskBinding) (port int, password string, d
 			return 0, "", "", appagent.NewError("supervisor.resume_reuse", appagent.ErrKindBindingInvalid,
 				errors.New("derived binding 缺少 taskId（派生入参）"))
 		}
-		master, merr := appagent.ResolveMasterSecret()
+		master, merr := appagent.EnsureMasterSecret()
 		if merr != nil {
 			return 0, "", "", appagent.NewError("supervisor.resume_reuse", appagent.ErrKindBindingInvalid, merr)
 		}
