@@ -672,13 +672,20 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 }
 
 // bindingEndpoint 解析 binding 的 runtime 连接事实（port/password/directory）。
-// 优先经 provider.BindingRuntimeEndpoint（application port，C2）；provider 未实现
-// 时回退 task 层 v1 镜像（过渡裁决 B）。
+// 经 provider.BindingRuntimeEndpoint（application port，C2）；provider 拒绝
+// （BindingInvalid/instance 不匹配/目录缺失/凭据派生失败）原样传播——仅
+// isTestSeamBindingErr（CapabilityUnavailable 接缝形态）允许回退 task 层 v1
+// 镜像（过渡裁决 B）——与 resolveRuntimeBinding 同一闸门（两条路径一致，回退
+// 镜像只查 port/auth.kind 会重新接受 adapter 拒绝的 binding）。
 func (m *Manager) bindingEndpoint(binding domain.TaskBinding) (int, string, string, error) {
-	if p, perr := m.providerFor(binding.ProviderID); perr == nil {
-		if port, pw, dir, eerr := p.BindingRuntimeEndpoint(binding); eerr == nil {
-			return port, pw, dir, nil
-		}
+	p, perr := m.providerFor(binding.ProviderID)
+	if perr != nil {
+		return 0, "", "", perr
+	}
+	if port, pw, dir, eerr := p.BindingRuntimeEndpoint(binding); eerr == nil {
+		return port, pw, dir, nil
+	} else if !isTestSeamBindingErr(eerr) {
+		return 0, "", "", eerr
 	}
 	data, derr := decodeV1BindingData(binding)
 	if derr != nil {

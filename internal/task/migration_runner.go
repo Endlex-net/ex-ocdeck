@@ -32,6 +32,7 @@ import (
 
 	appagent "ocdeck/internal/application/agentprovider"
 	domain "ocdeck/internal/domain/agentprovider"
+	"ocdeck/internal/infrastructure/process"
 	"ocdeck/internal/infrastructure/store"
 )
 
@@ -96,7 +97,29 @@ func (m *Manager) migrateImportTask(ctx context.Context, row TaskRow, master str
 	// ② 来源标记判定（唯一判据 = OCDECK_CRED_KIND）。标记读取错误与 derived
 	// 显式区分：ShowSessionEnvContext 失败时不得当作「标记缺失」滑入 legacy
 	// 导入（C5 门禁修复——缺失才允许 legacy；未知值 fail-closed 不读密码）。
+	// 会话布局探测（阶段 4 残余修复）：优先 -runtime（新 v1 单进程布局）；确认
+	// 不存在则探测 -serve（旧 v1 双进程布局的存量 runtime——delete.go legacy 分支
+	// 证明该布局升级时可达）。实际会话名用于 marker/port/password 读取及导入
+	// binding 的 TerminalRef。基础设施错误 fail-closed（F6）：非 ErrNoTmuxServer
+	// 的 HasSession 错误 MUST NOT 被当作「不存在」滑入 -serve 回退（tmux 部分故障
+	// 下会错误导入仍存活 legacy -serve 的凭据/TerminalRef）——直接对该任务
+	// concludeImportFailure；ErrNoTmuxServer 按 process 层语义视为无会话（与
+	// supervisor releaseBinding 的既有处理一致）→ 仅「确认不存在」时才探测 -serve。
+	// 两者均不存在 → 保持 -runtime 名进入读取（会话缺失 → 标记读取失败 → 单任务
+	// 导入失败落 last_error，不中断其余候选）。
 	name := runtimeSessionName(row.ID)
+	alive, aerr := m.proc.HasSession(name)
+	switch {
+	case aerr != nil && !errors.Is(aerr, process.ErrNoTmuxServer):
+		return m.concludeImportFailure(ctx, row,
+			fmt.Errorf("runtime 会话探测失败: %v", aerr))
+	case !alive:
+		// -runtime 确认不存在（含 ErrNoTmuxServer=无 server 即无会话）→ 探测
+		// legacy -serve（旧 v1 双进程布局）。
+		if lalive, lerr := m.proc.HasSession(serveSessionName(row.ID)); lerr == nil && lalive {
+			name = serveSessionName(row.ID)
+		}
+	}
 	marker, markerErr := m.markerForImport(ctx, name)
 	// C5 门禁修复（mutation 证据：markerErr 静默降级为空 marker——读取失败被当作
 	// 缺失滑入 legacy 判定 → 测试 marker_read_error_and_unknown_value_failclosed
