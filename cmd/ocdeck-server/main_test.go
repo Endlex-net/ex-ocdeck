@@ -5,7 +5,9 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,13 +23,17 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
+	appagent "ocdeck/internal/application/agentprovider"
 	apptask "ocdeck/internal/application/task"
+	"ocdeck/internal/config"
 	ocdeckevent "ocdeck/internal/domain/event"
+	bindomain "ocdeck/internal/domain/agentprovider"
 	ocdecktask "ocdeck/internal/domain/task"
 	"ocdeck/internal/infrastructure/ai"
 	"ocdeck/internal/infrastructure/auditlog"
 	"ocdeck/internal/infrastructure/eventbus"
 	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/process"
 	"ocdeck/internal/infrastructure/store"
 	"ocdeck/internal/task"
 )
@@ -809,3 +815,219 @@ func TestNamespaceBackfillGate(t *testing.T) {
 type okNamespaceBackfiller struct{}
 
 func (okNamespaceBackfiller) BackfillProviderNamespaces(ctx context.Context) error { return nil }
+
+// TestRegistryDispatchFactory_RegisteredAndFailClosed（tasks 3.7 验证）：
+//   - v1 已注册 → 工厂返回共享 loopback client（*opencode.Client）；
+//   - 空 registry（未注册）→ fail-closed 占位 client：全部方法 errors.Is
+//     provider_not_found、PromptAsync 走 pre_send_failure（零网络副作用）。
+func TestRegistryDispatchFactory_RegisteredAndFailClosed(t *testing.T) {
+	// 正常路径：v1 注册。
+	reg := appagent.NewRegistry()
+	if err := reg.Register(opencode.NewSPIProvider()); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	factory := newRegistryDispatchFactory(reg)
+	// C2 门禁修复：分派按任务 binding 的 providerID（不再固定查 v1）。
+	oc := factory(opencode.ProviderID, 50001, "pw", appagent.Options{})
+	if _, ok := oc.(*opencode.Client); !ok {
+		t.Fatalf("已注册工厂产物类型 = %T, want *opencode.Client", oc)
+	}
+	// 未注册 provider 标识 → fail-closed 占位（按标识分派语义）。
+	miss := factory("other-v9", 50001, "pw", appagent.Options{})
+	if _, err := miss.Health(context.Background()); !errors.Is(err, appagent.ErrProviderNotFound) {
+		t.Errorf("未注册 provider 分派 Health = %v, want provider_not_found", err)
+	}
+
+	// fail-closed 路径：空 registry。
+	empty := appagent.NewRegistry()
+	fc := newRegistryDispatchFactory(empty)
+	stub := fc(opencode.ProviderID, 50001, "pw", appagent.Options{})
+	ctx := context.Background()
+	// 代表性方法：REST/SSE/回复路径全部 provider_not_found。
+	if _, err := stub.Health(ctx); !errors.Is(err, appagent.ErrProviderNotFound) {
+		t.Errorf("Health = %v, want provider_not_found", err)
+	}
+	if _, err := stub.Probe(ctx); !errors.Is(err, appagent.ErrProviderNotFound) {
+		t.Errorf("Probe = %v, want provider_not_found", err)
+	}
+	if err := stub.SubscribeEvents(ctx, "/d", nil, nil); !errors.Is(err, appagent.ErrProviderNotFound) {
+		t.Errorf("SubscribeEvents = %v, want provider_not_found", err)
+	}
+	// PromptAsync 四分类通道：unregistered 形态为 pre_send_failure（进入
+	// provider 前的准入失败经 PromptResult 表达）。
+	if res := stub.PromptAsync(ctx, "/d", "ses", "msg", "text", nil); res.Kind != appagent.ResultPreSendFailure {
+		t.Errorf("PromptAsync kind = %v, want pre_send_failure", res.Kind)
+	}
+}
+
+// --- 迁移导入启动门禁（opencode-v1-spi-provider tasks 4.2；生产 gate 直测） ---
+
+// --- C6 门禁修复：能力健康生产装配接线直测 ---
+
+// TestHealthWiring_ProviderReporterAndReleaseReset 生产装配语义直测：
+//   - WithHealthReporter 注入后，真实能力调用的观测经报告端口进 tracker
+//     （ProviderID 由装配方补齐；epoch 读取 RuntimeEpoch）；
+//   - OnRuntimeReady→BumpRuntimeEpoch（换代递增）；OnRuntimeRelease→
+//     ResetRuntime（释放侧重置代际与 runtime/session 观测）。
+func TestHealthWiring_ProviderReporterAndReleaseReset(t *testing.T) {
+	tr := appagent.NewHealthTracker()
+	tr.SetProviderID(opencode.ProviderID)
+	p := opencode.NewSPIProvider()
+	p.WithHealthReporter(func(h appagent.CapabilityHealth) {
+		if h.ProviderID == "" {
+			h.ProviderID = opencode.ProviderID
+		}
+		tr.Transition(h)
+	}, tr.RuntimeEpoch)
+
+	// 真实能力调用（binding 无效→degraded 观测进 tracker）。data 缺 port（协议
+	// 违约形态）但携带 taskId=t1（C6 身份键修复：观测按真实 task ID，与
+	// UpstreamSessionID=ses_a 区分）。
+	bad := bindomain.TaskBinding{Version: 1, ProviderID: opencode.ProviderID,
+		ProviderInstanceID: opencode.ProviderInstanceID, UpstreamSessionID: "ses_a",
+		TerminalRef: "t", Data: json.RawMessage(`{"taskId":"t1","directory":"/d"}`)}
+	_, _ = p.Events().Subscribe(context.Background(), bad)
+	var sawDegraded bool
+	for _, h := range tr.Snapshot() {
+		if h.TaskID == "t1" && h.State == appagent.CapDegraded {
+			sawDegraded = true
+		}
+	}
+	if !sawDegraded {
+		t.Error("能力调用失败未产生 degraded 观测（健康接线断裂）")
+	}
+
+	// 换代/释放生命周期：Bump→观测 epoch 跟随；Reset→runtime 观测清空。
+	if e := tr.BumpRuntimeEpoch("t1"); e != 1 {
+		t.Fatalf("epoch = %d, want 1", e)
+	}
+	tr.Transition(appagent.CapabilityHealth{ProviderID: opencode.ProviderID, TaskID: "t1",
+		Primitive: appagent.PrimitiveSessionControl, Scope: appagent.ScopeRuntime, State: appagent.CapAvailable})
+	if e := tr.RuntimeEpoch("t1"); e != 1 {
+		t.Errorf("RuntimeEpoch = %d, want 1", e)
+	}
+	// 释放侧：模拟 Release 成功终止 → OnRuntimeRelease→ResetRuntime。
+	tr.ResetRuntime("t1")
+	if e := tr.RuntimeEpoch("t1"); e != 0 {
+		t.Errorf("ResetRuntime 后 epoch = %d, want 0", e)
+	}
+	for _, h := range tr.Snapshot() {
+		if h.TaskID == "t1" && h.Scope != appagent.ScopeProvider {
+			t.Errorf("ResetRuntime 后残留 runtime 观测: %+v", h)
+		}
+	}
+}
+
+// TestMigrationImportGate 生产 migrationImportGate 直测（形态随
+// TestPermissionModeStartupGate）：
+//   - 成功路径：runner 完成（含单任务失败落账）→ open 恰好调用一次；
+//   - master 准入门失败（env 未设置）：fail-closed 拒绝启动、open 调用次数为
+//     零、任务状态零修改（候选屏障：零 env 读取先于一切结论）；
+//   - open 错误原样透传。
+func TestMigrationImportGate(t *testing.T) {
+	ctx := context.Background()
+	okEnv := func() {
+		t.Setenv(appagent.MasterSecretEnv, "gate-test-master")
+	}
+
+	// supProcBackend 构造真实 process.Manager（无 tmux server 的环境安全：
+	// ShowSessionEnv/HasSession 返回空/错误 → runner 按标记缺失/不可读处置，
+	// 无 panic——nil procMgr 会 panic，见 process.go）。
+	supProcBackend := func(t *testing.T) *process.Manager {
+		t.Helper()
+		tmpdir, err := process.EnsureTmpDir(t.TempDir())
+		if err != nil {
+			t.Fatalf("ensure tmpdir: %v", err)
+		}
+		return process.New(process.Options{SocketName: "ocdeck-test", Tmpdir: tmpdir,
+			BaseEnv: process.DefaultBaseEnv(os.LookupEnv)})
+	}
+
+	// ① 成功路径：单任务失败（无 runtime env 可读）不影响 gate 通过。
+	okEnv()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	if err := seedTaskForSubmissions(ctx, db); err != nil {
+		t.Fatalf("seed task: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE tasks SET status='active' WHERE id='t1'`); err != nil {
+		t.Fatalf("seed active: %v", err)
+	}
+	adapter := task.NewStoreAdapter(db)
+	tm := task.New(task.Options{
+		Cfg:       &config.Config{DataDir: t.TempDir(), ServePortRange: config.PortRange{Min: 50000, Max: 50099}},
+		Store:     adapter,
+		Proc:      supProcBackend(t),
+		Worktree:  task.NewWorktreeAdapter(nil),
+		OCFactory: func(_ string, port int, password string, opts appagent.Options) task.OCClient { return nil },
+	})
+	opened := 0
+	if err := migrationImportGate(ctx, tm, func() error { opened++; return nil }); err != nil {
+		t.Fatalf("gate success path: %v", err)
+	}
+	if opened != 1 {
+		t.Fatalf("open called %d times, want 1", opened)
+	}
+	var lastErr sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT last_error FROM tasks WHERE id='t1'`).Scan(&lastErr); err != nil {
+		t.Fatalf("read last_error: %v", err)
+	}
+	if !lastErr.Valid {
+		t.Error("single-task failure must be recorded via last_error")
+	}
+
+	// ② master 准入门失败：fail-closed + open 不被调用 + 任务状态零修改。
+	db2, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("open store2: %v", err)
+	}
+	defer db2.Close()
+	if err := seedTaskForSubmissions(ctx, db2); err != nil {
+		t.Fatalf("seed task2: %v", err)
+	}
+	if _, err := db2.ExecContext(ctx, `UPDATE tasks SET status='active', last_error=NULL WHERE id='t1'`); err != nil {
+		t.Fatalf("seed active2: %v", err)
+	}
+	os.Unsetenv(appagent.MasterSecretEnv)
+	t.Cleanup(func() { os.Unsetenv(appagent.MasterSecretEnv) })
+	tm2 := task.New(task.Options{
+		Cfg:       &config.Config{DataDir: t.TempDir(), ServePortRange: config.PortRange{Min: 50000, Max: 50099}},
+		Store:     task.NewStoreAdapter(db2),
+		Proc:      task.NewProcessAdapter(supProcBackend(t)),
+		Worktree:  task.NewWorktreeAdapter(nil),
+		OCFactory: func(_ string, port int, password string, opts appagent.Options) task.OCClient { return nil },
+	})
+	opened2 := 0
+	gateErr := migrationImportGate(ctx, tm2, func() error { opened2++; return nil })
+	if gateErr == nil || !strings.Contains(gateErr.Error(), "master secret") {
+		t.Fatalf("gate error = %v, want master secret gate failure", gateErr)
+	}
+	if opened2 != 0 {
+		t.Fatal("gate MUST NOT open on master secret failure")
+	}
+	var status string
+	var le sql.NullString
+	if err := db2.QueryRowContext(ctx, `SELECT status, last_error FROM tasks WHERE id='t1'`).Scan(&status, &le); err != nil {
+		t.Fatalf("read task2: %v", err)
+	}
+	if status != "active" || le.Valid {
+		t.Errorf("候选屏障：任务状态/last_error 零修改，got (%s, %+v)", status, le)
+	}
+
+	// ③ open 错误原样透传。
+	okEnv()
+	openErr := fmt.Errorf("open-boom-sentinel")
+	tm3 := task.New(task.Options{
+		Cfg:       &config.Config{DataDir: t.TempDir(), ServePortRange: config.PortRange{Min: 50000, Max: 50099}},
+		Store:     task.NewStoreAdapter(db),
+		Proc:      task.NewProcessAdapter(supProcBackend(t)),
+		Worktree:  task.NewWorktreeAdapter(nil),
+		OCFactory: func(_ string, port int, password string, opts appagent.Options) task.OCClient { return nil },
+	})
+	if got := migrationImportGate(ctx, tm3, func() error { return openErr }); got != openErr {
+		t.Fatalf("gate must pass through open error, got %v", got)
+	}
+}

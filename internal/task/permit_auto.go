@@ -24,13 +24,13 @@ import (
 	"strings"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/application/runtime"
 	ocdeckevent "ocdeck/internal/domain/event"
-	"ocdeck/internal/infrastructure/opencode"
 )
 
 // judgeScan 统一扫描入口：对 rt 的 pending 权限请求中未登记 ID 发起判定
-//（task-permission-mode D4）。任何失败仅记日志（注意力事件处理永不返回错误的
+// （task-permission-mode D4）。任何失败仅记日志（注意力事件处理永不返回错误的
 // 既有约定不变；调用方均为 fire-and-forget 触发位）。
 //
 // 入口零 DB/零阻塞（task-permission-mode F1）：judgeScan 可能被 SSE 事件处理路径
@@ -173,7 +173,7 @@ func (rt *taskRuntime) commitPermVerdict(epoch uint64, requestID, state string) 
 // 先（rt.mu 内）提交判定状态，提交成功后才发布 serve_runtime.permission_verdict
 // 唤醒事件（Topic=serve_runtime、RID=instVersion、Payload=ServeRuntimeTaskPayload{TaskID}，
 // D1 事件契约）；epoch 失配不写状态也不发事件。publish 未注入（测试构造）时 no-op
-//（与 RecordUserActivity 同一注入约定）。
+// （与 RecordUserActivity 同一注入约定）。
 func (m *Manager) settlePermVerdict(rt *taskRuntime, epoch uint64, requestID, state string) {
 	if !rt.commitPermVerdict(epoch, requestID, state) {
 		return
@@ -216,7 +216,7 @@ func permAuditVerdict(v PermissionVerdict) string {
 }
 
 // summarizeRequestDetail 由本次判定的同一份 RequestDetail 生成审计 detail 摘要
-//（task-permission-mode D11）：降级原因作为前缀（MUST NOT 被截掉）；最终串 UTF-8
+// （task-permission-mode D11）：降级原因作为前缀（MUST NOT 被截掉）；最终串 UTF-8
 // 长度 ≤1024 字节（前缀与截断标记均计入——生成时先预留前缀与标记空间再截断主体）；
 // 无详情时为空字符串。
 func summarizeRequestDetail(d RequestDetail) string {
@@ -304,9 +304,9 @@ func (m *Manager) recordPermAudit(taskID, taskName string, perm PendingPermissio
 // 终结路径恰好一条：UNCERTAIN/FAILED 判定终结即写（not_applicable）；APPROVE/REJECT
 // 已发送按结果写（ok 含 reply 字段 / gone / unknown / unsupported），未实际发送写
 // not_applicable 且不含 reply。detail 字段为本次判定同一份 RequestDetail 的摘要
-//（统一生成，禁止重读 metadata 另生成），所有终结分支含 detail。审计写入自身不再受
+// （统一生成，禁止重读 metadata 另生成），所有终结分支含 detail。审计写入自身不再受
 // permGate 拦截，写入失败仅记日志；审计文件 IO 无独立取消/deadline，Record 同步执行
-//（极端缓慢 Write 会拖住本 goroutine 与停止 join，见 recordPermAudit 生命周期界限）。
+// （极端缓慢 Write 会拖住本 goroutine 与停止 join，见 recordPermAudit 生命周期界限）。
 func (m *Manager) judgeAndReply(ctx context.Context, rt *taskRuntime, tok runtime.InstVersion, epoch uint64, platform PermissionJudgeInput, perm PendingPermission) {
 	// 条间复核（F2）：批内逐条进入 Judge 前复核——终止（stop/unsupported）、实例被替换
 	// 或 ctx 已取消时剩余条目不再进入 Judge（外层循环继续、逐条在本检查处返回；
@@ -378,12 +378,12 @@ func (m *Manager) judgeAndReply(ctx context.Context, rt *taskRuntime, tok runtim
 		m.settlePermVerdict(rt, epoch, perm.ID, permVerdictSettledNoNotify)
 		log.Printf("task %s: ai-auto replied %s to %s (%s)", rt.taskID, reply, perm.ID, perm.Permission)
 		m.recordPermAudit(rt.taskID, platform.TaskName, perm, auditVerdict, "ok", reply, auditDetail)
-	case errors.Is(rerr, opencode.ErrPermissionRequestGone):
+	case errors.Is(rerr, appagent.ErrPermissionRequestGone):
 		// 人工竞态：请求已了结，正常忽略（D6 分类 ③）。
 		m.settlePermVerdict(rt, epoch, perm.ID, permVerdictSettledNoNotify)
 		log.Printf("task %s: ai-auto reply %s: request already resolved (race), ignored", rt.taskID, perm.ID)
 		m.recordPermAudit(rt.taskID, platform.TaskName, perm, auditVerdict, "gone", "", auditDetail)
-	case errors.Is(rerr, opencode.ErrCapabilityUnsupported):
+	case errors.Is(rerr, appagent.ErrCapabilityUnsupported):
 		// 路由 404：该 runtime 无回复端点 → 标记 reply-unsupported，停止后续判定（D6 分类 ③）。
 		m.settlePermVerdict(rt, epoch, perm.ID, permVerdictManualRequired)
 		rt.mu.Lock()

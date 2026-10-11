@@ -17,7 +17,7 @@ import (
 	"strings"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/infrastructure/opencode"
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/infrastructure/process"
 	"ocdeck/internal/infrastructure/pty"
 )
@@ -77,49 +77,50 @@ type ProcessBackend interface {
 	AttachPty(name string, cols, rows int) (*pty.Pty, error)
 }
 
-// OCClient 抽象 opencode.Client 的 REST/SSE 能力。
+// OCClient 抽象任务 runtime REST/SSE 客户端的传输能力（opencode-v1-spi-provider
+// tasks 3.6：签名已中性化——DTO/错误 sentinel 经 application/agentprovider
+// provider-neutral 类型表达；v1 实现方为 opencode 适配器（infrastructure 层 *Client）。
 type OCClient interface {
-	Health(ctx context.Context) (opencode.HealthResponse, error)
+	Health(ctx context.Context) (appagent.HealthResponse, error)
 	Probe(ctx context.Context) (version string, err error)
-	ListSessions(ctx context.Context, dir string, limit int) ([]opencode.Session, error)
-	GetSession(ctx context.Context, dir, id string) (opencode.Session, error)
-	CreateSession(ctx context.Context, dir, title string) (opencode.Session, error)
+	ListSessions(ctx context.Context, dir string, limit int) ([]appagent.Session, error)
+	GetSession(ctx context.Context, dir, id string) (appagent.Session, error)
+	CreateSession(ctx context.Context, dir, title string) (appagent.Session, error)
 	DeleteSession(ctx context.Context, dir, id string) error
-	SessionStatus(ctx context.Context, dir string) (map[string]opencode.SessionStatus, error)
-	SubscribeEvents(ctx context.Context, dir string, onEvent func(opencode.Event), onReconnect func()) error
+	SessionStatus(ctx context.Context, dir string) (map[string]appagent.SessionStatus, error)
+	SubscribeEvents(ctx context.Context, dir string, onEvent func(appagent.Event), onReconnect func()) error
 	// ListPermissions GET /permission → pending 权限请求快照（design.md D6 注意力信号）。
-	// 404 → opencode.ErrCapabilityUnsupported（能力状态机迁移 unsupported）。
-	ListPermissions(ctx context.Context, dir string) ([]opencode.PermissionRequest, error)
+	// 404 → appagent.ErrCapabilityUnsupported（能力状态机迁移 unsupported）。
+	ListPermissions(ctx context.Context, dir string) ([]appagent.PermissionRequest, error)
 	// ListQuestions GET /question → pending 问题请求快照（design.md D6）。
-	ListQuestions(ctx context.Context, dir string) ([]opencode.QuestionRequest, error)
+	ListQuestions(ctx context.Context, dir string) ([]appagent.QuestionRequest, error)
 	// ReplyPermission POST /permission/{id}/reply，对单条权限请求回复 once/reject
 	//（task-permission-mode D6；调用方 MUST NOT 传 always，spec 契约）。
-	// 结果映射见 *opencode.Client.ReplyPermission：竞态 404 →
-	// opencode.ErrPermissionRequestGone（正常忽略）；路由 404 →
-	// opencode.ErrCapabilityUnsupported（唯一允许标记 reply-unsupported 的形态）；
+	// 结果映射（v1 client 现状）：竞态 404 →
+	// appagent.ErrPermissionRequestGone（正常忽略）；路由 404 →
+	// appagent.ErrCapabilityUnsupported（唯一允许标记 reply-unsupported 的形态）；
 	// 其余错误一律按「已发送、结果未知」处置（不重试、不补偿、不本地断言状态）。
 	ReplyPermission(ctx context.Context, dir, requestID, reply string) error
 	// PromptAsync 投递一条 text prompt 到目标 session 的异步队列（design.md D1）。
-	// 返回 transport DTO（不返回 error）；签名与 *opencode.Client 逐字一致。
+	// 返回 transport DTO（不返回 error）；签名与 v1 client 逐字一致。
 	// adapter 获取失败（taskOcClient ok=false）由 PromptPort 返回 pre_send_failure（D1），
 	// 不属于本接口的职责。
-	PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []opencode.PromptFilePart) opencode.PromptResult
+	PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []appagent.PromptFilePart) appagent.PromptTransportResult
 	// ProbePromptAsyncCapability 探测目标 serve 是否支持 prompt_async（design.md D1）。
 	// GET /doc 结构化解析，返回 supported/unsupported/unknown 三值。
-	// 签名与 *opencode.Client 逐字一致；adapter 在 RuntimePort.ProbeCapability 复用。
-	ProbePromptAsyncCapability(ctx context.Context) opencode.CapabilityState
+	// 签名与 v1 client 逐字一致；adapter 在 RuntimePort.ProbeCapability 复用。
+	ProbePromptAsyncCapability(ctx context.Context) appagent.ProbeCapabilityState
 	// UpdateSessionTitle PATCH /session/{id}?directory=...（task-info-editable D3）。
-	// body {"title": ...}，成功响应校验 ID；404 → opencode.ErrSessionTitleUnsupported
-	//（能力降级判定，D3 404 二分取消）。签名与 *opencode.Client 逐字一致。
+	// body {"title": ...}，成功响应校验 ID；404 → appagent.ErrSessionTitleUnsupported
+	//（能力降级判定，D3 404 二分取消）。签名与 v1 client 逐字一致。
 	UpdateSessionTitle(ctx context.Context, dir, id, title string) error
 }
 
-// 编译期断言：*opencode.Client 实现 OCClient（签名 MUST 与 *Client 逐字一致，
-// design.md D1）。factory 直接返回 *opencode.Client（manager.go:448）。
-var _ OCClient = (*opencode.Client)(nil)
-
-// OCClientFactory 构造指向某 serve（port+password）的 OCClient。
-type OCClientFactory func(port int, password string, opts opencode.Options) OCClient
+// OCClientFactory 构造指向某 serve（port+password）的 OCClient（生产装配经
+// provider registry 注入；Manager 构造期要求必须提供——缺失即构造失败）。
+// providerID 为目标任务持久化 binding 的 provider 标识（C2 门禁修复：生产工厂
+// 经该标识分派对应 provider 的传输实现；未知标识 fail-closed）。
+type OCClientFactory func(providerID string, port int, password string, opts appagent.Options) OCClient
 
 // WorktreeBackend 抽象 worktree.Manager。
 type WorktreeBackend interface {
@@ -203,7 +204,7 @@ type PermissionJudgeInput struct {
 // ai-auto 行为 = 全部转人工（防御回退，同 namer nil 防御）。
 //
 // 实现内部完成 LLM 调用与输出解析；Judge 自其入口派生 10s 总 deadline
-//（初次调用与能力协商重试共用，ai.PermJudge 承担）。
+// （初次调用与能力协商重试共用，ai.PermJudge 承担）。
 type PermissionJudge interface {
 	// Judge 返回 approve/reject/uncertain；err 非 nil 一律不回复（转人工）。
 	// 未配置与输出非法返回 uncertain + 非 nil error（供审计区分 FAILED 与真实
@@ -240,7 +241,7 @@ type PermAuditRecord struct {
 
 // PermAuditLogger ai-auto 判定审计端口（task-permission-mode D11，窄端口）：
 // 消费者在每次判定尝试终结时调用恰好一次；写入错误必须返回给调用方
-//（消费者降级为普通日志，旁路——MUST NOT 影响判定/回复）。nil 防御：未装配时
+// （消费者降级为普通日志，旁路——MUST NOT 影响判定/回复）。nil 防御：未装配时
 // 零写入、行为与无审计完全一致；装配侧 MUST 保持 nil 接口，MUST NOT 注入持有
 // nil 指针的非 nil interface。
 type PermAuditLogger interface {

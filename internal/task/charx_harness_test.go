@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	apptask "ocdeck/internal/application/task"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/opencode"
@@ -54,15 +55,20 @@ func newCharxProc() *charxProc {
 	return &charxProc{mockProc: newMockProc()}
 }
 
-// charxAuthShape 把会话 env 中的随机密码归一化为长度形状（"none" / "pw(<n>)"）。
-// 密码长度本身是行为相关量（v1 现状 32 字节 hex = 64；阶段 3 派生凭据为 32 字符
-// base64url——形状漂移应被保护网捕获）。
+// charxAuthShape 把会话 env 中的凭据归一化为「来源标记/密码长度形状」
+// （"none" / "derived/pw(<n>)" / "legacy/pw(<n>)"）。密码长度本身是行为相关量
+// （v1 派生凭据 = 32 字符 base64url——形状漂移应被保护网捕获）；来源标记为
+// D3 非秘密判定材料（C2c 裁决 1：派生形状为 golden 契约）。
 func charxAuthShape(env map[string]string) string {
 	pw, ok := env["OPENCODE_SERVER_PASSWORD"]
 	if !ok || pw == "" {
 		return "none"
 	}
-	return fmt.Sprintf("pw(%d)", len(pw))
+	kind := env[appagent.CredKindEnvKey]
+	if kind == "" {
+		return fmt.Sprintf("none-kind/pw(%d)", len(pw))
+	}
+	return fmt.Sprintf("%s/pw(%d)", kind, len(pw))
 }
 
 func (p *charxProc) NewSession(spec process.SessionSpec) error {
@@ -140,6 +146,9 @@ type charxEnv struct {
 // newCharxEnv 装配 characterization 环境：真实 OCClient → fake server。
 func newCharxEnv(t *testing.T, opts charxEnvOpts) *charxEnv {
 	t.Helper()
+	// harness 固定 master secret（迁移导入防御比对/派生凭据 golden 依赖；测试
+	// 内覆盖经 t.Setenv 仍可显式覆写——env 优先序）。
+	t.Setenv(appagent.MasterSecretEnv, "charx-test-master-secret")
 	srv := newFakeOCServer(t)
 	env := newCharxEnvOnServer(t, srv, newMockStore(), newCharxProc(), opts)
 	return env
@@ -158,6 +167,9 @@ func newCharxEnvOnServer(t *testing.T, srv *fakeOCServer, store *mockStore, proc
 // （harness 读取断言与 OwnerOf 归属反查用）。
 func newCharxEnvOnTaskStore(t *testing.T, srv *fakeOCServer, ts TaskStore, ms *mockStore, proc *charxProc, opts charxEnvOpts) *charxEnv {
 	t.Helper()
+	// harness 固定 master secret（迁移导入防御比对/派生凭据 golden 依赖；测试
+	// 内覆盖经 t.Setenv 仍可显式覆写——env 优先序）。
+	t.Setenv(appagent.MasterSecretEnv, "charx-test-master-secret")
 	proc.killAfterNew = opts.killAfterNew
 	wt := newMockWorktree()
 	// 缺省区间从 fake 端口 +1 起顺延，使 fixture 的端口分配对本机环境确定。
@@ -170,18 +182,18 @@ func newCharxEnvOnTaskStore(t *testing.T, srv *fakeOCServer, ts TaskStore, ms *m
 	if opts.retryRange {
 		pr = config.PortRange{Min: fakeMapped - 2, Max: fakeMapped}
 	}
-	var factory OCClientFactory = func(port int, password string, o opencode.Options) OCClient {
+	factory := func(_ string, port int, password string, o appagent.Options) OCClient {
 		// 默认：全部端口映射到 fake server（fixture 上游唯一）。
-		return opencode.NewClient(srv.port, password, o)
+		return opencode.NewClient(srv.port, password, opencode.OptionsFromNeutral(o))
 	}
 	if opts.deadPorts {
 		// 端口重试变体：仅映射端口指向 fake server，其余按真实端口构造——
 		// 死端口上健康检查连接拒绝 → 端口轮换直至命中映射端口。
-		factory = func(port int, password string, o opencode.Options) OCClient {
+		factory = func(_ string, port int, password string, o appagent.Options) OCClient {
 			if port == fakeMapped {
-				return opencode.NewClient(srv.port, password, o)
+				return opencode.NewClient(srv.port, password, opencode.OptionsFromNeutral(o))
 			}
-			return opencode.NewClient(port, password, o)
+			return opencode.NewClient(port, password, opencode.OptionsFromNeutral(o))
 		}
 	}
 	cfg := &config.Config{DataDir: t.TempDir(), ServePortRange: pr, ShutdownPolicy: config.ShutdownPersist}
@@ -197,18 +209,28 @@ func newCharxEnvOnTaskStore(t *testing.T, srv *fakeOCServer, ts TaskStore, ms *m
 		Sessions: appAdapter,
 		Publish:  pub,
 	})
-	m := New(Options{Cfg: cfg, Store: ts, Proc: proc, Worktree: wt, OCFactory: factory, Lifecycle: lifecycleSvc})
+	m := New(Options{Cfg: cfg, Store: ts, Proc: proc, Worktree: wt, OCFactory: factory, Lifecycle: lifecycleSvc,
+		ProviderRegistry: newTestRegistry()})
 	// 短健康轮询与零退避：fixture 在秒级收敛（生产默认值不变，仅测试注入）。
 	m.recoveryBackoffFn = func(int) time.Duration { return 0 }
 	m.serveReadyTimeout = 60 * time.Millisecond
 	m.serveReadyPollInterval = 5 * time.Millisecond
 	m.probeColdStartBackoffFn = func() []time.Duration { return []time.Duration{time.Millisecond} }
+	// 删除清理临时绑定入口（与生产 registry.Supervisor() 装配同形）；runtime
+	// supervisor 保持 nil——charx 行为保持矩阵按 ora-4 约定锁定内联 golden
+	// 锚定路径（双路径等价验证经 charx_dualpath_equiv_test.go 单独承载）。
+	injectEphemeralSupervisorForTestWithPort(t, m, ms, proc, srv.port)
 	lifeCtx, cancel := context.WithCancel(context.Background())
 	m.SetLifecycleCtx(lifeCtx)
 	t.Cleanup(cancel)
 	return &charxEnv{t: t, srv: srv, store: ms, proc: proc, wt: wt, m: m, pub: pub,
 		fakeMapped: fakeMapped, lifeCancel: cancel, portRange: pr}
 }
+
+// portHealthy 返回 fake server 的真实监听端口（迁移导入等直接与 srv.port 对接的
+// fixture 用：legacy env 端口、binding data.port 断言——与契约测试的「健康检查
+// 可达端口」语义一致）。
+func (e *charxEnv) portHealthy() int { return e.srv.port }
 
 // norm 把运行期动态端口归一化为稳定 token（快照/期望值可写成字面量）：
 // fake 端口 → FAKE；fake-1..-3 → DEAD1..3（端口重试死端口）；fake+1..+3 → PT1..3

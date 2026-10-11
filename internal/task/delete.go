@@ -8,10 +8,11 @@ import (
 	"os"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	ocdecksess "ocdeck/internal/domain/session"
 	ocdecktask "ocdeck/internal/domain/task"
-	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // Delete 删除任务（design.md §19 Delete 行 + §12）。
@@ -99,6 +100,17 @@ func (m *Manager) Delete(ctx context.Context, taskID string, mode DeleteMode, co
 	}
 
 	// ① 持久化 delete_mode + 置 deleting（原子）。
+	// C7 残余（review attempt 2）：删除准入——首次状态/进程副作用（deleting 提交）
+	// 前按任务 provider 做 registry 准入（specs「Provider registry 分派」）。未注册
+	// 任务零副作用拒绝删除（binding/归属/锚定/状态全不变；诊断性 last_error 允许）。
+	// mutation 证据（已验证 → 红）：准入旁路（`if false &&`）→ TestC7_Delete
+	// UnknownProviderZeroSideEffects 红（deleting 提交逃逸 + DeleteTask 执行）。
+	if aerr := m.registryAdmitTask(ctx, taskID); aerr != nil {
+		if isProviderNotFound(aerr) {
+			m.recordAdmissionError(ctx, taskID, aerr)
+		}
+		return newOpErr(codeInternal, aerr)
+	}
 	updated, err := m.writeBeginDeleteIntent(ctx, taskID, string(mode), []string{
 		StatusSuspended, StatusArchived, StatusCreationFailed, StatusDeletionFailed,
 	})
@@ -495,50 +507,29 @@ func (m *Manager) deleteOCSessions(ctx context.Context, row TaskRow) error {
 	if len(sessions) == 0 {
 		return nil
 	}
-	// 取得 serve 端口与密码：优先复用活跃 serve，否则起一次性 serve。
-	serveName := runtimeSessionName(row.ID)
-	alive, _ := m.proc.HasSession(serveName)
-	if !alive {
-		if legacyAlive, _ := m.proc.HasSession(serveSessionName(row.ID)); legacyAlive {
-			serveName = serveSessionName(row.ID)
-			alive = true
-		}
+	// 取得连接事实（opencode-v1-spi-provider tasks 4.3 / design D9 删除清理行 +
+	// D10 例外行）：
+	//   分支① 有持久化 binding 且 runtime 会话存活 → 直接复用 binding 端点/凭据；
+	//   分支② 无可复用 runtime（无 binding 或 binding 解析失败/会话已终止）→
+	//     AcquireEphemeral 内存临时绑定（不落库、不锚定、不建 SSE、不提交 active；
+	//     陈旧 binding MUST NOT 走普通 Resume），临时 runtime 清理失败阻断任务删除。
+	// tmux env 反查退役（特许例外仅迁移导入 runner 与本路径的临时 runtime 形态——
+	// 凭据由 supervisor 派生注入，删除侧不经 env 读回）。
+	port, password, serveName, ephemeral, setupErr := m.deleteCleanupConnect(ctx, row)
+	if setupErr != nil {
+		return setupErr
 	}
-	var port int
-	var password string
 	var errs []error
-	// tempServeStarted 标记是否起了临时 serve：临时 serve MUST 在 oc session 删除完成后
-	// 显式 kill 并聚合结果进 errs（不得用 defer——defer 在返回值计算后才追加，非 clean
-	// 清理错误不会进入返回值，调用方会越过 DB 提交点继续删 worktree/DB 致 tickets 丢失）。
-	tempServeStarted := false
-	if alive {
-		pw, err := m.proc.ShowSessionEnv(serveName, "OPENCODE_SERVER_PASSWORD")
-		if err != nil || pw == "" {
-			return fmt.Errorf("recover serve password: %w", err)
-		}
-		password = pw
-		// FIX4：端口 MUST 取 serve 会话内 OCDECK_SERVE_PORT（权威来源，design.md §3/§5），
-		// 读回失败按既有规则 fail（不得用 last_port 兜底——密码已从 tmux env 恢复，
-		// 端口同规则，last_port 仅记录非事实来源，MUST NOT 回退）。
-		portStr, perr := m.proc.ShowSessionEnv(serveName, "OCDECK_SERVE_PORT")
-		if perr != nil || portStr == "" {
-			return fmt.Errorf("recover serve port for oc session delete: %w", perr)
-		}
-		p, ok := parsePort(portStr)
-		if !ok {
-			return fmt.Errorf("invalid serve port %q for oc session delete", portStr)
-		}
-		port = p
-	} else {
-		// 起一次性 serve（design.md §12）。
-		var err error
-		port, password, err = m.startTempServe(ctx, row)
-		if err != nil {
-			return err
-		}
-		tempServeStarted = true
+	// ephemeralStartup 标记走了 AcquireEphemeral 分支：临时 runtime MUST 在 oc session
+	// 删除完成后显式终止并聚合结果进 errs（不得用 defer——defer 在返回值计算后才追加，
+	// 非 clean 清理错误不会进入返回值，调用方会越过 DB 提交点继续删 worktree/DB 致
+	// tickets 丢失；D10：临时 runtime 终止非净或清理落账失败 MUST 阻断任务 DB 删除）。
+	ephemeralStarted := ephemeral
+	deleteProviderID := row.ProviderID
+	if deleteProviderID == "" {
+		deleteProviderID = store.ProviderIDV1
 	}
-	oc := m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 10 * time.Second})
+	oc := m.ocFactory(deleteProviderID, port, password, appagent.Options{HealthTimeout: 2 * time.Second, OpTimeout: 10 * time.Second})
 	// D3：逐项删除，不短路。每项失败聚合到 errs，仍继续处理剩余项，
 	// 使已成功删除的 session 行同步落账，避免只删了一半就中止。
 	for _, s := range sessions {
@@ -560,15 +551,15 @@ func (m *Manager) deleteOCSessions(ctx context.Context, row TaskRow) error {
 			errs = append(errs, fmt.Errorf("delete session row %s: %w", s.SessionID, derr))
 		}
 	}
-	// 一次性 serve 清理（显式步骤，非 defer）：KillSession 结果与 notice 写入错误
+	// 临时 runtime 清理（显式步骤，非 defer）：终止结果与 notice 写入错误
 	// MUST 聚合进 errs，使 Delete 落 deletion_failed，tickets 落库后才可重试，
-	// 不随后续 worktree/DB 删除的 CASCADE 永久丢失（design.md §8/§19）。
+	// 不随后续 worktree/DB 删除的 CASCADE 永久丢失（design.md §8/§19 + D10 例外行）。
 	// 非 clean disposition 或 kill 错误 MUST 阻止越过 DB 提交点。
-	if tempServeStarted {
+	if ephemeralStarted {
 		res, kerr := m.proc.KillSession(serveName)
 		if kerr != nil {
 			// kill 基础设施错误：记 notice（reason=kill_failed, retryable=true）。
-			errs = append(errs, fmt.Errorf("kill temp serve %s: %w", serveName, kerr))
+			errs = append(errs, fmt.Errorf("kill temp runtime %s: %w", serveName, kerr))
 			if nerr := m.recordResidualNotice(ctx, row.ID, serveName, res.CleanupTickets, noticeReasonKillFailed, true); nerr != nil {
 				errs = append(errs, nerr)
 			}
@@ -578,49 +569,93 @@ func (m *Manager) deleteOCSessions(ctx context.Context, row TaskRow) error {
 				errs = append(errs, nerr)
 			}
 			if cls.action != "none" {
-				errs = append(errs, fmt.Errorf("temp serve %s cleanup not clean: %s", serveName, cls.reason))
+				errs = append(errs, fmt.Errorf("temp runtime %s cleanup not clean: %s", serveName, cls.reason))
 			}
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// startTempServe 起一次性 serve 会话用于删除 oc session 数据（design.md §12）。
-func (m *Manager) startTempServe(ctx context.Context, row TaskRow) (int, string, error) {
-	port, err := m.allocatePort(row.LastPort, 0)
-	if err != nil {
-		return 0, "", err
+// deleteCleanupConnect 按删除清理分支规则建立 oc session 删除的连接事实：
+// 返回 (port, password, runtime 会话名, 是否临时 runtime)。分支语义见
+// deleteOCSessions 头注释（design D9 删除清理行 / D10 例外行）。
+func (m *Manager) deleteCleanupConnect(ctx context.Context, row TaskRow) (int, string, string, bool, error) {
+	runtimeName := runtimeSessionName(row.ID)
+	serveName := runtimeName
+	alive, _ := m.proc.HasSession(runtimeName)
+	if !alive {
+		if legacyAlive, _ := m.proc.HasSession(serveSessionName(row.ID)); legacyAlive {
+			// legacy -serve 会话仍按既有清理矩阵处理（非 binding 路径——旧二进制
+			// 存量形态属迁移导入 runner 特许域）。
+			serveName = serveSessionName(row.ID)
+			alive = true
+		}
 	}
-	password := newRandomPassword()
-	serveName := runtimeSessionName(row.ID)
-	env := map[string]string{"OPENCODE_SERVER_PASSWORD": password, "OCDECK_TASK_ID": row.ID}
-	// 权限模式恒为 ask（task-permission-mode D3）：temp serve 仅用于清理 oc session 数据，
-	// 不承载任务权限语义，argv 与现状逐字一致。
-	if err := m.proc.NewSession(newSessionSpec(serveName, row.WorktreePath, env,
-		runtimeCmdArgv(port, "", PermissionModeAsk))); err != nil {
-		return 0, "", err
-	}
-	// 等待就绪。
-	oc := m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 5 * time.Second})
-	if err := m.waitServeReady(ctx, oc); err != nil {
-		// 健康失败：kill 一次性 serve，其 KillSession 结果与 tickets 不得丢弃——
-		// 非 clean / kill 错误 MUST 记 notice 聚合返回（design.md §8/§19），tickets 不随后续删除 CASCADE 丢失。
-		res, kerr := m.proc.KillSession(serveName)
-		if kerr != nil {
-			if nerr := m.recordResidualNotice(ctx, row.ID, serveName, res.CleanupTickets, noticeReasonKillFailed, true); nerr != nil {
-				return 0, "", fmt.Errorf("temp serve health check: %w; kill failed: %v; record notice: %v", err, kerr, nerr)
+	// 分支①：persisted binding 可解析 + runtime 会话存活/健康 → 复用 binding。
+	if alive && serveName == runtimeName {
+		if data, pw, rerr := m.resolveRuntimeBinding(ctx, row.ID); rerr == nil {
+			// 复用前健康校验（陈旧 binding 的 runtime 可能已重启且凭据失效）。
+			oc := m.ocFactory(data.ProviderID, data.Port, pw, appagent.Options{HealthTimeout: 2 * time.Second, OpTimeout: 5 * time.Second})
+			if _, herr := oc.Health(ctx); herr == nil {
+				return data.Port, pw, runtimeName, false, nil
 			}
-			return 0, "", fmt.Errorf("temp serve health check: %w; kill failed: %v", err, kerr)
 		}
-		if nerr := m.recordResidualNoticeFromDisposition(ctx, row.ID, serveName, res); nerr != nil {
-			return 0, "", fmt.Errorf("temp serve health check: %w; record notice: %v", err, nerr)
-		}
-		if cls := classifyKillResult(res); cls.action != "none" {
-			return 0, "", fmt.Errorf("temp serve health check: %w; cleanup not clean: %s", err, cls.reason)
-		}
-		return 0, "", fmt.Errorf("temp serve health check: %w", err)
+		// binding 陈旧/凭据失效 → 落分支②（MUST NOT 走普通 Resume 触发恢复）。
+		alive = false
 	}
-	return port, password, nil
+	// legacy 分支（旧二进制 -serve 存量，binding 未覆盖；保持既有 env 反查——
+	// 语义等同迁移导入桥接例外，删除路径不做行为收敛）。
+	if alive && serveName != runtimeName {
+		pw, err := m.proc.ShowSessionEnv(serveName, "OPENCODE_SERVER_PASSWORD")
+		if err != nil || pw == "" {
+			return 0, "", "", false, fmt.Errorf("recover serve password: %w", err)
+		}
+		portStr, perr := m.proc.ShowSessionEnv(serveName, "OCDECK_SERVE_PORT")
+		if perr != nil || portStr == "" {
+			return 0, "", "", false, fmt.Errorf("recover serve port for oc session delete: %w", perr)
+		}
+		port, ok := parsePort(portStr)
+		if !ok {
+			return 0, "", "", false, fmt.Errorf("invalid serve port %q for oc session delete", portStr)
+		}
+		return port, pw, serveName, false, nil
+	}
+	// 分支②：AcquireEphemeral 内存临时绑定（design D9a 分支②/D10）——经 registry
+	// 分派 supervisor（未注册 fail-closed），端口+进程+健康；无锚定 bootstrap、无
+	// claim、无对齐、无任务状态提交、不读/不写 env 快照与启动事实；返回值仅存内存
+	//（MUST NOT 持久化）。陈旧 binding 不参与（MUST NOT 走普通 Resume 触发恢复）。
+	if err := m.registryDispatch(store.ProviderIDV1); err != nil {
+		return 0, "", "", false, err
+	}
+	if m.ephemeralSupervisor == nil {
+		return 0, "", "", false, appagent.NewError("supervisor.acquire_ephemeral",
+			appagent.ErrKindCapabilityUnavailable, errors.New("supervisor 未注入"))
+	}
+	binding, aerr := m.ephemeralSupervisor.AcquireEphemeral(ctx, appagent.TaskRef{
+		TaskID:    row.ID,
+		Directory: row.WorktreePath,
+		Mode:      taskModeForRef(row),
+	})
+	if aerr != nil {
+		return 0, "", "", false, fmt.Errorf("acquire ephemeral runtime for oc session delete: %w", aerr)
+	}
+	eddata, derr := decodeV1BindingData(binding)
+	if derr != nil {
+		return 0, "", "", false, fmt.Errorf("decode ephemeral binding: %w", derr)
+	}
+	epw, err2 := eddata.password()
+	if err2 != nil {
+		return 0, "", "", false, fmt.Errorf("resolve ephemeral credential: %w", err2)
+	}
+	return eddata.Port, epw, binding.TerminalRef, true, nil
+}
+
+// taskModeForRef 解析 TaskRef 的 mode 字段（provider 契约值：worktree|local-path）。
+func taskModeForRef(row TaskRow) string {
+	if row.Mode == TaskModeLocalPath {
+		return TaskModeLocalPath
+	}
+	return TaskModeWorktree
 }
 
 // killResidualSessions kill 残余 tmux 会话（serve/tui/shell）。

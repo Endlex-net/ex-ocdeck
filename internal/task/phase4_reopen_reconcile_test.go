@@ -109,15 +109,17 @@ func TestReopenAttach_NonActiveInvalidState(t *testing.T) {
 func seedPersistRuntime(t *testing.T, store *mockStore, proc *mockProc) {
 	t.Helper()
 	seedSuspendedTask(store, "t1", "p1")
-	snap := envSnapshot{Vars: map[string]string{"OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1"}}
+	snap := envSnapshot{Vars: map[string]string{"OCDECK_TASK_ID": "t1"}}
 	snapBytes, _ := encodeEnvSnapshot(snap)
 	store.mutTask("t1", func(r *TaskRow) { r.EnvSnapshot = snapBytes })
 	// 启动事实（D5 三路径矩阵②）：persist 前进程经 startRuntimeWithPortRetry 写入，
 	// resumeActive 注册前读校验。
 	store.seedPermissionModeAtStart("t1", PermissionModeAIAuto)
+	// tasks 4.3：恢复凭据/端口从 persisted binding 解析；OCDECK_TASK_ID 复检保留。
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 	proc.sessions[runtimeSessionName("t1")] = true
 	proc.envValues[runtimeSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
+		"OCDECK_TASK_ID": "t1",
 	}
 }
 

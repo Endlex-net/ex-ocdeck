@@ -12,8 +12,9 @@ import (
 	"testing"
 	"time"
 
-	apptask "ocdeck/internal/application/task"
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/application/runtime"
+	apptask "ocdeck/internal/application/task"
 	"ocdeck/internal/config"
 	ocdeckevent "ocdeck/internal/domain/event"
 	ocdecksess "ocdeck/internal/domain/session"
@@ -115,14 +116,20 @@ func newP18ManagerStores(t *testing.T, adapterStore *mockStore, mngStore TaskSto
 		ServePortRange: config.PortRange{Min: 50000, Max: 50999},
 		ShutdownPolicy: config.ShutdownPersist,
 	}
+	// tasks 4.3：runtime 连接分派按 registry（注入注册了 opencode-v1 的 registry）。
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatalf("register test provider: %v", err)
+	}
 	m := New(Options{
 		Cfg: cfg, Store: mngStore, Proc: proc, Worktree: newMockWorktree(),
-		OCFactory: func(port int, password string, opts opencode.Options) OCClient {
+		OCFactory: func(_ string, port int, password string, opts appagent.Options) OCClient {
 			hook.onReady = opts.OnReady
 			hook.onDisconnect = opts.OnDisconnect
 			return hook
 		},
-		Lifecycle: svc,
+		Lifecycle:        svc,
+		ProviderRegistry: reg,
 	})
 	m.SetLifecycleCtx(context.Background())
 	return m, pub, hook
@@ -162,15 +169,10 @@ func p18PendingRuntime(m *Manager, taskID string, sids ...string) (*taskRuntime,
 	return rt, a
 }
 
-// p18SetP18Env 为后台重试（taskOcClient 经 ShowSessionEnvContext 读 serve env）预置 env。
-func p18SetServeEnv(proc *mockProc, taskID string) {
-	proc.mu.Lock()
-	defer proc.mu.Unlock()
-	proc.envValues[runtimeSessionName(taskID)] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw",
-		"OCDECK_SERVE_PORT":        "50001",
-	}
-}
+// p18SetServeEnv（退役占位）：tasks 4.3 事实来源切换后，后台对账的连接事实来自
+// persisted binding（seedDerivedBinding）；tmux env 预置退役。保留空实现以避免
+// 历史调用点噪音。
+func p18SetServeEnv(_ *mockProc, _ string) {}
 
 // --- 唯一 apply：聚合 / delta / 无变化不发布 ---
 
@@ -278,7 +280,7 @@ func TestP18_Apply_AggregationAndDelta(t *testing.T) {
 // --- 对账：交集过滤 / 缺失 idle / 空 owned 省略 ---
 
 // TestP18_Probe_IntersectAndIdleDefault 验证 REST 目录级状态 map 与 owned 取交集
-//（他任务 session 忽略）、owned 缺失按 idle、对账成功进入 valid（P1.8.6）。
+// （他任务 session 忽略）、owned 缺失按 idle、对账成功进入 valid（P1.8.6）。
 func TestP18_Probe_IntersectAndIdleDefault(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
@@ -332,7 +334,8 @@ func TestP18_ReconcileFailure_BackgroundRetry(t *testing.T) {
 	seedActiveTask(store, "t1", "p1")
 	ctx := context.Background()
 	proc := newMockProc()
-	p18SetServeEnv(proc, "t1")
+	// tasks 4.3：后台对账经 persisted binding 分派（tmux env 预置退役）。
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 
 	oc := newMockOC(true)
 	oc.sessionStatusErr = errors.New("probe down")
@@ -371,8 +374,8 @@ func TestP18_ReconcileFailure_BackgroundRetry(t *testing.T) {
 // --- 连接代：断流顺序 / 陈旧写回 / 阶段门控 ---
 
 // TestP18_DisconnectSequenceAndTokenValidation 经 startSSE 全链验证断流顺序
-//（disconnect→unavailable→reconnect+reconcile→available）与 runtime 激活代身份校验
-//（旧实例回调不得触碰新实例，B4）。
+// （disconnect→unavailable→reconnect+reconcile→available）与 runtime 激活代身份校验
+// （旧实例回调不得触碰新实例，B4）。
 func TestP18_DisconnectSequenceAndTokenValidation(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
@@ -386,7 +389,7 @@ func TestP18_DisconnectSequenceAndTokenValidation(t *testing.T) {
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
 	rt.registerGroup(roleRuntime, runtimeSessionName("t1"))
-	if err := m.startSSE(context.Background(), rt, "t1", "/data/worktrees/p1/t1", 50001, "pw", AlignModeRepo); err != nil {
+	if err := m.startSSE(context.Background(), rt, "t1", "/data/worktrees/p1/t1", 50001, "pw", AlignModeRepo, nil); err != nil {
 		t.Fatalf("startSSE: %v", err)
 	}
 	defer m.clearRuntime("t1")
@@ -436,7 +439,8 @@ func TestP18_StaleWritebackProtection(t *testing.T) {
 	seedActiveTask(store, "t1", "p1")
 	ctx := context.Background()
 	proc := newMockProc()
-	p18SetServeEnv(proc, "t1")
+	// tasks 4.3：后台对账经 persisted binding 分派（tmux env 预置退役）。
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 
 	oc := newMockOC(true)
 	oc.sessionStatuses = map[string]opencode.SessionStatus{"s1": {Type: "busy"}}
@@ -481,7 +485,8 @@ func TestP18_EpochPhaseGating(t *testing.T) {
 	seedActiveTask(store, "t1", "p1")
 	ctx := context.Background()
 	proc := newMockProc()
-	p18SetServeEnv(proc, "t1")
+	// tasks 4.3：后台对账经 persisted binding 分派（tmux env 预置退役）。
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 	oc := newMockOC(true)
 	oc.sessionStatuses = map[string]opencode.SessionStatus{"s1": {Type: "busy"}}
 	m, pub, _ := newP18Manager(t, store, proc, oc)
@@ -616,7 +621,8 @@ func TestP18_ModeB_Equivalents(t *testing.T) {
 	seedActiveTask(store, "t1", "p1")
 	store.sessions["t1"] = []SessionRow{{TaskID: "t1", SessionID: "s1"}}
 	proc := newMockProc()
-	p18SetServeEnv(proc, "t1")
+	// tasks 4.3：后台对账经 persisted binding 分派（tmux env 预置退役）。
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 	oc := newMockOC(true)
 	m, pub, _ := newP18Manager(t, store, proc, oc)
 	rt, a := p18ReadyRuntime(m, "t1", "s1")
@@ -664,7 +670,7 @@ func TestP18_ModeB_Equivalents(t *testing.T) {
 }
 
 // TestP18_FirstProbeImmediateAtReconcile 验证进入 reconcilePending 后立即首次探测
-//（不等待后台周期；reconcileAgentStatus→probeAgentStatus 为模式 A/B 共用的首次探测
+// （不等待后台周期；reconcileAgentStatus→probeAgentStatus 为模式 A/B 共用的首次探测
 // 路径）。
 func TestP18_FirstProbeImmediateAtReconcile(t *testing.T) {
 	store := newMockStore()
@@ -802,7 +808,7 @@ func (w *p18ListErrStore) ListTaskSessions(ctx context.Context, taskID string) (
 }
 
 // p18SeedVisibleRunStatus 对当前 t1 runtime 构造可见 busy 的 agentStatus 快照
-//（valid + available；直接经 state apply，不经 commit 路径——不产生发布，与
+// （valid + available；直接经 state apply，不经 commit 路径——不产生发布，与
 // p149SeedVisibleAttention 同构）。
 func p18SeedVisibleRunStatus(t *testing.T, m *Manager) {
 	t.Helper()
@@ -825,7 +831,7 @@ func p18SeedVisibleRunStatus(t *testing.T, m *Manager) {
 }
 
 // TestP18_DisconnectEpochFence 验证断流按连接代栅栏失效：旧连接代的延迟回调
-//（epoch 失配）MUST NOT 失效新连接代；仅匹配当前代的断流使快照不可用并发布。
+// （epoch 失配）MUST NOT 失效新连接代；仅匹配当前代的断流使快照不可用并发布。
 func TestP18_DisconnectEpochFence(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
@@ -915,7 +921,8 @@ func TestP18_Reconcile_ListSessionsFailureFailClosed(t *testing.T) {
 	oc := &p18CountingOC{OCClient: mock}
 	listErrStore := &p18ListErrStore{TaskStore: store, listErr: errors.New("store: list task sessions failed")}
 	proc := newMockProc()
-	p18SetServeEnv(proc, "t1") // 后台 tick 经 taskOcClient 读 serve env 构造 client
+	// tasks 4.3：后台对账经 persisted binding 分派（tmux env 预置退役）。
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1") // 后台 tick 经 taskOcClient 读 serve env 构造 client
 	m, pub, _ := newP18ManagerStores(t, store, listErrStore, proc, oc)
 	rt, a := p18AligningRuntime(m, "t1", "s1")
 
@@ -970,7 +977,7 @@ func TestP18_TimeoutInvalidation_AppliedAndDisconnectDedup(t *testing.T) {
 	seedActiveTask(store, "t1", "p1")
 	store.sessions["t1"] = []SessionRow{{TaskID: "t1", SessionID: "s1"}}
 	m, pub, _ := newP18Manager(t, store, newMockProc(), newMockOC(true))
-	rt, a := p18ReadyRuntime(m, "t1", "s1") // valid idle
+	rt, a := p18ReadyRuntime(m, "t1", "s1")                                       // valid idle
 	m.applyAgentStatusAndCommit("t1", rt, p18StatusOp("s1", opencode.StatusBusy)) // 发布 idle→busy
 
 	// 锁超时路径：登记成功 → 失效经唯一 apply 落态（快照立即 ""）→ claim → 发布一次。
@@ -1009,7 +1016,7 @@ func TestP18_TimeoutInvalidation_LaterEventRecovers(t *testing.T) {
 	seedActiveTask(store, "t1", "p1")
 	errStore := wrapStatusErr(store, errors.New("db: status commit failed"))
 	m, pub, _ := newP18ManagerStores(t, store, errStore, newMockProc(), newMockOC(true))
-	rt, a := p18ReadyRuntime(m, "t1", "s1") // valid idle
+	rt, a := p18ReadyRuntime(m, "t1", "s1")                                       // valid idle
 	m.applyAgentStatusAndCommit("t1", rt, p18StatusOp("s1", opencode.StatusBusy)) // 发布 idle→busy
 
 	m.onConvergeLockTimeout("t1", "serve exit; converge lock wait timed out", rt.instVersion)
@@ -1141,7 +1148,7 @@ func TestP18_InvalidateCaptureIsApply_DeltaFromReflectsOpTimeProjection(t *testi
 }
 
 // TestP18_AlignBarrierExtendedThroughOwnedRebuild 验证 align 屏障延伸覆盖 re-list 窗口
-//（round-4）：owned 重建成功并落态前 probeCandidate 恒 false（后台 tick 绝不带陈旧
+// （round-4）：owned 重建成功并落态前 probeCandidate 恒 false（后台 tick 绝不带陈旧
 // 成员集探测）；屏障开放后（pending）在途探测与成员钩子（claim）竞争——成员写推进
 // 写代，陈旧探测结果被写代护栏拒绝，新鲜探测正常写回。
 func TestP18_AlignBarrierExtendedThroughOwnedRebuild(t *testing.T) {
@@ -1194,7 +1201,7 @@ func TestP18_AlignBarrierExtendedThroughOwnedRebuild(t *testing.T) {
 }
 
 // TestP18_SnapshotNonActiveEmpty 验证快照对非 active 任务返回空串：activating 窗口
-//（状态已置 activating 而 runtime 已完成对账）与 suspended 均不外泄快照。
+// （状态已置 activating 而 runtime 已完成对账）与 suspended 均不外泄快照。
 func TestP18_SnapshotNonActiveEmpty(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
@@ -1301,7 +1308,7 @@ func TestP18_Converge_LockTimeout_VisibleRunStatus_PublishesOnceAcrossWorker(t *
 // TestP18_Converge_TOCTOU_TimeoutClaimDuringHeldLockWindow_SinglePublish TOCTOU 双发
 // 防护（round-4：捕获即 apply）：持锁回调 A 的清理窗口内，无需任务锁的超时回调 B
 // 先行「捕获即 apply」占住失效事实并 claim 发布；A 的失效 apply 随后为幂等 no-op
-//（零 delta，From==""）→ 矩阵不发布——状态层面消除「先捕获后 apply」的双发窗口。
+// （零 delta，From==""）→ 矩阵不发布——状态层面消除「先捕获后 apply」的双发窗口。
 func TestP18_Converge_TOCTOU_TimeoutClaimDuringHeldLockWindow_SinglePublish(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
@@ -1340,7 +1347,7 @@ func TestP18_StaleBackgroundFullReconcileAbortsOnNewEpoch(t *testing.T) {
 	mock.sessionStatuses = map[string]opencode.SessionStatus{"s2": {Type: "busy"}}
 	oc := &p18CountingOC{OCClient: mock}
 	m, pub, _ := newP18Manager(t, store, newMockProc(), oc)
-	rt, a := p18AligningRuntime(m, "t1", "s1") // 连接代 1，owned {s1}
+	rt, a := p18AligningRuntime(m, "t1", "s1")                      // 连接代 1，owned {s1}
 	a.apply(agentStatusOp{kind: agentOpReconcileBlocked, epoch: 1}) // 受阻形态
 
 	// 后台 tick 判定 + 租约捕获（同一锁域）。
@@ -1414,13 +1421,13 @@ func TestP18_BackgroundFullReconcileLeasePasses(t *testing.T) {
 
 // TestP18_FullReconcileLeaseStateFencing 状态层钉住租约栅栏的成员写防护：陈旧租约的
 // OwnedSet/AlignSuccess 在新代上 MUST 双双 no-op——新代成员不被预对齐集合覆写
-//（探测目录仅含 s1 时聚合为 busy 仅当成员仍是 {s1}）、屏障不被开放；同代同阶段
+// （探测目录仅含 s1 时聚合为 busy 仅当成员仍是 {s1}）、屏障不被开放；同代同阶段
 // 未失配时 OwnedSet 正常落态。
 func TestP18_FullReconcileLeaseStateFencing(t *testing.T) {
 	a := newAgentStatusState()
-	a.apply(agentStatusOp{kind: agentOpConnect})                                                  // 连接代 1
+	a.apply(agentStatusOp{kind: agentOpConnect})                                                              // 连接代 1
 	a.apply(agentStatusOp{kind: agentOpOwnedSet, owned: []string{"s1"}, epoch: 1, phase: agentPhaseAligning}) // 成员 {s1}
-	a.apply(agentStatusOp{kind: agentOpReconcileBlocked, epoch: 1})                               // 受阻
+	a.apply(agentStatusOp{kind: agentOpReconcileBlocked, epoch: 1})                                           // 受阻
 	lease, ok := a.beginFullReconcile()
 	if !ok || lease.epoch != 1 || lease.phase != agentPhaseReconcileBlocked {
 		t.Fatalf("prereq lease = %+v ok=%v", lease, ok)
@@ -1480,7 +1487,7 @@ func TestP18_StaleLeaseCannotClaimProbeOfNewerEpoch(t *testing.T) {
 	mockB.sessionStatuses = map[string]opencode.SessionStatus{"s1": {Type: "busy"}}
 	ocB := &p18CountingOC{OCClient: mockB}
 	m, pub, _ := newP18Manager(t, store, newMockProc(), ocA)
-	rt, a := p18AligningRuntime(m, "t1", "s1") // 连接代 1，owned {s1}
+	rt, a := p18AligningRuntime(m, "t1", "s1")                      // 连接代 1，owned {s1}
 	a.apply(agentStatusOp{kind: agentOpReconcileBlocked, epoch: 1}) // 受阻形态
 
 	// ① 后台 tick 为代 1 捕获完整对账租约。

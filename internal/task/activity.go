@@ -13,7 +13,7 @@ import (
 )
 
 // RecordUserActivity 记录一次任务的用户主动操作：发布 task.user_activity
-//（RID=taskID）。Publish 未注入（测试构造）时 no-op。
+// （RID=taskID）。Publish 未注入（测试构造）时 no-op。
 func (m *Manager) RecordUserActivity(_ context.Context, taskID string) {
 	if m.publish == nil {
 		return
@@ -22,7 +22,7 @@ func (m *Manager) RecordUserActivity(_ context.Context, taskID string) {
 }
 
 // RecordShellUserActivity 记录一次 shell 终端的用户主动操作：tid 为 shell 终端 ID
-//（shell tmux 会话名），经 taskIDFromSessionName 解析归属任务；解析失败（非法 tid）
+// （shell tmux 会话名），经 taskIDFromSessionName 解析归属任务；解析失败（非法 tid）
 // 静默忽略零发布。
 func (m *Manager) RecordShellUserActivity(_ context.Context, tid string) {
 	taskID := taskIDFromSessionName(tid)

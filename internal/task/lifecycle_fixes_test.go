@@ -97,7 +97,7 @@ func TestStopAndJoinAllRuntimes_NoLeak(t *testing.T) {
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
 	rt.registerGroup(roleRuntime, runtimeSessionName("t1"))
-	if err := m.startSSE(lifeCtx, rt, "t1", "/wt", 50001, "pw", AlignModeRepo); err != nil {
+	if err := m.startSSE(lifeCtx, rt, "t1", "/wt", 50001, "pw", AlignModeRepo, nil); err != nil {
 		t.Fatalf("startSSE: %v", err)
 	}
 	m.watchServeExit("t1", runtimeSessionName("t1"))
@@ -164,4 +164,4 @@ func TestWatchExit_G_JoinAfterCancel(t *testing.T) {
 
 // 辅助。
 func newStrNull(s string) sql.NullString { return sql.NullString{String: s, Valid: true} }
-func newIntNull(n int) sql.NullInt64      { return sql.NullInt64{Int64: int64(n), Valid: true} }
+func newIntNull(n int) sql.NullInt64     { return sql.NullInt64{Int64: int64(n), Valid: true} }

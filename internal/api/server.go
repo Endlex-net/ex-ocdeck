@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/application/diffreview"
 	appuploads "ocdeck/internal/application/uploads"
 	"ocdeck/internal/config"
@@ -63,6 +64,9 @@ type Server struct {
 	// watchdogStateProvider 返回 watchdog 运行态字符串（off/running/degraded），
 	// 供 /server/status 接线（design.md §21）。nil 时回退 "off"。
 	watchdogStateProvider func() string
+	// capabilitiesProvider 返回能力健康快照（tasks 3.8）；nil 时 /server/status
+	// 省略 capabilities 字段（既有响应形状不变）。
+	capabilitiesProvider func() []appagent.CapabilityHealth
 
 	// wsClients 单交互客户端注册表（design.md §21：同一终端新连接替换旧连接，4009）。
 	wsClients *wsClientRegistry
@@ -158,7 +162,7 @@ func (s *Server) SetDeliverOrchestrator(o deliverOrchestrator) {
 }
 
 // SetDeliverReplaceCoordination 注入 TUI 连接替换提交共用的 per-task 协调锁
-//（组合根注入 uploadOrch.Coordination()，使替换提交与投递准入/finalize 临界区互斥）。
+// （组合根注入 uploadOrch.Coordination()，使替换提交与投递准入/finalize 临界区互斥）。
 func (s *Server) SetDeliverReplaceCoordination(c *appuploads.Coordination) {
 	s.replaceCoord = c
 }
@@ -435,6 +439,57 @@ func (s *Server) SetWatchdogStateProvider(fn func() string) {
 	s.watchdogStateProvider = fn
 }
 
+// SetCapabilitiesProvider 注入能力健康快照函数（opencode-v1-spi-provider
+// tasks 3.8）：GET /api/v1/server/status 透出只读 `capabilities` 数组字段——
+// 唯一增量，既有字段与响应形状不变。nil（未装配）时省略该字段，保持既有
+// 响应字节形状（行为保持约束 F-23/F-31）。
+func (s *Server) SetCapabilitiesProvider(fn func() []appagent.CapabilityHealth) {
+	s.capabilitiesProvider = fn
+}
+
+// capabilityHealthDTO 是 capabilities 数组元素的 HTTP JSON 形状（tasks 3.7 T9
+// 决议，逐字段断言）：小驼峰键；session 可空对象（null | {providerId,
+// providerInstanceId, upstreamId}）。
+type capabilityHealthDTO struct {
+	Primitive string                `json:"primitive"`
+	Scope     string                `json:"scope"`
+	Epoch     int64                 `json:"epoch"`
+	State     string                `json:"state"`
+	Reason    string                `json:"reason"`
+	TaskID    string                `json:"taskId"`
+	Session   *capabilitySessionDTO `json:"session"`
+}
+
+type capabilitySessionDTO struct {
+	ProviderID         string `json:"providerId"`
+	ProviderInstanceID string `json:"providerInstanceId"`
+	UpstreamID         string `json:"upstreamId"`
+}
+
+// toCapabilityDTOs 把内存快照映射为透出形状。
+func toCapabilityDTOs(snapshot []appagent.CapabilityHealth) []capabilityHealthDTO {
+	out := make([]capabilityHealthDTO, 0, len(snapshot))
+	for _, h := range snapshot {
+		dto := capabilityHealthDTO{
+			Primitive: string(h.Primitive),
+			Scope:     string(h.Scope),
+			Epoch:     h.Epoch,
+			State:     string(h.State),
+			Reason:    h.Reason,
+			TaskID:    h.TaskID,
+		}
+		if h.Session != nil {
+			dto.Session = &capabilitySessionDTO{
+				ProviderID:         h.Session.ProviderID,
+				ProviderInstanceID: h.Session.ProviderInstanceID,
+				UpstreamID:         h.Session.UpstreamID,
+			}
+		}
+		out = append(out, dto)
+	}
+	return out
+}
+
 // handleServerStatus 返回服务端状态（design.md §21）。
 // watchdogState 反映 watchdog 真实运行态（off/running/degraded）；
 // 非 kill_immediate 模式恒为 "off"。
@@ -451,6 +506,11 @@ func (s *Server) handleServerStatus(w http.ResponseWriter, r *http.Request) {
 		"contractBaseline":   config.ContractBaseline,
 		"contractMinVersion": config.ContractMinVersion,
 		"versionVerified":    s.cfg.VersionVerified,
+	}
+	// capabilities 为唯一增量字段（tasks 3.8；比较例外——旧基线无对应，单独按
+	// 新契约验证）；未装配 provider 时省略，既有响应形状不变。
+	if s.capabilitiesProvider != nil {
+		status["capabilities"] = toCapabilityDTOs(s.capabilitiesProvider())
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(status)

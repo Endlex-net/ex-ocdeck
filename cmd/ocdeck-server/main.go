@@ -22,6 +22,7 @@ import (
 
 	"ocdeck/internal/api"
 	"ocdeck/internal/application"
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/application/diffreview"
 	appnotification "ocdeck/internal/application/notification"
 	apptask "ocdeck/internal/application/task"
@@ -35,6 +36,7 @@ import (
 	"ocdeck/internal/infrastructure/eventbus"
 	"ocdeck/internal/infrastructure/lifecycle"
 	"ocdeck/internal/infrastructure/notify"
+	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/palette"
 	"ocdeck/internal/infrastructure/process"
 	sqlite "ocdeck/internal/infrastructure/sqlite"
@@ -177,11 +179,28 @@ func run() error {
 	// Conns 数据源（api WS 注册表）构造晚于此处，serveAndShutdown 中 setServer 回填。
 	uploadConns := &currentConnPort{}
 	uploadOrch := newUploadOrchestrator(cfg, appAdapter, bus, uploadConns)
+	// agent-provider-spi（opencode-v1-spi-provider tasks 3.7/3.6）：provider registry
+	// 手工装配（无 Fx）——本期仅注册 opencode-v1；v1 缺失即启动失败（fail-closed）。
+	// OCFactory 经 registry 查表分派：任务 provider 未注册 → fail-closed 错误
+	//（零网络副作用，task 层已有处置）。transport 由 opencode 包共享 loopback
+	// transport 承载（design「连接管理」）。
+	// provider 实例在 tm 构造后注册（supervisor deps 的 SideFx/AllocatePort 指向
+	// task.Manager 现状实现）；ocFactory 闭包只在分派时查 registry——分派晚于
+	// 注册，先建 factory 后注册实例不改变语义。
+	// 能力健康 tracker（tasks 3.8 + 4.x）：内存按 runtime 代际维护，run() 顶层
+	// 构造——供状态端点透出（serveAndShutdown 注入 api）与 supervisor 换代回调
+	//（OnRuntimeReady → BumpRuntimeEpoch）共用同一实例。
+	healthTracker := appagent.NewHealthTracker()
+	healthTracker.SetProviderID(opencode.ProviderID)
+	registry := appagent.NewRegistry()
+	ocFactory := newRegistryDispatchFactory(registry)
 	tm := task.New(task.Options{
 		Cfg:                cfg,
 		Store:              adapter,
 		Proc:               task.NewProcessAdapter(procMgr),
 		Worktree:           task.NewWorktreeAdapter(wtMgr),
+		OCFactory:          ocFactory,       // tasks 3.6/3.7：registry 分派工厂（上方）
+		ProviderRegistry:   registry,        // C1 门禁修复：binding 分派（binding_dispatch）按任务 provider 查本表
 		DebtStore:          adapter,         // R7：orphan tickets 持久化跨重启恢复（design.md §10）
 		LifecycleRunner:    lifecycle.New(), // design.md §7.1：init/pre-delete 脚本与 inherit
 		LogDir:             cfg.DataDir + "/logs",
@@ -195,6 +214,46 @@ func run() error {
 	})
 	// 注入 Manager 生命周期 context（design.md §4：SSE/退出监视挂进程 ctx，非 HTTP request ctx）。
 	tm.SetLifecycleCtx(ctx)
+
+	// SPI supervisor 生产装配（tasks 4.x；D11）：v1 provider 携带真实 supervisor deps
+	//（进程托管 seam = procMgr 适配；持久化 seam = supStoreSeam；旁路副作用委托
+	// task 层现状实现，行为与 startRuntimeWithPortRetry 建进程前三步逐字一致；
+	// 换代回调 → healthTracker epoch 递增）。注册失败 = 装配错误，拒绝启动。
+	supDeps := opencode.SupervisorDeps{
+		Proc:           task.NewProcessAdapter(procMgr),
+		Store:          &supStoreSeam{db: db},
+		SideFx:         task.NewSupervisorSideEffects(tm),
+		AllocatePort:   tm.AllocateServePort,
+		OnRuntimeReady: func(taskID string) { healthTracker.BumpRuntimeEpoch(taskID) },
+		// C6 门禁修复：释放侧换代重置——Release 成功终止 runtime 后回收该任务
+		// 的旧观测与代际（runtime/session 作用域清空；provider 作用域保留）。
+		OnRuntimeRelease: func(taskID string) { healthTracker.ResetRuntime(taskID) },
+		// ReadyTimeout/PollInterval 省略 → 生产默认 10s/500ms（spi_supervisor.go）。
+	}
+	v1Provider := opencode.NewSPIProviderWithDeps(supDeps)
+	// C6 门禁修复：能力适配器健康上报接线（SPI spec「能力故障透出」）——
+	// 真实能力调用的出口（成功/协议违约/明确不支持）经 provider 报告端口
+	// Transition 进 tracker（携带 runtime epoch）；装配方不直接制造观测。
+	v1Provider.WithHealthReporter(
+		func(h appagent.CapabilityHealth) {
+			if h.ProviderID == "" {
+				h.ProviderID = opencode.ProviderID
+			}
+			healthTracker.Transition(h)
+		},
+		healthTracker.RuntimeEpoch,
+	)
+	if err := registry.Register(v1Provider); err != nil {
+		return fmt.Errorf("register opencode-v1 provider: %w", err)
+	}
+	// opencode-v1-spi-provider tasks 4.3：删除清理的 AcquireEphemeral 入口接线
+	//（design D9a 分支②）——v1 provider 的 RuntimeSupervisor 注入 Manager，
+	// 临时绑定分支经 registry 分派同源实现。
+	tm.SetEphemeralSupervisor(v1Provider.Supervisor())
+	// C2 门禁修复：激活/恢复建程入口接线（design D9 结构化主流程）——activateRun
+	// 经 Acquire、runRecoveryAttempt 经 Resume 建程；与临时绑定入口同一 supervisor
+	// 实现。
+	tm.SetRuntimeSupervisor(v1Provider.Supervisor())
 
 	// diff-review-workbench composition root（design.md D9/F1）。
 	// 在 Reconcile/启动调度/HTTP 开放前构造 diffreview service 并注入 Manager。
@@ -226,22 +285,145 @@ func run() error {
 	// 命名空间防御性补齐门禁（opencode-v1-spi-provider tasks 2.2 / design D6 阶段 1）：
 	// 每次启动、在任何命名空间消费者（diffreview 收敛、权限事实回填、Reconcile、
 	// HTTP）运行前执行；补齐失败 fail-closed 拒绝启动。顺序钉死：
-	// migration 0018 加列（Open→Migrate，更早）→ 命名空间补齐（本门禁）→ 既有收敛
-	// 门禁序列 → Reconcile → HTTP open。与 binding 导入 runner（阶段 3）相互独立。
+	// migration 0018 加列（Open→Migrate，更早）→ 命名空间补齐（本门禁）→ 迁移导入
+	// runner（tasks 4.2，master 准入门失败 fail-closed 拒绝就绪；候选出结论前
+	// 生命周期消费者不启动——屏障即序列）→ 既有收敛门禁序列 → Reconcile → HTTP
+	// open。补齐与导入 runner 相互独立（D6）。
 	return namespaceBackfillGate(ctx, db, func() error {
-		return diffReviewStartupGate(ctx, tm, func() error {
-			return permissionModeStartupGate(ctx, tm, func() error {
-				return serveAndShutdown(ctx, tm, cfg, db, bus, aiStore, wd, diffSvc, uploadOrch, uploadConns, prefixStore)
+		return migrationImportGate(ctx, tm, func() error {
+			return diffReviewStartupGate(ctx, tm, func() error {
+				return permissionModeStartupGate(ctx, tm, func() error {
+					return serveAndShutdown(ctx, tm, cfg, db, bus, aiStore, wd, diffSvc, uploadOrch, uploadConns, prefixStore, healthTracker)
+				})
 			})
 		})
 	})
+}
+
+// migrationImporter 迁移导入门禁依赖的最小端口（task.Manager 满足）。
+type migrationImporter interface {
+	RunMigrationImport(ctx context.Context) error
+}
+
+// migrationImportGate 迁移导入启动门禁（opencode-v1-spi-provider tasks 4.2 /
+// design D6 阶段 3）：主密钥不可用/快照失败 → runner 返回错误 → fail-closed
+// 拒绝启动（MUST NOT 调用 open——候选屏障不释放、不耗恢复预算、不改任务状态）；
+// 成功 → 调用 open 并透传错误。
+func migrationImportGate(ctx context.Context, mi migrationImporter, open func() error) error {
+	if err := mi.RunMigrationImport(ctx); err != nil {
+		return fmt.Errorf("migration import gate: %w", err)
+	}
+	return open()
+}
+
+// supStoreSeam 是 SPI supervisor 的持久化 seam 适配（store 层方法包装；
+// 锚定读写走 v1 统一命名空间版本）。
+type supStoreSeam struct{ db *store.DB }
+
+func (s *supStoreSeam) GetTaskAnchor(ctx context.Context, taskID string) (string, error) {
+	row, err := s.db.GetTask(ctx, taskID)
+	if err != nil {
+		return "", err
+	}
+	return row.AnchorSessionID.String, nil
+}
+
+func (s *supStoreSeam) ClaimSessionKeyAndSetAnchor(ctx context.Context, taskID, sessionID string,
+	createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
+	return s.db.ClaimTaskSessionAndSetAnchor(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+}
+
+func (s *supStoreSeam) ClearTaskAnchorConditional(ctx context.Context, taskID, oldAnchor string) (application.MutationResult, error) {
+	return s.db.ClearTaskAnchorConditional(ctx, taskID, oldAnchor)
+}
+
+func (s *supStoreSeam) GetTaskLastPort(ctx context.Context, taskID string) (int, bool, error) {
+	row, err := s.db.GetTask(ctx, taskID)
+	if err != nil {
+		return 0, false, err
+	}
+	return int(row.LastPort.Int64), row.LastPort.Valid, nil
 }
 
 // serveAndShutdown 执行收敛通过后的启动序列（design.md §5/§10）：
 // 上传编排启动（扫描/订阅/清理器）→ Reconcile（失败 fail-closed 拒绝开放 HTTP）→
 // 后台周期重试 → API 装配与阻塞服务 → 关停序列。
 // diffSvc 注入 API 层（diff-review-workbench D8 路由），须在 RebuildRoutes 前生效。
-func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config, db *store.DB, bus *eventbus.Bus, aiStore *ai.Store, wd *process.WatchdogManager, diffSvc *diffreview.Service, uploadOrch *appuploads.Orchestrator, uploadConns *currentConnPort, prefixStore *branchprefix.Store) error {
+// unregisteredOCClient 是 registry 分派失败的 fail-closed 占位 client：
+// 工厂无法解析任务 provider 时返回此实现，全部方法返回 provider_not_found 包装
+// 错误——零网络副作用（specs「Provider registry 分派」：未注册 fail-closed）。
+// 本期 registry 仅注册 opencode-v1，该形态仅在 provider_id 持久化损坏时可达。
+type unregisteredOCClient struct{ err *appagent.Error }
+
+func newUnregisteredOCClient() *unregisteredOCClient {
+	return &unregisteredOCClient{err: appagent.NewError("registry.get", appagent.ErrKindProviderNotFound,
+		fmt.Errorf("task provider 未注册"))}
+}
+
+// newRegistryDispatchFactory 构造经 registry 分派的 OCClient 工厂（tasks 3.6/3.7）：
+// C2 残余修复（ora-4 裁决 ②「生产 OCClient 固定查 v1+NewClient 不可接受」）：
+// 按 providerID 分派经 registry.Get（fail-closed）；分派命中后的传输构造委托
+// provider 包内出口（opencode.NewWireClient——「从端点三元组构造传输 client」
+// 的调用点收敛进 provider 面，cmd 不再直构）。未注册 → fail-closed 占位 client
+//（provider_not_found，零网络副作用——specs「Provider registry 分派」）。
+// 生产能力调用（sessions/status/attention/prompts/titles）经 task 层能力出口桥
+//（task.buildTaskOCClient → spiBridgeOCClient）消费 Provider 窄接口，本工厂仅
+// 承接无窄接口对应的探活/原始事件通道（Health/Probe/raw-SubscribeEvents/
+// ProbePromptAsyncCapability——非能力面 fallback）。
+func newRegistryDispatchFactory(registry *appagent.Registry) task.OCClientFactory {
+	return func(providerID string, port int, password string, opts appagent.Options) task.OCClient {
+		// mutation 证据（已验证 → 红 → 还原）：分派判定旁路（Get 调用删除/恒真）
+		// → factory 对未注册 provider 返回传输 client（零 fail-closed）→
+		// TestRegistryDispatchFactory_RegisteredAndFailClosed 的 miss/empty 段红。
+		if _, err := registry.Get(providerID); err != nil {
+			return newUnregisteredOCClient()
+		}
+		return opencode.NewWireClient(port, password, opts)
+	}
+}
+
+func (c *unregisteredOCClient) Health(context.Context) (appagent.HealthResponse, error) {
+	return appagent.HealthResponse{}, c.err
+}
+func (c *unregisteredOCClient) Probe(context.Context) (string, error) { return "", c.err }
+func (c *unregisteredOCClient) ListSessions(context.Context, string, int) ([]appagent.Session, error) {
+	return nil, c.err
+}
+func (c *unregisteredOCClient) GetSession(context.Context, string, string) (appagent.Session, error) {
+	return appagent.Session{}, c.err
+}
+func (c *unregisteredOCClient) CreateSession(context.Context, string, string) (appagent.Session, error) {
+	return appagent.Session{}, c.err
+}
+func (c *unregisteredOCClient) DeleteSession(context.Context, string, string) error { return c.err }
+func (c *unregisteredOCClient) SessionStatus(context.Context, string) (map[string]appagent.SessionStatus, error) {
+	return nil, c.err
+}
+func (c *unregisteredOCClient) SubscribeEvents(context.Context, string, func(appagent.Event), func()) error {
+	return c.err
+}
+func (c *unregisteredOCClient) ListPermissions(context.Context, string) ([]appagent.PermissionRequest, error) {
+	return nil, c.err
+}
+func (c *unregisteredOCClient) ListQuestions(context.Context, string) ([]appagent.QuestionRequest, error) {
+	return nil, c.err
+}
+func (c *unregisteredOCClient) ReplyPermission(context.Context, string, string, string) error {
+	return c.err
+}
+func (c *unregisteredOCClient) PromptAsync(context.Context, string, string, string, string, []appagent.PromptFilePart) appagent.PromptTransportResult {
+	return appagent.PromptTransportResult{Kind: appagent.ResultPreSendFailure, Detail: c.err.Error()}
+}
+func (c *unregisteredOCClient) ProbePromptAsyncCapability(context.Context) appagent.ProbeCapabilityState {
+	return appagent.ProbeCapabilityState("unknown")
+}
+func (c *unregisteredOCClient) UpdateSessionTitle(context.Context, string, string, string) error {
+	return c.err
+}
+
+var _ task.OCClient = (*unregisteredOCClient)(nil)
+
+func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config, db *store.DB, bus *eventbus.Bus, aiStore *ai.Store, wd *process.WatchdogManager, diffSvc *diffreview.Service, uploadOrch *appuploads.Orchestrator, uploadConns *currentConnPort, prefixStore *branchprefix.Store, healthTracker *appagent.HealthTracker) error {
 	// 受管上传启动序列（terminal-file-paste-drop 2.4）：启动恢复扫描（失败记日志，
 	// 不阻断启动——遗留产物按孤儿规则由周期清理收敛）→ 订阅 task.deleted 与周期清理。
 	// 先扫描后订阅：订阅起点覆盖 Reconcile 期间的删除事件。Reconcile 失败提前返回时
@@ -265,6 +447,10 @@ func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config,
 
 	srv := api.New(cfg, db)
 	srv.SetTaskBackend(tm)
+	// 能力健康透出（opencode-v1-spi-provider tasks 3.8）：run() 顶层构造的
+	// tracker（provider 作用域预填 unknown；supervisor OnRuntimeReady 换代
+	// 递增 epoch）注入状态端点——只读 capabilities 数组为唯一增量字段。
+	srv.SetCapabilitiesProvider(healthTracker.Snapshot)
 	// terminal-file-paste-drop：Conns 端口数据源回填（api WS 注册表）与投递编排注入
 	//（(bool, DeliverErrorCode) → api 窄接口 (bool, string)），须在 RebuildRoutes 前生效。
 	uploadConns.setServer(srv)

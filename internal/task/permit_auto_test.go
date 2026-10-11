@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
+	appagent "ocdeck/internal/application/agentprovider"
+	domain "ocdeck/internal/domain/agentprovider"
 	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
 )
@@ -20,7 +22,7 @@ import (
 // --- ai-auto 判定消费者测试基建（task-permission-mode D4/D9） ---
 
 // fakeJudge 记录 Judge 输入并返回脚本化结果；block 非 nil 时阻塞直到 release 或 ctx 取消
-//（ctx 取消返回 uncertain + err，模拟真实 Judge 的 10s 预算中断；onCtxDone/drain 供
+// （ctx 取消返回 uncertain + err，模拟真实 Judge 的 10s 预算中断；onCtxDone/drain 供
 // 并发停止测试观测 cancel 与模拟收尾耗时）。
 type fakeJudge struct {
 	mu        sync.Mutex
@@ -150,7 +152,7 @@ func permRepliedEvent(sid, rid string) opencode.Event {
 }
 
 // newAutoTaskEnv 构造单元级 ai-auto 消费者环境：active + ai-auto 任务的就绪 runtime
-//（serve 会话 env 已就位，taskOcClient 可用；attention 已懒初始化）。
+// （serve 会话 env 已就位，taskOcClient 可用；attention 已懒初始化）。
 // 返回 (manager, store, mockOC, runtime, 释放函数)。
 func newAutoTaskEnv(t *testing.T, judge PermissionJudge) (*Manager, *mockStore, *mockOC, *taskRuntime, func()) {
 	t.Helper()
@@ -159,10 +161,11 @@ func newAutoTaskEnv(t *testing.T, judge PermissionJudge) (*Manager, *mockStore, 
 	store.mutTask("t1", func(r *TaskRow) { r.PermissionMode = PermissionModeAIAuto })
 	proc := newMockProc()
 	proc.sessions[runtimeSessionName("t1")] = true
+	// tasks 4.3：回复路由经 persisted binding 解析（tmux env 预置退役）；
+	// OCDECK_TASK_ID 会话内复检保留。
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 	proc.envValues[runtimeSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw",
-		"OCDECK_SERVE_PORT":        "50001",
-		"OCDECK_TASK_ID":           "t1",
+		"OCDECK_TASK_ID": "t1",
 	}
 	oc := newMockOC(true)
 	m := newTestManager(t, store, proc, newMockWorktree(), oc)
@@ -597,12 +600,12 @@ func TestResumeActive_AIAuto_CommitGating(t *testing.T) {
 		snapBytes, _ := encodeEnvSnapshot(snap)
 		store.mutTask("t1", func(r *TaskRow) { r.EnvSnapshot = snapBytes })
 		proc := newMockProc()
-		// resumeActive 读 runtime 会话名（runtimeSessionName）下的密码/端口/任务 ID。
+		// resumeActive 读 runtime 会话名下的 OCDECK_TASK_ID 复检（tasks 4.3：
+		// 凭据/端口经 persisted binding 解析，env 反查退役）。
+		seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 		proc.sessions[runtimeSessionName("t1")] = true
 		proc.envValues[runtimeSessionName("t1")] = map[string]string{
-			"OPENCODE_SERVER_PASSWORD": "pw",
-			"OCDECK_SERVE_PORT":        "50001",
-			"OCDECK_TASK_ID":           "t1",
+			"OCDECK_TASK_ID": "t1",
 		}
 		oc := newMockOC(true)
 		oc.listPermissionsResult = []opencode.PermissionRequest{permReq("r1", "s1", "bash", "rm")}
@@ -663,14 +666,10 @@ func TestSuspendRepair_AIAuto_JudgesAfterRepair(t *testing.T) {
 	})
 	// 启动事实（D5 三路径矩阵②）：ai-auto 进程在位 → AIAutoEnabled=true。
 	store.seedPermissionModeAtStart("t1", PermissionModeAIAuto)
+	// tasks 4.3：修复与回复路由均经 persisted binding（tmux env 反查退役）。
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 	proc := newMockProc()
 	proc.sessions[serveSessionName("t1")] = true
-	proc.envValues[serveSessionName("t1")] = map[string]string{"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001"}
-	// reply 路径 taskOcClient 读 runtime 会话名下的密码/端口（修复路径不重写 env）。
-	proc.envValues[runtimeSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw",
-		"OCDECK_SERVE_PORT":        "50001",
-	}
 	// tui/serve kill 失败 + serve 存活 → 分支 c 修复（tryRepairRuntime → startSSE align）。
 	proc.killResults[tuiSessionName("t1")] = process.KillResult{SessionKilled: false, Disposition: process.DispositionKillFailed, CleanupTickets: []string{"tk1"}}
 	proc.killResults[serveSessionName("t1")] = process.KillResult{SessionKilled: false, Disposition: process.DispositionKillFailed, CleanupTickets: []string{"tk2"}}
@@ -698,7 +697,7 @@ func TestReconnectAlign_AIAuto_JudgesAfterAlign(t *testing.T) {
 	m, _, oc, rt, _ := newAutoTaskEnv(t, judge)
 	roc := &reconnectPermOC{mockOC: oc, proceed: make(chan struct{})}
 	// 替换 ocFactory 产物：taskOcClient/reply 仍走原 mockOC（roc 内嵌），SSE 走 roc。
-	m.ocFactory = func(port int, password string, opts opencode.Options) OCClient {
+	m.ocFactory = func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOC{inner: roc, onReady: opts.OnReady}
 	}
 	oc.listPermissionsResult = nil // 首次 align：无 pending
@@ -707,7 +706,7 @@ func TestReconnectAlign_AIAuto_JudgesAfterAlign(t *testing.T) {
 	defer cancel()
 	started := make(chan error, 1)
 	go func() {
-		started <- m.startSSE(ctx, rt, "t1", "/data/worktrees/p1/t1", 50001, "pw", AlignModeRepo)
+		started <- m.startSSE(ctx, rt, "t1", "/data/worktrees/p1/t1", 50001, "pw", AlignModeRepo, nil)
 	}()
 	// startSSE 等待 ready 后完成首次 align 才返回。
 	select {
@@ -749,7 +748,7 @@ func TestDegradedReplay_AIAuto_JudgesOnce(t *testing.T) {
 
 	// 轮 1：GET 在途期间 asked r2 入缓冲 → 失败重放写入 → (c) 扫描判定 r1+r2。
 	gated := &gatedPermOC{mockOC: oc, entered: make(chan struct{}, 1), release: make(chan struct{})}
-	m.ocFactory = func(port int, password string, opts opencode.Options) OCClient {
+	m.ocFactory = func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOC{inner: gated, onReady: opts.OnReady}
 	}
 	done := make(chan struct{})
@@ -813,7 +812,7 @@ func TestHandleSSEAsked_PreCommitResolved_NoJudge(t *testing.T) {
 func blockedFactory(oc *mockOC) (entered chan struct{}, release chan struct{}, factory OCClientFactory) {
 	entered = make(chan struct{}, 1)
 	release = make(chan struct{})
-	factory = func(port int, password string, opts opencode.Options) OCClient {
+	factory = func(_ string, port int, password string, opts appagent.Options) OCClient {
 		entered <- struct{}{}
 		<-release
 		return &readyOC{inner: oc, onReady: opts.OnReady}
@@ -878,7 +877,7 @@ func TestJudgeAndReply_FinalAdmit_UnsupportedDuringConstruction(t *testing.T) {
 }
 
 // TestJudgeAndReply_FinalAdmit_ReplacedDuringConstruction 旧实例延迟返回零回复
-//（F1/F4.2）：Manager 替换 runtime 后，旧 runtime 的判定结果 MUST NOT 发送——
+// （F1/F4.2）：Manager 替换 runtime 后，旧 runtime 的判定结果 MUST NOT 发送——
 // 旧对象令牌自比较恒真，只有 Manager 当前实例校验能拦住（旧实现此处会发送）。
 // 审计（7.2 补强）：最终发送准入拒绝仍是「调用 Judge 后」的终结路径 → 恰好一条
 // APPROVE + not_applicable（留痕不受 permGate 拦截）。
@@ -1050,7 +1049,7 @@ func TestDegradedReplay_AIAuto_SuccessReplace_JudgesOnce(t *testing.T) {
 	m, _, oc, rt, _ := newAutoTaskEnv(t, judge)
 	var getCalls int32
 	counting := &countingPermOC{mockOC: oc, calls: &getCalls}
-	m.ocFactory = func(port int, password string, opts opencode.Options) OCClient {
+	m.ocFactory = func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOC{inner: counting, onReady: opts.OnReady}
 	}
 	a := rt.ensureAttentionState()
@@ -1118,7 +1117,7 @@ func (p *gatedListProc) ListSessions() ([]string, error) {
 }
 
 // TestResumeActive_AIAuto_PreCommitAskedGating（F4.1）resumeActive 阻塞后续恢复步骤
-//（watcher 阶段）注入 asked + 立即 APPROVE fake Judge：提交前零 Judge/零 Reply 且
+// （watcher 阶段）注入 asked + 立即 APPROVE fake Judge：提交前零 Judge/零 Reply 且
 // 暂缓不登记；提交成功后恰好一次判定；恢复失败始终零回复。
 func TestResumeActive_AIAuto_PreCommitAskedGating(t *testing.T) {
 	newEnv := func(t *testing.T, listErr error) (*Manager, *mockStore, *mockOC, *fakeJudge, *gatedListProc, chan error) {
@@ -1135,10 +1134,10 @@ func TestResumeActive_AIAuto_PreCommitAskedGating(t *testing.T) {
 		store.mutTask("t1", func(r *TaskRow) { r.EnvSnapshot = snapBytes })
 		proc := newMockProc()
 		proc.sessions[runtimeSessionName("t1")] = true
+		// tasks 4.3：resumeActive 凭据/端口经 persisted binding（env 反查退役）。
+		seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 		proc.envValues[runtimeSessionName("t1")] = map[string]string{
-			"OPENCODE_SERVER_PASSWORD": "pw",
-			"OCDECK_SERVE_PORT":        "50001",
-			"OCDECK_TASK_ID":           "t1",
+			"OCDECK_TASK_ID": "t1",
 		}
 		gated := &gatedListProc{
 			mockProc: proc,
@@ -1254,6 +1253,15 @@ func (s *failCommitCASStore) UpdateTaskStatusConditional(ctx context.Context, id
 		return application.TransitionResult{}, errCommitInject
 	}
 	return s.mockStore.UpdateTaskStatusConditional(ctx, id, fromStatus, toStatus, lastError)
+}
+
+// CommitActivation 覆盖（tasks 4.3 后激活提交事务路由到此方法）：拦截分支复用
+// failCommitCASStore 的目标提交点 failpoint 语义（同 sentinel/快照/屏障）。
+func (s *failCommitCASStore) CommitActivation(ctx context.Context, id string, b domain.TaskBinding, fromStatus, toStatus string) (application.TransitionResult, error) {
+	if fromStatus == s.failFrom && toStatus == s.failTo {
+		return s.UpdateTaskStatusConditional(ctx, id, fromStatus, toStatus, sql.NullString{})
+	}
+	return s.mockStore.CommitActivation(ctx, id, b, fromStatus, toStatus)
 }
 
 // interceptSnapshot 返回拦截时刻记录：命中次数、pending 快照、就绪状态、runtime 缺失标记。
@@ -1399,13 +1407,9 @@ func TestSuspendRepair_AIAuto_CommitFailure_NoReply(t *testing.T) {
 	})
 	// 启动事实（D5 三路径矩阵②）：ai-auto 进程在位 → AIAutoEnabled=true。
 	store.seedPermissionModeAtStart("t1", PermissionModeAIAuto)
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 	proc := newMockProc()
 	proc.sessions[serveSessionName("t1")] = true
-	proc.envValues[serveSessionName("t1")] = map[string]string{"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001"}
-	proc.envValues[runtimeSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw",
-		"OCDECK_SERVE_PORT":        "50001",
-	}
 	proc.killResults[tuiSessionName("t1")] = process.KillResult{SessionKilled: false, Disposition: process.DispositionKillFailed, CleanupTickets: []string{"tk1"}}
 	proc.killResults[serveSessionName("t1")] = process.KillResult{SessionKilled: false, Disposition: process.DispositionKillFailed, CleanupTickets: []string{"tk2"}}
 	oc := newMockOC(true)
@@ -1461,7 +1465,7 @@ func TestSuspendRepair_AIAuto_CommitFailure_NoReply(t *testing.T) {
 // --- F1：judgeScan 入口零 DB/零阻塞；扫描工作绑定 runtime cancel+join ---
 
 // gatedGetTaskStore 匿名内嵌 *mockStore：第 armAfter 次 GetTask 阻塞在屏障
-//（entered 信号、release 放行或 ctx 取消），用于确定性验证扫描 DB 读的可取消性。
+// （entered 信号、release 放行或 ctx 取消），用于确定性验证扫描 DB 读的可取消性。
 type gatedGetTaskStore struct {
 	*mockStore
 	armAfter int32
@@ -1489,7 +1493,7 @@ func (s *gatedGetTaskStore) GetTask(ctx context.Context, id string) (TaskRow, er
 
 // TestJudgeScan_SSEPathNotBlockedByDBPrecheck SSE asked 处理路径（触发点 (a)）不被
 // 判定扫描的 DB 预检阻塞：judgeScan 入口零 DB/零阻塞，DB 读在扫描 goroutine 内
-//（judgeCtx 绑定）。阻塞 DB 读期间 handleSSEEvent MUST 立即返回，放行后判定照常。
+// （judgeCtx 绑定）。阻塞 DB 读期间 handleSSEEvent MUST 立即返回，放行后判定照常。
 func TestJudgeScan_SSEPathNotBlockedByDBPrecheck(t *testing.T) {
 	store := &gatedGetTaskStore{
 		mockStore: newMockStore(),
@@ -1501,10 +1505,10 @@ func TestJudgeScan_SSEPathNotBlockedByDBPrecheck(t *testing.T) {
 	store.mockStore.mutTask("t1", func(r *TaskRow) { r.PermissionMode = PermissionModeAIAuto })
 	proc := newMockProc()
 	proc.sessions[runtimeSessionName("t1")] = true
+	// tasks 4.3：回复路由经 persisted binding；(4.4) OCDECK_TASK_ID 复检语义保留。
+	seedDerivedBinding(store.mockStore, "t1", 50001, "/data/worktrees/p1/t1")
 	proc.envValues[runtimeSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw",
-		"OCDECK_SERVE_PORT":        "50001",
-		"OCDECK_TASK_ID":           "t1",
+		"OCDECK_TASK_ID": "t1",
 	}
 	oc := newMockOC(true)
 	judge := newFakeJudge(PermissionVerdictApprove)
@@ -1546,10 +1550,9 @@ func TestJudgeScan_StopDuringBlockedDBRead(t *testing.T) {
 	store.mockStore.mutTask("t1", func(r *TaskRow) { r.PermissionMode = PermissionModeAIAuto })
 	proc := newMockProc()
 	proc.sessions[runtimeSessionName("t1")] = true
+	seedDerivedBinding(store.mockStore, "t1", 50001, "/data/worktrees/p1/t1")
 	proc.envValues[runtimeSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw",
-		"OCDECK_SERVE_PORT":        "50001",
-		"OCDECK_TASK_ID":           "t1",
+		"OCDECK_TASK_ID": "t1",
 	}
 	oc := newMockOC(true)
 	judge := newFakeJudge(PermissionVerdictApprove)
@@ -1611,7 +1614,7 @@ func (f *fakePermAudit) snapshot() []PermAuditRecord {
 }
 
 // TestJudgeAndReply_AuditMatrix 四 verdict × reply_result 全分支恰好一条记录
-//（tasks 7.2）：ok 仅 APPROVE（D2：REJECT 不回复）且含 reply 字段；gone/unknown/
+// （tasks 7.2）：ok 仅 APPROVE（D2：REJECT 不回复）且含 reply 字段；gone/unknown/
 // unsupported/not_applicable 不含；FAILED/UNCERTAIN/REJECT 判定终结即写 not_applicable。
 func TestJudgeAndReply_AuditMatrix(t *testing.T) {
 	newEnv := func(t *testing.T, verdict PermissionVerdict, judgeErr error) (*Manager, *mockOC, *taskRuntime, *fakePermAudit) {
@@ -1692,14 +1695,12 @@ func TestJudgeAndReply_AuditMatrix(t *testing.T) {
 // 回复客户端构造失败（serve env 缺失）→ 恰好一条 APPROVE + not_applicable 且不含 reply。
 func TestJudgeAndReply_AuditNotApplicable_ClientConstructFail(t *testing.T) {
 	judge := newFakeJudge(PermissionVerdictApprove)
-	m, _, oc, rt, _ := newAutoTaskEnv(t, judge)
+	m, store, oc, rt, _ := newAutoTaskEnv(t, judge)
 	fake := &fakePermAudit{}
 	m.permAudit = fake
-	// 摘除 serve 会话 env：taskOcClient 构造失败（active 门槛后）。
-	proc := m.proc.(*mockProc)
-	proc.mu.Lock()
-	delete(proc.envValues, runtimeSessionName("t1"))
-	proc.mu.Unlock()
+	// 摘除持久化 binding：taskOcClient 构造失败（active 门槛后；tasks 4.3 起
+	// client 构造失败注入位从 tmux env 反查迁移到 binding 解析）。
+	store.DeleteTaskBindingForTest("t1")
 	rt.ensureAttentionState().applyAttentionEvent(permAsked("r1", "s1", "bash", "rm"))
 
 	m.judgeScan(rt)
@@ -1742,7 +1743,7 @@ func TestJudgeAndReply_AuditNotApplicable_OnInstanceReplaced(t *testing.T) {
 }
 
 // TestJudgeScan_PreGateReject_ZeroAudit 调用判定器之前的门禁拒绝零审计记录
-//（记录计数从调用判定器起算，tasks 7.2）。
+// （记录计数从调用判定器起算，tasks 7.2）。
 func TestJudgeScan_PreGateReject_ZeroAudit(t *testing.T) {
 	judge := newFakeJudge(PermissionVerdictApprove)
 	m, _, oc, rt, _ := newAutoTaskEnv(t, judge)
@@ -1888,7 +1889,7 @@ func TestJudgeAndReply_AuditDetailAndDegraded(t *testing.T) {
 		fake := &fakePermAudit{}
 		m.permAudit = fake
 		ev := permAsked("r1", "s1", "apply_patch", "src")
-		ev.Metadata = metaRaw(t, `{"files":[{"type":"move","relativePath":"b.go","movePath":"` + strings.Repeat("m", 9000) + `"}]}`)
+		ev.Metadata = metaRaw(t, `{"files":[{"type":"move","relativePath":"b.go","movePath":"`+strings.Repeat("m", 9000)+`"}]}`)
 		rt.ensureAttentionState().applyAttentionEvent(ev)
 
 		m.judgeScan(rt)

@@ -148,9 +148,9 @@ func TestCharx_AttentionSixFamilies(t *testing.T) {
 		},
 		owner: []string{"t1 -> [" + anchor + "]"},
 		proc: []string{
-			"new ocdeck-t1-runtime cwd=/data/worktrees/p1/t1 auth=pw(64) argv=opencode --port PT1 --hostname 127.0.0.1",
+			"new ocdeck-t1-runtime cwd=/data/worktrees/p1/t1 auth=derived/pw(32) argv=opencode --port PT1 --hostname 127.0.0.1",
 			"kill ocdeck-t1-runtime",
-			fmt.Sprintf("new ocdeck-t1-runtime cwd=/data/worktrees/p1/t1 auth=pw(64) argv=opencode --port PT1 --hostname 127.0.0.1 --session %s", anchor),
+			fmt.Sprintf("new ocdeck-t1-runtime cwd=/data/worktrees/p1/t1 auth=derived/pw(32) argv=opencode --port PT1 --hostname 127.0.0.1 --session %s", anchor),
 		},
 		notices: nil,
 		dto:     []string{`t1|attention={"Permissions":[],"Questions":[]}|agentStatus=idle`},

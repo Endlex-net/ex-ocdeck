@@ -42,6 +42,8 @@ type fakeOCServer struct {
 
 	// healthFailFirst 剩余本次数的 /global/health 返回 503（健康超时脚本）。
 	healthFailFirst int
+	// healthHealthy 正常应答的 healthy 字段值（默认 true；C5 fixture 切 false）。
+	healthHealthy bool
 
 	// statuses 是 GET /session/status 的 sessionID → type 映射。
 	statuses map[string]string
@@ -71,6 +73,10 @@ type fakeOCServer struct {
 
 	// titleNetFail=true 时 PATCH /session/:id 中断连接（网络失败脚本，标题第三态）。
 	titleNetFail bool
+
+	// probeBroken 置位时 /session/status 返回结构违约（数组）→ Probe 失败 fixture
+	//（C12 注入：能力探测失败经真实 supervisor 触发）。
+	probeBroken bool
 
 	// deleteCalls 供 fixture 观测上游删除调用次数。
 	deleteCalls int
@@ -109,6 +115,7 @@ func newFakeOCServer(t *testing.T) *fakeOCServer {
 			statuses:         map[string]string{},
 			deleteStatusByID: map[string]int{},
 			expectDirs:       map[string]bool{},
+			healthHealthy:    true,
 			reset:            make(chan struct{}),
 		}
 		hs := httptest.NewUnstartedServer(s)
@@ -140,11 +147,27 @@ func (s *fakeOCServer) setHealthFailFirst(n int) {
 	s.healthFailFirst = n
 }
 
-// setStatus 设置 /session/status 映射项。
+// setHealthHealthy 切换正常 health 应答的 healthy 字段（C5 fixture：协议应答
+// 200 + healthy=false 的字段级违约形态）。
+func (s *fakeOCServer) setHealthHealthy(ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.healthHealthy = ok
+}
+
+// expectDirectory 登记预期 directory（A6 残留：/event 与 /session/status 校验用）。
 func (s *fakeOCServer) setStatus(sessionID, statusType string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.statuses[sessionID] = statusType
+}
+
+// setProbeBroken 置位 /session/status 结构违约（数组）→ Probe 失败 fixture
+//（C12 注入：能力探测失败经真实 supervisor 触发，同 infra supFixture.probeBroken）。
+func (s *fakeOCServer) setProbeBroken(broken bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.probeBroken = broken
 }
 
 // expectDirectory 登记预期 directory（A6 残留：/event 与 /session/status 校验用）。
@@ -389,7 +412,7 @@ func (s *fakeOCServer) handleHealth(w http.ResponseWriter) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"healthy": true, "version": opencode.ContractBaseline})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"healthy": s.healthHealthy, "version": opencode.ContractBaseline})
 }
 
 func (s *fakeOCServer) handleDoc(w http.ResponseWriter) {
@@ -484,6 +507,14 @@ func (s *fakeOCServer) dirMismatchOrAbsent(r *http.Request, id string) (fakeSess
 // 全量映射。
 func (s *fakeOCServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	dir := r.URL.Query().Get("directory")
+	s.mu.Lock()
+	broken := s.probeBroken
+	s.mu.Unlock()
+	if broken {
+		// C12 probe 失败 fixture：结构违约（数组）→ 客户端 Probe 报契约形状错误。
+		_ = json.NewEncoder(w).Encode([]interface{}{})
+		return
+	}
 	if dir != "" && !s.checkExpectedDirectory("/session/status", dir) {
 		w.WriteHeader(http.StatusBadRequest)
 		return

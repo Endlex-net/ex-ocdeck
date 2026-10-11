@@ -1,7 +1,7 @@
 // diffreview_adapters.go 实现 diffreview service 的 task 层 adapter（design.md D9）。
 //
 // 三类 adapter（均经 Manager 协调，MUST NOT 反向依赖 application/diffreview 以外的 application 包）：
-//   - PromptPortAdapter：实现 diffreview.PromptPort，opencode.PromptResult → diffreview.PromptOutcome 显式逐字段映射；
+//   - PromptPortAdapter：实现 diffreview.PromptPort，appagent.PromptTransportResult → diffreview.PromptOutcome 显式逐字段映射；
 //     经 Manager.taskOcClient(taskID) 获取 client+directory（attention.go:854）；获取失败 ok=false →
 //     PromptOutcome{Kind: pre_send_failure, Detail: "runtime client unavailable"}（design.md D1 adapter 获取失败唯一规则）。
 //   - DiffSourcePortAdapter：实现 diffreview.DiffSourcePort，经 Manager.gitDiffLocked（已持锁核心 helper）读取。
@@ -19,14 +19,14 @@ import (
 	"path/filepath"
 	"strings"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/application/diffreview"
 	"ocdeck/internal/infrastructure/git"
-	"ocdeck/internal/infrastructure/opencode"
 )
 
 // PromptPortAdapter 实现 diffreview.PromptPort（design.md D1/D9，task 层）。
 //
-// opencode.PromptResult → diffreview.PromptOutcome 显式逐字段映射（MUST NOT 类型别名跨层共享）。
+// appagent.PromptTransportResult → diffreview.PromptOutcome 显式逐字段映射（MUST NOT 类型别名跨层共享）。
 // 经 Manager.taskOcClient(taskID) 获取当前 client+directory；获取失败 → pre_send_failure 固定文案。
 type PromptPortAdapter struct {
 	m *Manager
@@ -44,7 +44,7 @@ var _ diffreview.PromptPort = (*PromptPortAdapter)(nil)
 // taskID 路由：经 Manager.taskOcClient(taskID) 获取当前 client+directory，保证多任务投递路由隔离。
 // adapter 获取失败（ok=false：任务非 active、凭据/端口缺失等）→ PromptOutcome{Kind: pre_send_failure,
 // Detail: "runtime client unavailable"}（design.md D1 adapter 获取失败唯一规则，MUST NOT 标 delivery_unknown）。
-// 成功获取 client 后调用 OCClient.PromptAsync（返回 opencode.PromptResult transport DTO），
+// 成功获取 client 后调用 OCClient.PromptAsync（返回 appagent.PromptTransportResult transport DTO），
 // 逐字段映射为 diffreview.PromptOutcome。
 // files（批注 7）：批注涉及的 worktree 相对路径（已去重），逐一构造 file part——
 // file:// 绝对路径 URI + mime "text/plain" + basename；发送前 os.Stat 校验，
@@ -57,14 +57,14 @@ func (a *PromptPortAdapter) PromptAsync(ctx context.Context, taskID, sessionID, 
 			Detail: "runtime client unavailable",
 		}
 	}
-	parts := make([]opencode.PromptFilePart, 0, len(files))
+	parts := make([]appagent.PromptFilePart, 0, len(files))
 	for _, rel := range files {
 		abs := filepath.Join(dir, rel)
 		st, serr := os.Stat(abs)
 		if serr != nil || !st.Mode().IsRegular() {
 			continue // 跳过缺失/非 regular 文件（批注快照已在 payload 中，不影响提交语义）
 		}
-		parts = append(parts, opencode.PromptFilePart{
+		parts = append(parts, appagent.PromptFilePart{
 			URL:      fileURLForPath(abs),
 			Mime:     "text/plain",
 			Filename: filepath.Base(rel),
@@ -84,19 +84,19 @@ func fileURLForPath(abs string) string {
 	return "file://" + strings.Join(segs, "/")
 }
 
-// mapPromptResult 将 opencode.PromptResult（transport DTO）逐字段映射为 diffreview.PromptOutcome（domain 类型）。
+// mapPromptResult 将 appagent.PromptTransportResult（transport DTO）逐字段映射为 diffreview.PromptOutcome（domain 类型）。
 // design.md D1 类型归属条：MUST 显式逐字段转换，MUST NOT 类型别名跨层共享。
 // 四值 Kind 一一对应：ResultAccepted→PromptOutcomeAccepted，余类推。
-func mapPromptResult(r opencode.PromptResult) diffreview.PromptOutcome {
+func mapPromptResult(r appagent.PromptTransportResult) diffreview.PromptOutcome {
 	var kind diffreview.PromptOutcomeKind
 	switch r.Kind {
-	case opencode.ResultAccepted:
+	case appagent.ResultAccepted:
 		kind = diffreview.PromptOutcomeAccepted
-	case opencode.ResultHTTPResponse:
+	case appagent.ResultHTTPResponse:
 		kind = diffreview.PromptOutcomeHTTPResponse
-	case opencode.ResultTransportUnknown:
+	case appagent.ResultTransportUnknown:
 		kind = diffreview.PromptOutcomeTransportUnknown
-	case opencode.ResultPreSendFailure:
+	case appagent.ResultPreSendFailure:
 		kind = diffreview.PromptOutcomePreSendFailure
 	default:
 		// 未知 Kind（opencode 包契约保证仅四值，兜底 fail-closed 为 pre_send_failure）。

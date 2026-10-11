@@ -241,8 +241,10 @@ func TestPersistResume_RestoresShellWatchersGroups(t *testing.T) {
 	proc := newMockProc()
 	proc.sessions[runtimeSessionName("t1")] = true
 	proc.sessions[shellSessionName("t1", 1)] = true
+	// tasks 4.3：恢复凭据/端口从 persisted binding 解析；OCDECK_TASK_ID 会话内复检保留。
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 	proc.envValues[runtimeSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
+		"OCDECK_TASK_ID": "t1",
 	}
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	m.cfg.ShutdownPolicy = config.ShutdownPersist

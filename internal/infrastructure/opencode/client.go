@@ -22,171 +22,9 @@ import (
 	"time"
 )
 
-// ContractBaseline 已验证契约区间上限；仅作告警，非门禁；区间检查见 internal/infrastructure/opencode/CONTRACT.md。
-// 1.18.26：scripts/check-opencode-contract.sh v1.18.25→v1.18.26 全锚点核验，23/23 字节一致，
-// ocdeck 使用的端点契约未变。
-const ContractBaseline = "1.18.26"
-
-// ContractMinVersion 已验证契约区间下限；仅作告警，非门禁。
-const ContractMinVersion = "1.18.14"
-
-// Session 表示 opencode 的 session 对象。顶层字段 id、time.updated（§20，
-// session.ts:191-209，非嵌套 info.id）。额外字段以 Raw 保留原文供上层按需取用。
-// ParentID 非空表示 background subagent 子会话（1.18.18 契约：Session 有 parentID 字段，
-// 子 session 非空，与主会话同 directory）；空为顶层会话（用户主会话）。
-type Session struct {
-	ID       string                 `json:"id"`
-	Time     SessionTime            `json:"time"`
-	Title    string                 `json:"title,omitempty"`
-	ParentID string                 `json:"parentID,omitempty"`
-	Raw      map[string]interface{} `json:"-"`
-}
-
-// SessionTime session.time 子对象（§20：顶层 time.updated）。
-type SessionTime struct {
-	Created float64 `json:"created,omitempty"`
-	Updated float64 `json:"updated,omitempty"`
-}
-
-// SessionStatusType /session/status 的三值枚举（§20，session-status-event.ts）。
-type SessionStatusType string
-
-const (
-	StatusIdle  SessionStatusType = "idle"
-	StatusBusy  SessionStatusType = "busy"
-	StatusRetry SessionStatusType = "retry"
-)
-
-// SessionStatus 单个 session 的状态对象，其余字段保留在 Raw。
-type SessionStatus struct {
-	Type SessionStatusType     `json:"type"`
-	Raw  map[string]interface{} `json:"-"`
-}
-
-// HealthResponse GET /global/health 响应（§20）。
-type HealthResponse struct {
-	Healthy bool   `json:"healthy"`
-	Version string `json:"version"`
-}
-
-// Event SSE 事件 envelope（§20）：{type, properties}。
-type Event struct {
-	Type       string                 `json:"type"`
-	Properties map[string]interface{} `json:"properties"`
-}
-
-// infoMap 取出 properties.info 并断言为 object；非 object 返回 nil。
-func (e Event) infoMap() map[string]interface{} {
-	if e.Properties == nil {
-		return nil
-	}
-	if info, ok := e.Properties["info"].(map[string]interface{}); ok {
-		return info
-	}
-	return nil
-}
-
-// SessionID 从 Event 提取 sessionID（§20：session.created/updated/deleted 均取
-// properties.info.id）。
-func (e Event) SessionID() string {
-	info := e.infoMap()
-	if info == nil {
-		return ""
-	}
-	if id, ok := info["id"].(string); ok {
-		return id
-	}
-	return ""
-}
-
-// SessionIDProp 从 Event 提取 sessionID，优先 properties.sessionID（status/diff 事件真实结构，
-// VERIFICATION.md 实测：无 properties.info，仅有 properties.sessionID），回退 properties.info.id
-//（created/updated/deleted 携带 info.id，冗余 properties.sessionID 与之同值）。
-// 用于 status/diff 事件按 sessionID 反查 task_sessions 归属（design.md §4 补注）。
-func (e Event) SessionIDProp() string {
-	if e.Properties != nil {
-		if id, ok := e.Properties["sessionID"].(string); ok && id != "" {
-			return id
-		}
-	}
-	return e.SessionID()
-}
-
-// Directory 从 Event 提取 properties.info.directory（design.md §4 补注：SSE 防线，
-// created/updated/deleted 事件校验 directory == 本任务 worktree，不匹配丢弃并告警）。
-// 无 directory 字段返回 ("", false)；存在但非 string 返回 ("", false)。
-// status/diff 事件无 directory（由 sessionID 反查 task_sessions 归属，不依赖此方法）。
-func (e Event) Directory() (string, bool) {
-	info := e.infoMap()
-	if info == nil {
-		return "", false
-	}
-	d, ok := info["directory"].(string)
-	if !ok || d == "" {
-		return "", false
-	}
-	return d, true
-}
-
-// TimeUpdated 从 Event 提取 info.time.updated（§4：以事件 info.time.updated 刷新
-// last_seen_at）。结构化访问封装在 occlient 内，调用方不得再解析 properties.info.time.updated。
-// 缺失或非数字返回 (0, false)。
-func (e Event) TimeUpdated() (float64, bool) {
-	info := e.infoMap()
-	if info == nil {
-		return 0, false
-	}
-	t, ok := info["time"].(map[string]interface{})
-	if !ok {
-		return 0, false
-	}
-	return floatNumber(t["updated"])
-}
-
-// ParentID 从 Event 提取 properties.info.parentID（1.18.18 契约：Session 有 parentID 字段，
-// 子 session 非空）。用于 SSE 捕获与全量对齐时持久化 parent_id，锚定候选据此仅取顶层会话。
-// 无 parentID 字段或非 string 返回 ""（顶层会话）。
-func (e Event) ParentID() string {
-	info := e.infoMap()
-	if info == nil {
-		return ""
-	}
-	if id, ok := info["parentID"].(string); ok {
-		return id
-	}
-	return ""
-}
-
-// floatNumber 判断 v 是否为 JSON number（float64 / json.Number），返回数值与是否为数字。
-func floatNumber(v interface{}) (float64, bool) {
-	switch n := v.(type) {
-	case float64:
-		return n, true
-	case int:
-		return float64(n), true
-	case int64:
-		return float64(n), true
-	case json.Number:
-		f, err := n.Float64()
-		return f, err == nil
-	}
-	return 0, false
-}
-
-// 错误集合。occlient 内部流转 err-first；上层在边界映射成 code/msg。
-var (
-	// ErrServeNotReady health 超时或非 2xx：serve 未就绪（§20）。
-	ErrServeNotReady = errors.New("opencode: serve not ready")
-	// ErrUnauthorized 401：内部 bug（Basic Auth 凭据错误，§20）。
-	ErrUnauthorized = errors.New("opencode: unauthorized (internal bug)")
-	// ErrSessionNotFound 404：会话不存在，必须与其他错误区分（attach 前预检、孤儿清理）。
-	ErrSessionNotFound = errors.New("opencode: session not found")
-	// ErrCapabilityMismatch 能力探测不兼容（health 不可达 / /session/status 结构不符 /
-	// session 列表字段形状不符），激活门禁拒绝（§11）。
-	ErrCapabilityMismatch = errors.New("opencode: capability mismatch (incompatible with contract baseline)")
-	// ErrSessionOverflow GET /session 返回数==limit，视为溢出（§20）。
-	ErrSessionOverflow = errors.New("opencode: session list overflow (returned count equals limit)")
-)
+// 契约区间常量、传输 DTO（Session/Event/HealthResponse/SessionStatus 等）、
+// 事件访问器与错误 sentinel 已迁移至 application/agentprovider/occlient.go
+//（C2a 中性化）；本包经 neutral_compat.go 同名别名引用，行为不变。
 
 // httpStatusError 携带 HTTP 状态码与原始 body，便于分类（404 vs 401 vs 5xx）。
 type httpStatusError struct {
@@ -209,8 +47,8 @@ type Client struct {
 	sseClient  *http.Client // SSE 专用：无读超时，靠 heartbeat/重连
 
 	// SSE 重连退避参数（§20：断流指数退避重连，有上限）。
-	reconnectBase    time.Duration
-	reconnectMax     time.Duration
+	reconnectBase     time.Duration
+	reconnectMax      time.Duration
 	reconnectMaxTries int // 最大重试次数；0 = 无限
 
 	// healthTimeout health 短超时（就绪轮询用，§20）。

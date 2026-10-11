@@ -12,10 +12,10 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/git"
 	"ocdeck/internal/infrastructure/lifecycle"
-	"ocdeck/internal/infrastructure/opencode"
 )
 
 // newLifecycleTestManager 构造注入 LifecycleRunner + LogDir 的 Manager（Phase 3 测试用）。
@@ -27,12 +27,13 @@ func newLifecycleTestManager(t *testing.T, store TaskStore, proc ProcessBackend,
 		ServePortRange: config.PortRange{Min: 50000, Max: 50999},
 		ShutdownPolicy: config.ShutdownPersist,
 	}
-	wrap := func(port int, password string, opts opencode.Options) OCClient {
+	wrap := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOC{inner: oc, onReady: opts.OnReady}
 	}
 	opts := Options{
 		Cfg: cfg, Store: store, Proc: proc, Worktree: wt, OCFactory: wrap,
-		LogDir: cfg.DataDir + "/logs",
+		LogDir:           cfg.DataDir + "/logs",
+		ProviderRegistry: newTestRegistry(),
 	}
 	if runner != nil {
 		opts.LifecycleRunner = runner
@@ -996,12 +997,13 @@ func TestDelete_Success_CleansLifecycleLogDir(t *testing.T) {
 	wt.products[wtPath] = true
 	oc := newMockOC(true)
 	runner := &mockLifecycleRunner{}
-	wrap := func(port int, password string, opts opencode.Options) OCClient {
+	wrap := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOC{inner: oc, onReady: opts.OnReady}
 	}
 	m := New(Options{
 		Cfg: cfg, Store: store, Proc: proc, Worktree: wt, OCFactory: wrap,
 		LifecycleRunner: runner, LogDir: logDir,
+		ProviderRegistry: newTestRegistry(),
 	})
 	tid := "t1"
 	store.tasks[tid] = TaskRow{ID: tid, ProjectID: "p1", Status: StatusSuspended, WorktreePath: wtPath, Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusNone}
@@ -1040,13 +1042,14 @@ func TestReconcile_ConvergeBeforeRestoreCleanupDebts(t *testing.T) {
 		ServePortRange: config.PortRange{Min: 50000, Max: 50999},
 		ShutdownPolicy: config.ShutdownPersist,
 	}
-	wrap := func(port int, password string, opts opencode.Options) OCClient {
+	wrap := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOC{inner: oc, onReady: opts.OnReady}
 	}
 	debt := &restoreTraceDebtStore{inner: newMemCleanupDebtStore(), orderMu: orderMu, order: &order}
 	m := New(Options{
 		Cfg: cfg, Store: store, Proc: proc, Worktree: wt, OCFactory: wrap,
 		DebtStore: debt, LifecycleRunner: &mockLifecycleRunner{},
+		ProviderRegistry: newTestRegistry(),
 	})
 	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt1", Branch: "ocdeck/my-task", BaseRef: "refs/heads/main", InitStatus: InitStatusRunning}
 	if err := m.Reconcile(context.Background()); err != nil {
@@ -1132,12 +1135,13 @@ func TestRerunInit_EmptyScript_OverwritesInitLog(t *testing.T) {
 	oc := newMockOC(true)
 	// 真实 LifecycleRunner：RunScript 以 /bin/sh -c 真实执行脚本、O_TRUNC 重写日志。
 	realRunner := lifecycle.New()
-	wrap := func(port int, password string, opts opencode.Options) OCClient {
+	wrap := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOC{inner: oc, onReady: opts.OnReady}
 	}
 	m := New(Options{
 		Cfg: cfg, Store: store, Proc: proc, Worktree: wt, OCFactory: wrap,
 		LifecycleRunner: realRunner, LogDir: logDir,
+		ProviderRegistry: newTestRegistry(),
 	})
 	tid := "t1"
 	// WorktreePath 须是真实存在的目录（/bin/sh -c 以其为 cwd）。

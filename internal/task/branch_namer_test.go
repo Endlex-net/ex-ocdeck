@@ -7,15 +7,15 @@ import (
 	"testing"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/config"
-	"ocdeck/internal/infrastructure/opencode"
 )
 
 // mockNamer 实现 BranchNamer，记录调用并返回预设 slug。
 type mockNamer struct {
-	mu       sync.Mutex
-	calls    []string // 记录收到的 taskName
-	slug     string   // 返回的 slug
+	mu        sync.Mutex
+	calls     []string // 记录收到的 taskName
+	slug      string   // 返回的 slug
 	callCount int
 }
 
@@ -44,7 +44,7 @@ func newTestManagerWithNamer(t *testing.T, store TaskStore, wt WorktreeBackend, 
 		ServePortRange: config.PortRange{Min: 50000, Max: 50999},
 		ShutdownPolicy: config.ShutdownPersist,
 	}
-	wrap := func(port int, password string, opts opencode.Options) OCClient {
+	wrap := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOC{inner: newMockOC(true), onReady: opts.OnReady}
 	}
 	m := New(Options{

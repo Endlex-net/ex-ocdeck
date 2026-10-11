@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/application/diffreview"
 	"ocdeck/internal/infrastructure/opencode"
 )
@@ -31,13 +32,13 @@ func TestCapabilityProbeSingleFlightConcurrentMerge(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
 	proc := newMockProc()
-	setProcServeEnv(proc, "t1")
+	setProcBinding(store, "t1", "/data/worktrees/p1/t1")
 	// 计数 ProbePromptAsyncCapability 调用次数。
 	var probeCalls int32
 	oc := newMockOC(true)
 	oc.probePromptAsyncResult = opencode.CapabilitySupported
 	wrap := &countingProbeOC{inner: oc, probeCalls: &probeCalls}
-	factory := func(port int, password string, opts opencode.Options) OCClient { return wrap }
+	factory := func(_ string, port int, password string, opts appagent.Options) OCClient { return wrap }
 	m := newTestManagerWithFactory(t, store, proc, newMockWorktree(), factory)
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
@@ -69,7 +70,7 @@ func TestCapabilityProbeSingleFlightBarrierStrictOneProbe(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
 	proc := newMockProc()
-	setProcServeEnv(proc, "t1")
+	setProcBinding(store, "t1", "/data/worktrees/p1/t1")
 	var probeCalls int32
 	oc := newMockOC(true)
 	oc.probePromptAsyncResult = opencode.CapabilitySupported
@@ -77,7 +78,7 @@ func TestCapabilityProbeSingleFlightBarrierStrictOneProbe(t *testing.T) {
 	start := make(chan struct{})
 	proceed := make(chan struct{})
 	wrap := &barrierProbeOC{mockOC: oc, probeCalls: &probeCalls, start: start, proceed: proceed}
-	factory := func(port int, password string, opts opencode.Options) OCClient { return wrap }
+	factory := func(_ string, port int, password string, opts appagent.Options) OCClient { return wrap }
 	m := newTestManagerWithFactory(t, store, proc, newMockWorktree(), factory)
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
@@ -190,12 +191,12 @@ func TestCapabilityCacheInvalidatedOnInstVersionChange(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
 	proc := newMockProc()
-	setProcServeEnv(proc, "t1")
+	setProcBinding(store, "t1", "/data/worktrees/p1/t1")
 	var probeCalls int32
 	oc := newMockOC(true)
 	oc.probePromptAsyncResult = opencode.CapabilitySupported
 	wrap := &countingProbeOC{inner: oc, probeCalls: &probeCalls}
-	factory := func(port int, password string, opts opencode.Options) OCClient { return wrap }
+	factory := func(_ string, port int, password string, opts appagent.Options) OCClient { return wrap }
 	m := newTestManagerWithFactory(t, store, proc, newMockWorktree(), factory)
 
 	rt1 := m.newRuntime("t1")
@@ -221,15 +222,13 @@ func TestCapabilityCacheInvalidatedOnInstVersionChange(t *testing.T) {
 	}
 }
 
-// setProcServeEnv 在 mockProc 中设置 serve 会话的 password/port env（使 taskOcClient ok=true）。
-func setProcServeEnv(proc *mockProc, taskID string) {
-	serveName := runtimeSessionName(taskID)
-	proc.mu.Lock()
-	proc.envValues[serveName] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "secret",
-		"OCDECK_SERVE_PORT":        "12345",
-	}
-	proc.mu.Unlock()
+// setProcBinding 预置任务持久化 binding 使 taskOcClient ok=true（tasks 4.3
+// 事实来源切换：连接端点/凭据经 persisted binding 解析，tmux env 不再为事实来源）。
+// port 固定 12345：capability/diffreview fixture 的 factory 不按 port 分派（全部
+// 返回同一 wrap），port 值仅经 binding 传递。derived 凭据现场派生（TestMain
+// 固定 master secret）。旧 setProcServeEnv 的 tmux env 预置已退役。
+func setProcBinding(s *mockStore, taskID, directory string) {
+	seedDerivedBinding(s, taskID, 12345, directory)
 }
 
 // --- 双任务路由隔离 ---
@@ -246,9 +245,13 @@ func TestPromptPortAdapterDualTaskRoutingIsolation(t *testing.T) {
 	store.mutTask("t1", func(r *TaskRow) { r.WorktreePath = dir1 })
 	seedActiveTask(store, "t2", "p2")
 	store.mutTask("t2", func(r *TaskRow) { r.WorktreePath = dir2 })
-	proc := newMockProc()
-	setProcServeEnv(proc, "t1")
-	setProcServeEnv(proc, "t2")
+	// tasks 4.3：双任务各预置 binding；factory 按 derived 密码区分（派生密码
+	// 因 taskId 不同而不同——D3 公式）。
+	seedDerivedBinding(store, "t1", 11111, dir1)
+	seedDerivedBinding(store, "t2", 22222, dir2)
+	master, _ := appagent.ResolveMasterSecret()
+	pw1, pw2 := appagent.DeriveRuntimePassword(master, "opencode-v1", "t1"),
+		appagent.DeriveRuntimePassword(master, "opencode-v1", "t2")
 
 	// 用两个独立 mockOC 实例（经 factory 按 port 区分），记录各自 PromptAsync 的 dir。
 	var dir1Calls, dir2Calls []string
@@ -259,24 +262,14 @@ func TestPromptPortAdapterDualTaskRoutingIsolation(t *testing.T) {
 	oc2.promptAsyncResult = opencode.PromptResult{Kind: opencode.ResultAccepted}
 	wrap1 := &dirCaptureOC{inner: oc1, dirs: &dir1Calls, mu: &mu}
 	wrap2 := &dirCaptureOC{inner: oc2, dirs: &dir2Calls, mu: &mu}
-	// factory 按 port 区分：t1 port=12345, t2 port=12345（同端口）——需按 password 或其他区分。
-	// 实际 taskOcClient 按 taskID 取 env，两任务 port 可同。factory 需按 taskID 区分——但 factory
-	// 签名只收 port+password。改用 password 区分：t1 password="secret1", t2 password="secret2"。
-	proc2 := newMockProc()
-	proc2.mu.Lock()
-	proc2.envValues[runtimeSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "secret1", "OCDECK_SERVE_PORT": "11111",
-	}
-	proc2.envValues[runtimeSessionName("t2")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "secret2", "OCDECK_SERVE_PORT": "22222",
-	}
-	proc2.mu.Unlock()
-	factory := func(port int, password string, opts opencode.Options) OCClient {
-		if password == "secret1" {
+	factory := func(_ string, port int, password string, opts appagent.Options) OCClient {
+		if password == pw1 {
 			return wrap1
 		}
+		_ = pw2
 		return wrap2
 	}
+	proc2 := newMockProc()
 	m := newTestManagerWithFactory(t, store, proc2, newMockWorktree(), factory)
 	m.setRuntime("t1", m.newRuntime("t1"))
 	m.setRuntime("t2", m.newRuntime("t2"))
@@ -565,7 +558,7 @@ func TestCapabilityProbeLeaderFenceFailureRotatesToNewInstance(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
 	proc := newMockProc()
-	setProcServeEnv(proc, "t1")
+	setProcBinding(store, "t1", "/data/worktrees/p1/t1")
 	var probeCalls int32
 	oc := newMockOC(true)
 	oc.probePromptAsyncResult = opencode.CapabilitySupported
@@ -573,7 +566,7 @@ func TestCapabilityProbeLeaderFenceFailureRotatesToNewInstance(t *testing.T) {
 	proceed := make(chan struct{})
 	started := make(chan struct{})
 	wrap := &barrierProbeOC{mockOC: oc, probeCalls: &probeCalls, start: started, proceed: proceed}
-	factory := func(port int, password string, opts opencode.Options) OCClient { return wrap }
+	factory := func(_ string, port int, password string, opts appagent.Options) OCClient { return wrap }
 	m := newTestManagerWithFactory(t, store, proc, newMockWorktree(), factory)
 
 	rt1 := m.newRuntime("t1")
@@ -627,12 +620,12 @@ func TestCapabilityProbeWaiterInstanceChangeIteratesNotUnboundedRecursion(t *tes
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
 	proc := newMockProc()
-	setProcServeEnv(proc, "t1")
+	setProcBinding(store, "t1", "/data/worktrees/p1/t1")
 	var probeCalls int32
 	oc := newMockOC(true)
 	oc.probePromptAsyncResult = opencode.CapabilitySupported
 	mb := newMultiBarrierProbeOC(oc, &probeCalls)
-	factory := func(port int, password string, opts opencode.Options) OCClient { return mb }
+	factory := func(_ string, port int, password string, opts appagent.Options) OCClient { return mb }
 	m := newTestManagerWithFactory(t, store, proc, newMockWorktree(), factory)
 
 	rt1 := m.newRuntime("t1")
@@ -711,13 +704,13 @@ func TestCapabilityProbeWaiterContinuousRotationReturnsUnknown(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
 	proc := newMockProc()
-	setProcServeEnv(proc, "t1")
+	setProcBinding(store, "t1", "/data/worktrees/p1/t1")
 	var probeCalls int32
 	oc := newMockOC(true)
 	oc.probePromptAsyncResult = opencode.CapabilitySupported
 	// multiBarrierProbeOC：每次 ProbePromptAsyncCapability 阻塞（供连续替换测试每轮 barrier）。
 	mb := newMultiBarrierProbeOC(oc, &probeCalls)
-	factory := func(port int, password string, opts opencode.Options) OCClient { return mb }
+	factory := func(_ string, port int, password string, opts appagent.Options) OCClient { return mb }
 	m := newTestManagerWithFactory(t, store, proc, newMockWorktree(), factory)
 
 	rt := m.newRuntime("t1")
@@ -799,12 +792,12 @@ func TestCapabilityProbeWaiterCacheReadRaceWithInvalidation(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
 	proc := newMockProc()
-	setProcServeEnv(proc, "t1")
+	setProcBinding(store, "t1", "/data/worktrees/p1/t1")
 	var probeCalls int32
 	oc := newMockOC(true)
 	oc.probePromptAsyncResult = opencode.CapabilitySupported
 	mb := newMultiBarrierProbeOC(oc, &probeCalls)
-	factory := func(port int, password string, opts opencode.Options) OCClient { return mb }
+	factory := func(_ string, port int, password string, opts appagent.Options) OCClient { return mb }
 	m := newTestManagerWithFactory(t, store, proc, newMockWorktree(), factory)
 	rt1 := m.newRuntime("t1")
 	m.setRuntime("t1", rt1)
@@ -919,7 +912,7 @@ func (c *filesCaptureOC) PromptAsync(ctx context.Context, dir, sessionID, messag
 }
 
 // TestPromptPortAdapterFileParts 验证批注 7：存在的 regular 文件构造出 file part
-//（url 为 file:// + worktree 拼接路径、mime text/plain、filename 为 basename）；
+// （url 为 file:// + worktree 拼接路径、mime text/plain、filename 为 basename）；
 // 缺失/非 regular（目录）文件被跳过，发送仍进行。
 func TestPromptPortAdapterFileParts(t *testing.T) {
 	dir := t.TempDir()
@@ -933,13 +926,15 @@ func TestPromptPortAdapterFileParts(t *testing.T) {
 	seedActiveTask(store, "t1", "p1")
 	store.mutTask("t1", func(r *TaskRow) { r.WorktreePath = dir })
 	proc := newMockProc()
-	setProcServeEnv(proc, "t1")
+	// binding directory = 任务行 WorktreePath（tasks 4.3：adapter 的 dir 经 binding
+	// 解析——文件 part 的 file:// URL 以它为根）。
+	seedDerivedBinding(store, "t1", 12345, dir)
 	var calls [][]opencode.PromptFilePart
 	var mu sync.Mutex
 	oc := newMockOC(true)
 	oc.promptAsyncResult = opencode.PromptResult{Kind: opencode.ResultAccepted}
 	wrap := &filesCaptureOC{mockOC: oc, calls: &calls, mu: &mu}
-	factory := func(port int, password string, opts opencode.Options) OCClient { return wrap }
+	factory := func(_ string, port int, password string, opts appagent.Options) OCClient { return wrap }
 	m := newTestManagerWithFactory(t, store, proc, newMockWorktree(), factory)
 	m.setRuntime("t1", m.newRuntime("t1"))
 

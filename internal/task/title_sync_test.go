@@ -25,12 +25,11 @@ func seedTitleSyncTask(t *testing.T, store *mockStore, proc *mockProc, oc *mockO
 		AnchorSessionID: sqlNullString("ses_anchor"),
 	}
 	serveName := runtimeSessionName("t1")
-	if err := proc.NewSession(newSessionSpec(serveName, "/wt/t1", map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw",
-		"OCDECK_SERVE_PORT":        "50001",
-	}, []string{"sleep"})); err != nil {
+	if err := proc.NewSession(newSessionSpec(serveName, "/wt/t1", map[string]string{}, []string{"sleep"})); err != nil {
 		t.Fatal(err)
 	}
+	// tasks 4.3：taskOcClient 经 persisted binding 解析（tmux env 预置退役）。
+	seedDerivedBinding(store, "t1", 50001, "/wt/t1")
 	m := newTestManager(t, store, proc, newMockWorktree(), oc)
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)

@@ -1,21 +1,17 @@
 // session_title.go 实现会话标题更新端点（openspec change task-info-editable D3）。
 // 端点契约为目标契约声明（CONTRACT.md 增补行标注），以 live probe 为准的既有约定不变。
+// ErrSessionTitleUnsupported sentinel 已迁移至 application/agentprovider（C2a），
+// 本包经 neutral_compat.go 别名引用。
 package opencode
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 )
-
-// ErrSessionTitleUnsupported 表示 serve 不提供会话标题更新端点（PATCH 404）。
-// 404 二分取消（D3）：路由级 404（端点缺失）与会话级 404（会话已删）无法可靠区分，
-// 一律归一为「不支持/不可用」，由调用方按能力降级处置（记 notice、不阻断改名）。
-var ErrSessionTitleUnsupported = errors.New("opencode: session title update unsupported")
 
 // UpdateSessionTitle PATCH /session/:id?directory=<wt>（task-info-editable D3 协议表）。
 // body `{"title": <title>}`；成功 200 + Session JSON，校验顶层 id 与请求一致。

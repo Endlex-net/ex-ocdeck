@@ -184,9 +184,9 @@ func newManagerWithRand(t *testing.T, dataDir string, rand4Fn func() (string, er
 
 // seqRand4 按顺序返回预设后缀；耗尽后 panic（测试用，保证调用次数受控）。
 type seqRand4 struct {
-	mu   sync.Mutex
-	seq  []string
-	idx  int
+	mu  sync.Mutex
+	seq []string
+	idx int
 }
 
 func (s *seqRand4) Next() (string, error) {

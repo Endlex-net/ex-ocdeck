@@ -58,7 +58,7 @@ func p149SeedVisibleAttention(t *testing.T, m *Manager) {
 }
 
 // p149CASNoMatchStore 包装 TaskStore：UpdateTaskStatusConditional 一律返回 !Matched 无错误
-//（模拟并发已转走，供 ③ 分叉测试）。
+// （模拟并发已转走，供 ③ 分叉测试）。
 type p149CASNoMatchStore struct {
 	TaskStore
 }
@@ -69,7 +69,7 @@ func (w *p149CASNoMatchStore) UpdateTaskStatusConditional(ctx context.Context, i
 
 // TestP149_Converge_CASerr_VisibleAttention_PublishesOnceAndResyncs ②（CAS error）+
 // 重读仍 active（②a）+ 清理前 attention 可见 → attention_changed 恰好一次 + resync 一次
-//（经全路径 convergeToSuspended 验证可见性捕获）。
+// （经全路径 convergeToSuspended 验证可见性捕获）。
 func TestP149_Converge_CASerr_VisibleAttention_PublishesOnceAndResyncs(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
@@ -95,7 +95,7 @@ func TestP149_Converge_CASerr_VisibleAttention_PublishesOnceAndResyncs(t *testin
 }
 
 // TestP149_Converge_CASerr_InvisibleAttention_NoAttentionEvent ② + attention 不可见
-//（无 pending permission/question）→ 不发 attention_changed（无可见字段则不发领域事件），
+// （无 pending permission/question）→ 不发 attention_changed（无可见字段则不发领域事件），
 // resync 仍一次。
 func TestP149_Converge_CASerr_InvisibleAttention_NoAttentionEvent(t *testing.T) {
 	store := newMockStore()
@@ -142,7 +142,7 @@ func TestP149_Matrix_W3a_VisibleAttention_InvalidatesAndRegisters(t *testing.T) 
 }
 
 // TestP149_Matrix_Committed_NoAttentionEvent ①（CAS 命中 committed）→ 即使清理前可见
-//（visible=true）也不发 attention_changed（迁移事件承载），不 resync，债务 CAD。
+// （visible=true）也不发 attention_changed（迁移事件承载），不 resync，债务 CAD。
 func TestP149_Matrix_Committed_NoAttentionEvent(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
@@ -166,7 +166,7 @@ func TestP149_Matrix_Committed_NoAttentionEvent(t *testing.T) {
 // TestP149_Matrix_W2b_VisibleAttention_PublishesViaTopOfBranch2 ②b（CAS error + 重读
 // 非 active）+ 可见 attention → ② 顶部已发布失效：attention 恰好一次 + resync 一次 +
 // 债务 CAD。钉住 design.md:425「②CAS error → 保守发布…然后按重读分叉」的发布位置
-//（发布先于重读，②b 属 ② 分支）。
+// （发布先于重读，②b 属 ② 分支）。
 func TestP149_Matrix_W2b_VisibleAttention_PublishesViaTopOfBranch2(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1") // 重读非 active → ②b
@@ -358,7 +358,7 @@ func TestP149_Worker_PreCleanup_TimeoutInvalidationNotRepublished(t *testing.T) 
 }
 
 // TestP149_Worker_PreCleanup_UnmarkedDebtStillPublishes 正向钉住：登记未标记失效
-//（AttentionInvalidated=false，如超时时 attention 不可见、随后 SSE 又到达新事件使快照
+// （AttentionInvalidated=false，如超时时 attention 不可见、随后 SSE 又到达新事件使快照
 // 可见——该可见事实从未被失效过）→ worker preCleanup 正常发布一次（修复不得变成
 // worker 永不发布）。
 func TestP149_Worker_PreCleanup_UnmarkedDebtStillPublishes(t *testing.T) {

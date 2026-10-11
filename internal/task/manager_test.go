@@ -209,7 +209,8 @@ func TestSuspend_BranchC_PartialFailRepair(t *testing.T) {
 	})
 	proc := newMockProc()
 	proc.sessions[serveSessionName("t1")] = true
-	proc.envValues[serveSessionName("t1")] = map[string]string{"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001"}
+	// tasks 4.3：连接事实来源为 persisted binding（derived）。
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 	// tui kill 失败（kill_failed 带 tickets）；serve kill 失败（仍存活）→ 分支 c。
 	proc.killResults[tuiSessionName("t1")] = process.KillResult{SessionKilled: false, Disposition: process.DispositionKillFailed, CleanupTickets: []string{"tk1"}}
 	proc.killResults[serveSessionName("t1")] = process.KillResult{SessionKilled: false, Disposition: process.DispositionKillFailed, CleanupTickets: []string{"tk2"}}
@@ -255,7 +256,8 @@ func TestSuspend_BranchC_RestoreCommitCtxCancel_ConvergesSuspended(t *testing.T)
 	})
 	proc := newMockProc()
 	proc.sessions[serveSessionName("t1")] = true
-	proc.envValues[serveSessionName("t1")] = map[string]string{"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001"}
+	// tasks 4.3：连接事实来源为 persisted binding（derived）；tmux env 反查退役。
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 	// tui/serve kill 失败 → 分支 c；serve 存活 → tryRepairRuntime 成功。
 	proc.killResults[tuiSessionName("t1")] = process.KillResult{SessionKilled: false, Disposition: process.DispositionKillFailed, CleanupTickets: []string{"tk1"}}
 	proc.killResults[serveSessionName("t1")] = process.KillResult{SessionKilled: false, Disposition: process.DispositionKillFailed, CleanupTickets: []string{"tk2"}}

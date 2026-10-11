@@ -92,7 +92,7 @@ func openTestDBRaw(t *testing.T) *DB {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "ocdeck.db")
-	dsn := "file:" + dbPath + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	dsn := "file:" + dbPath + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate"
 	sqlDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)

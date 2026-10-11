@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
+	domain "ocdeck/internal/domain/agentprovider"
 	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
 )
@@ -191,6 +192,15 @@ func TestReopenAttach_ActivateHoldsLockReturnsRecovering(t *testing.T) {
 
 type mismatchActiveCASStore struct{ *mockStore }
 
+// CommitActivation 覆盖（tasks 4.3 后激活提交事务路由到此方法）：复用激活 CAS
+// failpoint 语义（mismatch → 零修改零副作用；其余透传）。
+func (s *mismatchActiveCASStore) CommitActivation(ctx context.Context, id string, b domain.TaskBinding, fromStatus, toStatus string) (application.TransitionResult, error) {
+	if fromStatus == StatusActivating && toStatus == StatusActive {
+		return application.TransitionResult{}, nil
+	}
+	return s.mockStore.CommitActivation(ctx, id, b, fromStatus, toStatus)
+}
+
 func (s *mismatchActiveCASStore) UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (application.TransitionResult, error) {
 	if fromStatus == StatusActivating && toStatus == StatusActive {
 		return application.TransitionResult{}, nil
@@ -232,6 +242,11 @@ func TestActivate_CASMismatch_NoGenericCompensation(t *testing.T) {
 	}
 	if row.AnchorSessionID.String != "sess-existing" {
 		t.Errorf("anchor mutated: %+v", row.AnchorSessionID)
+	}
+	// tasks 4.3 binding 提交协议：CAS 失配 → 提交事务零持久化副作用
+	//（本次内存 binding 未写入——任务行无 persisted binding）。
+	if _, ok := inner.rawBindingOf("t1"); ok {
+		t.Error("binding MUST NOT be persisted on CAS mismatch (D9 提交协议)")
 	}
 	entries, _ := parseNotices(row.Notice)
 	if n := countResidualBySession(entries, runtimeSessionName("t1")); n != 1 {
@@ -286,6 +301,17 @@ func (s *rereadFailCASStore) GetTask(ctx context.Context, id string) (TaskRow, e
 	return s.mockStore.GetTask(ctx, id)
 }
 
+// CommitActivation 覆盖（tasks 4.3 后激活提交事务路由到此方法）：复用激活 CAS
+// failpoint 语义——arm reread 失败并返回 mismatch（零持久化副作用；mock 侧
+// binding 写入由调用方 CAS 失配跳过）。
+func (s *rereadFailCASStore) CommitActivation(ctx context.Context, id string, b domain.TaskBinding, fromStatus, toStatus string) (application.TransitionResult, error) {
+	if fromStatus == StatusActivating && toStatus == StatusActive {
+		s.arm = true
+		return application.TransitionResult{}, nil
+	}
+	return s.mockStore.CommitActivation(ctx, id, b, fromStatus, toStatus)
+}
+
 func TestActivate_CASMismatchRereadFail_NoGenericCompensation(t *testing.T) {
 	inner := newMockStore()
 	seedSuspendedTask(inner, "t1", "p1")
@@ -318,6 +344,15 @@ func TestActivate_CASMismatchRereadFail_NoGenericCompensation(t *testing.T) {
 
 type casMismatchNoticeFailStore struct {
 	*noConvergeStore
+}
+
+// CommitActivation 覆盖（tasks 4.3 后激活提交事务路由到此方法）：同
+// mismatchActiveCASStore 的激活 CAS failpoint 语义。
+func (s *casMismatchNoticeFailStore) CommitActivation(ctx context.Context, id string, b domain.TaskBinding, fromStatus, toStatus string) (application.TransitionResult, error) {
+	if fromStatus == StatusActivating && toStatus == StatusActive {
+		return application.TransitionResult{}, nil
+	}
+	return s.mockStore.CommitActivation(ctx, id, b, fromStatus, toStatus)
 }
 
 func (s *casMismatchNoticeFailStore) UpdateTaskStatusConditional(ctx context.Context, id, fromStatus, toStatus string, lastError sql.NullString) (application.TransitionResult, error) {

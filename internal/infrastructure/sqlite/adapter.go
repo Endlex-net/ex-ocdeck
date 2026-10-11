@@ -15,6 +15,7 @@ import (
 	"fmt"
 
 	"ocdeck/internal/application"
+	domain "ocdeck/internal/domain/agentprovider"
 	ocdecktask "ocdeck/internal/domain/task"
 	ocdecksess "ocdeck/internal/domain/session"
 	"ocdeck/internal/infrastructure/store"
@@ -51,6 +52,13 @@ func (a *Adapter) UpdateTaskStatus(ctx context.Context, id string, status ocdeck
 // UpdateTaskStatusConditional 委托 store.UpdateTaskStatusConditional。
 func (a *Adapter) UpdateTaskStatusConditional(ctx context.Context, id string, fromStatus, toStatus ocdecktask.Status, lastError *string) (application.TransitionResult, error) {
 	return a.db.UpdateTaskStatusConditional(ctx, id, fromStatus, toStatus, lastError)
+}
+
+// CommitActivation 委托 store.CommitActivation（opencode-v1-spi-provider tasks 4.3：
+// binding 写入与任务状态 CAS 同事务；失败零持久化副作用）。
+func (a *Adapter) CommitActivation(ctx context.Context, taskID string, binding domain.TaskBinding,
+	fromStatus, toStatus ocdecktask.Status) (application.TransitionResult, error) {
+	return a.db.CommitActivation(ctx, taskID, binding, fromStatus, toStatus)
 }
 
 // UpdateTaskEnvSnapshot 委托 store.UpdateTaskEnvSnapshot。

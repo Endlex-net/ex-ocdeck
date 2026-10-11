@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/infrastructure/opencode"
 )
 
@@ -130,7 +131,7 @@ func TestP4_SSEFirstAlignInProgressReconnectSerializes(t *testing.T) {
 		// 缓冲事件在首次 align 进行中发送（buffering=true），验证不被并发清空丢失。
 		bufEvents: []opencode.Event{makeEventWithDir("session.created", "E1", 300, "/data/worktrees/p1/t1"), makeEventWithDir("session.created", "E2", 310, "/data/worktrees/p1/t1")},
 	}
-	factory := func(port int, password string, opts opencode.Options) OCClient {
+	factory := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		base.onReadyCb = opts.OnReady
 		return sub
 	}

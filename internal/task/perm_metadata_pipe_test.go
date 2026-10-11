@@ -6,6 +6,7 @@ import (
 	"errors"
 	"testing"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/infrastructure/opencode"
 )
 
@@ -20,7 +21,7 @@ func metaRaw(t *testing.T, s string) json.RawMessage {
 
 // TestUpsertPerm_MetadataPipeline 管道携带与等值判断修正（tasks 8.1，D12/F8②）：
 // 第一段（可控 observedAt，独立 state + 新 requestID r9）——登记 command=A
-//（Since=1000）→ 仅 command 改 B（changed=false、Metadata=B、Since 仍 1000）→
+// （Since=1000）→ 仅 command 改 B（changed=false、Metadata=B、Since 仍 1000）→
 // 同值 B 再提交（no-op）。第二段——核心字段变化为可见变化、同值 no-op、快照
 // 深拷贝字节隔离。
 func TestUpsertPerm_MetadataPipeline(t *testing.T) {
@@ -120,7 +121,7 @@ func TestBufferedReplay_MetadataCarriedAndIsolated(t *testing.T) {
 
 	// GET 在途期间 asked 携带 metadata 入缓冲。
 	gated := &gatedPermOC{mockOC: oc, entered: make(chan struct{}, 1), release: make(chan struct{})}
-	m.ocFactory = func(port int, password string, opts opencode.Options) OCClient {
+	m.ocFactory = func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOC{inner: gated, onReady: opts.OnReady}
 	}
 	done := make(chan struct{})

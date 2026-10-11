@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/infrastructure/opencode"
 )
 
@@ -759,9 +760,7 @@ func TestAttention_BackgroundRetry_ConcurrentTypes(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
 	proc := newMockProc()
-	proc.envValues[runtimeSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001",
-	}
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 
 	// 先把两类型推到 degraded（对齐种子），再挂到 runtime
 	seed := newMockOC(true)
@@ -786,7 +785,7 @@ func TestAttention_BackgroundRetry_ConcurrentTypes(t *testing.T) {
 	wrap := &blockingBothOC{inner: oc, block: blockCh, permEntered: permEntered, questEntered: questEntered}
 
 	// OCFactory 返回 blockingBothOC，经 taskOcClient → retryAttentionDegraded 生产路径
-	factory := func(port int, password string, opts opencode.Options) OCClient { return wrap }
+	factory := func(_ string, port int, password string, opts appagent.Options) OCClient { return wrap }
 	m := newTestManagerWithFactory(t, store, proc, newMockWorktree(), factory)
 	rt := m.newRuntime("t1")
 	rt.attention = a

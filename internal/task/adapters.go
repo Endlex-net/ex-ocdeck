@@ -5,6 +5,7 @@ import (
 	"database/sql"
 
 	"ocdeck/internal/application"
+	domain "ocdeck/internal/domain/agentprovider"
 	ocdecksess "ocdeck/internal/domain/session"
 	ocdecktask "ocdeck/internal/domain/task"
 	"ocdeck/internal/infrastructure/git"
@@ -21,6 +22,28 @@ type StoreAdapter struct {
 
 // NewStoreAdapter 构造 TaskStore 适配器。
 func NewStoreAdapter(db *store.DB) *StoreAdapter { return &StoreAdapter{db: db} }
+
+// GetTaskBinding 读取任务绑定 envelope（tasks 4.2 迁移导入 runner seam；
+// domain.TaskBinding 经 domain 包传递——无 infrastructure-opencode 依赖）。
+func (a *StoreAdapter) GetTaskBinding(ctx context.Context, taskID string) (domain.TaskBinding, bool, error) {
+	return a.db.GetTaskBinding(ctx, taskID)
+}
+
+// GetTaskProviderID 读取任务声明的 provider 标识（C7 门禁修复：生命周期副作用
+// 前按任务行 provider_id 做 registry 准入）。
+func (a *StoreAdapter) GetTaskProviderID(ctx context.Context, taskID string) (string, error) {
+	return a.db.GetTaskProviderID(ctx, taskID)
+}
+
+// SetTaskBinding 写入任务绑定 envelope（Encode 校验在 domain 层）。
+func (a *StoreAdapter) SetTaskBinding(ctx context.Context, taskID string, b domain.TaskBinding) error {
+	return a.db.SetTaskBinding(ctx, taskID, b)
+}
+
+// CommitActivation 激活/恢复成功提交事务（tasks 4.3：binding 与状态 CAS 同事务）。
+func (a *StoreAdapter) CommitActivation(ctx context.Context, taskID string, b domain.TaskBinding, fromStatus, toStatus string) (application.TransitionResult, error) {
+	return a.db.CommitActivation(ctx, taskID, b, ocdecktask.Status(fromStatus), ocdecktask.Status(toStatus))
+}
 
 func (a *StoreAdapter) GetProject(ctx context.Context, id string) (ProjectRow, error) {
 	p, err := a.db.GetProject(ctx, id)
@@ -617,7 +640,7 @@ func (a *WorktreeAdapter) ValidateBranchName(ctx context.Context, repoPath, bran
 }
 
 // WorktreeHeadBranch 返回 worktree 的 symbolic HEAD 短分支名并校验仓库归属
-//（task-info-editable D2）。委托 internal/infrastructure/git.WorktreeHeadBranch。
+// （task-info-editable D2）。委托 internal/infrastructure/git.WorktreeHeadBranch。
 func (a *WorktreeAdapter) WorktreeHeadBranch(ctx context.Context, repoPath, wtPath string) (string, error) {
 	return git.WorktreeHeadBranch(ctx, repoPath, wtPath)
 }

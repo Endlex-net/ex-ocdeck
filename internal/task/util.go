@@ -3,10 +3,13 @@ package task
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"strconv"
 	"strings"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/infrastructure/process"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // newTaskID 生成 16 字节随机 hex 任务 ID（与 project ID 同策略）。
@@ -56,11 +59,15 @@ func parsePort(s string) (int, bool) {
 	return p, true
 }
 
-// newRandomPassword 生成 32 字节随机 hex 服务密码（每 serve 独立，design.md §2）。
-func newRandomPassword() string {
-	b := make([]byte, 32)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+// derivedServePassword 返回任务的派生运行时密码（D3 固定公式；同任务恒定——
+// D3 批准的内部变更：派生密码不再随重启/轮换轮换）。主密钥缺失/空值
+// fail-closed（涉及凭据的操作不得继续——不建进程）。
+func derivedServePassword(taskID string) (string, error) {
+	master, err := appagent.ResolveMasterSecret()
+	if err != nil {
+		return "", fmt.Errorf("resolve master secret: %w", err)
+	}
+	return appagent.DeriveRuntimePassword(master, store.ProviderIDV1, taskID), nil
 }
 
 // sessionNameFor 构造会话名 ocdeck-<taskID>-<role>（design.md §2）。

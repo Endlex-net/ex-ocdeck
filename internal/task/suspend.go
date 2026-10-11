@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/infrastructure/opencode"
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/infrastructure/process"
 )
 
@@ -42,6 +42,18 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 	mode, kerr := resolveAlignMode(row, proj.Kind)
 	if kerr != nil {
 		return newOpErr(codeInternal, kerr)
+	}
+	// C7 残余（review attempt 2）：挂起准入——首次状态/进程副作用前按任务 provider
+	// 做 registry 准入（specs「Provider registry 分派」：未注册 fail-closed 零副作用，
+	// 诊断性 last_error 允许）。准入失败：任务保持 active，零 kill 零 suspending。
+	// mutation 证据（已验证 → 红）：准入旁路（`if false &&`）→ TestC7_Suspend
+	// UnknownProviderZeroSideEffects 红（suspending 提交逃逸——status 偏离 active）。
+	if aerr := m.registryAdmitTask(ctx, taskID); aerr != nil {
+		if isProviderNotFound(aerr) {
+			m.recordAdmissionError(ctx, taskID, aerr)
+			return newOpErr(codeInternal, aerr)
+		}
+		return newOpErr(codeInternal, aerr)
 	}
 	// task-info-editable D2 仲裁表：Suspend 在 active→suspending 状态流转前先执行 R1 收敛
 	//（防止清快照后恢复补提交复活快照）。不可收敛 → conflict 拒绝挂起（状态与快照不变）。
@@ -320,32 +332,60 @@ func (m *Manager) tryRepairRuntime(ctx context.Context, taskID string, mode Alig
 	if err != nil || !alive {
 		return false, fmt.Errorf("runtime gone before repair: %w", err)
 	}
-	row, gerr := m.store.GetTask(ctx, taskID)
-	if gerr != nil {
-		return false, fmt.Errorf("get task: %w", gerr)
+	// C2 门禁修复（design D9a 入口映射：tryRepairRuntime → Resume 仅修复（不建程）
+	// {AllowSessionCreate=false, AllowRebuild=false, BeforeLaunch=nil}）：runtimeSupervisor
+	// 注入时，存活终端健康验证经 supervisor.Resume 复用分支——会话仍在为前置
+	//（上方 HasSession 已校验；复用零 NewSession），策略矩阵与 D9 一致。
+	if m.runtimeSupervisor != nil {
+		oldBinding, _, berr := m.store.GetTaskBinding(ctx, taskID)
+		if berr != nil || oldBinding.TerminalRef == "" {
+			return false, fmt.Errorf("cannot recover binding for repair")
+		}
+		binding, serr := m.runtimeSupervisor.Resume(ctx,
+			appagent.TaskRef{TaskID: taskID, Directory: m.worktreePathForRepair(taskID, serveName)},
+			oldBinding, appagent.ResumePolicy{AllowSessionCreate: false, AllowRebuild: false})
+		if serr != nil {
+			return false, fmt.Errorf("supervisor resume reuse: %w", serr)
+		}
+		port, password, _, eerr := m.bindingEndpoint(binding)
+		if eerr != nil {
+			return false, fmt.Errorf("provider binding endpoint: %w", eerr)
+		}
+		return m.repairRuntimeRegistered(ctx, taskID, mode, serveName, port, password)
 	}
-	// 读回 serve 密码与端口（端口以会话内 OCDECK_SERVE_PORT 为唯一权威来源，design.md §3/§5：
-	// last_port 非事实来源，MUST NOT 回退）。读回失败/空 MUST 返回错误，不得用 last_port 兜底。
-	password := m.recoverPassword(ctx, taskID)
-	if password == "" {
-		return false, fmt.Errorf("cannot recover serve password")
-	}
-	portStr, perr := m.proc.ShowSessionEnv(serveName, "OCDECK_SERVE_PORT")
-	if perr != nil || portStr == "" {
-		return false, fmt.Errorf("cannot recover serve port from session: %w", perr)
-	}
-	port, ok := parsePort(portStr)
+	// 健康检查凭据/端点从持久化 binding 解析（tasks 4.3 事实来源切换）；任务行由
+	// repairRuntimeRegistered 读取（initPermState 需要）。
+	oc, _, ok := m.taskOcBindingClient(ctx, taskID, appagent.Options{HealthTimeout: 2 * time.Second, OpTimeout: 5 * time.Second})
 	if !ok {
-		return false, fmt.Errorf("invalid serve port %q", portStr)
+		return false, fmt.Errorf("cannot recover binding for repair")
 	}
-	// 认证健康检查探活（校验 serve 仍健康）。
-	oc := m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 5 * time.Second})
 	if _, err := oc.Health(ctx); err != nil {
 		return false, fmt.Errorf("health check: %w", err)
 	}
+	return m.repairRuntimeRegistered(ctx, taskID, mode, serveName, -1, "")
+}
+
+// worktreePathForRepair 返回修复路径的 supervisor TaskRef 目录（任务行 worktree；
+// 读取失败回退空串——supervisor checkDeps 对空目录 fail-closed，等价既有失败语义）。
+func (m *Manager) worktreePathForRepair(taskID, serveName string) string {
+	if row, err := m.store.GetTask(context.Background(), taskID); err == nil {
+		return row.WorktreePath
+	}
+	_ = serveName
+	return ""
+}
+
+// repairRuntimeRegistered 是 tryRepairRuntime 的注册段（共享）：启动事实校验 →
+// runtime 注册 → SSE（C9 finalBinding 语义：supervisor 路径显式传入 binding）→
+// watchServeExit。port<0 表示内联回退路径（SSE 端点经持久化 binding 自解析）。
+func (m *Manager) repairRuntimeRegistered(ctx context.Context, taskID string, mode AlignMode, serveName string, port int, password string) (bool, error) {
 	// 重建运行时 → SSE 订阅 + 全量对齐（B7：恢复完整运行时）。mode 由 Suspend 入口传入。
 	// 启动事实读校验（task-permission-mode D5 三路径矩阵②）：有存活进程但启动事实
 	// NULL/非法 MUST 失败不注册（fail-closed）。
+	row, grerr := m.store.GetTask(ctx, taskID)
+	if grerr != nil {
+		return false, fmt.Errorf("get task: %w", grerr)
+	}
 	startMode, serr := m.readStartFactForRegister(ctx, taskID)
 	if serr != nil {
 		return false, serr
@@ -356,7 +396,17 @@ func (m *Manager) tryRepairRuntime(ctx context.Context, taskID string, mode Alig
 	}
 	m.setRuntime(taskID, rt)
 	rt.registerGroup(roleRuntime, serveName)
-	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode); err != nil {
+	if port > 0 {
+		binding, berr := m.currentTaskBinding(ctx, taskID)
+		if berr != nil {
+			m.clearRuntime(taskID)
+			return false, fmt.Errorf("resolve binding for sse: %w", berr)
+		}
+		if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode, &binding); err != nil {
+			m.clearRuntime(taskID)
+			return false, fmt.Errorf("sse resubscribe: %w", err)
+		}
+	} else if err := m.startSSEFromBinding(ctx, rt, taskID, mode); err != nil {
 		m.clearRuntime(taskID)
 		return false, fmt.Errorf("sse resubscribe: %w", err)
 	}
@@ -407,19 +457,6 @@ func (m *Manager) listShellSessions(taskID string) ([]string, error) {
 		}
 	}
 	return out, nil
-}
-
-// recoverPassword 从 serve 会话环境恢复密码（persist 恢复 / suspend 修复用，design.md §2）。
-func (m *Manager) recoverPassword(ctx context.Context, taskID string) string {
-	pw, err := m.proc.ShowSessionEnv(runtimeSessionName(taskID), "OPENCODE_SERVER_PASSWORD")
-	if err == nil && pw != "" {
-		return pw
-	}
-	pw, err = m.proc.ShowSessionEnv(serveSessionName(taskID), "OPENCODE_SERVER_PASSWORD")
-	if err != nil {
-		return ""
-	}
-	return pw
 }
 
 // newSessionSpec 构造 SessionSpec 辅助。

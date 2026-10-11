@@ -468,18 +468,22 @@ func TestStartFact_ShellAndTempServeDoNotWrite(t *testing.T) {
 		t.Errorf("start fact map size %d -> %d（shell NewSession MUST NOT 写启动事实）", before, after)
 	}
 
-	// temp serve：直接调用删除清理路径的一次性 serve（无 runtime 场景）。
+	// 临时删除清理 runtime（tasks 4.3 AcquireEphemeral 分支）：经 supervisor 入口
+	// spawn（SideFx.ResolvePermissionMode 仅 Activate 路径消费——本用例验证
+	// AcquireEphemeral 的 resolve 分支亦不写启动事实）。
+	srv := newFakeOCServer(t)
 	store2 := newMockStore()
-	row := seedSuspendedTask(store2, "t2", "p1")
+	seedSuspendedTask(store2, "t2", "p1")
 	m2 := newTestManager(t, store2, newMockProc(), newMockWorktree(), newMockOC(true))
-	if _, _, err := m2.startTempServe(context.Background(), row); err != nil {
-		t.Fatalf("startTempServe: %v", err)
+	injectEphemeralSupervisorForTestWithPort(t, m2, store2, nil, srv.port)
+	if _, _, _, _, err := m2.deleteCleanupConnect(context.Background(), store2.tasks["t2"]); err != nil {
+		t.Fatalf("deleteCleanupConnect(ephemeral): %v", err)
 	}
 	store2.mu.Lock()
 	_, written := store2.permissionModeAtStart["t2"]
 	store2.mu.Unlock()
 	if written {
-		t.Error("temp serve NewSession MUST NOT write start fact")
+		t.Error("ephemeral runtime NewSession MUST NOT write start fact")
 	}
 }
 
@@ -499,10 +503,10 @@ func newResumeStartFactEnv(t *testing.T) (*Manager, *mockStore, *mockProc) {
 	store.mutTask("t1", func(r *TaskRow) { r.EnvSnapshot = snapBytes })
 	proc := newMockProc()
 	proc.sessions[runtimeSessionName("t1")] = true
+	// tasks 4.3：恢复凭据/端口从 persisted binding 解析；OCDECK_TASK_ID 复检保留。
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 	proc.envValues[runtimeSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw",
-		"OCDECK_SERVE_PORT":        "50001",
-		"OCDECK_TASK_ID":           "t1",
+		"OCDECK_TASK_ID": "t1",
 	}
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	m.SetLifecycleCtx(context.Background())
@@ -569,8 +573,10 @@ func TestTryRepairRuntime_StartFactGate(t *testing.T) {
 		})
 		proc := newMockProc()
 		proc.sessions[serveSessionName("t1")] = true
+		// tasks 4.3：修复路径凭据/端口经 persisted binding 解析。
+		seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 		proc.envValues[serveSessionName("t1")] = map[string]string{
-			"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
+			"OCDECK_TASK_ID": "t1",
 		}
 		m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 		return m, store

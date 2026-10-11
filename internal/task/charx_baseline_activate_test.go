@@ -180,7 +180,7 @@ func TestCharx_AnchorBootstrap_ValidAnchorDirectStart(t *testing.T) {
 		sessions: []string{"t1|ses-existing|created=1|first_seen=<TS>|last_seen=1|parent=-"},
 		owner:    []string{"t1 -> [ses-existing]"},
 		proc: []string{
-			"new ocdeck-t1-runtime cwd=/data/worktrees/p1/t1 auth=pw(64) argv=opencode --port PT1 --hostname 127.0.0.1 --session ses-existing",
+			"new ocdeck-t1-runtime cwd=/data/worktrees/p1/t1 auth=derived/pw(32) argv=opencode --port PT1 --hostname 127.0.0.1 --session ses-existing",
 		},
 		notices: nil,
 		dto:     []string{`t1|attention={"Permissions":[],"Questions":[]}|agentStatus=idle`},

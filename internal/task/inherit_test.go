@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/git"
 )
@@ -145,7 +146,7 @@ func newReadInitLogManager(t *testing.T, store TaskStore, logDir string) *Manage
 		ServePortRange: config.PortRange{Min: 50000, Max: 50999},
 		ShutdownPolicy: config.ShutdownPersist,
 	}
-	return New(Options{Cfg: cfg, Store: store, LogDir: logDir, LifecycleRunner: &mockLifecycleRunner{}})
+	return New(Options{Cfg: cfg, Store: store, LogDir: logDir, LifecycleRunner: &mockLifecycleRunner{}, OCFactory: func(_ string, port int, password string, opts appagent.Options) OCClient { return newMockOC(true) }})
 }
 
 // TestReadInitLog_InheritConcatenated：init.log + inherit.log 拼接，inherit 节冠以

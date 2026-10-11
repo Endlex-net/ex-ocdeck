@@ -18,8 +18,8 @@ import (
 	ocdecktask "ocdeck/internal/domain/task"
 	"ocdeck/internal/infrastructure/eventbus"
 	"ocdeck/internal/infrastructure/sqlite"
-	uploads "ocdeck/internal/infrastructure/uploads"
 	"ocdeck/internal/infrastructure/store"
+	uploads "ocdeck/internal/infrastructure/uploads"
 )
 
 // wiringUploadConfig 构造仅含上传三字段的 config（组合根等价：字段经
@@ -125,7 +125,7 @@ func (f *fakeCurrentConnSource) CurrentTUIConnID(taskID string) (string, bool) {
 }
 
 // TestUploadWiring_CurrentConnPort 验证 currentConnPort 适配映射：HTTP 服务构造前
-//（未回填）按未注册处理 ("",false,nil)；setServer 回填后透传数据源结果。
+// （未回填）按未注册处理 ("",false,nil)；setServer 回填后透传数据源结果。
 func TestUploadWiring_CurrentConnPort(t *testing.T) {
 	ctx := context.Background()
 	p := &currentConnPort{}
@@ -145,7 +145,7 @@ func TestUploadWiring_CurrentConnPort(t *testing.T) {
 }
 
 // TestUploadWiring_DeliverConnCurrentity 验证接线后 Deliver ①连接当前性真实生效
-//（不再跳过）：connID 与数据源当前值匹配才注入；不匹配返回 forbidden 且零注入。
+// （不再跳过）：connID 与数据源当前值匹配才注入；不匹配返回 forbidden 且零注入。
 func TestUploadWiring_DeliverConnCurrentity(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

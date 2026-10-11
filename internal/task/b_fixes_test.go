@@ -207,7 +207,9 @@ func TestSuspend_BranchC_FullRuntimeRecovery(t *testing.T) {
 	})
 	proc := newMockProc()
 	proc.sessions[serveSessionName("t1")] = true
-	proc.envValues[serveSessionName("t1")] = map[string]string{"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1"}
+	// tasks 4.3：连接事实来源为 persisted binding（derived）；tmux env 不再反查
+	//（OCDECK_TASK_ID 会话内复检属 reconcile resumeActive 语义）。
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 	// tui kill 失败；serve kill 失败（仍存活）→ 分支 c。
 	proc.killResults[tuiSessionName("t1")] = process.KillResult{SessionKilled: false, Disposition: process.DispositionKillFailed, CleanupTickets: []string{"tk1"}}
 	proc.killResults[serveSessionName("t1")] = process.KillResult{SessionKilled: false, Disposition: process.DispositionKillFailed, CleanupTickets: []string{"tk2"}}

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
@@ -137,12 +138,13 @@ func newServeRetryManager(t *testing.T, store TaskStore, proc ProcessBackend, oc
 		ServePortRange: pr,
 		ShutdownPolicy: config.ShutdownPersist,
 	}
-	factory := func(port int, password string, opts opencode.Options) OCClient {
+	factory := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOCWrap{inner: oc, onReady: opts.OnReady}
 	}
 	m := New(Options{
 		Cfg: cfg, Store: store, Proc: proc, Worktree: newMockWorktree(),
-		OCFactory: factory,
+		OCFactory:        factory,
+		ProviderRegistry: newTestRegistry(),
 	})
 	// 测试注入短健康轮询：生产默认 10s/500ms 不变；整套 D2 用例应在数十秒内完成。
 	m.serveReadyTimeout = 30 * time.Millisecond
@@ -316,7 +318,7 @@ func TestPortRetry_AdjacentPortsDifferOnHealthTimeoutClean(t *testing.T) {
 	proc := &portRecordingProc{mockProc: base, ports: &ports, mu: &portsMu}
 	// 前 2 次 New 对应的 client 永不健康；第 3 次健康。
 	var healthClients atomic.Int32
-	factory := func(port int, password string, opts opencode.Options) OCClient {
+	factory := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		n := healthClients.Add(1)
 		var inner OCClient
 		if n <= 2 {
@@ -329,6 +331,7 @@ func TestPortRetry_AdjacentPortsDifferOnHealthTimeoutClean(t *testing.T) {
 	m := New(Options{
 		Cfg:   &config.Config{DataDir: t.TempDir(), ServePortRange: config.PortRange{Min: 50000, Max: 50010}, ShutdownPolicy: config.ShutdownPersist},
 		Store: store, Proc: proc, Worktree: newMockWorktree(), OCFactory: factory,
+		ProviderRegistry: newTestRegistry(),
 	})
 	withFastServeReady(m)
 	env, err := m.mergeEnvSnapshot(context.Background(), row, 50000)
@@ -591,7 +594,7 @@ func TestPortRetry_SnapshotMissingDegradedContinuesRotate(t *testing.T) {
 		{res: process.KillResult{SessionKilled: false, Disposition: process.DispositionSnapshotMissingDegraded}},
 	}}
 	failPort := 50000
-	ocFactory := func(port int, password string, opts opencode.Options) OCClient {
+	ocFactory := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOCWrap{inner: &portHealthOC{port: port, failPort: failPort}, onReady: opts.OnReady}
 	}
 	m := New(Options{

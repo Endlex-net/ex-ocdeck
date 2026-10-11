@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/application/runtime"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/opencode"
@@ -785,14 +786,14 @@ func newPortFailoverManager(t *testing.T, store TaskStore, proc ProcessBackend, 
 		ServePortRange: config.PortRange{Min: 50000, Max: 50999},
 		ShutdownPolicy: config.ShutdownPersist,
 	}
-	factory := func(port int, password string, opts opencode.Options) OCClient {
+	factory := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		inner := oc
 		if fp := failPort.Load(); fp == -1 || int64(port) == fp {
 			inner = &failHealthOC{OCClient: oc}
 		}
 		return &readyOC{inner: inner, onReady: opts.OnReady}
 	}
-	m := New(Options{Cfg: cfg, Store: store, Proc: proc, Worktree: newMockWorktree(), OCFactory: factory})
+	m := New(Options{Cfg: cfg, Store: store, Proc: proc, Worktree: newMockWorktree(), OCFactory: factory, ProviderRegistry: newTestRegistry()})
 	m.recoveryBackoffFn = func(int) time.Duration { return 0 }
 	m.serveReadyTimeout = 150 * time.Millisecond
 	m.serveReadyPollInterval = 30 * time.Millisecond
