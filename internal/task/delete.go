@@ -9,6 +9,7 @@ import (
 	"time"
 
 	appagent "ocdeck/internal/application/agentprovider"
+	domain "ocdeck/internal/domain/agentprovider"
 	ocdecksess "ocdeck/internal/domain/session"
 	ocdecktask "ocdeck/internal/domain/task"
 	"ocdeck/internal/infrastructure/process"
@@ -515,7 +516,7 @@ func (m *Manager) deleteOCSessions(ctx context.Context, row TaskRow) error {
 	//     陈旧 binding MUST NOT 走普通 Resume），临时 runtime 清理失败阻断任务删除。
 	// tmux env 反查退役（特许例外仅迁移导入 runner 与本路径的临时 runtime 形态——
 	// 凭据由 supervisor 派生注入，删除侧不经 env 读回）。
-	port, password, serveName, ephemeral, setupErr := m.deleteCleanupConnect(ctx, row)
+	port, password, serveName, ephemeral, ephemeralBinding, setupErr := m.deleteCleanupConnect(ctx, row)
 	if setupErr != nil {
 		return setupErr
 	}
@@ -556,20 +557,44 @@ func (m *Manager) deleteOCSessions(ctx context.Context, row TaskRow) error {
 	// 不随后续 worktree/DB 删除的 CASCADE 永久丢失（design.md §8/§19 + D10 例外行）。
 	// 非 clean disposition 或 kill 错误 MUST 阻止越过 DB 提交点。
 	if ephemeralStarted {
-		res, kerr := m.proc.KillSession(serveName)
-		if kerr != nil {
-			// kill 基础设施错误：记 notice（reason=kill_failed, retryable=true）。
-			errs = append(errs, fmt.Errorf("kill temp runtime %s: %w", serveName, kerr))
-			if nerr := m.recordResidualNotice(ctx, row.ID, serveName, res.CleanupTickets, noticeReasonKillFailed, true); nerr != nil {
-				errs = append(errs, nerr)
+		// 阶段 4 Release 接线（约束评估：经 Release 不破坏「临时 runtime 清理失败
+		// 阻断删除」契约——CleanupStageError 映射后聚合进 errs 的路径与内联
+		// KillSession 失败相同，D10 例外行语义不变；临时绑定即 AcquireEphemeral
+		// 返回的内存 binding，Release 幂等消费 TerminalRef）。runtimeSupervisor
+		// 未注入（内联测试接缝/golden 矩阵）保持内联实现。
+		if m.runtimeSupervisor != nil {
+			if rerr := m.runtimeSupervisor.Release(ctx, ephemeralBinding); rerr != nil {
+				entry := releaseStageToKillEntry(serveName, rerr)
+				if entry.killErr != nil {
+					errs = append(errs, fmt.Errorf("kill temp runtime %s: %w", serveName, entry.killErr))
+					if nerr := m.recordResidualNotice(ctx, row.ID, serveName, entry.result.CleanupTickets, noticeReasonKillFailed, true); nerr != nil {
+						errs = append(errs, nerr)
+					}
+				} else {
+					if nerr := m.recordResidualNoticeFromDisposition(ctx, row.ID, serveName, entry.result); nerr != nil {
+						errs = append(errs, nerr)
+					}
+					if cls := classifyKillResult(entry.result); cls.action != "none" {
+						errs = append(errs, fmt.Errorf("temp runtime %s cleanup not clean: %s", serveName, cls.reason))
+					}
+				}
 			}
 		} else {
-			cls := classifyKillResult(res)
-			if nerr := m.recordResidualNoticeFromDisposition(ctx, row.ID, serveName, res); nerr != nil {
-				errs = append(errs, nerr)
-			}
-			if cls.action != "none" {
-				errs = append(errs, fmt.Errorf("temp runtime %s cleanup not clean: %s", serveName, cls.reason))
+			res, kerr := m.proc.KillSession(serveName)
+			if kerr != nil {
+				// kill 基础设施错误：记 notice（reason=kill_failed, retryable=true）。
+				errs = append(errs, fmt.Errorf("kill temp runtime %s: %w", serveName, kerr))
+				if nerr := m.recordResidualNotice(ctx, row.ID, serveName, res.CleanupTickets, noticeReasonKillFailed, true); nerr != nil {
+					errs = append(errs, nerr)
+				}
+			} else {
+				cls := classifyKillResult(res)
+				if nerr := m.recordResidualNoticeFromDisposition(ctx, row.ID, serveName, res); nerr != nil {
+					errs = append(errs, nerr)
+				}
+				if cls.action != "none" {
+					errs = append(errs, fmt.Errorf("temp runtime %s cleanup not clean: %s", serveName, cls.reason))
+				}
 			}
 		}
 	}
@@ -577,9 +602,11 @@ func (m *Manager) deleteOCSessions(ctx context.Context, row TaskRow) error {
 }
 
 // deleteCleanupConnect 按删除清理分支规则建立 oc session 删除的连接事实：
-// 返回 (port, password, runtime 会话名, 是否临时 runtime)。分支语义见
-// deleteOCSessions 头注释（design D9 删除清理行 / D10 例外行）。
-func (m *Manager) deleteCleanupConnect(ctx context.Context, row TaskRow) (int, string, string, bool, error) {
+// 返回 (port, password, runtime 会话名, 是否临时 runtime, 临时绑定, error)。
+// 临时绑定仅分支②返回（阶段 4 Release 接线：临时 runtime 终止经 Release 消费
+// 该绑定；其余分支零值）。分支语义见 deleteOCSessions 头注释（design D9 删除
+// 清理行 / D10 例外行）。
+func (m *Manager) deleteCleanupConnect(ctx context.Context, row TaskRow) (int, string, string, bool, domain.TaskBinding, error) {
 	runtimeName := runtimeSessionName(row.ID)
 	serveName := runtimeName
 	alive, _ := m.proc.HasSession(runtimeName)
@@ -597,7 +624,7 @@ func (m *Manager) deleteCleanupConnect(ctx context.Context, row TaskRow) (int, s
 			// 复用前健康校验（陈旧 binding 的 runtime 可能已重启且凭据失效）。
 			oc := m.ocFactory(data.ProviderID, data.Port, pw, appagent.Options{HealthTimeout: 2 * time.Second, OpTimeout: 5 * time.Second})
 			if _, herr := oc.Health(ctx); herr == nil {
-				return data.Port, pw, runtimeName, false, nil
+				return data.Port, pw, runtimeName, false, domain.TaskBinding{}, nil
 			}
 		}
 		// binding 陈旧/凭据失效 → 落分支②（MUST NOT 走普通 Resume 触发恢复）。
@@ -608,27 +635,27 @@ func (m *Manager) deleteCleanupConnect(ctx context.Context, row TaskRow) (int, s
 	if alive && serveName != runtimeName {
 		pw, err := m.proc.ShowSessionEnv(serveName, "OPENCODE_SERVER_PASSWORD")
 		if err != nil || pw == "" {
-			return 0, "", "", false, fmt.Errorf("recover serve password: %w", err)
+			return 0, "", "", false, domain.TaskBinding{}, fmt.Errorf("recover serve password: %w", err)
 		}
 		portStr, perr := m.proc.ShowSessionEnv(serveName, "OCDECK_SERVE_PORT")
 		if perr != nil || portStr == "" {
-			return 0, "", "", false, fmt.Errorf("recover serve port for oc session delete: %w", perr)
+			return 0, "", "", false, domain.TaskBinding{}, fmt.Errorf("recover serve port for oc session delete: %w", perr)
 		}
 		port, ok := parsePort(portStr)
 		if !ok {
-			return 0, "", "", false, fmt.Errorf("invalid serve port %q for oc session delete", portStr)
+			return 0, "", "", false, domain.TaskBinding{}, fmt.Errorf("invalid serve port %q for oc session delete", portStr)
 		}
-		return port, pw, serveName, false, nil
+		return port, pw, serveName, false, domain.TaskBinding{}, nil
 	}
 	// 分支②：AcquireEphemeral 内存临时绑定（design D9a 分支②/D10）——经 registry
 	// 分派 supervisor（未注册 fail-closed），端口+进程+健康；无锚定 bootstrap、无
 	// claim、无对齐、无任务状态提交、不读/不写 env 快照与启动事实；返回值仅存内存
 	//（MUST NOT 持久化）。陈旧 binding 不参与（MUST NOT 走普通 Resume 触发恢复）。
 	if err := m.registryDispatch(store.ProviderIDV1); err != nil {
-		return 0, "", "", false, err
+		return 0, "", "", false, domain.TaskBinding{}, err
 	}
 	if m.ephemeralSupervisor == nil {
-		return 0, "", "", false, appagent.NewError("supervisor.acquire_ephemeral",
+		return 0, "", "", false, domain.TaskBinding{}, appagent.NewError("supervisor.acquire_ephemeral",
 			appagent.ErrKindCapabilityUnavailable, errors.New("supervisor 未注入"))
 	}
 	binding, aerr := m.ephemeralSupervisor.AcquireEphemeral(ctx, appagent.TaskRef{
@@ -637,17 +664,17 @@ func (m *Manager) deleteCleanupConnect(ctx context.Context, row TaskRow) (int, s
 		Mode:      taskModeForRef(row),
 	})
 	if aerr != nil {
-		return 0, "", "", false, fmt.Errorf("acquire ephemeral runtime for oc session delete: %w", aerr)
+		return 0, "", "", false, domain.TaskBinding{}, fmt.Errorf("acquire ephemeral runtime for oc session delete: %w", aerr)
 	}
 	eddata, derr := decodeV1BindingData(binding)
 	if derr != nil {
-		return 0, "", "", false, fmt.Errorf("decode ephemeral binding: %w", derr)
+		return 0, "", "", false, domain.TaskBinding{}, fmt.Errorf("decode ephemeral binding: %w", derr)
 	}
 	epw, err2 := eddata.password()
 	if err2 != nil {
-		return 0, "", "", false, fmt.Errorf("resolve ephemeral credential: %w", err2)
+		return 0, "", "", false, domain.TaskBinding{}, fmt.Errorf("resolve ephemeral credential: %w", err2)
 	}
-	return eddata.Port, epw, binding.TerminalRef, true, nil
+	return eddata.Port, epw, binding.TerminalRef, true, binding, nil
 }
 
 // taskModeForRef 解析 TaskRef 的 mode 字段（provider 契约值：worktree|local-path）。
@@ -676,6 +703,30 @@ func (m *Manager) killResidualSessions(ctx context.Context, taskID string) error
 		errs = append(errs, err)
 	}
 	for _, name := range names {
+		// 阶段 4 Release 接线：agent runtime（binding.TerminalRef 对应会话）终止经
+		// supervisor.Release（C7 provider 准入已在 Delete 入口/清理连接完成）；
+		// CleanupStageError 映射回既有 notice/errs 通道（文本形态与内联一致）。
+		// legacy -serve（特许域）与 tui/shell 保持内联；runtimeSupervisor 未注入
+		// （内联测试接缝/golden 矩阵）保持内联实现。
+		if name == runtimeSessionName(taskID) && m.runtimeSupervisor != nil {
+			if rerr := m.runtimeSupervisor.Release(ctx, minimalReleaseBinding(taskID, name)); rerr != nil {
+				entry := releaseStageToKillEntry(name, rerr)
+				if entry.killErr != nil {
+					if nerr := m.recordResidualNotice(ctx, taskID, name, entry.result.CleanupTickets, noticeReasonKillFailed, true); nerr != nil {
+						errs = append(errs, fmt.Errorf("kill residual session %s: %w; record notice: %v", name, entry.killErr, nerr))
+					} else {
+						errs = append(errs, fmt.Errorf("kill residual session %s: %w", name, entry.killErr))
+					}
+					continue
+				}
+				if nerr := m.recordResidualNoticeFromDisposition(ctx, taskID, name, entry.result); nerr != nil {
+					errs = append(errs, fmt.Errorf("kill residual session %s: record notice: %w", name, nerr))
+				} else {
+					errs = append(errs, fmt.Errorf("kill residual session %s: %s", name, classifyKillResult(entry.result).reason))
+				}
+			}
+			continue
+		}
 		exists, herr := m.proc.HasSession(name)
 		if herr != nil && !errors.Is(herr, process.ErrNoTmuxServer) {
 			errs = append(errs, fmt.Errorf("kill residual sessions: has session %s: %w", name, herr))

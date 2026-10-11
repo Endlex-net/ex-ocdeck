@@ -3,13 +3,16 @@ package task
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"ocdeck/internal/application"
 	appagent "ocdeck/internal/application/agentprovider"
+	domain "ocdeck/internal/domain/agentprovider"
 	"ocdeck/internal/infrastructure/process"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // Suspend 挂起任务（design.md §19 Suspend 行 + §5 互斥决策树三分支）。
@@ -225,6 +228,52 @@ type killResultEntry struct {
 	killErr  error // KillSession 本身的基础设施错误（非 nil 时 disposition 不可信）
 }
 
+// minimalReleaseBinding 构造 supervisor.Release 的最小 envelope：Release 只消费
+// TerminalRef（终止目标）与 data.taskId（provider 侧换代观测身份）；终止目标是
+// 任务会话名事实，非 binding 事实来源切换（不读写持久化 binding）。
+func minimalReleaseBinding(taskID, name string) domain.TaskBinding {
+	data, _ := json.Marshal(map[string]string{"taskId": taskID})
+	return domain.TaskBinding{
+		Version:            domain.TaskBindingVersion,
+		ProviderID:         store.ProviderIDV1,
+		ProviderInstanceID: store.ProviderInstanceV1Default,
+		TerminalRef:        name,
+		Data:               data,
+	}
+}
+
+// releaseStageToKillEntry 把 supervisor.Release 的 CleanupStageError 映射回既有
+// killResultEntry 通道（阶段 4 Release 接线）：disposition 决策树与 notice 语义
+// 不变——Reason 反向映射 process.Disposition 并按 ClassifyKill 语义保真
+// SessionKilled（reap_failed=已杀收割失败；snapshot_missing=未净终止 degraded；
+// snapshot_failed/kill_failed=会话仍在），tickets 透传；kill_failed 映射为
+// killErr 形态（finishSuspend 的 infra 分派：notice kill_failed + tickets +
+// "kill session" 错误聚合，与内联 KillSession 基础设施错误同通道）。
+func releaseStageToKillEntry(name string, err error) killResultEntry {
+	se, ok := appagent.StageErrorOf(err)
+	if !ok || se.Cleanup == nil {
+		// 非 cleanup 形态（理论不可达——Release 只产 CleanupStageError/nil）：
+		// 保守按基础设施错误聚合，不伪造 disposition。
+		return killResultEntry{name: name, killErr: err}
+	}
+	tickets := se.Cleanup.Tickets
+	mk := func(killed bool, disp process.CleanupDisposition) killResultEntry {
+		return killResultEntry{name: name, result: process.KillResult{
+			SessionKilled: killed, Disposition: disp, CleanupTickets: tickets}}
+	}
+	switch se.Cleanup.Reason {
+	case appagent.KillReasonReapFailed:
+		return mk(true, process.DispositionReapFailed)
+	case appagent.KillReasonSnapshotFailed:
+		return mk(false, process.DispositionSnapshotFailed)
+	case appagent.KillReasonSnapshotMissing:
+		return mk(false, process.DispositionSnapshotMissingDegraded)
+	default: // kill_failed：HasSession/KillSession 基础设施错误。
+		return killResultEntry{name: name, killErr: err,
+			result: process.KillResult{Disposition: process.DispositionKillFailed, CleanupTickets: tickets}}
+	}
+}
+
 // killTaskSessions 对 names 中存在的会话执行 KillSession，返回结果集。
 // 仅收集，不记 notice：逐项 notice 由调用方（finishSuspend）统一聚合记录，
 // 避免在此处记录后被 finishSund 再次记录导致同一清理失败双写两条 notice。
@@ -233,6 +282,19 @@ type killResultEntry struct {
 func (m *Manager) killTaskSessions(ctx context.Context, taskID string, names []string) []killResultEntry {
 	var out []killResultEntry
 	for _, name := range names {
+		// 阶段 4 Release 接线（opencode-v1-spi-provider）：agent runtime（serve，
+		// binding.TerminalRef 对应会话）的终止经 supervisor.Release（registry 分派
+		// 到 provider——Release 成为生产路径）；C7 provider 准入已在 Suspend 入口
+		// 完成。CleanupStageError 映射回 killResultEntry，disposition/notice 通道
+		// 不变。TUI/shell 与 legacy -serve（迁移导入桥接特许域，binding 未覆盖）
+		// 仍由 task 层直接管理；runtimeSupervisor 未注入（内联测试接缝/golden
+		// 矩阵）保持内联实现——与 resumeActive 的回退形态同一模式。
+		if name == runtimeSessionName(taskID) && m.runtimeSupervisor != nil {
+			if rerr := m.runtimeSupervisor.Release(ctx, minimalReleaseBinding(taskID, name)); rerr != nil {
+				out = append(out, releaseStageToKillEntry(name, rerr))
+			}
+			continue
+		}
 		exists, herr := m.proc.HasSession(name)
 		if herr != nil && !errors.Is(herr, process.ErrNoTmuxServer) {
 			// infra 错误收集为 killErr，由 hasKillFailure 判定失败 → 触发分支 c 修复或强制收敛。
@@ -419,6 +481,9 @@ func (m *Manager) repairRuntimeRegistered(ctx context.Context, taskID string, mo
 // 不得吞错——无法清理的会话经 finishSund 记 retryable notice 形成可重试 debt
 // （否则残留会话下次 Activate 被 residual 门禁永久阻塞，design.md §5/§8）。
 // ErrNoTmuxServer 视为 absent（无 server 即无会话可清）。
+// 阶段 4 Release 接线说明：本函数是挂起补偿的强制清场兜底（tui/shell/serve 混合
+// 集合、「尽力清理」语义），保持 task 层直接管理不经 Release——agent runtime 的
+// Release 接线覆盖主清理路径（killTaskSessions），补偿兜底不改变。
 func (m *Manager) forceKillAll(ctx context.Context, names []string) []killResultEntry {
 	var out []killResultEntry
 	for _, name := range names {

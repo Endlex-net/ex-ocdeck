@@ -476,7 +476,7 @@ func TestStartFact_ShellAndTempServeDoNotWrite(t *testing.T) {
 	seedSuspendedTask(store2, "t2", "p1")
 	m2 := newTestManager(t, store2, newMockProc(), newMockWorktree(), newMockOC(true))
 	injectEphemeralSupervisorForTestWithPort(t, m2, store2, nil, srv.port)
-	if _, _, _, _, err := m2.deleteCleanupConnect(context.Background(), store2.tasks["t2"]); err != nil {
+	if _, _, _, _, _, err := m2.deleteCleanupConnect(context.Background(), store2.tasks["t2"]); err != nil {
 		t.Fatalf("deleteCleanupConnect(ephemeral): %v", err)
 	}
 	store2.mu.Lock()
