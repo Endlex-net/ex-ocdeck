@@ -11,12 +11,14 @@ package task
 // 保证各段落地时 fixture 无需重建观察基建。
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1264,5 +1266,388 @@ func newCharxSupHealthDeps(t *testing.T, tr *appagent.HealthTracker) opencode.Su
 		},
 		OnRuntimeReady: func(taskID string) { tr.BumpRuntimeEpoch(taskID) },
 		ReadyTimeout:   60 * time.Millisecond, PollInterval: 5 * time.Millisecond,
+	}
+}
+
+// TestCharxContract_SensitiveDataAudit 敏感数据审查（tasks 5.2 / design D3 敏感
+// 数据保护）：legacy auth.password 与 master secret MUST NOT 进入 API DTO、日志、
+// 事件、错误文本。审查面 = 生产写入链的存储投影：
+//  1. DB 全表扫描（tasks / task_sessions / task_binding / recovery_debts）：
+//     derived 任务（激活提交）的派生密码 MUST NOT 出现在任何列；env_snapshot /
+//     notice / last_error 对两种任务均 MUST NOT 含密码；
+//  2. legacy 仅标记字段形态：legacy 导入 binding 的 auth.password 仅存在于
+//     task_binding 列（唯一存储事实），其余列零出现；
+//  3. 日志面：RunMigrationImport 与激活补全链的 log 输出经捕获扫描（migration
+//     runner 是唯一显式 log.Printf 的凭据邻近路径）；
+//  4. 事件面：领域事件 publisher 输出全文扫描（Activate/Suspend/恢复全链）。
+//
+// mutation 证据（已验证 → 红 → 还原）：
+//   - activationBinding 的 auth map 临时夹带 password → ①/② 红（binding 列
+//     出现派生密码、derived 任务全表扫描命中）；
+//   - migration runner 成功日志临时夹带密码 → ③ 红（log 捕获命中）。
+func TestCharxContract_SensitiveDataAudit(t *testing.T) {
+	e := newCharxEnv(t, charxEnvOpts{})
+	ctx := context.Background()
+
+	// 捕获 std log（migration runner 导入成功/失败均经 log.Printf 落账——
+	// 审查「日志不携带密码值」直接可见面）。
+	var logBuf bytes.Buffer
+	prevOut := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(prevOut) })
+
+	// ① legacy 导入：旧二进制随机凭据 → runner 导入（binding auth.password
+	// = legacy-random-audit-pw，唯一允许存储的凭据字段）。
+	wt := "/data/worktrees/p1/mi-audit"
+	e.store.seedProject(ProjectRow{ID: "p1", Name: "p", Path: "/repo", DefaultBranch: "main"})
+	e.store.tasks["mi-audit"] = TaskRow{ID: "mi-audit", ProjectID: "p1", Name: "t",
+		Status: StatusActive, WorktreePath: wt,
+		AnchorSessionID: sql.NullString{String: "ses-audit", Valid: true}}
+	e.srv.seedSession(wt, "ses-audit", 1, 1)
+	name := runtimeSessionName("mi-audit")
+	e.proc.mockProc.mu.Lock()
+	e.proc.mockProc.sessions[name] = true
+	e.proc.mockProc.envValues[name] = map[string]string{
+		"OPENCODE_SERVER_PASSWORD": "legacy-random-audit-pw",
+		"OCDECK_SERVE_PORT":        fmt.Sprintf("%d", e.portHealthy()),
+	}
+	e.proc.mockProc.mu.Unlock()
+
+	// ② derived 激活：suspend 任务 t1（锚定会话在场 → 直启单次成功）→ Activate
+	// （派生凭据提交 binding + 状态链）。
+	charxSeedRepoWorktreeTask(e.store, "t1", "p1")
+	e.store.mutTask("t1", func(tr *TaskRow) {
+		tr.AnchorSessionID = sql.NullString{String: "ses-existing", Valid: true}
+	})
+	e.srv.seedSession("/data/worktrees/p1/t1", "ses-existing", 1, 1)
+	if err := e.charxActivate("t1"); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+
+	// ③ 重启恢复链（Suspend → Activate 第二轮：补偿/notice/last_error 全链再走一遍）。
+	if err := e.m.Suspend(ctx, "t1"); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	if err := e.charxActivate("t1"); err != nil {
+		t.Fatalf("Reactivate: %v", err)
+	}
+
+	if err := e.m.RunMigrationImport(ctx); err != nil {
+		t.Fatalf("RunMigrationImport: %v", err)
+	}
+
+	// --- 审查断言 ---
+	derivedPW := charxDerivedOf("t1")
+	legacyPW := "legacy-random-audit-pw"
+	e.store.mu.Lock()
+	defer e.store.mu.Unlock()
+
+	// ① tasks / task_binding / recovery_debts 全列扫描。
+	for taskID, row := range e.store.tasks {
+		for name, val := range map[string]string{
+			"last_error":   row.LastError.String,
+			"notice":       row.Notice.String,
+			"env_snapshot": row.EnvSnapshot.String,
+		} {
+			for _, pw := range []string{derivedPW, legacyPW, charxMasterSecret} {
+				if val != "" && strings.Contains(val, pw) {
+					t.Errorf("tasks.%s(%s) 泄露凭据材料（%s 前缀）", name, taskID, pw[:8])
+				}
+			}
+		}
+	}
+	// derived 任务 binding 列：派生密码零出现。
+	if raw, ok := e.store.bindings["t1"]; ok && strings.Contains(raw, derivedPW) {
+		t.Errorf("derived 任务 task_binding 列出现派生密码（MUST 现场派生不落库）")
+	}
+	// legacy 仅标记字段形态：密码仅允许出现在 task_binding 列。
+	if raw, ok := e.store.bindings["mi-audit"]; ok {
+		if !strings.Contains(raw, legacyPW) {
+			t.Errorf("legacy binding 列缺失导入密码（导入失败形态）")
+		}
+	}
+	// 除 task_binding 外的其余存储列对 legacy 密码零出现（①的循环已覆盖
+	// tasks 列；此处补 sessions/debts 全扫描）。
+	for taskID, rows := range e.store.sessions {
+		for _, r := range rows {
+			joined := fmt.Sprintf("%v", r)
+			for _, pw := range []string{derivedPW, legacyPW} {
+				if strings.Contains(joined, pw) {
+					t.Errorf("task_sessions(%s) 泄露凭据材料", taskID)
+				}
+			}
+		}
+	}
+	for key, debt := range e.store.recoveryDebts {
+		joined := fmt.Sprintf("%+v", debt)
+		for _, pw := range []string{derivedPW, legacyPW, charxMasterSecret} {
+			if strings.Contains(joined, pw) {
+				t.Errorf("recovery_debts(%s) 泄露凭据材料", key)
+			}
+		}
+	}
+	// ③ 日志面：捕获缓冲全文扫描。
+	for _, pw := range []string{derivedPW, legacyPW, charxMasterSecret} {
+		if strings.Contains(logBuf.String(), pw) {
+			t.Errorf("日志输出泄露凭据材料（%s 前缀）", pw[:8])
+		}
+	}
+	// ④ 事件面：领域事件全载荷扫描。
+	e.pub.mu.Lock()
+	var evDump strings.Builder
+	for _, ev := range e.pub.events {
+		evDump.WriteString(fmt.Sprintf("%+v", ev.Payload))
+	}
+	e.pub.mu.Unlock()
+	for _, pw := range []string{derivedPW, legacyPW, charxMasterSecret} {
+		if strings.Contains(evDump.String(), pw) {
+			t.Errorf("领域事件输出泄露凭据材料（%s 前缀）", pw[:8])
+		}
+	}
+}
+
+// TestCharxContract_SensitiveDataAudit_SQLite 真实 SQLite 全列扫描（tasks 5.2 /
+// design D3 敏感数据保护）：审查数据全部经生产写入链产生——
+//  1. derived：Manager 激活提交（binding/env 快照/last_port/status 单事务写链）；
+//  2. legacy：迁移导入 runner（候选 = 持久化 active；标记缺失 → 读旧随机凭据 →
+//     健康验证 → binding 列唯一存储位置）；
+//  3. 激活失败补偿：锚定 claim 冲突（他任务持有）→ last_error + cleanup notice
+//     （kill 非净注入走 residual notice 分派）；
+//  4. 恢复 debt：生产写入入口 persistRecoveryCleanupDebt → recovery_debts 行。
+//
+// 扫描相关表全部列（SELECT * + rows.Columns()）：唯一允许秘密的位置 = t-legacy
+// 行 tasks.task_binding 的 data.auth.password（且其中仅 legacy 密码合法）；其余
+// 任何位置对派生密码、legacy 密码、master secret 零出现。Scan 错误与 rows.Err()
+// 必检；任一 binding 缺失即失败。
+// mutation 证据（红→还原，生产写入点）：activationBinding 的 auth map 临时夹带
+// 派生密码 → tasks.task_binding(t1) 出现派生密码 → 全列扫描红 → 还原。
+func TestCharxContract_SensitiveDataAudit_SQLite(t *testing.T) {
+	srv := newFakeOCServer(t)
+	adapter, db := openRealStore(t)
+	ctx := context.Background()
+
+	// t1（openRealStore seed：repo kind + worktree 默认 mode = 合法组合）激活前置：
+	// base_ref 基线 ref、锚定三元组、fake server 同目录会话。
+	if _, err := db.Exec(`UPDATE tasks SET base_ref = 'refs/heads/b', anchor_session_id = 'ses-existing' WHERE id = 't1'`); err != nil {
+		t.Fatalf("seed t1 anchor/base_ref: %v", err)
+	}
+	srv.seedSession("/wt", "ses-existing", 1, 1)
+	srv.expectDirectory("/wt")
+	e := newCharxEnvOnTaskStore(t, srv, adapter, newMockStore(), newCharxProc(), charxEnvOpts{})
+
+	// ① derived：Manager 激活提交（生产写入链，runtime 凭据不落库）。
+	if err := e.charxActivate("t1"); err != nil {
+		t.Fatalf("Activate t1: %v", err)
+	}
+
+	// ② legacy：迁移导入 runner 真实落库（密码仅入 task_binding 列）。
+	const legacyPW = "legacy-sqlite-audit-pw"
+	if _, err := db.Exec(
+		`INSERT INTO tasks (id, project_id, name, branch, status, worktree_path, anchor_session_id, created_at, updated_at)
+		 VALUES ('t-legacy', 'p1', 'legacy', 'b', 'active', '/wt-legacy', 'ses-legacy', 1, 1)`); err != nil {
+		t.Fatalf("seed t-legacy: %v", err)
+	}
+	legacyName := runtimeSessionName("t-legacy")
+	e.proc.mockProc.mu.Lock()
+	e.proc.mockProc.sessions[legacyName] = true
+	e.proc.mockProc.envValues[legacyName] = map[string]string{
+		"OPENCODE_SERVER_PASSWORD": legacyPW,
+		"OCDECK_SERVE_PORT":        fmt.Sprintf("%d", e.portHealthy()),
+	}
+	e.proc.mockProc.mu.Unlock()
+	if err := e.m.RunMigrationImport(ctx); err != nil {
+		t.Fatalf("RunMigrationImport: %v", err)
+	}
+
+	// ③ 失败场景：健康检查失败（进程已建）→ wait 就绪超时 → KillSession 门禁
+	// 非净注入（reap_failed + tickets）→ residual cleanup notice + last_error
+	//（激活统一补偿 runActivateFailureCompensation 的真实落账链）。
+	if _, err := db.Exec(
+		`INSERT INTO tasks (id, project_id, name, branch, status, worktree_path, base_ref, anchor_session_id, created_at, updated_at)
+		 VALUES ('t-conflict', 'p1', 'conflict', 'b', 'suspended', '/wt-conflict', 'refs/heads/b', 'ses-existing', 1, 1)`); err != nil {
+		t.Fatalf("seed t-conflict: %v", err)
+	}
+	srv.seedSession("/wt-conflict", "ses-existing", 1, 1)
+	srv.expectDirectory("/wt-conflict")
+	srv.setHealthFailFirst(1 << 30)
+	conflictName := runtimeSessionName("t-conflict")
+	e.proc.mockProc.mu.Lock()
+	e.proc.mockProc.killResults[conflictName] = process.KillResult{
+		SessionKilled: false, Disposition: process.DispositionReapFailed,
+		CleanupTickets: []string{"tk-audit"},
+	}
+	e.proc.mockProc.mu.Unlock()
+	if aerr := e.charxActivate("t-conflict"); aerr == nil {
+		t.Fatal("健康失败激活必须失败（失败分支发生前置）")
+	} else {
+		t.Logf("t-conflict activate failed as expected: %v", aerr)
+	}
+	// ④ 恢复 debt：生产写入入口（恢复失败补偿唯一落账函数）。
+	if derr := e.m.persistRecoveryCleanupDebt(ctx, "t1", runtimeSessionName("t1"),
+		[]string{"tk-audit-debt"}, noticeReasonReapFailed, true, "audit debt fixture"); derr != nil {
+		t.Fatalf("persist recovery debt: %v", derr)
+	}
+
+	// --- 断言各分支确实发生（审查数据非空、来源为生产写入链） ---
+	// 秘密集合覆盖全部实际生成凭据的任务：t1（激活成功）与 t-conflict（激活
+	// 失败但进程已派生凭据——错误文本若夹带其派生值同样必须检出）。
+	derivedPW := charxDerivedOf("t1")
+	secrets := []string{derivedPW, charxDerivedOf("t-conflict"), legacyPW, charxMasterSecret}
+	t1Binding := charxSQLiteCol(t, db, `SELECT task_binding FROM tasks WHERE id = 't1'`)
+	if !t1Binding.Valid || t1Binding.String == "" {
+		t.Fatalf("t1 binding 缺失（激活提交未写入，derived 审查数据不成立）")
+	}
+	if strings.Contains(t1Binding.String, "password") || strings.Contains(t1Binding.String, derivedPW) {
+		t.Errorf("derived task_binding 列含 password 成员/派生密码: %s", t1Binding.String)
+	}
+	legacyBinding := charxSQLiteCol(t, db, `SELECT task_binding FROM tasks WHERE id = 't-legacy'`)
+	if !legacyBinding.Valid || legacyBinding.String == "" {
+		t.Fatalf("t-legacy binding 缺失（迁移导入未写入，legacy 审查数据不成立）")
+	}
+	// legacy 例外精确构成（不整列放行）：envelope data.auth.kind=="legacy"、
+	// data.auth.password==预期导入值；仅移除 auth.password 字段后扫描剩余
+	// 完整 JSON——密码被移到 directory 或新增字段时在此红。
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(legacyBinding.String), &envelope); err != nil {
+		t.Fatalf("decode legacy envelope: %v", err)
+	}
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(envelope["data"], &data); err != nil {
+		t.Fatalf("decode legacy data: %v", err)
+	}
+	var authMap map[string]json.RawMessage
+	if err := json.Unmarshal(data["auth"], &authMap); err != nil {
+		t.Fatalf("decode legacy auth: %v", err)
+	}
+	var authKind, authPW string
+	if err := json.Unmarshal(authMap["kind"], &authKind); err != nil {
+		t.Fatalf("decode auth.kind: %v", err)
+	}
+	if err := json.Unmarshal(authMap["password"], &authPW); err != nil {
+		t.Fatalf("decode auth.password: %v", err)
+	}
+	if authKind != "legacy" {
+		t.Errorf("legacy auth.kind = %q, want legacy", authKind)
+	}
+	if authPW != legacyPW {
+		t.Errorf("legacy auth.password = %q, want %q（预期导入值精确相等）", authPW, legacyPW)
+	}
+	delete(authMap, "password")
+	remaining, merr := json.Marshal(authMap)
+	if merr != nil {
+		t.Fatalf("marshal remaining auth: %v", merr)
+	}
+	data["auth"] = remaining
+	remainingData, merr := json.Marshal(data)
+	if merr != nil {
+		t.Fatalf("marshal remaining data: %v", merr)
+	}
+	envelope["data"] = remainingData
+	remainingEnvelope, merr := json.Marshal(envelope)
+	if merr != nil {
+		t.Fatalf("marshal remaining envelope: %v", merr)
+	}
+	for _, s := range secrets {
+		if strings.Contains(string(remainingEnvelope), s) {
+			t.Errorf("legacy binding 移除 auth.password 后仍泄露凭据材料（%.8s…）", s)
+		}
+	}
+	// 唯一允许位置自身的秘密构成：仅允许 legacy 密码（派生密码/master secret 禁止）。
+	for _, s := range []string{derivedPW, charxMasterSecret} {
+		if strings.Contains(legacyBinding.String, s) {
+			t.Errorf("legacy task_binding（唯一允许位置）出现非 legacy 凭据材料（%.8s…）", s)
+		}
+	}
+	conflictErr := charxSQLiteCol(t, db, `SELECT last_error FROM tasks WHERE id = 't-conflict'`)
+	if !conflictErr.Valid || conflictErr.String == "" {
+		t.Fatalf("t-conflict last_error 空（激活失败分支未落账）")
+	}
+	conflictNotice := charxSQLiteCol(t, db, `SELECT notice FROM tasks WHERE id = 't-conflict'`)
+	if !conflictNotice.Valid || !strings.Contains(conflictNotice.String, "tk-audit") {
+		t.Fatalf("t-conflict cleanup notice 缺失（失败补偿分支未落账）: %+v", conflictNotice)
+	}
+	var debtCount int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM recovery_debts WHERE task_id = 't1'`).Scan(&debtCount); err != nil {
+		t.Fatalf("scan recovery_debts count: %v", err)
+	}
+	if debtCount != 1 {
+		t.Fatalf("recovery_debts 行数 = %d, want 1（debt 补偿分支未落账）", debtCount)
+	}
+
+	// --- 全列扫描：唯一允许位置 = t-legacy 行 tasks.task_binding ---
+	for _, table := range []string{"tasks", "task_sessions", "recovery_debts", "cleanup_debts",
+		"task_env_vars", "task_recovery_attempts"} {
+		scanAuditTableColumns(t, db, table,
+			map[string]map[string]struct{}{"t-legacy": {"task_binding": {}}}, secrets)
+	}
+}
+
+// charxSQLiteCol 读单行单列（Scan 错误必检，err 非 sql.ErrNoRows 即失败）。
+func charxSQLiteCol(t *testing.T, db *store.DB, query string) sql.NullString {
+	t.Helper()
+	var raw sql.NullString
+	if err := db.QueryRow(query).Scan(&raw); err != nil && err != sql.ErrNoRows {
+		t.Fatalf("scan (%s): %v", query, err)
+	}
+	return raw
+}
+
+// scanAuditTableColumns 全列扫描一张表的全部行/列（SELECT *）：秘密零出现
+// （allow 声明的 (行任务 ID, 列名) 位置除外——其自身构成由调用方单独特断言）。
+// Scan 错误与 rows.Err() 必检。
+func scanAuditTableColumns(t *testing.T, db *store.DB, table string,
+	allow map[string]map[string]struct{}, secrets []string) {
+	t.Helper()
+	rows, err := db.Query("SELECT * FROM " + table)
+	if err != nil {
+		t.Fatalf("scan %s: %v", table, err)
+	}
+	defer rows.Close()
+	cols, cerr := rows.Columns()
+	if cerr != nil {
+		t.Fatalf("scan %s columns: %v", table, cerr)
+	}
+	idIdx := -1
+	for i, c := range cols {
+		if c == "id" || c == "task_id" {
+			idIdx = i
+			break
+		}
+	}
+	vals := make([]sql.NullString, len(cols))
+	ptrs := make([]any, len(cols))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	for rows.Next() {
+		if err := rows.Scan(ptrs...); err != nil {
+			t.Fatalf("scan %s row: %v", table, err)
+		}
+		rowID := ""
+		if idIdx >= 0 {
+			rowID = vals[idIdx].String
+		}
+		for i, col := range cols {
+			v := vals[i].String
+			if !vals[i].Valid || v == "" {
+				continue
+			}
+			allowed := false
+			if allowedCols, ok := allow[rowID]; ok {
+				_, allowed = allowedCols[col]
+			}
+			if allowed {
+				continue
+			}
+			for _, s := range secrets {
+				if strings.Contains(v, s) {
+					t.Errorf("%s(%s).%s 泄露凭据材料（%.8s…）", table, rowID, col, s)
+				}
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("scan %s rows: %v", table, err)
 	}
 }

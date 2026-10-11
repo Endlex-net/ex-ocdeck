@@ -42,6 +42,8 @@ type fakeOCServer struct {
 
 	// healthFailFirst 剩余本次数的 /global/health 返回 503（健康超时脚本）。
 	healthFailFirst int
+	// healthCalls 累计 /global/health 请求数（健康失败分支发生断言用）。
+	healthCalls int
 	// healthHealthy 正常应答的 healthy 字段值（默认 true；C5 fixture 切 false）。
 	healthHealthy bool
 
@@ -147,6 +149,13 @@ func (s *fakeOCServer) setHealthFailFirst(n int) {
 	s.healthFailFirst = n
 }
 
+// healthCallsSnapshot 返回累计 /global/health 请求数（失败分支发生断言）。
+func (s *fakeOCServer) healthCallsSnapshot() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.healthCalls
+}
+
 // setHealthHealthy 切换正常 health 应答的 healthy 字段（C5 fixture：协议应答
 // 200 + healthy=false 的字段级违约形态）。
 func (s *fakeOCServer) setHealthHealthy(ok bool) {
@@ -163,7 +172,7 @@ func (s *fakeOCServer) setStatus(sessionID, statusType string) {
 }
 
 // setProbeBroken 置位 /session/status 结构违约（数组）→ Probe 失败 fixture
-//（C12 注入：能力探测失败经真实 supervisor 触发，同 infra supFixture.probeBroken）。
+// （C12 注入：能力探测失败经真实 supervisor 触发，同 infra supFixture.probeBroken）。
 func (s *fakeOCServer) setProbeBroken(broken bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -403,6 +412,7 @@ func (s *fakeOCServer) replyCalls() []string {
 
 func (s *fakeOCServer) handleHealth(w http.ResponseWriter) {
 	s.mu.Lock()
+	s.healthCalls++
 	fail := s.healthFailFirst > 0
 	if fail {
 		s.healthFailFirst--

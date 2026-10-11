@@ -456,7 +456,12 @@ func (m *Manager) resumeActive(ctx context.Context, t TaskRow, mode AlignMode) e
 // → watchers → 提交 active。port<0 表示内联回退路径（SSE 端点经持久化 binding
 // 自解析）。
 func (m *Manager) resumeActiveRegistered(ctx context.Context, t TaskRow, mode AlignMode, runtimeName string, port int, password string) error {
-	// OCDECK_TASK_ID 校验语义保留（design.md §5）：persist 恢复确认会话归属任务。
+	// OCDECK_TASK_ID 校验语义保留（阶段 4 tasks 5.1 特许第三类）：该读取是 persist
+	// 恢复的安全校验——确认 tmux 会话 env 携带的任务标识与 DB 任务一致（会话名可能
+	// 被外部伪造/错挂），不解析任何凭据或连接端点（连接事实来源仍是持久化 binding）。
+	// 删除会移除恢复安全网（既有测试 TestCharx_Reconcile_ResumeFailsOnTaskIDMismatch
+	// 锁定 mismatch → resume 失败 → 清理 + suspended 精确 last_error 行为），
+	// 故保留并在此钉死理由；非「凭据/端口反查」清理范围。
 	taskIDInSession, terr := m.proc.ShowSessionEnv(runtimeName, "OCDECK_TASK_ID")
 	if terr != nil || taskIDInSession != t.ID {
 		return fmt.Errorf("OCDECK_TASK_ID mismatch (got %q want %q): %w", taskIDInSession, t.ID, terr)
