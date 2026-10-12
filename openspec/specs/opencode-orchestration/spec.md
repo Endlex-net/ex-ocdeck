@@ -130,7 +130,7 @@ serve 会话进程在健康轮询期间已死亡时 MUST 直接换端口重试�
 ### Requirement: session 归属捕获
 系统 SHALL 订阅每个活跃任务进程的 SSE 事件流（`GET /event`）：`session.created` 事件的 sessionID 位于 `properties.info.id`（已验证契约区间 [ContractMinVersion, ContractBaseline]）；同时监听 `session.updated` 刷新 `last_seen_at`。激活后 MUST 按任务有效模式执行一次该 directory 的 session 对齐（worktree 模式任务执行目录级全量对齐，新 session 按 claim 语义补记；dir 任务与 repo 项目 local-path 模式任务执行 ownedOnly 对齐，MUST NOT 认领新 session）。SSE 断流时 MUST 指数退避重连，重连成功后 MUST 再次按同一有效模式对齐。
 
-**session 所有权规则**：一个 opencode session 至多归属一个 ocdeck 任务（该约束适用于经本变更后合法写入口产生的新归属；历史遗留的重复归属行不做启动修复，随任务删除自然清理）；任务 MUST 仅对本任务拥有的 session（`task_sessions` 中本任务的行）执行删除、attach 与对齐写回。归属写入 MUST 统一经 store 层原子 claim（单事务内"仅当 sessionID 未被其他任务拥有时插入/更新本任务行"），MUST NOT 以"先查询后 upsert"的非原子方式写归属。claim 冲突语义：SSE/对齐路径冲突 MUST 忽略该 session 并记服务端诊断日志（不阻断）；锚定创建路径冲突 MUST 使激活失败并记录 last_error，MUST NOT attach 不属本任务的 session。
+**session 所有权规则**：会话归属的唯一键为 SessionKey（provider 标识 + provider 实例标识 + 上游 sessionID，契约归属 agent-provider-spi「SessionKey 会话归属命名空间」）；本 capability 现有全部归属处于 `opencode-v1` 命名空间。一个 SessionKey 至多归属一个 ocdeck 任务（该约束适用于经本变更后合法写入口产生的新归属；历史遗留的重复归属行不做启动修复，随任务删除自然清理）；任务 MUST 仅对本任务拥有的 session（`task_sessions` 中本任务的行）执行删除、attach 与对齐写回。归属写入 MUST 统一经 store 层原子 claim（单事务内"仅当 SessionKey 未被其他任务拥有时插入/更新本任务行"），MUST NOT 以"先查询后 upsert"的非原子方式写归属。claim 冲突语义：SSE/对齐路径冲突 MUST 忽略该 session 并记服务端诊断日志（不阻断）；锚定创建路径冲突 MUST 使激活失败并记录 last_error，MUST NOT attach 不属本任务的 session。
 
 `kind=dir` 项目的任务与 repo 项目 local-path 模式任务（目录可共享）MUST NOT 经目录级全量对齐认领新 session。dir 任务与 local-path 模式任务的对齐（ownedOnly）MUST 按以下顺序执行：① 按原始目录列表数量判定 complete/overflow（判定先于任何过滤）；② 候选集取"原始目录列表 ∩ 本任务当前 owned 集合"；③ complete 时在单个 store 事务内仅对候选集刷新 `last_seen_at`、仅删除本任务 owned 集合中的缺席行，并经事务内 noticeFn 清除既有 session_overflow notice；④ overflow 时不删任何缺席行，application 层 MUST 先经事务外 CAS 写入 session_overflow notice 再调对齐（对齐失败时 notice 保留，与 repo 现状逐点一致），仅刷新候选集。dir 任务与 local-path 模式任务的新 session 仅经本任务进程的 SSE 捕获（原子 claim）与锚定创建记录归属（SSE 断流期间经 TUI 新建的 session 不补记，为已接受的降级）。`session.updated` 事件 MUST 仅刷新本任务已归属行的 `last_seen_at`（条件更新，绝不插入新归属），未归属 session 的 updated 事件一律忽略。
 
@@ -140,7 +140,7 @@ serve 会话进程在健康轮询期间已死亡时 MUST 直接换端口重试�
 
 #### Scenario: TUI 新建会话被记录
 - **WHEN** 用户在 TUI 中新建会话
-- **THEN** 新 sessionID 经 SSE 被捕获并原子 claim 至本任务，用于后续恢复；若已被其他任务拥有则忽略并记诊断日志
+- **THEN** 新 sessionID 经 SSE 被捕获并按 SessionKey 原子 claim 至本任务，用于后续恢复；若已被其他任务拥有则忽略并记诊断日志
 
 #### Scenario: 断流后对齐
 - **WHEN** repo 项目 worktree 模式任务 SSE 连接断开并恢复
@@ -160,7 +160,7 @@ serve 会话进程在健康轮询期间已死亡时 MUST 直接换端口重试�
 - **THEN** 该新会话不被补记进任务归属（与"他人/手工创建"无法区分），任务既有 session 的存在性核对与缺席清理语义不变
 
 #### Scenario: 并发 claim 唯一归属
-- **WHEN** 两个任务（如 SSE 与对齐并发）同时 claim 同一 sessionID
+- **WHEN** 两个任务（如 SSE 与对齐并发）同时 claim 同一 SessionKey（同一上游 sessionID）
 - **THEN** 原子 claim 仅一个成功，该 session 归属唯一任务；失败方按路径语义忽略/记诊断
 
 #### Scenario: session.updated 不创建归属
@@ -207,10 +207,10 @@ serve 会话进程在健康轮询期间已死亡时 MUST 直接换端口重试�
 - **THEN** 任务保持活跃，仅该 shell 终端标记为已关闭
 
 ### Requirement: serve HTTP 客户端连接管理
-ocdeck-server 进程内经 `internal/infrastructure/opencode` Client 发起的对任务进程的全部 HTTP 请求（健康检查、能力探测、状态查询、后台重试、SSE）SHALL 复用共享的 loopback HTTP transport，跨 Client 实例按 host:port 连接池复用，空闲连接 MUST 有回收上限；该 transport MUST 显式禁用代理（`Proxy: nil`）。对任务进程的全部 directory-scoped API 请求 MUST 显式携带 directory 参数。
+ocdeck-server 进程内经任务 provider 适配层 HTTP Client 发起的对任务进程的全部 HTTP 请求（健康检查、能力探测、状态查询、后台重试、SSE）SHALL 复用共享的 loopback HTTP transport，跨 Client 实例按 host:port 连接池复用，空闲连接 MUST 有回收上限；该 transport MUST 显式禁用代理（`Proxy: nil`）。对任务进程的全部 directory-scoped API 请求 MUST 显式携带 directory 参数。任务进程的连接端点与凭据 MUST 以持久化 TaskBinding 为事实来源解析（契约归属 agent-provider-spi「运行时托管与任务绑定生命周期」），MUST NOT 从进程环境变量反查。
 
 #### Scenario: 新建 client 实例共享连接池
-- **WHEN** 系统为状态查询/后台重试等路径创建新的 occlient 实例访问同一任务进程
+- **WHEN** 系统为状态查询/后台重试等路径创建新的 client 实例访问同一任务进程
 - **THEN** 新实例复用共享 transport 的空闲连接，而非各自新建独立连接池
 
 #### Scenario: 空闲连接有界回收
@@ -219,28 +219,32 @@ ocdeck-server 进程内经 `internal/infrastructure/opencode` Client 发起的�
 
 #### Scenario: 代理禁用语义保持
 - **WHEN** 宿主环境设置了 HTTP_PROXY/HTTPS_PROXY
-- **THEN** occlient 对任务进程的 loopback 请求仍直连 127.0.0.1，不经过代理
+- **THEN** client 对任务进程的 loopback 请求仍直连 127.0.0.1，不经过代理
+
+#### Scenario: 连接凭据按绑定解析
+- **WHEN** 后台路径（attention 对账、permission 回复、agent status 等）需要连接任务进程
+- **THEN** 连接端点读自该任务的持久化 TaskBinding，认证密码经确定性派生计算（规范归 agent-provider-spi「运行时托管与任务绑定生命周期」），而非读取 tmux 会话环境变量
 
 ### Requirement: 每任务单进程实例
-系统 SHALL 为每个活跃任务启动单个 opencode 进程：`opencode --port <port> --hostname 127.0.0.1`（托管于命名 tmux 会话 `ocdeck-<taskID>-runtime`），工作目录为该任务的「任务运行目录」（worktree 模式任务为其持久化 `worktree_path`；`kind=dir` 任务与 repo 项目 local-path 模式任务为其 canonical 项目路径），并以随机强密码经会话 env（`new-session -e OPENCODE_SERVER_PASSWORD`）启用 Basic Auth。该进程经 `--port`/`--hostname` 进入 external 模式，在同一进程内同时提供 TUI（浏览器经 tmux attach 客户端接入）与完整 HTTP API/SSE 控制面（与 `opencode serve` 相同的 `Server.listen` 实现）。ocdeck MUST 作为该进程 API 的唯一访问入口；密码 MUST NOT 经 argv 传递。
+系统 SHALL 为每个活跃任务启动单个 opencode 进程：`opencode --port <port> --hostname 127.0.0.1`（托管于命名 tmux 会话 `ocdeck-<taskID>-runtime`），工作目录为该任务的「任务运行目录」（worktree 模式任务为其持久化 `worktree_path`；`kind=dir` 任务与 repo 项目 local-path 模式任务为其 canonical 项目路径），并以确定性派生强密码（KDF(master_secret, provider_id, task_id)，同任务恒定；规范归 agent-provider-spi「运行时托管与任务绑定生命周期」）经会话 env（`new-session -e OPENCODE_SERVER_PASSWORD`）启用 Basic Auth，同时注入非秘密凭据来源标记（`new-session -e OCDECK_CRED_KIND=derived`，供迁移导入的来源判定，归 agent-provider-spi「迁移导入桥接」）。该进程经 `--port`/`--hostname` 进入 external 模式，在同一进程内同时提供 TUI（浏览器经 tmux attach 客户端接入）与完整 HTTP API/SSE 控制面（与 `opencode serve` 相同的 `Server.listen` 实现）。ocdeck MUST 作为该进程 API 的唯一访问入口；密码 MUST NOT 经 argv 传递。
 
 锚定 session bootstrap MUST 采用确定性顺序协议（MUST NOT 依赖启动期 SSE `session.created` 事件——不可重放、与订阅建立有竞态、无法从并发事件中识别 bootstrap 事件）：
 
 1. **启动**：有锚定 → 命令 MUST 携带 `--session <anchoredSessionID>`；无锚定 → MUST NOT 携带 `--session`
 2. **就绪校验**：健康检查 + 能力探测通过后 MUST `GET /session?directory=` 取列表：有锚定且在列表中 → 锚定确认；有锚定但不在列表（已失效）→ 弃用旧锚定转无锚定流程
 3. **无锚定创建**：MUST `POST /session?directory=` 创建新 session，**按响应 ID 原子 claim** 并写入锚定；claim 冲突 MUST 判定本次激活/恢复失败并记录 last_error（恢复场景计入重拉预算），MUST NOT 接入不属本任务的 session
-4. **落到锚定（双启动子事务，仅新建锚定时；permit 子协议仅适用 Recovery 路径——首次 Activate 的双启动 MUST NOT 消耗恢复 permit、不执行恢复退避）**：① bootstrap 进程占用一个重拉预算 permit 并完成健康检查 + 能力探测；② `POST /session` + claim 后 MUST 按既有 KillResult/cleanup notice 规则确认 bootstrap 进程已终止，才可复用 `-runtime` 名称与端口；③ 正式进程占用**新的**预算 permit 并执行对应退避，端口复用已持久化值、密码重新生成；④ 正式进程 MUST 重新执行健康检查 + 能力探测 + 锚定存在校验；⑤ 全部通过才进入成功提交；⑥ 预算窗口不足以取得第二个 permit 时，已 claim 的锚定 MUST 保留，本次尝试进入终态补偿
+4. **落到锚定（双启动子事务，仅新建锚定时；permit 子协议仅适用 Recovery 路径——首次 Activate 的双启动 MUST NOT 消耗恢复 permit、不执行恢复退避）**：① bootstrap 进程占用一个重拉预算 permit 并完成健康检查 + 能力探测；② `POST /session` + claim 后 MUST 按既有 KillResult/cleanup notice 规则确认 bootstrap 进程已终止，才可复用 `-runtime` 名称与端口；③ 正式进程占用**新的**预算 permit 并执行对应退避，端口复用已持久化值、密码按派生规则计算（同任务恒定）；④ 正式进程 MUST 重新执行健康检查 + 能力探测 + 锚定存在校验；⑤ 全部通过才进入成功提交；⑥ 预算窗口不足以取得第二个 permit 时，已 claim 的锚定 MUST 保留，本次尝试进入终态补偿
 5. dir 项目任务与 repo 项目 local-path 模式任务 MUST NOT 经目录级对齐认领（ownedOnly 语义不变）
 
 `--session` 失效的确定性分派：进程在 HTTP server 就绪前退出 → 健康轮询判死/超时 → 按本次尝试失败处理（既有错误分类）；进程就绪 → 列表校验是唯一正确性判据（锚定在列表中且 id 有效则 CLI 校验正常路径必然选中；不在则弃用重建）。
 
-锚定持久化契约：锚定 MUST 存于 `tasks.anchor_session_id` 显式列（替代「最近顶层 owned session 推导」现状）；「ClaimTaskSession + 设置 anchor」MUST 为单事务——claim 成功后 newID 立即成为权威锚定，跨 attempt/重启保留；claim 冲突时归属与 anchor 均不修改。`--session <id>` 的 id 一律读自 `tasks.anchor_session_id`。旧锚定条件清空（列表校验缺席时执行 `anchor_session_id=NULL WHERE task_id=? AND anchor_session_id=<old>`）的分派：store error → POST 前终态补偿；清空 Matched → 转无锚定流程继续；CAS mismatch（0 行匹配）→ MUST 复读：为 NULL 才继续，已出现新 anchor → 终止本次 bootstrap、按新锚定进入下一 attempt，MUST NOT 覆盖。既有数据 MUST 回填：schema 迁移时（或首次读取时惰性）按旧确定性排序（最近顶层 owned session）回填 `anchor_session_id`，仅处理 NULL 行。
+锚定持久化契约：锚定 MUST 存于 tasks 的锚定三元组显式列（`anchor_provider_id`、`anchor_provider_instance_id`、`anchor_session_id`，命名空间迁移归 agent-provider-spi 契约文档）；「ClaimTaskSession + 设置 anchor」MUST 为单事务——claim 成功后 newID 立即成为权威锚定，跨 attempt/重启保留；claim 冲突时归属与 anchor 均不修改。`--session <id>` 的 id 一律读自 `tasks.anchor_session_id`。旧锚定条件清空（列表校验缺席时执行锚定三元组清空（`...=NULL WHERE task_id=? AND anchor_session_id=<old>`））的分派：store error → POST 前终态补偿；清空 Matched → 转无锚定流程继续；CAS mismatch（0 行匹配）→ MUST 复读：为 NULL 才继续，已出现新 anchor → 终止本次 bootstrap、按新锚定进入下一 attempt，MUST NOT 覆盖。既有数据 MUST 回填：schema 迁移时按统一 v1 命名空间回填锚定三元组（归 agent-provider-spi「SessionKey 会话归属命名空间」），仅处理未回填行。
 
 术语继承：本 capability 其余 Requirement 中的「serve 进程」「serve 会话」「serve」一律指本 Requirement 定义的任务单进程及其 tmux 会话；端口分配、健康检查、能力探测、SSE 归属、连接管理等既有语义不变。
 
 #### Scenario: 激活时启动单进程
 - **WHEN** 任务被激活
-- **THEN** 系统分配端口、生成随机密码并以任务运行目录为 cwd 启动单进程会话（worktree 模式任务→持久化 worktree 路径；dir 任务与 repo 项目 local-path 模式任务→项目路径），TUI 画面与 API 在同一进程就绪
+- **THEN** 系统分配端口、以派生密码生成凭据并以任务运行目录为 cwd 启动单进程会话（worktree 模式任务→持久化 worktree 路径；dir 任务与 repo 项目 local-path 模式任务→项目路径），TUI 画面与 API 在同一进程就绪
 
 #### Scenario: 同进程提供 API 与 TUI
 - **WHEN** 单进程通过健康检查与能力探测
@@ -280,7 +284,7 @@ ocdeck-server 进程内经 `internal/infrastructure/opencode` Client 发起的�
 
 *一次性前序（每个恢复 incident 执行一次）*：持锁后做 runtime token 校验 → CAS `active→activating` → 停止旧 SSE/watch → 清理该任务全部 shell 会话与残余 runtime 会话——出现 retryable cleanup debt MUST 直接进入终态补偿，MUST NOT 创建进程。
 
-*可重复进程 attempt（预算内每次执行）*：分配端口（先上次端口）→ 将新端口持久化进 `tasks.env_snapshot.vars.OCDECK_SERVE_PORT`（持久化失败判定本次 attempt 失败，MUST NOT 创建会话）→ 以新随机密码创建进程 → 健康检查 + 能力探测 → 执行锚定 bootstrap（无锚定分支含双启动子事务，见「每任务单进程实例」）→ 成功提交。
+*可重复进程 attempt（预算内每次执行）*：分配端口（先上次端口）→ 将新端口持久化进 `tasks.env_snapshot.vars.OCDECK_SERVE_PORT`（持久化失败判定本次 attempt 失败，MUST NOT 创建会话）→ 以派生密码（同任务恒定，规范归 agent-provider-spi）创建进程 → 健康检查 + 能力探测 → 执行锚定 bootstrap（无锚定分支含双启动子事务，见「每任务单进程实例」）→ 成功提交。
 
 *成功提交（标记活跃前 MUST 按序全部完成）*：正式进程 ready → 创建新 runtime token、注册 runtime group 与 watcher → 建立 SSE 订阅 + 全量对齐 → 健康检查通过后写回 `tasks.last_port` → CAS `activating→active`。token/group/watcher 注册后的任何失败 MUST 先 cancel/join SSE 与 watch、清理 runtime registry，再执行 HasSession/KillSession 与本次 attempt 失败/终态补偿分派。**CAS 失配分派**：CAS mismatch 后 MUST 复读任务状态与本 attempt token——最新状态为 active 且 token 仍属本 attempt → 视为幂等成功，结束执行器；否则 MUST 执行完整反向清理（cancel/join SSE 与 watch、清理 runtime registry、HasSession/KillSession）。此分支的 DB 禁写范围 MUST 收窄为 `status`/`last_error`/`env_snapshot`/`anchor` 四字段（以 DB 最新状态为准）；反向清理的 KillResult 按完整 disposition 表产生的 notice/debt 仍 MUST 持久化，持久化失败进入 tagged debt（`phase=cleanup_notice`）。
 

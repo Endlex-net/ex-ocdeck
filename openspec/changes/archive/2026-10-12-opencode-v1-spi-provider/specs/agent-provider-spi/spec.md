@@ -1,0 +1,158 @@
+## Purpose
+
+为 ocdeck 托管的各类 agent（opencode v1/v2、codex、pi 等）定义统一的 provider 接入契约：provider 身份模型、registry 分派、运行时托管与任务绑定生命周期、会话归属命名空间、typed events 与能力接口集合。本 change 由 opencode v1 作为首个 provider 兑现该契约，对外行为不变。
+
+## ADDED Requirements
+
+### Requirement: Provider 身份模型
+
+系统 SHALL 为每个可接入的 agent 分配稳定的 provider 标识（`provider_id`，如 `opencode-v1`），并区分四个身份概念：provider 标识（产品族+协议代）、契约版本区间、二进制版本、任务激活时的绑定（TaskBinding）。任务 MUST 持久化其 provider 标识；存量任务 MUST 在迁移时回填为 `opencode-v1`。活跃任务 MUST 按激活时的绑定路由，禁止按任务实时状态重新推导 provider；任务仅允许在非活跃（suspended）状态下切换 provider。切换采用**保留业务关联的重建语义**：系统 MUST 保留任务及其既有归属行（作为旧命名空间下的历史记录），释放旧 provider runtime 与其 TaskBinding，清空旧锚定（锚定属于旧 provider 命名空间，对目标 provider 无意义）；任务切换后保持 suspended，下次激活时由目标 provider 重新建立 runtime、绑定与新锚定。切换动作本身 MUST 原子：目标 provider 未注册或旧 runtime 释放失败时切换失败，任务 provider 标识保持原值，归属与锚定不变。
+
+#### Scenario: 存量任务回填默认 provider
+
+- **WHEN** 系统执行 provider 持久化迁移
+- **THEN** 所有未声明 provider 的存量任务被回填为 `opencode-v1`，其行为与迁移前完全一致
+
+#### Scenario: 活跃任务禁止切换 provider
+
+- **WHEN** 对处于活跃状态的任务请求切换 provider
+- **THEN** 系统拒绝该请求且零副作用；任务先挂起后才允许切换
+
+#### Scenario: 切换保留业务关联并重建
+
+- **WHEN** 非活跃任务切换 provider
+- **THEN** 既有归属行保留为旧命名空间历史记录，旧 runtime 与其绑定被释放，旧锚定清空；任务保持 suspended，下次激活由目标 provider 重新建立 runtime、绑定与锚定
+
+#### Scenario: 切换失败保持原状
+
+- **WHEN** 非活跃任务切换 provider，但目标 provider 未注册或旧 runtime 释放失败
+- **THEN** 切换失败，任务 provider 标识、归属、锚定与绑定均保持原值
+
+### Requirement: Provider registry 分派
+
+系统 SHALL 维护 provider registry（provider_id → provider 实现）。task 层所有 agent 消费点（激活、attention、permission 回复、agent status、diffreview、恢复、挂起、删除）MUST 经 registry 按任务 provider 标识分派到对应 provider 实现，MUST NOT 直接实例化特定 provider 的客户端。任务 provider 未在 registry 中注册时，该任务的生命周期操作 MUST 报错且零副作用，不得回退到默认 provider 静默执行。
+
+#### Scenario: 未注册 provider fail-closed
+
+- **WHEN** 某任务声明的 provider 标识在 registry 中不存在
+- **THEN** 对该任务的生命周期操作报错并记录 last_error（诊断性持久化为允许的副作用）；不产生任何进程/网络副作用，不修改归属、锚定、绑定与任务状态，不得回退到默认 provider 静默执行
+
+#### Scenario: 消费点统一分派
+
+- **WHEN** 后台对账（attention）需要构造任务的 agent 客户端
+- **THEN** 客户端经 registry 按该任务持久化的 provider 标识分派构造，而非硬编码单一 provider
+
+### Requirement: 运行时托管与任务绑定生命周期
+
+系统 SHALL 经 provider 的运行时托管契约（RuntimeSupervisor）管理 agent 运行时：任务激活时获取（Acquire）运行时可用的绑定、重启或恢复时重建（Resume）绑定、任务删除或挂起时释放（Release）绑定。绑定（TaskBinding）MUST 持久化，内容至少包含：provider 标识、provider 实例标识（稳定的后端运行池/数据域标识，不得为易变的进程号）、上游 session 标识、终端引用（如有）、以及 provider 私有的连接数据（版本化）。连接凭据分两类：秘密凭据（如认证密码）MUST 经确定性派生获得（由主密钥与任务标识派生），MUST NOT 持久化于绑定或任何存储；非秘密连接数据（端点、目录等）MUST 以持久化绑定为事实来源。进程环境变量仅作为向 agent 进程注入凭据的通道，MUST NOT 作为 ocdeck 读取凭据的来源。**两个例外**：① 迁移导入桥接（见「迁移导入桥接」）对存量 runtime 的历史随机密码允许一次性读取并存入绑定（标记为 legacy，该任务的下次激活/重建起切换为派生凭据）；② 删除清理例外：删除任务且无可复用 runtime（无持久化绑定，或 binding 陈旧——对应 runtime 已终止或凭据失效；如存量 suspended 任务仍有归属会话）时，系统 SHALL 经一次性临时绑定（仅存内存、MUST NOT 持久化）连接其上游以执行归属清理；临时绑定 MUST NOT 用于锚定 bootstrap、session 创建、SSE 订阅或任务状态提交；临时 runtime 的清理失败 MUST 阻断任务删除并保留可重试的清理记录。
+
+#### Scenario: 激活产生持久化绑定
+
+- **WHEN** 任务激活成功
+- **THEN** 系统持久化该任务的 TaskBinding，后续对任务 runtime 的全部访问按绑定路由
+
+#### Scenario: 重启后按绑定恢复
+
+- **WHEN** ocdeck-server 重启后恢复活跃任务
+- **THEN** 系统按持久化 TaskBinding 重建与任务 runtime 的连接，而非从进程环境变量反查凭据
+
+#### Scenario: 绑定缺失按恢复失败处理
+
+- **WHEN** 恢复路径发现任务缺少有效 TaskBinding 或绑定数据无法解析
+- **THEN** 本次恢复判定失败并记录 last_error（计入重拉预算），不得回退到环境变量反查
+
+#### Scenario: 无绑定任务的删除清理
+
+- **WHEN** 删除一个无可复用 runtime 但有归属会话的任务（无持久化绑定或 binding 陈旧，如存量 suspended 任务）
+- **THEN** 系统以一次性内存临时绑定连接上游，逐项删除本任务拥有的会话后终止临时 runtime；临时绑定不持久化、不建锚定、不建 SSE、不提交任务状态
+
+#### Scenario: 临时清理失败阻断删除
+
+- **WHEN** 删除清理中临时 runtime 的终止非净或清理记录落账失败
+- **THEN** 任务 DB 删除被阻断，清理记录保留可重试；不得越过删除提交点导致清理票据随级联删除丢失
+
+#### Scenario: 终端引用失效重建绑定
+
+- **WHEN** 任务存在 TaskBinding 但其中的终端引用已失效（对应 tmux 会话不存在）
+- **THEN** Resume 将该 runtime 视为已死亡，进入既有重拉/重建流程；新 runtime 建立成功后新绑定原子替换旧绑定；新 runtime 建立失败时旧绑定保留、本次恢复判定失败并计入恢复预算；除迁移导入桥接外，不得从旧环境变量静默恢复
+
+### Requirement: 迁移导入桥接
+
+系统 SHALL 在每次启动时执行迁移导入 runner，保证持久化 active 任务的 TaskBinding 可信。runner 对每个 active 任务按「验证或导入」处理：binding 存在且可解析时 MUST 以其凭据实际验证连通（健康检查通过为准），通过则保留；binding 缺失、无法解析或验证失败时，MUST 读取旧 runtime 的连接信息（进程环境变量与持久化目录）并验证连通，通过后以验证结果写入或替换 binding。旧来源读取是 runner 的迁移桥接特许，其适用条件由以下**唯一优先级分支规则**定义（「运行时托管与任务绑定生命周期」的凭据读取禁令适用于正常生命周期路径，与 runner 互不冲突）：
+
+**主密钥准入**：runner MUST 在任何网络验证与桥接前确认主密钥可用（能完成派生计算）；主密钥不可用则本轮 runner 整体放弃，server MUST 以启动错误拒绝进入正常生命周期与服务就绪（候选屏障不释放、不耗恢复预算、不改任务状态、不读 env）。主密钥的 master secret 文件缺失时由首启自动生成（D3 修订），故「不可用」仅指显式空 env / 空文件等配置错误。
+
+**凭据来源判定（唯一判据为非秘密来源标记，禁止以密码值比对代替）**：runtime 由本系统创建时 MUST 经会话 env 注入非秘密来源标记（`OCDECK_CRED_KIND=derived`）。runner 对验证失败的候选读取该标记：标记为 `derived` → 该 runtime 为派生凭据，MUST NOT 读取/导入/落库其密码，记 last_error 标注疑似主密钥或凭据问题，不修改 binding；标记缺失 → 确认为旧二进制产生的随机凭据 runtime（回滚窗口重拉），允许读取端口与密码并经健康检查验证后 legacy 导入。防御性不变量：任何路径 MUST NOT 把等于当前派生值的密码写入存储（比对仅作防御断言，不作来源判据）。
+
+runner MUST 幂等：完成判定为本次启动快照的待处理集合中每个任务均出结论（保留/替换/失败），不设完成标记位，中断后重启即续跑。runner 对某任务出结论前，正常生命周期消费者 MUST NOT 处理该任务（不判恢复失败、不耗恢复预算）。单任务导入失败（旧 runtime 消失、连接失败、数据解析失败）时 MUST 记录 last_error 并继续其余任务，由既有恢复路径接管，MUST NOT 写入伪造绑定；导入失败的副作用边界为：MUST NOT 创建新进程、MUST NOT 删除旧 session、MUST NOT 修改锚定、MUST NOT 清理归属行。
+
+#### Scenario: 已有可信绑定直接保留
+
+- **WHEN** runner 处理 active 任务，其 binding 可解析且健康检查通过
+- **THEN** 保留该 binding，不读取旧来源，任务正常进入生命周期
+
+#### Scenario: 导入成功建立或替换绑定
+
+- **WHEN** 任务 binding 缺失/无法解析/验证失败，旧 runtime 存活且健康检查通过
+- **THEN** 以验证结果在单事务内写入或替换完整 TaskBinding，任务状态不变；回滚窗口被旧二进制变更的过时 binding 由此被识别并替换
+
+#### Scenario: 导入失败不产生副作用
+
+- **WHEN** 导入时旧 runtime 已消失或健康检查失败
+- **THEN** 记录 last_error 并继续其余任务；不写入绑定、不创建进程、不删除 session、不修改锚定与归属
+
+#### Scenario: 启动屏障隔离候选任务
+
+- **WHEN** runner 尚未对某 active 任务出结论
+- **THEN** 正常生命周期消费者（恢复、重拉、对账）跳过该任务，不判恢复失败、不消耗恢复预算
+
+### Requirement: SessionKey 会话归属命名空间
+
+系统 SHALL 以 SessionKey（provider 标识 + provider 实例标识 + 上游 session 标识）作为会话归属的唯一键。归属唯一性约束（一个会话至多归属一个任务）MUST 作用于完整 SessionKey；不同 provider 或不同 provider 实例产生的相同上游 session 标识 MUST NOT 相互冲突。父子会话的 SessionKey MUST 处于同一命名空间。存量归属数据 MUST 确定性回填到 `opencode-v1` 命名空间。
+
+#### Scenario: 跨 provider 同 ID 不冲突
+
+- **WHEN** 两个不同 provider（或同一 provider 的不同实例）产生相同的上游 session 标识
+- **THEN** 二者在归属判定中被视为不同会话，各自可独立归属不同任务
+
+#### Scenario: 存量归属回填
+
+- **WHEN** 系统执行 SessionKey 持久化迁移
+- **THEN** 既有 `task_sessions` 归属行与锚定 session 全部回填为 `opencode-v1` 命名空间，迁移前后归属判定结果一致
+
+### Requirement: typed events 契约
+
+系统 SHALL 以带类型事件作为 task 层消费 agent 运行信息的唯一事件形态，事件类型集合为：`SessionCreated`、`SessionUpdated`、`SessionDeleted`、`StatusChanged`、`AttentionRaised`、`AttentionResolved`、`SessionError`。provider 适配层 MUST 将上游协议事件（SSE payload、终端输出模式等）在适配层内部翻译为带类型事件；task 层 MUST NOT 解析 provider 原始事件格式。事件流语义为 volatile：断流期间的事件允许丢失，消费者 MUST 容忍断流缺口，并在重连后主动拉取状态对齐。
+
+#### Scenario: 原始事件不出适配层
+
+- **WHEN** provider 上游协议新增或变更事件字段
+- **THEN** 影响面限制在该 provider 的适配层内，task 层消费的事件类型集合与语义不变
+
+#### Scenario: 断流后主动对齐
+
+- **WHEN** 事件流断开并重新建立
+- **THEN** 消费者不假设断流期间事件可重放，主动拉取当前状态完成对齐（与既有 SSE 重连对齐语义一致）
+
+### Requirement: SPI 能力接口与健康状态透出
+
+系统 SHALL 将 SPI 能力组织为按消费者划分的接口集合：SessionControl（会话枚举/创建/删除/层级）、EventSource（事件订阅）、AttentionIO（permission/question 读取与回复）、AsyncPrompt（异步 prompt 注入）、StatusReader（运行状态读取）、TerminalIO（终端输入/输出/attach）、TitleUpdater（标题同步）。每项能力对每个 provider 均为契约必需；适配层自选兑现通道（API 或 TUI），通道选择对 SPI 消费者透明。能力运行时健康状态 MUST 按（能力原语、状态、作用域、原因、代际）透出，状态取值至少含 `unknown` / `available` / `unsupported` / `degraded`；`unsupported`/`degraded` 表示适配层故障或上游变更导致的违约，MUST 可被发现并告警，不得静默降级。透出通道为日志与服务状态端点的 `capabilities` 只读字段；该字段为纯增量，「v1 迁移行为保持」的等价比较仅覆盖既有字段，`capabilities` 单独按本节契约验证。
+
+#### Scenario: 能力故障透出
+
+- **WHEN** 某 provider 的某项能力因上游变更失效
+- **THEN** 该能力的健康状态转为 `unsupported` 或 `degraded` 并带原因透出，而非表现为任务静默无响应
+
+#### Scenario: 通道选择对消费者透明
+
+- **WHEN** 某 provider 的 AsyncPrompt 能力经 TUI 通道而非 API 通道兑现
+- **THEN** task 层调用方式与语义不变，无需感知兑现通道差异
+
+### Requirement: v1 迁移行为保持
+
+opencode v1 作为首个 provider 迁入 SPI 后，系统对外的全部既有行为 MUST 保持不变：进程托管形态、端口分配与健康检查、SSE 归属捕获语义、锚定 bootstrap 协议、attention/permission/status/diffreview 全链路行为、恢复与挂起语义。本 change 的全部既有自动化测试 MUST 在重构后保持通过，且新增的 characterization tests MUST 在重构前后均通过。
+
+#### Scenario: 保护网前后一致
+
+- **WHEN** characterization tests 在重构前建立并运行
+- **THEN** 同一套测试在 v1 迁入 SPI 后不做行为断言修改即可全部通过
