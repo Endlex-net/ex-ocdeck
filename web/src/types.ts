@@ -337,6 +337,26 @@ export interface ServerStatus {
   contractMinVersion: string;
   contractBaseline: string;
   versionVerified: boolean;
+  /**
+   * 能力健康快照（opencode-v1-spi-provider tasks 3.8；internal/api
+   * capabilityHealthDTO）。后端未装配 provider 时整个字段省略。
+   */
+  capabilities?: ServerStatusCapability[];
+}
+
+/** GET /server/status capabilities 数组元素（internal/api/server.go capabilityHealthDTO）。 */
+export interface ServerStatusCapability {
+  primitive: string;
+  scope: string;
+  epoch: number;
+  state: string;
+  reason: string;
+  taskId: string;
+  session: {
+    providerId: string;
+    providerInstanceId: string;
+    upstreamId: string;
+  } | null;
 }
 
 /** 全局 AI provider 配置（ai-worktree-naming design.md D6）：GET/PUT /ai/config 同形响应。 */

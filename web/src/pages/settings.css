@@ -161,3 +161,15 @@
     padding: 6px 12px;
   }
 }
+
+/* ============ Agent 配置子项区块头 ============ */
+/* 「opencode」子项标题 + 版本 badge 横排对齐；badge 复用 od-badge 既有样式。 */
+.set-agent-subhead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 12px;
+}
+.set-agent-subhead .od-section-title {
+  margin: 0;
+}
