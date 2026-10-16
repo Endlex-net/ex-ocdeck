@@ -6,3 +6,6 @@ nohup.out
 .opencode/
 /dist/
 .idea/
+openspec/changes/opencode-v2-contract-spike/sandbox/
+__pycache__/
+.DS_Store
