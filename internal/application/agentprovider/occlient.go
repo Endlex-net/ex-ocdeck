@@ -233,15 +233,20 @@ const (
 	AttentionQuestion   AttentionType = "question"
 )
 
-// AttentionEvent 是从 SSE Event 解析出的规范化注意力事件。
+// AttentionEvent 是从 SSE Event 解析出的规范化注意力事件。Title/Fields 为
+// 方案 B（design D10）结构化 question 视图：provider 侧携带时填充（v2 form
+// 事件路径；v1 wire 无字段级信息，事件路径留空——消费方经 EffectiveFields
+// 回退）。
 type AttentionEvent struct {
 	Kind       AttentionKind
 	Type       AttentionType
 	RequestID  string
 	SessionID  string
-	Permission string         // permission.asked only
-	Patterns   []string       // permission.asked only
-	Questions  []QuestionItem // question.asked only
+	Permission string                 // permission.asked only
+	Patterns   []string               // permission.asked only
+	Title      string                 // question asks only（结构化，可空）
+	Fields     []domain.QuestionField // question asks only（结构化主视图）
+	Questions  []QuestionItem         // question asks only（兼容视图）
 	Metadata   json.RawMessage
 }
 

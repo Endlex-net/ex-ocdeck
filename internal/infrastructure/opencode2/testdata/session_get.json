@@ -1,0 +1,12 @@
+{
+  "data": {
+    "id": "ses_fixture01a",
+    "projectID": "proj_fixture01",
+    "cost": 0,
+    "tokens": { "input": 0, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+    "time": { "created": 1792083316435, "updated": 1792083340561 },
+    "title": "renamed-title",
+    "subpath": "work",
+    "location": { "directory": "/wt" }
+  }
+}

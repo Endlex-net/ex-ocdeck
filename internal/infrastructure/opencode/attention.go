@@ -95,5 +95,10 @@ func parseQuestionRequest(raw jsonRawObject) (QuestionRequest, error) {
 			return QuestionRequest{}, fmt.Errorf("question request: question missing header/question")
 		}
 	}
+	// 方案 B 双写（design D10）：v1 每个 QuestionItem 一对一映射为结构化字段
+	//（合成稳定 key question-N，非上游 ID）；Fields 与 Questions 双视图同源
+	//（EffectiveFields 为合成规则唯一来源）。v1 reply 上游契约未冻结，维持
+	// spi_provider 既有 ErrKindCapabilityUnavailable，不猜测。
+	r.Fields = r.EffectiveFields()
 	return r, nil
 }

@@ -1,0 +1,10 @@
+{
+  "data": {
+    "id": "msg_fixture01",
+    "sessionID": "ses_fixture01a",
+    "time": { "created": 1792083340416 },
+    "type": "user",
+    "payload": { "text": "fixture prompt" },
+    "delivery": "steer"
+  }
+}

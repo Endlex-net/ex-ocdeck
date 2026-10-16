@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"ocdeck/internal/application"
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/infrastructure/pty"
 )
 
@@ -153,7 +154,7 @@ func (s *Server) registerTaskRoutes(mux *http.ServeMux) {
 // null=缺省（→ask），非 null=显式提供（trim 后须为三合法值）。
 // BranchSlug 为可选显式分支 slug（task-info-editable D5）：指针保留 presence 语义——
 // 缺失/null/trim 后空 = 未提供（走 LLM/slugify）；非空 trim 后原样透传 task 层
-//（trim/presence 判定在 Manager 侧统一执行，handler 不改写）。
+// （trim/presence 判定在 Manager 侧统一执行，handler 不改写）。
 type createTaskReq struct {
 	Name           string  `json:"name"`
 	BaseRef        string  `json:"base_ref"`
@@ -610,14 +611,32 @@ type permissionDTO struct {
 }
 
 type questionDTO struct {
-	ID        string            `json:"id"`
-	Questions []questionItemDTO `json:"questions"`
-	Since     int64             `json:"since"`
+	ID    string `json:"id"`
+	Title string `json:"title,omitempty"`
+	// Fields 是结构化主视图（design D10）：Fields 为空时经 EffectiveFields
+	// 自兼容视图合成（v1 路径），消费方优先消费本字段。
+	Fields    []questionFieldDTO `json:"fields"`
+	Questions []questionItemDTO  `json:"questions"`
+	Since     int64              `json:"since"`
 }
 
 type questionItemDTO struct {
 	Header   string `json:"header"`
 	Question string `json:"question"`
+}
+
+type questionFieldDTO struct {
+	Key      string              `json:"key"`
+	Label    string              `json:"label,omitempty"`
+	Prompt   string              `json:"prompt,omitempty"`
+	Type     string              `json:"type,omitempty"`
+	Required bool                `json:"required,omitempty"`
+	Options  []questionOptionDTO `json:"options,omitempty"`
+}
+
+type questionOptionDTO struct {
+	Value string `json:"value"`
+	Label string `json:"label"`
 }
 
 // toAttentionDTO 将 application.Attention 快照转为 DTO（空集合为非 nil 空数组，spec）。
@@ -635,10 +654,29 @@ func toAttentionDTO(att application.Attention) attentionDTO {
 			items = append(items, questionItemDTO{Header: qi.Header, Question: qi.Question})
 		}
 		quests = append(quests, questionDTO{
-			ID: q.ID, Questions: items, Since: q.Since,
+			ID: q.ID, Title: q.Title, Fields: toQuestionFieldDTOs(q.QuestionRequest), Questions: items, Since: q.Since,
 		})
 	}
 	return attentionDTO{Permissions: perms, Questions: quests}
+}
+
+// toQuestionFieldDTOs 组装结构化字段视图（design D10：优先 Fields，空则经
+// EffectiveFields 自 Questions 合成——消费方回退逻辑收敛于此单一出口）。
+func toQuestionFieldDTOs(p appagent.QuestionRequest) []questionFieldDTO {
+	fields := make([]questionFieldDTO, 0)
+	for _, f := range p.EffectiveFields() {
+		fdto := questionFieldDTO{
+			Key: f.Key, Label: f.Label, Prompt: f.Prompt, Type: f.Type, Required: f.Required,
+		}
+		if len(f.Options) > 0 {
+			fdto.Options = make([]questionOptionDTO, 0, len(f.Options))
+			for _, o := range f.Options {
+				fdto.Options = append(fdto.Options, questionOptionDTO{Value: o.Value, Label: o.Label})
+			}
+		}
+		fields = append(fields, fdto)
+	}
+	return fields
 }
 
 // activeSessionDTO 跨项目 active 任务概览 DTO（cross-project-active-sessions D3/D4）。
@@ -774,8 +812,8 @@ func decodeOptionalTaskInfoPatchJSON(data []byte) (updateTaskInfoReq, *ApiError)
 
 // handleUpdateTaskInfo PATCH /api/v1/tasks/{id}（task-info-editable D1）：
 // 空 body / {} / 全 null → 幂等 200 返回当前任务；字段矩阵与门禁归 task 层
-//（UpdateTaskInfo 用例），错误经 mapTaskErr 统一映射
-//（invalid_input/invalid_state/conflict/git_error/internal）；成功 200 + 任务 DTO。
+// （UpdateTaskInfo 用例），错误经 mapTaskErr 统一映射
+// （invalid_input/invalid_state/conflict/git_error/internal）；成功 200 + 任务 DTO。
 func (s *Server) handleUpdateTaskInfo(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, taskInfoPatchBodyMax))
@@ -856,10 +894,10 @@ func decodePermissionModePatchJSON(data []byte) (string, *ApiError) {
 }
 
 // handleUpdateTaskPermissionMode PATCH /api/v1/tasks/{id}/permission-mode
-//（task-permission-mode D4/tasks 4.1）：body 4KiB 上限；解码错误矩阵（必填/类型/
+// （task-permission-mode D4/tasks 4.1）：body 4KiB 上限；解码错误矩阵（必填/类型/
 // 未知字段/尾随 JSON）→ 422；严格序列（校验→互斥→读行→同值→DB 提交→收敛→发布）
 // 归 task 层唯一协调器，错误经 mapTaskErr 统一映射。成功 200 + 固定两字段
-//（输出归一化复用 permissionModeForOutput，fail-closed）。
+// （输出归一化复用 permissionModeForOutput，fail-closed）。
 func (s *Server) handleUpdateTaskPermissionMode(w http.ResponseWriter, r *http.Request) {
 	taskID := r.PathValue("id")
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, taskInfoPatchBodyMax))

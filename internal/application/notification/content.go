@@ -74,13 +74,18 @@ func newIntent(snap TaskSnapshot, cat notification.Category, body, url string) n
 // 见 titleFor），Body = 提问内容（正文不重复任务名，spec「通知内容与跳转链接」；
 // 多条 \n 拼接，单字段截 200、整体截 500）。B14：空白提问字段省略，全部为空白
 // 时整体使用固定降级文案（MUST NOT 出现空白详情）。
+// 方案 B（design D10）：正文优先读结构化 Fields（Prompt 优先、Label 回退），
+// 经 EffectiveFields 回退兼容视图。
 func questionIntent(snap TaskSnapshot, pq application.PendingQuestion, url string) notification.Intent {
-	fields := make([]string, 0, len(pq.Questions))
-	for _, q := range pq.Questions {
-		if strings.TrimSpace(q.Question) == "" {
+	ef := pq.EffectiveFields()
+	fields := make([]string, 0, len(ef))
+	for _, f := range ef {
+		// B14 语义保持：仅提问正文（Prompt；兼容视图即 Question）参与正文，
+		// 空白省略；Label/Key 不进入通知正文。
+		if strings.TrimSpace(f.Prompt) == "" {
 			continue // 空白详情字段省略
 		}
-		fields = append(fields, truncate(q.Question, maxDetailFieldLen))
+		fields = append(fields, truncate(f.Prompt, maxDetailFieldLen))
 	}
 	detail := truncate(strings.Join(fields, "\n"), maxDetailTotalLen)
 	if strings.TrimSpace(detail) == "" {

@@ -11,6 +11,7 @@ import (
 
 	"ocdeck/internal/application"
 	appagent "ocdeck/internal/application/agentprovider"
+	domain "ocdeck/internal/domain/agentprovider"
 )
 
 // --- 三层类型模型（含 Since，本地首次观察时间） ---
@@ -211,13 +212,17 @@ func (a *attentionState) upsertQuestLocked(ev appagent.AttentionEvent, observedA
 	since := observedAt
 	if old, ok := a.quest.quests[id]; ok {
 		since = old.Since
-		if old.SessionID == ev.SessionID && equalQuestionItems(old.Questions, ev.Questions) {
+		// 结构化视图（Fields/Title）与兼容视图共同参与外部可见等值——
+		// 仅结构化字段变化同样触发发布（design D10）。
+		if old.SessionID == ev.SessionID && old.Title == ev.Title &&
+			equalQuestionFields(old.Fields, ev.Fields) &&
+			equalQuestionItems(old.Questions, ev.Questions) {
 			return false
 		}
 	}
 	a.quest.quests[id] = PendingQuestion{
 		QuestionRequest: appagent.QuestionRequest{
-			ID: id, SessionID: ev.SessionID, Questions: ev.Questions,
+			ID: id, SessionID: ev.SessionID, Title: ev.Title, Fields: ev.Fields, Questions: ev.Questions,
 		},
 		Since: since,
 	}
@@ -289,6 +294,7 @@ func (a *attentionState) questSnapshotLocked() []PendingQuestion {
 	quests := make([]PendingQuestion, 0, len(a.quest.order))
 	for _, id := range a.quest.order {
 		q := a.quest.quests[id]
+		q.Fields = copyQuestionFields(q.Fields)
 		q.Questions = copyQuestionItems(q.Questions)
 		quests = append(quests, q)
 	}
@@ -318,6 +324,8 @@ func equalQuestSnapshots(x, y []PendingQuestion) bool {
 	for i := range x {
 		a, b := x[i], y[i]
 		if a.ID != b.ID || a.SessionID != b.SessionID || a.Since != b.Since ||
+			a.Title != b.Title ||
+			!equalQuestionFields(a.Fields, b.Fields) ||
 			!equalQuestionItems(a.Questions, b.Questions) {
 			return false
 		}
@@ -349,6 +357,47 @@ func equalQuestionItems(x, y []appagent.QuestionItem) bool {
 		}
 	}
 	return true
+}
+
+// equalQuestionFields 判断两个结构化字段 slice 逐元素等值（design D10：
+// 结构化视图是外部可见状态的一部分；Metadata 为 JSON 原文比较，nil 与空等值）。
+func equalQuestionFields(x, y []domain.QuestionField) bool {
+	if len(x) != len(y) {
+		return false
+	}
+	for i := range x {
+		a, b := x[i], y[i]
+		if a.Key != b.Key || a.Label != b.Label || a.Prompt != b.Prompt ||
+			a.Type != b.Type || a.Required != b.Required ||
+			!equalMetadata(a.Metadata, b.Metadata) ||
+			len(a.Options) != len(b.Options) {
+			return false
+		}
+		for j := range a.Options {
+			if a.Options[j] != b.Options[j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// copyQuestionFields 深拷贝结构化字段 slice（含 Options 与 Metadata，
+// 快照隔离）。
+func copyQuestionFields(fs []domain.QuestionField) []domain.QuestionField {
+	if fs == nil {
+		return nil
+	}
+	out := make([]domain.QuestionField, len(fs))
+	for i, f := range fs {
+		out[i] = f
+		if f.Options != nil {
+			out[i].Options = make([]domain.QuestionOption, len(f.Options))
+			copy(out[i].Options, f.Options)
+		}
+		out[i].Metadata = copyMetadata(f.Metadata)
+	}
+	return out
 }
 
 // clearAttention 推进 attentionEpoch（atomic，不依赖 mu）并清空全部集合（短暂持 mu）。

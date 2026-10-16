@@ -464,7 +464,11 @@ func (a *spiAttention) ListQuestions(ctx context.Context, b domain.TaskBinding, 
 		for _, item := range q.Questions {
 			items = append(items, domain.QuestionItem{Header: item.Header, Question: item.Question})
 		}
-		out = append(out, domain.QuestionPayload{ID: q.ID, SessionID: q.SessionID, Questions: items})
+		// 方案 B 双写（design D10）：结构化 Fields 随解析层填充透传，
+		// Questions 兼容视图保持 v1 现状。
+		out = append(out, domain.QuestionPayload{
+			ID: q.ID, SessionID: q.SessionID, Title: q.Title, Fields: q.Fields, Questions: items,
+		})
 	}
 	a.p.reportConversion(h, "attention.list_questions", nil)
 	return out, nil

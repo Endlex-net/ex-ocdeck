@@ -54,10 +54,14 @@ type EventStream interface {
 }
 
 // AttentionReply 是 permission/question 回复：permission 的 Action 取值集合以
-// CONTRACT.md 锚点为准；question 为答案文本数组（封装按 v1 client 现状搬运）。
+// CONTRACT.md 锚点为准；question 回复主视图 = Values（按字段 Key 关联），
+// 旧 Answers 为按字段顺序的兼容视图（迁移完成后可删——design D10）。
 type AttentionReply struct {
-	Action  string
+	Action string
+	// Deprecated: 兼容视图（按 EffectiveFields 顺序位置对应）；见 Values。
 	Answers []string
+	// Values 是 question 回复的主视图（key-based；design D10）。
+	Values []domain.QuestionAnswer
 }
 
 // ListResult 承载列表边界语义（D7）：Overflow 为不完整快照信号，不是错误——

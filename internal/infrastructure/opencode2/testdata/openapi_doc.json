@@ -1,0 +1,24 @@
+{
+  "openapi": "3.1.0",
+  "info": { "title": "opencode v2 (fixture excerpt)", "version": "2.0.28" },
+  "paths": {
+    "/api/session": {
+      "get": { "operationId": "session.list" },
+      "post": { "operationId": "session.create" }
+    },
+    "/api/session/{sessionID}/prompt": {
+      "post": { "operationId": "session.prompt" }
+    },
+    "/api/event": {
+      "get": { "operationId": "event.subscribe" }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Session.ID": { "type": "string", "pattern": "^ses" },
+      "Session.Message.ID": { "type": "string", "pattern": "^msg_" },
+      "Form.ID": { "type": "string", "pattern": "^frm_" },
+      "Permission.ID": { "type": "string", "pattern": "^per" }
+    }
+  }
+}

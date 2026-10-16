@@ -1855,6 +1855,11 @@ func attentionEventFromAgentEvent(att domain.Attention, resolved bool) appagent.
 		out.Metadata = att.Permission.Metadata
 	case att.Question != nil:
 		out.Type = appagent.AttentionQuestion
+		// 方案 B（design D10）：结构化视图（Title/Fields）优先透传；
+		// Questions 兼容视图保持既有填充（v1 事件路径无字段级信息，
+		// 消费方经 EffectiveFields 回退）。
+		out.Title = att.Question.Title
+		out.Fields = att.Question.Fields
 		for _, q := range att.Question.Questions {
 			out.Questions = append(out.Questions, appagent.QuestionItem{Header: q.Header, Question: q.Question})
 		}

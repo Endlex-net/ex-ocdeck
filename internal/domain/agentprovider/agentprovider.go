@@ -284,16 +284,90 @@ type PermissionPayload struct {
 }
 
 // QuestionItem 单条提问的最小稳定字段。
+//
+// Deprecated: 方案 B（design D10）引入结构化字段模型后，Questions 仅为
+// QuestionPayload 的兼容视图（v1 路径填充）；消费方 MUST 优先读 Fields，
+// 经 EffectiveFields() 回退。迁移完成后可删除。
 type QuestionItem struct {
 	Header   string `json:"header"`
 	Question string `json:"question"`
 }
 
-// QuestionPayload 字段与 v1 opencode.QuestionRequest 一致。
+// QuestionFieldType 是结构化字段的类型值域（design D10）：
+// text/textarea/boolean/number/select/multiselect。未知类型值 MUST 保留原值
+// （消费方按可降级文本处理），MUST NOT 静默降级为 text。
+type QuestionFieldType string
+
+const (
+	QuestionTypeText        QuestionFieldType = "text"
+	QuestionTypeTextarea    QuestionFieldType = "textarea"
+	QuestionTypeBoolean     QuestionFieldType = "boolean"
+	QuestionTypeNumber      QuestionFieldType = "number"
+	QuestionTypeSelect      QuestionFieldType = "select"
+	QuestionTypeMultiselect QuestionFieldType = "multiselect"
+)
+
+// QuestionOption 是 select/multiselect 字段的单个选项。
+type QuestionOption struct {
+	Value string `json:"value"`
+	Label string `json:"label"`
+}
+
+// QuestionField 是结构化 question 的单个字段（design D10）：Key 为回复关联键
+// （provider 原生 key 或合成稳定 key），Label 为展示标题，Prompt 为提问正文，
+// Metadata 仅保留未入模型的字段（不得成为消费方主路径）。
+type QuestionField struct {
+	Key      string           `json:"key"`
+	Label    string           `json:"label,omitempty"`
+	Prompt   string           `json:"prompt,omitempty"`
+	Type     string           `json:"type,omitempty"`
+	Required bool             `json:"required,omitempty"`
+	Options  []QuestionOption `json:"options,omitempty"`
+	Metadata json.RawMessage  `json:"metadata,omitempty"`
+}
+
+// QuestionAnswer 是 question 回复的单字段答案（design D10）：Key 关联
+// QuestionField.Key；Value 为任意 JSON 值（v2 Form.Value 值域：
+// string/number/boolean/string[]），类型校验由 provider 上游契约承担。
+type QuestionAnswer struct {
+	Key   string
+	Value any
+}
+
+// QuestionPayload 是 provider-neutral 的 pending question 快照。主视图 =
+// Fields（结构化字段，key-based 回复关联）；Questions 为兼容视图（v1 路径
+// 填充；v2 form 不再填充——design D10）。消费方 MUST 优先读 Fields，
+// 缺失时经 EffectiveFields() 回退合成视图。
 type QuestionPayload struct {
-	ID        string         `json:"id"`
-	SessionID string         `json:"sessionID"`
-	Questions []QuestionItem `json:"questions"`
+	ID        string          `json:"id"`
+	SessionID string          `json:"sessionID"`
+	Title     string          `json:"title,omitempty"`
+	Fields    []QuestionField `json:"fields,omitempty"`
+	// Deprecated: 兼容视图（v1 QuestionItem 路径）；见 Fields。
+	Questions []QuestionItem `json:"questions,omitempty"`
+}
+
+// EffectiveFields 返回 question 的主视图字段（design D10 纯函数，不涉及
+// wire）：Fields 非空时原样返回；否则由 Questions 逐条合成——
+// Key=question-N（1 起，合成稳定 key，非上游 ID）、Label=Header、
+// Prompt=Question、Type=text。两视图皆空返回 nil。
+func (p QuestionPayload) EffectiveFields() []QuestionField {
+	if len(p.Fields) > 0 {
+		return p.Fields
+	}
+	if len(p.Questions) == 0 {
+		return nil
+	}
+	out := make([]QuestionField, 0, len(p.Questions))
+	for i, q := range p.Questions {
+		out = append(out, QuestionField{
+			Key:    fmt.Sprintf("question-%d", i+1),
+			Label:  q.Header,
+			Prompt: q.Question,
+			Type:   string(QuestionTypeText),
+		})
+	}
+	return out
 }
 
 // Attention 是归一化注意力信号：Kind 决定唯一非 nil 负载。
