@@ -435,6 +435,59 @@ func (c *Client) UpdateTitle(ctx context.Context, id, title string) error {
 	return nil
 }
 
+// PutSessionEnvironment PUT /api/session/{id}/environment body {variables} →
+// 204 替换式（CONTRACT §2；R2 p1b_environment 实证 session 间隔离）。tasks 5.4
+// 配置应用链的应用点。
+func (c *Client) PutSessionEnvironment(ctx context.Context, sessionID string, vars map[string]string) error {
+	if vars == nil {
+		vars = map[string]string{}
+	}
+	body, err := json.Marshal(map[string]interface{}{"variables": vars})
+	if err != nil {
+		return fmt.Errorf("opencode2: put session environment: marshal body: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
+		c.apiURL("/session/"+url.PathEscape(sessionID)+"/environment", nil), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(c.username, c.password)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return classifyStatus(resp)
+}
+
+// InterruptSession POST /api/session/{id}/interrupt → 200 {interrupted:bool}
+// （CONTRACT §4：/abort 不存在；false = idle no-op 成功）。挂起门禁的停止 wire。
+func (c *Client) InterruptSession(ctx context.Context, sessionID string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.apiURL("/session/"+url.PathEscape(sessionID)+"/interrupt", nil), nil)
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(c.username, c.password)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if err := classifyStatus(resp); err != nil {
+		return err
+	}
+	var out struct {
+		Interrupted bool `json:"interrupted"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return fmt.Errorf("opencode2: interrupt: decode body: %w", err)
+	}
+	// true=实际中断活跃执行；false=idle no-op——两者均为停止确认成功。
+	return nil
+}
+
 // isNotFound 判断是否 404。
 func isNotFound(err error) bool {
 	var hse *httpStatusError

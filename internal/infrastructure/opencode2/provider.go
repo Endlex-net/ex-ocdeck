@@ -36,6 +36,9 @@ type SPIProvider struct {
 	statusVerified bool
 	// health 是能力健康上报端口（可选；nil → no-op，测试态）。
 	health *spiHealthPort
+	// supDeps 非 nil 时 Supervisor() 为真实 A+ 承载（NewSPIProviderWithDeps）；
+	// nil 保持阶段 2 的 fail-closed 占位。
+	supDeps *SupervisorDeps
 
 	contractMu sync.Mutex
 	contract   *WireContract
@@ -80,6 +83,17 @@ func NewSPIProvider(opts ProviderOptions) *SPIProvider {
 	}
 }
 
+// NewSPIProviderWithDeps 构造带真实 A+ supervisor 承载的 v2 Provider
+// （tasks 5.1；deps 完整性由装配方保证）。
+func NewSPIProviderWithDeps(opts ProviderOptions, supDeps *SupervisorDeps) *SPIProvider {
+	p := NewSPIProvider(opts)
+	if supDeps != nil {
+		supDeps.OpencodeBin = p.opencodeBin
+		p.supDeps = supDeps
+	}
+	return p
+}
+
 // 编译期断言：*SPIProvider 实现 Provider 聚合与归属校验窄接口。
 var (
 	_ appagent.Provider                = (*SPIProvider)(nil)
@@ -91,13 +105,21 @@ var (
 	_ appagent.StatusReader            = (*spiStatus)(nil)
 	_ appagent.TerminalIO              = (*spiTerminal)(nil)
 	_ appagent.TitleUpdater            = (*spiTitles)(nil)
+	_ appagent.RuntimeSupervisor       = (*V2Supervisor)(nil)
 )
 
 func (p *SPIProvider) Meta() appagent.ProviderMeta { return p.meta }
 
-// Supervisor 返回 runtime supervisor：阶段 2 为显式 fail-closed 占位
-// （tasks 5.x 落位 A+ 全局单 server 生命周期；不做任何被猜测的行为）。
-func (p *SPIProvider) Supervisor() appagent.RuntimeSupervisor { return spiSupervisorStub{} }
+// Supervisor 返回 runtime supervisor：deps 已注入（NewSPIProviderWithDeps）时
+// 为真实 A+ 承载；否则保持阶段 2 的 fail-closed 占位（tasks 5.x 前测试依赖）。
+func (p *SPIProvider) Supervisor() appagent.RuntimeSupervisor {
+	if p.supDeps == nil {
+		return spiSupervisorStub{}
+	}
+	sup := NewV2Supervisor(*p.supDeps)
+	sup.contractOf = p.contractFor
+	return sup
+}
 
 func (p *SPIProvider) Sessions() appagent.SessionControl { return &spiSessions{p: p} }
 func (p *SPIProvider) Events() appagent.EventSource      { return &spiEvents{p: p} }

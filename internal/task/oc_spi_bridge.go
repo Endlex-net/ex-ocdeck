@@ -34,8 +34,17 @@ type spiBridgeOCClient struct {
 
 var _ OCClient = (*spiBridgeOCClient)(nil)
 
-// bridgeSessionKey 按 v1 命名空间构造 SessionKey（store 统一命名空间常量）。
-func bridgeSessionKey(upstreamID string) domain.SessionKey {
+// bridgeSessionKey 按 binding 命名空间构造 SessionKey（opencode-v2-provider
+// tasks 6.5，design D4 替换表：v2 任务 → (opencode-v2, default, upstreamID)；
+// v1/未知命名空间回退 v1 常量——存量行为不变）。
+func (c *spiBridgeOCClient) bridgeSessionKey(upstreamID string) domain.SessionKey {
+	if c.binding.ProviderID != "" {
+		return domain.SessionKey{
+			ProviderID:         c.binding.ProviderID,
+			ProviderInstanceID: c.binding.ProviderInstanceID,
+			UpstreamID:         upstreamID,
+		}
+	}
 	return domain.SessionKey{
 		ProviderID:         store.ProviderIDV1,
 		ProviderInstanceID: store.ProviderInstanceV1Default,
@@ -108,7 +117,7 @@ func (c *spiBridgeOCClient) ListSessions(ctx context.Context, dir string, limit 
 
 func (c *spiBridgeOCClient) GetSession(ctx context.Context, dir, id string) (appagent.Session, error) {
 	_ = dir
-	got, err := c.p.Sessions().Get(ctx, c.binding, bridgeSessionKey(id))
+	got, err := c.p.Sessions().Get(ctx, c.binding, c.bridgeSessionKey(id))
 	if err != nil {
 		return appagent.Session{}, err
 	}
@@ -128,7 +137,7 @@ func (c *spiBridgeOCClient) CreateSession(ctx context.Context, dir, title string
 
 func (c *spiBridgeOCClient) DeleteSession(ctx context.Context, dir, id string) error {
 	_ = dir
-	return c.p.Sessions().Delete(ctx, c.binding, bridgeSessionKey(id))
+	return c.p.Sessions().Delete(ctx, c.binding, c.bridgeSessionKey(id))
 }
 
 func (c *spiBridgeOCClient) SessionStatus(ctx context.Context, dir string) (map[string]appagent.SessionStatus, error) {
@@ -152,7 +161,7 @@ func (c *spiBridgeOCClient) ListPermissions(ctx context.Context, dir string) ([]
 	_ = dir
 	// scope 通道：Session 字段仅参与健康观测归属（REST 传输是全目录快照），
 	// key 的 UpstreamID 留空（runtime scope 观测面）。
-	out, err := c.p.Attention().ListPermissions(ctx, c.binding, bridgeSessionKey(""))
+	out, err := c.p.Attention().ListPermissions(ctx, c.binding, c.bridgeSessionKey(""))
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +170,7 @@ func (c *spiBridgeOCClient) ListPermissions(ctx context.Context, dir string) ([]
 
 func (c *spiBridgeOCClient) ListQuestions(ctx context.Context, dir string) ([]appagent.QuestionRequest, error) {
 	_ = dir
-	out, err := c.p.Attention().ListQuestions(ctx, c.binding, bridgeSessionKey(""))
+	out, err := c.p.Attention().ListQuestions(ctx, c.binding, c.bridgeSessionKey(""))
 	if err != nil {
 		return nil, err
 	}
@@ -170,7 +179,7 @@ func (c *spiBridgeOCClient) ListQuestions(ctx context.Context, dir string) ([]ap
 
 func (c *spiBridgeOCClient) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
 	_ = dir
-	at := domain.Attention{ID: requestID, Kind: domain.AttentionPermission, Session: bridgeSessionKey(requestID)}
+	at := domain.Attention{ID: requestID, Kind: domain.AttentionPermission, Session: c.bridgeSessionKey(requestID)}
 	return c.p.Attention().Reply(ctx, c.binding, at, appagent.AttentionReply{Action: reply})
 }
 
@@ -183,7 +192,7 @@ func (c *spiBridgeOCClient) PromptAsync(ctx context.Context, dir, sessionID, mes
 			req.Files = append(req.Files, appagent.PromptFile{URL: f.URL, Mime: f.Mime, Filename: f.Filename})
 		}
 	}
-	res, _ := c.p.Prompts().Send(ctx, c.binding, bridgeSessionKey(sessionID), req)
+	res, _ := c.p.Prompts().Send(ctx, c.binding, c.bridgeSessionKey(sessionID), req)
 	// Outcome→Kind 一一对应（字面值同形：accepted/http_response/transport_
 	// unknown/pre_send_failure——agentprovider.PromptOutcome 常量表）。
 	return appagent.PromptTransportResult{
@@ -202,7 +211,7 @@ func (c *spiBridgeOCClient) ProbePromptAsyncCapability(ctx context.Context) appa
 
 func (c *spiBridgeOCClient) UpdateSessionTitle(ctx context.Context, dir, id, title string) error {
 	_ = dir
-	return c.p.Titles().Sync(ctx, c.binding, bridgeSessionKey(id), title)
+	return c.p.Titles().Sync(ctx, c.binding, c.bridgeSessionKey(id), title)
 }
 
 // bridgeClientFor 在 provider 实现可承载能力出口（非测试接缝）时构造桥；

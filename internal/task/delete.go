@@ -651,6 +651,44 @@ func (m *Manager) deleteCleanupConnect(ctx context.Context, row TaskRow) (int, s
 	// 分派 supervisor（未注册 fail-closed），端口+进程+健康；无锚定 bootstrap、无
 	// claim、无对齐、无任务状态提交、不读/不写 env 快照与启动事实；返回值仅存内存
 	//（MUST NOT 持久化）。陈旧 binding 不参与（MUST NOT 走普通 Resume 触发恢复）。
+	// R4 消费点路由（opencode-v2-provider tasks 6.5）：按任务 binding 命名空间
+	// 分派——v2 binding → v2 provider supervisor（归属校验门禁先于凭据派生）；
+	// v1/无 binding → 既有 v1 路径（registryDispatch + ephemeralSupervisor）。
+	b, hasBinding, berr := m.store.GetTaskBinding(ctx, row.ID)
+	if berr != nil {
+		return 0, "", "", false, domain.TaskBinding{}, berr
+	}
+	if hasBinding && b.ProviderID == store.ProviderIDV2 {
+		sup, serr := m.supervisorForTaskConsumption(ctx, row.ID, b, row.WorktreePath)
+		if serr != nil {
+			return 0, "", "", false, domain.TaskBinding{}, serr
+		}
+		binding, aerr := sup.AcquireEphemeral(ctx, appagent.TaskRef{
+			TaskID:    row.ID,
+			Directory: row.WorktreePath,
+			Mode:      taskModeForRef(row),
+		})
+		if aerr != nil {
+			return 0, "", "", false, domain.TaskBinding{}, fmt.Errorf("acquire ephemeral runtime for oc session delete: %w", aerr)
+		}
+		// v2 临时 binding 端点解析经 provider 侧下沉（EphemeralRuntimeEndpoint——
+		// lifecycle 解码拒绝 ephemeral 形态，独立端口；密码仅经派生注入）。
+		p, gerr := m.providerRegistry.Get(store.ProviderIDV2)
+		if gerr != nil {
+			return 0, "", "", false, domain.TaskBinding{}, gerr
+		}
+		er, ok := p.(appagent.EphemeralEndpointResolver)
+		if !ok {
+			return 0, "", "", false, domain.TaskBinding{}, appagent.NewError(
+				"supervisor.acquire_ephemeral", appagent.ErrKindCapabilityUnavailable,
+				errors.New("provider 未实现 EphemeralRuntimeEndpoint"))
+		}
+		port, pw, _, eerr := er.EphemeralRuntimeEndpoint(binding)
+		if eerr != nil {
+			return 0, "", "", false, domain.TaskBinding{}, eerr
+		}
+		return port, pw, binding.TerminalRef, true, binding, nil
+	}
 	if err := m.registryDispatch(store.ProviderIDV1); err != nil {
 		return 0, "", "", false, domain.TaskBinding{}, err
 	}

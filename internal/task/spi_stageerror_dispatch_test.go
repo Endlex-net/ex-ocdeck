@@ -56,7 +56,7 @@ func TestStageErrorMapping_ClaimConflictTerminal(t *testing.T) {
 // TestStageErrorMapping_CleanupTicketsNoticeOrDebt 固定输入：supervisor 轮换 kill
 // 非净 disposition（cleanup payload：reap_failed + tickets）。断言两条腿：
 // (1) notice 写成功 → retryable cleanup debt 已落账 → 终态补偿阻断继续建程
-//（orchestration spec「统一终态补偿」：reap_failed 等 retryable debt/notice
+// （orchestration spec「统一终态补偿」：reap_failed 等 retryable debt/notice
 // **持久化成功后**执行终态事务——落账的 debt MUST 直接进终态，MUST NOT 回到
 // attempt 重试继续创建进程）；
 // (2) notice 写失败（noticeCasErr failpoint）→ pendingCleanupError（durable debt 重放，

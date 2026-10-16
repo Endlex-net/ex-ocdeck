@@ -619,7 +619,33 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 		return err
 	}
 
-	if m.runtimeSupervisor != nil {
+	// 单一 resolver 准入（opencode-v2-provider tasks 6.3/6.6，design D4）：
+	// 拒绝（R2/R3/R6/R7/R9）零副作用 + 用户可感知 last_error；registry 未注入
+	// 时回退固定 v1 supervisor（既有装配/测试现状行为不变）。
+	var sup appagent.RuntimeSupervisor
+	var dec execDecision
+	if m.providerRegistry != nil {
+		var aerr error
+		sup, dec, aerr = m.admitExecution(ctx, taskID)
+		if aerr != nil {
+			// fail-closed：零副作用 + 诊断性 last_error/用户提示（D4 允许行）。
+			m.recordAdmissionError(ctx, taskID, aerr)
+			return newOpErr(codeConflict, aerr)
+		}
+		// R8：承接主流程（D5 六步；B 首建/A 延续由判定矩阵在流程内分派）。
+		if dec.Adopt {
+			return m.adoptTaskV2(ctx, taskID, row, mode)
+		}
+		// G3-F2：已有 v2 binding → Resume（连续性——MUST NOT 再 POST 建 session）；
+		// 恢复/替换提交（binding 替换 + suspended→active CAS，不走 activating
+		// 首次语义）。
+		if dec.ExecProviderID == store.ProviderIDV2 {
+			return m.resumeActivateV2(ctx, taskID, row, sup, mode)
+		}
+	} else {
+		sup = m.runtimeSupervisor
+	}
+	if sup != nil {
 		// D8：激活即持久化 env 快照（含 OCDECK_SERVE_PORT 复用提示）——恢复 incident
 		// 的 loadEnvSnapshot 与 supervisor BuildServeEnv 同源（内联路径 mergeEnvSnapshot
 		// 同形，语义对齐）。
@@ -630,7 +656,7 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 		if _, merr := m.mergeEnvSnapshot(ctx, row, port0); merr != nil {
 			return newOpErr(codeInternal, merr)
 		}
-		binding, serr := m.runtimeSupervisor.Acquire(ctx, appagent.TaskRef{TaskID: taskID, Directory: row.WorktreePath})
+		binding, serr := sup.Acquire(ctx, appagent.TaskRef{TaskID: taskID, Directory: row.WorktreePath})
 		if serr != nil {
 			// C17 残余修复（Activate 回放合同扩展）：Acquire 失败经同一桥接——
 			// CleanupPayload 落账/折叠进 pending（runActivateFailureCompensation

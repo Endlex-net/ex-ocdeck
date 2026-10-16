@@ -37,7 +37,7 @@ type c11GatedSupervisor struct {
 	// entered 通知测试「Resume 已返回」（owned 窗口开始）。
 	entered chan string
 	// release 让测试放行包装层继续返回 binding。
-	release chan struct{}
+	release  chan struct{}
 	released atomic.Bool
 }
 

@@ -15,10 +15,13 @@ import (
 
 // ProviderIDV1 与 ProviderInstanceV1Default 是本期 v1 统一命名空间常量
 // （design D2：整个既有 v1 数据域一个命名空间，取值固定；归属判定冲突集合
-// 与迁移前逐点一致）。
+// 与迁移前逐点一致）。ProviderIDV2/ProviderInstanceV2Default 是 v2 命名空间
+// 常量（opencode-v2-provider design D2；承接原子转换的目标命名空间）。
 const (
 	ProviderIDV1              = "opencode-v1"
 	ProviderInstanceV1Default = "default"
+	ProviderIDV2              = "opencode-v2"
+	ProviderInstanceV2Default = "default"
 )
 
 // BackfillProviderNamespaces 命名空间防御性补齐：单事务内执行四组 UPDATE，

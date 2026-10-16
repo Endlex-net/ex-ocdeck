@@ -19,3 +19,10 @@ import (
 type BindingOwnershipChecker interface {
 	CheckBindingOwnership(b domain.TaskBinding, expectedTaskID, expectedDirectory string) error
 }
+
+// EphemeralEndpointResolver 是 v2 临时 binding 的端点解析端口（opencode-v2-provider
+// tasks 5.2/6.5 删除清理消费）：解 provider 私有 ephemeral data 并派生凭据。
+// 生命周期 binding 不经此端口（BindingRuntimeEndpoint 承载）。
+type EphemeralEndpointResolver interface {
+	EphemeralRuntimeEndpoint(b domain.TaskBinding) (port int, password string, directory string, err error)
+}

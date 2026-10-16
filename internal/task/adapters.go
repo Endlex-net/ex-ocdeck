@@ -40,6 +40,27 @@ func (a *StoreAdapter) SetTaskBinding(ctx context.Context, taskID string, b doma
 	return a.db.SetTaskBinding(ctx, taskID, b)
 }
 
+// ListTaskSessionKeys 读任务归属行 SessionKey（承接判定矩阵）。
+func (a *StoreAdapter) ListTaskSessionKeys(ctx context.Context, taskID string) ([]domain.SessionKey, error) {
+	return a.db.ListTaskSessionKeys(ctx, taskID)
+}
+
+// GetTaskAnchor 读锚定三元组。
+func (a *StoreAdapter) GetTaskAnchor(ctx context.Context, taskID string) (string, string, string, error) {
+	return a.db.GetTaskAnchor(ctx, taskID)
+}
+
+// CommitAdoption 承接原子提交（tasks 6.4：归属转换+anchor+binding+状态守卫 CAS 单事务）。
+func (a *StoreAdapter) CommitAdoption(ctx context.Context, taskID string, b domain.TaskBinding, fromStatus string, lastError *string) (application.TransitionResult, error) {
+	return a.db.CommitAdoption(ctx, taskID, b, ocdecktask.Status(fromStatus), lastError)
+}
+
+// CommitV2Resume v2 恢复/替换提交（gate3 G3-F2/F8：binding 替换 + 旧 binding
+// 代际守卫 + 状态守卫 CAS）。
+func (a *StoreAdapter) CommitV2Resume(ctx context.Context, taskID string, oldBinding, b domain.TaskBinding, expectedStatus string) (application.TransitionResult, error) {
+	return a.db.CommitV2Resume(ctx, taskID, oldBinding, b, ocdecktask.Status(expectedStatus))
+}
+
 // CommitActivation 激活/恢复成功提交事务（tasks 4.3：binding 与状态 CAS 同事务）。
 func (a *StoreAdapter) CommitActivation(ctx context.Context, taskID string, b domain.TaskBinding, fromStatus, toStatus string) (application.TransitionResult, error) {
 	return a.db.CommitActivation(ctx, taskID, b, ocdecktask.Status(fromStatus), ocdecktask.Status(toStatus))

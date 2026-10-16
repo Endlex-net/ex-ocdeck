@@ -15,8 +15,8 @@ import (
 	"fmt"
 
 	"ocdeck/internal/application"
-	ocdecktask "ocdeck/internal/domain/task"
 	domain "ocdeck/internal/domain/agentprovider"
+	ocdecktask "ocdeck/internal/domain/task"
 )
 
 // v1 命名空间常量（design D2；与 provider_namespace.go 补齐目标一致）。
@@ -230,4 +230,36 @@ func (q *Queries) ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sess
 		}
 		return res, nil
 	})
+}
+
+// ListTaskSessionKeys 读任务全部归属行的 SessionKey（承接判定矩阵「历史归属
+// 集合」；调用方按命名空间过滤）。
+func (q *Queries) ListTaskSessionKeys(ctx context.Context, taskID string) ([]domain.SessionKey, error) {
+	rows, err := q.db.QueryContext(ctx,
+		`SELECT provider_id, provider_instance_id, session_id FROM task_sessions WHERE task_id = ?`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.SessionKey
+	for rows.Next() {
+		var k domain.SessionKey
+		if err := rows.Scan(&k.ProviderID, &k.ProviderInstanceID, &k.UpstreamID); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// GetTaskAnchor 读锚定三元组（承接判定矩阵；无锚定 → 空串列）。
+func (q *Queries) GetTaskAnchor(ctx context.Context, taskID string) (anchorID, providerID, instanceID string, err error) {
+	var sid, pid, iid sql.NullString
+	err = q.db.QueryRowContext(ctx,
+		`SELECT anchor_session_id, anchor_provider_id, anchor_provider_instance_id FROM tasks WHERE id = ?`,
+		taskID).Scan(&sid, &pid, &iid)
+	if err != nil {
+		return "", "", "", err
+	}
+	return sid.String, pid.String, iid.String, nil
 }

@@ -10,11 +10,12 @@
 //   - name 仅文件名，不允许路径分隔符。
 //
 // JSONC 解析：维持自研单次扫描状态机（stripJSONC），不引入第三方依赖。
-//   理由：go 1.24 兼容 + 零依赖策略；仅用于语法校验（不影响保存原文），状态机覆盖
-//   行/块注释、字符串字面量内 // 与 /* 保留、尾逗号、未闭合块注释拒绝。
-//   测试覆盖清单见 occonfig_test.go：TestStripJSONC_UnclosedBlockCommentRejected、
-//   TestStripJSONC_StringLiteralsPreserved、TestStripJSONC_TrailingCommaStripped、
-//   TestStripJSONC_LinearTime（大文件单次扫描线性时间）。
+//
+//	理由：go 1.24 兼容 + 零依赖策略；仅用于语法校验（不影响保存原文），状态机覆盖
+//	行/块注释、字符串字面量内 // 与 /* 保留、尾逗号、未闭合块注释拒绝。
+//	测试覆盖清单见 occonfig_test.go：TestStripJSONC_UnclosedBlockCommentRejected、
+//	TestStripJSONC_StringLiteralsPreserved、TestStripJSONC_TrailingCommaStripped、
+//	TestStripJSONC_LinearTime（大文件单次扫描线性时间）。
 //
 // 不做业务 schema 校验（配置语义由 opencode 自己负责）；编辑保留原文（含注释原样保存）。
 package config

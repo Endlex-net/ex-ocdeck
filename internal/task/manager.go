@@ -248,6 +248,8 @@ type Manager struct {
 	// ephemeralSupervisor 是删除清理临时绑定入口（tasks 4.3 AcquireEphemeral 分支；
 	// design D9a 分支②）：仅消费 AcquireEphemeral（临时 runtime——不落库、不锚定、
 	// 不建 SSE、不提交 active）。经 Options.EphemeralSupervisor 注入。
+	// machine 是 resolver 机器事实（tasks 6.3；setMachineFacts/Options 注入）。
+	machine             machineFacts
 	ephemeralSupervisor appagent.RuntimeSupervisor
 	// runtimeSupervisor 是激活/恢复建程入口（C2 门禁修复）：非 nil 时 activateRun
 	// 经 Acquire、runRecoveryAttempt 经 Resume 建程（supervisor 返回最终 binding，
@@ -505,6 +507,9 @@ type Options struct {
 	// 经 registry 分派（未注册 fail-closed）。nil 时分派降级为 provider-not-found
 	// fail-closed（仅测试直构可达；生产装配与契约测试 MUST 注入）。
 	ProviderRegistry *appagent.Registry
+	// MachineFacts 注入 resolver 的机器事实（opencode-v2-provider tasks 6.3：
+	// config.OpenCodeMajor/V2Adoption；零值 = unknown + 开关关）。
+	MachineFacts machineFacts
 	// EphemeralSupervisor 注入删除清理临时绑定入口（tasks 4.3 AcquireEphemeral 分支；
 	// 生产装配 = registry 内 v1 provider 的 Supervisor()；nil 时临时绑定请求
 	// fail-closed 报 supervisor 未注入）。
@@ -571,6 +576,7 @@ func New(opts Options) *Manager {
 		wt:                      opts.Worktree,
 		ocFactory:               opts.OCFactory,
 		providerRegistry:        opts.ProviderRegistry,
+		machine:                 opts.MachineFacts,
 		ephemeralSupervisor:     opts.EphemeralSupervisor,
 		runtimeSupervisor:       opts.RuntimeSupervisor,
 		namer:                   opts.Namer,
@@ -1052,6 +1058,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 			killErr = errors.Join(killErr, fmt.Errorf("shutdown: converge rename pendings: %w", rerr))
 		}
 		killErr = errors.Join(killErr, m.shutdownKillAllSessions(ctx))
+		killErr = errors.Join(killErr, m.shutdownV2Server(ctx))
 		if killErr != nil {
 			// 记录但继续停 runtime goroutine，避免 goroutine 泄漏；错误向上传播。
 			log.Printf("shutdown: kill all sessions: %v", killErr)
@@ -1104,6 +1111,10 @@ func (m *Manager) stopAndJoinAllRuntimes() {
 	}
 }
 
+// v2ServeSessionName 是 v2 共享 serve 托管单元名（跨层契约镜像；
+// opencode-v2-provider design D3：opencode2.ServeSessionName）。
+const v2ServeSessionName = "ocdeck-v2-serve"
+
 // shutdownKillAllSessions kill 全部 ocdeck 会话并确认 runtime 已空（design.md §10 kill 模式）。
 // 确认空 = 无 tmux 会话且无可重试 cleanup debt。
 // KillResult 的 disposition/tickets/error MUST 检查：残留（非 clean）MUST 持久化 tickets
@@ -1118,6 +1129,12 @@ func (m *Manager) shutdownKillAllSessions(ctx context.Context) error {
 	}
 	killFailed := false
 	for _, name := range sessions {
+		if name == v2ServeSessionName {
+			// v2 共享 serve 单元：supervisor 单 owner 关闭（shutdownV2Server），
+			// 不参与逐任务 kill/orphan 语义（opencode-v2-provider design D4）。
+			// 常量镜像（单元名为跨层契约；禁止 task→provider 传输包 import）。
+			continue
+		}
 		res, kerr := m.proc.KillSession(name)
 		if kerr != nil {
 			// kill 基础设施错误（tmux 不可达）：视为未净，返回错误让调用方保留 watchdog 兜底（design.md §10）。

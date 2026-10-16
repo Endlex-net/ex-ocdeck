@@ -86,12 +86,12 @@ type mockStore struct {
 	// --- task-info-editable：rename_pending 镜像与 failpoint ---
 	// renamePending 镜像 tasks.rename_pending（taskID → JSON）。setRenamePendingErr /
 	// commitInfoErr / clearRenamePendingErr 非空时对应方法返回该错误（失败矩阵 failpoint）。
-	renamePending         map[string]string
-	setRenamePendingErr   error
+	renamePending       map[string]string
+	setRenamePendingErr error
 	// projEnvVars/taskEnvVars 可注入 env 配置层（C22 同代快照测试；nil = 空层，
 	// 保持既有行为零变化）。
-	projEnvVars map[string][]EnvVarRow
-	taskEnvVars map[string][]EnvVarRow
+	projEnvVars           map[string][]EnvVarRow
+	taskEnvVars           map[string][]EnvVarRow
 	commitInfoErr         error
 	clearRenamePendingErr error
 	// --- task-permission-mode：启动事实镜像与 failpoint ---
@@ -2209,3 +2209,44 @@ func (c *readyOC) ListMessages(ctx context.Context, dir, sessionID string, limit
 	}
 	return lm.ListMessages(ctx, dir, sessionID, limit)
 }
+
+// CommitV2Resume 镜像 store.CommitV2Resume（gate3 G3-F2/F8 测试支撑）：binding
+// 写入 + 旧 binding 代际守卫（raw 精确匹配）+ 状态守卫 CAS。
+func (s *mockStore) CommitV2Resume(ctx context.Context, taskID string, oldBinding, b domain.TaskBinding, expectedStatus string) (application.TransitionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.tasks[taskID]
+	if !ok {
+		return application.TransitionResult{}, ocdeckstore_errAdoptionConflict()
+	}
+	if t.Status != expectedStatus {
+		return application.TransitionResult{}, ocdeckstore_errAdoptionConflict()
+	}
+	// G3-F8 代际守卫：当前存储 raw 必须与本次读取的旧 binding 编码精确一致。
+	if oldBinding.ProviderID != "" || oldBinding.UpstreamSessionID != "" {
+		oldRaw, oerr := oldBinding.Encode()
+		if oerr != nil {
+			return application.TransitionResult{}, oerr
+		}
+		if s.bindings[taskID] != oldRaw {
+			return application.TransitionResult{}, ocdeckstore_errAdoptionConflict()
+		}
+	}
+	raw, err := b.Encode()
+	if err != nil {
+		return application.TransitionResult{}, err
+	}
+	s.bindings[taskID] = raw
+	t.Status = "active"
+	s.tasks[taskID] = t
+	return application.TransitionResult{MutationResult: application.MutationResult{Matched: true}, StatusChanged: expectedStatus != "active", From: ocdecktask.Status(expectedStatus), To: ocdecktask.Status("active")}, nil
+}
+
+// ocdeckstore_errAdoptionConflict 是 store 承接冲突哨兵的镜像（测试断言用；
+// 错误文本对齐 store.ErrAdoptionConflict）。
+func ocdeckstore_errAdoptionConflict() error {
+	return errors.New("store: adoption commit rejected")
+}
+
+// ocdecktask_status 是 domain status 的窄转换（mock 镜像用）。
+func ocdecktask_status(s string) string { return s }

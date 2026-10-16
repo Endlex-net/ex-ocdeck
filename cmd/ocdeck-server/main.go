@@ -12,10 +12,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -37,6 +39,7 @@ import (
 	"ocdeck/internal/infrastructure/lifecycle"
 	"ocdeck/internal/infrastructure/notify"
 	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/opencode2"
 	"ocdeck/internal/infrastructure/palette"
 	"ocdeck/internal/infrastructure/process"
 	sqlite "ocdeck/internal/infrastructure/sqlite"
@@ -255,6 +258,42 @@ func run() error {
 	// 实现。
 	tm.SetRuntimeSupervisor(v1Provider.Supervisor())
 
+	// opencode-v2-provider tasks 6.1/6.7：v2 provider 双注册装配（承接开关开时；
+	// 关闭形态固定为「v2 不注册」）。注册失败拒绝启动；机器事实注入 resolver。
+	tm.SetMachineFacts(task.MachineFacts{
+		MachineMajor: cfg.OpenCodeMajor,
+		V2Enabled:    cfg.V2Adoption,
+	})
+	if cfg.V2Adoption {
+		v2Provider := opencode2.NewSPIProviderWithDeps(
+			opencode2.ProviderOptions{StatusVerified: true},
+			&opencode2.SupervisorDeps{
+				Proc:         procMgr,
+				Store:        &providerRuntimeStoreSeam{db: db},
+				AllocatePort: tm.AllocateServePort,
+				ProcessIdentity: func(pid int) (string, bool, error) {
+					out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+					if err != nil {
+						return "", false, nil // 进程不存在
+					}
+					return strings.TrimSpace(string(out)), true, nil
+				},
+				Env: task.NewV2TaskEnvSeam(tm),
+			})
+		v2Provider.WithHealthReporter(
+			func(h appagent.CapabilityHealth) {
+				if h.ProviderID == "" {
+					h.ProviderID = opencode2.ProviderID
+				}
+				healthTracker.Transition(h)
+			},
+			healthTracker.RuntimeEpoch,
+		)
+		if err := registry.Register(v2Provider); err != nil {
+			return fmt.Errorf("register opencode-v2 provider: %w", err)
+		}
+	}
+
 	// diff-review-workbench composition root（design.md D9/F1）。
 	// 在 Reconcile/启动调度/HTTP 开放前构造 diffreview service 并注入 Manager。
 	// 五个 consumer-owned ports（DiffReviewRepository/TaskScopePort 在 store 包，
@@ -365,9 +404,9 @@ func newUnregisteredOCClient() *unregisteredOCClient {
 // 按 providerID 分派经 registry.Get（fail-closed）；分派命中后的传输构造委托
 // provider 包内出口（opencode.NewWireClient——「从端点三元组构造传输 client」
 // 的调用点收敛进 provider 面，cmd 不再直构）。未注册 → fail-closed 占位 client
-//（provider_not_found，零网络副作用——specs「Provider registry 分派」）。
+// （provider_not_found，零网络副作用——specs「Provider registry 分派」）。
 // 生产能力调用（sessions/status/attention/prompts/titles）经 task 层能力出口桥
-//（task.buildTaskOCClient → spiBridgeOCClient）消费 Provider 窄接口，本工厂仅
+// （task.buildTaskOCClient → spiBridgeOCClient）消费 Provider 窄接口，本工厂仅
 // 承接无窄接口对应的探活/原始事件通道（Health/Probe/raw-SubscribeEvents/
 // ProbePromptAsyncCapability——非能力面 fallback）。
 func newRegistryDispatchFactory(registry *appagent.Registry) task.OCClientFactory {
@@ -822,4 +861,23 @@ func (a permAuditAdapter) Record(rec task.PermAuditRecord) error {
 		Reply:       rec.Reply,
 		Detail:      rec.Detail,
 	})
+}
+
+// providerRuntimeStoreSeam 适配 store 实例记录读写（opencode2.RuntimeRecordSeam）。
+type providerRuntimeStoreSeam struct{ db *store.DB }
+
+func (s *providerRuntimeStoreSeam) GetProviderRuntime(ctx context.Context, providerID, instanceID string) (store.ProviderRuntimeRecord, bool, error) {
+	return s.db.Queries.GetProviderRuntime(ctx, providerID, instanceID)
+}
+
+func (s *providerRuntimeStoreSeam) PutProviderRuntimeStart(ctx context.Context, providerID, instanceID string, port int) error {
+	return s.db.Queries.PutProviderRuntimeStart(ctx, providerID, instanceID, port)
+}
+
+func (s *providerRuntimeStoreSeam) SetProviderRuntimePID(ctx context.Context, providerID, instanceID string, pid int) error {
+	return s.db.Queries.SetProviderRuntimePID(ctx, providerID, instanceID, pid)
+}
+
+func (s *providerRuntimeStoreSeam) SetProviderRuntimeError(ctx context.Context, providerID, instanceID string, cause string) error {
+	return s.db.Queries.SetProviderRuntimeError(ctx, providerID, instanceID, cause)
 }

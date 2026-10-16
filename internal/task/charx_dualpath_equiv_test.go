@@ -32,7 +32,7 @@ type dualPathPair struct {
 }
 
 // newDualPathPair 装配一对同形态环境：两腿各自独占 fake server/store/proc
-//（观察面互不污染），装配变体同参（retryRange/deadPorts/killAfterNew）。
+// （观察面互不污染），装配变体同参（retryRange/deadPorts/killAfterNew）。
 // supervisor 腿在 harness 基础上注入真实 opencode Supervisor（生产装配形态）。
 func newDualPathPair(t *testing.T, opts charxEnvOpts) *dualPathPair {
 	t.Helper()

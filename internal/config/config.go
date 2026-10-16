@@ -94,6 +94,14 @@ type Config struct {
 	// VersionVerified OpenCodeVersion 落在 [ContractMinVersion, ContractBaseline] 的比较结果（design.md §11）。
 	// 仅作告警/UI 提示，不作为激活门禁（门禁是能力探测）。
 	VersionVerified bool
+	// OpenCodeMajor 是机器实装 opencode 的主版本（opencode-v2-provider design D4
+	// resolver 口径）：2=v2 机器、1=v1 机器、0=unknown（探测失败/解析失败——
+	// resolver 按保守口径处理）。
+	OpenCodeMajor int
+	// V2Adoption 是承接开关（opencode-v2-provider tasks 6.7，默认关）：关闭时
+	// v2 provider 不注册、v2 钉扎任务创建入口不可用；已承接任务的 v2 消费点按
+	// 未注册 provider fail-closed（不自动转回 v1）。
+	V2Adoption bool
 	// TmuxVersion 启动时 `tmux -V` 记录（design.md §2），MUST >= 3.2。
 	TmuxVersion string
 }
@@ -293,6 +301,8 @@ func Load(opts Options) (*Config, func(), error) {
 		UploadRetention: uploadRetention,
 		OpenCodeVersion: ocVersion,
 		VersionVerified: VersionSupported(ocVersion),
+		OpenCodeMajor:   ExtractOpenCodeMajor(ocVersion),
+		V2Adoption:      v2AdoptionEnabled(opts.EnvLookup),
 		TmuxVersion:     tmuxVersion,
 	}
 	if !cfg.VersionVerified {
@@ -585,4 +595,43 @@ func versionAtLeast(maj, min, pat, loMaj, loMin, loPat int) bool {
 		return min > loMin
 	}
 	return pat >= loPat
+}
+
+// V2AdoptionEnv 是承接开关（opencode-v2-provider tasks 6.7）的环境变量名；
+// 默认关——关闭形态固定为「v2 provider 不注册」。
+const V2AdoptionEnv = "OCDECK_V2_ADOPTION"
+
+// v2AdoptionEnabled 解析承接开关（默认关；真值 = "1"/"true"/"on"，大小写不
+// 敏感、容忍首尾空白）。nil lookup 视为未配置（关）。
+func v2AdoptionEnabled(lookup EnvLookup) bool {
+	if lookup == nil {
+		return false
+	}
+	v, ok := lookup(V2AdoptionEnv)
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// ExtractOpenCodeMajor 提取机器实装 opencode 的主版本（design D4 resolver
+// 口径）：容忍 v/V 前缀，取首个点分段的前导数字；解析失败/非正数 → 0
+// （unknown——resolver 按保守口径处理，探测失败同样归 0）。
+func ExtractOpenCodeMajor(version string) int {
+	s := strings.TrimSpace(version)
+	s = strings.TrimPrefix(s, "v")
+	s = strings.TrimPrefix(s, "V")
+	if dot := strings.IndexByte(s, '.'); dot >= 0 {
+		s = s[:dot]
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }

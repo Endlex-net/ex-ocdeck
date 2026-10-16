@@ -34,7 +34,7 @@ import (
 )
 
 // c21GatedSupervisor：inner.Resume 成功返回后放行前把 incident ctx 打入取消态
-//（由测试在 release 前调 cancelAllRecoveryIncidents）——保证 :843 检查点踩中
+// （由测试在 release 前调 cancelAllRecoveryIncidents）——保证 :843 检查点踩中
 // 取消（而非包装层 ctx.Err 分支）。
 type c21GatedSupervisor struct {
 	inner    appagent.RuntimeSupervisor
