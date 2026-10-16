@@ -1,0 +1,3 @@
+[2026-10-15T18:30:37Z] REJECTED as expected: /root/spike-canary-p1b
+errno: 30 (Read-only file system)
+caller-proof: container --read-only rootfs: / created by image, writable only via declared tmpfs mounts

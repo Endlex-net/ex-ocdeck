@@ -1,0 +1,5 @@
+anchor=packages/opencode/src/server/routes/instance/httpapi/groups/global.ts
+v1_ref=774cc7c1914e4329eefde5a669f938b0cf566661
+v2_ref=026b106bc5d41b679ffc413264229c340871e4d3
+attempts=['static/static.17.fetch.v1.attempt1.log', 'static/static.17.fetch.v2.attempt1.log', 'static/static.17.fetch.v2.contents.log']
+v2-removed-proof=static/static.17.fetch.v2.contents.log

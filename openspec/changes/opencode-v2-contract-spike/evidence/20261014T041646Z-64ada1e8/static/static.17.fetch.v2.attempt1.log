@@ -1,0 +1,1 @@
+GET https://raw.githubusercontent.com/anomalyco/opencode/026b106bc5d41b679ffc413264229c340871e4d3/packages/opencode/src/server/routes/instance/httpapi/groups/global.ts attempt=1 status=404 err=None

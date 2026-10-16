@@ -1,0 +1,14 @@
+--- /Users/mendlex/.ocdeck/worktrees/ex-ocwork/v2-yarg/scripts/spike-v2/spikelib.py	2026-10-14 12:51:45
++++ /var/folders/yk/5bvypw1121s2h7mf08c1x0pr0000gn/T/opencode/p1b-harness/scripts/spike-v2/spikelib.py	2026-10-16 01:31:41
+@@ -852,6 +852,11 @@
+     }
+     if password is not None:
+         env["OPENCODE_SERVER_PASSWORD"] = password
++    # p1b（模型依赖运行时实证）：模型凭据仅经容器 env 注入，透传给上游 opencode；
++    # 值仍经脱敏集合（_SECRET_RE 命中 TOKEN/KEY）不落日志
++    for _mk in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"):
++        if os.environ.get(_mk):
++            env[_mk] = os.environ[_mk]
+     for sub in ("home", "xdg/config", "xdg/data", "xdg/state", "xdg/cache", "tmp"):
+         sandbox_mkdir(envroot / sub)   # F1：受保护入口
+     return env

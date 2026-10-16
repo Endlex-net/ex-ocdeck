@@ -1,0 +1,19 @@
+{
+  "http": 200,
+  "pending": {
+    "id": "per_140d4b3fe0018qDpwv3nYHMQbV",
+    "sessionID": "ses_ebf2b523dffeoHivUGCaFZUR9Z",
+    "action": "shell",
+    "resources": [
+      "touch /tmp/p1b-perm-marker"
+    ],
+    "save": [
+      "touch *"
+    ],
+    "source": {
+      "type": "tool",
+      "messageID": "msg_140d4ade9001thzda37m9Mm3s8",
+      "id": "call_00_6rmvvftdi2v63utm3sqt0z1x"
+    }
+  }
+}

@@ -1,0 +1,1 @@
+GET https://api.github.com/repos/anomalyco/opencode/releases/tags/v1.18.26 attempt=1 status=200 err=None

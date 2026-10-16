@@ -1,0 +1,54 @@
+data: {"id":"evt_1389b59e7001GsNHp9pJt6YIfT","type":"server.connected","data":{}}
+
+: heartbeat
+
+data: {"id":"evt_1389b5ad4001WoNFB3wxjtbrHm","created":1791951067860,"type":"session.created","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec764a542ffeTLEjPggMZdnhCk","slug":"sunny-falcon","version":"2.0.28","projectID":"global","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"subpath":"openspec/changes/opencode-v2-contract-spike/sandbox/work","title":"spike-event-create"},"durable":{"aggregateID":"ses_ec764a542ffeTLEjPggMZdnhCk","seq":0,"version":1}}
+
+data: {"id":"evt_1389b5af7001qNm6B6W0tFR7vG","created":1791951067895,"type":"project.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"id":"global","canonical":"/repo","vcs":"git","time":{"created":1791951064543,"updated":1791951064543,"active":1791951067895},"sandboxes":[]}}
+
+data: {"id":"evt_1389b5b61001yMAvgcZktrWkRM","created":1791951068001,"type":"session.renamed","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec764b233ffeNAcguezV2Cnu5W","title":"spike-event-updated"},"durable":{"aggregateID":"ses_ec764b233ffeNAcguezV2Cnu5W","seq":1,"version":1}}
+
+data: {"id":"evt_1389b5c4e001xWhj6Yz119YwbC","created":1791951068238,"type":"integration.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_1389b5c510010o1RTUcGrzqvQM","created":1791951068241,"type":"provider.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_1389b5c56001XfsYcIbFkiuRdq","created":1791951068247,"type":"model.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_1389b5c67001Xse1gO8Mgq4i7Z","created":1791951068263,"type":"vcs.branch.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"branch":"master"}}
+
+data: {"id":"evt_1389b5c68001Fe9P9J85dzCKYF","created":1791951068264,"type":"agent.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_1389b5c68002KHMoaaE352poEX","created":1791951068264,"type":"command.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_1389b5c68003JAtdpuej5XOgSx","created":1791951068264,"type":"skill.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_1389b5c6a001K4G9aJZQDZ5ubp","created":1791951068266,"type":"websearch.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_1389b5c790010pvdDSfvxKNws9","created":1791951068281,"type":"reference.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_1389b5c7d0011gINL1whEALMmS","created":1791951068285,"type":"plugin.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_1389b5c7e001roTbKCmPMRp19t","created":1791951068286,"type":"session.inbox.enqueued","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"inboxID":"msg_status_52018321edef1575","sessionID":"ses_ec764b233ffeNAcguezV2Cnu5W","item":{"type":"user","payload":{"text":"status probe ping"},"delivery":"steer"}},"durable":{"aggregateID":"ses_ec764b233ffeNAcguezV2Cnu5W","seq":2,"version":1}}
+
+data: {"id":"evt_1389b5c81001TrV58xoWcmeXN5","created":1791951068289,"type":"session.execution.started","data":{"sessionID":"ses_ec764b233ffeNAcguezV2Cnu5W"},"durable":{"aggregateID":"ses_ec764b233ffeNAcguezV2Cnu5W","seq":3,"version":1}}
+
+data: {"id":"evt_1389b5c8c001Ebs6NpXKG6vJmu","created":1791951068300,"metadata":{"instructions":{"initial":true}},"type":"session.instructions.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec764b233ffeNAcguezV2Cnu5W","delta":{"core/codemode":"e6428fd7742161f6c3a6c86e53cbbe2c6e4dcc462bbf1a1a07bc4fcbeb9e0b0b","core/skill-guidance":"d111ca633b47a2291f4ce55ccf97e06fdef2d9ac2d45f4eb85ea1d513f9fac86","core/date":"69dc8438f9eb203ca34f520e89b000bba5bd89c8b9ebd3624d24e9ee37f64b0c","core/environment":"337fddb6605a55b104b312ab9cd34dcecac32698223dd62577521a929c0a7990"}},"durable":{"aggregateID":"ses_ec764b233ffeNAcguezV2Cnu5W","seq":4,"version":2}}
+
+data: {"id":"evt_1389b5c90001As20veAIFzuPYu","created":1791951068304,"type":"session.inbox.delivered","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec764b233ffeNAcguezV2Cnu5W","inboxID":"msg_status_52018321edef1575"},"durable":{"aggregateID":"ses_ec764b233ffeNAcguezV2Cnu5W","seq":5,"version":1}}
+
+data: {"id":"evt_1389b61650014Ty11ubGbpPy36","created":1791951069541,"type":"session.step.started","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec764b233ffeNAcguezV2Cnu5W","agent":"build","model":{"id":"exo-free","providerID":"opencode"},"assistantMessageID":"msg_1389b5c9a001hF9QiaKobpUro3","snapshot":"4b825dc642cb6eb9a060e54bf8d69288fbee4904","started":1791951068325},"durable":{"aggregateID":"ses_ec764b233ffeNAcguezV2Cnu5W","seq":6,"version":1}}
+
+data: {"id":"evt_1389b6182001g3XsPxsVE31DIo","created":1791951069570,"type":"session.step.failed","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec764b233ffeNAcguezV2Cnu5W","assistantMessageID":"msg_1389b5c9a001hF9QiaKobpUro3","error":{"type":"provider.invalid-request","message":"Model exo-free has been deprecated.","status":410,"response":{"body":"{\"type\":\"error\",\"error\":{\"type\":\"ModelDeprecated\",\"message\":\"Model exo-free has been deprecated.\"},\"metadata\":{\"model\":\"exo-free\"}}"}},"snapshot":"4b825dc642cb6eb9a060e54bf8d69288fbee4904","files":[]},"durable":{"aggregateID":"ses_ec764b233ffeNAcguezV2Cnu5W","seq":7,"version":1}}
+
+data: {"id":"evt_1389b6187001uuqn64jUj4ii6o","created":1791951069575,"type":"session.execution.failed","data":{"sessionID":"ses_ec764b233ffeNAcguezV2Cnu5W","error":{"type":"provider.invalid-request","message":"Model exo-free has been deprecated.","status":410,"response":{"body":"{\"type\":\"error\",\"error\":{\"type\":\"ModelDeprecated\",\"message\":\"Model exo-free has been deprecated.\"},\"metadata\":{\"model\":\"exo-free\"}}"}}},"durable":{"aggregateID":"ses_ec764b233ffeNAcguezV2Cnu5W","seq":8,"version":1}}
+
+data: {"id":"evt_1389b64e9001RDJGqAE1hASYyj","created":1791951070441,"type":"models-dev.refreshed","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_1389b653b001jbGwt7xt58dF3J","created":1791951070523,"type":"integration.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_1389b656300110Cbb4TQKtpA9h","created":1791951070563,"type":"provider.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_1389b656a001VEfaslxbX3RmjW","created":1791951070570,"type":"model.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+: heartbeat
+

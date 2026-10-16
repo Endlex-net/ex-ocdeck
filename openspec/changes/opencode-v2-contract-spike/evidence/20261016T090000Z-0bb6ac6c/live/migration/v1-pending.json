@@ -1,0 +1,24 @@
+{
+  "id": "per_140d7767a0016nVKYfY3iiAFrq",
+  "sessionID": "ses_ebf289939ffe5aLA8A6rY2CJla",
+  "permission": "external_directory",
+  "patterns": [
+    "/tmp/*"
+  ],
+  "metadata": {
+    "command": "touch /tmp/p1b-perm-marker",
+    "directories": [
+      "/tmp"
+    ],
+    "patterns": [
+      "/tmp/*"
+    ]
+  },
+  "always": [
+    "/tmp/*"
+  ],
+  "tool": {
+    "messageID": "msg_140d7695f001dIPPMrk80nti6I",
+    "callID": "call_00_yiyyqw2ojrm9wifs1wmz5xu4"
+  }
+}

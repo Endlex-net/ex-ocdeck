@@ -1,0 +1,3 @@
+state=STARTED_INCONCLUSIVE
+failure_classes=['INCONCLUSIVE']
+reason=reverse：v1 serve 超时/环境未就绪（rc=1）；仅记录，不作承诺

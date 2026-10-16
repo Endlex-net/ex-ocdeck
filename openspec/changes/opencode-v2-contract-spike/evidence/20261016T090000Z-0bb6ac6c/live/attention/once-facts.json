@@ -1,0 +1,88 @@
+{
+  "pending_session_ep": {
+    "http": 200,
+    "pending": {
+      "id": "per_140d4d6e3001IG6sxsMQLjAl93",
+      "sessionID": "ses_ebf2b2edeffeKU6zuxE9xgD3XJ",
+      "action": "shell",
+      "resources": [
+        "touch /tmp/p1b-perm-marker"
+      ],
+      "save": [
+        "touch *"
+      ],
+      "source": {
+        "type": "tool",
+        "messageID": "msg_140d4d17e00106twpTQMBerz6v",
+        "id": "call_00_ps8hefc982s1qxphs4gc8hk9"
+      }
+    }
+  },
+  "location_query_forms": {
+    "deepObject": {
+      "http": 200,
+      "body": {
+        "location": {
+          "directory": "/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"
+        },
+        "data": [
+          {
+            "id": "per_140d4d6e3001IG6sxsMQLjAl93",
+            "sessionID": "ses_ebf2b2edeffeKU6zuxE9xgD3XJ",
+            "action": "shell",
+            "resources": [
+              "touch /tmp/p1b-perm-marker"
+            ],
+            "save": [
+              "touch *"
+            ],
+            "source": {
+              "type": "tool",
+              "messageID": "msg_140d4d17e00106twpTQMBerz6v",
+              "id": "call_00_ps8hefc982s1qxphs4gc8hk9"
+            }
+          }
+        ]
+      }
+    },
+    "plain": {
+      "http": 400,
+      "body": {
+        "_tag": "InvalidRequestError",
+        "message": "Expected object | undefined\n  at [\"location\"]",
+        "kind": "Query"
+      }
+    }
+  },
+  "saved_during_pending": {
+    "http": 200,
+    "body": {
+      "data": []
+    }
+  },
+  "once_reply": {
+    "request_id": "per_140d4d6e3001IG6sxsMQLjAl93",
+    "http": 204,
+    "body": ""
+  },
+  "pending_after_once": {
+    "http": 200,
+    "list": []
+  },
+  "duplicate_reply": {
+    "http": 404,
+    "body": {
+      "_tag": "PermissionNotFoundError",
+      "requestID": "per_140d4d6e3001IG6sxsMQLjAl93",
+      "message": "Permission request not found: per_140d4d6e3001IG6sxsMQLjAl93"
+    }
+  },
+  "ghost_reply": {
+    "http": 404,
+    "body": {
+      "_tag": "PermissionNotFoundError",
+      "requestID": "per_p1b_ghost",
+      "message": "Permission request not found: per_p1b_ghost"
+    }
+  }
+}

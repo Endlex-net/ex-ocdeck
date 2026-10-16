@@ -1,0 +1,51 @@
+{
+  "probe_id": "p1b.environment",
+  "schema": "p1b-extra-v1",
+  "exec_status": "PASS",
+  "facts": {
+    "put": {
+      "a": {
+        "http": 204,
+        "body": ""
+      },
+      "b": {
+        "http": 204,
+        "body": ""
+      }
+    },
+    "shell_api": {
+      "a": {
+        "submit": 204,
+        "body": "",
+        "output": "alpha\n",
+        "exit": 0,
+        "ended_event": true
+      },
+      "b": {
+        "submit": 204,
+        "body": "",
+        "output": "beta\n",
+        "exit": 0,
+        "ended_event": true
+      }
+    },
+    "model_bash_in_a": {
+      "submit": 200,
+      "pending": {
+        "http": 200,
+        "request_id": "per_140d7352a001Xg1kTkb9TuM2Ah"
+      },
+      "auto_reply_once": 204,
+      "alpha_event": true,
+      "beta_seen": false,
+      "texts": [
+        "Raw output:\n\n```\nalpha\n```"
+      ]
+    }
+  },
+  "evidence": [
+    "live/env/env-shell.json",
+    "live/env/env-model.json",
+    "live/env/p1b-frames.jsonl"
+  ]
+}

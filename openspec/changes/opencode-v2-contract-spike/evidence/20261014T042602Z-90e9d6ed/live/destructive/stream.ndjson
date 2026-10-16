@@ -1,0 +1,6 @@
+data: {"id":"evt_138ab305f001EVdVCe4j2CZNbq","type":"server.connected","data":{}}
+
+: heartbeat
+
+data: {"id":"evt_138ab307c001RjnsxGkGgs1rsM","created":1791952105596,"type":"session.created","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec754cf92ffeTWQfyQY7MnorcS","slug":"happy-star","version":"2.0.28","projectID":"global","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"subpath":"openspec/changes/opencode-v2-contract-spike/sandbox/work","title":"spike-event-delete"},"durable":{"aggregateID":"ses_ec754cf92ffeTWQfyQY7MnorcS","seq":0,"version":1}}
+

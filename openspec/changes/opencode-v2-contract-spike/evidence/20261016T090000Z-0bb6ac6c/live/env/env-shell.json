@@ -1,0 +1,28 @@
+{
+  "put": {
+    "a": {
+      "http": 204,
+      "body": ""
+    },
+    "b": {
+      "http": 204,
+      "body": ""
+    }
+  },
+  "shell_api": {
+    "a": {
+      "submit": 204,
+      "body": "",
+      "output": "alpha\n",
+      "exit": 0,
+      "ended_event": true
+    },
+    "b": {
+      "submit": 204,
+      "body": "",
+      "output": "beta\n",
+      "exit": 0,
+      "ended_event": true
+    }
+  }
+}

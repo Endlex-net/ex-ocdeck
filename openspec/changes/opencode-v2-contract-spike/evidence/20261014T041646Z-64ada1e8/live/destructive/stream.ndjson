@@ -1,0 +1,6 @@
+data: {"id":"evt_138a2b05f001H9fnONIFW561q6","type":"server.connected","data":{}}
+
+: heartbeat
+
+data: {"id":"evt_138a2b07a001iEbvm4bjl6edMC","created":1791951548538,"type":"session.created","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec75d4f94ffetAsrSX52nD5c6N","slug":"cosmic-canyon","version":"2.0.28","projectID":"global","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"subpath":"openspec/changes/opencode-v2-contract-spike/sandbox/work","title":"spike-event-delete"},"durable":{"aggregateID":"ses_ec75d4f94ffetAsrSX52nD5c6N","seq":0,"version":1}}
+

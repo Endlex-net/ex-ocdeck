@@ -1,0 +1,3 @@
+state=NOT_STARTED_DEPENDENCY_MISSING
+failure_classes=[]
+reason=前置依赖事实缺失：supervisor.01,supervisor.02,supervisor.03,session.01,session.02,session.03,prompt.01

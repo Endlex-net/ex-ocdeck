@@ -1,0 +1,2 @@
+GET https://opencode.ai/update/api/latest/cli/opencode attempt=1 status=200 err=None
+GET https://opencode.ai/update/api/latest/cli/opencode attempt=1 status=200 err=None

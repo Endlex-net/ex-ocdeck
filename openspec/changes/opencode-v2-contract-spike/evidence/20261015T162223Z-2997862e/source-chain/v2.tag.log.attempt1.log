@@ -1,0 +1,2 @@
+GET https://api.github.com/repos/anomalyco/opencode/git/ref/tags/v2.0.28 attempt=1 status=200 err=None
+GET https://api.github.com/repos/anomalyco/opencode/git/ref/tags/v2.0.28 attempt=1 status=200 err=None

@@ -1,0 +1,13 @@
+{
+  "model_listed": true,
+  "ping_attempts": [
+    {
+      "attempt": 1,
+      "submit": 200,
+      "texts": [
+        "pong"
+      ],
+      "ok": true
+    }
+  ]
+}

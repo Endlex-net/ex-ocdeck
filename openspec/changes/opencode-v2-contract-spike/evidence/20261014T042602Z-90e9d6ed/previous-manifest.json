@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "v1": {
+    "side": "v1",
+    "version": "1.18.26",
+    "release_url": "https://github.com/anomalyco/opencode/releases/tag/v1.18.26",
+    "tag": "v1.18.26",
+    "commit_sha": "774cc7c1914e4329eefde5a669f938b0cf566661",
+    "asset_name": "opencode-linux-arm64.tar.gz",
+    "os": "linux",
+    "arch": "arm64",
+    "download_url": "https://github.com/anomalyco/opencode/releases/download/v1.18.26/opencode-linux-arm64.tar.gz",
+    "official_sha256": "90b99cc2356fea188d67352418ad7223559841178142f719848ca2c88a689c3e",
+    "source_chain_status": "verified",
+    "locked_at": "2026-10-14T04:17:14Z",
+    "download_sha256": "90b99cc2356fea188d67352418ad7223559841178142f719848ca2c88a689c3e",
+    "sha256_match": true,
+    "exec_path": "/repo/openspec/changes/opencode-v2-contract-spike/sandbox/bin/v1/.staging-16-1791951419519/opencode",
+    "runtime_version_output": "1.18.26\n"
+  },
+  "v2": {
+    "side": "v2",
+    "version": "2.0.28",
+    "release_url": "https://opencode.ai/update/api/latest/cli/opencode",
+    "tag": "v2.0.28",
+    "commit_sha": "026b106bc5d41b679ffc413264229c340871e4d3",
+    "asset_name": "opencode-linux-arm64.tar.gz",
+    "os": "linux",
+    "arch": "arm64",
+    "download_url": "https://opencode.ai/files/bin/2.0.28/opencode-linux-arm64.tar.gz",
+    "official_sha256": "58fd41544e570ceb9bdb2fa4b445ce66f05538490f6b9ad27d23dcdfe4689670",
+    "source_chain_status": "verified",
+    "locked_at": "2026-10-14T04:17:14Z",
+    "download_sha256": "58fd41544e570ceb9bdb2fa4b445ce66f05538490f6b9ad27d23dcdfe4689670",
+    "sha256_match": true,
+    "exec_path": "/repo/openspec/changes/opencode-v2-contract-spike/sandbox/bin/v2/.staging-16-1791951430529/opencode",
+    "runtime_version_output": "opencode v2.0.28\n"
+  },
+  "canary_target": "/root/spike-canary-20261014T041646Z-64ada1e8",
+  "boundary_mechanism": "container"
+}

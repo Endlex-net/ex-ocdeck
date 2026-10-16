@@ -1,0 +1,1 @@
+harness failure: migration 中断补齐：SpikeExit(4): harness error: migration work dir already exists (runs must not reuse): /Users/mendlex/.ocdeck/worktrees/ex-ocwork/v2-yarg/openspec/changes/opencode-v2-contract-spike/sandbox/migration/20261015T164857Z-2df53b5f

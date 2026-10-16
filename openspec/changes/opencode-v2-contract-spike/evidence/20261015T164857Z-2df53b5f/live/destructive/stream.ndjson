@@ -1,0 +1,8 @@
+data: {"id":"evt_140790183001ST4bGw0nSF0K6G","type":"server.connected","data":{}}
+
+: heartbeat
+
+data: {"id":"evt_1407901b1001G9z6n4D9drUcTA","created":1792083034545,"type":"session.created","location":{"directory":"/Users/mendlex/.ocdeck/worktrees/ex-ocwork/v2-yarg/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ebf86fe6cffe8YXJZnlc9xafZC","slug":"crisp-wolf","version":"2.0.28","projectID":"6363f0e18f81ff0a3993b41937ffbbf833d87cd4","location":{"directory":"/Users/mendlex/.ocdeck/worktrees/ex-ocwork/v2-yarg/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"subpath":"openspec/changes/opencode-v2-contract-spike/sandbox/work","title":"spike-event-delete"},"durable":{"aggregateID":"ses_ebf86fe6cffe8YXJZnlc9xafZC","seq":0,"version":1}}
+
+data: {"id":"evt_1407901c0001Z9ARnEHF2bF25z","created":1792083034560,"type":"session.deleted","data":{"sessionID":"ses_ebf86fe6cffe8YXJZnlc9xafZC"},"durable":{"aggregateID":"ses_ebf86fe6cffe8YXJZnlc9xafZC","seq":1,"version":2}}
+

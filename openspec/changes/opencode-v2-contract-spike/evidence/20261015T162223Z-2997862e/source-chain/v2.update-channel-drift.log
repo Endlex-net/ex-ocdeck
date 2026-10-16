@@ -1,0 +1,2 @@
+update-api latest=2.0.29 != manifest version 2.0.28; no historical metadata endpoint
+fallback: download_url matches official versioned form (https://opencode.ai/files/bin/2.0.28/opencode-linux-arm64.tar.gz); sha256 verified against official_sha256 at download; official_sha256 provenance = locked-run update-api evidence (evidence/20261014T045810Z-f125cafd/source-chain/v2.update-api.json)

@@ -1,0 +1,16 @@
+{
+  "sequence": [
+    {
+      "type": "session.execution.started",
+      "status": "busy",
+      "sessionID": "ses_ebf2b5761ffezae8Fznqe4EC1F"
+    },
+    {
+      "type": "session.execution.succeeded",
+      "status": "idle",
+      "sessionID": "ses_ebf2b5761ffezae8Fznqe4EC1F"
+    }
+  ],
+  "outcome": "succeeded",
+  "outcome_http": 200
+}

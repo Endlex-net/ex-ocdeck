@@ -1,0 +1,2 @@
+GET https://opencode.ai/files/bin/2.0.28/opencode-linux-arm64.tar.gz attempt=1 status=200 err=None
+downloaded sha256: 58fd41544e570ceb9bdb2fa4b445ce66f05538490f6b9ad27d23dcdfe4689670

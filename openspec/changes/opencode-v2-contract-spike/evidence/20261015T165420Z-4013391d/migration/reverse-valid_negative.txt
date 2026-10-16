@@ -1,0 +1,3 @@
+state=VALID_NEGATIVE
+failure_classes=[]
+reason=reverse：v1 打开 v2 原生数据明确报数据类错误（见 serve-reverse.log）；仅记录，不作承诺
