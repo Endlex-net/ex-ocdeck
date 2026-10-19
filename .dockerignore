@@ -1,0 +1,8 @@
+# 构建上下文排除（docker/Dockerfile.ocdeck-v2 契约清单）
+.git
+node_modules
+web/node_modules
+openspec/changes/*/sandbox
+openspec/changes/*/evidence
+.slim
+scripts/spike-v2/__pycache__
