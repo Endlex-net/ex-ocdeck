@@ -1040,6 +1040,10 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 		log.Printf("shutdown: replay recovery debts: %v", err)
 		killErr = errors.Join(killErr, fmt.Errorf("shutdown: replay recovery debts: %w", err))
 	}
+	// 评审 I9（监控生命周期）：v2 共享 server 的监控 owner 必须在两种关停策略下
+	// 都停止（persist 不关 server 但同样不得在关停后继续访问 store/重拉）——
+	// 取消在途监控重试并等待退出，先于任何 store 收敛/落库收尾。
+	m.stopV2ServerMonitoring()
 	// R7：收割内存 orphanFailures（kill 失败的孤儿会话 tickets，非仅 DB notice）。
 	// 后台周期已停（bgCancel），关停时 MUST 主动调用一次 retryOrphanSessions，避免逃逸进程
 	// tickets 仅存内存随进程退出丢失（design.md §10：runtime 已空 = 无会话且无可重试 cleanup debt，

@@ -75,15 +75,37 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 	// terminal-file-paste-drop 2.5：active→suspending 提交（离开 active）在 per-task
 	// 协调锁临界区内执行（本方法已持任务锁，锁顺序：任务锁 → 协调锁），与上传
 	// finalize/投递临界区互斥——挂起提交先行时 finalize 复查必见非 active、不发布。
+	// 评审 I2（停止已确认独立收敛出口）：v2 停止确认后，状态收敛 MUST NOT 因调用方
+	// ctx 取消半途而废（否则上游已停而状态报 active——矛盾事实）——WithoutCancel
+	// 有界预算完成收敛；持续写库失败留可重放意图（durable retryable notice）。
+	casCtx := ctx
+	if hasV2 {
+		var ccancel context.CancelFunc
+		casCtx, ccancel = context.WithTimeout(context.WithoutCancel(ctx), activateCompensationTimeout)
+		defer ccancel()
+	}
 	var updated application.TransitionResult
-	if err := m.inUploadCoordination(ctx, taskID, func() error {
+	if err := m.inUploadCoordination(casCtx, taskID, func() error {
 		var werr error
-		updated, werr = m.writeStatusConditional(ctx, taskID, StatusActive, StatusSuspending, sql.NullString{})
+		updated, werr = m.writeStatusConditional(casCtx, taskID, StatusActive, StatusSuspending, sql.NullString{})
 		return werr
 	}); err != nil {
+		if hasV2 {
+			// 停止已确认 + 收敛写失败：可重放意图（守卫语义——conditional CAS
+			// 保证后续重放不覆盖其他代的状态事实）；不掩盖原错误。
+			if nerr := m.recordResidualNotice(casCtx, taskID, sb.TerminalRef, nil, "suspend_stop_confirmed", true); nerr != nil {
+				log.Printf("suspend: task %s stop confirmed but convergence intent notice failed: %v", taskID, nerr)
+			}
+		}
 		return newOpErr(codeInternal, err)
 	}
 	if !updated.Matched {
+		if hasV2 {
+			// 停止已确认但状态已被其他代收敛/改写：守卫生效不覆盖；如实留痕。
+			if nerr := m.recordResidualNotice(casCtx, taskID, sb.TerminalRef, nil, "suspend_stop_confirmed", true); nerr != nil {
+				log.Printf("suspend: task %s stop confirmed but CAS mismatch, intent notice failed: %v", taskID, nerr)
+			}
+		}
 		return newOpErr(codeConflict, fmt.Errorf("task %s state changed before suspend", taskID))
 	}
 	return m.suspendRun(ctx, taskID, mode, sb, hasV2)
@@ -518,7 +540,7 @@ func (m *Manager) repairRuntimeRegistered(ctx context.Context, taskID string, mo
 			m.clearRuntime(taskID)
 			return false, fmt.Errorf("resolve binding for sse: %w", berr)
 		}
-		if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode, &binding); err != nil {
+		if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode, &binding, nil); err != nil {
 			m.clearRuntime(taskID)
 			return false, fmt.Errorf("sse resubscribe: %w", err)
 		}

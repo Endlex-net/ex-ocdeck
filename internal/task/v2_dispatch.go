@@ -144,6 +144,23 @@ func (m *Manager) checkBindingOwnershipGate(ctx context.Context, taskID string, 
 	return checker.CheckBindingOwnership(b, taskID, trow.WorktreePath)
 }
 
+// stopV2ServerMonitoring 停止 v2 supervisor 的 server 监控循环（评审 I9 生命
+// 周期：persist/kill 两种关停策略都必须停止——persist 不调 ShutdownServer，但
+// 关停后监控不得继续访问 store/重拉）。join（取消在途重试并等待退出）后调用方
+// 才允许关 store。v2 未注册（开关关）→ no-op。
+func (m *Manager) stopV2ServerMonitoring() {
+	if m.providerRegistry == nil {
+		return
+	}
+	p, err := m.providerRegistry.Get(ocdeckstore.ProviderIDV2)
+	if err != nil {
+		return // v2 未注册：无共享 server（开关关形态）
+	}
+	if ctl, ok := p.Supervisor().(appagent.ServerMonitorController); ok {
+		ctl.StopServerMonitoring()
+	}
+}
+
 // serverShutdownHook 是 v2 supervisor 单 owner 关停能力（V2Supervisor 满足；
 // persist 策略不调用——server 保留）。
 type serverShutdownHook interface {

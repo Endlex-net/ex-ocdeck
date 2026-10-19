@@ -198,10 +198,11 @@ const (
 	// v2TUISessionPrefix 是 v2 交互 TUI 托管单元名前缀（opencode-v2-provider
 	// design D3 TerminalIO：ocdeck-v2-tui-<taskID>，从 binding TerminalRef 派生）。
 	v2TUISessionPrefix = "ocdeck-v2-tui-"
-	suffixRuntime     = "runtime"
-	suffixServe       = "serve"
-	suffixTUI         = "tui"
-	suffixShellPrefix = "shell-"
+	suffixRuntime      = "runtime"
+	suffixServe        = "serve"
+	suffixTUI          = "tui"
+	suffixV2TUI        = "v2-tui"
+	suffixShellPrefix  = "shell-"
 )
 
 // ParseSessionName 是会话名的单一 canonical parser（design D2 / G1-3）。
@@ -214,6 +215,16 @@ func ParseSessionName(name string) (taskID, suffix string, err error) {
 	}
 	if len(name) > sessionNameMaxLen {
 		return "", "", fmt.Errorf("process: session name too long (%d)", len(name))
+	}
+	// v2 交互 TUI 托管单元（评审 I14：canonical parser 统一扩展——与
+	// validateParsedSessionName 同规。归属解析/启动 reconcile 分组/关停 tickets
+	// 归属都经本 parser，不认该形态会丢任务归属）。
+	if strings.HasPrefix(name, v2TUISessionPrefix) {
+		taskID := name[len(v2TUISessionPrefix):]
+		if !validTaskID(taskID) {
+			return "", "", fmt.Errorf("process: invalid v2 tui session name %q (want %s<taskID>, charset [a-z0-9-])", name, v2TUISessionPrefix)
+		}
+		return taskID, suffixV2TUI, nil
 	}
 	if !strings.HasPrefix(name, ocdeckPrefix) || len(name) <= len(ocdeckPrefix) {
 		return "", "", fmt.Errorf("process: invalid session name %q (want ocdeck-<taskID>-<role>, charset [a-z0-9-])", name)

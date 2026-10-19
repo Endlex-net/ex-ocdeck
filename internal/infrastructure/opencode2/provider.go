@@ -45,6 +45,11 @@ type SPIProvider struct {
 
 	statusMu sync.Mutex
 	status   map[string]domain.AgentStatus
+	// statusGen 状态写入代计数（评审 I12：断线失效的代际守卫——流失效仅删除
+	// 「本流写入且其后无更新写入」的事实；同目录多订阅下旧流不得清除新流刚
+	// 写入的状态）。statusGenCtr 单调分配。
+	statusGen    map[string]uint64
+	statusGenCtr uint64
 }
 
 // spiHealthPort 聚合健康上报的两个注入函数（v1 同构：report 收到已填充的

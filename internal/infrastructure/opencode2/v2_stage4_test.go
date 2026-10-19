@@ -187,8 +187,8 @@ func TestStage4_ServerMonitor_StopsOnShutdown(t *testing.T) {
 
 // TestStage4_Status_ConnectionGenerationInvalidation 落实 I12：断流即旧代
 // execution 状态作废（Current 缺项——不得重发过期 busy）；重连新代由快照自补
-//（SessionUpdated 不映射状态——不得 outcome→idle 猜测）；新代冻结映射事件
-//（succeeded）到达才重建 idle。
+// （SessionUpdated 不映射状态——不得 outcome→idle 猜测）；新代冻结映射事件
+// （succeeded）到达才重建 idle。
 func TestStage4_Status_ConnectionGenerationInvalidation(t *testing.T) {
 	setMasterSecret(t)
 	var conns atomic.Int32
@@ -299,6 +299,95 @@ func TestStage4_Status_ConnectionGenerationInvalidation(t *testing.T) {
 	}
 	cancel()
 	_ = es.Close()
+}
+
+// TestStage4_Status_ChildSession_Invalidation 落实 I12 失效范围（主+子）：同一流
+// 携带的子 session 状态随断线一并按流覆盖范围失效——不残留旧代 busy。
+func TestStage4_Status_ChildSession_Invalidation(t *testing.T) {
+	setMasterSecret(t)
+	child := "ses_child01"
+	var conns atomic.Int32
+	gate := make(chan struct{})
+	srv := httptestServerFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/event":
+			n := conns.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			if n == 1 {
+				writeSSE(t, w, "data: {\"id\":\"h1\",\"created\":1,\"type\":\"server.connected\",\"data\":{\"clientID\":\"c\"}}\n\n"+
+					"data: {\"id\":\"e1\",\"created\":1,\"type\":\"session.execution.started\",\"data\":{\"sessionID\":\""+child+"\"}}\n\n")
+				<-gate // 持流至测试释放；返回即断流（EOF）
+				return
+			}
+			<-r.Context().Done()
+		case "/api/session/" + child:
+			_, _ = w.Write([]byte(`{"data":{"id":"` + child + `","location":{"directory":"/wt"},"time":{"created":1,"updated":1}}}`))
+		default:
+			_, _ = w.Write([]byte(`{"data":[],"cursor":{"previous":null,"next":null}}`))
+		}
+	})
+	p := newTestProvider(t, srv.URL, ProviderOptions{StatusVerified: true})
+	b := testBinding(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	es, err := p.Events().Subscribe(ctx, b)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	es.SetCallbacks(func() {}, func() {})
+	expectEvent(t, es, domain.EventStatusChanged) // 子 session started → busy
+	if st, ok := p.status[child]; !ok || st != domain.StatusBusy {
+		t.Fatalf("child busy expected, got %v ok=%v", st, ok)
+	}
+	close(gate) // 断流
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		p.statusMu.Lock()
+		_, alive := p.status[child]
+		p.statusMu.Unlock()
+		if !alive {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("child stale busy must be invalidated on disconnect")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+	_ = es.Close()
+}
+
+// TestStage4_Status_MultiSub_GenerationGuard 落实 I12 并行订阅互不污染：旧流的
+// 断线清扫按代守卫——只清除「本流写入且其后无更新写入」的事实，新流刚写入的
+// 状态不被旧流清除。
+func TestStage4_Status_MultiSub_GenerationGuard(t *testing.T) {
+	p := NewSPIProvider(ProviderOptions{StatusVerified: true})
+	key := domain.SessionKey{ProviderID: ProviderID, ProviderInstanceID: ProviderInstanceID, UpstreamID: "ses_x"}
+	// 旧流写入 busy（gen1）。
+	p.recordStatus(key, domain.StatusBusy)
+	gen1, ok := p.statusGeneration("ses_x")
+	if !ok {
+		t.Fatalf("gen1 must exist")
+	}
+	// 新流随后重写（gen2——事实已被新流接管）。
+	p.recordStatus(key, domain.StatusBusy)
+	// 旧流断线清扫（按 gen1）：MUST NOT 清除新流的 gen2 事实。
+	p.invalidateStatusGen("ses_x", gen1)
+	if st, ok := p.status["ses_x"]; !ok || st != domain.StatusBusy {
+		t.Fatalf("newer stream fact must survive old-stream sweep, got %v ok=%v", st, ok)
+	}
+	// 新流自身断线（按 gen2）：事实清除（缺项=未知）。
+	gen2, _ := p.statusGeneration("ses_x")
+	p.invalidateStatusGen("ses_x", gen2)
+	p.statusMu.Lock()
+	_, alive := p.status["ses_x"]
+	p.statusMu.Unlock()
+	if alive {
+		t.Fatalf("own-generation sweep must invalidate")
+	}
 }
 
 // TestStage4_TerminalIO_EnsureAndAttach 落实 TerminalIO 真实 wire 行为（D3

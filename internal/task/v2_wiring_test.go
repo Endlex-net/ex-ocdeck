@@ -462,9 +462,10 @@ func TestGate3_F3_Adoption_CommittedThenTakeover(t *testing.T) {
 	if m.getRuntime("t-f3") == nil {
 		t.Fatalf("takeover must register task runtime")
 	}
-	// 候选流已退订（避免双通道）。
-	if atomic.LoadInt32(&stream.closed) == 0 {
-		t.Fatalf("candidate stream must be closed after takeover")
+	// 候选流复用为正式接管流（评审 I10：保留缓冲事件，不重订阅——流保持打开，
+	// 由 runtime SSE 生命周期接管关闭时机；关闭反而是回归信号）。
+	if atomic.LoadInt32(&stream.closed) != 0 {
+		t.Fatalf("candidate stream must be reused as takeover stream (not closed)")
 	}
 }
 

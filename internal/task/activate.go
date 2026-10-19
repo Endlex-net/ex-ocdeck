@@ -415,11 +415,13 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 	if m.providerRegistry != nil {
 		adoptA, perr := m.adoptBranchAPrecheck(ctx, taskID)
 		if perr != nil {
+			// resolver 拒绝 / I1 判定不一致：任何状态写入前零副作用停止（保留
+			// 全部旧事实——不经 activating、不清 env 快照），提交用户决策。
 			m.recordAdmissionError(ctx, taskID, perr)
 			return newOpErr(codeConflict, perr)
 		}
 		if adoptA {
-			return m.adoptTaskV2(ctx, taskID, row, mode)
+			return m.adoptTaskV2(ctx, taskID, row, mode, true)
 		}
 	}
 
@@ -442,6 +444,14 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 			m.replayHandledCleanup(ctx, taskID, err)
 			return handled.err
 		}
+		var pce *postCommitTakeoverError
+		if errors.As(err, &pce) {
+			// 评审 I10：已提交接管失败——禁普通激活补偿（状态已 active，
+			// activating 谓词回退不可达；清 env/关联会制造矛盾事实）；实际登记
+			// 恢复工作（ensureRecovery 调度闭环）后如实上抛已分类错误。
+			m.registerPostCommitRecovery(taskID)
+			return err
+		}
 		// 失败：清理已建会话（runtime/shell）→ suspended + last_error（design.md §19 补偿）。
 		// 补偿 MUST 用脱离调用方取消的 context：activateRun 可能在 probe 退避/健康检查等
 		// 步骤因 ctx 取消返回，此时调用方 ctx 已取消，真实 store 用 ExecContext 会因 ctx 取消
@@ -457,10 +467,12 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 // MUST NOT 再走通用补偿（禁写 status/last_error/env_snapshot/anchor）。
 type errActivateCommitHandled struct{ err error }
 
-// adoptBranchAPrecheck 只读预判当前入口是否为承接 A（评审 I1：零副作用准入——
-// resolver 决策 + D5 判定矩阵，先于 beginActivation 的任何状态写入）。resolver
-// 拒绝（R2/R3/R6/R7/R9/数据异常）原样返回错误（调用方零副作用处置——不进
-// activating）；非承接（含 B/R5/v1）返回 false 走既有激活序列。
+// adoptBranchAPrecheck 只读预判当前入口的承接形态（评审 I1：零副作用准入——
+// resolver 决策 + D5 判定矩阵，先于 beginActivation 的任何状态写入）。adoptA=
+// 承接 A（走专用承接出口，不经 activating）；err 非 nil = 停止（判定不一致/
+// 承接能力缺失/resolver 拒绝——MUST 在任何状态写入前直接停止报告，保留全部
+// 旧事实，提交用户决策；旧实现把判定不一致误判为「非承接」放进激活序列，失败
+// 补偿清 env 快照）；二者皆否 = 非承接（含 B/R5/v1）走既有激活序列。
 func (m *Manager) adoptBranchAPrecheck(ctx context.Context, taskID string) (bool, error) {
 	_, dec, _, _, err := m.admitExecution(ctx, taskID)
 	if err != nil {
@@ -469,24 +481,33 @@ func (m *Manager) adoptBranchAPrecheck(ctx context.Context, taskID string) (bool
 	if !dec.Adopt {
 		return false, nil
 	}
-	astore := m.adoptionStoreOf()
-	if astore == nil {
-		return false, nil // 承接能力缺失由 adoptTaskV2 内 fail-closed 统一处置
+	if m.adoptionStoreOf() == nil {
+		// 承接能力缺失：先于任何状态写入 fail-closed（I1）。
+		return false, appagent.NewError("admission.adopt", appagent.ErrKindCapabilityUnavailable,
+			errors.New("store 未实现承接原子转换能力（CommitAdoption）"))
 	}
 	binding, hasBinding, err := m.store.GetTaskBinding(ctx, taskID)
 	if err != nil {
 		return false, err
 	}
-	anchorID, anchorPID, anchorIID, err := astore.GetTaskAnchor(ctx, taskID)
+	anchorID, anchorPID, anchorIID, err := m.adoptionStoreOf().GetTaskAnchor(ctx, taskID)
 	if err != nil {
 		return false, err
 	}
-	keys, err := astore.ListTaskSessionKeys(ctx, taskID)
+	keys, err := m.adoptionStoreOf().ListTaskSessionKeys(ctx, taskID)
 	if err != nil {
 		return false, err
 	}
 	branch, _ := classifyAdoption(hasBinding, binding, anchorID, anchorPID, anchorIID, keys)
-	return branch == branchA, nil
+	switch branch {
+	case branchA:
+		return true, nil
+	case branchStop:
+		return false, appagent.NewError("admission.adopt", appagent.ErrKindBindingInvalid,
+			errors.New("承接准入判定不一致（binding/anchor/归属行部分缺失或不一致）——停止承接，保留任务现状，待用户决策"))
+	default:
+		return false, nil
+	}
 }
 
 func (e *errActivateCommitHandled) Error() string { return e.err.Error() }
@@ -685,17 +706,18 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 			return newOpErr(codeConflict, aerr)
 		}
 		// R8：承接主流程（D5 六步；B 首建/A 延续由判定矩阵在流程内分派）。
+		// taskLocked=true：Activate 全程持任务锁。
 		if dec.Adopt {
-			return m.adoptTaskV2(ctx, taskID, row, mode)
+			return m.adoptTaskV2(ctx, taskID, row, mode, true)
 		}
 		// G3-F2 + 评审 I4：已有 v2 binding → resumeActivateV2（连续性——MUST NOT
 		// 再 POST 建 session）；v2 执行但无 v2 binding（R5 首建——v2 钉扎新任务）
 		// → firstBuildV2（与 R8-B 共用同一首建准备+原子提交+candidate 补偿流程）。
 		if dec.ExecProviderID == store.ProviderIDV2 {
 			if decHasBinding && decBinding.ProviderID == store.ProviderIDV2 {
-				return m.resumeActivateV2(ctx, taskID, row, sup, mode)
+				return m.resumeActivateV2(ctx, taskID, row, sup, mode, true)
 			}
-			return m.firstBuildV2(ctx, taskID, row, mode, sup)
+			return m.firstBuildV2(ctx, taskID, row, mode, sup, true)
 		}
 	} else {
 		sup = m.runtimeSupervisor
@@ -841,7 +863,7 @@ func (m *Manager) commitRuntimeReady(ctx context.Context, taskID string, row Tas
 	m.setRuntime(taskID, rt)
 	rt.registerGroup(roleRuntime, runtimeName)
 	m.watchServeExit(taskID, runtimeName)
-	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode, binding); err != nil {
+	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode, binding, nil); err != nil {
 		return newOpErr(codeProcessError, fmt.Errorf("sse subscribe: %w", err))
 	}
 	ocProviderID := store.ProviderIDV1
@@ -1495,7 +1517,7 @@ func (m *Manager) ocProviderIDForSSE(taskID string, finalBinding *domain.TaskBin
 	return store.ProviderIDV1
 }
 
-func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath string, port int, password string, mode AlignMode, finalBinding *domain.TaskBinding) error {
+func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath string, port int, password string, mode AlignMode, finalBinding *domain.TaskBinding, preStream appagent.EventStream) error {
 	// SSE 挂 Manager 生命周期 context，非传入的 HTTP request ctx。
 	sseCtx, cancel := context.WithCancel(m.lifecycleCtx())
 	sseDone := make(chan struct{})
@@ -1609,6 +1631,11 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 	// 订阅在主 goroutine 同步受理（C10：ready 由 SetCallbacks 的连接建立回调驱动，
 	// 非订阅受理即 ready）。
 	finalStream, streamErr := (func() (appagent.EventStream, error) {
+		if preStream != nil {
+			// 评审 I10：候选流复用为正式接管流（保留缓冲事件——提交到接管之间
+			// 不重订阅，消除第二次订阅失败面）。
+			return preStream, nil
+		}
 		if finalBinding == nil {
 			return nil, nil
 		}

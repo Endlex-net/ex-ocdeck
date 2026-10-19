@@ -729,6 +729,9 @@ func (m *Manager) killResidualSessions(ctx context.Context, taskID string) error
 	// 客户端/shell 先清，runtime 与 leftover serve 后清；任一失败聚合，不 fail-fast。
 	var names []string
 	names = append(names, tuiSessionName(taskID))
+	// 评审 I14：v2 TUI 托管单元（ocdeck-v2-tui-<taskID>，binding.TerminalRef 的
+	// 确定性派生形态）纳入删除清理——仅 v2 任务存在该单元，不存在即跳过。
+	names = append(names, "ocdeck-v2-tui-"+taskID)
 	shellNames, err := m.listShellSessions(taskID)
 	if err != nil {
 		err = fmt.Errorf("kill residual sessions: enumerate shells (task %s): %w", taskID, err)

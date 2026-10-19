@@ -325,7 +325,7 @@ func (m *Manager) ensureRecovery(taskID string, tok runtime.InstVersion) {
 		}
 		if adoptA {
 			unlock()
-			if aerr := m.adoptTaskV2(ctx, taskID, row, mode); aerr != nil {
+			if aerr := m.adoptTaskV2(ctx, taskID, row, mode, false); aerr != nil {
 				log.Printf("ensureRecovery: adopt A task %s: %v", taskID, aerr)
 			}
 			return
@@ -458,7 +458,7 @@ func (m *Manager) ensureRecoveryFromAttach(taskID string) {
 		}
 		if adoptA {
 			unlock()
-			if aerr := m.adoptTaskV2(ctx, taskID, row, mode); aerr != nil {
+			if aerr := m.adoptTaskV2(ctx, taskID, row, mode, false); aerr != nil {
 				log.Printf("ensureRecovery: attach adopt A task %s: %v", taskID, aerr)
 			}
 			return
@@ -624,6 +624,16 @@ func (m *Manager) runRecoveryIncident(ctx context.Context, taskID string, trigge
 				log.Printf("recovery stop-report task %s record last_error: %v", taskID, werr)
 			}
 			inc.releaseProcess()
+			return
+		}
+		var pce *postCommitTakeoverError
+		if errors.As(attemptErr, &pce) {
+			// 评审 I10：提交后接管失败——任务已 active（提交不可回滚）；本轮
+			// attempt 以「已完成+恢复债务」收口（禁普通补偿/禁终态），恢复工作
+			// 实际登记为新 incident（调度闭环——下轮 Resume 重试接管）。
+			log.Printf("recovery: task %s post-commit takeover failed, re-registering recovery: %v", taskID, attemptErr)
+			inc.releaseProcess()
+			m.registerPostCommitRecovery(taskID)
 			return
 		}
 		if isRecoveryTerminal(attemptErr) {
@@ -815,7 +825,7 @@ func (m *Manager) runRecoveryAttempt(ctx context.Context, taskID string, trigger
 			return aerr
 		}
 		if dec.Adopt {
-			return m.adoptTaskV2(ctx, taskID, row, mode)
+			return m.adoptTaskV2(ctx, taskID, row, mode, false)
 		}
 		if dec.ExecProviderID == store.ProviderIDV2 {
 			// v2 恢复（R1）：独立预算序（I8）——server 可用性（supervisor 独立
@@ -1026,6 +1036,20 @@ func (m *Manager) runRecoveryAttempt(ctx context.Context, taskID string, trigger
 	return cerr
 }
 
+// providerErrorKind 解析 provider 边界错误分类（评审 I8：公共 Kind 契约——
+// *StageError 与 *Error 同 Kind 语义；真实 supervisor 路径多返回 NewError，
+// 仅认 *StageError 会漏分类）。
+func providerErrorKind(err error) (appagent.ErrorKind, bool) {
+	var ae *appagent.Error
+	if errors.As(err, &ae) {
+		return ae.Kind, true
+	}
+	if se, ok := appagent.StageErrorOf(err); ok {
+		return se.Kind, true
+	}
+	return "", false
+}
+
 // runV2RecoveryAttempt 是 v2 任务的恢复 attempt（评审 I8 预算顺序；R1 延续）：
 // ①server 可用性（supervisor 独立有界重试——不消耗任务预算；耗尽 → 停止报告，
 // 保留现状提交用户决策，MUST NOT 进普通 attempt 循环）→ ②任务 permit + backoff
@@ -1071,10 +1095,17 @@ func (m *Manager) runV2RecoveryAttempt(ctx context.Context, taskID string, trigg
 				return m.checkRecoveryContinuable(bctx, taskID, trigger)
 			}})
 	if serr != nil {
-		if se, ok := appagent.StageErrorOf(serr); ok && se.Kind == appagent.ErrKindNotFound {
+		// 评审 I8：公共 Kind 分类（*StageError 与 *Error 同 Kind 契约——真实
+		// Resume 404 返回 NewError，仅认 *StageError 会漏分类烧预算）。
+		switch kind, ok := providerErrorKind(serr); {
+		case ok && kind == appagent.ErrKindNotFound:
 			// 原 session 缺失（D5 恢复序列行 3：不可读/不存在/不可继续使用）：
 			// 停止、保留现状、提交用户决策——不创建替代 session、不进预算循环。
 			return &recoveryStopReportError{err: fmt.Errorf("原 session %s 缺失（停止，提交用户决策）: %w", oldBinding.UpstreamSessionID, serr)}
+		case ok && kind == appagent.ErrKindCapabilityUnavailable:
+			// 配置应用阶段能力缺失（env seam 未注入等）：确定性失败——另行区分，
+			// 不进预算循环（终态补偿出口）。
+			return &recoveryTerminalError{err: newOpErr(codeInternal, fmt.Errorf("v2 恢复能力缺失（确定性）: %w", serr))}
 		}
 		return m.supervisorStageErrorForTyped(serr, taskID)
 	}
@@ -1102,10 +1133,11 @@ func (m *Manager) runV2RecoveryAttempt(ctx context.Context, taskID string, trigg
 		}
 		return newOpErr(codeConflict, fmt.Errorf("v2 恢复替换提交: %w", rerr))
 	}
-	if es != nil {
-		_ = es.Close()
-	}
-	return m.commitV2RuntimeReady(ctx, taskID, row, port, password, binding, mode)
+	// 候选流复用为正式接管流（评审 I10：保留缓冲事件，不重订阅）。接管失败 =
+	// 已提交分类（postCommitTakeoverError），incident 循环登记恢复工作。
+	// taskLocked=false：incident 不持任务锁——接管注册临界区由 commitV2RuntimeReady
+	// 自行取锁（评审 I15 串行边界）。
+	return m.commitV2RuntimeReady(ctx, taskID, row, port, password, binding, mode, es, false)
 }
 
 // supervisorStageErrorForTyped 把 supervisor 阶段错误映射为 task 层 typed 分派

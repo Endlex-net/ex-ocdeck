@@ -153,15 +153,31 @@ func (p *SPIProvider) recordStatus(key domain.SessionKey, state domain.AgentStat
 	if p.status == nil {
 		p.status = map[string]domain.AgentStatus{}
 	}
+	if p.statusGen == nil {
+		p.statusGen = map[string]uint64{}
+	}
+	p.statusGenCtr++
 	p.status[key.UpstreamID] = state
+	p.statusGen[key.UpstreamID] = p.statusGenCtr
 	p.statusMu.Unlock()
 }
 
-// invalidateStatus 按连接代失效 session 的 execution 状态追踪（评审 I12：断流/
-// 重连新代即旧代状态作废——Current 缺项 = 未知，MUST NOT 用旧代值或
-// outcome→idle 猜测补齐；新代状态仅由新的冻结映射事件重建）。
-func (p *SPIProvider) invalidateStatus(upstreamID string) {
+// statusGeneration 返回 session 当前状态写入代（无记录 → false——无可失效事实）。
+func (p *SPIProvider) statusGeneration(upstreamID string) (uint64, bool) {
 	p.statusMu.Lock()
-	delete(p.status, upstreamID)
+	defer p.statusMu.Unlock()
+	gen, ok := p.statusGen[upstreamID]
+	return gen, ok
+}
+
+// invalidateStatusGen 按代失效 session 状态（评审 I12）：仅当当前代仍等于记录代
+// （本流写入后无更新写入）才删除——同目录多订阅下，新流刚写入的事实不被旧流
+// 的断线清除。
+func (p *SPIProvider) invalidateStatusGen(upstreamID string, gen uint64) {
+	p.statusMu.Lock()
+	if p.statusGen[upstreamID] == gen {
+		delete(p.status, upstreamID)
+		delete(p.statusGen, upstreamID)
+	}
 	p.statusMu.Unlock()
 }

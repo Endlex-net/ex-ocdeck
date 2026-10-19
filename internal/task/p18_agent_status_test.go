@@ -389,7 +389,7 @@ func TestP18_DisconnectSequenceAndTokenValidation(t *testing.T) {
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
 	rt.registerGroup(roleRuntime, runtimeSessionName("t1"))
-	if err := m.startSSE(context.Background(), rt, "t1", "/data/worktrees/p1/t1", 50001, "pw", AlignModeRepo, nil); err != nil {
+	if err := m.startSSE(context.Background(), rt, "t1", "/data/worktrees/p1/t1", 50001, "pw", AlignModeRepo, nil, nil); err != nil {
 		t.Fatalf("startSSE: %v", err)
 	}
 	defer m.clearRuntime("t1")

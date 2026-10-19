@@ -134,6 +134,25 @@ func TestNewSession_RejectsLegacySuffix(t *testing.T) {
 	}
 }
 
+func TestParseSessionName_V2TUIUnit(t *testing.T) {
+	// 评审 I14：canonical parser 统一扩展——v2 TUI 形态归属解析（util/reconcile/
+	// shutdown 分组同源），与 validateParsedSessionName 同规。
+	taskID, suffix, err := ParseSessionName("ocdeck-v2-tui-t-abc")
+	if err != nil || taskID != "t-abc" || suffix != "v2-tui" {
+		t.Fatalf("v2 tui: %q %q %v", taskID, suffix, err)
+	}
+	if _, _, err := ParseSessionName("ocdeck-v2-tui-"); err == nil {
+		t.Fatalf("empty taskID must fail")
+	}
+	if _, _, err := ParseSessionName("ocdeck-v2-tui-Bad_ID"); err == nil {
+		t.Fatalf("invalid charset must fail")
+	}
+	// 既有 v1 文法不回归。
+	if taskID, suffix, err := ParseSessionName("ocdeck-t1-tui"); err != nil || taskID != "t1" || suffix != "tui" {
+		t.Fatalf("v1 tui regression: %q %q %v", taskID, suffix, err)
+	}
+}
+
 func TestParseSessionName(t *testing.T) {
 	cases := []struct {
 		name   string

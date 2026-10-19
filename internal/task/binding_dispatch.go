@@ -316,7 +316,7 @@ func (m *Manager) startSSEFromBinding(ctx context.Context, rt *taskRuntime, task
 	if berr != nil {
 		return newOpErr(codeInternal, fmt.Errorf("resolve binding for sse: %w", berr))
 	}
-	return m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode, &binding)
+	return m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode, &binding, nil)
 }
 
 // bindingAndEndpoint 读取任务持久化 binding 并解析 runtime 连接事实

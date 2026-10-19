@@ -26,3 +26,10 @@ type CandidateSessionRecycler interface {
 type ServerAvailabilityWarmer interface {
 	CheckServerAlive(ctx context.Context) error
 }
+
+// ServerMonitorController 是 v2 server 监控循环的关停窄接口（可选能力；评审
+// I9 生命周期：persist/kill 两种关停策略都必须停止监控——取消在途重试并等待
+// 退出，调用方在其返回后才允许关停底层资源）。
+type ServerMonitorController interface {
+	StopServerMonitoring()
+}

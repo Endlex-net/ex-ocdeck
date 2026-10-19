@@ -706,7 +706,7 @@ func TestReconnectAlign_AIAuto_JudgesAfterAlign(t *testing.T) {
 	defer cancel()
 	started := make(chan error, 1)
 	go func() {
-		started <- m.startSSE(ctx, rt, "t1", "/data/worktrees/p1/t1", 50001, "pw", AlignModeRepo, nil)
+		started <- m.startSSE(ctx, rt, "t1", "/data/worktrees/p1/t1", 50001, "pw", AlignModeRepo, nil, nil)
 	}()
 	// startSSE 等待 ready 后完成首次 align 才返回。
 	select {

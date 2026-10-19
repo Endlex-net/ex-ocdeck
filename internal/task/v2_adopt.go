@@ -118,8 +118,10 @@ func classifyAdoption(hasBinding bool, binding domain.TaskBinding, anchorID, anc
 
 // adoptTaskV2 承接主流程入口（activate/recovery 的 R8 分支共用）。mode 为对齐
 // 模式（沿用激活语义）。fromStatus 由任务行现状决定：suspended→active（手动
-// 激活）/ active→active 守卫（存量承接，均不经 activating）。
-func (m *Manager) adoptTaskV2(ctx context.Context, taskID string, row TaskRow, mode AlignMode) error {
+// 激活）/ active→active 守卫（存量承接，均不经 activating）。taskLocked 表示
+// 调用方已持任务锁（Activate 全程持锁）——接管注册的串行边界复用之；恢复路径
+// （false）由接管点自行取锁（评审 I15：与 Suspend/Delete 同一任务级串行边界）。
+func (m *Manager) adoptTaskV2(ctx context.Context, taskID string, row TaskRow, mode AlignMode, taskLocked bool) error {
 	// store 承接能力（窄接口；缺失 = 装配不支持承接——fail-closed）。
 	astore, ok := m.store.(adoptionStore)
 	if !ok {
@@ -156,7 +158,7 @@ func (m *Manager) adoptTaskV2(ctx context.Context, taskID string, row TaskRow, m
 			m.recordAdmissionError(ctx, taskID, berr)
 			return berr
 		}
-		return m.firstBuildV2(ctx, taskID, row, mode, supB)
+		return m.firstBuildV2(ctx, taskID, row, mode, supB, taskLocked)
 	case branchA:
 		// target = anchor session id；继续步骤 2-6。
 	}
@@ -213,12 +215,9 @@ func (m *Manager) adoptTaskV2(ctx context.Context, taskID string, row TaskRow, m
 	// 若在；v2 任务无任务进程，正常路径无残留）。
 	m.retireLegacyAssociations(ctx, taskID)
 
-	// 候选流退订（避免双通道）：正式 provider-aware SSE 由接管路径重建
-	//（G3-F3：提交成功后必须完成正式运行时接线——注册 runtime/启动 SSE/对齐）。
-	if es != nil {
-		_ = es.Close()
-	}
-	return m.adoptTakeover(ctx, taskID, row, candidate, mode)
+	// 候选流复用为正式接管流（评审 I10：保留缓冲事件，不重订阅——close 移交
+	// 给 startSSE 的流生命周期）。
+	return m.adoptTakeover(ctx, taskID, row, candidate, mode, es, taskLocked)
 }
 
 // candidateHandshake 候选关联订阅 + 首帧握手（D4 提交条件四之一：SSE 首帧先于
@@ -235,7 +234,9 @@ func (m *Manager) candidateHandshake(ctx context.Context, taskID string, candida
 	if es == nil {
 		return nil, nil
 	}
-	stream, serr := es.Subscribe(ctx, candidate)
+	// 订阅挂 Manager 生命周期 ctx（评审 I10：候选流在提交成功后复用为正式 SSE——
+	// 保留缓冲事件、消除重订阅失败面；请求 ctx 取消不得拆掉已提交任务的接管流）。
+	stream, serr := es.Subscribe(m.lifecycleCtx(), candidate)
 	if serr != nil {
 		return nil, serr
 	}
@@ -257,7 +258,7 @@ func (m *Manager) candidateHandshake(ctx context.Context, taskID string, candida
 // claim+anchor+binding+activating→active CAS 单事务）→ 提交后正式接管（对齐/
 // 事件消费启用点；失败=已提交恢复债务，不回滚）。提交前失败 = candidate 未提
 // 交：回收（D3 受限回收例外）+ 上抛（激活入口经既有补偿收敛 suspended）。
-func (m *Manager) firstBuildV2(ctx context.Context, taskID string, row TaskRow, mode AlignMode, sup appagent.RuntimeSupervisor) error {
+func (m *Manager) firstBuildV2(ctx context.Context, taskID string, row TaskRow, mode AlignMode, sup appagent.RuntimeSupervisor, taskLocked bool) error {
 	astore := m.adoptionStoreOf()
 	if astore == nil {
 		err := appagent.NewError("activate.v2", appagent.ErrKindCapabilityUnavailable,
@@ -294,12 +295,9 @@ func (m *Manager) firstBuildV2(ctx context.Context, taskID string, row TaskRow, 
 		return m.rollbackFirstBuild(ctx, taskID, sup, binding,
 			newOpErr(codeConflict, fmt.Errorf("v2 首建提交: %w", cerr)))
 	}
-	if es != nil {
-		_ = es.Close()
-	}
-	// 提交后正式接管（正式 SSE/对齐/事件消费启用；失败=已提交恢复债务——D4 B 行
-	// 提交成功列之后的接管失败语义与 A 分支一致）。
-	return m.adoptTakeover(ctx, taskID, row, binding, mode)
+	// 提交后正式接管（候选流复用——评审 I10；正式 SSE/对齐/事件消费启用；
+	// 失败=已提交恢复债务 postCommitTakeoverError，禁普通补偿）。
+	return m.adoptTakeover(ctx, taskID, row, binding, mode, es, taskLocked)
 }
 
 // rollbackFirstBuild 是首建提交前失败的 candidate 回收（D3 受限回收例外）：
@@ -375,14 +373,14 @@ func (s *V2TaskEnvSeam) ResolveSessionEnv(ctx context.Context, taskID string, re
 // runtime 会话探活/watchServeExit（v2 无任务 tmux 单元）。返回 rt 供提交后段
 // 续用；rt 非 nil 的失败（SSE）由调用方决定回退（未提交：clearRuntime）或保留
 // （已提交：恢复债务重建）。
-func (m *Manager) beginV2RuntimeTakeover(ctx context.Context, taskID string, row TaskRow, port int, password string, binding domain.TaskBinding, mode AlignMode) (*taskRuntime, error) {
+func (m *Manager) beginV2RuntimeTakeover(ctx context.Context, taskID string, row TaskRow, port int, password string, binding domain.TaskBinding, mode AlignMode, preStream appagent.EventStream) (*taskRuntime, error) {
 	startMode := row.PermissionMode
 	rt := m.newRuntime(taskID)
 	if err := initPermState(rt, row, startMode); err != nil {
 		return nil, fmt.Errorf("v2 runtime register: init perm state: %v", err)
 	}
 	m.setRuntime(taskID, rt)
-	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode, &binding); err != nil {
+	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode, &binding, preStream); err != nil {
 		return rt, err
 	}
 	return rt, nil
@@ -397,44 +395,102 @@ func (m *Manager) finishV2RuntimeReady(taskID string, rt *taskRuntime) {
 	m.judgeScan(rt)
 }
 
+// postCommitTakeoverError 标记「原子提交已完成后的正式接管失败」（评审 I10）：
+// 任务已 active/binding 已提交——MUST NOT 回滚、MUST NOT 走普通激活补偿（清
+// env/清关联对已提交事实是破坏性的，且 activating 谓词回退不可达）；恢复工作
+// 由调用方实际登记（registerPostCommitRecovery——ensureRecovery 调度闭环）。
+type postCommitTakeoverError struct{ err error }
+
+func (e *postCommitTakeoverError) Error() string { return e.err.Error() }
+func (e *postCommitTakeoverError) Unwrap() error { return e.err }
+
+// registerPostCommitRecovery 登记已提交任务的恢复工作（评审 I10 调度闭环）：
+// 以当前 runtime 令牌触发 ensureRecovery（active→activating→Resume→接管重试）。
+func (m *Manager) registerPostCommitRecovery(taskID string) {
+	rt := m.getRuntime(taskID)
+	if rt == nil {
+		log.Printf("post-commit takeover failure task %s: no runtime to anchor recovery", taskID)
+		return
+	}
+	tok := rt.instVersion
+	log.Printf("post-commit takeover failure task %s: registering recovery work", taskID)
+	go m.ensureRecovery(taskID, tok)
+}
+
 // commitV2RuntimeReady 是 v2 任务运行时就绪提交（gate3 G3-F2/F3；已提交路径：
 // A 分支接管/已有 v2 binding 激活/恢复）：前段接管（runtime+SSE）+ 提交后段
 // （调度器/判定就绪），无状态 CAS（调用方已完成 binding/状态事务）。失败（SSE
 // 建立等）= 正式接管失败：任务已 active/binding 已提交，MUST NOT 回滚——记
-// last_error（恢复债务语义），由恢复循环重建，不得伪装完整可用。
-func (m *Manager) commitV2RuntimeReady(ctx context.Context, taskID string, row TaskRow, port int, password string, binding domain.TaskBinding, mode AlignMode) error {
-	rt, err := m.beginV2RuntimeTakeover(ctx, taskID, row, port, password, binding, mode)
+// last_error（恢复债务语义），经 postCommitTakeoverError 分类由调用方登记恢复
+// 工作（禁普通激活补偿），不得伪装完整可用。preStream 非 nil 时复用候选流
+// （评审 I10：保留缓冲事件，不重订阅）。
+func (m *Manager) commitV2RuntimeReady(ctx context.Context, taskID string, row TaskRow, port int, password string, binding domain.TaskBinding, mode AlignMode, preStream appagent.EventStream, taskLocked bool) error {
+	// 接管守卫（评审 I15）：注册 runtime/启动 SSE 前重验任务状态——已离开
+	// active（并发 Suspend/Delete 收敛）→ 放弃接管。串行边界：taskLocked=true
+	//（调用方持锁——Activate 全程）复用之；false（恢复路径）在此取锁并把注册
+	// 临界区置于锁内（与 Suspend/Delete 同一任务级串行边界，窗口密闭）。
+	var unlock func()
+	if !taskLocked {
+		u, lerr := m.lockTaskForRecovery(taskID)
+		if lerr != nil {
+			return &postCommitTakeoverError{err: newOpErr(codeConflict,
+				fmt.Errorf("承接接管守卫：任务锁不可得（并发生命周期变更）: %w", lerr))}
+		}
+		unlock = u
+	}
+	cur, gerr := m.store.GetTask(ctx, taskID)
+	if gerr != nil {
+		if unlock != nil {
+			unlock()
+		}
+		return &postCommitTakeoverError{err: newOpErr(codeInternal, gerr)}
+	}
+	if cur.Status != StatusActive {
+		if unlock != nil {
+			unlock()
+		}
+		return &postCommitTakeoverError{err: newOpErr(codeConflict,
+			fmt.Errorf("承接接管守卫：任务状态已收敛 %s（并发 Suspend/Delete 等）——放弃接管，不重建运行关联", cur.Status))}
+	}
+	row = cur
+	rt, err := m.beginV2RuntimeTakeover(ctx, taskID, row, port, password, binding, mode, preStream)
+	if unlock != nil {
+		unlock()
+	}
 	if err != nil {
 		if rt == nil {
-			// 接管前段初始化失败（未产生连接/订阅面）。
+			// 接管前段初始化失败（未产生连接/订阅面）——同为已提交分类。
 			m.recordAdmissionError(ctx, taskID, err)
-			return newOpErr(codeInternal, err)
+			return &postCommitTakeoverError{err: newOpErr(codeInternal, err)}
 		}
 		// 正式接管失败：已提交事务不可回滚 → last_error（恢复债务），恢复循环
 		// 按既有语义重建（不得伪装完整可用）。
 		m.recordAdmissionError(ctx, taskID, fmt.Errorf("v2 runtime SSE 接管失败（已提交，待恢复重建）: %v", err))
-		return newOpErr(codeProcessError, fmt.Errorf("v2 runtime sse subscribe: %w", err))
+		return &postCommitTakeoverError{err: newOpErr(codeProcessError, fmt.Errorf("v2 runtime sse subscribe: %w", err))}
 	}
 	m.finishV2RuntimeReady(taskID, rt)
 	return nil
 }
 
-// adoptTakeover 是承接提交成功后的正式运行时接管（G3-F3）：基于已提交 v2
-// binding 解析端点并落 commitV2RuntimeReady。
-func (m *Manager) adoptTakeover(ctx context.Context, taskID string, row TaskRow, binding domain.TaskBinding, mode AlignMode) error {
+// adoptTakeover 是承接提交成功后的正式运行时接管（G3-F3）：接管守卫（评审
+// I15：提交与 Suspend/Delete 并发窗口——注册 runtime/启动 SSE 前重验任务仍为
+// active，否则放弃接管，不重建「suspended + 运行关联」矛盾事实）→ 基于已提交
+// v2 binding 解析端点并落 commitV2RuntimeReady（preStream 复用候选流）。
+// taskLocked=调用方已持任务锁（Activate 全程持锁——串行边界复用；守卫仅重验）。
+func (m *Manager) adoptTakeover(ctx context.Context, taskID string, row TaskRow, binding domain.TaskBinding, mode AlignMode, preStream appagent.EventStream, taskLocked bool) error {
 	port, password, _, eerr := m.bindingEndpoint(binding)
 	if eerr != nil {
 		m.recordAdmissionError(ctx, taskID, fmt.Errorf("承接接管端点解析失败（已提交，待恢复重建）: %v", eerr))
-		return newOpErr(codeInternal, eerr)
+		return &postCommitTakeoverError{err: newOpErr(codeInternal, eerr)}
 	}
-	return m.commitV2RuntimeReady(ctx, taskID, row, port, password, binding, mode)
+	return m.commitV2RuntimeReady(ctx, taskID, row, port, password, binding, mode, preStream, taskLocked)
 }
 
 // resumeActivateV2 是已有 v2 binding 任务的激活分支（gate3 G3-F2）：Resume
 // 延续原 session（不建替代）→ 恢复/替换提交（binding 替换 + activating→active
 // 状态收敛单事务——入口 beginActivation 已置 activating，D4 生命周期矩阵；不走
 // 首次语义）→ 正式运行时就绪（G3-F3 同一原语）。
-func (m *Manager) resumeActivateV2(ctx context.Context, taskID string, row TaskRow, sup appagent.RuntimeSupervisor, mode AlignMode) error {
+func (m *Manager) resumeActivateV2(ctx context.Context, taskID string, row TaskRow, sup appagent.RuntimeSupervisor, mode AlignMode, taskLocked bool) error {
 	astore, ok := m.store.(v2ResumeStore)
 	if !ok {
 		err := appagent.NewError("activate.v2", appagent.ErrKindCapabilityUnavailable,
@@ -477,11 +533,9 @@ func (m *Manager) resumeActivateV2(ctx context.Context, taskID string, row TaskR
 		}
 		return newOpErr(codeConflict, fmt.Errorf("v2 激活替换提交: %w", cerr))
 	}
-	// 候选流退订（避免双通道）：正式 provider-aware SSE 由接管路径重建。
-	if es != nil {
-		_ = es.Close()
-	}
-	return m.commitV2RuntimeReady(ctx, taskID, row, port, password, binding, mode)
+	// 候选流复用为正式接管流（评审 I10：保留缓冲事件，不重订阅）。
+	// taskLocked=true：Activate 全程持任务锁（接管注册复用该串行边界）。
+	return m.commitV2RuntimeReady(ctx, taskID, row, port, password, binding, mode, es, true)
 }
 
 // adoptionStoreOf 返回承接/恢复提交窄能力视图（缺失 = nil——调用方 fail-closed）。

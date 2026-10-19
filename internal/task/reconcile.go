@@ -491,7 +491,7 @@ func (m *Manager) resumeActiveRegistered(ctx context.Context, t TaskRow, mode Al
 			m.clearRuntime(t.ID)
 			return newOpErr(codeInternal, fmt.Errorf("resolve binding for sse: %w", berr))
 		}
-		if err := m.startSSE(ctx, rt, t.ID, t.WorktreePath, port, password, mode, &binding); err != nil {
+		if err := m.startSSE(ctx, rt, t.ID, t.WorktreePath, port, password, mode, &binding, nil); err != nil {
 			m.clearRuntime(t.ID)
 			return err
 		}
