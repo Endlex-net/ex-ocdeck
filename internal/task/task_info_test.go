@@ -1016,7 +1016,7 @@ func TestArbitration_Recovery_Unconvergeable_SkipWithLastErrorBeforeCAS(t *testi
 	// 注册匹配 token 的 runtime 后同步触发运行期恢复。
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 
 	got := store.tasks["t1"]
 	if got.Status != StatusActive {

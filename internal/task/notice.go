@@ -301,60 +301,59 @@ func (m *Manager) clearSuspendStopIntents(ctx context.Context, taskID string) er
 	return fmt.Errorf("clear suspend stop intent: CAS did not converge (task %s)", taskID)
 }
 
-// retrySuspendStopIntent 消费停止收敛意图（评审 Round3 I2；调用方持任务锁）：
-// 复核（suspended=已收敛/非 active=意图过时/新一代 runtime 在位=旧意图失效——
-// 三者清除意图且不影响现状）→ 复用正常挂起收尾语义完成清关联+残留 notice/tickets
-// 持久化+env 快照清除（Round4 I17——MUST NOT 丢弃清理债务）+ active→suspended
-// 条件收敛 → 删除意图。返回 done（true=意图已了结可清除）；状态写仍失败返回
-// done=false + err（保留意图下轮重试）。
-func (m *Manager) retrySuspendStopIntent(ctx context.Context, taskID string, e noticeEntry) (bool, error) {
-	row, err := m.store.GetTask(ctx, taskID)
+// suspendFinishObligation 是挂起收尾未完成的持久化义务（Round5 I17）：清理操作
+// 失败可随收敛固化为债务，但债务/快照「持久化」失败 MUST 保留为未完成义务——
+// 意图不清除、完整 tickets 随意图保留，下轮重放优先补全。
+type suspendFinishObligation struct {
+	Kind      string   `json:"kind"` // "notice"（残留 notice 未落库）| "env"（env 快照清除失败）
+	Name      string   `json:"name,omitempty"`
+	Tickets   []string `json:"tickets,omitempty"`
+	Reason    string   `json:"reason,omitempty"`
+	Retryable bool     `json:"retryable"`
+}
+
+const suspendFinishPendingKey = "pendingJSON"
+
+func encodeSuspendFinishObligations(obs []suspendFinishObligation) string {
+	if len(obs) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(obs)
 	if err != nil {
-		return false, fmt.Errorf("suspend stop intent: reread task: %w", err)
+		return ""
 	}
-	if row.Status != StatusActive {
-		// suspended=已收敛；activating/其他=用户新一代动作已接管——意图过时清除
-		//（守卫语义：MUST NOT 覆盖其他代的状态事实）。
-		return true, nil
+	return string(b)
+}
+
+func decodeSuspendFinishObligations(e noticeEntry) []suspendFinishObligation {
+	raw, _ := e.Data[suspendFinishPendingKey].(string)
+	if raw == "" {
+		return nil
 	}
-	token, _ := e.Data["token"].(string)
-	if rt := m.getRuntime(taskID); rt != nil {
-		// Round4 I2：注册表存在 runtime 即与记录代际严格比对——记录时空 token
-		//（记录时无 runtime）不得授权清理后来出现的 runtime（无可验证身份→视为
-		// 新代，意图过时清除）。
-		if token == "" || string(rt.instVersion) != token {
-			return true, nil
+	var obs []suspendFinishObligation
+	if err := json.Unmarshal([]byte(raw), &obs); err != nil {
+		return nil
+	}
+	return obs
+}
+
+// persistSuspendFinishObligations 补全持久化义务，返回仍未完成的义务。
+func (m *Manager) persistSuspendFinishObligations(ctx context.Context, taskID, terminalRef string, obs []suspendFinishObligation) []suspendFinishObligation {
+	var remaining []suspendFinishObligation
+	for _, o := range obs {
+		switch o.Kind {
+		case "notice":
+			if nerr := m.recordResidualNotice(ctx, taskID, o.Name, o.Tickets, o.Reason, o.Retryable); nerr != nil {
+				remaining = append(remaining, o)
+			}
+		case "env":
+			if _, eerr := m.writeEnvSnapshot(ctx, taskID, sql.NullString{}); eerr != nil {
+				remaining = append(remaining, o)
+			}
 		}
 	}
-	// 完成挂起的本地半程（上游停止已确认属实）：清运行时关联 + 幂等回收 v2 本地
-	// 单元（TUI/shell）——收集完整结果（含 shell 枚举错误），复用正常挂起收尾
-	// 语义持久化残留 notice/tickets + 清 env 快照（Round4 I17：MUST NOT 丢弃
-	// 清理债务、MUST NOT 残留 env 快照）。
-	m.clearRuntime(taskID)
-	terminalRef, _ := e.Data["sessionName"].(string)
-	var results []killResultEntry
-	if terminalRef != "" {
-		results = append(results, m.killTaskSessions(ctx, taskID, []string{terminalRef})...)
-	}
-	shells, serr := m.listShellSessions(taskID)
-	if serr != nil {
-		// 枚举失败如实入结果集（finishSuspendCommon 记 retryable kill_failed）。
-		results = append(results, killResultEntry{name: terminalRef,
-			killErr: fmt.Errorf("list shells: %w", serr)})
-	} else {
-		results = append(results, m.killTaskSessions(ctx, taskID, shells)...)
-	}
-	le, ferrs := m.finishSuspendCommon(ctx, taskID, results, nil)
-	if joined := errors.Join(ferrs...); joined != nil && !le.Valid {
-		le = sql.NullString{String: joined.Error(), Valid: true}
-	}
-	if _, werr := m.writeStatusConditional(ctx, taskID, StatusActive, StatusSuspended, le); werr != nil {
-		// DB 仍不可用：意图保留，下轮重试（done=false 不删）。
-		return false, fmt.Errorf("suspend stop intent: converge: %w", werr)
-	}
-	// Matched=收敛完成（清理失败已固化为残留 notice/tickets 债务）；!Matched=
-	// 状态已被其他代改写（守卫不覆盖）——意图均了结。
-	return true, nil
+	_ = terminalRef
+	return remaining
 }
 
 // recordResidualNoticeFromDisposition 按 KillResult 完整处置表记 notice（B6/G4-4
@@ -369,6 +368,96 @@ func (m *Manager) recordResidualNoticeFromDisposition(ctx context.Context, taskI
 		return nil
 	}
 	return m.recordResidualNotice(ctx, taskID, sessionName, res.CleanupTickets, cls.reason, cls.retryable)
+}
+
+// retrySuspendStopIntent 消费停止收敛意图（评审 Round3 I2；调用方持任务锁）：
+// 复核（suspended=已收敛/非 active=意图过时/新一代 runtime 在位=旧意图失效——
+// 三者清除意图且不影响现状）→ 复用正常挂起收尾语义完成清关联+残留 notice/tickets
+// 持久化+env 快照清除（Round4 I17）→ active→suspended 条件收敛。Round5 I17：
+// 未完成的持久化义务（notice/env 写失败）以 pending 形态随条目保留（updated
+// 返回给外层 CAS 持久化）——done=false 不清意图、完整 tickets 不丢；下轮重放
+// 优先补全义务（与状态无关——suspended 已收敛也不得丢弃 tickets 重放能力）。
+// 返回 done（true=意图已了结可清除）、更新后的条目与错误。
+func (m *Manager) retrySuspendStopIntent(ctx context.Context, taskID string, e noticeEntry) (bool, noticeEntry, error) {
+	terminalRef, _ := e.Data["sessionName"].(string)
+	// Round5 I17：上一轮遗留的未完成持久化义务优先补全（与状态无关——suspended
+	// 已收敛也不得丢弃 tickets 重放能力）。
+	if pending := decodeSuspendFinishObligations(e); len(pending) > 0 {
+		remaining := m.persistSuspendFinishObligations(ctx, taskID, terminalRef, pending)
+		e = annotateSuspendStopPending(e, remaining)
+		if len(remaining) > 0 {
+			return false, e, fmt.Errorf("suspend stop intent: %d obligation(s) still unpersisted", len(remaining))
+		}
+	}
+	row, err := m.store.GetTask(ctx, taskID)
+	if err != nil {
+		return false, e, fmt.Errorf("suspend stop intent: reread task: %w", err)
+	}
+	if row.Status != StatusActive {
+		// suspended=已收敛；activating/其他=用户新一代动作已接管——意图过时清除
+		//（守卫语义：MUST NOT 覆盖其他代的状态事实；未完成义务已在上方补全）。
+		return true, e, nil
+	}
+	token, _ := e.Data["token"].(string)
+	if rt := m.getRuntime(taskID); rt != nil {
+		// Round4 I2：注册表存在 runtime 即与记录代际严格比对——记录时空 token
+		//（记录时无 runtime）不得授权清理后来出现的 runtime（无可验证身份→视为
+		// 新代，意图过时清除）。
+		if token == "" || string(rt.instVersion) != token {
+			return true, e, nil
+		}
+	}
+	// 完成挂起的本地半程（上游停止已确认属实）：清运行时关联 + 幂等回收 v2 本地
+	// 单元（TUI/shell）——收集完整结果（含 shell 枚举错误），复用正常挂起收尾
+	// 语义持久化残留 notice/tickets + 清 env 快照（Round4 I17：MUST NOT 丢弃
+	// 清理债务、MUST NOT 残留 env 快照）。
+	m.clearRuntime(taskID)
+	var results []killResultEntry
+	if terminalRef != "" {
+		results = append(results, m.killTaskSessions(ctx, taskID, []string{terminalRef})...)
+	}
+	shells, serr := m.listShellSessions(taskID)
+	if serr != nil {
+		// 枚举失败如实入结果集（finishSuspendCommon 记 retryable kill_failed）。
+		results = append(results, killResultEntry{name: terminalRef,
+			killErr: fmt.Errorf("list shells: %w", serr)})
+	} else {
+		results = append(results, m.killTaskSessions(ctx, taskID, shells)...)
+	}
+	le, ferrs, obligations := m.finishSuspendCommon(ctx, taskID, results, nil)
+	if joined := errors.Join(ferrs...); joined != nil && !le.Valid {
+		le = sql.NullString{String: joined.Error(), Valid: true}
+	}
+	if _, werr := m.writeStatusConditional(ctx, taskID, StatusActive, StatusSuspended, le); werr != nil {
+		// DB 仍不可用：未完成义务随意图保留，下轮重试（done=false 不删）。
+		return false, annotateSuspendStopPending(e, obligations),
+			fmt.Errorf("suspend stop intent: converge: %w", werr)
+	}
+	if len(obligations) > 0 {
+		// Round5 I17：状态已收敛但债务/env 持久化未完成——意图以 pending 形态
+		// 保留（完整 tickets 随条目，由外层 CAS 持久化）；MUST NOT 清除。
+		return false, annotateSuspendStopPending(e, obligations), errors.Join(ferrs...)
+	}
+	// Matched=收敛完成（清理失败已固化为残留 notice/tickets 债务）；!Matched=
+	// 状态已被其他代改写（守卫不覆盖）——意图均了结。
+	return true, e, nil
+}
+
+// annotateSuspendStopPending 把未完成持久化义务以 pendingJSON 形态写入条目副本
+// （obs 空=清除标记）。条目的持久化由外层 retryTaskNotices 的 CAS 承担。
+func annotateSuspendStopPending(e noticeEntry, obs []suspendFinishObligation) noticeEntry {
+	data := map[string]interface{}{}
+	for k, v := range e.Data {
+		if k != suspendFinishPendingKey {
+			data[k] = v
+		}
+	}
+	if raw := encodeSuspendFinishObligations(obs); raw != "" {
+		data[suspendFinishPendingKey] = raw
+	}
+	c := e
+	c.Data = data
+	return c
 }
 
 // casWriteNotices 将 remaining notice CAS 写回（design.md §8：新 tickets 不丢失）。
@@ -471,18 +560,20 @@ func (m *Manager) retryTaskNotices(ctx context.Context, t TaskRow, entries []not
 		if e.Code == noticeCodeSuspendStop {
 			// 停止收敛意图（评审 Round3 I2）：上游已停+收敛写曾失败——持任务锁
 			// 复核后完成清关联+状态收敛（suspended）再删意图；旧意图不得影响
-			// 新一代运行（执行代际守卫）。done=false（DB 仍不可用）保留重试。
-			done, herr := m.retrySuspendStopIntent(ctx, t.ID, e)
+			// 新一代运行（执行代际守卫）。done=false（DB 仍不可用/义务未完成）
+			// 保留重试——updated 条目（含 Round5 I17 pending 义务标注）随外层
+			// CAS 持久化。
+			done, updated, herr := m.retrySuspendStopIntent(ctx, t.ID, e)
 			if herr != nil {
-				remaining = append(remaining, e)
+				remaining = append(remaining, updated)
 				errs = append(errs, herr)
 				continue
 			}
 			if !done {
-				remaining = append(remaining, e)
+				remaining = append(remaining, updated)
 				continue
 			}
-			clearedKeys[noticeKey(e)] = true
+			clearedKeys[noticeKey(updated)] = true
 			continue
 		}
 		if e.Code != noticeCodeResidual {

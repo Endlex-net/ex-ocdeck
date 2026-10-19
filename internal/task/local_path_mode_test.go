@@ -1475,7 +1475,7 @@ func TestIllegalCombo_RuntimeEntries_FailClosed(t *testing.T) {
 				rt := m.newRuntime("t1")
 				m.setRuntime("t1", rt)
 				regBefore := runtimeRegistrySnapshot(m, "t1")
-				m.ensureRecovery("t1", rt.instVersion)
+				m.ensureRecovery("t1", rt.instVersion, false)
 				m.ensureRecoveryFromAttach("t1")
 				assertStatus(t, store, "t1", StatusActive)
 				if n := store.recoveryPermitCount("t1"); n != 0 {

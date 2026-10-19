@@ -552,7 +552,11 @@ type spiEventStream struct {
 	// 移交依据——握手消费者已取走 connected 信号后，新 SetCallbacks 依此重放
 	// 当前连接代，正式接管不二次等 ready）。
 	connEstablished bool
-	dispMu          sync.Mutex
+	// handoverReadyPending 交接期消费者（断线中经 SetCallbacks 安装）等待首次
+	// ready（Round5 I10）：下一次成功连接（markConnected/fireReconnect）前置
+	// connected 满足之。
+	handoverReadyPending bool
+	dispMu               sync.Mutex
 
 	// statusNotes 本流写入过的 session 状态代（评审 I12：失效范围=流覆盖范围
 	// +连接代——断线仅清除本流写入且其后无更新的事实；同目录多订阅互不污染）。
@@ -596,6 +600,16 @@ const (
 func (s *spiEventStream) markConnected() {
 	s.connMu.Lock()
 	s.connEstablished = true
+	pending := s.handoverReadyPending
+	s.handoverReadyPending = false
+	if pending {
+		// Round5 I10：交接期（断线中）安装的消费方等待首次 ready——本次连接代
+		// 建立即满足（前置 connected：先 ready，后既有派发序）。
+		s.lifecycleEvents = append([]string{lifecycleConnected}, s.lifecycleEvents...)
+		s.connMu.Unlock()
+		s.dispatchLifecycle()
+		return
+	}
 	s.connMu.Unlock()
 	s.enqueueLifecycle(lifecycleConnected)
 }
@@ -608,9 +622,15 @@ func (s *spiEventStream) markDisconnected() {
 }
 func (s *spiEventStream) fireReconnect() {
 	// 评审 I10②：重连即新连接代建立——恢复「当前已建立」事实，使移交消费方的
-	// 首次 ready 不依赖「期间从未断线」。
+	// 首次 ready 不依赖「期间从未断线」。Round5 I10：交接期消费者（断线中安装）
+	// 的首次 ready 由本次重连满足——前置 connected（先 ready，后 reconnect 对齐）。
 	s.connMu.Lock()
 	s.connEstablished = true
+	pending := s.handoverReadyPending
+	s.handoverReadyPending = false
+	if pending {
+		s.lifecycleEvents = append([]string{lifecycleConnected}, s.lifecycleEvents...)
+	}
 	s.connMu.Unlock()
 	s.enqueueLifecycle(lifecycleReconnect)
 }
@@ -690,6 +710,9 @@ func (s *spiEventStream) SetCallbacks(onConnected, onReconnect func()) {
 			}
 		}
 		s.lifecycleEvents = trimmed
+		// Round5 I10：交接期安装（断线中）——首次 ready 由下一次成功连接
+		//（markConnected/fireReconnect）满足。
+		s.handoverReadyPending = true
 	} else if len(s.lifecycleEvents) == 0 || s.lifecycleEvents[0] != lifecycleConnected {
 		s.lifecycleEvents = append([]string{lifecycleConnected}, s.lifecycleEvents...)
 	}

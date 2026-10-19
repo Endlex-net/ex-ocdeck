@@ -163,7 +163,7 @@ func TestRecovery_FreshPasswordPerCreate(t *testing.T) {
 	m.setRuntime("t1", rt)
 	rt.registerGroup(roleRuntime, runtimeSessionName("t1"))
 
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 	waitStatusAny(t, store, "t1", 3*time.Second, StatusActive)
 
 	if len(proc.envs) != 2 {

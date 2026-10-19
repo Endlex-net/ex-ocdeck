@@ -61,8 +61,8 @@ func TestEnsureRecovery_IdempotentDualTrigger(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); m.ensureRecovery("t1", tok) }()
-	go func() { defer wg.Done(); m.ensureRecovery("t1", tok) }()
+	go func() { defer wg.Done(); m.ensureRecovery("t1", tok, false) }()
+	go func() { defer wg.Done(); m.ensureRecovery("t1", tok, false) }()
 	wg.Wait()
 
 	got := waitStatusAny(t, store, "t1", 3*time.Second, StatusActive)
@@ -92,7 +92,7 @@ func TestEnsureRecovery_BudgetExhaustedSuspends(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 	row, _ := store.GetTask(context.Background(), "t1")
 	if row.Status != StatusSuspended {
 		t.Fatalf("status=%s want suspended on budget exhausted", row.Status)
@@ -142,7 +142,7 @@ func TestEnsureRecovery_StaleTokenNoCleanup(t *testing.T) {
 	}
 	cur := m.getRuntime("t1")
 	stale := runtime.InstVersion("stale-token")
-	m.ensureRecovery("t1", stale)
+	m.ensureRecovery("t1", stale, false)
 	assertStatus(t, store, "t1", StatusActive)
 	if m.getRuntime("t1") == nil || m.getRuntime("t1").instVersion != cur.instVersion {
 		t.Fatal("stale token MUST NOT clear current runtime")
@@ -157,7 +157,7 @@ func TestEnsureRecovery_ActivatingNoReentry(t *testing.T) {
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 	assertStatus(t, store, "t1", StatusActivating)
 	if store.recoveryPermitCount("t1") != 0 {
 		t.Errorf("activating reentry consumed permits: %v", store.recoveryAttempts["t1"])
@@ -177,7 +177,7 @@ func TestEnsureRecovery_SuspendWinsAbandons(t *testing.T) {
 		t.Fatalf("Suspend: %v", err)
 	}
 	assertStatus(t, store, "t1", StatusSuspended)
-	m.ensureRecovery("t1", runtime.InstVersion("any"))
+	m.ensureRecovery("t1", runtime.InstVersion("any"), false)
 	assertStatus(t, store, "t1", StatusSuspended)
 }
 
@@ -225,7 +225,7 @@ func TestEnsureRecovery_LockBusyThenRecovers(t *testing.T) {
 	}
 	var done atomic.Bool
 	go func() {
-		m.ensureRecovery("t1", rt.instVersion)
+		m.ensureRecovery("t1", rt.instVersion, false)
 		done.Store(true)
 	}()
 	time.Sleep(80 * time.Millisecond)
@@ -280,7 +280,7 @@ func TestEnsureRecovery_PermitBeforeNewSession(t *testing.T) {
 		t.Fatalf("Activate: %v", err)
 	}
 	rt := m.getRuntime("t1")
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 	waitStatusAny(t, store, "t1", 3*time.Second, StatusActive)
 
 	ops := tr.snapshot()
@@ -359,7 +359,7 @@ func TestEnsureRecovery_UnknownKindZeroSideEffects(t *testing.T) {
 	m.setRuntime("t1", rt)
 	rt.registerGroup(roleRuntime, runtimeSessionName("t1"))
 
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 
 	assertStatus(t, store, "t1", StatusActive)
 	if store.recoveryPermitCount("t1") != 0 {
@@ -621,7 +621,7 @@ func TestCompleteRecoveryFailure_Dispositions(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			m.ensureRecovery("t1", rt.instVersion)
+			m.ensureRecovery("t1", rt.instVersion, false)
 
 			row, _ := store.GetTask(context.Background(), "t1")
 			if row.Status != tc.wantStatus {
@@ -733,7 +733,7 @@ func TestRecoveryBackoff_CancelledByShutdown(t *testing.T) {
 	// 真实退避：取消前 backoff 会睡满 30s，若 Shutdown 未即时取消则测试超时失败。
 	m.recoveryBackoffFn = func(ordinal int) time.Duration { return 30 * time.Second }
 
-	go m.ensureRecovery("t1", rt.instVersion)
+	go m.ensureRecovery("t1", rt.instVersion, false)
 	// 等 permit 写入（attempt 已进入退避）。
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -924,7 +924,7 @@ func TestRecoveryNoAnchor_DualStartPermits(t *testing.T) {
 	store.onPermit = func(taskID string) { tr.add("permit:" + taskID) }
 	proc.onNewSession = func(name string) { tr.add("new:" + name) }
 
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 	waitStatusAny(t, store, "t1", 3*time.Second, StatusActive)
 
 	if got := store.recoveryPermitCount("t1"); got != 2 {
@@ -959,7 +959,7 @@ func TestRecoveryNoAnchor_SecondPermitWindowExhaustedKeepsAnchor(t *testing.T) {
 		}
 	}
 
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 	waitStatusAny(t, store, "t1", 5*time.Second, StatusSuspended)
 
 	frow, _ := store.GetTask(context.Background(), "t1")
@@ -989,7 +989,7 @@ func TestRecoveryBackoff_CancelledByStateWrite(t *testing.T) {
 	rt.registerGroup(roleRuntime, runtimeSessionName("t1"))
 	m.recoveryBackoffFn = func(int) time.Duration { return 60 * time.Second }
 
-	go m.ensureRecovery("t1", rt.instVersion)
+	go m.ensureRecovery("t1", rt.instVersion, false)
 	waitFor(t, 5*time.Second, func() bool { return store.recoveryPermitCount("t1") == 1 })
 
 	// 生产写路径把任务带离 activating（如并发收敛）→ wake → 退避即时放弃。
@@ -1025,7 +1025,7 @@ func TestRecoveryBackoff_CancelledByForeignRuntime(t *testing.T) {
 	rt.registerGroup(roleRuntime, runtimeSessionName("t1"))
 	m.recoveryBackoffFn = func(int) time.Duration { return 60 * time.Second }
 
-	go m.ensureRecovery("t1", rt.instVersion)
+	go m.ensureRecovery("t1", rt.instVersion, false)
 	waitFor(t, 5*time.Second, func() bool { return store.recoveryPermitCount("t1") == 1 })
 
 	// 异代 runtime 注册（setRuntime 生产路径触发 wake）→ trigger token 失效。
@@ -1078,7 +1078,7 @@ func TestRecoveryCancelOwnedProcessCleanup(t *testing.T) {
 	// 恢复 attempt 的健康轮询阻塞：进程已创建（owned）、未到 commit。
 	blockOC.block.Store(true)
 
-	go m.ensureRecovery("t1", rt.instVersion)
+	go m.ensureRecovery("t1", rt.instVersion, false)
 	waitFor(t, 5*time.Second, func() bool { return runtimeCreateCount(proc, "t1") >= 3 })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1137,7 +1137,7 @@ func TestEnsureRecovery_ShutdownBarrierInLockWait(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		m.ensureRecovery("t1", rt.instVersion)
+		m.ensureRecovery("t1", rt.instVersion, false)
 	}()
 	time.Sleep(50 * time.Millisecond)
 	select {
@@ -1184,7 +1184,7 @@ func TestCompleteRecoveryFailure_IntentFirstRetained(t *testing.T) {
 	}
 	store.completeRecoveryErr = errors.New("complete store down")
 
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 
 	row, _ := store.GetTask(context.Background(), "t1")
 	if row.Status != StatusActivating {
@@ -1229,7 +1229,7 @@ func TestRecoveryDebtFallbackFlush(t *testing.T) {
 	store.completeRecoveryErr = errors.New("complete store down")
 	store.recoveryDebtUpsertErr = errors.New("debt store down")
 
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 
 	m.recoveryDebtFallbackMu.Lock()
 	fallbacks := len(m.recoveryDebtFallbacks)
@@ -1317,7 +1317,7 @@ func TestRecoveryDebts_MultiPendingFullPayload(t *testing.T) {
 		}
 	}
 
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 
 	row, _ := store.GetTask(context.Background(), "t1")
 	if row.Status != StatusActivating {
@@ -1720,7 +1720,7 @@ func TestRecoveryBackoff_CancelledByDebtReplayComplete(t *testing.T) {
 	rt.registerGroup(roleRuntime, runtimeSessionName("t1"))
 	m.recoveryBackoffFn = func(int) time.Duration { return 60 * time.Second }
 
-	go m.ensureRecovery("t1", rt.instVersion)
+	go m.ensureRecovery("t1", rt.instVersion, false)
 	waitFor(t, 5*time.Second, func() bool { return store.recoveryPermitCount("t1") == 1 })
 
 	// 退避中：debt 重放路径的 Complete 把任务带离 activating（生产路径 wake）。
@@ -1803,7 +1803,7 @@ func TestRecoveryTerminalCleanupBetweenAttempts_FreezesNewSession(t *testing.T) 
 		proc.newSessionErr = errors.New("new-session rejected")
 	}
 
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 	waitStatusAny(t, store, "t1", 5*time.Second, StatusSuspended)
 
 	// 预算仅耗 1 个 permit（3 窗口仍余）但创建冻结：无 attempt2。
@@ -1970,7 +1970,7 @@ func TestEnsureRecovery_RejectsUncleanedRecoveryDebt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 
 	assertStatus(t, store, "t1", StatusActive)
 	if got := store.recoveryPermitCount("t1"); got != 0 {
@@ -2129,7 +2129,7 @@ func TestActivate_AroundLiveIncident_ConvergesSafely(t *testing.T) {
 	rt.registerGroup(roleRuntime, runtimeSessionName("t1"))
 	m.recoveryBackoffFn = func(int) time.Duration { return 60 * time.Second }
 
-	go m.ensureRecovery("t1", rt.instVersion)
+	go m.ensureRecovery("t1", rt.instVersion, false)
 	waitFor(t, 5*time.Second, func() bool {
 		m.recoveryIncidentsMu.Lock()
 		defer m.recoveryIncidentsMu.Unlock()
@@ -2179,7 +2179,7 @@ func TestRecoveryDebtCleanup_SingleClearPoint(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 	waitStatusAny(t, store, "t1", 5*time.Second, StatusSuspended)
 	if got := store.deleteDebtCallsCount(); got != 0 {
 		t.Fatalf("legacy DeleteRecoveryDebt calls=%d want 0 (single clear point: atomic tx)", got)

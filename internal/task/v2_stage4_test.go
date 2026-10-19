@@ -104,7 +104,7 @@ func TestStage4_V2Recovery_ServerRestart_ResumeKeepsSameSession(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		m.ensureRecovery("t-v2rec", rt.instVersion)
+		m.ensureRecovery("t-v2rec", rt.instVersion, false)
 	}()
 
 	// ensureRecovery 完成后（done happens-before）再读 recorder 计数。
@@ -2215,7 +2215,7 @@ func TestStage4_AdoptA_ViaRecovery_KeepsFactsOnFailure(t *testing.T) {
 	rt := m.newRuntime("t-a3")
 	m.setRuntime("t-a3", rt)
 
-	m.ensureRecovery("t-a3", rt.instVersion)
+	m.ensureRecovery("t-a3", rt.instVersion, false)
 	if atomic.LoadInt32(&failSup.resumeCalls) != 1 {
 		t.Fatalf("resume=%d（恢复入口承接 A 分派）", atomic.LoadInt32(&failSup.resumeCalls))
 	}
@@ -2580,6 +2580,9 @@ type realStreamHarness struct {
 	// dropConn 非 nil 时：首条连接写出 hello 后等待该 chan 关闭再返回（模拟
 	// 服务端主动断连——触发客户端重连）。
 	dropConn chan struct{}
+	// conn2Hello 非 nil 时：第二条连接等待该 chan 关闭后才写 hello（模拟「断线
+	// 期间接管消费者已安装、上游尚未恢复」的可控时序——Round5 I10）。
+	conn2Hello chan struct{}
 }
 
 func newRealStreamHarness(t *testing.T, taskID, upstream, status string) *realStreamHarness {
@@ -2607,6 +2610,9 @@ func newRealStreamHarness(t *testing.T, taskID, upstream, status string) *realSt
 			w.Header().Set("Content-Type", "text/event-stream")
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
+			}
+			if h.conns.Load() == 2 && h.conn2Hello != nil {
+				<-h.conn2Hello // Round5 I10：conn2 建立但尚未握手（断线期间窗口）
 			}
 			_, _ = w.Write([]byte("data: {\"id\":\"h\",\"created\":1,\"type\":\"server.connected\",\"data\":{\"clientID\":\"cli_x\"}}\n\n"))
 			if f, ok := w.(http.Flusher); ok {
@@ -2808,6 +2814,247 @@ func TestStage4_I16_RejectTakeover_ClosesCandidateStream(t *testing.T) {
 	case <-h.evtDone:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("server must observe candidate stream disconnect")
+	}
+}
+
+// failReplayPersistStore 是 Round5 I17 的持久化失败注入：分别独立失败
+// UpdateTaskNoticeCAS（债务持久化）与 UpdateTaskEnvSnapshot（env 快照清除）。
+type failReplayPersistStore struct {
+	*StoreAdapter
+	failNoticeCAS atomic.Bool
+	// failNextNoticeCAS 计数失败：仅接下来 N 次 notice CAS 写失败（让携带
+	// pending 标注的意图写回成功、仅债务落库失败的精确注入）。
+	failNextNoticeCAS atomic.Int32
+	failEnvClear      atomic.Bool
+}
+
+func (s *failReplayPersistStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error) {
+	if s.failNoticeCAS.Load() {
+		return application.MutationResult{}, errors.New("notice cas injected failure")
+	}
+	if n := s.failNextNoticeCAS.Load(); n > 0 {
+		s.failNextNoticeCAS.Add(-1)
+		return application.MutationResult{}, errors.New("notice cas injected failure (counted)")
+	}
+	return s.StoreAdapter.UpdateTaskNoticeCAS(ctx, id, expected, newNotice)
+}
+
+func (s *failReplayPersistStore) UpdateTaskEnvSnapshot(ctx context.Context, id string, envSnapshot sql.NullString) (application.MutationResult, error) {
+	if s.failEnvClear.Load() {
+		return application.MutationResult{}, errors.New("env clear injected failure")
+	}
+	return s.StoreAdapter.UpdateTaskEnvSnapshot(ctx, id, envSnapshot)
+}
+
+// TestStage4_R5_I17_ReplayKeepsIntentOnDebtPersistFail 落实 Round5 I17（债务
+// 持久化失败）：收敛写成功但残留 notice（含完整 tickets）落库失败 → 意图不清除、
+// 改写为 pending 形态（tickets 随意图保留）；下一轮补全后意图才清除。
+func TestStage4_R5_I17_ReplayKeepsIntentOnDebtPersistFail(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-dp")
+	adapter := NewStoreAdapter(db)
+	fstore := &failReplayPersistStore{StoreAdapter: adapter}
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManagerStore(t, db, fstore, prov)
+	// 义务持久化走 writeNoticeCAS 的 lifecycle 出口——测试置空回退 store 注入
+	//（failReplayPersistStore）。
+	m.lifecycle = nil
+	rt := m.newRuntime("t-dp")
+	m.setRuntime("t-dp", rt)
+	mproc := m.proc.(*mockProc)
+	mproc.mu.Lock()
+	mproc.sessions["ocdeck-v2-tui-t-dp"] = true
+	mproc.killResults["ocdeck-v2-tui-t-dp"] = process.KillResult{
+		SessionKilled:  false,
+		Disposition:    process.DispositionKillFailed,
+		CleanupTickets: []string{"tk-r5-1"},
+	}
+	mproc.mu.Unlock()
+
+	ref := "ocdeck-v2-tui-t-dp"
+	if ierr := m.recordSuspendStopIntent(ctx, "t-dp", ref, string(rt.instVersion)); ierr != nil {
+		t.Fatal(ierr)
+	}
+	// 精确注入：覆盖 recordResidualNotice 的全部 CAS 重试（8 次——它丢弃单次
+	// 写错误并重试至成功）→ 债务落库真失败 → 义务进入意图（pending 标注的意图
+	// 写回=第 9 次写，成功）。
+	fstore.failNextNoticeCAS.Store(8)
+	row, _ := fstore.GetTask(ctx, "t-dp")
+	entries, _ := parseNotices(row.Notice)
+	if rerr := m.retryTaskNotices(ctx, row, entries); rerr == nil {
+		t.Fatalf("debt persistence failure must surface (done=false)")
+	}
+	row2, _ := fstore.GetTask(ctx, "t-dp")
+	if row2.Status != "suspended" {
+		t.Fatalf("status=%s（收敛写成功）", row2.Status)
+	}
+	// 债务 notice MUST NOT 在持久化失败时伪装落库；意图 MUST 以 pending 形态
+	// 保留（完整 tickets 随意图——不得仅写错误文本后清除）。
+	if strings.Contains(row2.Notice.String, `"code":"residual_processes"`) {
+		t.Fatalf("debt notice must NOT be persisted while persistence fails: %q", row2.Notice.String)
+	}
+	if !strings.Contains(row2.Notice.String, noticeCodeSuspendStop) {
+		t.Fatalf("intent must be kept (not cleared) on debt persistence failure: %q", row2.Notice.String)
+	}
+	if !strings.Contains(row2.Notice.String, suspendFinishPendingKey) || !strings.Contains(row2.Notice.String, "tk-r5-1") {
+		t.Fatalf("pending obligations with full tickets must be preserved with the intent: %q", row2.Notice.String)
+	}
+
+	// 下一轮重放：义务补全（notice 落库）→ 意图清除。
+	row3, _ := fstore.GetTask(ctx, "t-dp")
+	entries3, _ := parseNotices(row3.Notice)
+	if rerr := m.retryTaskNotices(ctx, row3, entries3); rerr != nil {
+		t.Fatalf("replay(restore): %v", rerr)
+	}
+	row4, _ := fstore.GetTask(ctx, "t-dp")
+	if strings.Contains(row4.Notice.String, suspendFinishPendingKey) {
+		t.Fatalf("pending marker must be cleared after obligations complete: %q", row4.Notice.String)
+	}
+	if !strings.Contains(row4.Notice.String, "tk-r5-1") {
+		t.Fatalf("tickets debt must be persisted after obligation completion: %q", row4.Notice.String)
+	}
+}
+
+// TestStage4_R5_I17_ReplayKeepsIntentOnEnvClearFail 落实 Round5 I17（env 快照
+// 清除失败）：收敛写成功但 env 清除失败 → 意图不清除（pending 形态保留）、快照
+// 不得残留被当作已完成；下一轮补全后意图清除。
+func TestStage4_R5_I17_ReplayKeepsIntentOnEnvClearFail(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-ev")
+	adapter := NewStoreAdapter(db)
+	fstore := &failReplayPersistStore{StoreAdapter: adapter}
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManagerStore(t, db, fstore, prov)
+	m.lifecycle = nil
+	rt := m.newRuntime("t-ev")
+	m.setRuntime("t-ev", rt)
+
+	ref := "ocdeck-v2-tui-t-ev"
+	if ierr := m.recordSuspendStopIntent(ctx, "t-ev", ref, string(rt.instVersion)); ierr != nil {
+		t.Fatal(ierr)
+	}
+	fstore.failEnvClear.Store(true)
+	row, _ := fstore.GetTask(ctx, "t-ev")
+	entries, _ := parseNotices(row.Notice)
+	if rerr := m.retryTaskNotices(ctx, row, entries); rerr == nil {
+		t.Fatalf("env clear failure must surface (done=false)")
+	}
+	row2, _ := fstore.GetTask(ctx, "t-ev")
+	if row2.Status != "suspended" {
+		t.Fatalf("status=%s", row2.Status)
+	}
+	if !strings.Contains(row2.Notice.String, suspendFinishPendingKey) {
+		t.Fatalf("intent must be kept with env obligation: %q", row2.Notice.String)
+	}
+	var snap sql.NullString
+	if err := db.QueryRow(`SELECT env_snapshot FROM tasks WHERE id='t-ev'`).Scan(&snap); err != nil {
+		t.Fatal(err)
+	}
+	if !snap.Valid || snap.String == "" {
+		t.Fatalf("env snapshot must remain while clear fails (not treated as done)")
+	}
+
+	fstore.failEnvClear.Store(false)
+	row3, _ := fstore.GetTask(ctx, "t-ev")
+	entries3, _ := parseNotices(row3.Notice)
+	if rerr := m.retryTaskNotices(ctx, row3, entries3); rerr != nil {
+		t.Fatalf("replay(restore): %v", rerr)
+	}
+	row4, _ := fstore.GetTask(ctx, "t-ev")
+	if strings.Contains(row4.Notice.String, suspendFinishPendingKey) {
+		t.Fatalf("pending marker must be cleared after env obligation completes: %q", row4.Notice.String)
+	}
+	var snap2 sql.NullString
+	if err := db.QueryRow(`SELECT env_snapshot FROM tasks WHERE id='t-ev'`).Scan(&snap2); err != nil {
+		t.Fatal(err)
+	}
+	if snap2.Valid && snap2.String != "" {
+		t.Fatalf("env snapshot must be cleared after obligation completion, got %q", snap2.String)
+	}
+}
+
+// TestStage4_R5_I10_HandoverDuringDisconnect 落实 Round5 I10：候选握手完成 →
+// 连接断开 → 正式消费方在断线期间接手（安装回调、进入 ready 等待）→ 上游恢复
+// 重连成功 → 首次 ready 由重连满足（对齐执行、接管成功）——不再依赖
+// 「期间从未断线」。
+func TestStage4_R5_I10_HandoverDuringDisconnect(t *testing.T) {
+	ctx := context.Background()
+	h := newRealStreamHarness(t, "t-hd", "ses_keep", "active")
+	h.allowConns = 2
+	h.dropConn = make(chan struct{})
+	h.conn2Hello = make(chan struct{})
+
+	binding, has, err := h.adapter.GetTaskBinding(ctx, "t-hd")
+	if err != nil || !has {
+		t.Fatalf("binding: %v", err)
+	}
+	warmRealStreamHarness(t, h)
+	es, serr := h.prov.Events().Subscribe(ctx, binding)
+	if serr != nil {
+		t.Fatalf("Subscribe: %v", serr)
+	}
+	connected := make(chan struct{}, 4)
+	es.SetCallbacks(func() {
+		select {
+		case connected <- struct{}{}:
+		default:
+		}
+	}, nil)
+	select {
+	case <-connected:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("handshake connected never fired")
+	}
+
+	// 断开首条连接 → 客户端发起 conn2（建立 TCP 但尚未握手——hello 门控挡住）。
+	close(h.dropConn)
+	deadline := time.Now().Add(5 * time.Second)
+	for h.conns.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("client never reconnected after server drop")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 断线期间安装正式消费方（接管进入 ready 等待）。
+	row, err := h.adapter.GetTask(ctx, "t-hd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	takeoverDone := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		takeoverDone <- h.m.commitV2RuntimeReady(ctx, "t-hd", row, h.port, "pw", binding, AlignModeRepo, es, true)
+	}()
+	time.Sleep(150 * time.Millisecond) // 消费方已安装、阻塞在 ready 等待
+
+	// 上游恢复：conn2 握手完成 → fireReconnect → 交接期首次 ready 满足。
+	close(h.conn2Hello)
+	select {
+	case terr := <-takeoverDone:
+		if terr != nil {
+			t.Fatalf("takeover after during-disconnect handover: %v", terr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("takeover did not converge (first ready not satisfied by reconnect)")
+	}
+	if elapsed := time.Since(start); elapsed > 14*time.Second {
+		t.Fatalf("ready must be satisfied by reconnect, elapsed=%v", elapsed)
+	}
+	if n := h.conns.Load(); n != 2 {
+		t.Fatalf("event connections=%d（无重订阅）", n)
 	}
 }
 
@@ -3032,9 +3279,10 @@ func (p *listFailProc) ListSessions() ([]string, error) {
 	return p.mockProc.ListSessions()
 }
 
-// TestStage4_R4_I10_MintedTokenRecovery_ExecutesResume 落实 Round4 I10①：无
-// runtime（接管前段失败登记——minted token）的恢复入口实际执行 Resume（此前
-// stale-token 直接返回，恢复闭环断裂）；已注册新代且代际失配仍正确 skip。
+// TestStage4_R4_I10_MintedTokenRecovery_ExecutesResume 落实 Round5 I18：无
+// runtime（接管前段失败登记）的恢复入口受注册表 tombstone 代际权威约束——
+// 登记 T1→推进至 T2→runtime 为空→T1 零副作用拒绝、T2 才能恢复；任意字面量
+// token 拒绝；v1 回调形态（allowNoRuntime=false）保持原拒绝语义。
 func TestStage4_R4_I10_MintedTokenRecovery_ExecutesResume(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir())
@@ -3058,20 +3306,39 @@ func TestStage4_R4_I10_MintedTokenRecovery_ExecutesResume(t *testing.T) {
 	}
 	m.providerRegistry = reg
 
-	// 无 runtime + minted token：恢复入口必须实际执行（Resume 延续原 session）。
-	m.ensureRecovery("t-mt", "minted-token-1")
+	// 登记 T1 → 推进至 T2（登记后发生过代际推进）→ runtime 为空：
+	// T1 零副作用拒绝（stale——当前 tombstone 已是 T2）。
+	t1 := m.runtimeRegistry.NewInstVersion("t-mt")
+	t2 := m.runtimeRegistry.NewInstVersion("t-mt")
+	m.ensureRecovery("t-mt", t1, true)
+	if rec.resumeCalls != 0 {
+		t.Fatalf("stale registered token T1 must be rejected, resumes=%d", rec.resumeCalls)
+	}
+	// 任意字面量（未由注册表签发）：拒绝。
+	m.ensureRecovery("t-mt", "literal-not-issued", true)
+	if rec.resumeCalls != 0 {
+		t.Fatalf("literal token must be rejected, resumes=%d", rec.resumeCalls)
+	}
+	// 当前 tombstone T2（allowNoRuntime）：实际执行 Resume（恢复闭环）。
+	m.ensureRecovery("t-mt", t2, true)
 	if rec.resumeCalls != 1 {
-		t.Fatalf("minted-token recovery must execute Resume, resumes=%d", rec.resumeCalls)
+		t.Fatalf("current tombstone T2 must execute Resume, resumes=%d", rec.resumeCalls)
 	}
 	got, has, err := adapter.GetTaskBinding(ctx, "t-mt")
 	if err != nil || !has || got.UpstreamSessionID != "ses_keep" {
 		t.Fatalf("binding continuity: %+v has=%v err=%v", got, has, err)
 	}
 
-	// 已注册新代且代际失配：skip（stale 守卫方向不回归）。
+	// v1 回调形态（allowNoRuntime=false，rt==nil）：保持原拒绝语义。
 	rec.resumeCalls = 0
-	m.setRuntime("t-mt", m.newRuntime("t-mt")) // 新代 token ≠ minted-token-1
-	m.ensureRecovery("t-mt", "minted-token-1")
+	m.ensureRecovery("t-mt", t2, false)
+	if rec.resumeCalls != 0 {
+		t.Fatalf("v1 callback form (rt==nil) must keep rejection semantics, resumes=%d", rec.resumeCalls)
+	}
+
+	// 已注册新代且代际失配：skip（stale 守卫方向不回归）。
+	m.setRuntime("t-mt", m.newRuntime("t-mt")) // 新代 token ≠ t2
+	m.ensureRecovery("t-mt", t2, true)
 	if rec.resumeCalls != 0 {
 		t.Fatalf("stale token against registered newer generation must skip, resumes=%d", rec.resumeCalls)
 	}

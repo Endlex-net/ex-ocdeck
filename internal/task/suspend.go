@@ -421,11 +421,12 @@ func hasKillFailure(results []killResultEntry) bool {
 // finishSuspendCommon 是挂起收尾的公共半程（评审 Round4 I17 抽取——正常挂起与
 // 停止收敛意图重放共用）：逐项聚合记录残留 notice（killRes 内的 killErr →
 // retryable kill_failed；disposition 非净 → 分类记录）+ 清除 env 快照。返回
-// last_error 载荷与聚合错误（不含状态提交——提交方式由调用方决定：正常路径
-// writeStatus、重放路径 writeStatusConditional 条件守卫）。F16 约束同
-// finishSuspend：MUST NOT 伪造清理失败。
-func (m *Manager) finishSuspendCommon(ctx context.Context, taskID string, results []killResultEntry, cause error) (sql.NullString, []error) {
+// last_error 载荷、聚合错误与「未完成的持久化义务」（Round5 I17：notice/env
+// 写失败——调用方 MUST 保留为意图 pending 形态，不得仅写错误文本后清除）。F16
+// 约束同 finishSuspend：MUST NOT 伪造清理失败。
+func (m *Manager) finishSuspendCommon(ctx context.Context, taskID string, results []killResultEntry, cause error) (sql.NullString, []error, []suspendFinishObligation) {
 	var errs []error
+	var obligations []suspendFinishObligation
 	if cause != nil {
 		errs = append(errs, cause)
 	}
@@ -433,24 +434,30 @@ func (m *Manager) finishSuspendCommon(ctx context.Context, taskID string, result
 		if r.killErr != nil {
 			// 基础设施错误：记 notice（reason=kill_failed, retryable=true，保留 tickets）。
 			if nerr := m.recordResidualNotice(ctx, taskID, r.name, r.result.CleanupTickets, noticeReasonKillFailed, true); nerr != nil {
+				obligations = append(obligations, suspendFinishObligation{Kind: "notice",
+					Name: r.name, Tickets: r.result.CleanupTickets, Reason: noticeReasonKillFailed, Retryable: true})
 				errs = append(errs, fmt.Errorf("record notice %s: %w", r.name, nerr))
 			}
 			errs = append(errs, fmt.Errorf("kill session %s: %w", r.name, r.killErr))
 			continue
 		}
 		if nerr := m.recordResidualNoticeFromDisposition(ctx, taskID, r.name, r.result); nerr != nil {
+			cls := classifyKillResult(r.result)
+			obligations = append(obligations, suspendFinishObligation{Kind: "notice",
+				Name: r.name, Tickets: r.result.CleanupTickets, Reason: cls.reason, Retryable: cls.retryable})
 			errs = append(errs, fmt.Errorf("record notice %s: %w", r.name, nerr))
 		}
 	}
 	// 清除 env 快照（design.md §2：Suspend 成功清快照）。
 	if _, err := m.writeEnvSnapshot(ctx, taskID, sql.NullString{}); err != nil {
+		obligations = append(obligations, suspendFinishObligation{Kind: "env"})
 		errs = append(errs, fmt.Errorf("clear env snapshot: %w", err))
 	}
 	var le sql.NullString
 	if joined := errors.Join(errs...); joined != nil {
 		le = sql.NullString{String: joined.Error(), Valid: true}
 	}
-	return le, errs
+	return le, errs, obligations
 }
 
 // finishSund 落为 suspended：逐项聚合记录残留 notice（killRes + 强制清理中的失败项），
@@ -466,7 +473,7 @@ func (m *Manager) finishSuspendCommon(ctx context.Context, taskID string, result
 // 补偿本身是否失败。
 // suspended 状态提交失败 MUST 处理：不得静默置为无效流转（design.md §19 Suspend 行）。
 func (m *Manager) finishSuspend(ctx context.Context, taskID string, results []killResultEntry, cause error) error {
-	le, errs := m.finishSuspendCommon(ctx, taskID, results, cause)
+	le, errs, _ := m.finishSuspendCommon(ctx, taskID, results, cause)
 	if _, err := m.writeStatus(ctx, taskID, StatusSuspended, le); err != nil {
 		// F20：状态提交失败无条件进入返回值（不得被 cause 掩盖）。
 		errs = append(errs, fmt.Errorf("commit suspended: %w", err))

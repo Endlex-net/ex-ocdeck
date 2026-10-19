@@ -103,7 +103,7 @@ func TestRecovery_RecoveryWinsLock_SuspendTransitionalRejected(t *testing.T) {
 	if rt == nil {
 		t.Fatal("runtime missing")
 	}
-	go m.ensureRecovery("t1", rt.instVersion)
+	go m.ensureRecovery("t1", rt.instVersion, false)
 	waitStatusAny(t, store, "t1", 3*time.Second, StatusActivating)
 
 	// 恢复先拿锁（已进入 activating）→ Suspend 收到 transitional-state 拒绝。
@@ -134,7 +134,7 @@ func TestRecovery_SuspendWinsLock_RecoveryAbandons(t *testing.T) {
 	assertStatus(t, store, "t1", StatusSuspended)
 
 	// 挂起先拿锁（已完成）：恢复触发（watcher 回调形态）→ 锁内复读状态非 active → 放弃。
-	m.ensureRecovery("t1", "any-token")
+	m.ensureRecovery("t1", "any-token", false)
 	assertStatus(t, store, "t1", StatusSuspended)
 	if n := store.recoveryPermitCount("t1"); n != 0 {
 		t.Errorf("permits = %d, want 0（挂起后恢复放弃不耗预算）", n)
@@ -161,7 +161,7 @@ func TestRecoveryPolicy_TokenInvalidationZeroSideEffects(t *testing.T) {
 	cur := m.getRuntime("t1")
 
 	// 陈旧 token 触发恢复（watcher 异代回调形态）。
-	m.ensureRecovery("t1", "stale-token")
+	m.ensureRecovery("t1", "stale-token", false)
 
 	// 零状态写入：保持 active 且 last_error 不变（zero modify）。
 	assertStatus(t, store, "t1", StatusActive)
@@ -263,7 +263,7 @@ func TestRecovery_NoticePersistFailureBlocksCompleteZeroBudgetSpill(t *testing.T
 	// notice store 故障：notice 写失败 → 阻断终态事务（先落 durable debt）。
 	store.noticeCasErr = errors.New("notice cas down")
 	rt := m.getRuntime("t1")
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 
 	// 终态事务未执行：状态仍 activating（notice/debt 持久化失败阻断 Complete）。
 	assertStatus(t, store, "t1", StatusActivating)
@@ -348,7 +348,7 @@ func TestRecoveryBudgetExhausted_CASSequenceTraced(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 
 	waitStatusAny(t, store, "t1", 3*time.Second, StatusSuspended)
 	// CAS 序列：先准入（active→activating）再补偿（complete 单事务）。

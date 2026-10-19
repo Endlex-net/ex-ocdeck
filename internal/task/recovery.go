@@ -127,7 +127,7 @@ func (m *Manager) reportRuntimeFatal(taskID string, tok runtime.InstVersion, err
 	if inc != nil {
 		inc.reportFatal(recoveryFatal{tok: tok, err: err})
 	}
-	go m.ensureRecovery(taskID, tok)
+	go m.ensureRecovery(taskID, tok, false)
 }
 
 // incidentFatalFor 排空任务当前 incident 的 fatal latch，返回属于 tok 的 fatal
@@ -238,7 +238,11 @@ func (m *Manager) recoveryBackoff(ordinal int) time.Duration {
 // G3-9：准入（gate 检查 + recoveryWG.Add）在 shutdownGateMu 临界区内完成，
 // Shutdown 的 WG barrier 覆盖整个 ensure 路径（含锁等待与 CAS），不存在
 // 「已过 gate 检查但未 Add」的逃逸窗口；defer Done 收尾。
-func (m *Manager) ensureRecovery(taskID string, tok runtime.InstVersion) {
+// allowNoRuntime（Round5 I18）：仅提交后恢复登记（registerPostCommitRecovery）
+// 允许无 runtime 形态——token MUST 为注册表当前 tombstone（注册表签发且仍为
+// 最新代：任意字面量/陈旧 token 拒绝，v1 旧回调 allowNoRuntime=false 保持原
+// 拒绝语义）。
+func (m *Manager) ensureRecovery(taskID string, tok runtime.InstVersion, allowNoRuntime bool) {
 	m.shutdownGateMu.Lock()
 	if m.shutdownStarted {
 		m.shutdownGateMu.Unlock()
@@ -261,12 +265,25 @@ func (m *Manager) ensureRecovery(taskID string, tok runtime.InstVersion) {
 		return
 	}
 	rt := m.getRuntime(taskID)
-	// Round4 I10①：rt==nil（registerPostCommitRecovery 的接管前段失败登记——
-	// 无本地运行面）继续恢复：状态守卫 + 注册表代际承担保护（其后任何 runtime
-	// 注册都铸造新代，与本 minted token 失配即 stale skip）。rt 非 nil 且代际
-	// 失配 = 新代已注册非本次触发 → skip。
-	if rt != nil && rt.instVersion != tok {
-		log.Printf("ensureRecovery: stale token (task %s instVersion=%s) skipped", taskID, tok)
+	// Round5 I18：token 校验分派。rt 非 nil → 与本代等值（原有语义）；rt==nil →
+	// 仅 allowNoRuntime（提交后恢复登记）且 token 必须是注册表当前 tombstone
+	//（代际权威——任意字面量/已推进的陈旧 token 拒绝；普通旧回调
+	// allowNoRuntime=false 保持原拒绝语义）。
+	if rt != nil {
+		if rt.instVersion != tok {
+			log.Printf("ensureRecovery: stale token (task %s instVersion=%s) skipped", taskID, tok)
+			unlock()
+			return
+		}
+	} else if allowNoRuntime {
+		tomb, ok := m.runtimeRegistry.Tombstone(taskID)
+		if !ok || tomb != tok {
+			log.Printf("ensureRecovery: no-runtime token not current tombstone (task %s) skipped", taskID)
+			unlock()
+			return
+		}
+	} else {
+		log.Printf("ensureRecovery: no runtime and no-runtime form not allowed (task %s) skipped", taskID)
 		unlock()
 		return
 	}

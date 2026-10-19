@@ -418,7 +418,7 @@ func (m *Manager) registerPostCommitRecovery(taskID string) {
 		tok = string(m.runtimeRegistry.NewInstVersion(taskID))
 	}
 	log.Printf("post-commit takeover failure task %s: registering recovery work", taskID)
-	go m.ensureRecovery(taskID, runtime.InstVersion(tok))
+	go m.ensureRecovery(taskID, runtime.InstVersion(tok), true)
 }
 
 // commitV2RuntimeReady 是 v2 任务运行时就绪提交（gate3 G3-F2/F3；已提交路径：

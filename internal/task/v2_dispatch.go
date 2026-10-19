@@ -208,6 +208,6 @@ func (m *Manager) RebuildV2Associations() {
 			continue
 		}
 		tok := rt.instVersion
-		go m.ensureRecovery(taskID, tok)
+		go m.ensureRecovery(taskID, tok, false)
 	}
 }

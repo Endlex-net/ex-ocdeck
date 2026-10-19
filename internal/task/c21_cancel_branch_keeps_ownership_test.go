@@ -137,7 +137,7 @@ func TestC21_CancelAfterResumeReturnKeepsOwnership(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		m.ensureRecovery("t1", rt.instVersion)
+		m.ensureRecovery("t1", rt.instVersion, false)
 	}()
 	select {
 	case ownedName := <-gated.entered:

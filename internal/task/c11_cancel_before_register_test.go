@@ -132,7 +132,7 @@ func TestC11_CancelBeforeRegisterKeepsOwnership(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		m.ensureRecovery("t1", rt.instVersion)
+		m.ensureRecovery("t1", rt.instVersion, false)
 	}()
 	// 等 Resume 返回并挂住 gate（owned 窗口稳定）。
 	select {

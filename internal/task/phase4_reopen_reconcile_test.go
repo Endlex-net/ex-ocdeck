@@ -306,7 +306,7 @@ func TestRecovery_WatcherAndAttachConcurrent_SingleIncident(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); m.ensureRecovery("t1", rt.instVersion) }()
+	go func() { defer wg.Done(); m.ensureRecovery("t1", rt.instVersion, false) }()
 	go func() { defer wg.Done(); m.ensureRecoveryFromAttach("t1") }()
 	wg.Wait()
 

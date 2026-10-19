@@ -906,7 +906,7 @@ func (m *Manager) commitRuntimeReady(ctx context.Context, taskID string, row Tas
 		// G3-1：CAS 后 fatal → 已提交 active，经幂等 ensureRecovery 立即开新 incident
 		//（same-token 状态/锁校验保证不产生并发双恢复）。
 		if fatalErr := m.incidentFatalFor(taskID, rt.instVersion); fatalErr != nil {
-			go m.ensureRecovery(taskID, rt.instVersion)
+			go m.ensureRecovery(taskID, rt.instVersion, false)
 		}
 		// F3：active 提交后才启动 diff review 调度器（此前启动会让首探抢跑，
 		// taskOcClient 拒绝非 active task）。幂等（已运行则 no-op）。
@@ -2504,7 +2504,7 @@ func (m *Manager) watchServeExit(taskID, serveName string) {
 		case process.WatchEventSessionExit:
 			m.handleServeExit(taskID, tok)
 		case process.WatchEventInfraError:
-			m.ensureRecovery(taskID, tok)
+			m.ensureRecovery(taskID, tok, false)
 		}
 	})
 	if cur := m.getRuntime(taskID); cur != nil {
@@ -2521,7 +2521,7 @@ func (m *Manager) watchServeExit(taskID, serveName string) {
 // single-process Phase 4：watchTUIExit 已随独立 TUI 会话模型删除（TUI 与任务进程
 // 同体，-tui 遗留会话仅由 reconcile 清理路径处置）。
 func (m *Manager) handleServeExit(taskID string, tok runtime.InstVersion) {
-	m.ensureRecovery(taskID, tok)
+	m.ensureRecovery(taskID, tok, false)
 }
 
 // convergeToSuspended 收敛活跃任务到 suspended（design.md §4：不得留 active 但无 SSE 托管的运行时）。
