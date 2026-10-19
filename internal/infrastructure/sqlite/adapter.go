@@ -16,8 +16,8 @@ import (
 
 	"ocdeck/internal/application"
 	domain "ocdeck/internal/domain/agentprovider"
-	ocdecktask "ocdeck/internal/domain/task"
 	ocdecksess "ocdeck/internal/domain/session"
+	ocdecktask "ocdeck/internal/domain/task"
 	"ocdeck/internal/infrastructure/store"
 )
 
@@ -228,20 +228,20 @@ func (a *Adapter) ListTasksByProject(ctx context.Context, projectID string) ([]a
 // 保持与 legacy toTaskRow 1:1 字段对应，供 Manager facade 还原 task.TaskRow。
 func toTaskSnapshot(r store.TaskRow) application.TaskSnapshot {
 	return application.TaskSnapshot{
-		ID:           r.ID,
-		ProjectID:    r.ProjectID,
-		Name:         r.Name,
-		Branch:       r.Branch,
-		Status:       r.Status,
-		WorktreePath: r.WorktreePath,
-		LastPort:     nullInt64ToPtr(r.LastPort),
-		LastError:    nullStringToPtrSnapshot(r.LastError),
-		Notice:       nullStringToPtrSnapshot(r.Notice),
-		DeleteMode:   nullStringToPtrSnapshot(r.DeleteMode),
-		EnvSnapshot:  nullStringToPtrSnapshot(r.EnvSnapshot),
-		CreatedAt:    r.CreatedAt,
-		UpdatedAt:    r.UpdatedAt,
-		ArchivedAt:   nullInt64ToPtr(r.ArchivedAt),
+		ID:              r.ID,
+		ProjectID:       r.ProjectID,
+		Name:            r.Name,
+		Branch:          r.Branch,
+		Status:          r.Status,
+		WorktreePath:    r.WorktreePath,
+		LastPort:        nullInt64ToPtr(r.LastPort),
+		LastError:       nullStringToPtrSnapshot(r.LastError),
+		Notice:          nullStringToPtrSnapshot(r.Notice),
+		DeleteMode:      nullStringToPtrSnapshot(r.DeleteMode),
+		EnvSnapshot:     nullStringToPtrSnapshot(r.EnvSnapshot),
+		CreatedAt:       r.CreatedAt,
+		UpdatedAt:       r.UpdatedAt,
+		ArchivedAt:      nullInt64ToPtr(r.ArchivedAt),
 		InitStatus:      r.InitStatus,
 		InitError:       nullStringToPtrSnapshot(r.InitError),
 		BaseRef:         r.BaseRef,
@@ -296,8 +296,21 @@ func nullStringValue(ns sql.NullString) string {
 //（expected 失配返回 application.AlignConflict）。
 
 // Claim 实现 SessionRepository.Claim：单事务先查他主再 upsert（design.md D0:77）。
+// 命名空间随 observation（opencode-v2-provider 评审 I5：会话写端口保留完整
+// SessionKey）；零值 = v1 缺省（既有 v1 调用方行为不变），不完整 key fail-closed。
 func (a *Adapter) Claim(ctx context.Context, taskID string, obs ocdecksess.Observation) (application.ClaimResult, error) {
-	return a.db.ClaimTaskSession(ctx, taskID, string(obs.ID), obs.CreatedAt, obs.FirstSeenAt, obs.UpdatedAt, obs.ParentID)
+	if obs.ProviderID == "" {
+		if obs.ProviderInstanceID != "" {
+			return application.ClaimResult{}, fmt.Errorf("sqlite: claim: observation 命名空间不完整（provider 空而 instance=%q）", obs.ProviderInstanceID)
+		}
+		return a.db.ClaimTaskSession(ctx, taskID, string(obs.ID), obs.CreatedAt, obs.FirstSeenAt, obs.UpdatedAt, obs.ParentID)
+	}
+	if obs.ProviderInstanceID == "" {
+		return application.ClaimResult{}, fmt.Errorf("sqlite: claim: observation 命名空间不完整（provider=%q 而 instance 空）", obs.ProviderID)
+	}
+	return a.db.ClaimSessionKey(ctx, taskID, domain.SessionKey{
+		ProviderID: obs.ProviderID, ProviderInstanceID: obs.ProviderInstanceID, UpstreamID: string(obs.ID),
+	}, obs.CreatedAt, obs.FirstSeenAt, obs.UpdatedAt, obs.ParentID)
 }
 
 // TouchOwned 实现 SessionRepository.TouchOwned：值变化条件推进已归属行 last_seen_at。
@@ -317,10 +330,12 @@ func (a *Adapter) Align(ctx context.Context, taskID string, mode ocdecksess.Alig
 	obs := make([]store.SessionObservation, 0, len(observed))
 	for _, o := range observed {
 		obs = append(obs, store.SessionObservation{
-			SessionID: string(o.ID),
-			CreatedAt: o.CreatedAt,
-			UpdatedAt: o.UpdatedAt,
-			ParentID:  o.ParentID,
+			SessionID:          string(o.ID),
+			CreatedAt:          o.CreatedAt,
+			UpdatedAt:          o.UpdatedAt,
+			ParentID:           o.ParentID,
+			ProviderID:         o.ProviderID,
+			ProviderInstanceID: o.ProviderInstanceID,
 		})
 	}
 	return a.db.AlignTaskSessions(ctx, taskID, toStoreAlignMode(mode), obs, complete, notice)
@@ -427,7 +442,9 @@ var ErrNotImplemented = errNotImplemented{}
 
 type errNotImplemented struct{}
 
-func (errNotImplemented) Error() string { return "sqlite adapter: method not implemented in P1.2 skeleton" }
+func (errNotImplemented) Error() string {
+	return "sqlite adapter: method not implemented in P1.2 skeleton"
+}
 
 // --- ProcessPort / OpenCodePort / WorktreePort（P1.4 完整接入） ---
 //

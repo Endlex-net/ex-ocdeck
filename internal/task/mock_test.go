@@ -896,6 +896,12 @@ func (s *mockStore) ClaimTaskSession(ctx context.Context, taskID, sessionID stri
 	return application.ClaimResult{Claimed: true, Changed: true}, nil
 }
 
+// ClaimTaskSessionKey 按完整 SessionKey 原子 claim（评审 I5）。mock 为单命名
+// 空间内存实现：冲突/归属判定按 upstream id（与 ClaimTaskSession 同域）。
+func (s *mockStore) ClaimTaskSessionKey(ctx context.Context, taskID string, key domain.SessionKey, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
+	return s.ClaimTaskSession(ctx, taskID, key.UpstreamID, createdAt, firstSeen, lastSeen, parentID)
+}
+
 func (s *mockStore) ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
 	res, err := s.ClaimTaskSession(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
 	if err != nil || !res.Claimed {

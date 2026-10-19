@@ -281,6 +281,9 @@ func (s *recordingV2Sup) AcquireEphemeral(ctx context.Context, t appagent.TaskRe
 
 func (s *recordingV2Sup) Release(ctx context.Context, b domain.TaskBinding) error { return nil }
 
+// CheckServerAlive 满足 ServerAvailabilityWarmer（I8 v2 恢复预算序①——fake 恒可用）。
+func (s *recordingV2Sup) CheckServerAlive(ctx context.Context) error { return nil }
+
 // recordingV2Provider 包装 v2Stub：Supervisor 指向 recorder；端点解析返回同端口；
 // 归属校验通过（G3-F5 门禁放行形态）。
 type recordingV2Provider struct {

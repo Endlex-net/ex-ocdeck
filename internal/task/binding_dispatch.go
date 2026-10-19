@@ -185,6 +185,10 @@ func (m *Manager) resolveRuntimeBinding(ctx context.Context, taskID string) (*op
 		return nil, "", appagent.NewError("resolve binding", appagent.ErrKindBindingInvalid,
 			fmt.Errorf("task %s 无持久化 binding（事实来源切换后 runtime 连接 MUST 经 binding 解析）", taskID))
 	}
+	// I7：归属门禁先于 endpoint/凭据派生（同一次 binding 读取——无二次读漂移窗口）。
+	if oerr := m.checkBindingOwnershipGate(ctx, taskID, binding); oerr != nil {
+		return nil, "", oerr
+	}
 	p, perr := m.providerFor(binding.ProviderID)
 	if perr != nil {
 		return nil, "", perr
@@ -326,6 +330,10 @@ func (m *Manager) bindingAndEndpoint(ctx context.Context, taskID string) (domain
 	if !has {
 		return domain.TaskBinding{}, 0, "", appagent.NewError("resolve binding", appagent.ErrKindBindingInvalid,
 			fmt.Errorf("task %s 无持久化 binding（事实来源切换后 runtime 连接 MUST 经 binding 解析）", taskID))
+	}
+	// I7：归属门禁先于 endpoint/凭据派生（同一次 binding 读取）。
+	if oerr := m.checkBindingOwnershipGate(ctx, taskID, binding); oerr != nil {
+		return domain.TaskBinding{}, 0, "", oerr
 	}
 	port, pw, _, eerr := m.bindingEndpoint(binding)
 	if eerr != nil {

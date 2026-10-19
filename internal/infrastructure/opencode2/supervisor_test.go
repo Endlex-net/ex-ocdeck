@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -558,11 +559,12 @@ func stringsHasSuffix(s, suf string) bool {
 
 func TestSupervisor_CrashRepull_Callback(t *testing.T) {
 	// 5.3：server 崩溃 → CheckServerAlive 重拉 → OnServerRestarted 触发
-	//（活跃任务按 binding 重建关联的钩子）。
+	//（活跃任务按 binding 重建关联的钩子；I9：通知已收口至 ensureServer 真实
+	// 恢复状态转换并异步派发——通知体可能取任务锁，同步会与 Resume 成环）。
 	srv := fixtureServer(t, route{path: "/api/session", status: 200, body: string(readFixture(t, "session_list_page2.json"))})
-	var restarts int
+	var restarts atomic.Int32
 	sup, proc, recs := newTestSupervisor(t, srv.URL, nil)
-	sup.deps.OnServerRestarted = func() { restarts++ }
+	sup.deps.OnServerRestarted = func() { restarts.Add(1) }
 	if _, _, err := sup.ensureServer(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -570,16 +572,24 @@ func TestSupervisor_CrashRepull_Callback(t *testing.T) {
 	if err := sup.CheckServerAlive(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if restarts != 0 {
-		t.Fatalf("restarts=%d（首次复用不算重拉）", restarts)
-	}
+	awaitRestarts(t, &restarts, 0)
 	// 崩溃：进程真实死亡（G3-F10——托管单元消失 + pid 身份报不存活，无 ready 篡改）。
 	makeProcDead(sup, proc, recs)
 	if err := sup.CheckServerAlive(context.Background()); err != nil {
 		t.Fatalf("CheckServerAlive: %v", err)
 	}
-	if restarts != 1 {
-		t.Fatalf("restarts=%d（重拉成功触发回调）", restarts)
+	awaitRestarts(t, &restarts, 1)
+}
+
+// awaitRestarts 轮询等待重拉回调计数达标（I9：通知异步派发）。deadline 2s。
+func awaitRestarts(t *testing.T, n *atomic.Int32, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for n.Load() != want && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if n.Load() != want {
+		t.Fatalf("restarts=%d, want %d", n.Load(), want)
 	}
 }
 

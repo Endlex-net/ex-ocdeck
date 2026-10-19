@@ -10,14 +10,22 @@ package task
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/opencode2"
+	"ocdeck/internal/infrastructure/process"
 	"ocdeck/internal/infrastructure/store"
 
 	appagent "ocdeck/internal/application/agentprovider"
@@ -29,6 +37,13 @@ import (
 // （upstream=ses_keep、origin=created）+ 合法 env 快照。
 func seedV2ActiveTask(t *testing.T, db *store.DB, taskID string) {
 	t.Helper()
+	seedV2ActiveTaskUpstream(t, db, taskID, "ses_keep")
+}
+
+// seedV2ActiveTaskUpstream 同 seedV2ActiveTask，upstream 可变（隔离/挂起测试：
+// 同 provider 下多任务各自独立 session 身份）。
+func seedV2ActiveTaskUpstream(t *testing.T, db *store.DB, taskID, upstream string) {
+	t.Helper()
 	now := time.Now().Unix()
 	if _, err := db.Exec(`INSERT INTO projects (id, name, path, default_branch, created_at, kind)
 		 VALUES (?, 'proj', '/repo', 'main', ?, 'repo')`, "p-"+taskID, now); err != nil {
@@ -38,7 +53,7 @@ func seedV2ActiveTask(t *testing.T, db *store.DB, taskID string) {
 		Version:            domain.TaskBindingVersion,
 		ProviderID:         ocdeckstore.ProviderIDV2,
 		ProviderInstanceID: ocdeckstore.ProviderInstanceV2Default,
-		UpstreamSessionID:  "ses_keep",
+		UpstreamSessionID:  upstream,
 		TerminalRef:        "ocdeck-v2-tui-" + taskID,
 		Data:               []byte(`{"port":4096,"directory":"/wt","taskId":"` + taskID + `","origin":"created","auth":{"kind":"derived"}}`),
 	}.Encode()
@@ -166,9 +181,17 @@ func TestStage4_AdoptionCommitConflict_RetryKeepsSameSession(t *testing.T) {
 
 	adapter := NewStoreAdapter(db)
 	proc := newMockProc()
-	m := newTestManagerFull(t, adapter, nil, proc, newMockWorktree(), newMockOC(true))
+	oc := newMockOC(true)
+	m := newTestManagerFull(t, adapter, nil, proc, newMockWorktree(), oc)
 	m.SetLifecycleCtx(ctx)
 	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	// mock 上游列出原 session 集（提交后对齐保留归属行——恢复归属转换断言）。
+	oc.mu.Lock()
+	oc.sessions = []opencode.Session{
+		{ID: "sess-keep", Time: opencode.SessionTime{Created: 1, Updated: 1}},
+		{ID: "sess-child", Time: opencode.SessionTime{Created: 1, Updated: 1}},
+	}
+	oc.mu.Unlock()
 	rec := &recordingV2Sup{upstream: "sess-keep", port: 4096}
 	stream := newFakeAdoptStream()
 	reg := appagent.NewRegistry()
@@ -218,9 +241,13 @@ func TestStage4_AdoptionCommitConflict_RetryKeepsSameSession(t *testing.T) {
 	if err != nil || row.Status != "active" {
 		t.Fatalf("status: %s %v", row.Status, err)
 	}
-	// 归属转换（全部行 v1→v2、session_id 不变、含 parent 链）由 store 层
-	// TestCommitAdoption_Success 覆盖；此处不断言归属行——fake 环境接管后的
-	// SSE 对齐（mock 上游为空）会回收 absent 归属行，属 fake 语义而非承接事务。
+	// 归属转换（评审 I5 断言恢复）：全部行 v1→v2、session_id 不变、含 parent 链。
+	var nV2After, nV1After int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id='t-ad' AND provider_id=?`, ocdeckstore.ProviderIDV2).Scan(&nV2After)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id='t-ad' AND provider_id=?`, ocdeckstore.ProviderIDV1).Scan(&nV1After)
+	if nV2After != 2 || nV1After != 0 {
+		t.Fatalf("ownership conversion: v2=%d v1=%d（session_id 不变的命名空间转换）", nV2After, nV1After)
+	}
 	// pending 丢失如实告知：last_error 指明重新触发（非「已解决」）。
 	if !strings.Contains(row.LastError.String, "pending") || !strings.Contains(row.LastError.String, "重新触发") {
 		t.Fatalf("pending loss must be surfaced in last_error: %q", row.LastError.String)
@@ -332,6 +359,80 @@ func seedBranchBTask(t *testing.T, db *store.DB, taskID string) {
 	}
 }
 
+// seedAdoptAFormTask 种子承接 A 形态任务（真实 store）：v1 binding(sess-keep)@v1 +
+// anchor@v1 + 归属行（父+子）+ env 快照事实（承接失败保留断言用）。pinned 可指定
+//（承接 A 为 v1；R5 用 v2）。
+func seedAdoptAFormTask(t *testing.T, db *store.DB, taskID, pinned string) {
+	t.Helper()
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO projects (id, name, path, default_branch, created_at, kind)
+		 VALUES ('p1','proj','/repo','main',?,'repo')`, now); err != nil {
+		t.Fatal(err)
+	}
+	v1Raw, err := domain.TaskBinding{
+		Version: domain.TaskBindingVersion, ProviderID: ocdeckstore.ProviderIDV1,
+		ProviderInstanceID: ocdeckstore.ProviderInstanceV1Default,
+		UpstreamSessionID:  "sess-keep", TerminalRef: "tui",
+		Data: []byte(`{"port":4000,"directory":"/wt","taskId":"` + taskID + `","auth":{"kind":"derived"}}`),
+	}.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO tasks (id, project_id, name, branch, status, mode, worktree_path,
+		 anchor_session_id, anchor_provider_id, anchor_provider_instance_id, provider_id, task_binding, env_snapshot, created_at, updated_at)
+		 VALUES (?,'p1','task','b','suspended','worktree','/wt','sess-keep','opencode-v1','default',?,?,?, ?, ?)`,
+		taskID, pinned, v1Raw, `{"OCDECK_TASK_ID":"`+taskID+`"}`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, sid := range []string{"sess-keep", "sess-child"} {
+		if _, err := db.Exec(`INSERT INTO task_sessions (task_id, session_id, session_created_at, first_seen_at, last_seen_at, parent_id)
+			 VALUES (?, ?, 1, 1, 1, ?)`, taskID, sid, map[bool]string{true: "", false: "sess-keep"}[sid == "sess-keep"]); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// failResumeV2Sup 是 Resume 恒败（NotFound——原 session 不可读）的 v2 supervisor
+// fake（承接 A 失败出口注入）。
+type failResumeV2Sup struct {
+	resumeCalls int32
+}
+
+func (s *failResumeV2Sup) Acquire(ctx context.Context, t appagent.TaskRef) (domain.TaskBinding, error) {
+	return domain.TaskBinding{}, errors.New("unexpected Acquire")
+}
+
+func (s *failResumeV2Sup) Resume(ctx context.Context, t appagent.TaskRef, b domain.TaskBinding, p appagent.ResumePolicy) (domain.TaskBinding, error) {
+	atomic.AddInt32(&s.resumeCalls, 1)
+	return domain.TaskBinding{}, appagent.NewError("supervisor.resume", appagent.ErrKindNotFound,
+		errors.New("original session unreadable"))
+}
+
+func (s *failResumeV2Sup) AcquireEphemeral(ctx context.Context, t appagent.TaskRef) (domain.TaskBinding, error) {
+	return domain.TaskBinding{}, errors.New("unexpected")
+}
+
+func (s *failResumeV2Sup) Release(ctx context.Context, b domain.TaskBinding) error { return nil }
+
+// handshakeFailV2Provider 包装 recordingV2Sup：Resume 正常、Events 订阅即失败
+//（评审 I10：提交前候选握手失败注入——提交 MUST NOT 发生）。
+type handshakeFailV2Provider struct {
+	v2Stub
+	sup *recordingV2Sup
+}
+
+func (p *handshakeFailV2Provider) Supervisor() appagent.RuntimeSupervisor { return p.sup }
+
+func (p *handshakeFailV2Provider) CheckBindingOwnership(b domain.TaskBinding, expectedTaskID, expectedDirectory string) error {
+	return nil
+}
+
+func (p *handshakeFailV2Provider) BindingRuntimeEndpoint(b domain.TaskBinding) (int, string, string, error) {
+	return p.sup.port, "derived", "/wt", nil
+}
+
+func (p *handshakeFailV2Provider) Events() appagent.EventSource { return failEventsSrc{} }
+
 // newBranchBManager 构造 B 首建测试 Manager（真实 store + machine v2 开关开 +
 // 注入 v2 fake registry）。
 func newBranchBManager(t *testing.T, db *store.DB, sup *branchBV2Sup, sseErr bool) *Manager {
@@ -354,9 +455,10 @@ func newBranchBManager(t *testing.T, db *store.DB, sup *branchBV2Sup, sseErr boo
 
 // TestStage4_AdoptBranchB_E2E_CommitAndTakeover 落实 B 首建端到端（R8→branchB→
 // 提交→接管）：Activate（suspended→activating 既有入口）→ v2 Acquire 建 session →
-// 接管前段 SSE → commitActivationBinding（activating→active CAS + binding）→
-// 提交后段就绪。断言：只 Acquire 不 Resume、binding v2 提交（upstream=本次
-// candidate）、任务 active、钉扎 provider_id 不变（D5 #1）、runtime 注册、零回收。
+// 候选握手（仅缓冲）→ CommitFirstBuild（claim+anchor+binding+activating→active
+// CAS 单事务，评审 I5）→ 提交后正式接管（对齐/事件消费启用）。断言：只 Acquire
+// 不 Resume、binding v2 提交（upstream=本次 candidate）、任务 active、钉扎
+// provider_id 不变（D5 #1）、claim/anchor 落 v2 命名空间、runtime 注册、零回收。
 func TestStage4_AdoptBranchB_E2E_CommitAndTakeover(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir())
@@ -366,7 +468,25 @@ func TestStage4_AdoptBranchB_E2E_CommitAndTakeover(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	seedBranchBTask(t, db, "t-b1")
 	sup := &branchBV2Sup{upstream: "ses_new_1", port: 4096}
-	m := newBranchBManager(t, db, sup, false)
+	adapter := NewStoreAdapter(db)
+	proc := newMockProc()
+	oc := newMockOC(true)
+	m := newTestManagerFull(t, adapter, nil, proc, newMockWorktree(), oc)
+	m.SetLifecycleCtx(ctx)
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg := appagent.NewRegistry()
+	// 钉扎 v1 准入（registryAdmitTask 按 tasks.provider_id 查表）+ v2 fake。
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(&branchBV2Provider{sup: sup}); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+	// mock 上游列出本次 candidate（提交后对齐保留归属行——断言 claim/anchor）。
+	oc.mu.Lock()
+	oc.sessions = []opencode.Session{{ID: "ses_new_1", Time: opencode.SessionTime{Created: 100, Updated: 100}}}
+	oc.mu.Unlock()
 
 	if err := m.Activate(ctx, "t-b1"); err != nil {
 		t.Fatalf("Activate(B first-build): %v", err)
@@ -374,7 +494,6 @@ func TestStage4_AdoptBranchB_E2E_CommitAndTakeover(t *testing.T) {
 	if atomic.LoadInt32(&sup.acquireCalls) != 1 {
 		t.Fatalf("acquire=%d, want 1", atomic.LoadInt32(&sup.acquireCalls))
 	}
-	adapter := NewStoreAdapter(db)
 	got, has, err := adapter.GetTaskBinding(ctx, "t-b1")
 	if err != nil || !has || got.ProviderID != ocdeckstore.ProviderIDV2 || got.UpstreamSessionID != "ses_new_1" {
 		t.Fatalf("binding: %+v has=%v err=%v", got, has, err)
@@ -387,6 +506,17 @@ func TestStage4_AdoptBranchB_E2E_CommitAndTakeover(t *testing.T) {
 	var pinned string
 	if err := db.QueryRow(`SELECT provider_id FROM tasks WHERE id='t-b1'`).Scan(&pinned); err != nil || pinned != ocdeckstore.ProviderIDV1 {
 		t.Fatalf("pinned provider: %q err=%v（钉扎 MUST NOT 漂移）", pinned, err)
+	}
+	// 评审 I5：claim+anchor 单事务落库——归属行 v2 命名空间、anchor 三元组 v2。
+	var nV2, nV1 int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id='t-b1' AND provider_id=?`, ocdeckstore.ProviderIDV2).Scan(&nV2)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id='t-b1' AND provider_id=?`, ocdeckstore.ProviderIDV1).Scan(&nV1)
+	if nV2 != 1 || nV1 != 0 {
+		t.Fatalf("claim rows: v2=%d v1=%d（首建归属 MUST 落 v2 命名空间）", nV2, nV1)
+	}
+	var anchorSID, anchorPID string
+	if err := db.QueryRow(`SELECT anchor_session_id, anchor_provider_id FROM tasks WHERE id='t-b1'`).Scan(&anchorSID, &anchorPID); err != nil || anchorSID != "ses_new_1" || anchorPID != ocdeckstore.ProviderIDV2 {
+		t.Fatalf("anchor: %s/%s err=%v", anchorSID, anchorPID, err)
 	}
 	if m.getRuntime("t-b1") == nil {
 		t.Fatalf("B first-build must register task runtime（正式接管）")
@@ -506,6 +636,9 @@ func (s *atomicResumeSup) AcquireEphemeral(ctx context.Context, t appagent.TaskR
 
 func (s *atomicResumeSup) Release(ctx context.Context, b domain.TaskBinding) error { return nil }
 
+// CheckServerAlive 满足 ServerAvailabilityWarmer（I8 v2 恢复预算序①——fake 恒可用）。
+func (s *atomicResumeSup) CheckServerAlive(ctx context.Context) error { return nil }
+
 // atomicV2Provider 包装 atomicResumeSup（归属校验通过 + 端点解析）。
 type atomicV2Provider struct {
 	v2Stub
@@ -576,6 +709,1117 @@ func TestStage4_OnServerRestarted_RebuildResumesActiveV2Only(t *testing.T) {
 	}
 	row, err := adapter.GetTask(ctx, "t-v2a")
 	if err != nil || row.Status != "active" {
+		t.Fatalf("status: %s %v", row.Status, err)
+	}
+}
+
+// ---- I9 全链确定性：server 死亡 → supervisor 监控自动重拉 → OnServerRestarted
+//（生产接线 = Manager.RebuildV2Associations）→ 活跃任务按 binding 重建关联 ----
+
+// monitorProcSeam 是全链测试的 SupervisorProcSeam fake：serve 托管单元真实监听
+// 端口（生产形态——端口归 serve 进程所有，startServer 的 portOccupied fail-closed
+// 才能如实工作）。
+type monitorProcSeam struct {
+	mu      sync.Mutex
+	unitUp  bool
+	pid     int
+	port    int
+	ln      net.Listener
+	handler http.Handler
+	// onSpawn 在 serve 单元（重新）绑定时回调——模拟「新进程存活」（身份核验
+	// 依据由测试侧持有，测试经此复活 ProcessIdentity 事实）。
+	onSpawn func()
+}
+
+// newMonitorProcSeam 构造并预占一个空闲端口（构造即关闭——端口在 NewSession 时
+// 由 serve 单元绑定，startServer 的占用检查在此前必须看到端口空闲）。
+func newMonitorProcSeam(handler http.Handler) *monitorProcSeam {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return &monitorProcSeam{pid: 4242, port: port, handler: handler}
+}
+
+func (p *monitorProcSeam) NewSession(spec process.SessionSpec) error {
+	port := 0
+	for i, tok := range spec.CmdArgv {
+		if tok == "--port" && i+1 < len(spec.CmdArgv) {
+			port, _ = strconv.Atoi(spec.CmdArgv[i+1])
+		}
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.ln = ln
+	p.unitUp = true
+	onSpawn := p.onSpawn
+	srv := &http.Server{Handler: p.handler}
+	p.mu.Unlock()
+	if onSpawn != nil {
+		onSpawn()
+	}
+	go func() { _ = srv.Serve(ln) }()
+	return nil
+}
+
+func (p *monitorProcSeam) HasSession(name string) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.unitUp, nil
+}
+
+func (p *monitorProcSeam) KillSession(name string) (process.KillResult, error) {
+	p.killUnit()
+	return process.KillResult{}, nil
+}
+
+func (p *monitorProcSeam) SessionPID(name string) (int, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.unitUp {
+		return 0, false, nil
+	}
+	return p.pid, true, nil
+}
+
+func (p *monitorProcSeam) killUnit() {
+	p.mu.Lock()
+	ln := p.ln
+	p.ln = nil
+	p.unitUp = false
+	p.mu.Unlock()
+	if ln != nil {
+		_ = ln.Close()
+	}
+}
+
+// monitorRecordSeam 是全链测试的 RuntimeRecordSeam fake（内存实例记录）。
+type monitorRecordSeam struct {
+	mu  sync.Mutex
+	rec store.ProviderRuntimeRecord
+	has bool
+}
+
+func (s *monitorRecordSeam) GetProviderRuntime(ctx context.Context, providerID, instanceID string) (store.ProviderRuntimeRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rec, s.has, nil
+}
+
+func (s *monitorRecordSeam) PutProviderRuntimeStart(ctx context.Context, providerID, instanceID string, port int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rec = store.ProviderRuntimeRecord{ProviderID: providerID, InstanceID: instanceID, Port: port}
+	s.has = true
+	return nil
+}
+
+func (s *monitorRecordSeam) SetProviderRuntimePID(ctx context.Context, providerID, instanceID string, pid int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rec.PID = sql.NullInt64{Int64: int64(pid), Valid: true}
+	return nil
+}
+
+func (s *monitorRecordSeam) SetProviderRuntimeError(ctx context.Context, providerID, instanceID string, cause string) error {
+	return nil
+}
+
+// supRealV2Provider 用真实 opencode2.V2Supervisor 参与 registry 分派：归属校验
+// 放行、端点从 binding data 解码、Events nil（握手回退 ocFactory——全链测试聚焦
+// supervisor/重建链，SSE 由 mock 承载）。
+type supRealV2Provider struct {
+	v2Stub
+	sup *opencode2.V2Supervisor
+}
+
+func (p *supRealV2Provider) Supervisor() appagent.RuntimeSupervisor { return p.sup }
+
+func (p *supRealV2Provider) CheckBindingOwnership(b domain.TaskBinding, expectedTaskID, expectedDirectory string) error {
+	return nil
+}
+
+func (p *supRealV2Provider) BindingRuntimeEndpoint(b domain.TaskBinding) (int, string, string, error) {
+	var ed struct {
+		Port      int    `json:"port"`
+		Directory string `json:"directory"`
+	}
+	if err := json.Unmarshal(b.Data, &ed); err != nil {
+		return 0, "", "", err
+	}
+	return ed.Port, "derived", ed.Directory, nil
+}
+
+func (p *supRealV2Provider) Events() appagent.EventSource { return nil }
+
+// TestStage4_ServerMonitor_FullChain_DeathToRebuild 落实 I9 生产触发闭环的确定性
+// 全链（不直调 RebuildV2Associations）：真实 V2Supervisor 监控循环发现 server
+// 死亡 → 独立重拉（同端口）→ 「确认重拉成功」异步通知（生产接线 OnServerRestarted
+// = Manager.RebuildV2Associations）→ 活跃 v2 任务经既有恢复入口重建关联（Resume
+// 延续原 session，零 POST——不重复建 session）；首次启动不通知。
+func TestStage4_ServerMonitor_FullChain_DeathToRebuild(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv(appagent.MasterSecretEnv, "test-master-secret")
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	// ① 上游 serve 端口（proc fake 承载真实监听；固定端口跨重启不变）。
+	var getSessionHits, postHits atomic.Int32
+	var identityAlive atomic.Bool
+	procSeam := newMonitorProcSeam(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost:
+			postHits.Add(1) // 重建链 MUST NOT 建 session——任何 POST 即违规信号
+			w.WriteHeader(http.StatusNotFound)
+		case r.URL.Path == "/api/session/ses_keep":
+			getSessionHits.Add(1)
+			_, _ = w.Write([]byte(`{"data":{"id":"ses_keep","location":{"directory":"/wt"},"time":{"created":1,"updated":1}}}`))
+		default:
+			_, _ = w.Write([]byte(`{"data":[],"cursor":{"previous":null,"next":null}}`))
+		}
+	}))
+	procSeam.onSpawn = func() { identityAlive.Store(true) } // 重绑 = 新进程存活
+	ocPort := procSeam.port
+
+	// ② 种子 active v2 任务（binding data 端口 = 实际上游端口——Resume 端口一致性
+	// fail-closed 校验要求）。
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO projects (id, name, path, default_branch, created_at, kind)
+		 VALUES ('p-fc','proj','/repo','main',?,'repo')`, now); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := domain.TaskBinding{
+		Version:            domain.TaskBindingVersion,
+		ProviderID:         ocdeckstore.ProviderIDV2,
+		ProviderInstanceID: ocdeckstore.ProviderInstanceV2Default,
+		UpstreamSessionID:  "ses_keep",
+		TerminalRef:        "ocdeck-v2-tui-t-fc",
+		Data:               []byte(fmt.Sprintf(`{"port":%d,"directory":"/wt","taskId":"t-fc","origin":"created","auth":{"kind":"derived"}}`, ocPort)),
+	}.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, serr := encodeEnvSnapshot(envSnapshot{Vars: map[string]string{"OCDECK_TASK_ID": "t-fc"}})
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	if _, err := db.Exec(`INSERT INTO tasks (id, project_id, name, branch, status, worktree_path,
+		 provider_id, task_binding, env_snapshot, created_at, updated_at)
+		 VALUES ('t-fc','p-fc','task','b','active','/wt',?,?,?,?,?)`,
+		ocdeckstore.ProviderIDV2, raw, snap, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// ③ Manager + 真实 V2Supervisor（OnServerRestarted = 生产接线 Rebuild）。
+	adapter := NewStoreAdapter(db)
+	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m.SetLifecycleCtx(ctx)
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	proc := procSeam
+	recs := &monitorRecordSeam{}
+	identityAlive.Store(true)
+	sup := opencode2.NewV2Supervisor(opencode2.SupervisorDeps{
+		Proc:  proc,
+		Store: recs,
+		Env:   NewV2TaskEnvSeam(m), // 生产装配同源：created 恢复应用同代 env 快照
+		AllocatePort: func(int, bool, int) (int, error) {
+			return ocPort, nil
+		},
+		ProcessIdentity: func(pid int) (string, bool, error) {
+			if identityAlive.Load() && pid == 4242 {
+				return fmt.Sprintf("opencode serve --port %d --hostname 127.0.0.1", ocPort), true, nil
+			}
+			return "", false, nil
+		},
+		OnServerRestarted: m.RebuildV2Associations,
+		MonitorInterval:   5 * time.Millisecond,
+		PollInterval:      5 * time.Millisecond,
+		ReadyTimeout:      500 * time.Millisecond,
+		StartAttempts:     2,
+	})
+	t.Cleanup(func() { _ = sup.ShutdownServer(ctx) })
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(&supRealV2Provider{sup: sup}); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+	m.setRuntime("t-fc", m.newRuntime("t-fc"))
+
+	// ④ 业务入口预热（首次启动：监控后置启动；首启不通知——无重建请求面）。
+	if err := sup.CheckServerAlive(ctx); err != nil {
+		t.Fatalf("warmup CheckServerAlive: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond) // 数个监控周期
+	hitsAfterWarm := getSessionHits.Load()
+	if postHits.Load() != 0 {
+		t.Fatalf("first start must not trigger rebuild, POSTs=%d", postHits.Load())
+	}
+
+	// ⑤ server 真实死亡：监听关闭 + 托管单元消失 + pid 身份报死（无任何显式
+	// CheckServerAlive 调用——生产触发 owner 是监控循环）。
+	proc.killUnit()
+	identityAlive.Store(false)
+
+	// ⑦ 轮询：监控自动发现 → 独立重拉（NewSession 重绑同端口）→ 通知 → Rebuild
+	// → Resume 验证原 session（GET 命中）。
+	deadline := time.Now().Add(5 * time.Second)
+	for getSessionHits.Load() <= hitsAfterWarm && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if getSessionHits.Load() <= hitsAfterWarm {
+		t.Fatalf("monitor did not auto-repull and rebuild (GET hits=%d, warm=%d)", getSessionHits.Load(), hitsAfterWarm)
+	}
+	time.Sleep(100 * time.Millisecond) // 重建链收尾（提交/接管）
+	if postHits.Load() != 0 {
+		t.Fatalf("rebuild MUST NOT create sessions, POSTs=%d", postHits.Load())
+	}
+	got, has, gerr := adapter.GetTaskBinding(ctx, "t-fc")
+	if gerr != nil || !has || got.UpstreamSessionID != "ses_keep" {
+		t.Fatalf("binding continuity: %+v has=%v err=%v", got, has, gerr)
+	}
+	frow, ferr := adapter.GetTask(ctx, "t-fc")
+	if ferr != nil || frow.Status != "active" {
+		t.Fatalf("status: %s %v lastError=%q", frow.Status, ferr, frow.LastError.String)
+	}
+}
+
+// ---- I8 确定性：server 可用性失败 = 停止报告（保留现状 + 阶段结果），不进
+// 预算循环、不终态补偿 ----
+
+// stopReportV2Provider 包装 supervisor 并可注入 warmer 故障（CheckServerAlive
+// 恒败 = supervisor 独立重试耗尽的确定性注入）。
+type stopReportV2Provider struct {
+	v2Stub
+	sup appagent.RuntimeSupervisor
+}
+
+func (p *stopReportV2Provider) Supervisor() appagent.RuntimeSupervisor { return p.sup }
+
+func (p *stopReportV2Provider) CheckBindingOwnership(b domain.TaskBinding, expectedTaskID, expectedDirectory string) error {
+	return nil
+}
+
+func (p *stopReportV2Provider) BindingRuntimeEndpoint(b domain.TaskBinding) (int, string, string, error) {
+	return 4096, "derived", "/wt", nil
+}
+
+func (p *stopReportV2Provider) Events() appagent.EventSource { return nil }
+
+// TestStage4_V2Recovery_ServerUnavailable_StopReport 落实 D4/D5：共享 server
+// 可用性失败（supervisor 独立重试耗尽）→ 停止、保留现状（activating）、last_error
+// 提交用户决策的明确阶段结果——MUST NOT 终态补偿（非 suspended）、任务 permit
+// 零消耗（permit 恰在 server 可用后才扣）。
+func TestStage4_V2Recovery_ServerUnavailable_StopReport(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-sr")
+
+	adapter := NewStoreAdapter(db)
+	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m.SetLifecycleCtx(ctx)
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	sup := &recordingV2Sup{upstream: "ses_keep", port: 4096}
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(&stopReportV2Provider{sup: sup}); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+	m.setRuntime("t-sr", m.newRuntime("t-sr"))
+	// warmer 故障注入（recordingV2Sup 恒可用——此处覆写为恒败）。
+	warmFail := &warmFailSup{recordingV2Sup: sup}
+	reg2 := appagent.NewRegistry()
+	if err := reg2.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg2.Register(&stopReportV2Provider{sup: warmFail}); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg2
+
+	m.RebuildV2Associations() // 通知体：内部 go ensureRecovery（异步——下方轮询收口）
+	// 轮询至 stop-report 落定（activating 保持 + 阶段结果 last_error）。
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		row, err := adapter.GetTask(ctx, "t-sr")
+		if err == nil && row.LastError.Valid && strings.Contains(row.LastError.String, "保留现状") {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	row, err := adapter.GetTask(ctx, "t-sr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != "activating" {
+		t.Fatalf("stop-report must keep current status (activating), got %s (lastError=%q)", row.Status, row.LastError.String)
+	}
+	if !row.LastError.Valid || !strings.Contains(row.LastError.String, "保留现状") {
+		t.Fatalf("stage result must be distinguishable in last_error: %q", row.LastError.String)
+	}
+	if sup.resumeCalls != 0 {
+		t.Fatalf("session verification MUST NOT run after server availability failure, resumes=%d", sup.resumeCalls)
+	}
+}
+
+// warmFailSup 覆写 CheckServerAlive 为恒败（其余行为委托 recordingV2Sup）。
+type warmFailSup struct {
+	*recordingV2Sup
+}
+
+func (s *warmFailSup) CheckServerAlive(ctx context.Context) error {
+	return errors.New("server 启动重试耗尽（注入）")
+}
+
+// ---- 批次 2：I2（Suspend v2 分派）/ I3（终端 attach）/ I6（attention 桥）/ I7（ownership 门禁）----
+
+// v2BindingFor 构造测试 v2 binding（port 4096/dir /wt/origin created；隔离与
+// 挂起测试的多任务身份用）。
+func v2BindingFor(taskID, upstream string) domain.TaskBinding {
+	raw, _ := json.Marshal(map[string]any{
+		"port": 4096, "directory": "/wt", "taskId": taskID,
+		"origin": "created", "auth": map[string]string{"kind": "derived"},
+	})
+	return domain.TaskBinding{
+		Version:            domain.TaskBindingVersion,
+		ProviderID:         ocdeckstore.ProviderIDV2,
+		ProviderInstanceID: ocdeckstore.ProviderInstanceV2Default,
+		UpstreamSessionID:  upstream,
+		TerminalRef:        "ocdeck-v2-tui-" + taskID,
+		Data:               raw,
+	}
+}
+
+// suspendV2Sup 记录 Release 停止路径的 binding upstream（评审 I2）。
+type suspendV2Sup struct {
+	mu         sync.Mutex
+	released   []string
+	releaseN   int32
+	releaseErr error
+}
+
+func (s *suspendV2Sup) Acquire(ctx context.Context, t appagent.TaskRef) (domain.TaskBinding, error) {
+	return domain.TaskBinding{}, errors.New("unexpected Acquire")
+}
+
+func (s *suspendV2Sup) Resume(ctx context.Context, t appagent.TaskRef, b domain.TaskBinding, p appagent.ResumePolicy) (domain.TaskBinding, error) {
+	return domain.TaskBinding{}, errors.New("unexpected Resume")
+}
+
+func (s *suspendV2Sup) AcquireEphemeral(ctx context.Context, t appagent.TaskRef) (domain.TaskBinding, error) {
+	return domain.TaskBinding{}, errors.New("unexpected AcquireEphemeral")
+}
+
+func (s *suspendV2Sup) Release(ctx context.Context, b domain.TaskBinding) error {
+	atomic.AddInt32(&s.releaseN, 1)
+	s.mu.Lock()
+	s.released = append(s.released, b.UpstreamSessionID)
+	s.mu.Unlock()
+	return s.releaseErr
+}
+
+func (s *suspendV2Sup) releasedSnapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.released...)
+}
+
+// fakeTerminal 记录 EnsureTerminal 入参并按注入结果应答（评审 I3：预验证先于
+// 创建的顺序断言）。
+type fakeTerminal struct {
+	ensureGot domain.TaskBinding
+	ensureErr error
+	argvCalls int32
+}
+
+func (f *fakeTerminal) EnsureTerminal(ctx context.Context, b domain.TaskBinding) (string, error) {
+	f.ensureGot = b
+	if f.ensureErr != nil {
+		return "", f.ensureErr
+	}
+	return b.TerminalRef, nil
+}
+
+func (f *fakeTerminal) AttachCommand(ctx context.Context, b domain.TaskBinding) ([]string, error) {
+	atomic.AddInt32(&f.argvCalls, 1)
+	return []string{"opencode", "--server", "http://127.0.0.1:4096", "--session", b.UpstreamSessionID}, nil
+}
+
+// suspendV2Provider：supervisor/归属校验/endpoint 计数/Terminal 可配置
+//（评审 I2/I3/I7 共用 fake）。
+type suspendV2Provider struct {
+	v2Stub
+	sup           *suspendV2Sup
+	ownershipErr  error
+	endpointCalls int32
+	terminal      appagent.TerminalIO
+	sessions      appagent.SessionControl
+}
+
+func (p *suspendV2Provider) Supervisor() appagent.RuntimeSupervisor { return p.sup }
+
+func (p *suspendV2Provider) CheckBindingOwnership(b domain.TaskBinding, expectedTaskID, expectedDirectory string) error {
+	return p.ownershipErr
+}
+
+func (p *suspendV2Provider) BindingRuntimeEndpoint(b domain.TaskBinding) (int, string, string, error) {
+	atomic.AddInt32(&p.endpointCalls, 1)
+	return 4096, "derived", "/wt", nil
+}
+
+func (p *suspendV2Provider) Terminal() appagent.TerminalIO {
+	if p.terminal != nil {
+		return p.terminal
+	}
+	return v2Stub{}.Terminal()
+}
+
+func (p *suspendV2Provider) Sessions() appagent.SessionControl { return p.sessions }
+
+// newSuspendManager 构造挂起/终端测试 Manager（真实 store + v2 fake registry）。
+func newSuspendManager(t *testing.T, db *store.DB, prov *suspendV2Provider) *Manager {
+	t.Helper()
+	adapter := NewStoreAdapter(db)
+	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m.SetLifecycleCtx(context.Background())
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(prov); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+	return m
+}
+
+// TestStage4_Suspend_V2_StopOK_SuspendsAndReclaimsLocalUnits 落实评审 I2（停止
+// 成功侧）：Manager.Suspend 经实际 binding 分派 v2 supervisor（Release=停止，
+// 上游=真实 upstream）→ 收敛 suspended；本地自有单元（v2 TUI/shell）回收；
+// v1 serve/runtime 单元判定不参与（无强杀、无修复树）。
+func TestStage4_Suspend_V2_StopOK_SuspendsAndReclaimsLocalUnits(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-s1")
+	prov := &suspendV2Provider{sup: &suspendV2Sup{}}
+	m := newSuspendManager(t, db, prov)
+	proc := m.proc.(*mockProc)
+	proc.mu.Lock()
+	proc.sessions["ocdeck-v2-tui-t-s1"] = true
+	proc.sessions["ocdeck-t-s1-shell-1"] = true
+	proc.mu.Unlock()
+
+	if err := m.Suspend(ctx, "t-s1"); err != nil {
+		t.Fatalf("Suspend(v2): %v", err)
+	}
+	if got := prov.sup.releasedSnapshot(); len(got) != 1 || got[0] != "ses_keep" {
+		t.Fatalf("stop must target real upstream session: %v", got)
+	}
+	adapter := NewStoreAdapter(db)
+	row, err := adapter.GetTask(ctx, "t-s1")
+	if err != nil || row.Status != "suspended" {
+		t.Fatalf("status: %s %v", row.Status, err)
+	}
+	proc.mu.Lock()
+	_, tuiLeft := proc.sessions["ocdeck-v2-tui-t-s1"]
+	_, shellLeft := proc.sessions["ocdeck-t-s1-shell-1"]
+	proc.mu.Unlock()
+	if tuiLeft || shellLeft {
+		t.Fatalf("local units must be reclaimed (tui=%v shell=%v)", tuiLeft, shellLeft)
+	}
+	for _, name := range proc.killOrder {
+		if name == runtimeSessionName("t-s1") || name == serveSessionName("t-s1") {
+			t.Fatalf("v1 unit %s must not participate in v2 suspend", name)
+		}
+	}
+}
+
+// TestStage4_Suspend_V2_StopFail_KeepsActive 落实 D4 挂起行失败侧：停止失败 →
+// 保持 active + last_error、保留运行关联（不 clearRuntime、不进 v1 强杀补偿、
+// 不清 env 快照）。
+func TestStage4_Suspend_V2_StopFail_KeepsActive(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-s2")
+	prov := &suspendV2Provider{sup: &suspendV2Sup{releaseErr: appagent.NewError("supervisor.release",
+		appagent.ErrKindRuntimeUnavailable, errors.New("interrupt failed"))}}
+	m := newSuspendManager(t, db, prov)
+	rt := m.newRuntime("t-s2")
+	m.setRuntime("t-s2", rt)
+
+	if err := m.Suspend(ctx, "t-s2"); err == nil || !strings.Contains(err.Error(), "suspend stop") {
+		t.Fatalf("expect suspend stop failure, got %v", err)
+	}
+	adapter := NewStoreAdapter(db)
+	row, err := adapter.GetTask(ctx, "t-s2")
+	if err != nil || row.Status != "active" {
+		t.Fatalf("status: %s %v（停止失败保持 active）", row.Status, err)
+	}
+	if !strings.Contains(row.LastError.String, "suspend stop failed") {
+		t.Fatalf("last_error: %q", row.LastError.String)
+	}
+	if m.getRuntime("t-s2") == nil {
+		t.Fatalf("running association must be kept（不 clearRuntime）")
+	}
+	if atomic.LoadInt32(&prov.sup.releaseN) != 1 {
+		t.Fatalf("release attempts=%d, want 1", atomic.LoadInt32(&prov.sup.releaseN))
+	}
+}
+
+// TestStage4_Suspend_V2_OwnershipFail_BeforeEndpoint 落实评审 I7：归属校验失败
+// 先于凭据派生与停止副作用——Release 与 endpoint 解析计数均为零。
+func TestStage4_Suspend_V2_OwnershipFail_BeforeEndpoint(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-s3")
+	prov := &suspendV2Provider{
+		sup:          &suspendV2Sup{},
+		ownershipErr: appagent.NewError("ownership", appagent.ErrKindBindingInvalid, errors.New("not owner")),
+	}
+	m := newSuspendManager(t, db, prov)
+
+	if err := m.Suspend(ctx, "t-s3"); err == nil {
+		t.Fatalf("ownership failure must reject suspend")
+	}
+	if atomic.LoadInt32(&prov.sup.releaseN) != 0 {
+		t.Fatalf("release must not run before ownership check")
+	}
+	if atomic.LoadInt32(&prov.endpointCalls) != 0 {
+		t.Fatalf("endpoint/credential derivation must not run before ownership check, calls=%d", prov.endpointCalls)
+	}
+	adapter := NewStoreAdapter(db)
+	row, err := adapter.GetTask(ctx, "t-s3")
+	if err != nil || row.Status != "active" {
+		t.Fatalf("status: %s %v（零副作用准入）", row.Status, err)
+	}
+}
+
+// TestStage4_Suspend_V2_Isolation_ANotB 落实任务隔离（D9）：同 server 双任务
+// ——A 挂起仅停止 A 的 upstream session；B 零触达、保持 active。
+func TestStage4_Suspend_V2_Isolation_ANotB(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTaskUpstream(t, db, "t-a", "ses_a")
+	seedV2ActiveTaskUpstream(t, db, "t-b", "ses_b")
+	prov := &suspendV2Provider{sup: &suspendV2Sup{}}
+	m := newSuspendManager(t, db, prov)
+
+	if err := m.Suspend(ctx, "t-a"); err != nil {
+		t.Fatalf("Suspend(A): %v", err)
+	}
+	got := prov.sup.releasedSnapshot()
+	if len(got) != 1 || got[0] != "ses_a" {
+		t.Fatalf("only A upstream must be stopped: %v", got)
+	}
+	adapter := NewStoreAdapter(db)
+	rowB, err := adapter.GetTask(ctx, "t-b")
+	if err != nil || rowB.Status != "active" {
+		t.Fatalf("B status: %s %v（A 挂起不影响 B）", rowB.Status, err)
+	}
+}
+
+// TestStage4_ReopenAttach_V2_TUIUnit 落实评审 I3：v2 终端 attach——EnsureTerminal
+// 预验证先于创建；幂等创建 ocdeck-v2-tui-<taskID>（AttachCommand argv + 派生
+// 凭据 env OPENCODE_SERVER_PASSWORD + worktree dir）；预验证失败零创建。
+func TestStage4_ReopenAttach_V2_TUIUnit(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-at")
+	term := &fakeTerminal{}
+	prov := &suspendV2Provider{sup: &suspendV2Sup{}, terminal: term}
+	m := newSuspendManager(t, db, prov)
+	proc := m.proc.(*mockProc)
+
+	// ① 预验证失败（NotFound）→ typed not_found 且零创建（顺序断言）。
+	term.ensureErr = appagent.NewError("terminal.ensure", appagent.ErrKindNotFound, errors.New("session gone"))
+	if _, err := m.ReopenAttach(ctx, "t-at"); err == nil || OpErrorCode(err) != codeNotFound {
+		t.Fatalf("expect not_found, got %v", err)
+	}
+	if n := len(proc.newSessionNames); n != 0 {
+		t.Fatalf("prevalidation failure must not create unit, created=%v", proc.newSessionNames)
+	}
+
+	// ② 预验证通过 → 幂等创建：argv/env/目录断言。
+	term.ensureErr = nil
+	tid, err := m.ReopenAttach(ctx, "t-at")
+	if err != nil {
+		t.Fatalf("ReopenAttach(v2): %v", err)
+	}
+	ref := "ocdeck-v2-tui-t-at"
+	if string(tid) != ref {
+		t.Fatalf("terminal id: %q want %q", tid, ref)
+	}
+	proc.mu.Lock()
+	argv := proc.cmdArgvValues[ref]
+	env := proc.envValues[ref]
+	proc.mu.Unlock()
+	if len(argv) != 5 || argv[2] != "http://127.0.0.1:4096" || argv[4] != "ses_keep" {
+		t.Fatalf("attach argv: %v（自动选中机制 D8-7）", argv)
+	}
+	if env["OPENCODE_SERVER_PASSWORD"] == "" {
+		t.Fatalf("derived credential env missing")
+	}
+	if atomic.LoadInt32(&term.argvCalls) != 1 {
+		t.Fatalf("AttachCommand calls=%d, want 1", term.argvCalls)
+	}
+
+	// ③ 幂等：单元已在 → 不重复创建，同一 ID。
+	tid2, err := m.ReopenAttach(ctx, "t-at")
+	if err != nil || tid2 != tid {
+		t.Fatalf("idempotent reopen: %q %v", tid2, err)
+	}
+	proc.mu.Lock()
+	count := 0
+	for _, n := range proc.newSessionNames {
+		if n == ref {
+			count++
+		}
+	}
+	proc.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("unit must be created exactly once, created %d times", count)
+	}
+}
+
+// TestStage4_ReopenAttach_V2_OwnershipFail_BeforeEndpoint 落实评审 I7（终端
+// 入口同门禁）：归属失败先于凭据派生（endpoint 计数为零）。
+func TestStage4_ReopenAttach_V2_OwnershipFail_BeforeEndpoint(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-at2")
+	prov := &suspendV2Provider{
+		sup:          &suspendV2Sup{},
+		ownershipErr: appagent.NewError("ownership", appagent.ErrKindBindingInvalid, errors.New("not owner")),
+		terminal:     &fakeTerminal{},
+	}
+	m := newSuspendManager(t, db, prov)
+	if _, err := m.ReopenAttach(ctx, "t-at2"); err == nil || OpErrorCode(err) != codeConflict {
+		t.Fatalf("expect conflict, got %v", err)
+	}
+	if atomic.LoadInt32(&prov.endpointCalls) != 0 {
+		t.Fatalf("endpoint must not run before ownership check")
+	}
+}
+
+// ---- I6：attention 桥真实 session 身份 ----
+
+// recordingAttention 记录 AttentionIO 入参（bridge 消费断言）。
+type recordingAttention struct {
+	mu        sync.Mutex
+	listKeys  []domain.SessionKey
+	perms     []domain.PermissionPayload
+	replySess []string
+	replyIDs  []string
+}
+
+func (a *recordingAttention) ListPermissions(ctx context.Context, b domain.TaskBinding, s domain.SessionKey) ([]domain.PermissionPayload, error) {
+	a.mu.Lock()
+	a.listKeys = append(a.listKeys, s)
+	a.mu.Unlock()
+	return []domain.PermissionPayload{{ID: "per_" + s.UpstreamID, SessionID: s.UpstreamID, Permission: "bash"}}, nil
+}
+
+func (a *recordingAttention) ListQuestions(ctx context.Context, b domain.TaskBinding, s domain.SessionKey) ([]domain.QuestionPayload, error) {
+	a.mu.Lock()
+	a.listKeys = append(a.listKeys, s)
+	a.mu.Unlock()
+	return nil, nil
+}
+
+func (a *recordingAttention) Reply(ctx context.Context, b domain.TaskBinding, at domain.Attention, reply appagent.AttentionReply) error {
+	a.mu.Lock()
+	a.replySess = append(a.replySess, at.Session.UpstreamID)
+	a.replyIDs = append(a.replyIDs, at.ID)
+	a.mu.Unlock()
+	return nil
+}
+
+// stubSessions 非 nil 占位（bridgeClientFor 的能力出口门禁）。
+type stubSessions struct{}
+
+func (stubSessions) Create(ctx context.Context, b domain.TaskBinding) (domain.AgentSession, error) {
+	return domain.AgentSession{}, errors.New("unexpected")
+}
+func (stubSessions) Get(ctx context.Context, b domain.TaskBinding, k domain.SessionKey) (domain.AgentSession, error) {
+	return domain.AgentSession{}, errors.New("unexpected")
+}
+func (stubSessions) Delete(ctx context.Context, b domain.TaskBinding, k domain.SessionKey) error {
+	return errors.New("unexpected")
+}
+func (stubSessions) List(ctx context.Context, b domain.TaskBinding) (appagent.ListResult, error) {
+	return appagent.ListResult{}, errors.New("unexpected")
+}
+
+// TestStage4_Bridge_V2_Attention_CarriesRealSession 落实评审 I6：v2 桥——列表
+// 按归属 session 集合逐 session 聚合；回复从 attention 事实携带真实 sessionID
+//（MUST NOT 用 requestID 冒充 session）。
+func TestStage4_Bridge_V2_Attention_CarriesRealSession(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTaskUpstream(t, db, "t-br", "ses_main")
+	adapter := NewStoreAdapter(db)
+	now := time.Now().Unix()
+	for _, up := range []string{"ses_a", "ses_b"} {
+		if _, err := adapter.ClaimTaskSessionKey(ctx, "t-br",
+			domain.SessionKey{ProviderID: ocdeckstore.ProviderIDV2, ProviderInstanceID: ocdeckstore.ProviderInstanceV2Default, UpstreamID: up},
+			now, now, now, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	att := &recordingAttention{}
+	prov := &suspendV2Provider{sup: &suspendV2Sup{}, sessions: stubSessions{}}
+	m := newSuspendManager(t, db, prov)
+	// 注入 recording attention：bridgeClientFor 经 providerFor 取 Provider——
+	// suspendV2Provider 的 Attention 走 v2Stub（nil）会令桥构造后退回 fallback？
+	// 不——桥构造只查 Sessions() 非 nil；Attention 经 p.Attention() 调用。
+	// 用包装 provider 覆盖 Attention。
+	provWithAtt := &attentionV2Provider{suspendV2Provider: *prov, att: att}
+	reg := appagent.NewRegistry()
+	if err := reg.Register(provWithAtt); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+
+	rt := m.newRuntime("t-br")
+	rt.attention = newAttentionState()
+	rt.attention.applyAttentionEvent(appagent.AttentionEvent{
+		Kind: appagent.AttentionAsked, Type: appagent.AttentionPermission,
+		RequestID: "per_1", SessionID: "ses_a", Permission: "bash",
+	})
+	m.setRuntime("t-br", rt)
+
+	binding := v2BindingFor("t-br", "ses_main")
+	data := &opencodeBindingData{ProviderID: ocdeckstore.ProviderIDV2, Port: 4096, Directory: "/wt", TaskID: "t-br"}
+	bridge := m.bridgeClientFor(data, binding, m.ocFactory(ocdeckstore.ProviderIDV2, 4096, "pw", appagent.Options{}))
+	if bridge == nil {
+		t.Fatalf("bridge must be constructed for provider with capability exits")
+	}
+
+	// 列表：按归属 session 集合聚合（ses_a/ses_b 各一次——main session 未 claim
+	// 不参与；上游返回按 session 标识拼接可验证聚合）。
+	perms, err := bridge.ListPermissions(ctx, "/wt")
+	if err != nil {
+		t.Fatalf("ListPermissions: %v", err)
+	}
+	if len(perms) != 2 {
+		t.Fatalf("aggregated permissions=%d, want 2 (per_ses_a + per_ses_b)", len(perms))
+	}
+	gotKeys := map[string]bool{}
+	for _, k := range att.listKeys {
+		gotKeys[k.UpstreamID] = true
+	}
+	if !gotKeys["ses_a"] || !gotKeys["ses_b"] {
+		t.Fatalf("list must query owned sessions: %v", gotKeys)
+	}
+
+	// 回复：真实 sessionID（ses_a——attention 事实），非 requestID。
+	if err := bridge.ReplyPermission(ctx, "/wt", "per_1", "once"); err != nil {
+		t.Fatalf("ReplyPermission: %v", err)
+	}
+	if len(att.replySess) != 1 || att.replySess[0] != "ses_a" || att.replyIDs[0] != "per_1" {
+		t.Fatalf("reply must carry real session id: sess=%v ids=%v", att.replySess, att.replyIDs)
+	}
+}
+
+// attentionV2Provider 在 suspendV2Provider 上覆盖 Attention 出口（桥测试注入）。
+type attentionV2Provider struct {
+	suspendV2Provider
+	att *recordingAttention
+}
+
+func (p *attentionV2Provider) Attention() appagent.AttentionIO { return p.att }
+
+// ---- 评审 I1：承接 A 经公开入口可达 + 失败保留全部旧事实 ----
+
+// supOnlyV2Provider 通用 v2 provider 测试 fake：任意 RuntimeSupervisor + 可选
+// EventSource（nil = 无 EventSource 测试接缝形态）；归属校验通过、端点同端口。
+type supOnlyV2Provider struct {
+	v2Stub
+	sup    appagent.RuntimeSupervisor
+	events appagent.EventSource
+}
+
+func (p *supOnlyV2Provider) Supervisor() appagent.RuntimeSupervisor { return p.sup }
+
+func (p *supOnlyV2Provider) CheckBindingOwnership(b domain.TaskBinding, expectedTaskID, expectedDirectory string) error {
+	return nil
+}
+
+func (p *supOnlyV2Provider) BindingRuntimeEndpoint(b domain.TaskBinding) (int, string, string, error) {
+	return 4096, "derived", "/wt", nil
+}
+
+func (p *supOnlyV2Provider) Events() appagent.EventSource { return p.events }
+
+// newAdoptATestManager 构造承接 A 测试 Manager（真实 store + machine v2 开 + v1
+// 钉扎准入 + 指定 v2 fake provider）。
+func newAdoptATestManager(t *testing.T, db *store.DB, v2prov appagent.Provider) *Manager {
+	t.Helper()
+	adapter := NewStoreAdapter(db)
+	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m.SetLifecycleCtx(context.Background())
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(v2prov); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+	return m
+}
+
+// adoptAFactsSnapshot 读取承接 A 的旧事实（status/anchor upstream/归属行 v1 数/
+// env 快照原文），供失败保留断言。
+func adoptAFactsSnapshot(t *testing.T, db *store.DB, taskID string) (status, upstream string, nV1 int, env string) {
+	t.Helper()
+	_ = db.QueryRow(`SELECT status FROM tasks WHERE id=?`, taskID).Scan(&status)
+	_ = db.QueryRow(`SELECT anchor_session_id FROM tasks WHERE id=?`, taskID).Scan(&upstream)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id=? AND provider_id=?`,
+		taskID, ocdeckstore.ProviderIDV1).Scan(&nV1)
+	_ = db.QueryRow(`SELECT COALESCE(env_snapshot,'') FROM tasks WHERE id=?`, taskID).Scan(&env)
+	return
+}
+
+// TestStage4_AdoptA_ViaActivate_FailureKeepsAllOldFacts 落实评审 I1：承接 A 经公开
+// Activate 可达（suspended→active 守卫，不经 activating），Resume 失败（原
+// session 不可读）→ 零状态副作用、保留全部旧事实（suspended/v1 binding/归属行/
+// env 快照），MUST NOT 走普通激活补偿（不清 env 快照）。
+func TestStage4_AdoptA_ViaActivate_FailureKeepsAllOldFacts(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedAdoptAFormTask(t, db, "t-a1", ocdeckstore.ProviderIDV1)
+	failSup := &failResumeV2Sup{}
+	m := newAdoptATestManager(t, db, &supOnlyV2Provider{sup: failSup})
+
+	aerr := m.Activate(ctx, "t-a1")
+	if aerr == nil || !strings.Contains(aerr.Error(), "original session unreadable") {
+		t.Fatalf("expect adoption failure, got %v", aerr)
+	}
+	if atomic.LoadInt32(&failSup.resumeCalls) != 1 {
+		t.Fatalf("resume=%d（承接 A 经 Activate 分派）", atomic.LoadInt32(&failSup.resumeCalls))
+	}
+	status, upstream, nV1, env := adoptAFactsSnapshot(t, db, "t-a1")
+	if status != "suspended" {
+		t.Fatalf("status=%s（零状态副作用——不经 activating/补偿回退）", status)
+	}
+	if upstream != "sess-keep" || nV1 != 2 {
+		t.Fatalf("old facts must be intact: upstream=%s nV1=%d", upstream, nV1)
+	}
+	if !strings.Contains(env, "OCDECK_TASK_ID") {
+		t.Fatalf("env snapshot must be preserved（承接失败不走普通激活补偿）: %q", env)
+	}
+}
+
+// TestStage4_AdoptA_ViaActivate_SuccessKeepsSameSession 落实评审 I1 成功面：承接 A
+// 经公开 Activate → 单事务承接提交（binding v2、upstream=原 session、active），
+// 只 Resume 不 Acquire。
+func TestStage4_AdoptA_ViaActivate_SuccessKeepsSameSession(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedAdoptAFormTask(t, db, "t-a2", ocdeckstore.ProviderIDV1)
+	rec := &recordingV2Sup{upstream: "sess-keep", port: 4096}
+	m := newAdoptATestManager(t, db, &supOnlyV2Provider{sup: rec})
+
+	if err := m.Activate(ctx, "t-a2"); err != nil {
+		t.Fatalf("Activate(adopt A): %v", err)
+	}
+	if rec.resumeCalls != 1 || rec.acquireCalls != 0 {
+		t.Fatalf("resume=%d acquire=%d（承接 A 只 Resume——延续原 session）", rec.resumeCalls, rec.acquireCalls)
+	}
+	adapter := NewStoreAdapter(db)
+	got, has, err := adapter.GetTaskBinding(ctx, "t-a2")
+	if err != nil || !has || got.ProviderID != ocdeckstore.ProviderIDV2 || got.UpstreamSessionID != "sess-keep" {
+		t.Fatalf("binding: %+v has=%v err=%v", got, has, err)
+	}
+	row, err := adapter.GetTask(ctx, "t-a2")
+	if err != nil || row.Status != "active" {
+		t.Fatalf("status: %s %v", row.Status, err)
+	}
+}
+
+// TestStage4_AdoptA_ViaRecovery_KeepsFactsOnFailure 落实评审 I1 恢复面：active 存量
+// 任务的恢复入口（ensureRecovery）先解析路径——承接 A 走 active→active 守卫专用
+// 出口（MUST NOT 写 activating）；Resume 失败保留全部旧事实（active/v1 binding/
+// 归属行/env 快照）。
+func TestStage4_AdoptA_ViaRecovery_KeepsFactsOnFailure(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedAdoptAFormTask(t, db, "t-a3", ocdeckstore.ProviderIDV1)
+	if _, err := db.Exec(`UPDATE tasks SET status='active' WHERE id='t-a3'`); err != nil {
+		t.Fatal(err)
+	}
+	failSup := &failResumeV2Sup{}
+	m := newAdoptATestManager(t, db, &supOnlyV2Provider{sup: failSup})
+	// ensureRecovery 前置校验要求注册表 runtime + token 匹配（watcher 语义）。
+	rt := m.newRuntime("t-a3")
+	m.setRuntime("t-a3", rt)
+
+	m.ensureRecovery("t-a3", rt.instVersion)
+	if atomic.LoadInt32(&failSup.resumeCalls) != 1 {
+		t.Fatalf("resume=%d（恢复入口承接 A 分派）", atomic.LoadInt32(&failSup.resumeCalls))
+	}
+	status, upstream, nV1, env := adoptAFactsSnapshot(t, db, "t-a3")
+	if status != "active" {
+		t.Fatalf("status=%s（active→active 守卫失败零状态副作用——MUST NOT 写 activating/abandon）", status)
+	}
+	if upstream != "sess-keep" || nV1 != 2 || !strings.Contains(env, "OCDECK_TASK_ID") {
+		t.Fatalf("old facts must be intact: upstream=%s nV1=%d env=%q", upstream, nV1, env)
+	}
+}
+
+// ---- 评审 I4：R5（v2 钉扎新任务）首建经公开 Activate 可达 ----
+
+// TestStage4_R5_V2PinnedFirstBuild_ViaActivate 落实评审 I4：v2 钉扎、无 binding 的
+// suspended 任务激活 → firstBuildV2（与 R8-B 共用同一首建流程）——Acquire 首建、
+// claim/anchor/binding/active 原子落库、钉扎值不变。
+func TestStage4_R5_V2PinnedFirstBuild_ViaActivate(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedBranchBTask(t, db, "t-r5")
+	if _, err := db.Exec(`UPDATE tasks SET provider_id=? WHERE id='t-r5'`, ocdeckstore.ProviderIDV2); err != nil {
+		t.Fatal(err)
+	}
+	sup := &branchBV2Sup{upstream: "ses_r5_1", port: 4096}
+	adapter := NewStoreAdapter(db)
+	oc := newMockOC(true)
+	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), oc)
+	m.SetLifecycleCtx(ctx)
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(&branchBV2Provider{sup: sup}); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+	// mock 上游列出本次 candidate（提交后对齐保留归属行——断言 claim）。
+	oc.mu.Lock()
+	oc.sessions = []opencode.Session{{ID: "ses_r5_1", Time: opencode.SessionTime{Created: 100, Updated: 100}}}
+	oc.mu.Unlock()
+
+	if err := m.Activate(ctx, "t-r5"); err != nil {
+		t.Fatalf("Activate(R5 first-build): %v", err)
+	}
+	if atomic.LoadInt32(&sup.acquireCalls) != 1 {
+		t.Fatalf("acquire=%d, want 1", atomic.LoadInt32(&sup.acquireCalls))
+	}
+	got, has, err := adapter.GetTaskBinding(ctx, "t-r5")
+	if err != nil || !has || got.ProviderID != ocdeckstore.ProviderIDV2 || got.UpstreamSessionID != "ses_r5_1" {
+		t.Fatalf("binding: %+v has=%v err=%v", got, has, err)
+	}
+	row, err := adapter.GetTask(ctx, "t-r5")
+	if err != nil || row.Status != "active" {
+		t.Fatalf("status: %s %v", row.Status, err)
+	}
+	var nV2 int
+	_ = db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id='t-r5' AND provider_id=?`, ocdeckstore.ProviderIDV2).Scan(&nV2)
+	if nV2 != 1 {
+		t.Fatalf("claim rows=%d（首建 claim 原子落库）", nV2)
+	}
+}
+
+// ---- 评审 I10：v2 激活提交前候选握手——失败保留旧 binding ----
+
+// TestStage4_V2Resume_HandshakeFail_KeepsOldBinding 落实评审 I10：已有 v2 binding
+// 激活的候选握手（订阅）失败 → 提交未发生（binding 保持旧值/旧 upstream）、任务
+// 经既有激活补偿收敛 suspended；MUST NOT 出现「先提交 active 再建 SSE」的顺序。
+func TestStage4_V2Resume_HandshakeFail_KeepsOldBinding(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedAdoptAFormTask(t, db, "t-h1", ocdeckstore.ProviderIDV2)
+	// v2 钉扎任务持既有 v2 binding（R1 形态：binding 决定执行身份）。
+	old := domain.TaskBinding{
+		Version: domain.TaskBindingVersion, ProviderID: ocdeckstore.ProviderIDV2,
+		ProviderInstanceID: ocdeckstore.ProviderInstanceV2Default,
+		UpstreamSessionID:  "ses_old_1", TerminalRef: "ocdeck-v2-tui-t-h1",
+		Data: []byte(`{"port":4096,"directory":"/wt","taskId":"t-h1","origin":"created","auth":{"kind":"derived"}}`),
+	}
+	if err := NewStoreAdapter(db).SetTaskBinding(ctx, "t-h1", old); err != nil {
+		t.Fatal(err)
+	}
+	rec := &recordingV2Sup{upstream: "ses_old_1", port: 4096}
+	m := newAdoptATestManager(t, db, &handshakeFailV2Provider{sup: rec})
+
+	aerr := m.Activate(ctx, "t-h1")
+	if aerr == nil || !strings.Contains(aerr.Error(), "sse subscribe") {
+		t.Fatalf("expect handshake subscribe failure, got %v", aerr)
+	}
+	if rec.resumeCalls != 1 {
+		t.Fatalf("resume=%d", rec.resumeCalls)
+	}
+	// 提交未发生：binding 保持旧 envelope（代际一致——CommitV2Resume 未执行）。
+	got, has, err := NewStoreAdapter(db).GetTaskBinding(ctx, "t-h1")
+	if err != nil || !has || got.UpstreamSessionID != "ses_old_1" {
+		t.Fatalf("binding must stay old: %+v has=%v err=%v", got, has, err)
+	}
+	// 候选握手失败属提交前失败 → 既有激活补偿收敛 suspended（D4 已有 binding 激活
+	// 失败行）。
+	row, err := NewStoreAdapter(db).GetTask(ctx, "t-h1")
+	if err != nil || row.Status != "suspended" {
 		t.Fatalf("status: %s %v", row.Status, err)
 	}
 }

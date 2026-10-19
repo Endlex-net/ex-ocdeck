@@ -84,6 +84,9 @@ type SupervisorDeps struct {
 	PollInterval time.Duration
 	// StartAttempts 启动独立有界重试次数（D3：耗尽 fail-closed；默认 3）。
 	StartAttempts int
+	// MonitorInterval 监控循环轮询间隔（I9：就绪态轻量进程验活周期；默认 5s——
+	// 独立于业务 PollInterval，监控不做网络探测）。
+	MonitorInterval time.Duration
 }
 
 // V2Supervisor 是 RuntimeSupervisor 的 v2 真实承载（进程级单例语义由 supervisor
@@ -103,6 +106,14 @@ type V2Supervisor struct {
 	pid          int
 	password     string
 	shuttingDown bool // shutdown 开始后拒绝新业务 ensure（G3-F7）
+	// everReady 本实例曾确认就绪（I9：首个成功 ensure 置位；其后成功拉起即重拉——
+	// 通知收口的「真实恢复状态转换」判据，首次启动不通知）。
+	everReady bool
+	// monitorOnce/monitorStop 监控循环唯一启动与停止（I9：supervisor 是 server
+	// 监控与重拉的唯一 owner；启动后置——首个成功 ensure 后启动；关停停止）。
+	monitorOnce     sync.Once
+	monitorStop     chan struct{}
+	monitorStopOnce sync.Once
 }
 
 // NewV2Supervisor 构造 supervisor（deps 完整性由调用方保证——生产装配在
@@ -120,34 +131,52 @@ func NewV2Supervisor(deps SupervisorDeps) *V2Supervisor {
 	if deps.StartAttempts <= 0 {
 		deps.StartAttempts = 3
 	}
-	return &V2Supervisor{deps: deps, newClient: NewClient}
+	if deps.MonitorInterval <= 0 {
+		deps.MonitorInterval = 5 * time.Second
+	}
+	return &V2Supervisor{deps: deps, newClient: NewClient, monitorStop: make(chan struct{})}
 }
 
 // --- ensureServer：六步写序 + 重启恢复矩阵 ---
 
 // ensureServer 幂等确保全局 server 在跑，返回 (port, 派生密码)。单飞互斥；
 // 实现启动顺序六步与 D3 重启恢复矩阵；启动按 deps.StartAttempts 独立有界重试
-// （不扣任何任务 permit），耗尽 fail-closed。
+// （不扣任何任务 permit），耗尽 fail-closed。「确认重拉成功」的通知收口在
+// ensureServerOnce 的真实恢复状态转换（I9 唯一 owner）：仅 everReady（本实例曾
+// 确认就绪）之后的成功拉起视为重拉并异步触发 OnServerRestarted（异步：通知体
+// 会取任务锁，同步与 Resume 持有的任务锁成环）；首次启动不通知；并发调用经
+// 同一状态锁串行，单次重拉通知至多一次。首个成功 ensure 后置启动监控循环
+// （I9：server 死亡自动重拉的生产触发 owner；关停停止）。
 func (s *V2Supervisor) ensureServer(ctx context.Context) (int, string, error) {
+	port, password, err, restarted := s.ensureServerOnce(ctx)
+	if err == nil && restarted && s.deps.OnServerRestarted != nil {
+		go s.deps.OnServerRestarted()
+	}
+	return port, password, err
+}
+
+func (s *V2Supervisor) ensureServerOnce(ctx context.Context) (int, string, error, bool) {
 	password, err := derivePassword()
 	if err != nil {
-		return 0, "", err
+		return 0, "", err, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.shuttingDown {
 		return 0, "", appagent.NewError("supervisor.ensure_server",
-			appagent.ErrKindRuntimeUnavailable, errShuttingDown)
+			appagent.ErrKindRuntimeUnavailable, errShuttingDown), false
 	}
 	if s.ready {
 		// G3-F1：快速路径轻量验活（进程存活 + 身份匹配）——失效即清除进入恢复矩阵，
 		// 杜绝「ready 恒真」拿到失效端口/凭据。
 		if s.verifyAliveLocked() {
-			return s.port, password, nil
+			s.startMonitorLocked()
+			return s.port, password, nil, false
 		}
 		s.ready = false
 		s.pid = 0
 	}
+	wasEverReady := s.everReady
 	var lastErr error
 	for attempt := 1; attempt <= s.deps.StartAttempts; attempt++ {
 		port, err := s.ensureServerAttempt(ctx, password)
@@ -155,25 +184,64 @@ func (s *V2Supervisor) ensureServer(ctx context.Context) (int, string, error) {
 			s.ready = true
 			s.port = port
 			s.password = password
-			return port, password, nil
+			s.everReady = true
+			s.startMonitorLocked()
+			return port, password, nil, wasEverReady
 		}
 		s.pid = 0
 		if errors.Is(err, errRuntimeIdentityMismatch) {
 			// 身份/认证/协议不符：fail-closed，MUST NOT 仅凭端口响应接管
 			//（D3 恢复矩阵；重试不改变事实——立即返回可判定错误）。
-			return 0, "", err
+			return 0, "", err, false
 		}
 		lastErr = err
 		if ctx.Err() != nil {
-			return 0, "", ctx.Err()
+			return 0, "", ctx.Err(), false
 		}
 		select {
 		case <-ctx.Done():
-			return 0, "", ctx.Err()
+			return 0, "", ctx.Err(), false
 		case <-time.After(time.Duration(attempt) * s.deps.PollInterval):
 		}
 	}
-	return 0, "", fmt.Errorf("opencode2: server 启动重试耗尽（%d 次）: %w", s.deps.StartAttempts, lastErr)
+	return 0, "", fmt.Errorf("opencode2: server 启动重试耗尽（%d 次）: %w", s.deps.StartAttempts, lastErr), false
+}
+
+// startMonitorLocked 首个成功 ensure 后置启动监控循环（I9：supervisor 是 server
+// 监控与重拉的唯一 owner；关停停止）。调用方持 s.mu；Once.Do 仅派发 goroutine
+// 立即返回，不在锁内运行循环体。
+func (s *V2Supervisor) startMonitorLocked() {
+	s.monitorOnce.Do(func() { go s.runMonitor() })
+}
+
+// runMonitor 后台监视循环（I9）：就绪态轻量进程验活（不触网），死亡即清就绪态
+// 并交 ensureServer 自愈——独立重试与重拉通知经同一收口（不扣任务预算；生产
+// 触发闭环不再依赖业务入口顺带调 CheckServerAlive）。关停（shuttingDown 或
+// monitorStop 关闭）即退出。
+func (s *V2Supervisor) runMonitor() {
+	ticker := time.NewTicker(s.deps.MonitorInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.monitorStop:
+			return
+		case <-ticker.C:
+		}
+		s.mu.Lock()
+		if s.shuttingDown {
+			s.mu.Unlock()
+			return
+		}
+		alive := s.ready && s.verifyAliveLocked()
+		if !alive {
+			s.ready = false
+			s.pid = 0
+		}
+		s.mu.Unlock()
+		if !alive {
+			_, _, _ = s.ensureServer(context.Background())
+		}
+	}
 }
 
 // verifyAliveLocked 轻量验活（调用方持 s.mu）：实例 pid 存活且身份匹配。
@@ -664,27 +732,20 @@ func (s *V2Supervisor) AcquireEphemeral(ctx context.Context, task appagent.TaskR
 	}, nil
 }
 
-// CheckServerAlive 暴露就绪/重拉（5.3：崩溃自动重拉——任何业务入口前调用；
-// 监控循环亦经此触发）。重拉成功（原 ready=false → 本调用拉起）时触发
-// OnServerRestarted（活跃任务按 binding 重建 session 关联）。
+// CheckServerAlive 暴露就绪/重拉（5.3：崩溃自动重拉——任何业务入口前调用）。
+// 重拉成功的通知收口在 ensureServer 的真实恢复状态转换（I9 唯一 owner——本方法
+// 不再另行通知；监控循环自愈亦经同一 ensureServer）。
 func (s *V2Supervisor) CheckServerAlive(ctx context.Context) error {
 	// G3-F1：ready 时仍执行轻量进程/就绪验证——失败即清除就绪态进恢复矩阵
 	//（ensureServer 快速路径已含同一验活；此处显式触发重拉语义）。
 	s.mu.Lock()
-	wasReady := s.ready
-	if wasReady && !s.verifyAliveLocked() {
+	if s.ready && !s.verifyAliveLocked() {
 		s.ready = false
 		s.pid = 0
-		wasReady = false
 	}
 	s.mu.Unlock()
-	if _, _, err := s.ensureServer(ctx); err != nil {
-		return err
-	}
-	if !wasReady && s.deps.OnServerRestarted != nil {
-		s.deps.OnServerRestarted()
-	}
-	return nil
+	_, _, err := s.ensureServer(ctx)
+	return err
 }
 
 // ShutdownServer 关闭全局共享 server（supervisor 单 owner——design D4 shutdown
@@ -696,6 +757,8 @@ func (s *V2Supervisor) ShutdownServer(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.shuttingDown = true
+	// I9：关停停止监控（幂等——Once 防重复 close）。
+	s.monitorStopOnce.Do(func() { close(s.monitorStop) })
 	s.ready = false
 	s.port = 0
 	s.pid = 0

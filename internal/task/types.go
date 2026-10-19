@@ -277,6 +277,10 @@ type SessionObservation struct {
 	CreatedAt int64
 	UpdatedAt int64
 	ParentID  string
+	// ProviderID/ProviderInstanceID 归属命名空间（opencode-v2-provider 评审 I5：
+	// 对齐 claim 保留完整 SessionKey）。零值 = v1 缺省命名空间（既有 v1 行为不变）。
+	ProviderID         string
+	ProviderInstanceID string
 }
 
 // ProjectKind 项目类型枚举（add-plain-dir-project D1）。未知值 fail-closed。

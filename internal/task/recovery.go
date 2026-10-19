@@ -312,6 +312,25 @@ func (m *Manager) ensureRecovery(taskID string, tok runtime.InstVersion) {
 		unlock()
 		return
 	}
+	// 评审 I1：执行路径解析先于 active→activating CAS（零副作用准入）。承接 A
+	//（active 存量）按 D4 生命周期矩阵 MUST NOT 写 activating：专用承接出口
+	//（active→active 守卫，失败零状态副作用保留全部旧事实）；resolver 拒绝 →
+	// 保持 active + last_error，不进恢复循环。
+	if m.providerRegistry != nil {
+		adoptA, perr := m.adoptBranchAPrecheck(ctx, taskID)
+		if perr != nil {
+			m.recordAdmissionError(ctx, taskID, perr)
+			unlock()
+			return
+		}
+		if adoptA {
+			unlock()
+			if aerr := m.adoptTaskV2(ctx, taskID, row, mode); aerr != nil {
+				log.Printf("ensureRecovery: adopt A task %s: %v", taskID, aerr)
+			}
+			return
+		}
+	}
 	// G3-18：激活准入原子拒绝未清 recovery debt（Complete 成功
 	// 但删除失败遗留 / CAS mismatch 留存的旧 intent 不得误伤本次恢复）。
 	cas, cerr := m.beginActivation(ctx, taskID, StatusActive)
@@ -427,6 +446,23 @@ func (m *Manager) ensureRecoveryFromAttach(taskID string) {
 		}
 		unlock()
 		return
+	}
+	// 评审 I1：同 ensureRecovery——承接 A 先于 active→activating CAS 走专用承接
+	// 出口（MUST NOT 写 activating）；resolver 拒绝零副作用（保持 active）。
+	if m.providerRegistry != nil {
+		adoptA, perr := m.adoptBranchAPrecheck(ctx, taskID)
+		if perr != nil {
+			m.recordAdmissionError(ctx, taskID, perr)
+			unlock()
+			return
+		}
+		if adoptA {
+			unlock()
+			if aerr := m.adoptTaskV2(ctx, taskID, row, mode); aerr != nil {
+				log.Printf("ensureRecovery: attach adopt A task %s: %v", taskID, aerr)
+			}
+			return
+		}
 	}
 	cas, cerr := m.beginActivation(ctx, taskID, StatusActive)
 	if cerr != nil {
@@ -578,6 +614,18 @@ func (m *Manager) runRecoveryIncident(ctx context.Context, taskID string, trigge
 			m.cancelOwnedCleanup(context.WithoutCancel(incCtx), taskID, inc)
 			return
 		}
+		var srr *recoveryStopReportError
+		if errors.As(attemptErr, &srr) {
+			// I8/D5：确定性阶段失败——停止、保留现状（activating）、last_error
+			// 提交用户决策；MUST NOT 终态补偿、不进预算循环。可区分于普通
+			// attempt 错误（后者继续消耗预算重试）。
+			le := sql.NullString{String: fmt.Sprintf("恢复阶段结果（保留现状，待用户决策）: %v", attemptErr), Valid: true}
+			if _, werr := m.writeStatus(incCtx, taskID, StatusActivating, le); werr != nil {
+				log.Printf("recovery stop-report task %s record last_error: %v", taskID, werr)
+			}
+			inc.releaseProcess()
+			return
+		}
 		if isRecoveryTerminal(attemptErr) {
 			cause := attemptErr
 			if lastErr != nil {
@@ -694,6 +742,14 @@ func (e *retryableCleanupError) Unwrap() error { return e.err }
 
 var errRecoveryBudgetExhaustedSentinel = errors.New(errRecoveryBudgetExhausted)
 
+// recoveryStopReportError 标记 v2 恢复的确定性阶段失败（D4/D5：server 可用性
+// 独立重试耗尽 / 原 session 缺失——停止、保留现状、记 last_error、提交用户
+// 决策；MUST NOT 终态补偿、MUST NOT 进入普通 attempt 预算循环——评审 I8）。
+type recoveryStopReportError struct{ err error }
+
+func (e *recoveryStopReportError) Error() string { return e.err.Error() }
+func (e *recoveryStopReportError) Unwrap() error { return e.err }
+
 func (m *Manager) checkRecoveryContinuable(ctx context.Context, taskID string, trigger runtime.InstVersion) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -742,7 +798,34 @@ func (m *Manager) runRecoveryAttempt(ctx context.Context, taskID string, trigger
 	if err := m.checkRecoveryContinuable(ctx, taskID, trigger); err != nil {
 		return err
 	}
-	// permit 是 attempt 首个动作（D3：先于端口分配与任何进程副作用）；store 写失败属
+	row, err := m.store.GetTask(ctx, taskID)
+	if err != nil {
+		return newOpErr(codeInternal, err)
+	}
+	// 单一 resolver 准入先行（评审 I8：v2 决策先于 v1 permit/端口/env 解析——
+	// 零副作用读取；v2 路径不产生任何 v1 attempt 副作用）。拒绝零副作用 +
+	// last_error；R8（active 存量承接）经 adoptTaskV2（active→active 守卫 CAS）。
+	var sup appagent.RuntimeSupervisor
+	var dec execDecision
+	if m.providerRegistry != nil {
+		var aerr error
+		sup, dec, _, _, aerr = m.admitExecution(ctx, taskID)
+		if aerr != nil {
+			m.recordAdmissionError(ctx, taskID, aerr)
+			return aerr
+		}
+		if dec.Adopt {
+			return m.adoptTaskV2(ctx, taskID, row, mode)
+		}
+		if dec.ExecProviderID == store.ProviderIDV2 {
+			// v2 恢复（R1）：独立预算序（I8）——server 可用性（supervisor 独立
+			// 有界重试）→ 任务 permit → Resume/握手/提交，见 runV2RecoveryAttempt。
+			return m.runV2RecoveryAttempt(ctx, taskID, trigger, mode, inc, sup, row)
+		}
+	} else {
+		sup = m.runtimeSupervisor
+	}
+	// permit 是 v1 attempt 首个消耗动作（D3：先于端口分配与任何进程副作用）；store 写失败属
 	// 不可约边界 → 终态补偿（G3-5 typed）。
 	permit, err := m.store.AcquireRecoveryPermit(ctx, taskID, m.nowUnix())
 	if err != nil {
@@ -753,11 +836,6 @@ func (m *Manager) runRecoveryAttempt(ctx context.Context, taskID string, trigger
 	}
 	if err := m.waitRecoveryBackoff(ctx, taskID, trigger, permit.Ordinal); err != nil {
 		return err
-	}
-
-	row, err := m.store.GetTask(ctx, taskID)
-	if err != nil {
-		return newOpErr(codeInternal, err)
 	}
 	port, aerr := m.allocatePort(row.LastPort, 0)
 	if aerr != nil {
@@ -799,32 +877,13 @@ func (m *Manager) runRecoveryAttempt(ctx context.Context, taskID string, trigger
 	// G3-7：进程即将创建——claim 归属本 incident（取消清理在注册表无 runtime 时
 	// 仍可据此回退该进程）。
 	inc.claimProcess(runtimeName)
-	// C12 门禁修复（supervisor 阶段错误桥接）：supervisor 建程失败分派到恢复
-	// 失败矩阵（orchestration spec 逐阶段失败分派表）——probe→终态补偿
-	//（capabilityProbeError）、claim 冲突→终态补偿（anchorStageError）、cleanup
-	// 非净→pendingCleanupError（notice/debt 重放）、rebuild 拒绝→终态；
-	// 其余 RuntimeUnavailable（spawn/env/allocate/wait_ready）→ 普通 attempt
-	// 重试（原样返回）。映射函数 supervisorStageErrorForTyped见下方。
-	// 单一 resolver 准入（opencode-v2-provider tasks 6.3/6.6）：拒绝零副作用 +
-	// last_error；R8（active 存量承接）经 adoptTaskV2（active→active 守卫 CAS）；
-	// v2 恢复（R1）经 v2 provider supervisor（BeforeLaunch 仅取消检查——permit 已
-	// 于 attempt 入口消耗，不重复扣款）。
-	var sup appagent.RuntimeSupervisor
-	var dec execDecision
-	if m.providerRegistry != nil {
-		var aerr error
-		sup, dec, aerr = m.admitExecution(ctx, taskID)
-		if aerr != nil {
-			m.recordAdmissionError(ctx, taskID, aerr)
-			return aerr
-		}
-		if dec.Adopt {
-			return m.adoptTaskV2(ctx, taskID, row, mode)
-		}
-	} else {
-		sup = m.runtimeSupervisor
-	}
 	if sup != nil {
+		// C12 门禁修复（supervisor 阶段错误桥接）：supervisor 建程失败分派到恢复
+		// 失败矩阵（orchestration spec 逐阶段失败分派表）——probe→终态补偿
+		//（capabilityProbeError）、claim 冲突→终态补偿（anchorStageError）、cleanup
+		// 非净→pendingCleanupError（notice/debt 重放）、rebuild 拒绝→终态；
+		// 其余 RuntimeUnavailable（spawn/env/allocate/wait_ready）→ 普通 attempt
+		// 重试（原样返回）。映射函数 supervisorStageErrorForTyped见下方。
 		// C2 门禁修复（design D9：恢复类入口经 Resume；BeforeLaunch=重拉预算闸门，
 		// 闸门语义与 supPortRetries 轮换逐次对齐——每 attempt 入口已过 beforeCreate
 		//，轮换/双启动正式进程前由 supervisor 经同一 BeforeLaunch 闭包再复核）。
@@ -832,22 +891,16 @@ func (m *Manager) runRecoveryAttempt(ctx context.Context, taskID string, trigger
 		// 零 permit 消耗在 supervisor 外已计入本 attempt）；old binding 取持久化值
 		//（缺失/解析失败 → 零值 binding，复用分支被跳过，重建后新 binding 经
 		// commitRuntimeReady 原子替换，与 D9 一致）。
-		oldBinding, hasOld, oldErr := m.store.GetTaskBinding(ctx, taskID)
+		oldBinding, _, oldErr := m.store.GetTaskBinding(ctx, taskID)
 		if oldErr != nil {
 			// G3-F9 同源：binding 读取失败不得静默降级为「无 binding」。
 			return oldErr
 		}
-		v2Path := dec.ExecProviderID == store.ProviderIDV2
 		resumePolicy := appagent.ResumePolicy{AllowSessionCreate: true, AllowRebuild: true,
 			BeforeLaunch: func(bctx context.Context) error {
 				// supervisor 的 BeforeLaunch 契约携带 ctx；task 层闸门闭包沿用
 				// attempt ctx（预算/退避不区分调用方 ctx 域）。
 				_ = bctx
-				if v2Path {
-					// v2 BeforeLaunch 仅取消/继续条件检查（D4 替换表：不含扣款——
-					// permit 已于 attempt 入口消耗）。
-					return m.checkRecoveryContinuable(bctx, taskID, trigger)
-				}
 				return beforeCreate()
 			}}
 		binding, serr := sup.Resume(ctx, appagent.TaskRef{TaskID: taskID, Directory: row.WorktreePath},
@@ -876,28 +929,6 @@ func (m *Manager) runRecoveryAttempt(ctx context.Context, taskID string, trigger
 				return err
 			}
 			return err
-		}
-		if v2Path {
-			// v2 恢复提交（gate3 G3-F2/F3）：binding 替换 + activating→active 状态
-			// 收敛单事务（CommitV2Resume——beginActivation 已置 activating；无 v1
-			// runtime 会话探活/watchServeExit）+ 正式运行时就绪（provider-aware
-			// SSE/对齐）。失败记恢复债务（已替换 binding 不可回滚——不得伪装完整
-			// 可用），恢复循环重建。
-			astore := m.adoptionStoreOf()
-			if astore == nil {
-				inc.releaseProcess()
-				return newOpErr(codeInternal, errors.New("store 未实现 v2 恢复/替换提交能力"))
-			}
-			if _, rerr := astore.CommitV2Resume(ctx, taskID, oldBindingIf(hasOld, oldBinding), binding, row.Status); rerr != nil {
-				inc.releaseProcess()
-				return newOpErr(codeConflict, fmt.Errorf("v2 恢复替换提交: %w", rerr))
-			}
-			if terr := m.commitV2RuntimeReady(ctx, taskID, row, port, password, binding, mode); terr != nil {
-				inc.releaseProcess()
-				return terr
-			}
-			inc.releaseProcess()
-			return nil
 		}
 		cerr := m.commitRuntimeReady(ctx, taskID, row, runtimeName, port, password, &binding, mode, func(rt *taskRuntime) {
 			inc.noteAttemptToken(rt.instVersion)
@@ -993,6 +1024,88 @@ func (m *Manager) runRecoveryAttempt(ctx context.Context, taskID string, trigger
 	}
 	inc.releaseProcess()
 	return cerr
+}
+
+// runV2RecoveryAttempt 是 v2 任务的恢复 attempt（评审 I8 预算顺序；R1 延续）：
+// ①server 可用性（supervisor 独立有界重试——不消耗任务预算；耗尽 → 停止报告，
+// 保留现状提交用户决策，MUST NOT 进普通 attempt 循环）→ ②任务 permit + backoff
+// （恰在 server 可用后、session 验证 attempt 前消耗一次）→ ③Resume 延续原
+// session（BeforeLaunch 仅取消/继续检查不扣款；原 session 缺失 = 确定性历史
+// 事实——停止报告，不创建替代）→ ④候选关联握手（四就绪缺一不提交）→ ⑤
+// binding 替换 + activating→active 单事务 → ⑥正式接管（失败=已提交恢复债务）。
+func (m *Manager) runV2RecoveryAttempt(ctx context.Context, taskID string, trigger runtime.InstVersion, mode AlignMode, inc *recoveryIncident, sup appagent.RuntimeSupervisor, row TaskRow) error {
+	if err := m.checkRecoveryContinuable(ctx, taskID, trigger); err != nil {
+		return err
+	}
+	// ① server 可用性：supervisor 独立预算承担（任务预算零消耗）。未实现该能力
+	// 的 supervisor 形态 fail-closed（不猜 server 状态）。
+	warmer, ok := sup.(appagent.ServerAvailabilityWarmer)
+	if !ok {
+		return newOpErr(codeInternal, errors.New("v2 supervisor 未实现 server 可用性检查（CheckServerAlive）"))
+	}
+	if serr := warmer.CheckServerAlive(ctx); serr != nil {
+		return &recoveryStopReportError{err: fmt.Errorf("server 可用性失败（supervisor 独立重试耗尽，保留现状待用户决策）: %w", serr)}
+	}
+	// ② 任务 permit：恰在 server 可用后、session 验证 attempt 前消耗一次（D4）。
+	permit, err := m.store.AcquireRecoveryPermit(ctx, taskID, m.nowUnix())
+	if err != nil {
+		return &recoveryTerminalError{err: newOpErr(codeInternal, fmt.Errorf("acquire recovery permit: %w", err))}
+	}
+	if !permit.Acquired {
+		return fmt.Errorf("%w", errRecoveryBudgetExhaustedSentinel)
+	}
+	if err := m.waitRecoveryBackoff(ctx, taskID, trigger, permit.Ordinal); err != nil {
+		return err
+	}
+	// ③ Resume 延续原 session（v2 attempt 不创建任务进程——不 claim v1 runtime 名）。
+	oldBinding, hasOld, oldErr := m.store.GetTaskBinding(ctx, taskID)
+	if oldErr != nil {
+		// G3-F9 同源：binding 读取失败不得静默降级为「无 binding」。
+		return oldErr
+	}
+	binding, serr := sup.Resume(ctx, appagent.TaskRef{TaskID: taskID, Directory: row.WorktreePath},
+		oldBinding, appagent.ResumePolicy{AllowSessionCreate: true, AllowRebuild: true,
+			BeforeLaunch: func(bctx context.Context) error {
+				// v2 BeforeLaunch 仅取消/继续条件检查（D4 替换表：不含扣款——
+				// permit 已于上一步消耗）。
+				return m.checkRecoveryContinuable(bctx, taskID, trigger)
+			}})
+	if serr != nil {
+		if se, ok := appagent.StageErrorOf(serr); ok && se.Kind == appagent.ErrKindNotFound {
+			// 原 session 缺失（D5 恢复序列行 3：不可读/不存在/不可继续使用）：
+			// 停止、保留现状、提交用户决策——不创建替代 session、不进预算循环。
+			return &recoveryStopReportError{err: fmt.Errorf("原 session %s 缺失（停止，提交用户决策）: %w", oldBinding.UpstreamSessionID, serr)}
+		}
+		return m.supervisorStageErrorForTyped(serr, taskID)
+	}
+	port, password, _, eerr := m.bindingEndpoint(binding)
+	if eerr != nil {
+		// endpoint 解析失败 = binding 无效 → 终态补偿（isRecoveryTerminal 检出）。
+		return m.supervisorStageErrorForTyped(
+			appagent.NewStageError("supervisor.binding_endpoint", appagent.ErrKindBindingInvalid, eerr), taskID)
+	}
+	// ④⑤⑥（批次 1 I10 序列）：候选握手（SSE 首帧先于原子提交；失败关候选保留
+	// 旧事实，attempt 按既有矩阵重试——提交未发生，status 仍 activating 可继续）
+	// → binding 替换 + activating→active 单事务 → 正式接管（失败记恢复债务）。
+	astore := m.adoptionStoreOf()
+	if astore == nil {
+		return newOpErr(codeInternal, errors.New("store 未实现 v2 恢复/替换提交能力"))
+	}
+	es, herr := m.candidateHandshake(ctx, taskID, binding)
+	if herr != nil {
+		return m.supervisorStageErrorForTyped(
+			appagent.NewStageError("recovery.v2.handshake", appagent.ErrKindRuntimeUnavailable, herr), taskID)
+	}
+	if _, rerr := astore.CommitV2Resume(ctx, taskID, oldBindingIf(hasOld, oldBinding), binding, row.Status); rerr != nil {
+		if es != nil {
+			_ = es.Close()
+		}
+		return newOpErr(codeConflict, fmt.Errorf("v2 恢复替换提交: %w", rerr))
+	}
+	if es != nil {
+		_ = es.Close()
+	}
+	return m.commitV2RuntimeReady(ctx, taskID, row, port, password, binding, mode)
 }
 
 // supervisorStageErrorForTyped 把 supervisor 阶段错误映射为 task 层 typed 分派

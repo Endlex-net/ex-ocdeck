@@ -71,6 +71,10 @@ type TaskStore interface {
 	// 实际推进（P1.4.5 结构化）。不加跨任务唯一索引；冲突语义由调用方按入口处理
 	//（SSE/对齐忽略+诊断，锚定失败+last_error）。
 	ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error)
+	// ClaimTaskSessionKey 按完整 SessionKey（provider/instance/upstream 三列谓词）
+	// 原子 claim（opencode-v2-provider 评审 I5：事件消费保留命名空间——v2 会话
+	// 归属行落 v2 命名空间）。冲突语义同 ClaimTaskSession。
+	ClaimTaskSessionKey(ctx context.Context, taskID string, key domain.SessionKey, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error)
 	// ClaimTaskSessionAndSetAnchor 单事务 claim + 写入 tasks.anchor_session_id（D5）。
 	// 冲突时归属与 anchor 均不修改。
 	ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error)

@@ -454,12 +454,23 @@ func (a *spiEvents) Subscribe(ctx context.Context, b domain.TaskBinding) (appage
 		cancel: cancel,
 	}
 	a.p.reportConversion(h, "events.subscribe", nil)
-	c2 := a.p.newClient(data.Port, password, Options{OnReady: es.markConnected, OnDisconnect: es.markDisconnected})
+	// I12 连接代失效：断流即旧代 execution 状态作废（Current 缺项 = 未知——
+	// 不得用旧代 busy 猜测；重连新代仅由新的冻结映射事件重建）。
+	c2 := a.p.newClient(data.Port, password, Options{
+		OnReady: es.markConnected,
+		OnDisconnect: func() {
+			es.markDisconnected()
+			a.p.invalidateStatus(b.UpstreamSessionID)
+		},
+	})
 
 	// onReconnect：先入队生命周期信号（调用方对齐屏障），随后同步拉快照自补
 	//（Client 保证本回调先于新连接事件派发——快照事件先于新事件入通道）。
 	onReconnect := func() {
 		es.fireReconnect()
+		// I12：重连建立新连接代——旧代 execution 状态作废（幂等；selfHeal 的
+		// SessionUpdated 快照不携带状态映射，不得据 outcome 猜测补齐）。
+		a.p.invalidateStatus(b.UpstreamSessionID)
 		es.selfHeal(sctx, c2, data, b.UpstreamSessionID)
 	}
 

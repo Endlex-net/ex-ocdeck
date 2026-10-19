@@ -407,6 +407,22 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 		return newOpErr(codeConflict, cerr)
 	}
 
+	// 评审 I1（opencode-v2-provider）：执行路径解析先于任何状态写入（零副作用
+	// 准入——resolver 拒绝不得先进 activating 留下需要补偿的状态）。承接 A 按
+	// D4 生命周期矩阵 MUST NOT 写 activating：直接走专用承接出口（suspended→
+	// active 守卫；失败零状态副作用、保留全部旧事实、MUST NOT 走激活失败补偿
+	// ——不清 env 快照）。
+	if m.providerRegistry != nil {
+		adoptA, perr := m.adoptBranchAPrecheck(ctx, taskID)
+		if perr != nil {
+			m.recordAdmissionError(ctx, taskID, perr)
+			return newOpErr(codeConflict, perr)
+		}
+		if adoptA {
+			return m.adoptTaskV2(ctx, taskID, row, mode)
+		}
+	}
+
 	// ① 置 activating。G3-18：激活准入原子拒绝未清 recovery debt（Complete 成功
 	// 但删除失败遗留 / CAS mismatch 留存的旧 intent 不得被重放误伤本次激活）。
 	updated, err := m.beginActivation(ctx, taskID, StatusSuspended)
@@ -440,6 +456,38 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 // errActivateCommitHandled 表示 CAS mismatch 反向清理已按本 attempt token 做完，
 // MUST NOT 再走通用补偿（禁写 status/last_error/env_snapshot/anchor）。
 type errActivateCommitHandled struct{ err error }
+
+// adoptBranchAPrecheck 只读预判当前入口是否为承接 A（评审 I1：零副作用准入——
+// resolver 决策 + D5 判定矩阵，先于 beginActivation 的任何状态写入）。resolver
+// 拒绝（R2/R3/R6/R7/R9/数据异常）原样返回错误（调用方零副作用处置——不进
+// activating）；非承接（含 B/R5/v1）返回 false 走既有激活序列。
+func (m *Manager) adoptBranchAPrecheck(ctx context.Context, taskID string) (bool, error) {
+	_, dec, _, _, err := m.admitExecution(ctx, taskID)
+	if err != nil {
+		return false, err
+	}
+	if !dec.Adopt {
+		return false, nil
+	}
+	astore := m.adoptionStoreOf()
+	if astore == nil {
+		return false, nil // 承接能力缺失由 adoptTaskV2 内 fail-closed 统一处置
+	}
+	binding, hasBinding, err := m.store.GetTaskBinding(ctx, taskID)
+	if err != nil {
+		return false, err
+	}
+	anchorID, anchorPID, anchorIID, err := astore.GetTaskAnchor(ctx, taskID)
+	if err != nil {
+		return false, err
+	}
+	keys, err := astore.ListTaskSessionKeys(ctx, taskID)
+	if err != nil {
+		return false, err
+	}
+	branch, _ := classifyAdoption(hasBinding, binding, anchorID, anchorPID, anchorIID, keys)
+	return branch == branchA, nil
+}
 
 func (e *errActivateCommitHandled) Error() string { return e.err.Error() }
 func (e *errActivateCommitHandled) Unwrap() error { return e.err }
@@ -622,11 +670,15 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 	// 单一 resolver 准入（opencode-v2-provider tasks 6.3/6.6，design D4）：
 	// 拒绝（R2/R3/R6/R7/R9）零副作用 + 用户可感知 last_error；registry 未注入
 	// 时回退固定 v1 supervisor（既有装配/测试现状行为不变）。
+	// 评审 I7：决策读取的 binding 事实随 admitExecution 一并返回，分派复用同一
+	// 读取（消除二次读取漂移窗口）。
 	var sup appagent.RuntimeSupervisor
 	var dec execDecision
+	var decBinding domain.TaskBinding
+	var decHasBinding bool
 	if m.providerRegistry != nil {
 		var aerr error
-		sup, dec, aerr = m.admitExecution(ctx, taskID)
+		sup, dec, decBinding, decHasBinding, aerr = m.admitExecution(ctx, taskID)
 		if aerr != nil {
 			// fail-closed：零副作用 + 诊断性 last_error/用户提示（D4 允许行）。
 			m.recordAdmissionError(ctx, taskID, aerr)
@@ -636,11 +688,14 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 		if dec.Adopt {
 			return m.adoptTaskV2(ctx, taskID, row, mode)
 		}
-		// G3-F2：已有 v2 binding → Resume（连续性——MUST NOT 再 POST 建 session）；
-		// 恢复/替换提交（binding 替换 + suspended→active CAS，不走 activating
-		// 首次语义）。
+		// G3-F2 + 评审 I4：已有 v2 binding → resumeActivateV2（连续性——MUST NOT
+		// 再 POST 建 session）；v2 执行但无 v2 binding（R5 首建——v2 钉扎新任务）
+		// → firstBuildV2（与 R8-B 共用同一首建准备+原子提交+candidate 补偿流程）。
 		if dec.ExecProviderID == store.ProviderIDV2 {
-			return m.resumeActivateV2(ctx, taskID, row, sup, mode)
+			if decHasBinding && decBinding.ProviderID == store.ProviderIDV2 {
+				return m.resumeActivateV2(ctx, taskID, row, sup, mode)
+			}
+			return m.firstBuildV2(ctx, taskID, row, mode, sup)
 		}
 	} else {
 		sup = m.runtimeSupervisor
@@ -1770,10 +1825,14 @@ func (m *Manager) handleAgentEvent(ctx context.Context, taskID string, ev domain
 		if sess.Parent != nil {
 			parentID = sess.Parent.UpstreamID
 		}
+		// 评审 I5：会话写端口保留完整 SessionKey（事件携带 provider/instance 命名
+		// 空间——v2 会话归属行落 v2 命名空间）。事件 key 命名空间为空（未感知
+		// 命名空间的事件源）→ 走既有 v1 缺省 claim 路径（行为不变）。
 		if m.lifecycle != nil {
 			obs := ocdecksess.Observation{
 				ID: ocdecksess.ID(sid), ParentID: parentID,
 				CreatedAt: createdAt, UpdatedAt: lastSeen, FirstSeenAt: nowUnixI(),
+				ProviderID: sess.Key.ProviderID, ProviderInstanceID: sess.Key.ProviderInstanceID,
 			}
 			cres, cerr := m.lifecycle.ClaimSession(ctx, taskID, obs)
 			if cerr != nil {
@@ -1787,7 +1846,13 @@ func (m *Manager) handleAgentEvent(ctx context.Context, taskID string, ev domain
 			m.noteAgentSessionClaimed(taskID, sid)
 			return nil
 		}
-		cres, cerr := m.store.ClaimTaskSession(ctx, taskID, sid, createdAt, nowUnixI(), lastSeen, parentID)
+		var cres application.ClaimResult
+		var cerr error
+		if sess.Key.ProviderID == "" {
+			cres, cerr = m.store.ClaimTaskSession(ctx, taskID, sid, createdAt, nowUnixI(), lastSeen, parentID)
+		} else {
+			cres, cerr = m.store.ClaimTaskSessionKey(ctx, taskID, sess.Key, createdAt, nowUnixI(), lastSeen, parentID)
+		}
 		if cerr != nil {
 			return fmt.Errorf("claim session %s: %w", sid, cerr)
 		}
@@ -2168,13 +2233,23 @@ func (m *Manager) alignSessions(ctx context.Context, taskID, wtPath string, oc O
 			return fmt.Errorf("list sessions: %w", err)
 		}
 	}
+	// 评审 I5：对齐归属命名空间随任务 binding（v2 任务 → v2 命名空间 claim；无
+	// binding → 零值 = store 按 v1 缺省处理——既有 v1 行为不变）。
+	nsProvider, nsInstance := "", ""
+	if b, has, berr := m.store.GetTaskBinding(ctx, taskID); berr != nil {
+		return berr
+	} else if has {
+		nsProvider, nsInstance = b.ProviderID, b.ProviderInstanceID
+	}
 	obs := make([]ocdecksess.Observation, 0, len(sessions))
 	for _, s := range sessions {
 		obs = append(obs, ocdecksess.Observation{
-			ID:        ocdecksess.ID(s.ID),
-			ParentID:  s.ParentID,
-			CreatedAt: int64(s.Time.Created),
-			UpdatedAt: int64(s.Time.Updated),
+			ID:                 ocdecksess.ID(s.ID),
+			ParentID:           s.ParentID,
+			CreatedAt:          int64(s.Time.Created),
+			UpdatedAt:          int64(s.Time.Updated),
+			ProviderID:         nsProvider,
+			ProviderInstanceID: nsInstance,
 		})
 	}
 	if m.lifecycle != nil {

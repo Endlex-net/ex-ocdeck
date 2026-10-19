@@ -45,7 +45,8 @@ type v2ResumeStore interface {
 type adoptionStore interface {
 	ListTaskSessionKeys(ctx context.Context, taskID string) ([]domain.SessionKey, error)
 	GetTaskAnchor(ctx context.Context, taskID string) (anchorID, providerID, instanceID string, err error)
-	CommitAdoption(ctx context.Context, taskID string, b domain.TaskBinding, fromStatus string, lastError *string) (application.TransitionResult, error)
+	CommitAdoption(ctx context.Context, taskID string, b, oldBinding domain.TaskBinding, fromStatus string, lastError *string) (application.TransitionResult, error)
+	CommitFirstBuild(ctx context.Context, taskID string, b domain.TaskBinding, key domain.SessionKey, createdAt, firstSeen, lastSeen int64, parentID string) (application.TransitionResult, error)
 	CommitV2Resume(ctx context.Context, taskID string, oldBinding, b domain.TaskBinding, fromStatus string) (application.TransitionResult, error)
 }
 
@@ -64,30 +65,52 @@ const (
 
 // classifyAdoption 实现 D5 历史判定矩阵（只读；纯函数）：
 //   - binding(v1)/anchor(v1)/归属行三者一致（anchor==binding.UpstreamSessionID
-//     且 anchor ∈ 归属集合）→ A；
-//   - 三者一致为空 → B；
+//     且 anchor ∈ v1 归属集合）→ A；
+//   - 三者一致为空（无 binding、anchor 三元组完整为空、零归属行）→ B；
 //   - 已有 v2 binding → 非承接准入（R1 恢复路径——调用方按 resolver 处置）；
-//   - 其余（部分缺失、id 不一致、混杂）→ stop。
+//   - 其余（部分缺失、id 不一致、混杂、未知命名空间）→ stop（评审 I11：部分
+//     anchor 三元组 / v2 或未知命名空间归属行 MUST NOT 当作「为空」误归 B）。
 func classifyAdoption(hasBinding bool, binding domain.TaskBinding, anchorID, anchorProviderID, anchorInstanceID string, keys []domain.SessionKey) (adoptionBranch, string) {
 	v2Binding := hasBinding && binding.ProviderID == ocdeckstore.ProviderIDV2
-	hasAnchor := anchorID != "" && anchorProviderID != "" && anchorInstanceID != ""
-	hasRows := len(keys) > 0
-
 	if v2Binding {
 		return branchStop, "" // 非承接准入（R1 路径）
 	}
-	anchorIsV1 := hasAnchor && anchorProviderID == ocdeckstore.ProviderIDV1 && anchorInstanceID == ocdeckstore.ProviderInstanceV1Default
 	bindingIsV1 := hasBinding && binding.ProviderID == ocdeckstore.ProviderIDV1 && binding.ProviderInstanceID == ocdeckstore.ProviderInstanceV1Default
-
+	if hasBinding && !bindingIsV1 {
+		return branchStop, "" // 未知命名空间 binding（不猜测）
+	}
+	// 锚定存在性以 anchor_session_id 为准：命名空间迁移（0018）对存量行把
+	// anchor_provider_id/instance 回填为 v1 缺省值——anchor id 为空时这两列是
+	// 回填默认值而非事实（评审 I11 的「部分三元组」即指 id 与命名空间列不一致
+	// 的行，按 id 权威判定，MUST NOT 当作有 anchor 或误归 B）。
+	if anchorID != "" {
+		if anchorProviderID != ocdeckstore.ProviderIDV1 || anchorInstanceID != ocdeckstore.ProviderInstanceV1Default {
+			return branchStop, "" // anchor 在非 v1 命名空间（已承接过或损坏——非本入口）
+		}
+	}
+	// 归属行命名空间分区：v1 行=历史证据；v2 行=已承接证据（混杂→stop）；未知
+	// 命名空间→stop（不猜测）。
+	v1Rows := 0
+	for _, k := range keys {
+		switch {
+		case k.ProviderID == ocdeckstore.ProviderIDV1 && k.ProviderInstanceID == ocdeckstore.ProviderInstanceV1Default:
+			v1Rows++
+		case k.ProviderID == ocdeckstore.ProviderIDV2 && k.ProviderInstanceID == ocdeckstore.ProviderInstanceV2Default:
+			return branchStop, "" // v2 归属行存在而 binding 非 v2：混杂/已承接证据
+		default:
+			return branchStop, "" // 未知命名空间归属行
+		}
+	}
+	anchorIsV1 := anchorID != "" // 命名空间合法性已在上面的 id 权威守卫内验证
 	if bindingIsV1 && anchorIsV1 && binding.UpstreamSessionID == anchorID {
-		// anchor ∈ 归属集合（归属集合可含子 session；命名空间已由读取过滤为 v1）。
+		// anchor ∈ v1 归属集合（归属集合可含子 session）。
 		for _, k := range keys {
 			if k.UpstreamID == anchorID {
 				return branchA, anchorID
 			}
 		}
 	}
-	if !hasBinding && !hasAnchor && !hasRows {
+	if !hasBinding && anchorID == "" && v1Rows == 0 {
 		return branchB, ""
 	}
 	return branchStop, ""
@@ -127,17 +150,20 @@ func (m *Manager) adoptTaskV2(ctx context.Context, taskID string, row TaskRow, m
 		m.recordAdmissionError(ctx, taskID, err)
 		return err
 	case branchB:
-		// B：v2 正常首建（钉扎值不变）——走 v2 Acquire 提交路径（复用恢复提交
-		// 原语；candidate claim/anchor 与 binding 提交同一事务由既有
-		// commitRuntimeReady 承担）。
-		return m.adoptBranchB(ctx, taskID, row, mode)
+		// B：v2 正常首建（钉扎值不变）——R8-B 与 R5 共用 firstBuildV2（评审 I4）。
+		supB, _, _, _, berr := m.admitExecution(ctx, taskID)
+		if berr != nil {
+			m.recordAdmissionError(ctx, taskID, berr)
+			return berr
+		}
+		return m.firstBuildV2(ctx, taskID, row, mode, supB)
 	case branchA:
 		// target = anchor session id；继续步骤 2-6。
 	}
 
 	// 步骤 2+3：server 可用性（supervisor 独立有界重试）+ 原 session 验证
 	//（Resume；ResumePolicy 不授权创建替代——v2 supervisor 语义冻结）。
-	sup, _, err := m.admitExecution(ctx, taskID)
+	sup, _, _, _, err := m.admitExecution(ctx, taskID)
 	if err != nil {
 		m.recordAdmissionError(ctx, taskID, err)
 		return err
@@ -156,23 +182,10 @@ func (m *Manager) adoptTaskV2(ctx context.Context, taskID string, row TaskRow, m
 
 	// 步骤 4 候选关联（内存态）：派生凭据连接 + 事件订阅首帧握手；失败 → 全内存
 	// 丢弃、零持久化副作用、按既有恢复重试。
-	p, perr := m.providerRegistry.Get(ocdeckstore.ProviderIDV2)
-	if perr != nil {
-		return perr
-	}
-	es, serr := p.Events().Subscribe(ctx, candidate)
+	es, serr := m.candidateHandshake(ctx, taskID, candidate)
 	if serr != nil {
 		m.recordAdmissionError(ctx, taskID, fmt.Errorf("承接候选订阅失败: %v", serr))
 		return serr
-	}
-	handshake := make(chan struct{}, 1)
-	es.SetCallbacks(func() { handshake <- struct{}{} }, nil)
-	select {
-	case <-handshake:
-	case <-time.After(adoptionHandshakeTimeout):
-		_ = es.Close()
-		m.recordAdmissionError(ctx, taskID, errors.New("承接候选握手超时（全内存态丢弃）"))
-		return errors.New("admission.adopt: 候选关联握手超时")
 	}
 
 	// 步骤 5 原子提交：状态现状决定 CAS 形态（suspended→active / active→active
@@ -185,9 +198,11 @@ func (m *Manager) adoptTaskV2(ctx context.Context, taskID string, row TaskRow, m
 	default:
 		from = ocdecktask.StatusSuspended
 	}
-	res, cerr := astore.CommitAdoption(ctx, taskID, candidate, string(from), &adoptionPendingLossNotice)
+	res, cerr := astore.CommitAdoption(ctx, taskID, candidate, binding, string(from), &adoptionPendingLossNotice)
 	if cerr != nil || !res.Matched {
-		_ = es.Close()
+		if es != nil {
+			_ = es.Close()
+		}
 		if cerr == nil {
 			cerr = fmt.Errorf("%w: 承接提交状态守卫失配", ocdeckstore.ErrAdoptionConflict)
 		}
@@ -200,20 +215,53 @@ func (m *Manager) adoptTaskV2(ctx context.Context, taskID string, row TaskRow, m
 
 	// 候选流退订（避免双通道）：正式 provider-aware SSE 由接管路径重建
 	//（G3-F3：提交成功后必须完成正式运行时接线——注册 runtime/启动 SSE/对齐）。
-	_ = es.Close()
+	if es != nil {
+		_ = es.Close()
+	}
 	return m.adoptTakeover(ctx, taskID, row, candidate, mode)
 }
 
-// adoptBranchB 是 D5-B 首建：从未建立上游会话的新任务由 v2 正常首次创建
-// session（钉扎值不变；该路径不得用于替代丢失的历史 session——分支由判定矩阵
-// 唯一决定）。提交组合按 D4 生命周期矩阵 B 行与 D4 提交条件（SSE 首帧握手先于
-// 原子提交）：接管前段（runtime+SSE）→ commitActivationBinding（activating→
-// active CAS + binding 单事务）→ 提交后段（调度器/判定就绪）。前段/提交失败 =
-// candidate 未提交：回退本地接管 + 回收 candidate（D3 受限回收例外，D9 首建
-// 补偿场景②③）+ 既有激活补偿出口（suspended + last_error）。
-func (m *Manager) adoptBranchB(ctx context.Context, taskID string, row TaskRow, mode AlignMode) error {
-	sup, _, err := m.admitExecution(ctx, taskID)
+// candidateHandshake 候选关联订阅 + 首帧握手（D4 提交条件四之一：SSE 首帧先于
+// 原子提交；D4 替换表：候选阶段仅握手与缓冲——不对齐、零归属/事件写入）。失败/
+// 超时关流返回错误（全内存态零持久化）。EventSource 为 nil（minimalProvider/
+// 测试接缝形态，与 startSSE 回退约定同形）→ 视为握手满足返回 nil 流。返回流由
+// 调用方在提交后关闭（Close 幂等）。
+func (m *Manager) candidateHandshake(ctx context.Context, taskID string, candidate domain.TaskBinding) (appagent.EventStream, error) {
+	p, err := m.providerRegistry.Get(ocdeckstore.ProviderIDV2)
 	if err != nil {
+		return nil, err
+	}
+	es := p.Events()
+	if es == nil {
+		return nil, nil
+	}
+	stream, serr := es.Subscribe(ctx, candidate)
+	if serr != nil {
+		return nil, serr
+	}
+	handshake := make(chan struct{}, 1)
+	stream.SetCallbacks(func() { handshake <- struct{}{} }, nil)
+	select {
+	case <-handshake:
+		return stream, nil
+	case <-time.After(adoptionHandshakeTimeout):
+		_ = stream.Close()
+		return nil, errors.New("候选关联握手超时（全内存态丢弃）")
+	}
+}
+
+// firstBuildV2 是 v2 首建统一流程（评审 I4/I5；服务 R8-B 零历史承接与 R5 v2
+// 钉扎新任务——一份准备+原子提交+candidate 补偿流程）。序列（D4 B 行 + 提交
+// 条件）：Acquire（POST 语义，attempt 内失败已由 supervisor 回收）→ 端点 →
+// 候选握手（仅订阅+首帧，不对齐零归属写入）→ CommitFirstBuild（candidate
+// claim+anchor+binding+activating→active CAS 单事务）→ 提交后正式接管（对齐/
+// 事件消费启用点；失败=已提交恢复债务，不回滚）。提交前失败 = candidate 未提
+// 交：回收（D3 受限回收例外）+ 上抛（激活入口经既有补偿收敛 suspended）。
+func (m *Manager) firstBuildV2(ctx context.Context, taskID string, row TaskRow, mode AlignMode, sup appagent.RuntimeSupervisor) error {
+	astore := m.adoptionStoreOf()
+	if astore == nil {
+		err := appagent.NewError("activate.v2", appagent.ErrKindCapabilityUnavailable,
+			errors.New("store 未实现首建原子提交能力（CommitFirstBuild）"))
 		m.recordAdmissionError(ctx, taskID, err)
 		return err
 	}
@@ -221,46 +269,46 @@ func (m *Manager) adoptBranchB(ctx context.Context, taskID string, row TaskRow, 
 	if serr != nil {
 		return m.supervisorStageErrorForTyped(serr, taskID)
 	}
-	port, password, _, eerr := m.bindingEndpoint(binding)
-	if eerr != nil {
-		return m.rollbackAdoptBranchB(ctx, taskID, sup, binding,
+	if _, _, _, eerr := m.bindingEndpoint(binding); eerr != nil {
+		return m.rollbackFirstBuild(ctx, taskID, sup, binding,
 			m.supervisorStageErrorForTyped(
 				appagent.NewStageError("supervisor.binding_endpoint", appagent.ErrKindBindingInvalid, eerr), taskID))
 	}
-	// 接管前段：runtime 注册 + SSE（提交条件四之一，先于原子提交）。
-	rt, terr := m.beginV2RuntimeTakeover(ctx, taskID, row, port, password, binding, mode)
-	if terr != nil {
-		m.clearRuntime(taskID) // 回退本地接管（SSE/注册表——未提交，不得留半接管）
-		return m.rollbackAdoptBranchB(ctx, taskID, sup, binding, terr)
+	// 候选握手（提交条件：SSE 首帧先于原子提交；缓冲-only——不对齐/零归属写入）。
+	es, herr := m.candidateHandshake(ctx, taskID, binding)
+	if herr != nil {
+		m.recordAdmissionError(ctx, taskID, fmt.Errorf("首建候选握手失败（全内存态丢弃）: %v", herr))
+		return m.rollbackFirstBuild(ctx, taskID, sup, binding, herr)
 	}
-	// 原子提交（D4 B 行）：activating→active CAS + binding（入口 beginActivation
+	// 原子首建提交（candidate claim+anchor+binding+状态 CAS；入口 beginActivation
 	// 已置 activating；钉扎值 provider_id 列不变）。
-	cas, cerr := m.commitActivationBinding(ctx, taskID, binding, mode)
-	if cerr == nil && !cas.Matched {
-		// 冲突复读（同 v1 commitRuntimeReady 形态）：并发提交者已收敛 active →
-		// 幂等成功；否则为提交冲突（candidate 未提交，回退+回收）。
-		if fresh, rerr := m.store.GetTask(ctx, taskID); rerr == nil && fresh.Status == StatusActive {
-			m.finishV2RuntimeReady(taskID, rt)
-			return nil
+	key := domain.SessionKey{
+		ProviderID: binding.ProviderID, ProviderInstanceID: binding.ProviderInstanceID,
+		UpstreamID: binding.UpstreamSessionID,
+	}
+	now := m.nowUnix()
+	if _, cerr := astore.CommitFirstBuild(ctx, taskID, binding, key, now, now, now, ""); cerr != nil {
+		if es != nil {
+			_ = es.Close()
 		}
-		cerr = fmt.Errorf("%w: task %s B 首建提交状态守卫失配", ocdeckstore.ErrAdoptionConflict, taskID)
+		return m.rollbackFirstBuild(ctx, taskID, sup, binding,
+			newOpErr(codeConflict, fmt.Errorf("v2 首建提交: %w", cerr)))
 	}
-	if cerr != nil {
-		m.clearRuntime(taskID)
-		return m.rollbackAdoptBranchB(ctx, taskID, sup, binding,
-			newOpErr(codeConflict, fmt.Errorf("B 首建提交: %w", cerr)))
+	if es != nil {
+		_ = es.Close()
 	}
-	m.finishV2RuntimeReady(taskID, rt)
-	return nil
+	// 提交后正式接管（正式 SSE/对齐/事件消费启用；失败=已提交恢复债务——D4 B 行
+	// 提交成功列之后的接管失败语义与 A 分支一致）。
+	return m.adoptTakeover(ctx, taskID, row, binding, mode)
 }
 
-// rollbackAdoptBranchB 是 B 首建提交前失败的 candidate 回收（D3 受限回收例外）：
+// rollbackFirstBuild 是首建提交前失败的 candidate 回收（D3 受限回收例外）：
 // 经 supervisor 的 CandidateSessionRecycler 回收本次 attempt 新建且未提交的
 // session——回收 ctx 用 WithoutCancel 有界预算（activate.go 补偿同型：调用方 ctx
 // 已取消不得跳过回收）；回收失败聚合进错误链（清理债务，MUST NOT 误判「从未
 // 建立」）。recycler 未实现（装配不支持）→ 诊断性 last_error 记残留 candidate，
 // 不静默跳过。
-func (m *Manager) rollbackAdoptBranchB(ctx context.Context, taskID string, sup appagent.RuntimeSupervisor, candidate domain.TaskBinding, cause error) error {
+func (m *Manager) rollbackFirstBuild(ctx context.Context, taskID string, sup appagent.RuntimeSupervisor, candidate domain.TaskBinding, cause error) error {
 	rc, ok := sup.(appagent.CandidateSessionRecycler)
 	if !ok {
 		m.recordAdmissionError(ctx, taskID, fmt.Errorf(
@@ -415,8 +463,23 @@ func (m *Manager) resumeActivateV2(ctx context.Context, taskID string, row TaskR
 		return m.supervisorStageErrorForTyped(
 			appagent.NewStageError("supervisor.binding_endpoint", appagent.ErrKindBindingInvalid, eerr), taskID)
 	}
+	// 候选关联握手（评审 I10 / D4 提交条件：SSE 首帧先于原子提交——四就绪缺一
+	// 不提交）。失败关候选、保留旧 binding/status 事实（提交未发生），按激活
+	// 失败语义上抛。
+	es, herr := m.candidateHandshake(ctx, taskID, binding)
+	if herr != nil {
+		return m.supervisorStageErrorForTyped(
+			appagent.NewStageError("activate.v2.handshake", appagent.ErrKindRuntimeUnavailable, herr), taskID)
+	}
 	if _, cerr := astore.CommitV2Resume(ctx, taskID, cur, binding, row.Status); cerr != nil {
+		if es != nil {
+			_ = es.Close()
+		}
 		return newOpErr(codeConflict, fmt.Errorf("v2 激活替换提交: %w", cerr))
+	}
+	// 候选流退订（避免双通道）：正式 provider-aware SSE 由接管路径重建。
+	if es != nil {
+		_ = es.Close()
 	}
 	return m.commitV2RuntimeReady(ctx, taskID, row, port, password, binding, mode)
 }

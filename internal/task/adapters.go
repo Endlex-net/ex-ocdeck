@@ -50,9 +50,22 @@ func (a *StoreAdapter) GetTaskAnchor(ctx context.Context, taskID string) (string
 	return a.db.GetTaskAnchor(ctx, taskID)
 }
 
-// CommitAdoption 承接原子提交（tasks 6.4：归属转换+anchor+binding+状态守卫 CAS 单事务）。
-func (a *StoreAdapter) CommitAdoption(ctx context.Context, taskID string, b domain.TaskBinding, fromStatus string, lastError *string) (application.TransitionResult, error) {
-	return a.db.CommitAdoption(ctx, taskID, b, ocdecktask.Status(fromStatus), lastError)
+// CommitAdoption 承接原子提交（tasks 6.4：归属转换+anchor+binding+状态守卫 CAS
+// 单事务；评审 I11：携带同次读取旧 binding 做事务内代际复验）。
+func (a *StoreAdapter) CommitAdoption(ctx context.Context, taskID string, b, oldBinding domain.TaskBinding, fromStatus string, lastError *string) (application.TransitionResult, error) {
+	return a.db.CommitAdoption(ctx, taskID, b, oldBinding, ocdecktask.Status(fromStatus), lastError)
+}
+
+// CommitFirstBuild 首建原子提交（评审 I5：candidate claim+anchor+binding+状态
+// activating→active CAS 单事务）。
+func (a *StoreAdapter) CommitFirstBuild(ctx context.Context, taskID string, b domain.TaskBinding, key domain.SessionKey, createdAt, firstSeen, lastSeen int64, parentID string) (application.TransitionResult, error) {
+	return a.db.CommitFirstBuild(ctx, taskID, b, key, createdAt, firstSeen, lastSeen, parentID)
+}
+
+// ClaimTaskSessionKey 按完整 SessionKey 原子 claim（评审 I5：事件消费保留命名
+// 空间；三列谓词冲突语义同 ClaimTaskSession）。
+func (a *StoreAdapter) ClaimTaskSessionKey(ctx context.Context, taskID string, key domain.SessionKey, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
+	return a.db.ClaimSessionKey(ctx, taskID, key, createdAt, firstSeen, lastSeen, parentID)
 }
 
 // CommitV2Resume v2 恢复/替换提交（gate3 G3-F2/F8：binding 替换 + 旧 binding
@@ -423,6 +436,7 @@ func (a *StoreAdapter) AlignTaskSessions(ctx context.Context, taskID string, mod
 	for _, s := range listed {
 		obs = append(obs, store.SessionObservation{
 			SessionID: s.SessionID, CreatedAt: s.CreatedAt, UpdatedAt: s.UpdatedAt, ParentID: s.ParentID,
+			ProviderID: s.ProviderID, ProviderInstanceID: s.ProviderInstanceID,
 		})
 	}
 	return a.db.AlignTaskSessions(ctx, taskID, toStoreAlignMode(mode), obs, complete, notice)
@@ -454,6 +468,7 @@ func (a storeAlignPortsAdapter) Align(ctx context.Context, taskID string, mode o
 	for _, o := range observed {
 		listed = append(listed, SessionObservation{
 			SessionID: string(o.ID), CreatedAt: o.CreatedAt, UpdatedAt: o.UpdatedAt, ParentID: o.ParentID,
+			ProviderID: o.ProviderID, ProviderInstanceID: o.ProviderInstanceID,
 		})
 	}
 	return a.store.AlignTaskSessions(ctx, taskID, fromDomainAlignMode(mode), listed, complete, notice)

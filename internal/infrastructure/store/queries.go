@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
+	domain "ocdeck/internal/domain/agentprovider"
 	ocdecksess "ocdeck/internal/domain/session"
 	ocdecktask "ocdeck/internal/domain/task"
 )
@@ -1605,6 +1606,11 @@ type SessionObservation struct {
 	CreatedAt int64
 	UpdatedAt int64
 	ParentID  string
+	// ProviderID/ProviderInstanceID 归属命名空间（完整 SessionKey 三列之二；
+	// opencode-v2-provider 评审 I5：对齐 claim 保留完整命名空间）。零值 = v1
+	// 缺省命名空间（既有 v1 调用方行为不变）。
+	ProviderID         string
+	ProviderInstanceID string
 }
 
 // ClaimTaskSession 原子 claim 一个 session 至本任务（add-plain-dir-project D8）。
@@ -1982,10 +1988,17 @@ func (q *Queries) alignTaskSessionsInTx(ctx context.Context, taskID string, mode
 	var affected []ocdecksess.ID
 	switch mode {
 	case AlignModeRepo:
-		// listed 逐个原子 claim（冲突 ID 上报，不写入）。
+		// listed 逐个原子 claim（冲突 ID 上报，不写入）。命名空间随 observation
+		//（评审 I5）；零值 → v1 缺省（既有 v1 行为不变）。
 		var conflicts []ocdecksess.ID
 		for _, s := range listed {
-			cres, cerr := q.claimTaskSessionInTx(ctx, taskID, s.SessionID, s.CreatedAt, nowUnix(), s.UpdatedAt, s.ParentID)
+			nsID, nsInst := s.ProviderID, s.ProviderInstanceID
+			if nsID == "" {
+				nsID, nsInst = nsProviderIDV1, nsProviderInstanceV1Default
+			}
+			cres, cerr := q.claimSessionKeyInTx(ctx, taskID,
+				domain.SessionKey{ProviderID: nsID, ProviderInstanceID: nsInst, UpstreamID: s.SessionID},
+				s.CreatedAt, nowUnix(), s.UpdatedAt, s.ParentID)
 			if cerr != nil {
 				return res, cerr
 			}

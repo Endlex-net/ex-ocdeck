@@ -15,8 +15,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	domain "ocdeck/internal/domain/agentprovider"
 )
 
@@ -156,6 +159,236 @@ func TestStage4_RecycleCandidateSession_Supervisor(t *testing.T) {
 			t.Fatalf("no debt expected: %q", recs.rec.LastError.String)
 		}
 	})
+}
+
+// TestStage4_ServerMonitor_StopsOnShutdown 落实 I9 关停语义：监控循环在
+// ShutdownServer 后停止——此后进程死亡不再自动重拉（ready 保持清除、零通知）。
+func TestStage4_ServerMonitor_StopsOnShutdown(t *testing.T) {
+	var restarts atomic.Int32
+	srv := fixtureServer(t, route{path: "/api/session", status: 200, body: string(readFixture(t, "session_list_page2.json"))})
+	sup, proc, recs := newTestSupervisor(t, srv.URL, nil)
+	sup.deps.OnServerRestarted = func() { restarts.Add(1) }
+	sup.deps.MonitorInterval = 5 * time.Millisecond
+	if _, _, err := sup.ensureServer(context.Background()); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := sup.ShutdownServer(context.Background()); err != nil {
+		t.Fatalf("ShutdownServer: %v", err)
+	}
+	makeProcDead(sup, proc, recs)
+	time.Sleep(30 * time.Millisecond) // 数个监控周期：关停后监控不得自愈
+	if supervisorReadyLocked(sup) {
+		t.Fatalf("monitor must be stopped after shutdown (ready must stay cleared)")
+	}
+	if n := restarts.Load(); n != 0 {
+		t.Fatalf("no restart notifications after shutdown, got %d", n)
+	}
+}
+
+// TestStage4_Status_ConnectionGenerationInvalidation 落实 I12：断流即旧代
+// execution 状态作废（Current 缺项——不得重发过期 busy）；重连新代由快照自补
+//（SessionUpdated 不映射状态——不得 outcome→idle 猜测）；新代冻结映射事件
+//（succeeded）到达才重建 idle。
+func TestStage4_Status_ConnectionGenerationInvalidation(t *testing.T) {
+	setMasterSecret(t)
+	var conns atomic.Int32
+	gate1 := make(chan struct{}) // conn#1 持流（已发 started）；关闭即断流
+	gate2 := make(chan struct{}) // conn#2 持流（重连自补后）；关闭触发 conn#3
+	var snapGets atomic.Int32
+	srv := httptestServerFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/event":
+			n := conns.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			// 每连接首帧必须 server.connected（握手严格契约），随后业务帧。
+			hello := "data: {\"id\":\"h\",\"created\":1,\"type\":\"server.connected\",\"data\":{\"clientID\":\"cli_x\"}}\n\n"
+			switch n {
+			case 1:
+				writeSSE(t, w, hello+"data: {\"id\":\"e1\",\"created\":1,\"type\":\"session.execution.started\",\"data\":{\"sessionID\":\"ses_fixture01a\"}}\n\n")
+				<-gate1 // 持流至测试释放（模拟保持连接）
+			case 2:
+				writeSSE(t, w, hello+"data: {\"id\":\"e2\",\"created\":2,\"type\":\"session.updated\",\"data\":{\"sessionID\":\"ses_fixture01a\",\"title\":\"healed\"}}\n\n")
+				<-gate2
+			default:
+				writeSSE(t, w, hello+"data: {\"id\":\"e3\",\"created\":3,\"type\":\"session.execution.succeeded\",\"data\":{\"sessionID\":\"ses_fixture01a\"}}\n\n")
+				<-r.Context().Done()
+			}
+		case "/api/session/ses_fixture01a":
+			snapGets.Add(1) // selfHeal 快照（含 outcome——MUST NOT 映射状态）
+			_, _ = w.Write([]byte(`{"data":{"id":"ses_fixture01a","location":{"directory":"/wt"},"time":{"created":1,"updated":2},"outcome":"idle"}}`))
+		default:
+			w.WriteHeader(404)
+		}
+	})
+	p := newTestProvider(t, srv.URL, ProviderOptions{StatusVerified: true})
+	b := testBinding(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	es, err := p.Events().Subscribe(ctx, b)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	es.SetCallbacks(func() {}, func() {})
+	key := v2Namespace(b.UpstreamSessionID)
+	statusOf := func() (domain.AgentStatus, bool) {
+		snap, cerr := p.Status().Current(ctx, b)
+		if cerr != nil {
+			t.Fatalf("Current: %v", cerr)
+		}
+		st, ok := snap[key]
+		return st, ok
+	}
+	// 旧代：started 冻结映射 → busy。
+	expectEvent(t, es, domain.EventStatusChanged)
+	if st, ok := statusOf(); !ok || st != domain.StatusBusy {
+		t.Fatalf("pre-disconnect status=%v ok=%v, want busy", st, ok)
+	}
+	// 断流：旧代状态作废（Current 缺项——不重发过期 busy）。
+	close(gate1)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, ok := statusOf()
+		if !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stale busy must be invalidated on disconnect")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// 重连新代：selfHeal 快照（SessionUpdated，含 outcome）不重建状态——缺项
+	// 保持，不得 outcome→idle 猜测。
+	deadline = time.Now().Add(2 * time.Second)
+	for snapGets.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if st, ok := statusOf(); ok {
+		t.Fatalf("self-heal snapshot must not guess status, got %v", st)
+	}
+	// 新代冻结证据：succeeded 事件到达 → idle 重建（跳过自补 SessionUpdated 等
+	// 非状态事件——只认冻结映射的 StatusChanged）。
+	close(gate2)
+	statusSettled := false
+	deadline = time.Now().Add(5 * time.Second)
+	for !statusSettled {
+		select {
+		case ev, ok := <-es.Events():
+			if !ok {
+				t.Fatalf("stream closed while waiting for new-generation status event")
+			}
+			if ev.Kind == domain.EventStatusChanged {
+				statusSettled = true
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("new-generation status event never arrived")
+		}
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		st, ok := statusOf()
+		if ok && st == domain.StatusIdle {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("new-generation succeeded must rebuild idle, got %v ok=%v", st, ok)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+	_ = es.Close()
+}
+
+// TestStage4_TerminalIO_EnsureAndAttach 落实 TerminalIO 真实 wire 行为（D3
+// 契约；评审 I3 的 provider 侧证据）：EnsureTerminal REST 预验证（GET
+// /api/session/{id}——存在且 location.directory==binding directory，归属不符 →
+// BindingInvalid、缺失 → NotFound）；AttachCommand argv 自动选中（--server +
+// --session，D8-7）。
+func TestStage4_TerminalIO_EnsureAndAttach(t *testing.T) {
+	var getSessionHits int32
+	var lastGetPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/session/ses_") {
+			id := strings.TrimPrefix(r.URL.Path, "/api/session/")
+			if id == "ses_gone" {
+				w.WriteHeader(404)
+				_, _ = w.Write([]byte(`{"_tag":"NotFound"}`))
+				return
+			}
+			atomic.AddInt32(&getSessionHits, 1)
+			lastGetPath = r.URL.Path
+			dir := "/wt"
+			if id == "ses_foreign" {
+				dir = "/other"
+			}
+			_, _ = w.Write([]byte(`{"data":{"id":"` + id + `","time":{"created":1,"updated":1},"location":{"directory":"` + dir + `"}}}`))
+			return
+		}
+		w.WriteHeader(404)
+		_, _ = w.Write([]byte(`{"_tag":"NotFound"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	p := NewSPIProviderWithDeps(ProviderOptions{StatusVerified: true}, &SupervisorDeps{
+		Proc:         &fakeProcSeam{pids: map[string]int{}},
+		Store:        &fakeRecordStore{errs: map[string]error{}},
+		AllocatePort: func(lastPort int, lastValid bool, exclude int) (int, error) { return 4096, nil },
+	})
+	p.newClient = func(port int, password string, opts Options) *Client {
+		c := NewClient(port, password, opts)
+		c.baseURL = srv.URL
+		return c
+	}
+	term := p.Terminal()
+	b := stage4LifecycleBinding(t, "t-term", "ses_keep")
+
+	// 存在且归属本任务 → 返回托管单元引用（TerminalRef 稳定标识）。
+	ref, err := term.EnsureTerminal(context.Background(), b)
+	if err != nil || ref != b.TerminalRef {
+		t.Fatalf("EnsureTerminal: ref=%q err=%v", ref, err)
+	}
+	if atomic.LoadInt32(&getSessionHits) != 1 || lastGetPath != "/api/session/ses_keep" {
+		t.Fatalf("REST prevalidation expected on binding upstream, hits=%d path=%q", getSessionHits, lastGetPath)
+	}
+
+	// 归属不符 → BindingInvalid（MUST NOT 建替代 session）。
+	foreign := stage4LifecycleBinding(t, "t-term", "ses_foreign")
+	if _, err := term.EnsureTerminal(context.Background(), foreign); err == nil || !errorKindIs(err, appagent.ErrKindBindingInvalid) {
+		t.Fatalf("directory mismatch must be BindingInvalid, got %v", err)
+	}
+
+	// 缺失 → NotFound。
+	missing := stage4LifecycleBinding(t, "t-term", "ses_gone")
+	if _, err := term.EnsureTerminal(context.Background(), missing); err == nil || !errorKindIs(err, appagent.ErrKindNotFound) {
+		t.Fatalf("missing session must be NotFound, got %v", err)
+	}
+
+	// AttachCommand：argv 自动选中（--server + --session；凭据走 env 不入 argv）。
+	argv, aerr := term.AttachCommand(context.Background(), b)
+	if aerr != nil {
+		t.Fatalf("AttachCommand: %v", aerr)
+	}
+	want := []string{"opencode", "--server", "http://127.0.0.1:4096", "--session", "ses_keep"}
+	if len(argv) != len(want) {
+		t.Fatalf("argv: %v want %v", argv, want)
+	}
+	for i := range want {
+		if argv[i] != want[i] {
+			t.Fatalf("argv[%d]: %q want %q", i, argv[i], want[i])
+		}
+	}
+}
+
+// errorKindIs 判定 typed provider 错误的 ErrorKind（errors.As 解包）。
+func errorKindIs(err error, kind appagent.ErrorKind) bool {
+	var ae *appagent.Error
+	if !errors.As(err, &ae) {
+		return false
+	}
+	return ae.Kind == kind
 }
 
 // TestStage4_Ephemeral_FullChain 落实 ephemeral 完整链（D9）：AcquireEphemeral →

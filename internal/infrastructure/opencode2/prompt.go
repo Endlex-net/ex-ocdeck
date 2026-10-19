@@ -156,3 +156,12 @@ func (p *SPIProvider) recordStatus(key domain.SessionKey, state domain.AgentStat
 	p.status[key.UpstreamID] = state
 	p.statusMu.Unlock()
 }
+
+// invalidateStatus 按连接代失效 session 的 execution 状态追踪（评审 I12：断流/
+// 重连新代即旧代状态作废——Current 缺项 = 未知，MUST NOT 用旧代值或
+// outcome→idle 猜测补齐；新代状态仅由新的冻结映射事件重建）。
+func (p *SPIProvider) invalidateStatus(upstreamID string) {
+	p.statusMu.Lock()
+	delete(p.status, upstreamID)
+	p.statusMu.Unlock()
+}

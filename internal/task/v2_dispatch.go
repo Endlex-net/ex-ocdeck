@@ -48,28 +48,30 @@ func (m *Manager) taskExecutionDecision(ctx context.Context, taskID string) (exe
 // BindingOwnershipChecker（G3-F5：归属校验先于 supervisor 的任何网络/进程
 // 副作用与凭据派生）；provider 未实现该窄接口 → fail-closed。registry 未注入
 // → 回退固定 v1 supervisor（既有装配/测试现状，行为不变）。
-func (m *Manager) admitExecution(ctx context.Context, taskID string) (appagent.RuntimeSupervisor, execDecision, error) {
+// 评审 I7：binding 事实（同次决策读取）随返回值透出——调用方分派复用，MUST NOT
+// 二次读取（漂移窗口）。
+func (m *Manager) admitExecution(ctx context.Context, taskID string) (appagent.RuntimeSupervisor, execDecision, domain.TaskBinding, bool, error) {
 	dec, binding, hasBinding, err := m.taskExecutionDecision(ctx, taskID)
 	if err != nil {
-		return nil, execDecision{}, err
+		return nil, execDecision{}, domain.TaskBinding{}, false, err
 	}
 	if dec.DenyKind != "" {
-		return nil, dec, appagent.NewError("resolver.admit", dec.DenyKind, errors.New(dec.DenyReason))
+		return nil, dec, binding, hasBinding, appagent.NewError("resolver.admit", dec.DenyKind, errors.New(dec.DenyReason))
 	}
 	if dec.ExecProviderID == ocdeckstore.ProviderIDV1 {
 		// v1 决策 → 注入的 v1 supervisor 实例（D4 替换表「同一 v1 实例，行为
 		// 等价」——生产装配 SetRuntimeSupervisor(v1Provider.Supervisor())、
 		// 测试注入 fake；registry 不参与 v1 解析）。
-		return m.runtimeSupervisor, dec, nil
+		return m.runtimeSupervisor, dec, binding, hasBinding, nil
 	}
 	// v2 决策 → 经 registry（v2 provider 未注册 = fail-closed）。
 	if m.providerRegistry == nil {
-		return nil, dec, appagent.NewError("resolver.admit", appagent.ErrKindProviderNotFound,
+		return nil, dec, binding, hasBinding, appagent.NewError("resolver.admit", appagent.ErrKindProviderNotFound,
 			fmt.Errorf("执行 provider %s 未注册（registry 未装配）", dec.ExecProviderID))
 	}
 	p, err := m.providerRegistry.Get(dec.ExecProviderID)
 	if err != nil {
-		return nil, dec, err
+		return nil, dec, binding, hasBinding, err
 	}
 	// G3-F5/G3-F9：已有 v2 binding → 归属校验先于 supervisor 副作用（网络/进程/
 	// 凭据）——binding 事实复用决策读取（hasBinding==false 才跳过；读取错误已在
@@ -77,18 +79,18 @@ func (m *Manager) admitExecution(ctx context.Context, taskID string) (appagent.R
 	if hasBinding && binding.ProviderID == ocdeckstore.ProviderIDV2 {
 		checker, ok := p.(appagent.BindingOwnershipChecker)
 		if !ok {
-			return nil, dec, appagent.NewError("resolver.admit", appagent.ErrKindBindingInvalid,
+			return nil, dec, binding, hasBinding, appagent.NewError("resolver.admit", appagent.ErrKindBindingInvalid,
 				fmt.Errorf("provider %s 未实现 BindingOwnershipChecker（fail-closed 拒绝使用其 binding）", p.Meta().ProviderID))
 		}
 		trow, derr := m.store.GetTask(ctx, taskID)
 		if derr != nil {
-			return nil, dec, derr
+			return nil, dec, binding, hasBinding, derr
 		}
 		if err := checker.CheckBindingOwnership(binding, taskID, trow.WorktreePath); err != nil {
-			return nil, dec, err
+			return nil, dec, binding, hasBinding, err
 		}
 	}
-	return p.Supervisor(), dec, nil
+	return p.Supervisor(), dec, binding, hasBinding, nil
 }
 
 // supervisorForTaskConsumption 消费点路由（R4/R12：恒按 binding ProviderID 经
@@ -115,6 +117,31 @@ func (m *Manager) supervisorForTaskConsumption(ctx context.Context, taskID strin
 		return nil, err
 	}
 	return p.Supervisor(), nil
+}
+
+// checkBindingOwnershipGate 是任务级 binding 消费的统一归属门禁（评审 I7）：
+// 一次读取 binding 后、endpoint/client 提供与凭据派生前执行——v2 binding 强制
+// CheckBindingOwnership（provider 未实现 fail-closed 拒绝，形态同
+// supervisorForTaskConsumption）；其他命名空间维持既有行为（v1 无该窄接口，
+// 行为不变）。
+func (m *Manager) checkBindingOwnershipGate(ctx context.Context, taskID string, b domain.TaskBinding) error {
+	if b.ProviderID != ocdeckstore.ProviderIDV2 {
+		return nil
+	}
+	trow, err := m.store.GetTask(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("ownership gate: get task: %w", err)
+	}
+	p, err := m.providerFor(b.ProviderID)
+	if err != nil {
+		return err
+	}
+	checker, ok := p.(appagent.BindingOwnershipChecker)
+	if !ok {
+		return appagent.NewError("registry.ownership", appagent.ErrKindBindingInvalid,
+			fmt.Errorf("provider %s 未实现 BindingOwnershipChecker（fail-closed 拒绝使用其 binding）", b.ProviderID))
+	}
+	return checker.CheckBindingOwnership(b, taskID, trow.WorktreePath)
 }
 
 // serverShutdownHook 是 v2 supervisor 单 owner 关停能力（V2Supervisor 满足；

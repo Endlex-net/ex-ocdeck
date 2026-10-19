@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"ocdeck/internal/application"
@@ -63,6 +64,13 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 	if cerr := m.convergePendingBeforeLifecycle(ctx, row, proj); cerr != nil {
 		return newOpErr(codeConflict, cerr)
 	}
+	// 评审 I2（D4 挂起行）：v2 挂起门禁——active→suspending CAS 前完成归属校验与
+	// 停止（interrupt 确认；停止确认前 MUST 保留运行关联）。失败 → 任务保持 active
+	// + last_error（零状态写入；禁入 v1 强杀补偿/serve 修复树）。
+	sb, hasV2, gerr := m.suspendGateV2(ctx, taskID, row)
+	if gerr != nil {
+		return gerr
+	}
 	// P1.4.7：DB 写入经 write* helper 路由（注入 LifecycleService 时走 persist+commit 封装）。
 	// terminal-file-paste-drop 2.5：active→suspending 提交（离开 active）在 per-task
 	// 协调锁临界区内执行（本方法已持任务锁，锁顺序：任务锁 → 协调锁），与上传
@@ -78,7 +86,37 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 	if !updated.Matched {
 		return newOpErr(codeConflict, fmt.Errorf("task %s state changed before suspend", taskID))
 	}
-	return m.suspendRun(ctx, taskID, mode)
+	return m.suspendRun(ctx, taskID, mode, sb, hasV2)
+}
+
+// suspendGateV2 是 v2 挂起门禁（评审 I2，D4 挂起行）：active→suspending CAS 前
+// 读实际 binding → 归属校验（supervisorForTaskConsumption 统一入口）→ 按实际
+// binding 分派 supervisor 停止执行（Release=interrupt；停止确认成功才放行后续
+// 退订/清理）。非 v2 binding（无 binding/v1）返回 hasV2=false 走既有流程。
+// 停止失败：任务保持 active、保留运行关联、last_error，零状态转换（禁止进 v1
+// forceKillAll+finishSuspend 补偿——对共享 server 禁用）。
+func (m *Manager) suspendGateV2(ctx context.Context, taskID string, row TaskRow) (domain.TaskBinding, bool, error) {
+	b, has, err := m.store.GetTaskBinding(ctx, taskID)
+	if err != nil {
+		return domain.TaskBinding{}, false, newOpErr(codeInternal, fmt.Errorf("suspend gate: get binding: %w", err))
+	}
+	if !has || b.ProviderID != store.ProviderIDV2 {
+		return domain.TaskBinding{}, false, nil
+	}
+	sup, serr := m.supervisorForTaskConsumption(ctx, taskID, b, row.WorktreePath)
+	if serr != nil {
+		m.recordAdmissionError(ctx, taskID, serr)
+		return domain.TaskBinding{}, false, newOpErr(codeConflict, serr)
+	}
+	if rerr := sup.Release(ctx, b); rerr != nil {
+		// 停止失败如实报错：状态/运行关联/快照全部不动（active 保留）。
+		le := sql.NullString{String: fmt.Sprintf("suspend stop failed (kept active): %v", rerr), Valid: true}
+		if _, werr := m.writeStatus(ctx, taskID, m.readStatusForDiagnostic(ctx, taskID), le); werr != nil {
+			log.Printf("suspend gate: task %s record last_error: %v", taskID, werr)
+		}
+		return domain.TaskBinding{}, false, newOpErr(codeProcessError, fmt.Errorf("suspend stop: %w", rerr))
+	}
+	return b, true, nil
 }
 
 // suspendRun 执行挂起的外部副作用并按互斥决策树收敛（design.md §5）。
@@ -95,9 +133,25 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 // 落 suspended + last_error，不得直接返回 error 留 suspending。
 //
 // mode 为 Suspend 入口已解析的对齐模式，传入 repair 路径复用（D8：不重复查询项目 kind）。
-func (m *Manager) suspendRun(ctx context.Context, taskID string, mode AlignMode) error {
+func (m *Manager) suspendRun(ctx context.Context, taskID string, mode AlignMode, sb domain.TaskBinding, hasV2 bool) error {
 	// 停 SSE 订阅 + 退出监视。
 	m.clearRuntime(taskID)
+
+	// 评审 I2：v2 挂起收敛（停止已在 Suspend 门禁确认——先停止后退订，D3 顺序）。
+	// 本地清理仅限任务自有 tmux 单元（v2 TUI/shell；无 v1 serve/runtime 单元判定，
+	// 禁入 forceKillAll 强杀树与 tryRepairRuntime 修复树——共享 server 与 v1 单元
+	// 语义均不适用）。清理失败仍收敛 suspended + notice（D4：执行已停止属实，
+	// 清理遗留按 cleanup notice 后台重试；MUST NOT 停留 suspending）。
+	if hasV2 {
+		killRes := m.killTaskSessions(ctx, taskID, []string{sb.TerminalRef})
+		shellNames, serr := m.listShellSessions(taskID)
+		if serr != nil {
+			killRes = append(killRes, killResultEntry{name: sb.TerminalRef, killErr: serr})
+			return m.finalizeSuspendDetached(ctx, taskID, killRes, nil)
+		}
+		killRes = append(killRes, m.killTaskSessions(ctx, taskID, shellNames)...)
+		return m.finalizeSuspendDetached(ctx, taskID, killRes, nil)
+	}
 
 	// 分支判定时机：kill 前查进程会话是否已死。Phase 2 进程名为 -runtime，
 	// leftover -serve 仍参与判定与清理。

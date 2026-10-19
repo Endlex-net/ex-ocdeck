@@ -10,6 +10,7 @@ package task
 
 import (
 	"context"
+	"errors"
 
 	appagent "ocdeck/internal/application/agentprovider"
 	domain "ocdeck/internal/domain/agentprovider"
@@ -28,6 +29,8 @@ type spiBridgeOCClient struct {
 	dir string
 	// taskID 是 binding 解出的观测身份键（v1 data.taskId）。
 	taskID string
+	// m 是构造方 Manager（评审 I6：attention 事实/归属 session 集合来源）。
+	m *Manager
 	// fallback 承接无窄接口对应的方法（不得为 nil——构造入口保证）。
 	fallback OCClient
 }
@@ -159,28 +162,101 @@ func (c *spiBridgeOCClient) SubscribeEvents(ctx context.Context, dir string, onE
 
 func (c *spiBridgeOCClient) ListPermissions(ctx context.Context, dir string) ([]appagent.PermissionRequest, error) {
 	_ = dir
-	// scope 通道：Session 字段仅参与健康观测归属（REST 传输是全目录快照），
-	// key 的 UpstreamID 留空（runtime scope 观测面）。
-	out, err := c.p.Attention().ListPermissions(ctx, c.binding, c.bridgeSessionKey(""))
+	// 评审 I6：v2 无目录级 permission 列表端点——按任务拥有的 session 集合聚合
+	// session 级结果（归属集合经 store 权威读取）；v1/未知命名空间维持原出口
+	//（Session 观测键留空——v1 传输是全目录快照）。
+	if c.binding.ProviderID != store.ProviderIDV2 {
+		out, err := c.p.Attention().ListPermissions(ctx, c.binding, c.bridgeSessionKey(""))
+		if err != nil {
+			return nil, err
+		}
+		return out, nil // appagent.PermissionRequest = domain.PermissionPayload（alias）。
+	}
+	// 归属 session 集合经 store 窄接口权威读取（同承接判定来源）；未实现 →
+	// fail-closed（空集会静默漏掉 v2 attention 对账，不得降级）。
+	astore, ok := c.m.store.(adoptionStore)
+	if !ok {
+		return nil, appagent.NewError("bridge.attention", appagent.ErrKindCapabilityUnavailable,
+			errors.New("store 未实现归属 session 集合读取（ListTaskSessionKeys）"))
+	}
+	keys, err := astore.ListTaskSessionKeys(ctx, c.taskID)
 	if err != nil {
 		return nil, err
 	}
-	return out, nil // appagent.PermissionRequest = domain.PermissionPayload（alias）。
+	var out []appagent.PermissionRequest
+	for _, k := range keys {
+		if k.ProviderID != c.binding.ProviderID || k.ProviderInstanceID != c.binding.ProviderInstanceID {
+			continue
+		}
+		part, perr := c.p.Attention().ListPermissions(ctx, c.binding, k)
+		if perr != nil {
+			return nil, perr
+		}
+		out = append(out, part...)
+	}
+	return out, nil
 }
 
 func (c *spiBridgeOCClient) ListQuestions(ctx context.Context, dir string) ([]appagent.QuestionRequest, error) {
 	_ = dir
-	out, err := c.p.Attention().ListQuestions(ctx, c.binding, c.bridgeSessionKey(""))
+	// 评审 I6：同 ListPermissions——v2 按归属 session 集合聚合。
+	if c.binding.ProviderID != store.ProviderIDV2 {
+		out, err := c.p.Attention().ListQuestions(ctx, c.binding, c.bridgeSessionKey(""))
+		if err != nil {
+			return nil, err
+		}
+		return out, nil // appagent.QuestionRequest = domain.QuestionPayload（alias）。
+	}
+	astore, ok := c.m.store.(adoptionStore)
+	if !ok {
+		return nil, appagent.NewError("bridge.attention", appagent.ErrKindCapabilityUnavailable,
+			errors.New("store 未实现归属 session 集合读取（ListTaskSessionKeys）"))
+	}
+	keys, err := astore.ListTaskSessionKeys(ctx, c.taskID)
 	if err != nil {
 		return nil, err
 	}
-	return out, nil // appagent.QuestionRequest = domain.QuestionPayload（alias）。
+	var out []appagent.QuestionRequest
+	for _, k := range keys {
+		if k.ProviderID != c.binding.ProviderID || k.ProviderInstanceID != c.binding.ProviderInstanceID {
+			continue
+		}
+		part, perr := c.p.Attention().ListQuestions(ctx, c.binding, k)
+		if perr != nil {
+			return nil, perr
+		}
+		out = append(out, part...)
+	}
+	return out, nil
 }
 
 func (c *spiBridgeOCClient) ReplyPermission(ctx context.Context, dir, requestID, reply string) error {
 	_ = dir
-	at := domain.Attention{ID: requestID, Kind: domain.AttentionPermission, Session: c.bridgeSessionKey(requestID)}
+	// 评审 I6：回复 MUST 携带真实 session 身份——从 attention 事实（SSE 事件记录
+	// 的 SessionID）解析请求归属；查不到如实失败（不猜、不回落 requestID——v1
+	// 时代 requestID 即 session 键的巧合对 v2 不成立）。
+	at := domain.Attention{ID: requestID, Kind: domain.AttentionPermission, Session: c.bridgeSessionKey(c.attentionSessionID(requestID))}
 	return c.p.Attention().Reply(ctx, c.binding, at, appagent.AttentionReply{Action: reply})
+}
+
+// attentionSessionID 从当前 runtime 的 attention 快照解析请求归属 session
+// （MUST NOT 用 requestID 冒充 sessionID——v2 回复 URL 为 /session/<sid>/...）。
+// 无 runtime/无快照/未知请求 → 空串（v2 出口 fail-closed 拒绝）。
+func (c *spiBridgeOCClient) attentionSessionID(requestID string) string {
+	if c.m == nil {
+		return ""
+	}
+	rt := c.m.getRuntime(c.taskID)
+	if rt == nil || rt.attention == nil {
+		return ""
+	}
+	snap := rt.attention.attentionSnapshot()
+	for _, perm := range snap.Permissions {
+		if perm.ID == requestID {
+			return perm.SessionID
+		}
+	}
+	return ""
 }
 
 func (c *spiBridgeOCClient) PromptAsync(ctx context.Context, dir, sessionID, messageID, text string, files []appagent.PromptFilePart) appagent.PromptTransportResult {
@@ -227,5 +303,5 @@ func (m *Manager) bridgeClientFor(data *opencodeBindingData, binding domain.Task
 		// 测试接缝形态（minimalProvider：窄接口 nil）——既有 ocFactory 路径。
 		return nil
 	}
-	return &spiBridgeOCClient{p: p, binding: binding, dir: data.Directory, taskID: data.TaskID, fallback: fallback}
+	return &spiBridgeOCClient{p: p, binding: binding, dir: data.Directory, taskID: data.TaskID, m: m, fallback: fallback}
 }

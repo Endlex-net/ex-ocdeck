@@ -195,6 +195,9 @@ func EnsureTmpDir(dataDir string) (string, error) {
 const (
 	sessionNameMaxLen = 128
 	ocdeckPrefix      = "ocdeck-"
+	// v2TUISessionPrefix 是 v2 交互 TUI 托管单元名前缀（opencode-v2-provider
+	// design D3 TerminalIO：ocdeck-v2-tui-<taskID>，从 binding TerminalRef 派生）。
+	v2TUISessionPrefix = "ocdeck-v2-tui-"
 	suffixRuntime     = "runtime"
 	suffixServe       = "serve"
 	suffixTUI         = "tui"
@@ -290,6 +293,17 @@ func parseShellIndex(suffix string) (int, bool) {
 }
 
 func validateParsedSessionName(name string, createOnly bool) error {
+	// v2 交互 TUI 托管单元（opencode-v2-provider design D3 TerminalIO）：名称
+	// ocdeck-v2-tui-<taskID>（与 v2 serve 同一 "v2" 特许段；名字从 binding
+	// TerminalRef 确定性派生，延迟创建/幂等）。既有 ocdeck-<taskID>-<role> 文法
+	// 不含该形态，独立识别（创建与管理路径同规——Has/Kill/Attach 需同名寻址）。
+	if strings.HasPrefix(name, v2TUISessionPrefix) {
+		remainder := name[len(v2TUISessionPrefix):]
+		if validTaskID(remainder) {
+			return nil
+		}
+		return fmt.Errorf("process: invalid v2 tui session name %q (want %s<taskID>, charset [a-z0-9-])", name, v2TUISessionPrefix)
+	}
 	taskID, suffix, err := ParseSessionName(name)
 	if err != nil {
 		if createOnly {

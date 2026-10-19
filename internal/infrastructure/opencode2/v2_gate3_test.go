@@ -61,9 +61,9 @@ func supervisorReadyLocked(sup *V2Supervisor) bool {
 // CheckServerAlive 触发回调恰一次、Acquire 亦经同一快速路径恢复后建 session。
 func TestGate3_F10_ReadyFastPathDiscoversProcessDeath(t *testing.T) {
 	srv := fixtureServer(t, route{path: "/api/session", status: 200, body: string(readFixture(t, "session_list_page2.json"))})
-	var restarts int
+	var restarts atomic.Int32
 	sup, proc, recs := newTestSupervisor(t, srv.URL, nil)
-	sup.deps.OnServerRestarted = func() { restarts++ }
+	sup.deps.OnServerRestarted = func() { restarts.Add(1) }
 	if _, _, err := sup.ensureServer(context.Background()); err != nil {
 		t.Fatalf("init: %v", err)
 	}
@@ -76,13 +76,11 @@ func TestGate3_F10_ReadyFastPathDiscoversProcessDeath(t *testing.T) {
 	if supervisorReadyLocked(sup) {
 		t.Fatalf("fast path liveness check must fail after real process death")
 	}
-	// CheckServerAlive：快速路径失效 → 重拉同端口 → 回调恰一次。
+	// CheckServerAlive：快速路径失效 → 重拉同端口 → 回调恰一次（异步派发）。
 	if err := sup.CheckServerAlive(context.Background()); err != nil {
 		t.Fatalf("CheckServerAlive: %v", err)
 	}
-	if restarts != 1 {
-		t.Fatalf("restarts=%d", restarts)
-	}
+	awaitRestarts(t, &restarts, 1)
 	if !supervisorReadyLocked(sup) {
 		t.Fatalf("fast path must be alive after repull")
 	}
@@ -93,9 +91,7 @@ func TestGate3_F10_ReadyFastPathDiscoversProcessDeath(t *testing.T) {
 	if err := sup.CheckServerAlive(context.Background()); err != nil {
 		t.Fatalf("CheckServerAlive(reuse): %v", err)
 	}
-	if restarts != 1 {
-		t.Fatalf("reuse must not re-callback, restarts=%d", restarts)
-	}
+	awaitRestarts(t, &restarts, 1) // reuse must not re-callback
 	// Acquire 路径：再次死亡 → Acquire 内 ensureServer 快速路径自行发现 → 恢复
 	// 矩阵重拉（同端口）后建 session。
 	makeProcDead(sup, proc, recs)

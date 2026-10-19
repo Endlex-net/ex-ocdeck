@@ -17,3 +17,12 @@ import (
 type CandidateSessionRecycler interface {
 	RecycleCandidateSession(ctx context.Context, b domain.TaskBinding) error
 }
+
+// ServerAvailabilityWarmer 是 v2 共享 server 可用性步骤的窄接口（可选能力，
+// 形态同 BindingOwnershipChecker；D4/D5：共享 server 启动/重拉用 supervisor
+// 独立有界重试承担，不消耗任务恢复预算）：确认 server 存活，死亡即重拉。
+// 耗尽失败由 task 层按确定性阶段结果处置（保留现状 + last_error 提交用户
+// 决策），MUST NOT 进入普通任务 attempt 预算循环。
+type ServerAvailabilityWarmer interface {
+	CheckServerAlive(ctx context.Context) error
+}
