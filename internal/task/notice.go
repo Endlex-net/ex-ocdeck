@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"time"
@@ -817,7 +818,25 @@ func (m *Manager) retryTaskNotices(ctx context.Context, t TaskRow, entries []not
 	// clearedKeys 记录本轮成功清除的 notice key（B6：CAS 失败重试时不得从最新读回的
 	// 并发新增中复活本轮已清除项）。CAS 新值 MUST 基于同一次读取的最新版本计算。
 	clearedKeys := make(map[string]bool)
+	// Round4 J8：已知身份（真实 session id）的 candidate 债务先处理，占位意图后置
+	// ——占位是否可解除取决于本轮已知身份的收割结果（身份找回 + 回收证明）。若先
+	// 处理占位，会误把「本轮尚有机会证明已回收」当成身份永久未知。
+	ordered := make([]noticeEntry, 0, len(entries))
+	var pendingIntents []noticeEntry
 	for _, e := range entries {
+		if e.Code == noticeCodeResidual {
+			if reason, _ := e.Data["reason"].(string); reason == noticeReasonCandidateCleanupFailed {
+				if sn, _ := e.Data["sessionName"].(string); sn == candidateIntentSessionPending {
+					pendingIntents = append(pendingIntents, e)
+					continue
+				}
+			}
+		}
+		ordered = append(ordered, e)
+	}
+	ordered = append(ordered, pendingIntents...)
+	var knownCandidateReaped bool
+	for _, e := range ordered {
 		if e.Code == noticeCodeSuspendStop {
 			// 停止收敛意图（评审 Round3 I2）：上游已停+收敛写曾失败——持任务锁
 			// 复核后完成清关联+状态收敛（suspended）再删意图；旧意图不得影响
@@ -855,6 +874,18 @@ func (m *Manager) retryTaskNotices(ctx context.Context, t TaskRow, entries []not
 		// 重新 DELETE（收割目标=原 candidate session id）。成功清条目；失败/
 		// provider 未实现 fail-closed 保留（首建准入门禁持续生效）。
 		if reason, _ := e.Data["reason"].(string); reason == noticeReasonCandidateCleanupFailed {
+			// Round4 J8：占位意图只有在同一轮已用真实身份证明回收后才可解除
+			//（同进程 settle-fail 后真实 ID 经 ledger 落账）；仍未知 → 保持阻断，
+			// 人工处置（MUST NOT 因占位符 DELETE 成功/404 清债）。
+			if sessionName == candidateIntentSessionPending {
+				if knownCandidateReaped {
+					clearedKeys[noticeKey(e)] = true
+				} else {
+					log.Printf("task %s: candidate intent identity unknown (pre-POST placeholder); keeping first-build gated until manual resolution", t.ID)
+					remaining = append(remaining, e)
+				}
+				continue
+			}
 			done, rerr := m.reapCandidateDebt(ctx, t.ID, sessionName)
 			if rerr != nil || !done {
 				remaining = append(remaining, e)
@@ -863,6 +894,7 @@ func (m *Manager) retryTaskNotices(ctx context.Context, t TaskRow, entries []not
 				}
 				continue
 			}
+			knownCandidateReaped = true
 			clearedKeys[noticeKey(e)] = true
 			continue
 		}
@@ -1053,6 +1085,29 @@ func unionTickets(old, neu []string) []string {
 // candidateIntentSessionPending 是首建阻断意图的占位 sessionName（POST 前落库；
 // Acquire 拿到真实 candidate id 后经 settleCandidateIntent 替换）。
 const candidateIntentSessionPending = "pending"
+
+// unknownCandidateIntentGuidance 是身份未知首建意图的人工处置指引（Round4 J8：
+// 占位意图不随占位符 DELETE 成功/404 解除——真实 candidate 是否存活未知，自动
+// 重放保持阻断；跨重启后真实 ID 只存在于已丢失的内存 ledger，无法自动恢复）。
+const unknownCandidateIntentGuidance = "v2 首建候选身份未知（POST 后真实 session id 未能跨重启落库）：" +
+	"原 candidate 可能仍存活于共享 serve，自动重放不会解除阻断——请人工确认并清理该上游 session 后清除任务 notice（或强制删除任务）"
+
+// hasUnknownCandidateIntent 报告 notice 中是否存在身份未知的首建意图
+// （candidate_cleanup_failed + sessionName=pending）。
+func hasUnknownCandidateIntent(entries []noticeEntry) bool {
+	for _, e := range entries {
+		if e.Code != noticeCodeResidual {
+			continue
+		}
+		if reason, _ := e.Data["reason"].(string); reason != noticeReasonCandidateCleanupFailed {
+			continue
+		}
+		if sn, _ := e.Data["sessionName"].(string); sn == candidateIntentSessionPending {
+			return true
+		}
+	}
+	return false
+}
 
 // armCandidateIntent 在首建 POST 之前持久化可跨重启的阻断意图（Round3 J3）：
 // retryable candidate_cleanup_failed 残债（sessionName=pending）——持久化失败

@@ -3228,11 +3228,15 @@ func TestStage4_R6_I19_SuspendCompletesPendingOrKeepsIt(t *testing.T) {
 
 // debtCandidateSup 是 J3 测试的 fake supervisor：Acquire 恒失败且错误链携带
 // CandidateCleanupDebt（配置应用失败+DELETE 失败的编排后形态）；实现
-// CandidateDebtReaper 录制收割目标。
+// CandidateDebtReaper 录制收割目标。ReapCandidateSession 仅对真实 candidate id
+// 返回成功——任意 ID 均成功的 fake 会掩盖 J8「占位符被当作可收割身份」缺陷。
 type debtCandidateSup struct {
 	mu           sync.Mutex
 	acquireCalls int32
 	reaped       []string
+	// realCandidate 非空时：收割目标不匹配即返回 NotFound（模拟真实上游 DELETE
+	// 只对真实 session id 生效，未知 id 404）。
+	realCandidate string
 	// acquireHook 非 nil 时在 Acquire 进入后调用（取消/故障注入等时序控制）。
 	acquireHook func()
 }
@@ -3263,7 +3267,13 @@ func (s *debtCandidateSup) Release(ctx context.Context, b domain.TaskBinding) er
 func (s *debtCandidateSup) ReapCandidateSession(ctx context.Context, taskID, sessionID string) error {
 	s.mu.Lock()
 	s.reaped = append(s.reaped, sessionID)
+	real := s.realCandidate
 	s.mu.Unlock()
+	// J8：只有真实 candidate id 可被收割；占位/未知 id 模拟真实上游 404
+	//（J7 收敛只对真实 ID 的清理窄路径成立，测试 fake 不得对任意 ID 返回成功）。
+	if real != "" && sessionID != real {
+		return fmt.Errorf("reap candidate %s: session not found", sessionID)
+	}
 	return nil
 }
 
@@ -3303,7 +3313,7 @@ func TestR1_J3_CandidateDebt_GatesFirstBuild(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	seedBranchBTask(t, db, "t-cd")
 	adapter := NewStoreAdapter(db)
-	sup := &debtCandidateSup{}
+	sup := &debtCandidateSup{realCandidate: "ses_debt_1"}
 	prov := &debtProvider{sup: sup}
 	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
 	m.SetLifecycleCtx(ctx)
@@ -3460,7 +3470,7 @@ func TestR1_J3_ArmBlocksBeforePOST(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	seedBranchBTask(t, db, "t-am")
 	adapter := NewStoreAdapter(db)
-	sup := &debtCandidateSup{}
+	sup := &debtCandidateSup{realCandidate: "ses_debt_1"}
 	prov := &debtProvider{sup: sup}
 	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
 	m.SetLifecycleCtx(ctx)
@@ -3553,7 +3563,7 @@ func TestR1_J3_CrossRestartZeroPOST(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	seedBranchBTask(t, db, "t-xr")
 	adapter := NewStoreAdapter(db)
-	sup := &debtCandidateSup{}
+	sup := &debtCandidateSup{realCandidate: "ses_debt_1"}
 	prov := &debtProvider{sup: sup}
 	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
 	m.SetLifecycleCtx(ctx)
@@ -3616,7 +3626,7 @@ func TestR1_J3_CancelAndDebtPersist(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	seedBranchBTask(t, db, "t-cn")
 	adapter := NewStoreAdapter(db)
-	sup := &debtCandidateSup{}
+	sup := &debtCandidateSup{realCandidate: "ses_debt_1"}
 	sup.acquireHook = func() { cancel() } // Acquire 进入后取消（POST 在途形态）
 	prov := &debtProvider{sup: sup}
 	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
@@ -3747,11 +3757,47 @@ func TestR1_J3_SettleFail_StillGatedAfterRestart(t *testing.T) {
 		t.Fatalf("cross-restart must be zero-POST, acquires=%d", calls)
 	}
 
-	// notice 通道恢复 → 重放收割占位意图 → 门禁开放（换健康 sup 完成首建）。
+	// notice 通道恢复 → 后台重放 + 启动 Reconcile（debt pre-pass）后 MUST 仍零
+	// POST、占位不被当作收割目标——真实 candidate ses_debt_1 的身份只存在于已随
+	// 重启丢失的内存 ledger，占位符 DELETE 成功/404 不能证明其已回收（Round4 J8）。
 	fstore.failNoticeCAS.Store(false)
+	sup.realCandidate = "ses_debt_1" // 只有真实 candidate id 可被收割（未知 id 404）
 	if berr := m2.processRetryableNotices(ctx); berr != nil {
 		t.Fatalf("replay: %v", berr)
 	}
+	if rerr := m2.Reconcile(ctx); rerr != nil {
+		t.Fatalf("reconcile: %v", rerr)
+	}
+	if reaped := sup.reapedSnapshot(); len(reaped) != 0 {
+		t.Fatalf("identity-unknown placeholder MUST NOT be reaped, reaped=%v", reaped)
+	}
+	for _, id := range sup.reapedSnapshot() {
+		if id == candidateIntentSessionPending {
+			t.Fatalf("MUST NOT DELETE placeholder %q (proves nothing about real candidate)", id)
+		}
+	}
+	rowGate, _ := fstore.GetTask(ctx, "t-sf")
+	if rowGate.Status != "suspended" {
+		t.Fatalf("replay must not open first-build: status=%s", rowGate.Status)
+	}
+	if !strings.Contains(rowGate.Notice.String, `"pending"`) {
+		t.Fatalf("identity-unknown intent must stay persisted (gated): %q", rowGate.Notice.String)
+	}
+	if aerr := m2.Activate(ctx, "t-sf"); aerr == nil ||
+		!strings.Contains(aerr.Error(), "uncleaned cleanup debt") ||
+		!strings.Contains(aerr.Error(), "身份未知") {
+		t.Fatalf("gate must persist with manual-resolution guidance, got %v", aerr)
+	}
+	if calls := atomic.LoadInt32(&sup.acquireCalls); calls != 1 {
+		t.Fatalf("post-replay/reconcile Activate must stay zero-POST, acquires=%d", calls)
+	}
+	row2, _ := fstore.GetTask(ctx, "t-sf")
+	if !strings.Contains(row2.LastError.String, "身份未知") {
+		t.Fatalf("gated last_error must carry manual-resolution guidance, got %q", row2.LastError.String)
+	}
+
+	// 人工处置（清除占位 notice）后门禁才开放——换健康 sup 完成首建。
+	clearPendingIntentNotice(t, fstore, "t-sf")
 	okSup := &okAcquireSup{upstream: "ses_sf_1", port: 4096}
 	reg3 := appagent.NewRegistry()
 	if err := reg3.Register(newTestRegistryProvider()); err != nil {
@@ -3762,15 +3808,202 @@ func TestR1_J3_SettleFail_StillGatedAfterRestart(t *testing.T) {
 	}
 	m2.providerRegistry = reg3
 	if aerr := m2.Activate(ctx, "t-sf"); aerr != nil {
-		t.Fatalf("Activate(restore): %v", aerr)
+		t.Fatalf("Activate(restore after manual resolution): %v", aerr)
 	}
-	row2, _ := fstore.GetTask(ctx, "t-sf")
-	if row2.Status != "active" {
-		t.Fatalf("status=%s", row2.Status)
+	row3, _ := fstore.GetTask(ctx, "t-sf")
+	if row3.Status != "active" {
+		t.Fatalf("status=%s", row3.Status)
 	}
+}
+
+// clearPendingIntentNotice 模拟人工处置：从任务 notice 中移除身份未知的首建
+// 意图（candidate_cleanup_failed + sessionName=pending），其余条目保留。
+func clearPendingIntentNotice(t *testing.T, db TaskStore, taskID string) {
+	t.Helper()
+	ctx := context.Background()
+	row, err := db.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, perr := parseNotices(row.Notice)
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	var remaining []noticeEntry
+	for _, e := range entries {
+		if e.Code == noticeCodeResidual {
+			if sn, _ := e.Data["sessionName"].(string); sn == candidateIntentSessionPending {
+				continue
+			}
+		}
+		remaining = append(remaining, e)
+	}
+	if len(remaining) == len(entries) {
+		t.Fatalf("no pending intent notice to clear: %q", row.Notice.String)
+	}
+	if _, err := db.UpdateTaskNoticeCAS(ctx, taskID, row.Notice, encodeNotices(remaining)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ---- Round 4：J8 身份未知的首建意图不是可收割 session ----
+
+// TestR1_J8_PendingIntentNotReaped_KnownIdentityResolves 落实 Round4 J8 正向面：
+// 同进程 settle 失败后真实 candidate 身份仍在受管 ledger → 通道恢复重放先落账
+// 真实 ID 并收割成功（回收证明）→ 占位意图随之解除、门禁开放。
+func TestR1_J8_PendingIntentNotReaped_KnownIdentityResolves(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedBranchBTask(t, db, "t-j8k")
+	adapter := NewStoreAdapter(db)
+	fstore := &failReplayPersistStore{StoreAdapter: adapter}
+	sup := &debtCandidateSup{realCandidate: "ses_debt_1"}
+	sup.acquireHook = func() { fstore.failNoticeCAS.Store(true) }
+	prov := &debtProvider{sup: sup}
+	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m.store = fstore
+	m.SetLifecycleCtx(ctx)
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(prov); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+
+	// arm 成功 → debt 产生 → settle 失败（占位仍在，真实 ID 只在 ledger）。
+	if aerr := m.Activate(ctx, "t-j8k"); aerr == nil {
+		t.Fatalf("first build must fail")
+	}
+	if !m.reapLedgerHasUnfinished("t-j8k") {
+		t.Fatalf("settle failure must register real candidate identity in ledger")
+	}
+	row, _ := fstore.GetTask(ctx, "t-j8k")
+	if !strings.Contains(row.Notice.String, `"pending"`) {
+		t.Fatalf("pre-POST placeholder must persist: %q", row.Notice.String)
+	}
+
+	// 通道恢复 → 重放：真实 ID 经 ledger 落账并收割（占位不得被直接当作收割目标）。
+	fstore.failNoticeCAS.Store(false)
+	if berr := m.processRetryableNotices(ctx); berr != nil {
+		t.Fatalf("replay: %v", berr)
+	}
+	reaped := sup.reapedSnapshot()
+	if len(reaped) != 1 || reaped[0] != "ses_debt_1" {
+		t.Fatalf("replay must reap the real candidate identity only, reaped=%v", reaped)
+	}
+	row2, _ := fstore.GetTask(ctx, "t-j8k")
 	if strings.Contains(row2.Notice.String, "candidate_cleanup_failed") ||
 		strings.Contains(row2.Notice.String, `"pending"`) {
-		t.Fatalf("armed intent must be cleared after successful first-build: %q", row2.Notice.String)
+		t.Fatalf("recovered identity + proven recycle must clear the intent: %q", row2.Notice.String)
+	}
+	okSup := &okAcquireSup{upstream: "ses_j8k_1", port: 4096}
+	reg2 := appagent.NewRegistry()
+	if err := reg2.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg2.Register(&supOnlyV2Provider{sup: okSup}); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg2
+	if aerr := m.Activate(ctx, "t-j8k"); aerr != nil {
+		t.Fatalf("gate must open after real recycle, got %v", aerr)
+	}
+}
+
+// TestR1_J8_UnknownIdentity_ManualResolutionOnly 落实 Round4 J8 跨重启面：真实
+// candidate 身份只在内存 ledger（重启丢失）→ 重放与启动 Reconcile 均 MUST NOT
+// 把占位 `pending` 交给 reaper（DELETE 占位 404 不能证明真实 candidate 已回收）→
+// 门禁持续阻断、零新增 POST、last_error 给出人工处置指引；只有人工清除意图后
+// 才允许再次首建。
+func TestR1_J8_UnknownIdentity_ManualResolutionOnly(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedBranchBTask(t, db, "t-j8u")
+	adapter := NewStoreAdapter(db)
+	fstore := &failReplayPersistStore{StoreAdapter: adapter}
+	sup := &debtCandidateSup{realCandidate: "ses_debt_1"}
+	sup.acquireHook = func() { fstore.failNoticeCAS.Store(true) }
+	prov := &debtProvider{sup: sup}
+	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m.store = fstore
+	m.SetLifecycleCtx(ctx)
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(prov); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+	if aerr := m.Activate(ctx, "t-j8u"); aerr == nil {
+		t.Fatalf("first build must fail")
+	}
+	if aerr := m.Activate(ctx, "t-j8u"); aerr == nil ||
+		!strings.Contains(aerr.Error(), "uncleaned cleanup debt") {
+		t.Fatalf("same-process gate must hold before replay, got %v", aerr)
+	}
+
+	// 进程重启：全新 Manager（ledger 清空），同一 DB——真实身份不可找回。
+	m2 := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m2.store = fstore
+	m2.SetLifecycleCtx(ctx)
+	m2.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	m2.providerRegistry = reg
+
+	// 通道恢复 → 后台重放 + 启动 Reconcile（debt pre-pass）：零 DELETE、零 POST。
+	fstore.failNoticeCAS.Store(false)
+	if berr := m2.processRetryableNotices(ctx); berr != nil {
+		t.Fatalf("replay: %v", berr)
+	}
+	if rerr := m2.Reconcile(ctx); rerr != nil {
+		t.Fatalf("reconcile: %v", rerr)
+	}
+	if reaped := sup.reapedSnapshot(); len(reaped) != 0 {
+		t.Fatalf("unknown identity MUST NOT reach reaper, reaped=%v", reaped)
+	}
+	rowGate, _ := fstore.GetTask(ctx, "t-j8u")
+	if !strings.Contains(rowGate.Notice.String, `"pending"`) {
+		t.Fatalf("unknown identity intent must stay persisted: %q", rowGate.Notice.String)
+	}
+	if aerr := m2.Activate(ctx, "t-j8u"); aerr == nil ||
+		!strings.Contains(aerr.Error(), "uncleaned cleanup debt") ||
+		!strings.Contains(aerr.Error(), "身份未知") {
+		t.Fatalf("gate must persist with manual guidance, got %v", aerr)
+	}
+	if calls := atomic.LoadInt32(&sup.acquireCalls); calls != 1 {
+		t.Fatalf("unknown identity must stay zero-POST across replay/reconcile, acquires=%d", calls)
+	}
+	row2, _ := fstore.GetTask(ctx, "t-j8u")
+	if !strings.Contains(row2.LastError.String, "身份未知") ||
+		!strings.Contains(row2.LastError.String, "人工确认") {
+		t.Fatalf("last_error must carry manual-resolution guidance, got %q", row2.LastError.String)
+	}
+
+	// 人工处置后才开放：清除意图 → 健康 sup 完成首建。
+	clearPendingIntentNotice(t, fstore, "t-j8u")
+	okSup := &okAcquireSup{upstream: "ses_j8_1", port: 4096}
+	reg2 := appagent.NewRegistry()
+	if err := reg2.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg2.Register(&supOnlyV2Provider{sup: okSup}); err != nil {
+		t.Fatal(err)
+	}
+	m2.providerRegistry = reg2
+	if aerr := m2.Activate(ctx, "t-j8u"); aerr != nil {
+		t.Fatalf("Activate after manual resolution: %v", aerr)
 	}
 }
 

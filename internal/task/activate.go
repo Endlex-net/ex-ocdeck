@@ -368,6 +368,16 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 	if hasRetryable, err := m.hasRetryableNotice(ctx, row); err != nil {
 		return newOpErr(codeInternal, err)
 	} else if hasRetryable {
+		// Round4 J8：身份未知的首建意图无法自动收割（占位符不是真实 session），
+		// 门禁不随重放解除——last_error 给出人工处置指引（用户可见）。
+		if entries, perr := parseNotices(row.Notice); perr == nil && hasUnknownCandidateIntent(entries) {
+			if _, werr := m.writeStatus(ctx, taskID, row.Status,
+				sql.NullString{String: unknownCandidateIntentGuidance, Valid: true}); werr != nil {
+				log.Printf("activate: task %s record unknown candidate intent guidance: %v", taskID, werr)
+			}
+			return newOpErr(codeConflict, fmt.Errorf("task %s has uncleaned cleanup debt (%s); resolve or force-delete first",
+				taskID, unknownCandidateIntentGuidance))
+		}
 		return newOpErr(codeConflict, fmt.Errorf("task %s has uncleaned cleanup debt; resolve or force-delete first", taskID))
 	}
 	// Round2 J3：受管登记仍有未完成清理义务（notice 落库失败/下一轮落账前）——
