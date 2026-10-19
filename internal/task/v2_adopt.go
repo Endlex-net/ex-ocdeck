@@ -275,8 +275,17 @@ func (m *Manager) firstBuildV2(ctx context.Context, taskID string, row TaskRow, 
 		// 清理成功/用户处置前拒绝再次首建）。义务写失败 Join 传播（不得静默）。
 		var debt *appagent.CandidateCleanupDebt
 		if errors.As(serr, &debt) {
-			if nerr := m.recordResidualNotice(ctx, taskID, debt.SessionID, nil,
-				noticeReasonCandidateCleanupFailed, true); nerr != nil {
+			// Round2 J3：原请求 ctx 可能已取消——独立有界 ctx 落账；写失败进受管
+			// 重试链（义务安全登记前阻断再次首建，activate.go 门禁查 ledger）。
+			rcCtx, rcCancel := withResidualNoticeCtx(ctx)
+			nerr := m.recordResidualNotice(rcCtx, taskID, debt.SessionID, nil,
+				noticeReasonCandidateCleanupFailed, true)
+			rcCancel()
+			if nerr != nil {
+				m.registerReapObligations(taskID, []suspendFinishObligation{{
+					Kind: "notice", TaskID: taskID, Name: debt.SessionID,
+					Reason: noticeReasonCandidateCleanupFailed, Retryable: true,
+				}})
 				return errors.Join(serr, nerr)
 			}
 		}
@@ -329,6 +338,19 @@ func (m *Manager) rollbackFirstBuild(ctx context.Context, taskID string, sup app
 	rcCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), activateCompensationTimeout)
 	defer cancel()
 	if rerr := rc.RecycleCandidateSession(rcCtx, candidate); rerr != nil {
+		// Round2 J3：回收失败统一走 CandidateCleanupDebt 持久化门禁链（同路径
+		// 1 的登记与重放）——不得仅拼错误文本后放行再次首建。
+		debt := &appagent.CandidateCleanupDebt{SessionID: candidate.UpstreamSessionID, Err: rerr}
+		rcCtx2, rcCancel2 := withResidualNoticeCtx(ctx)
+		nerr := m.recordResidualNotice(rcCtx2, taskID, debt.SessionID, nil,
+			noticeReasonCandidateCleanupFailed, true)
+		rcCancel2()
+		if nerr != nil {
+			m.registerReapObligations(taskID, []suspendFinishObligation{{
+				Kind: "notice", TaskID: taskID, Name: debt.SessionID,
+				Reason: noticeReasonCandidateCleanupFailed, Retryable: true,
+			}})
+		}
 		return fmt.Errorf("%w; candidate %s 回收失败（清理债务，残留事实非「从未建立」）: %v",
 			cause, candidate.UpstreamSessionID, rerr)
 	}

@@ -731,6 +731,10 @@ type monitorProcSeam struct {
 	// onSpawn 在 serve 单元（重新）绑定时回调——模拟「新进程存活」（身份核验
 	// 依据由测试侧持有，测试经此复活 ProcessIdentity 事实）。
 	onSpawn func()
+	// onDeath 在 serve 单元被测试主动杀死时回调——对称 onSpawn，模拟「身份探测
+	// 同步感知进程死亡」（Round2 J6：死亡接缝必须改变身份探测事实，否则监控
+	// 永远判活、关停断言假绿）。
+	onDeath func()
 }
 
 // spawnCount 返回 serve 单元启动次数（Round收尾 J6：共享 serve 断言）。
@@ -804,9 +808,13 @@ func (p *monitorProcSeam) killUnit() {
 	ln := p.ln
 	p.ln = nil
 	p.unitUp = false
+	onDeath := p.onDeath
 	p.mu.Unlock()
 	if ln != nil {
 		_ = ln.Close()
+	}
+	if onDeath != nil {
+		onDeath()
 	}
 }
 
@@ -2704,6 +2712,7 @@ func newRealStreamHarness(t *testing.T, taskID, upstream, status string) *realSt
 		StartAttempts:   2,
 	}
 	h.proc.onSpawn = func() { identityAlive.Store(true) }
+	h.proc.onDeath = func() { identityAlive.Store(false) }
 	h.prov = opencode2.NewSPIProviderWithDeps(opencode2.ProviderOptions{StatusVerified: true}, deps)
 	reg := appagent.NewRegistry()
 	if err := reg.Register(newTestRegistryProvider()); err != nil {
@@ -3340,6 +3349,161 @@ func TestR1_J3_CandidateDebt_GatesFirstBuild(t *testing.T) {
 	}
 }
 
+// rollbackFailProvider：Acquire 成功返回 candidate、端点解析失败（回滚触发）、
+// 回收（CandidateSessionRecycler）恒失败——J3 逃逸路径 2 注入。
+type rollbackFailProvider struct {
+	v2Stub
+}
+
+func (p *rollbackFailProvider) Supervisor() appagent.RuntimeSupervisor {
+	return rollbackFailSup{}
+}
+
+type rollbackFailSup struct{}
+
+func (rollbackFailSup) Acquire(ctx context.Context, t appagent.TaskRef) (domain.TaskBinding, error) {
+	data, _ := json.Marshal(map[string]any{
+		"port": 4096, "directory": "/wt", "taskId": t.TaskID,
+		"origin": "created", "auth": map[string]string{"kind": "derived"},
+	})
+	return domain.TaskBinding{
+		Version:            domain.TaskBindingVersion,
+		ProviderID:         ocdeckstore.ProviderIDV2,
+		ProviderInstanceID: ocdeckstore.ProviderInstanceV2Default,
+		UpstreamSessionID:  "ses_rb_1",
+		TerminalRef:        "ocdeck-v2-tui-" + t.TaskID,
+		Data:               data,
+	}, nil
+}
+
+func (rollbackFailSup) Resume(ctx context.Context, t appagent.TaskRef, b domain.TaskBinding, p appagent.ResumePolicy) (domain.TaskBinding, error) {
+	return domain.TaskBinding{}, appagent.NewError("test.resume", appagent.ErrKindNotFound,
+		errors.New("no upstream session"))
+}
+
+func (rollbackFailSup) AcquireEphemeral(ctx context.Context, t appagent.TaskRef) (domain.TaskBinding, error) {
+	return domain.TaskBinding{}, errors.New("unexpected")
+}
+
+func (rollbackFailSup) Release(ctx context.Context, b domain.TaskBinding) error { return nil }
+
+// RecycleCandidateSession 注入回收失败（J3 逃逸路径 2：回滚触发但 DELETE 失败）。
+func (rollbackFailSup) RecycleCandidateSession(ctx context.Context, b domain.TaskBinding) error {
+	return errors.New("delete injected failure (rollback recycle)")
+}
+
+func (rollbackFailProvider) BindingRuntimeEndpoint(b domain.TaskBinding) (int, string, string, error) {
+	return 0, "", "", errors.New("endpoint resolution injected failure (rollback trigger)")
+}
+
+// TestR1_J3_RollbackFail_GatesFirstBuild 落实收尾 Round2 J3 逃逸路径 2：Acquire
+// 成功后端点解析失败触发回滚、回收（DELETE）失败 → 清理义务按 task 持久化
+// （candidate_cleanup_failed）→ 门禁拒绝再次首建；reaper 收割原 session 后清除。
+func TestR1_J3_RollbackFail_GatesFirstBuild(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedBranchBTask(t, db, "t-rb")
+	adapter := NewStoreAdapter(db)
+	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m.SetLifecycleCtx(ctx)
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(&rollbackFailProvider{}); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+
+	if aerr := m.Activate(ctx, "t-rb"); aerr == nil {
+		t.Fatalf("rollback must fail on injected endpoint+delete errors")
+	}
+	row, err := adapter.GetTask(ctx, "t-rb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(row.Notice.String, "candidate_cleanup_failed") ||
+		!strings.Contains(row.Notice.String, "ses_rb_1") {
+		t.Fatalf("cleanup debt must be persisted on rollback recycle failure: %q", row.Notice.String)
+	}
+	if aerr := m.Activate(ctx, "t-rb"); aerr == nil ||
+		!strings.Contains(aerr.Error(), "uncleaned cleanup debt") {
+		t.Fatalf("second Activate must be gated, got %v", aerr)
+	}
+}
+
+// TestR1_J3_CancelAndDebtPersist 落实收尾 Round2 J3 逃逸路径 1：请求 ctx 取消
+// 且 DELETE 失败 → 残债落库仍成功（withResidualNoticeCtx 独立有界 ctx）→ 门禁
+// 拒绝再次首建；reaper 收割后清除开放。
+func TestR1_J3_CancelAndDebtPersist(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedBranchBTask(t, db, "t-cn")
+	adapter := NewStoreAdapter(db)
+	sup := &debtCandidateSup{}
+	prov := &debtProvider{sup: sup}
+	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m.SetLifecycleCtx(ctx)
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(prov); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+
+	cancel() // 请求取消
+	if aerr := m.Activate(ctx, "t-cn"); aerr == nil {
+		t.Fatalf("cancelled activate must fail")
+	}
+	// 健康重试：完整链路（Acquire 注入失败+debt）→ 残债落库成功
+	//（withResidualNoticeCtx 生效——Acquire 内部补偿 ctx 独立于请求取消）。
+	// 取消后的 DB 读取一律用 bg（驱动尊重取消 ctx）。
+	bg := context.Background()
+	if aerr := m.Activate(bg, "t-cn"); aerr == nil {
+		t.Fatalf("healthy retry must still fail on injected acquire error")
+	}
+	row, err := adapter.GetTask(bg, "t-cn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(row.Notice.String, "candidate_cleanup_failed") ||
+		!strings.Contains(row.Notice.String, "ses_debt_1") {
+		t.Fatalf("debt must persist despite cancellation: %q (full=%v)", row.Notice.String, row.Notice)
+	}
+	// 门禁拒绝（健康 ctx——拒绝语义来自残债而非取消态）+ ledger 双检。
+	bg2 := context.Background()
+	if aerr := m.Activate(bg2, "t-cn"); aerr == nil ||
+		!strings.Contains(aerr.Error(), "uncleaned cleanup debt") {
+		t.Fatalf("gated, got %v", aerr)
+	}
+	if !m.reapLedgerHasUnfinished("t-cn") == false && len(m.reapLedgerSnapshot("t-cn")) > 0 {
+		t.Fatalf("unexpected ledger entries for a notice-persisted debt")
+	}
+	// 恢复（新 ctx——存储/取消态解除）→ 重放收割 → 清除。
+	if berr := m.processRetryableNotices(bg); berr != nil {
+		t.Fatalf("replay: %v", berr)
+	}
+	if reaped := sup.reapedSnapshot(); len(reaped) == 0 || reaped[0] != "ses_debt_1" {
+		t.Fatalf("reaper target=%v", reaped)
+	}
+	row2, _ := adapter.GetTask(bg, "t-cn")
+	if strings.Contains(row2.Notice.String, "candidate_cleanup_failed") {
+		t.Fatalf("debt must be cleared after reap: %q", row2.Notice.String)
+	}
+}
+
 // ---- Round 8：I20 ledger 按任务隔离 · I17 重试生命周期闭环 ----
 
 // TestStage4_R8_I20_LedgerPerTaskIsolation 落实 Round8 I20：A 挂起失败留下
@@ -3805,14 +3969,24 @@ func TestR1_J6_RealProvider_SharedInstanceAndLifecycle(t *testing.T) {
 		t.Fatalf("distinct upstream sessions required: %q vs %q", b1.UpstreamSessionID, b2.UpstreamSessionID)
 	}
 
-	// 关停（persist 策略不关 server 但监控必须停）：serve 死亡后零重拉。
-	if ctl, ok := sA.(appagent.ServerMonitorController); ok {
-		ctl.StopServerMonitoring()
+	// ①监控开启时的死亡 MUST 触发重拉（Round2 J6：死亡接缝同步身份探测——
+	// 否则此处 spawn 不增长、关停断言假绿）。
+	h.proc.killUnit()
+	deadline := time.Now().Add(5 * time.Second)
+	for h.proc.spawnCount() == 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
 	}
+	if spawns := h.proc.spawnCount(); spawns != 2 {
+		t.Fatalf("visible death while monitoring must trigger re-pull, spawns=%d", spawns)
+	}
+
+	// ②经 Manager 停止分派入口停止监控 → serve 死亡零重拉（Round2 J6：不走
+	// 直调 controller——与生产 Manager 停止分派同一入口）。
+	h.m.stopV2ServerMonitoring()
 	h.proc.killUnit()
 	time.Sleep(60 * time.Millisecond) // 数个监控周期：停止后不得重拉
-	if spawns := h.proc.spawnCount(); spawns != 1 {
-		t.Fatalf("monitor must stay stopped after shutdown, spawns=%d", spawns)
+	if spawns := h.proc.spawnCount(); spawns != 2 {
+		t.Fatalf("monitor must stay stopped after manager shutdown, spawns=%d", spawns)
 	}
 }
 

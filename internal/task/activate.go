@@ -370,6 +370,11 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 	} else if hasRetryable {
 		return newOpErr(codeConflict, fmt.Errorf("task %s has uncleaned cleanup debt; resolve or force-delete first", taskID))
 	}
+	// Round2 J3：受管登记仍有未完成清理义务（notice 落库失败/下一轮落账前）——
+	// 义务安全登记前同样阻断再次首建（与 notice 门禁同一冲突出口）。
+	if m.reapLedgerHasUnfinished(taskID) {
+		return newOpErr(codeConflict, fmt.Errorf("task %s has uncleaned cleanup debt (managed ledger); resolve or force-delete first", taskID))
+	}
 
 	// init_status 门禁（design.md §5，tasks 3.5）：none|succeeded → 放行；
 	// pending|running → invalid_state "init in progress"；failed → invalid_state 含 init_error；

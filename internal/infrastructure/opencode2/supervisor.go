@@ -661,6 +661,12 @@ func (s *V2Supervisor) ReapCandidateSession(ctx context.Context, taskID, session
 		return appagent.NewError("supervisor.reap_candidate", appagent.ErrKindRuntimeUnavailable, err)
 	}
 	if derr := c.DeleteSession(ctx, sessionID); derr != nil {
+		// Round2 J7：受限 candidate 清理语义内，404/NotFound 确认目标已不存在
+		//（首轮 DELETE 已生效但响应丢失/notice 清除未落库）→ 完成清债，不再
+		// 保留债务阻断 Activate。通用 API 的 404 分类不变。
+		if errors.Is(derr, ErrSessionNotFound) || isNotFound(derr) {
+			return nil
+		}
 		return appagent.NewError("supervisor.reap_candidate", appagent.ErrKindRuntimeUnavailable, derr)
 	}
 	return nil

@@ -734,3 +734,35 @@ func TestR1_J3_AcquireDebt_Propagates(t *testing.T) {
 		t.Fatalf("diagnostic last_error should still be recorded")
 	}
 }
+
+// TestR1_J7_ReapNotFoundCompletes 落实收尾 Round2 J7：受限 candidate 清理语义
+// 内，DELETE 404/NotFound 确认目标已不存在 → ReapCandidateSession 完成清债
+// （nil）——首轮 DELETE 已生效但 notice 清除未落库时，重放不再永久阻断 Activate。
+// 通用 API 的 404 分类不变（其它错误仍失败）。
+func TestR1_J7_ReapNotFoundCompletes(t *testing.T) {
+	run := func(t *testing.T, deleteStatus int) error {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/session/ses_") {
+				w.WriteHeader(deleteStatus)
+				if deleteStatus != http.StatusNoContent {
+					_, _ = w.Write([]byte(`{"_tag":"NotFound"}`))
+				}
+				return
+			}
+			_, _ = w.Write(readFixture(t, "session_list_page2.json"))
+		}))
+		t.Cleanup(srv.Close)
+		sup, _, _ := newTestSupervisor(t, srv.URL, nil)
+		if _, _, err := sup.ensureServer(context.Background()); err != nil {
+			t.Fatalf("init: %v", err)
+		}
+		return sup.ReapCandidateSession(context.Background(), "t1", "ses_gone")
+	}
+	if err := run(t, http.StatusNotFound); err != nil {
+		t.Fatalf("404 must complete the reap (target already gone): %v", err)
+	}
+	if err := run(t, http.StatusGone); err == nil {
+		t.Fatalf("non-404 errors must still fail")
+	}
+}
