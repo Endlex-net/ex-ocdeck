@@ -593,5 +593,35 @@ func awaitRestarts(t *testing.T, n *atomic.Int32, want int32) {
 	}
 }
 
+// TestSupervisor_VerifyReadyRejectsMalformedList 落实收尾 K2：就绪探测复用
+// ListSessions——HTTP 200 的畸形列表页（协议违约）MUST NOT 被判为 ready
+// （否则 supervisor 把畸形响应当作服务可用，后续建程/对账基于错误事实）。
+func TestSupervisor_VerifyReadyRejectsMalformedList(t *testing.T) {
+	malformed := []string{
+		`{}`,
+		`null`,
+		`{"data":null,"cursor":{"previous":null,"next":null}}`,
+		`{"data":[]}`,
+		`{"data":null}`,
+	}
+	for _, body := range malformed {
+		t.Run(body, func(t *testing.T) {
+			srv := fixtureServer(t, route{path: "/api/session", status: 200, body: body})
+			sup, _, _ := newTestSupervisor(t, srv.URL, nil)
+			if sup.verifyReady(context.Background(), 4096, "pw") {
+				t.Fatalf("malformed list page MUST NOT pass readiness probe: %s", body)
+			}
+		})
+	}
+	t.Run("legal page passes", func(t *testing.T) {
+		srv := fixtureServer(t, route{path: "/api/session", status: 200,
+			body: `{"data":[],"cursor":{"previous":null,"next":null}}`})
+		sup, _, _ := newTestSupervisor(t, srv.URL, nil)
+		if !sup.verifyReady(context.Background(), 4096, "pw") {
+			t.Fatalf("legal empty page must pass readiness probe")
+		}
+	})
+}
+
 var _ = domain.TaskBindingVersion
 var _ = store.ProviderIDV2

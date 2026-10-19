@@ -47,6 +47,24 @@ func (d *CandidateCleanupDebt) Error() string {
 
 func (d *CandidateCleanupDebt) Unwrap() error { return d.Err }
 
+// CandidateCreateUnknown 标记首建 POST 的交付结果未知（收尾 Round1 K1）：请求
+// 可能已到达上游并创建了 session，但连接在响应前断开/响应截断无法解码——调用方
+// MUST NOT 把它当作「candidate 未产生」清除首建阻断占位（否则原 candidate 成无
+// 索引残留，下次首建再次 POST）。与 AsyncPrompt 的 transport_unknown 同语义：
+// 交付未知即禁止推断，保留持久化阻断等待人工确认或已知身份的受限回收。
+type CandidateCreateUnknown struct {
+	Err error
+}
+
+func (e *CandidateCreateUnknown) Error() string {
+	if e.Err == nil {
+		return "candidate 创建结果未知（残留事实可能已产生）"
+	}
+	return fmt.Sprintf("candidate 创建结果未知（残留事实可能已产生）: %v", e.Err)
+}
+
+func (e *CandidateCreateUnknown) Unwrap() error { return e.Err }
+
 // CandidateDebtReaper 是 candidate 清理债务的重放收割窄接口（可选能力；J3）：
 // 按 task/session 身份重新执行受限回收（DELETE）。实现者：v2 supervisor。
 // 未实现者由调用方 fail-closed（债务保留，不得静默清除）。

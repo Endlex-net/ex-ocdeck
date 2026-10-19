@@ -320,6 +320,77 @@ type sessionListResponse struct {
 	} `json:"cursor"`
 }
 
+// decodeSessionListPage 严格解码列表页（CONTRACT §2 required 集合）：根必须是
+// object；data 必须存在且为非 null 数组；cursor 必须是 object 且 previous/next
+// 两个键都存在（值可为 null 或 string）。协议违约 → 错误，MUST NOT 退化为
+// 「空完整快照」——畸形页在就绪探测里会伪造成 ready，在任务对账里会当完整空
+// 快照删除已有归属行。
+func decodeSessionListPage(r io.Reader) (sessionListResponse, error) {
+	var page sessionListResponse
+	var root map[string]json.RawMessage
+	if err := json.NewDecoder(r).Decode(&root); err != nil {
+		return page, fmt.Errorf("opencode2: list sessions: decode root: %w", err)
+	}
+	if root == nil {
+		return page, errors.New("opencode2: list sessions: root 非 object（null）")
+	}
+	rawData, ok := root["data"]
+	if !ok {
+		return page, errors.New("opencode2: list sessions: 缺少 data")
+	}
+	trimmed := bytes.TrimSpace(rawData)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return page, errors.New("opencode2: list sessions: data 非数组（null）")
+	}
+	if trimmed[0] != '[' {
+		return page, fmt.Errorf("opencode2: list sessions: data 非数组: %s", truncateForError(trimmed))
+	}
+	if err := json.Unmarshal(rawData, &page.Data); err != nil {
+		return page, fmt.Errorf("opencode2: list sessions: decode data: %w", err)
+	}
+	rawCursor, ok := root["cursor"]
+	if !ok {
+		return page, errors.New("opencode2: list sessions: 缺少 cursor")
+	}
+	trimmedCursor := bytes.TrimSpace(rawCursor)
+	if len(trimmedCursor) == 0 || bytes.Equal(trimmedCursor, []byte("null")) || trimmedCursor[0] != '{' {
+		return page, fmt.Errorf("opencode2: list sessions: cursor 非 object: %s", truncateForError(trimmedCursor))
+	}
+	var cursorFields map[string]json.RawMessage
+	if err := json.Unmarshal(rawCursor, &cursorFields); err != nil {
+		return page, fmt.Errorf("opencode2: list sessions: decode cursor: %w", err)
+	}
+	for _, key := range []string{"previous", "next"} {
+		raw, ok := cursorFields[key]
+		if !ok {
+			return page, fmt.Errorf("opencode2: list sessions: cursor 缺少 %s", key)
+		}
+		t := bytes.TrimSpace(raw)
+		if bytes.Equal(t, []byte("null")) {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return page, fmt.Errorf("opencode2: list sessions: cursor.%s 非 string/null: %s", key, truncateForError(t))
+		}
+		if key == "previous" {
+			page.Cursor.Previous = &s
+		} else {
+			page.Cursor.Next = &s
+		}
+	}
+	return page, nil
+}
+
+// truncateForError 截断原始 JSON 片段用于错误信息（有界）。
+func truncateForError(raw []byte) string {
+	const max = 128
+	if len(raw) <= max {
+		return string(raw)
+	}
+	return string(raw[:max]) + "…"
+}
+
 // SessionPage 是一页 session 列表；HasMore = cursor.next 非 null（不完整快照
 // 信号，SPI ListResult.Overflow 的 v2 映射）。
 type SessionPage struct {
@@ -347,9 +418,9 @@ func (c *Client) ListSessions(ctx context.Context, dir string, limit int) (Sessi
 	if err := classifyStatus(resp); err != nil {
 		return SessionPage{}, err
 	}
-	var body sessionListResponse
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return SessionPage{}, fmt.Errorf("opencode2: list sessions: %w", err)
+	body, derr := decodeSessionListPage(resp.Body)
+	if derr != nil {
+		return SessionPage{}, derr
 	}
 	page := SessionPage{HasMore: body.Cursor.Next != nil}
 	for _, raw := range body.Data {
@@ -367,31 +438,92 @@ func (c *Client) ListSessions(ctx context.Context, dir string, limit int) (Sessi
 // 变化）。响应 {data: Session.Info}，ID pattern 校验由调用方按 2.5 运行时
 // 契约执行。
 func (c *Client) CreateSession(ctx context.Context, dir string) (wireSession, error) {
+	s, _, err := c.createSession(ctx, dir)
+	return s, err
+}
+
+// createSession 是 CreateSession 的三分实现（收尾 K1）：返回（session, idHint, err）。
+// idHint 非空表示响应里已可靠取得 session id——即使后续解码/形状校验失败，调用方
+// 仍可对该 ID 执行受限回收（MUST NOT 因「未知」而误判未创建）。
+// err 分类：
+//   - 请求未发出/发送失败/连接建立失败 → 确定未创建（idHint 空，普通错误）；
+//   - HTTP 非 2xx（classifyStatus）→ 上游明确拒绝，确定未创建；
+//   - 连接在响应前断开/读体截断/响应不可解码 → 结果未知（idHint 可能非空）。
+func (c *Client) createSession(ctx context.Context, dir string) (wireSession, string, error) {
 	body, err := json.Marshal(map[string]interface{}{
 		"location": map[string]string{"directory": dir},
 	})
 	if err != nil {
-		return wireSession{}, fmt.Errorf("opencode2: create session: marshal body: %w", err)
+		return wireSession{}, "", fmt.Errorf("opencode2: create session: marshal body: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.apiURL("/session", nil), bytes.NewReader(body))
 	if err != nil {
-		return wireSession{}, err
+		return wireSession{}, "", err
 	}
 	req.SetBasicAuth(c.username, c.password)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return wireSession{}, err
+		return wireSession{}, "", &createResultUnknownError{err: err}
 	}
 	defer resp.Body.Close()
 	if err := classifyStatus(resp); err != nil {
-		return wireSession{}, err
+		return wireSession{}, "", err
 	}
-	var raw json.RawMessage
-	if err := decodeEnvelope(resp.Body, &raw); err != nil {
-		return wireSession{}, fmt.Errorf("opencode2: create session: %w", err)
+	// 响应体先整体读取（有界），再解包——读取失败/截断 = 交付结果未知。
+	raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if rerr != nil {
+		return wireSession{}, "", &createResultUnknownError{err: rerr}
 	}
-	return parseWireSession(raw)
+	idHint := sniffSessionID(raw)
+	var payload json.RawMessage
+	if err := decodeEnvelopeBytes(raw, &payload); err != nil {
+		return wireSession{}, idHint, &createResultUnknownError{err: err}
+	}
+	s, perr := parseWireSession(payload)
+	if perr != nil {
+		return wireSession{}, idHint, &createResultUnknownError{err: perr}
+	}
+	return s, s.ID, nil
+}
+
+// createResultUnknownError 标记 CreateSession 的交付结果未知（客户端内部类型，
+// supervisor 转为 application 层 CandidateCreateUnknown）。
+type createResultUnknownError struct{ err error }
+
+func (e *createResultUnknownError) Error() string { return e.err.Error() }
+func (e *createResultUnknownError) Unwrap() error { return e.err }
+
+// sniffSessionID 在响应体里尽力提取 session id（`{"data":{"id":"ses_..."}}`）：
+// 成功即让上层对已产生的 candidate 走受限回收/债务链，而不是误判「未创建」。
+func sniffSessionID(raw []byte) string {
+	var env struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return ""
+	}
+	if env.Data.ID == "" {
+		return ""
+	}
+	return env.Data.ID
+}
+
+// decodeEnvelopeBytes 与 decodeEnvelope 同语义（字节入口，供需要先读体的调用方复用）。
+func decodeEnvelopeBytes(raw []byte, v interface{}) error {
+	var env dataEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return fmt.Errorf("opencode2: decode envelope: %w", err)
+	}
+	if len(env.Data) == 0 || bytes.Equal(bytes.TrimSpace(env.Data), []byte("null")) {
+		return errors.New("opencode2: envelope 缺少 data 载荷")
+	}
+	if err := json.Unmarshal(env.Data, v); err != nil {
+		return fmt.Errorf("opencode2: decode data payload: %w", err)
+	}
+	return nil
 }
 
 // DeleteSession DELETE /api/session/{id} → 204（CONTRACT §2；404 按 D7 映射

@@ -129,6 +129,70 @@ func TestClient_ListSessionsCursor(t *testing.T) {
 	}
 }
 
+// TestClient_ListSessionsMalformedPageMatrix 落实收尾 K2：列表页 envelope
+// required 集合（CONTRACT §2：根 object、data 非 null 数组、cursor object 且
+// previous/next 键齐全、值为 string/null）违约必须报错——MUST NOT 被接受为
+// HasMore=false 的完整列表（否则就绪探测伪 ready + 对账误删归属行）。
+func TestClient_ListSessionsMalformedPageMatrix(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"empty object", `{}`},
+		{"null root", `null`},
+		{"array root", `[]`},
+		{"null data", `{"data":null,"cursor":{"previous":null,"next":null}}`},
+		{"missing data", `{"cursor":{"previous":null,"next":null}}`},
+		{"object data", `{"data":{},"cursor":{"previous":null,"next":null}}`},
+		{"missing cursor", `{"data":[]}`},
+		{"null cursor", `{"data":[],"cursor":null}`},
+		{"cursor missing previous", `{"data":[],"cursor":{"next":null}}`},
+		{"cursor missing next", `{"data":[],"cursor":{"previous":null}}`},
+		{"cursor next wrong type", `{"data":[],"cursor":{"previous":null,"next":123}}`},
+		{"cursor previous wrong type", `{"data":[],"cursor":{"previous":true,"next":null}}`},
+		{"truncated body", `{"data":[],"cursor":{"previous":null`},
+		{"not json", `oops`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := fixtureServer(t, route{path: "/api/session", status: 200, body: tc.body})
+			c := newTestClient(t, srv, "pw")
+			if _, err := c.ListSessions(context.Background(), "/wt", 1000); err == nil {
+				t.Fatalf("malformed list page must be rejected (body=%s)", tc.body)
+			}
+		})
+	}
+}
+
+// TestClient_ListSessionsLegalPagination 落实收尾 K2 正面对：合法分页保持
+// 既有语义（cursor.next 非 null → HasMore/Overflow；空数组 + 双 null → 完整空快照）。
+func TestClient_ListSessionsLegalPagination(t *testing.T) {
+	t.Run("empty complete page", func(t *testing.T) {
+		srv := fixtureServer(t, route{path: "/api/session", status: 200,
+			body: `{"data":[],"cursor":{"previous":null,"next":null}}`})
+		c := newTestClient(t, srv, "pw")
+		page, err := c.ListSessions(context.Background(), "/wt", 1000)
+		if err != nil {
+			t.Fatalf("legal empty page must be accepted: %v", err)
+		}
+		if len(page.Sessions) != 0 || page.HasMore {
+			t.Fatalf("page: len=%d hasMore=%v", len(page.Sessions), page.HasMore)
+		}
+	})
+	t.Run("next cursor keeps overflow", func(t *testing.T) {
+		srv := fixtureServer(t, route{path: "/api/session", status: 200,
+			body: string(readFixture(t, "session_list_page1.json"))})
+		c := newTestClient(t, srv, "pw")
+		page, err := c.ListSessions(context.Background(), "/wt", 1000)
+		if err != nil {
+			t.Fatalf("legal page: %v", err)
+		}
+		if !page.HasMore {
+			t.Fatalf("cursor.next must keep HasMore/Overflow semantics")
+		}
+	})
+}
+
 func TestClient_SessionShapeViolation(t *testing.T) {
 	// Session.Info required 形状缺失 = 协议违约（fail-closed）。
 	cases := []struct {

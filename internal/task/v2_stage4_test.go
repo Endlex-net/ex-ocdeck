@@ -2609,9 +2609,17 @@ type realStreamHarness struct {
 	// readyOC{inner: oc} 读 ListSessions——真实流 harness 的 HTTP 面只服务
 	// supervisor/事件通道，会话列表事实在此注入）。
 	oc *mockOC
+	// listPageBody 非空时 GET /api/session 返回该原文（K2：畸形列表页注入）。
+	listPageBody string
+	// createFault 非 nil 时接管 POST /api/session 的响应（K1：服务端已创建
+	// session 但连接在响应前断开/响应截断）。返回 true = 已自行写响应。
+	createFault func(w http.ResponseWriter, r *http.Request, createdID string) bool
 }
 
-func newRealStreamHarness(t *testing.T, taskID, upstream, status string) *realStreamHarness {
+// harnessOpt 在 harness 构造期调整装配（必须在 Manager 构造前生效的注入点）。
+type harnessOpt func(*realStreamHarness)
+
+func newRealStreamHarness(t *testing.T, taskID, upstream, status string, opts ...harnessOpt) *realStreamHarness {
 	t.Helper()
 	t.Setenv(appagent.MasterSecretEnv, "test-master-secret")
 	ctx := context.Background()
@@ -2621,6 +2629,9 @@ func newRealStreamHarness(t *testing.T, taskID, upstream, status string) *realSt
 	}
 	t.Cleanup(func() { db.Close() })
 	h := &realStreamHarness{db: db, evtDone: make(chan struct{}), allowConns: 1}
+	for _, opt := range opts {
+		opt(h)
+	}
 	var evtOnce sync.Once
 	h.proc = newMonitorProcSeam(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -2631,6 +2642,9 @@ func newRealStreamHarness(t *testing.T, taskID, upstream, status string) *realSt
 			// 首建（Round收尾 J6）：递增 id 的 session 创建。
 			n := h.created.Add(1)
 			id := fmt.Sprintf("ses_c%d", n)
+			if h.createFault != nil && h.createFault(w, r, id) {
+				return
+			}
 			_, _ = w.Write([]byte(`{"data":{"id":"` + id + `","location":{"directory":"/wt"},"time":{"created":1,"updated":1}}}`))
 		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/environment"):
 			w.WriteHeader(http.StatusNoContent)
@@ -2660,6 +2674,8 @@ func newRealStreamHarness(t *testing.T, taskID, upstream, status string) *realSt
 		case strings.HasPrefix(r.URL.Path, "/api/session/ses_"):
 			id := strings.TrimPrefix(r.URL.Path, "/api/session/")
 			_, _ = w.Write([]byte(`{"data":{"id":"` + id + `","location":{"directory":"/wt"},"time":{"created":1,"updated":1}}}`))
+		case h.listPageBody != "":
+			_, _ = w.Write([]byte(h.listPageBody))
 		default:
 			_, _ = w.Write([]byte(`{"data":[],"cursor":{"previous":null,"next":null}}`))
 		}
@@ -5262,5 +5278,185 @@ func warmRealStreamHarness(t *testing.T, h *realStreamHarness) {
 	}
 	if err := warmer.CheckServerAlive(context.Background()); err != nil {
 		t.Fatalf("warmup: %v", err)
+	}
+}
+
+// ---- 收尾 Round 1：K2 畸形列表页不放行任务对账 ----
+
+// TestR1_K2_MalformedListKeepsOwnership_RealBridge 落实收尾 K2：生产桥
+// （真实 SPIProvider → spiBridgeOCClient → opencode2.Client.ListSessions）在
+// 上游返回 HTTP 200 畸形列表页时报错——任务对账 MUST 保留既有归属行
+// （MUST NOT 把畸形响应当完整空快照进 DeleteAbsentSessions）。
+func TestR1_K2_MalformedListKeepsOwnership_RealBridge(t *testing.T) {
+	ctx := context.Background()
+	h := newRealStreamHarness(t, "t-k2", "ses_keep", "active")
+	// 先用合法页完成 serve warmup（畸形页会让就绪验证本身失败——见 K2 语义），
+	// 再切换为畸形页，隔离「对账路径」的断言。
+	warmRealStreamHarness(t, h)
+	h.listPageBody = `{}`
+	// 既有 v2 归属行（对齐若误删即红）。
+	if _, err := h.db.Exec(`INSERT INTO task_sessions (task_id, session_id, session_created_at, first_seen_at, last_seen_at, provider_id, provider_instance_id)
+		 VALUES ('t-k2','ses_keep',1,1,1,?,?)`,
+		ocdeckstore.ProviderIDV2, ocdeckstore.ProviderInstanceV2Default); err != nil {
+		t.Fatal(err)
+	}
+	// 生产桥：buildTaskOCClient 经 bridgeClientFor 返回真实 provider 的 SPI 桥。
+	oc, err := h.m.buildTaskOCClient(ctx, "t-k2", appagent.Options{HealthTimeout: time.Second})
+	if err != nil {
+		t.Fatalf("build bridge client: %v", err)
+	}
+	if err := h.m.alignSessions(ctx, "t-k2", "/wt", oc, AlignModeRepo); err == nil {
+		t.Fatalf("malformed list page MUST surface as align error (protocol violation)")
+	} else if !strings.Contains(err.Error(), "list sessions") || strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("expected protocol violation error, got %v", err)
+	}
+	var n int
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id='t-k2' AND session_id='ses_keep'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("ownership row must survive protocol error, n=%d", n)
+	}
+}
+
+// TestR1_K2_LegalEmptySnapshotDeletesAbsent 落实收尾 K2 对照面：同一生产桥
+// 链路上「合法空快照」仍按既有语义删除缺席归属行（协议校验不得把合法页也拒掉，
+// 否则对账失去删除能力）。
+func TestR1_K2_LegalEmptySnapshotDeletesAbsent(t *testing.T) {
+	ctx := context.Background()
+	h := newRealStreamHarness(t, "t-k2b", "ses_keep", "active")
+	h.listPageBody = `{"data":[],"cursor":{"previous":null,"next":null}}`
+	warmRealStreamHarness(t, h)
+	if _, err := h.db.Exec(`INSERT INTO task_sessions (task_id, session_id, session_created_at, first_seen_at, last_seen_at, provider_id, provider_instance_id)
+		 VALUES ('t-k2b','ses_keep',1,1,1,?,?)`,
+		ocdeckstore.ProviderIDV2, ocdeckstore.ProviderInstanceV2Default); err != nil {
+		t.Fatal(err)
+	}
+	oc, err := h.m.buildTaskOCClient(ctx, "t-k2b", appagent.Options{HealthTimeout: time.Second})
+	if err != nil {
+		t.Fatalf("build bridge client: %v", err)
+	}
+	if err := h.m.alignSessions(ctx, "t-k2b", "/wt", oc, AlignModeRepo); err != nil {
+		t.Fatalf("legal empty page align: %v", err)
+	}
+	var n int
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id='t-k2b'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("legal empty snapshot must delete absent rows, n=%d", n)
+	}
+}
+
+// ---- 收尾 Round 1：K1 首建创建结果未知不误清占位 ----
+
+// TestR1_K1_UnknownCreate_KeepsGate_RealProvider 落实收尾 Round1 K1：真实
+// provider + 公开 Activate 入口——上游已创建 session 但连接在响应前断开 /
+// 响应截断不可解码（CreateSession 结果未知）时，MUST NOT 把「无 typed debt」
+// 当作「candidate 未产生」清占位：首次失败后重试与重建 Manager 后均保持占位、
+// 零新增 POST、无替代 session。
+func TestR1_K1_UnknownCreate_KeepsGate_RealProvider(t *testing.T) {
+	cases := []struct {
+		name  string
+		fault func(w http.ResponseWriter, r *http.Request, createdID string) bool
+	}{
+		{
+			name: "connection closed before response",
+			fault: func(w http.ResponseWriter, r *http.Request, _ string) bool {
+				hj, ok := w.(http.Hijacker)
+				if !ok {
+					t.Errorf("hijacker unavailable")
+					return false
+				}
+				conn, _, herr := hj.Hijack()
+				if herr != nil {
+					t.Errorf("hijack: %v", herr)
+					return false
+				}
+				_ = conn.Close() // 已创建 session，但响应前断开
+				return true
+			},
+		},
+		{
+			name: "truncated undecodable response",
+			fault: func(w http.ResponseWriter, _ *http.Request, createdID string) bool {
+				w.Header().Set("Content-Type", "application/json")
+				// 已写一半响应体（JSON 不完整——无法解码，也无可靠 ID）。
+				_, _ = w.Write([]byte(`{"data":{"id":"` + createdID + `"`))
+				return true
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			h := newRealStreamHarness(t, "t-k1", "ses_keep", "active")
+			// 清掉 harness 自种的 v2 任务行，改为 v2 钉扎 suspended 首建形态。
+			if _, err := h.db.Exec(`DELETE FROM tasks WHERE id='t-k1'`); err != nil {
+				t.Fatal(err)
+			}
+			seedBranchBTask(t, h.db, "t-k1")
+			if _, err := h.db.Exec(`UPDATE tasks SET provider_id=? WHERE id='t-k1'`, ocdeckstore.ProviderIDV2); err != nil {
+				t.Fatal(err)
+			}
+			warmRealStreamHarness(t, h)
+			h.createFault = tc.fault
+
+			berr := h.m.Activate(ctx, "t-k1")
+			if berr == nil {
+				t.Fatalf("unknown create result must fail the activation")
+			}
+			if n := h.created.Load(); n != 1 {
+				t.Fatalf("expected exactly one POST attempt, got %d", n)
+			}
+			row, err := h.adapter.GetTask(ctx, "t-k1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(row.Notice.String, candidateIntentSessionPending) {
+				t.Fatalf("placeholder must be retained on unknown create result: %q", row.Notice.String)
+			}
+			if strings.Contains(row.Notice.String, `"sessionName":"ses_`) {
+				t.Fatalf("no candidate identity may be fabricated: %q", row.Notice.String)
+			}
+			// 重试：门禁拒绝、零新增 POST。
+			if aerr := h.m.Activate(ctx, "t-k1"); aerr == nil ||
+				!strings.Contains(aerr.Error(), "uncleaned cleanup debt") {
+				t.Fatalf("retry must stay gated, got %v", aerr)
+			}
+			if n := h.created.Load(); n != 1 {
+				t.Fatalf("gated retry must not POST, POSTs=%d", n)
+			}
+			// 重建 Manager（模拟进程重启，内存态清空）后同样零 POST。
+			m2 := newTestManagerFull(t, h.adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+			m2.SetLifecycleCtx(ctx)
+			m2.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+			reg2 := appagent.NewRegistry()
+			if err := reg2.Register(newTestRegistryProvider()); err != nil {
+				t.Fatal(err)
+			}
+			if err := reg2.Register(h.prov); err != nil {
+				t.Fatal(err)
+			}
+			m2.providerRegistry = reg2
+			if aerr := m2.Activate(ctx, "t-k1"); aerr == nil ||
+				!strings.Contains(aerr.Error(), "uncleaned cleanup debt") {
+				t.Fatalf("cross-restart gate must hold, got %v", aerr)
+			}
+			if n := h.created.Load(); n != 1 {
+				t.Fatalf("cross-restart must be zero-POST, POSTs=%d", n)
+			}
+			// 无替代 session：任务无 binding / 无归属行。
+			if _, has, berr := h.adapter.GetTaskBinding(ctx, "t-k1"); berr != nil || has {
+				t.Fatalf("no binding may be committed: has=%v err=%v", has, berr)
+			}
+			var nsess int
+			if err := h.db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id='t-k1'`).Scan(&nsess); err != nil {
+				t.Fatal(err)
+			}
+			if nsess != 0 {
+				t.Fatalf("no ownership row may be claimed, n=%d", nsess)
+			}
+		})
 	}
 }

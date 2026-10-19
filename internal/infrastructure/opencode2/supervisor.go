@@ -585,13 +585,9 @@ func (s *V2Supervisor) Acquire(ctx context.Context, task appagent.TaskRef) (doma
 	if err != nil {
 		return domain.TaskBinding{}, err
 	}
-	created, err := c.CreateSession(ctx, task.Directory)
-	if err != nil {
-		if isTransportErr(err) {
-			s.invalidateServer() // G3-F1：连接类失败 = server 可能已死，清就绪态
-		}
-		return domain.TaskBinding{}, appagent.NewError("supervisor.acquire",
-			appagent.ErrKindRuntimeUnavailable, err)
+	created, aerr := s.acquireCreateSession(ctx, c, task.Directory)
+	if aerr != nil {
+		return domain.TaskBinding{}, aerr
 	}
 	// 首建补偿（D3 受限回收例外）：POST 已成功后的 attempt 失败——本次新建且
 	// 未提交的 candidate session 经 SessionControl.Delete 回收（candidate 所有权
@@ -606,6 +602,37 @@ func (s *V2Supervisor) Acquire(ctx context.Context, task appagent.TaskRef) (doma
 		return domain.TaskBinding{}, aerr
 	}
 	return binding, nil
+}
+
+// acquireCreateSession 是首建 POST 的三分收口（收尾 Round1 K1）：
+//   - 确定未创建（请求未发出/HTTP 非 2xx）→ 普通 typed 错误（编排层可清占位）；
+//   - 响应已可靠取得 session id（即使后续解码/形状失败）→ 转入该 ID 的受限回收；
+//     回收成功 = 已确认清理；回收失败 → CandidateCleanupDebt 债务链；
+//   - 交付结果未知且无 id → CandidateCreateUnknown（编排层 MUST 保留占位阻断）。
+func (s *V2Supervisor) acquireCreateSession(ctx context.Context, c *Client, dir string) (wireSession, error) {
+	created, idHint, err := c.createSession(ctx, dir)
+	if err == nil {
+		return created, nil
+	}
+	var unknown *createResultUnknownError
+	if !errors.As(err, &unknown) {
+		// 服务端明确拒绝/请求未发出：确定未创建（G3-F1 连接类失败清就绪态）。
+		if isTransportErr(err) {
+			s.invalidateServer()
+		}
+		return wireSession{}, appagent.NewError("supervisor.acquire",
+			appagent.ErrKindRuntimeUnavailable, err)
+	}
+	s.invalidateServer() // 响应不可达/截断：server 可能已死，清就绪态
+	if idHint != "" {
+		// 响应中已可靠取得 ID：按该 ID 走受限回收/债务链，MUST NOT 判未创建。
+		if derr := s.recycleCandidate(ctx, c, idHint); derr != nil {
+			return wireSession{}, errors.Join(unknown, derr)
+		}
+		return wireSession{}, errors.Join(unknown,
+			&appagent.CandidateCleanupDebt{SessionID: idHint, Err: errors.New("create 响应解码失败但已确认回收")})
+	}
+	return wireSession{}, errors.Join(unknown, &appagent.CandidateCreateUnknown{Err: unknown})
 }
 
 // finishAcquire POST 成功后的 attempt 收尾：契约发现校验（2.5）+ 配置应用链

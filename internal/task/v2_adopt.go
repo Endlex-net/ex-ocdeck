@@ -298,6 +298,15 @@ func (m *Manager) firstBuildV2(ctx context.Context, taskID string, row TaskRow, 
 			}
 			return m.supervisorStageErrorForTyped(serr, taskID)
 		}
+		// 收尾 Round1 K1：交付结果未知（连接在响应前断开/响应截断不可解码）——
+		// 上游可能已创建 session，MUST NOT 当作「candidate 未产生」清占位。占位
+		// 原样保留 = 跨重启门禁 + 人工处置指引（Activate 门禁按身份未知出口给出
+		// last_error 指引）；下次首建因此不会被放行。
+		var unknown *appagent.CandidateCreateUnknown
+		if errors.As(serr, &unknown) {
+			m.recordAdmissionError(ctx, taskID, fmt.Errorf("首建创建结果未知（保留阻断，待人工确认原 candidate）: %v", serr))
+			return m.supervisorStageErrorForTyped(serr, taskID)
+		}
 		// 无 debt（Acquire 前置失败——candidate 未产生）：占位意图清除（独立有界
 		// ctx——清除失败仅留待重放，门禁短期保守持有）。
 		cCtx, cCancel := withResidualNoticeCtx(ctx)
