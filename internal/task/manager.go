@@ -398,6 +398,14 @@ type Manager struct {
 	recoveryIncidents   map[string]*recoveryIncident
 	recoveryWG          sync.WaitGroup
 
+	// reapLedger 是挂起收尾义务的进程内受管重试登记（Round7 I17）：所有持久化
+	// 出口（残留 notice/pending 标注/外层写回）失败时，义务（含本次 kill 返回的
+	// 完整 tickets——单元可能已删、无法重新派生）交此登记；每轮重放优先落账，
+	// 不依赖再次 kill。Manager 生命周期内有效；跨进程恢复依赖意图 pending 标注
+	// 先于状态收敛落库（Round6 I17 排序）。
+	reapLedgerMu sync.Mutex
+	reapLedger   []suspendFinishObligation
+
 	// recoveryWakes 是恢复退避的状态/token invalidation 唤醒通道（G3-7）：
 	// setRuntime/clearRuntime/状态写入路径 close 当前通道，退避中的 incident 即时
 	// 复核 continuation（状态已离 activating / token 失效 → 立即取消，不等满 timer）。

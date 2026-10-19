@@ -2986,6 +2986,108 @@ func TestStage4_R5_I17_ReplayKeepsIntentOnEnvClearFail(t *testing.T) {
 	}
 }
 
+// TestStage4_R7_I17_ReapTicketsSurviveViaLedger 落实 Round7 I17：kill 返回
+// SessionKilled=true + ReapFailed + 原始 tickets（tmux 单元已删、逃逸进程待收割）
+// 且残留 notice/pending 标注/外层写回持续失败 → 义务进受管登记（单元消失后无法
+// 重新派生 tickets）→ 存储恢复后重放：按原 tickets 内容落账（收割目标=原
+// tickets，非重新派生）→ 收敛 suspended + 意图清除。
+func TestStage4_R7_I17_ReapTicketsSurviveViaLedger(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-r7")
+	adapter := NewStoreAdapter(db)
+	fstore := &failReplayPersistStore{StoreAdapter: adapter}
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManagerStore(t, db, fstore, prov)
+	m.lifecycle = nil
+	rt := m.newRuntime("t-r7")
+	m.setRuntime("t-r7", rt)
+	mproc := m.proc.(*mockProc)
+	const ref = "ocdeck-v2-tui-t-r7"
+	mproc.mu.Lock()
+	mproc.sessions[ref] = true
+	// SessionKilled=true + ReapFailed：单元已删、逃逸进程待收割——tickets 无法
+	// 通过再次 kill 重新派生（单元消失后 HasSession 直接跳过）。
+	mproc.killResults[ref] = process.KillResult{
+		SessionKilled:  true,
+		Disposition:    process.DispositionReapFailed,
+		CleanupTickets: []string{"tk-orig-1", "tk-orig-2"},
+	}
+	mproc.mu.Unlock()
+
+	ref2 := ref
+	if ierr := m.recordSuspendStopIntent(ctx, "t-r7", ref2, string(rt.instVersion)); ierr != nil {
+		t.Fatal(ierr)
+	}
+	// ①持续写失败：残留 notice / pending 标注 / 外层写回全部失败。
+	fstore.failNoticeCAS.Store(true)
+	row, _ := fstore.GetTask(ctx, "t-r7")
+	entries, _ := parseNotices(row.Notice)
+	if rerr := m.retryTaskNotices(ctx, row, entries); rerr == nil {
+		t.Fatalf("persistent persistence failure must surface")
+	}
+	// 单元消失（不可重新派生 tickets）。
+	mproc.mu.Lock()
+	delete(mproc.sessions, ref)
+	mproc.mu.Unlock()
+	// 本轮义务必须已进受管登记（进程内有生命周期的重试载荷）。
+	if len(m.reapLedgerSnapshot()) == 0 {
+		t.Fatalf("obligations must be registered in the managed ledger")
+	}
+
+	// ②存储恢复 → 重放：义务经受管登记落账并被收割（收割目标=原 tickets 内容，
+	// 非重新派生——单元已删、无可再次 kill）→ 收敛 suspended → 意图清除。
+	rproc := &reapRecordingProc{mockProc: mproc}
+	m.proc = rproc
+	fstore.failNoticeCAS.Store(false)
+	row2, _ := fstore.GetTask(ctx, "t-r7")
+	entries2, _ := parseNotices(row2.Notice)
+	if rerr := m.retryTaskNotices(ctx, row2, entries2); rerr != nil {
+		t.Fatalf("replay(restore): %v", rerr)
+	}
+	row3, _ := fstore.GetTask(ctx, "t-r7")
+	if row3.Status != "suspended" {
+		t.Fatalf("status=%s", row3.Status)
+	}
+	rproc.mu.Lock()
+	reaped := append([][]string(nil), rproc.reaped...)
+	rproc.mu.Unlock()
+	if len(reaped) == 0 {
+		t.Fatalf("original tickets must be reaped via ledger-drain")
+	}
+	for _, tk := range reaped {
+		if len(tk) != 2 || tk[0] != "tk-orig-1" || tk[1] != "tk-orig-2" {
+			t.Fatalf("reap target must be the ORIGINAL tickets, got %v", tk)
+		}
+	}
+	if strings.Contains(row3.Notice.String, noticeCodeSuspendStop) {
+		t.Fatalf("intent must be cleared after converged replay: %q", row3.Notice.String)
+	}
+	if len(m.reapLedgerSnapshot()) != 0 {
+		t.Fatalf("ledger must be drained after persistence recovers")
+	}
+}
+
+// reapRecordingProc 包装 mockProc 录制 RetryReap 的收割目标（Round7 I17：断言
+// 收割目标=原 tickets 内容）。
+type reapRecordingProc struct {
+	*mockProc
+	mu     sync.Mutex
+	reaped [][]string
+}
+
+func (p *reapRecordingProc) RetryReap(tickets []string) ([]string, error) {
+	p.mu.Lock()
+	p.reaped = append(p.reaped, append([]string(nil), tickets...))
+	p.mu.Unlock()
+	return nil, nil
+}
+
 // TestStage4_R6_I19_SuspendCompletesPendingOrKeepsIt 落实 Round6 I19：后续
 // Suspend 取得收敛权清除意图前 MUST 补全意图携带的未完成持久化义务——补全成功
 // → tickets 债务落库 + 意图清除；补全失败 → 意图保留（pending 不丢），下轮

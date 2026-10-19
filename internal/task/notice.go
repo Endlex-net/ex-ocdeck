@@ -390,6 +390,43 @@ func (m *Manager) recordResidualNoticeFromDisposition(ctx context.Context, taskI
 	return m.recordResidualNotice(ctx, taskID, sessionName, res.CleanupTickets, cls.reason, cls.retryable)
 }
 
+// reapLedgerSnapshot 返回受管登记快照（测试观测面）。
+func (m *Manager) reapLedgerSnapshot() []suspendFinishObligation {
+	m.reapLedgerMu.Lock()
+	defer m.reapLedgerMu.Unlock()
+	return append([]suspendFinishObligation(nil), m.reapLedger...)
+}
+
+// registerReapObligations 登记未完成持久化义务（Round7 I17：所有持久化出口
+// 失败时的受管重试登记——义务含本次 kill 返回的完整 tickets，单元可能已删，
+// 后续落账/收割 MUST 使用原 tickets，不依赖再次 kill）。
+func (m *Manager) registerReapObligations(obs []suspendFinishObligation) {
+	if len(obs) == 0 {
+		return
+	}
+	m.reapLedgerMu.Lock()
+	m.reapLedger = append(m.reapLedger, obs...)
+	m.reapLedgerMu.Unlock()
+}
+
+// drainReapLedger 尝试落账受管登记的全部义务，返回仍未完成的（保留在登记中）。
+// 每轮停止收敛意图重放前调用——存储恢复后优先落账原 tickets。
+func (m *Manager) drainReapLedger(ctx context.Context, taskID string) {
+	m.reapLedgerMu.Lock()
+	pending := m.reapLedger
+	m.reapLedger = nil
+	m.reapLedgerMu.Unlock()
+	if len(pending) == 0 {
+		return
+	}
+	remaining := m.persistSuspendFinishObligations(ctx, taskID, "", pending)
+	if len(remaining) > 0 {
+		m.reapLedgerMu.Lock()
+		m.reapLedger = append(remaining, m.reapLedger...)
+		m.reapLedgerMu.Unlock()
+	}
+}
+
 // retrySuspendStopIntent 消费停止收敛意图（评审 Round3 I2；调用方持任务锁）：
 // 复核（suspended=已收敛/非 active=意图过时/新一代 runtime 在位=旧意图失效——
 // 三者清除意图且不影响现状）→ 复用正常挂起收尾语义完成清关联+残留 notice/tickets
@@ -400,6 +437,9 @@ func (m *Manager) recordResidualNoticeFromDisposition(ctx context.Context, taskI
 // 返回 done（true=意图已了结可清除）、更新后的条目与错误。
 func (m *Manager) retrySuspendStopIntent(ctx context.Context, taskID string, e noticeEntry) (bool, noticeEntry, error) {
 	terminalRef, _ := e.Data["sessionName"].(string)
+	// Round7 I17：先落账受管登记的义务（存储恢复后优先落账原 tickets——单元
+	// 可能已删，不能依赖再次 kill 重新派生）。
+	m.drainReapLedger(ctx, taskID)
 	// Round5 I17：上一轮遗留的未完成持久化义务优先补全（与状态无关——suspended
 	// 已收敛也不得丢弃 tickets 重放能力）。
 	if pending := decodeSuspendFinishObligations(e); len(pending) > 0 {
@@ -447,6 +487,11 @@ func (m *Manager) retrySuspendStopIntent(ctx context.Context, taskID string, e n
 	le, ferrs, obligations := m.finishSuspendCommon(ctx, taskID, results, nil)
 	if joined := errors.Join(ferrs...); joined != nil && !le.Valid {
 		le = sql.NullString{String: joined.Error(), Valid: true}
+	}
+	if len(obligations) > 0 {
+		// Round7 I17：义务先交受管登记（进程内有生命周期的重试载荷——任何持久化
+		// 出口失败都不至于让完整 tickets 只存在于本次调用返回值）。
+		m.registerReapObligations(obligations)
 	}
 	// Round6 I17：状态收敛与完整 pending 载荷同一持久化提交边界——义务标注
 	// 先于状态收敛落库。标注失败 → 不收敛（保持 active：tickets 由 kill 结果
@@ -602,6 +647,9 @@ func (m *Manager) retryTaskNotices(ctx context.Context, t TaskRow, entries []not
 		return nil
 	}
 	defer unlock()
+
+	// Round7 I17：受管义务登记优先落账（含意图已清但义务尚在登记的边角）。
+	m.drainReapLedger(ctx, t.ID)
 
 	var errs []error
 
