@@ -19,6 +19,7 @@ import { attachTouchGestures, type GestureHandle } from './touch-gestures';
 import { shouldSendInput, encodeBinaryInput, createSyntheticGate, type SyntheticGate } from './input-gate';
 import { createLockOrchestrator, type LockOrchestrator } from './session-coordination';
 import { createImeCompensator, isImeProcessKey, type ImeCompensator } from './ime-compensator';
+import { TAB_FOCUS_TARGET_TUI, tabFocusTargetFromWsPath } from './tab-focus-intent';
 import { parseOsc52Payload } from './clipboard';
 import { debugMark } from '../debug';
 
@@ -685,10 +686,37 @@ export class TermSession {
   private handleCustomKey(ev: KeyboardEvent): boolean {
     const isShiftEnter =
       ev.key === 'Enter' && ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey;
+    const isBareEscape =
+      ev.key === 'Escape' && !ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey;
     if (ev.type === 'keydown') {
       if (isShiftEnter && !ev.isComposing && !isImeProcessKey(ev.key, ev.keyCode)) {
         ev.preventDefault();
         this.sendInput('\x1b[27;2;13~', false);
+        return false;
+      }
+      // 裸 ESC 拦截翻译（仅任务 TUI 终端）：tmux attach 的 ESC 消歧窗口（实测
+      // 下限 ~500ms）会把人类双击 ESC（80-300ms）合并成单批 `\x1b\x1b`，而
+      // opencode v1 parseKeypress 把 `\x1b\x1b` 折叠为一个 {name:"escape",meta:true}
+      // ——中断要求的「5 秒内两个独立 escape 事件」永远不成立。翻译为
+      // modifyOtherKeys 形态 CSI 27;1;27~：序列不以孤立 ESC 开头、tmux 不进入
+      // 消歧窗口，两次按键天然产生两个独立 {name:"escape"}（meta=false）事件
+      // （与 Shift+Enter → CSI 27;2;13~ 同机制，v1 parseKeypress 已支持该形态）。
+      // 终端种类守卫：xterm 6.0 不跟踪 modifyOtherKeys（typings 与 bundled lib
+      // 均 0 命中，modes API 不可用）——退回按 wsPath 区分终端种类，仅任务 TUI
+      // 实例（/ws/terminal/<taskID>）改写；shell 终端（/ws/terminal/shell/<tid>，
+      // bash/vim 等普通程序）放行原事件，避免收到字面垃圾序列。分类复用
+      // tabFocusTargetFromWsPath（tab 聚焦/TerminalView 同一 wsPath 分类源）。
+      // 修饰键放行：alt/ctrl/meta/shift 任一按住时不改写——alt+ESC 本身是 ESC
+      // 前缀序列，改写会破坏 alt 组合键语义。IME 边界与 Shift+Enter 同门禁
+      // （ESC 不满足 ime-compensator insertText 单字符条件，补偿器路径不受影响）。
+      if (
+        isBareEscape &&
+        tabFocusTargetFromWsPath(this.wsPath) === TAB_FOCUS_TARGET_TUI &&
+        !ev.isComposing &&
+        !isImeProcessKey(ev.key, ev.keyCode)
+      ) {
+        ev.preventDefault();
+        this.sendInput('\x1b[27;1;27~', false);
         return false;
       }
       return true;

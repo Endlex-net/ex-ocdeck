@@ -1627,6 +1627,51 @@ describe('OSC 52 clipboard 接线', () => {
   });
 });
 
+/* ============ custom key handler 共享测试环境（Shift+Enter / 裸 ESC 拦截翻译） ============ */
+
+/** 构造 authed + WS OPEN 的 session（sendInput 门禁放行），返回捕获的 custom handler 与 ws。
+ *  wsPath 可指定终端种类（'/ws/terminal/<tid>' TUI / '/ws/terminal/shell/<tid>' shell）。 */
+async function authedSession(wsPath = '/ws/x') {
+  env.matchMediaMatches = false;
+  const { TermSession } = await import('../terminal/session');
+  const session = new TermSession({} as HTMLElement, fakeWrap(), wsPath, () => {});
+  const savedWs = (globalThis as { WebSocket: unknown }).WebSocket;
+  let wsInstance: {
+    readyState: number;
+    binaryType: string;
+    send: ReturnType<typeof vi.fn>;
+    close: ReturnType<typeof vi.fn>;
+    onmessage?: (ev: MessageEvent) => void;
+  } | null = null;
+  const WsCtor = vi.fn(function (this: unknown) {
+    wsInstance = { readyState: 1, binaryType: 'arraybuffer', send: vi.fn(), close: vi.fn() };
+    return wsInstance as object;
+  }) as unknown as typeof WebSocket;
+  (WsCtor as unknown as { OPEN: number }).OPEN = 1;
+  (globalThis as { WebSocket: unknown }).WebSocket = WsCtor;
+  session.connect();
+  wsInstance!.onmessage!({ data: JSON.stringify({ type: 'auth_ok' }) } as MessageEvent);
+  const handler = (
+    termInstance.attachCustomKeyEventHandler.mock.calls as unknown as [(ev: KeyboardEvent) => boolean][]
+  )[0][0];
+  return {
+    handler,
+    ws: wsInstance!,
+    /** 统计指定 CSI 序列的发送次数（缺省为 Shift+Enter 的 CSI 27;2;13~）。 */
+    seqSendCount(seq = '\x1b[27;2;13~') {
+      return wsInstance!.send.mock.calls.filter(
+        (c: unknown[]) =>
+          c[0] instanceof Uint8Array &&
+          String.fromCharCode(...Array.from(c[0] as Uint8Array)) === seq,
+      ).length;
+    },
+    cleanup() {
+      (globalThis as { WebSocket: unknown }).WebSocket = savedWs;
+      session.dispose();
+    },
+  };
+}
+
 /* ============================ Shift+Enter → input_newline（CSI 27;2;13~） ============================ */
 
 describe('Shift+Enter 拦截翻译', () => {
@@ -1645,48 +1690,6 @@ describe('Shift+Enter 拦截翻译', () => {
       ...init,
     };
     return ev as unknown as KeyboardEvent & { preventDefault: ReturnType<typeof vi.fn> };
-  }
-
-  /** 构造 authed + WS OPEN 的 session（sendInput 门禁放行），返回捕获的 custom handler 与 ws。 */
-  async function authedSession() {
-    env.matchMediaMatches = false;
-    const { TermSession } = await import('../terminal/session');
-    const session = new TermSession({} as HTMLElement, fakeWrap(), '/ws/x', () => {});
-    const savedWs = (globalThis as { WebSocket: unknown }).WebSocket;
-    let wsInstance: {
-      readyState: number;
-      binaryType: string;
-      send: ReturnType<typeof vi.fn>;
-      close: ReturnType<typeof vi.fn>;
-      onmessage?: (ev: MessageEvent) => void;
-    } | null = null;
-    const WsCtor = vi.fn(function (this: unknown) {
-      wsInstance = { readyState: 1, binaryType: 'arraybuffer', send: vi.fn(), close: vi.fn() };
-      return wsInstance as object;
-    }) as unknown as typeof WebSocket;
-    (WsCtor as unknown as { OPEN: number }).OPEN = 1;
-    (globalThis as { WebSocket: unknown }).WebSocket = WsCtor;
-    session.connect();
-    wsInstance!.onmessage!({ data: JSON.stringify({ type: 'auth_ok' }) } as MessageEvent);
-    const handler = (
-      termInstance.attachCustomKeyEventHandler.mock.calls as unknown as [(ev: KeyboardEvent) => boolean][]
-    )[0][0];
-    return {
-      handler,
-      ws: wsInstance!,
-      /** 统计 CSI 27;2;13~ 的发送次数 */
-      seqSendCount() {
-        return wsInstance!.send.mock.calls.filter(
-          (c: unknown[]) =>
-            c[0] instanceof Uint8Array &&
-            String.fromCharCode(...Array.from(c[0] as Uint8Array)) === '\x1b[27;2;13~',
-        ).length;
-      },
-      cleanup() {
-        (globalThis as { WebSocket: unknown }).WebSocket = savedWs;
-        session.dispose();
-      },
-    };
   }
 
   it('构造时注册 custom key handler', async () => {
@@ -1751,6 +1754,105 @@ describe('Shift+Enter 拦截翻译', () => {
       expect(handler(keyEv({ type: 'keyup', shiftKey: true }))).toBe(true);
       expect(handler(keyEv({ type: 'keypress' }))).toBe(true); // 非 shift 的 keypress 不干预
       expect(seqSendCount()).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+});
+/* ==================== 裸 ESC → modifyOtherKeys 形态（ESC 双击中断修复） ==================== */
+
+describe('裸 ESC 拦截翻译（任务 TUI 终端）', () => {
+  /** fake 键盘事件：默认裸 ESC（key='Escape'、keyCode=27、无修饰键）。 */
+  function escEv(init?: Partial<KeyboardEvent>): KeyboardEvent & { preventDefault: ReturnType<typeof vi.fn> } {
+    const ev = {
+      type: 'keydown',
+      key: 'Escape',
+      keyCode: 27,
+      shiftKey: false,
+      ctrlKey: false,
+      altKey: false,
+      metaKey: false,
+      isComposing: false,
+      preventDefault: vi.fn(),
+      ...init,
+    };
+    return ev as unknown as KeyboardEvent & { preventDefault: ReturnType<typeof vi.fn> };
+  }
+
+  /** TUI 终端裸 ESC keydown → 翻译为 modifyOtherKeys 形态 CSI 27;1;27~ 并消费原事件。 */
+  it('TUI 终端裸 ESC keydown → preventDefault + 发送一次 CSI 27;1;27~ 并返回 false', async () => {
+    const { handler, seqSendCount, cleanup } = await authedSession('/ws/terminal/t1');
+    try {
+      const ev = escEv();
+      expect(handler(ev)).toBe(false);
+      expect(ev.preventDefault).toHaveBeenCalledTimes(1);
+      expect(seqSendCount('\x1b[27;1;27~')).toBe(1);
+      // 不误发 Shift+Enter 序列（两机制序列可区分）。
+      expect(seqSendCount()).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  /** 修饰键组合放行：alt/ctrl/meta/shift + Escape 均不改写（alt+ESC 是 ESC 前缀序列）。 */
+  it('修饰键组合（alt/shift/ctrl/meta+Escape）→ 返回 true 不改写', async () => {
+    const { handler, seqSendCount, cleanup } = await authedSession('/ws/terminal/t1');
+    try {
+      expect(handler(escEv({ altKey: true }))).toBe(true);
+      expect(handler(escEv({ shiftKey: true }))).toBe(true);
+      expect(handler(escEv({ ctrlKey: true }))).toBe(true);
+      expect(handler(escEv({ metaKey: true }))).toBe(true);
+      expect(seqSendCount('\x1b[27;1;27~')).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  /** shell 终端守卫：/ws/terminal/shell/<tid> 的裸 ESC 放行（bash/vim 收到字面序列即破坏）。 */
+  it('shell 终端（/ws/terminal/shell/<tid>）裸 ESC → 返回 true 不改写', async () => {
+    const { handler, seqSendCount, cleanup } = await authedSession('/ws/terminal/shell/sh1');
+    try {
+      const ev = escEv();
+      expect(handler(ev)).toBe(true);
+      expect(ev.preventDefault).not.toHaveBeenCalled();
+      expect(seqSendCount('\x1b[27;1;27~')).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  /** IME 边界（与 Shift+Enter 同门禁）：isComposing / Process / 229 放行。 */
+  it('IME 边界：isComposing、key=Process、keyCode=229 的裸 ESC 不拦截', async () => {
+    const { handler, seqSendCount, cleanup } = await authedSession('/ws/terminal/t1');
+    try {
+      expect(handler(escEv({ isComposing: true }))).toBe(true);
+      expect(handler(escEv({ key: 'Process' }))).toBe(true);
+      expect(handler(escEv({ keyCode: 229 }))).toBe(true);
+      expect(seqSendCount('\x1b[27;1;27~')).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  /** keypress 形态不干预：Escape 无派生 keypress（xterm keypress 对无 charCode 键
+   *  产出为空），无需 Shift+Enter 式残留防御；透传保持默认行为。 */
+  it('keypress 形态的裸 ESC → 返回 true（不干预、不重复发送）', async () => {
+    const { handler, seqSendCount, cleanup } = await authedSession('/ws/terminal/t1');
+    try {
+      expect(handler(escEv({ type: 'keypress' }))).toBe(true);
+      expect(seqSendCount('\x1b[27;1;27~')).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  /** 非 Escape 键不受影响：普通 keydown 仍透传。 */
+  it('非 Escape 键 → 返回 true（既有行为不变）', async () => {
+    const { handler, seqSendCount, cleanup } = await authedSession('/ws/terminal/t1');
+    try {
+      expect(handler(escEv({ key: 'a', keyCode: 65 }))).toBe(true);
+      expect(handler(escEv({ key: 'F1', keyCode: 112 }))).toBe(true);
+      expect(seqSendCount('\x1b[27;1;27~')).toBe(0);
     } finally {
       cleanup();
     }
