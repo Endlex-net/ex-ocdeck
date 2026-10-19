@@ -110,14 +110,15 @@ type V2Supervisor struct {
 	// everReady 本实例曾确认就绪（I9：首个成功 ensure 置位；其后成功拉起即重拉——
 	// 通知收口的「真实恢复状态转换」判据，首次启动不通知）。
 	everReady bool
-	// monitorOnce/monitorStop 监控循环唯一启动与停止（I9：supervisor 是 server
-	// 监控与重拉的唯一 owner；启动后置——首个成功 ensure 后启动；关停停止——
-	// persist/kill 两种策略都必须停止，join 语义经 monitorDone）。
-	monitorOnce     sync.Once
+	// monitorStop/monitorCancel/monitorDone 监控循环生命周期（I9：supervisor 是
+	// server 监控与重拉的唯一 owner；启动后置——首个成功 ensure 后启动；关停
+	// 停止——persist/kill 两种策略都必须停止）。monitorCancel 持有监控 ctx 的
+	// cancel（Round3 I9：停止入口可取消阻塞中的在途重试后再 join）。
 	monitorStop     chan struct{}
 	monitorStopOnce sync.Once
 	monitorDone     chan struct{}
-	monitorStarted  atomic.Bool // runMonitor 已派发（joinMonitor 判据）
+	monitorCancel   context.CancelFunc
+	monitorStarted  atomic.Bool // runMonitor 已派发（join 判据）
 }
 
 // NewV2Supervisor 构造 supervisor（deps 完整性由调用方保证——生产装配在
@@ -213,27 +214,40 @@ func (s *V2Supervisor) ensureServerOnce(ctx context.Context) (int, string, error
 }
 
 // startMonitorLocked 首个成功 ensure 后置启动监控循环（I9：supervisor 是 server
-// 监控与重拉的唯一 owner；关停停止）。调用方持 s.mu；Once.Do 仅派发 goroutine
-// 立即返回，不在锁内运行循环体。
+// 监控与重拉的唯一 owner；关停停止）。调用方持 s.mu；monitorCancel 非 nil 即在
+// 运行（幂等）。monitor ctx 持有于本函数——StopServerMonitoring 可取消在途
+// ensureServer 重试（Round3 I9：循环内 cancel 不足以打断阻塞中的重试）。
 func (s *V2Supervisor) startMonitorLocked() {
+	if s.monitorCancel != nil {
+		return // 已在运行
+	}
+	monCtx, cancel := context.WithCancel(context.Background())
+	s.monitorCancel = cancel
+	done := make(chan struct{})
+	s.monitorDone = done
 	s.monitorStarted.Store(true)
-	s.monitorOnce.Do(func() { go s.runMonitor() })
+	go func() {
+		defer close(done)
+		defer cancel()
+		s.runMonitor(monCtx)
+	}()
 }
 
 // runMonitor 后台监视循环（I9）：就绪态轻量进程验活（不触网），死亡即清就绪态
 // 并交 ensureServer 自愈——独立重试与重拉通知经同一收口（不扣任务预算；生产
-// 触发闭环不再依赖业务入口顺带调 CheckServerAlive）。关停（shuttingDown 或
-// monitorStop 关闭）即退出：取消在途重试（monitor ctx 贯穿 ensureServer）并
-// close(monitorDone) 供 StopServerMonitoring join。
-func (s *V2Supervisor) runMonitor() {
-	defer close(s.monitorDone)
-	monCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// 触发闭环不再依赖业务入口顺带调 CheckServerAlive）。关停（shuttingDown /
+// monitorStop 关闭 / monCtx 取消）即退出。
+func (s *V2Supervisor) runMonitor(monCtx context.Context) {
 	ticker := time.NewTicker(s.deps.MonitorInterval)
 	defer ticker.Stop()
 	for {
+		if monCtx.Err() != nil {
+			return
+		}
 		select {
 		case <-s.monitorStop:
+			return
+		case <-monCtx.Done():
 			return
 		case <-ticker.C:
 		}
@@ -256,11 +270,27 @@ func (s *V2Supervisor) runMonitor() {
 
 // StopServerMonitoring 停止监控循环并等待退出（评审 I9 生命周期修复：persist 与
 // kill 两种关停策略都必须停止监控——persist 策略不关 server 但同样不得在关停后
-// 继续访问 store/重拉）。幂等；join 前取消在途监控重试（ensureServer 随 monitor
-// ctx 取消快速返回）。MUST NOT 在持有 s.mu 时调用（join 与循环体互斥需要锁让位）。
+// 继续访问 store/重拉）。三态同步（Round3 I9）：未启动（monitorCancel nil——v2
+// 注册但从未成功 ensure）直接返回不 join；已启动先取消 monitor ctx（打断阻塞中
+// 的 ensureServer/在途重试）再 join；已停止（重复调用）幂等。join 后复位
+// monitorCancel 允许后续 ensure 重新拉起监控。MUST NOT 在持有 s.mu 时调用
+// （join 与循环体互斥需要锁让位）。
 func (s *V2Supervisor) StopServerMonitoring() {
 	s.monitorStopOnce.Do(func() { close(s.monitorStop) })
+	s.mu.Lock()
+	cancel := s.monitorCancel
+	started := s.monitorStarted.Load()
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel() // 打断阻塞中的 ensureServer（在途重试随 monCtx 取消快速返回）
+	}
+	if !started {
+		return // 监控从未派发（未使用 v2/首次启动前关停）：无可 join
+	}
 	<-s.monitorDone
+	s.mu.Lock()
+	s.monitorCancel = nil
+	s.mu.Unlock()
 }
 
 // verifyAliveLocked 轻量验活（调用方持 s.mu）：实例 pid 存活且身份匹配。
@@ -775,8 +805,8 @@ func (s *V2Supervisor) CheckServerAlive(ctx context.Context) error {
 func (s *V2Supervisor) ShutdownServer(ctx context.Context) error {
 	s.mu.Lock()
 	s.shuttingDown = true
-	// I9：关停停止监控（幂等——Once 防重复 close）；join 在锁外（循环体互斥
-	// 需要锁让位，见 StopServerMonitoring）。
+	// I9：关停停止监控——close(monitorStop) 幂等收口；cancel+join 三态语义
+	// 统一经 StopServerMonitoring（锁外执行——join 与循环体互斥需要锁让位）。
 	s.monitorStopOnce.Do(func() { close(s.monitorStop) })
 	s.ready = false
 	s.port = 0
@@ -784,19 +814,11 @@ func (s *V2Supervisor) ShutdownServer(ctx context.Context) error {
 	s.password = ""
 	_, err := s.deps.Proc.KillSession(ServeSessionName)
 	s.mu.Unlock()
-	s.joinMonitor()
+	s.StopServerMonitoring()
 	if err != nil && errors.Is(err, process.ErrNoTmuxServer) {
 		return nil // 无 tmux server：本就为空
 	}
 	return err
-}
-
-// joinMonitor 等待监控循环退出（从未启动 = 立即返回——无可 join）。
-func (s *V2Supervisor) joinMonitor() {
-	if !s.monitorStarted.Load() {
-		return
-	}
-	<-s.monitorDone
 }
 
 // EphemeralRuntimeEndpoint 解析仅内存临时 binding 的端点（SPI 窄接口

@@ -31,6 +31,10 @@ type noticeEntry struct {
 const (
 	noticeCodeResidual        = "residual_processes"
 	noticeCodeSessionOverflow = "session_overflow"
+	// noticeCodeSuspendStop 是 v2 停止收敛意图（评审 Round3 I2）：停止已确认但
+	// 状态收敛写失败时落库；后台重放持任务锁复核后完成清关联+active→suspended
+	// 再删意图。带执行代际（token）——新一代运行时旧意图失效清除，不影响新一代。
+	noticeCodeSuspendStop = "suspend_stop_confirmed"
 )
 
 // notice reason 枚举（§8：residual_processes.data.reason）。
@@ -209,6 +213,94 @@ func (m *Manager) recordResidualNotice(ctx context.Context, taskID, sessionName 
 	return fmt.Errorf("record residual notice: CAS did not converge (task %s, session %s)", taskID, sessionName)
 }
 
+// recordSuspendStopIntent 落 v2 停止收敛意图（评审 Round3 I2）：停止已确认
+// （Release interrupt 成功）但状态收敛写失败——durable retryable 意图，后台重放
+// 持任务锁复核后完成清关联+active→suspended 再删意图。token 为停止确认时的
+// runtime 执行代际（可校验：重放时与注册表当前代比对，新一代运行即意图过时
+// 清除，不影响新一代）。CAS 同键替换不膨胀（形态同 recordResidualNotice）。
+func (m *Manager) recordSuspendStopIntent(ctx context.Context, taskID, terminalRef, token string) error {
+	entry := noticeEntry{
+		Code:    noticeCodeSuspendStop,
+		Message: fmt.Sprintf("suspend stop confirmed; convergence pending for %s", terminalRef),
+		TS:      nowUnixI(),
+		Data: map[string]interface{}{
+			"sessionName": terminalRef,
+			"token":       token,
+			"retryable":   true,
+		},
+	}
+	key := noticeKey(entry)
+	for attempt := 0; attempt < 8; attempt++ {
+		row, err := m.store.GetTask(ctx, taskID)
+		if err != nil {
+			return fmt.Errorf("record suspend stop intent: get task: %w", err)
+		}
+		entries, perr := parseNotices(row.Notice)
+		if perr != nil {
+			// JSON 损坏 fail-closed（同 residual——不得覆盖已落库 notice）。
+			return fmt.Errorf("record suspend stop intent: notice json corrupted (task %s): %w", taskID, perr)
+		}
+		dup := false
+		for i, e := range entries {
+			if noticeKey(e) == key {
+				entries[i] = entry
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			entries = append(entries, entry)
+		}
+		r, _ := m.writeNoticeCAS(ctx, taskID, row.Notice, encodeNotices(entries))
+		if !r.Matched {
+			continue
+		}
+		if m.noticeReadbackContains(ctx, taskID, entry) {
+			return nil
+		}
+	}
+	return fmt.Errorf("record suspend stop intent: CAS did not converge (task %s, session %s)", taskID, terminalRef)
+}
+
+// retrySuspendStopIntent 消费停止收敛意图（评审 Round3 I2；调用方持任务锁）：
+// 复核（suspended=已收敛/非 active=意图过时/新一代 runtime 在位=旧意图失效——
+// 三者清除意图且不影响现状）→ 完成清关联（clearRuntime + v2 本地单元幂等回收）
+// + active→suspended 条件收敛 → 删除意图。返回 done（true=意图已了结可清除）；
+// DB 仍不可用返回 done=false + err（保留意图下轮重试）。
+func (m *Manager) retrySuspendStopIntent(ctx context.Context, taskID string, e noticeEntry) (bool, error) {
+	row, err := m.store.GetTask(ctx, taskID)
+	if err != nil {
+		return false, fmt.Errorf("suspend stop intent: reread task: %w", err)
+	}
+	if row.Status != StatusActive {
+		// suspended=已收敛；activating/其他=用户新一代动作已接管——意图过时清除
+		//（守卫语义：MUST NOT 覆盖其他代的状态事实）。
+		return true, nil
+	}
+	token, _ := e.Data["token"].(string)
+	if rt := m.getRuntime(taskID); rt != nil && token != "" && string(rt.instVersion) != token {
+		// 新一代运行中：旧停止意图不影响新一代（清除，不触达新代运行关联）。
+		return true, nil
+	}
+	// 完成挂起的本地半程（上游停止已确认属实）：清运行时关联 + 幂等回收 v2 本地
+	// 单元（TUI/shell——与 Suspend 收敛半程同形）。
+	m.clearRuntime(taskID)
+	terminalRef, _ := e.Data["sessionName"].(string)
+	if terminalRef != "" {
+		_ = m.killTaskSessions(ctx, taskID, []string{terminalRef})
+		if shells, serr := m.listShellSessions(taskID); serr == nil {
+			_ = m.killTaskSessions(ctx, taskID, shells)
+		}
+	}
+	le := sql.NullString{String: "suspend: 停止收敛意图重放完成（active→suspended）", Valid: true}
+	if _, werr := m.writeStatusConditional(ctx, taskID, StatusActive, StatusSuspended, le); werr != nil {
+		// DB 仍不可用：意图保留，下轮重试（done=false 不删）。
+		return false, fmt.Errorf("suspend stop intent: converge: %w", werr)
+	}
+	// Matched=收敛完成；!Matched=状态已被其他代改写（守卫不覆盖）——意图了结。
+	return true, nil
+}
+
 // recordResidualNoticeFromDisposition 按 KillResult 完整处置表记 notice（B6/G4-4
 // 同款语义，Phase 5 技术债 a）：复用 classifyKillResult——仅一致 clean 不记；
 // snapshot_missing_degraded 记 non-retryable；kill/disposition 失败、未知 disposition
@@ -320,6 +412,23 @@ func (m *Manager) retryTaskNotices(ctx context.Context, t TaskRow, entries []not
 	// 并发新增中复活本轮已清除项）。CAS 新值 MUST 基于同一次读取的最新版本计算。
 	clearedKeys := make(map[string]bool)
 	for _, e := range entries {
+		if e.Code == noticeCodeSuspendStop {
+			// 停止收敛意图（评审 Round3 I2）：上游已停+收敛写曾失败——持任务锁
+			// 复核后完成清关联+状态收敛（suspended）再删意图；旧意图不得影响
+			// 新一代运行（执行代际守卫）。done=false（DB 仍不可用）保留重试。
+			done, herr := m.retrySuspendStopIntent(ctx, t.ID, e)
+			if herr != nil {
+				remaining = append(remaining, e)
+				errs = append(errs, herr)
+				continue
+			}
+			if !done {
+				remaining = append(remaining, e)
+				continue
+			}
+			clearedKeys[noticeKey(e)] = true
+			continue
+		}
 		if e.Code != noticeCodeResidual {
 			// 非 residual（如 session_overflow）保留，后台不处理。
 			remaining = append(remaining, e)

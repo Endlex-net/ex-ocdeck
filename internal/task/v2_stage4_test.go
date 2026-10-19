@@ -2326,3 +2326,492 @@ func TestStage4_V2Resume_HandshakeFail_KeepsOldBinding(t *testing.T) {
 		t.Fatalf("status: %s %v", row.Status, err)
 	}
 }
+
+// ---- Round 3 批次 4：I2 重放 / I15 锁域 / I16 候选流所有权 / I10 真实流移交 ----
+
+// barrierStore 是接管守卫读屏障（I15 锁域测试）：armed 后首次 GetTask 阻塞至
+// release——固定「接管守卫已入锁域」与「Suspend 发起」的交错顺序。
+type barrierStore struct {
+	*StoreAdapter
+	armed   atomic.Bool
+	enter   chan struct{}
+	release chan struct{}
+	tripped atomic.Bool
+}
+
+func (s *barrierStore) GetTask(ctx context.Context, taskID string) (TaskRow, error) {
+	if s.armed.Load() && s.tripped.CompareAndSwap(false, true) {
+		close(s.enter)
+		<-s.release
+	}
+	return s.StoreAdapter.GetTask(ctx, taskID)
+}
+
+// TestStage4_I15_RecoveryTakeoverLockDomain_SuspendWaitsReadyPublish 落实 I15：
+// 恢复路径接管（taskLocked=false）的注册→SSE→ready 发布全程持有任务锁——
+// 「接管前段成功→Suspend 完成→旧接管发布 ready」交错不可能：Suspend 在锁外
+// 等待，接管完成后才执行清理（无复活关联/无旧代 ready 发布）。
+func TestStage4_I15_RecoveryTakeoverLockDomain_SuspendWaitsReadyPublish(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-ix")
+	adapter := NewStoreAdapter(db)
+	tstore := &barrierStore{StoreAdapter: adapter, enter: make(chan struct{}), release: make(chan struct{})}
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManagerStore(t, db, tstore, prov)
+	m.setRuntime("t-ix", m.newRuntime("t-ix"))
+
+	row, err := tstore.GetTask(ctx, "t-ix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, has, err := tstore.GetTaskBinding(ctx, "t-ix")
+	if err != nil || !has {
+		t.Fatalf("binding: %v", err)
+	}
+
+	// 接管 goroutine（恢复路径形态——taskLocked=false，守卫自取任务锁）。
+	tstore.armed.Store(true)
+	takeoverDone := make(chan error, 1)
+	go func() {
+		takeoverDone <- m.commitV2RuntimeReady(ctx, "t-ix", row, 4096, "pw", binding, AlignModeRepo, nil, false)
+	}()
+	<-tstore.enter // 守卫已持锁、阻塞在重验读——锁域内
+
+	// 锁域期间 Suspend 不得推进（无 interrupt、无状态转换）。
+	suspendDone := make(chan error, 1)
+	go func() { suspendDone <- m.Suspend(ctx, "t-ix") }()
+	time.Sleep(120 * time.Millisecond)
+	if atomic.LoadInt32(&sup.releaseN) != 0 {
+		t.Fatalf("suspend must block on task lock during takeover, releases=%d", atomic.LoadInt32(&sup.releaseN))
+	}
+	if r, _ := tstore.GetTask(ctx, "t-ix"); r.Status != "active" {
+		t.Fatalf("status must stay active while takeover holds the lock, got %s", r.Status)
+	}
+
+	// 放行接管 → 完成（active+runtime）→ Suspend 获锁执行 → suspended+清理。
+	close(tstore.release)
+	if err := <-takeoverDone; err != nil {
+		t.Fatalf("takeover: %v", err)
+	}
+	// Suspend 对并发占用快失败（busy——v1 既有语义：并发操作不排队）；锁域内
+	// 零副作用已由上方断言。重试即成功。
+	if serr := <-suspendDone; serr == nil {
+		t.Fatalf("concurrent suspend must fail fast busy")
+	} else if !strings.Contains(serr.Error(), "busy") {
+		t.Fatalf("expect busy, got %v", serr)
+	}
+	if serr := m.Suspend(ctx, "t-ix"); serr != nil {
+		t.Fatalf("sequential suspend after takeover: %v", serr)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		r, rerr := tstore.GetTask(ctx, "t-ix")
+		if rerr == nil && r.Status == "suspended" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("final status=%s err=%v（Suspend 完成后收敛 suspended）", r.Status, rerr)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if m.getRuntime("t-ix") != nil {
+		t.Fatalf("runtime must be cleaned by suspend（无复活关联）")
+	}
+	if atomic.LoadInt32(&sup.releaseN) != 1 {
+		t.Fatalf("releases=%d, want 1", atomic.LoadInt32(&sup.releaseN))
+	}
+}
+
+// TestStage4_I2_SuspendStopIntent_ReplayConverges 落实 I2 停止收敛意图重放：
+// 停止已确认+CAS 写失败（父 ctx 已取消）→ 意图落库；DB 恢复后后台重放持任务
+// 锁复核 → 清关联+active→suspended → 意图清除；旧意图在新一代运行下仅清除
+// 不触达。
+func TestStage4_I2_SuspendStopIntent_ReplayConverges(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-si")
+	adapter := NewStoreAdapter(db)
+	tstore := &failCondWriteStore{StoreAdapter: adapter, cancelParent: cancel}
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManagerStore(t, db, tstore, prov)
+	rt := m.newRuntime("t-si")
+	m.setRuntime("t-si", rt)
+	tstore.failCond.Store(true) // 注入收敛写失败（并取消父 ctx）
+	// TUI 托管单元在位（重放清理的可观测对象——killTaskSessions 仅清存活单元）。
+	mproc := m.proc.(*mockProc)
+	mproc.mu.Lock()
+	mproc.sessions["ocdeck-v2-tui-t-si"] = true
+	mproc.mu.Unlock()
+
+	// 停止确认成功 + 收敛写失败（failCond 取消父 ctx）。
+	if serr := m.Suspend(ctx, "t-si"); serr == nil {
+		t.Fatalf("CAS failure must surface（停止已确认、收敛失败）")
+	}
+	row, err := adapter.GetTask(context.Background(), "t-si")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != "active" {
+		t.Fatalf("status=%s（收敛失败保持 active）", row.Status)
+	}
+	entries, perr := parseNotices(row.Notice)
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	found := false
+	for _, e := range entries {
+		if e.Code == noticeCodeSuspendStop {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("suspend stop intent must be durable: %q", row.Notice.String)
+	}
+
+	// DB 恢复 → 后台重放：持锁复核（token 匹配）→ 清关联+收敛 suspended → 删意图。
+	tstore.failCond.Store(false)
+	row2, err := adapter.GetTask(context.Background(), "t-si")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries2, _ := parseNotices(row2.Notice)
+	if rerr := m.retryTaskNotices(context.Background(), row2, entries2); rerr != nil {
+		t.Fatalf("replay: %v", rerr)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		row3, rerr := adapter.GetTask(context.Background(), "t-si")
+		if rerr == nil && row3.Status == "suspended" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status=%s err=%v（重放收敛 suspended）", row3.Status, rerr)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if m.getRuntime("t-si") != nil {
+		t.Fatalf("runtime must be cleared by replay")
+	}
+	proc := m.proc.(*mockProc)
+	proc.mu.Lock()
+	killed := append([]string(nil), proc.killOrder...)
+	proc.mu.Unlock()
+	ref := "ocdeck-v2-tui-t-si"
+	hit := false
+	for _, k := range killed {
+		if k == ref {
+			hit = true
+		}
+	}
+	if !hit {
+		t.Fatalf("replay must reclaim v2 TUI unit %s, killed=%v", ref, killed)
+	}
+	row4, _ := adapter.GetTask(context.Background(), "t-si")
+	if strings.Contains(row4.Notice.String, noticeCodeSuspendStop) {
+		t.Fatalf("intent must be cleared after convergence: %q", row4.Notice.String)
+	}
+}
+
+// TestStage4_I2_SuspendStopIntent_StaleClearedOnNewGeneration 落实旧意图不影响
+// 新一代运行：intent 记录旧执行代际 → 新一代 runtime 注册 → 重放仅清除意图，
+// 不触达新代（状态保持 active、runtime 保留）。
+func TestStage4_I2_SuspendStopIntent_StaleClearedOnNewGeneration(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-si2")
+	adapter := NewStoreAdapter(db)
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManager(t, db, prov)
+	ref := "ocdeck-v2-tui-t-si2"
+	if ierr := m.recordSuspendStopIntent(ctx, "t-si2", ref, "stale-token"); ierr != nil {
+		t.Fatal(ierr)
+	}
+	m.setRuntime("t-si2", m.newRuntime("t-si2")) // 新一代执行体
+	row, _ := adapter.GetTask(ctx, "t-si2")
+	entries, _ := parseNotices(row.Notice)
+	if rerr := m.retryTaskNotices(ctx, row, entries); rerr != nil {
+		t.Fatalf("replay(new gen): %v", rerr)
+	}
+	row2, _ := adapter.GetTask(ctx, "t-si2")
+	if row2.Status != "active" {
+		t.Fatalf("stale intent must not converge new generation, status=%s", row2.Status)
+	}
+	if strings.Contains(row2.Notice.String, noticeCodeSuspendStop) {
+		t.Fatalf("stale intent must be cleared: %q", row2.Notice.String)
+	}
+	if m.getRuntime("t-si2") == nil {
+		t.Fatalf("new generation runtime must be untouched")
+	}
+	if atomic.LoadInt32(&sup.releaseN) != 0 {
+		t.Fatalf("stale intent must not touch new generation, releases=%d", atomic.LoadInt32(&sup.releaseN))
+	}
+}
+
+// realStreamHarness 组装真实 opencode2 provider（真实 spiEventStream/SSE 订阅、
+// 真实归属校验/端点解析）+ 端口钉扎上游（proc fake 真实监听，与生产一致——端口
+// 归 serve 进程所有）。
+type realStreamHarness struct {
+	db      *store.DB
+	adapter *StoreAdapter
+	m       *Manager
+	proc    *monitorProcSeam
+	prov    *opencode2.SPIProvider
+	conns   atomic.Int32
+	evtDone chan struct{}
+	port    int
+}
+
+func newRealStreamHarness(t *testing.T, taskID, upstream, status string) *realStreamHarness {
+	t.Helper()
+	t.Setenv(appagent.MasterSecretEnv, "test-master-secret")
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	h := &realStreamHarness{db: db, evtDone: make(chan struct{})}
+	var evtOnce sync.Once
+	h.proc = newMonitorProcSeam(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/openapi.json":
+			_, _ = w.Write([]byte(`{"components":{"schemas":{"Session.ID":{"type":"string","pattern":"^ses"},"Session.Message.ID":{"type":"string","pattern":"^msg_"}}}}`))
+		case r.URL.Path == "/api/event":
+			if h.conns.Add(1) >= 2 {
+				// 接管 MUST 复用候选流——第二次订阅即失败信号（重订阅即红）。
+				w.WriteHeader(500)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			_, _ = w.Write([]byte("data: {\"id\":\"h\",\"created\":1,\"type\":\"server.connected\",\"data\":{\"clientID\":\"cli_x\"}}\n\n"))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done() // 客户端断开（Close）→ return 产生 EOF
+			evtOnce.Do(func() { close(h.evtDone) })
+		case r.URL.Path == "/api/session/"+upstream:
+			_, _ = w.Write([]byte(`{"data":{"id":"` + upstream + `","location":{"directory":"/wt"},"time":{"created":1,"updated":1}}}`))
+		default:
+			_, _ = w.Write([]byte(`{"data":[],"cursor":{"previous":null,"next":null}}`))
+		}
+	}))
+	h.port = h.proc.port
+
+	// 种子 v2 binding 任务（binding data 端口=实际上游端口）。
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO projects (id, name, path, default_branch, created_at, kind)
+		 VALUES (?, 'proj', '/repo', 'main', ?, 'repo')`, "p-"+taskID, now); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := domain.TaskBinding{
+		Version:            domain.TaskBindingVersion,
+		ProviderID:         ocdeckstore.ProviderIDV2,
+		ProviderInstanceID: ocdeckstore.ProviderInstanceV2Default,
+		UpstreamSessionID:  upstream,
+		TerminalRef:        "ocdeck-v2-tui-" + taskID,
+		Data:               []byte(fmt.Sprintf(`{"port":%d,"directory":"/wt","taskId":"%s","origin":"created","auth":{"kind":"derived"}}`, h.port, taskID)),
+	}.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, serr := encodeEnvSnapshot(envSnapshot{Vars: map[string]string{"OCDECK_TASK_ID": taskID}})
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	if _, err := db.Exec(`INSERT INTO tasks (id, project_id, name, branch, status, worktree_path,
+		 provider_id, task_binding, env_snapshot, created_at, updated_at)
+		 VALUES (?,?,'task','b',?,'/wt',?,?,?,?,?)`,
+		taskID, "p-"+taskID, status, ocdeckstore.ProviderIDV2, raw, snap, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	h.adapter = NewStoreAdapter(db)
+	h.m = newTestManagerFull(t, h.adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	h.m.SetLifecycleCtx(ctx)
+	h.m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	var identityAlive atomic.Bool
+	identityAlive.Store(true)
+	deps := &opencode2.SupervisorDeps{
+		Proc:         h.proc,
+		Store:        &monitorRecordSeam{},
+		Env:          NewV2TaskEnvSeam(h.m),
+		AllocatePort: func(int, bool, int) (int, error) { return h.port, nil },
+		ProcessIdentity: func(pid int) (string, bool, error) {
+			if identityAlive.Load() && pid == 4242 {
+				return fmt.Sprintf("opencode serve --port %d --hostname 127.0.0.1", h.port), true, nil
+			}
+			return "", false, nil
+		},
+		MonitorInterval: 50 * time.Millisecond,
+		PollInterval:    5 * time.Millisecond,
+		ReadyTimeout:    500 * time.Millisecond,
+		StartAttempts:   2,
+	}
+	h.proc.onSpawn = func() { identityAlive.Store(true) }
+	h.prov = opencode2.NewSPIProviderWithDeps(opencode2.ProviderOptions{StatusVerified: true}, deps)
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(h.prov); err != nil {
+		t.Fatal(err)
+	}
+	h.m.providerRegistry = reg
+	t.Cleanup(func() {
+		sup := h.prov.Supervisor()
+		if ctl, ok := sup.(appagent.ServerMonitorController); ok {
+			ctl.StopServerMonitoring()
+		}
+		if ss, ok := sup.(interface{ ShutdownServer(context.Context) error }); ok {
+			_ = ss.ShutdownServer(ctx)
+		}
+	})
+	return h
+}
+
+// TestStage4_I10_RealStream_HandoverReplaysReady_ExistingBindingActivate 落实
+// I10 真实流握手移交：真实 spiEventStream 握手消费 connected 后，正式接管经
+// SetCallbacks 重放立即获得 ready（不二次等 15s 预算、不重订阅——第二次 /api/event
+// 连接即 500 红灯）。公开 Activate 入口（已有 binding→resumeActivateV2）。
+func TestStage4_I10_RealStream_HandoverReplaysReady_ExistingBindingActivate(t *testing.T) {
+	ctx := context.Background()
+	h := newRealStreamHarness(t, "t-hs", "ses_keep", "suspended")
+
+	start := time.Now()
+	if err := h.m.Activate(ctx, "t-hs"); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("ready handover must not wait full ready timeout, elapsed=%v", elapsed)
+	}
+	if n := h.conns.Load(); n != 1 {
+		t.Fatalf("takeover MUST reuse candidate stream, event connections=%d", n)
+	}
+	got, has, err := h.adapter.GetTaskBinding(ctx, "t-hs")
+	if err != nil || !has || got.UpstreamSessionID != "ses_keep" {
+		t.Fatalf("binding continuity: %+v has=%v err=%v", got, has, err)
+	}
+	row, err := h.adapter.GetTask(ctx, "t-hs")
+	if err != nil || row.Status != "active" {
+		t.Fatalf("status: %s %v", row.Status, err)
+	}
+	if h.m.getRuntime("t-hs") == nil {
+		t.Fatalf("runtime must be registered（正式接管完成）")
+	}
+}
+
+// TestStage4_I10_RealStream_HandoverReplaysReady_RecoveryEntry 落实 I10 恢复
+// 入口（v2Path）同一移交语义：ensureRecovery→Resume→候选握手（真实流消费
+// connected）→CommitV2Resume→接管复用候选流重放 ready——不重订阅、不二次等
+// ready 预算。
+func TestStage4_I10_RealStream_HandoverReplaysReady_RecoveryEntry(t *testing.T) {
+	ctx := context.Background()
+	h := newRealStreamHarness(t, "t-hr", "ses_keep", "active")
+	h.m.setRuntime("t-hr", h.m.newRuntime("t-hr"))
+
+	h.m.RebuildV2Associations() // 通知体：异步 ensureRecovery
+
+	// 完成信号=候选握手连接（真实流）出现；随后收敛收尾（提交+接管）。
+	deadline := time.Now().Add(10 * time.Second)
+	for h.conns.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("recovery handshake never reached the real event stream")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond) // 提交+接管收尾
+	if n := h.conns.Load(); n != 1 {
+		t.Fatalf("recovery takeover MUST reuse candidate stream, event connections=%d", n)
+	}
+	got, has, err := h.adapter.GetTaskBinding(ctx, "t-hr")
+	if err != nil || !has || got.UpstreamSessionID != "ses_keep" {
+		t.Fatalf("binding continuity: %+v has=%v err=%v", got, has, err)
+	}
+	row, err := h.adapter.GetTask(ctx, "t-hr")
+	if err != nil || row.Status != "active" {
+		t.Fatalf("status: %s %v", row.Status, err)
+	}
+}
+
+// TestStage4_I16_RejectTakeover_ClosesCandidateStream 落实 I16 候选流所有权：
+// 接管守卫拒绝（任务已离开 active）→ 候选流立即关闭（事件通道闭合+服务端观测
+// 连接取消）——不留存续到 Manager 关停的订阅面。
+func TestStage4_I16_RejectTakeover_ClosesCandidateStream(t *testing.T) {
+	ctx := context.Background()
+	h := newRealStreamHarness(t, "t-cg", "ses_keep", "suspended")
+
+	binding, has, err := h.adapter.GetTaskBinding(ctx, "t-cg")
+	if err != nil || !has {
+		t.Fatalf("binding: %v", err)
+	}
+	warmRealStreamHarness(t, h)
+	es, serr := h.prov.Events().Subscribe(ctx, binding)
+	if serr != nil {
+		t.Fatalf("Subscribe: %v", serr)
+	}
+	connected := make(chan struct{})
+	es.SetCallbacks(func() { close(connected) }, nil)
+	select {
+	case <-connected:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("handshake connected never fired (event conns=%d)", h.conns.Load())
+	}
+
+	row, err := h.adapter.GetTask(ctx, "t-cg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 守卫拒绝（suspended ≠ active）→ postCommit 分类 + 候选流立即关闭。
+	terr := h.m.commitV2RuntimeReady(ctx, "t-cg", row, h.port, "pw", binding, AlignModeRepo, es, true)
+	var pce *postCommitTakeoverError
+	if !errors.As(terr, &pce) {
+		t.Fatalf("guard rejection must be post-commit classified, got %v", terr)
+	}
+	select {
+	case _, ok := <-es.Events():
+		if ok {
+			t.Fatalf("candidate stream must be closed (no further events)")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("candidate stream was not closed after rejection")
+	}
+	select {
+	case <-h.evtDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("server must observe candidate stream disconnect")
+	}
+}
+
+// TestStage4_I16 前置：上游 server 冷启动（proc fake 真实监听——未预热时候选
+// 订阅只会打到未绑定端口）。
+func warmRealStreamHarness(t *testing.T, h *realStreamHarness) {
+	t.Helper()
+	sup := h.prov.Supervisor()
+	warmer, ok := sup.(appagent.ServerAvailabilityWarmer)
+	if !ok {
+		t.Fatalf("supervisor must implement ServerAvailabilityWarmer")
+	}
+	if err := warmer.CheckServerAlive(context.Background()); err != nil {
+		t.Fatalf("warmup: %v", err)
+	}
+}

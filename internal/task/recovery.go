@@ -326,6 +326,11 @@ func (m *Manager) ensureRecovery(taskID string, tok runtime.InstVersion) {
 		if adoptA {
 			unlock()
 			if aerr := m.adoptTaskV2(ctx, taskID, row, mode, false); aerr != nil {
+				// I10：已提交但接管失败的恢复登记（提交事实不可回滚）。
+				var pce *postCommitTakeoverError
+				if errors.As(aerr, &pce) {
+					m.registerPostCommitRecovery(taskID)
+				}
 				log.Printf("ensureRecovery: adopt A task %s: %v", taskID, aerr)
 			}
 			return
@@ -459,6 +464,11 @@ func (m *Manager) ensureRecoveryFromAttach(taskID string) {
 		if adoptA {
 			unlock()
 			if aerr := m.adoptTaskV2(ctx, taskID, row, mode, false); aerr != nil {
+				// I10：已提交但接管失败的恢复登记（提交事实不可回滚）。
+				var pce *postCommitTakeoverError
+				if errors.As(aerr, &pce) {
+					m.registerPostCommitRecovery(taskID)
+				}
 				log.Printf("ensureRecovery: attach adopt A task %s: %v", taskID, aerr)
 			}
 			return

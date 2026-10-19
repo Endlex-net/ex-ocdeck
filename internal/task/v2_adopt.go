@@ -22,7 +22,9 @@ import (
 	"log"
 	"time"
 
-	"ocdeck/internal/application"
+	"ocdeck/internal/application/runtime"
+
+	application "ocdeck/internal/application"
 	appagent "ocdeck/internal/application/agentprovider"
 	domain "ocdeck/internal/domain/agentprovider"
 	ocdecktask "ocdeck/internal/domain/task"
@@ -405,16 +407,18 @@ func (e *postCommitTakeoverError) Error() string { return e.err.Error() }
 func (e *postCommitTakeoverError) Unwrap() error { return e.err }
 
 // registerPostCommitRecovery 登记已提交任务的恢复工作（评审 I10 调度闭环）：
-// 以当前 runtime 令牌触发 ensureRecovery（active→activating→Resume→接管重试）。
+// 有 runtime（已注册接管面）→ 以其令牌触发 ensureRecovery；无 runtime（接管
+// 前段即失败——注册未发生）→ 铸造新代令牌后触发（恢复入口经 token 重铸收敛，
+// 不因无锚而丢失调度闭环）。
 func (m *Manager) registerPostCommitRecovery(taskID string) {
-	rt := m.getRuntime(taskID)
-	if rt == nil {
-		log.Printf("post-commit takeover failure task %s: no runtime to anchor recovery", taskID)
-		return
+	tok := ""
+	if rt := m.getRuntime(taskID); rt != nil {
+		tok = string(rt.instVersion)
+	} else {
+		tok = string(m.runtimeRegistry.NewInstVersion(taskID))
 	}
-	tok := rt.instVersion
 	log.Printf("post-commit takeover failure task %s: registering recovery work", taskID)
-	go m.ensureRecovery(taskID, tok)
+	go m.ensureRecovery(taskID, runtime.InstVersion(tok))
 }
 
 // commitV2RuntimeReady 是 v2 任务运行时就绪提交（gate3 G3-F2/F3；已提交路径：
@@ -429,6 +433,8 @@ func (m *Manager) commitV2RuntimeReady(ctx context.Context, taskID string, row T
 	// active（并发 Suspend/Delete 收敛）→ 放弃接管。串行边界：taskLocked=true
 	//（调用方持锁——Activate 全程）复用之；false（恢复路径）在此取锁并把注册
 	// 临界区置于锁内（与 Suspend/Delete 同一任务级串行边界，窗口密闭）。
+	// I15：锁域覆盖注册→SSE→ready 发布全程（finishV2RuntimeReady 的调度器
+	// 启动/perm judge 置位与并发清理互斥，不提前释放）。
 	var unlock func()
 	if !taskLocked {
 		u, lerr := m.lockTaskForRecovery(taskID)
@@ -438,38 +444,50 @@ func (m *Manager) commitV2RuntimeReady(ctx context.Context, taskID string, row T
 		}
 		unlock = u
 	}
+	if unlock != nil {
+		defer unlock()
+	}
 	cur, gerr := m.store.GetTask(ctx, taskID)
 	if gerr != nil {
-		if unlock != nil {
-			unlock()
-		}
+		m.closeAdoptPreStream(taskID, preStream)
 		return &postCommitTakeoverError{err: newOpErr(codeInternal, gerr)}
 	}
 	if cur.Status != StatusActive {
-		if unlock != nil {
-			unlock()
-		}
+		m.closeAdoptPreStream(taskID, preStream)
 		return &postCommitTakeoverError{err: newOpErr(codeConflict,
 			fmt.Errorf("承接接管守卫：任务状态已收敛 %s（并发 Suspend/Delete 等）——放弃接管，不重建运行关联", cur.Status))}
 	}
 	row = cur
 	rt, err := m.beginV2RuntimeTakeover(ctx, taskID, row, port, password, binding, mode, preStream)
-	if unlock != nil {
-		unlock()
-	}
 	if err != nil {
 		if rt == nil {
-			// 接管前段初始化失败（未产生连接/订阅面）——同为已提交分类。
+			// 接管前段初始化失败（未产生连接/订阅面）——候选流所有权仍在调用链，
+			// 关闭；同为已提交分类。
+			m.closeAdoptPreStream(taskID, preStream)
 			m.recordAdmissionError(ctx, taskID, err)
 			return &postCommitTakeoverError{err: newOpErr(codeInternal, err)}
 		}
-		// 正式接管失败：已提交事务不可回滚 → last_error（恢复债务），恢复循环
+		// 正式接管失败（SSE）：候选流已移交 SSE goroutine（defer Close——由 rt
+		// 生命周期收口）；已提交事务不可回滚 → last_error（恢复债务），恢复循环
 		// 按既有语义重建（不得伪装完整可用）。
 		m.recordAdmissionError(ctx, taskID, fmt.Errorf("v2 runtime SSE 接管失败（已提交，待恢复重建）: %v", err))
 		return &postCommitTakeoverError{err: newOpErr(codeProcessError, fmt.Errorf("v2 runtime sse subscribe: %w", err))}
 	}
+	// I16：成功移交正式消费循环（流由 SSE goroutine defer Close 承担——rt 生命周期）。
 	m.finishV2RuntimeReady(taskID, rt)
 	return nil
+}
+
+// closeAdoptPreStream 关闭尚未移交正式消费循环的候选流（评审 I16：拒绝接管/
+// 初始化失败等提前出口统一释放——候选订阅挂 Manager 生命周期，泄漏会存续到
+// 关停且继续更新状态缓存）。
+func (m *Manager) closeAdoptPreStream(taskID string, es appagent.EventStream) {
+	if es == nil {
+		return
+	}
+	if err := es.Close(); err != nil {
+		log.Printf("task %s: adopt pre-stream close: %v", taskID, err)
+	}
 }
 
 // adoptTakeover 是承接提交成功后的正式运行时接管（G3-F3）：接管守卫（评审
@@ -480,6 +498,7 @@ func (m *Manager) commitV2RuntimeReady(ctx context.Context, taskID string, row T
 func (m *Manager) adoptTakeover(ctx context.Context, taskID string, row TaskRow, binding domain.TaskBinding, mode AlignMode, preStream appagent.EventStream, taskLocked bool) error {
 	port, password, _, eerr := m.bindingEndpoint(binding)
 	if eerr != nil {
+		m.closeAdoptPreStream(taskID, preStream) // I16：未移交先释放
 		m.recordAdmissionError(ctx, taskID, fmt.Errorf("承接接管端点解析失败（已提交，待恢复重建）: %v", eerr))
 		return &postCommitTakeoverError{err: newOpErr(codeInternal, eerr)}
 	}

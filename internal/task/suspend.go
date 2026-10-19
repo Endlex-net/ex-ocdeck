@@ -91,9 +91,10 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 		return werr
 	}); err != nil {
 		if hasV2 {
-			// 停止已确认 + 收敛写失败：可重放意图（守卫语义——conditional CAS
-			// 保证后续重放不覆盖其他代的状态事实）；不掩盖原错误。
-			if nerr := m.recordResidualNotice(casCtx, taskID, sb.TerminalRef, nil, "suspend_stop_confirmed", true); nerr != nil {
+			// 停止已确认 + 收敛写失败：落停止收敛意图（评审 Round3 I2——durable
+			// retryable，后台重放持锁复核后完成清关联+suspended；带执行代际，
+			// 新一代运行不受旧意图影响）；不掩盖原错误。
+			if nerr := m.recordSuspendStopIntent(casCtx, taskID, sb.TerminalRef, m.suspendStopToken(taskID)); nerr != nil {
 				log.Printf("suspend: task %s stop confirmed but convergence intent notice failed: %v", taskID, nerr)
 			}
 		}
@@ -102,13 +103,23 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 	if !updated.Matched {
 		if hasV2 {
 			// 停止已确认但状态已被其他代收敛/改写：守卫生效不覆盖；如实留痕。
-			if nerr := m.recordResidualNotice(casCtx, taskID, sb.TerminalRef, nil, "suspend_stop_confirmed", true); nerr != nil {
+			if nerr := m.recordSuspendStopIntent(casCtx, taskID, sb.TerminalRef, m.suspendStopToken(taskID)); nerr != nil {
 				log.Printf("suspend: task %s stop confirmed but CAS mismatch, intent notice failed: %v", taskID, nerr)
 			}
 		}
 		return newOpErr(codeConflict, fmt.Errorf("task %s state changed before suspend", taskID))
 	}
 	return m.suspendRun(ctx, taskID, mode, sb, hasV2)
+}
+
+// suspendStopToken 返回停止确认时的 runtime 执行代际（停止收敛意图的可校验
+// 执行代际——重放时与注册表当前代等值比对；空串=runtime 未注册，重放仅按状态
+// 守卫复核）。
+func (m *Manager) suspendStopToken(taskID string) string {
+	if rt := m.getRuntime(taskID); rt != nil {
+		return string(rt.instVersion)
+	}
+	return ""
 }
 
 // suspendGateV2 是 v2 挂起门禁（评审 I2，D4 挂起行）：active→suspending CAS 前

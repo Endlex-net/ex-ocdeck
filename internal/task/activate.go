@@ -421,7 +421,13 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 			return newOpErr(codeConflict, perr)
 		}
 		if adoptA {
-			return m.adoptTaskV2(ctx, taskID, row, mode, true)
+			aerr := m.adoptTaskV2(ctx, taskID, row, mode, true)
+			// I10：已提交但接管失败的恢复登记（提交事实不可回滚——禁普通补偿）。
+			var pce *postCommitTakeoverError
+			if errors.As(aerr, &pce) {
+				m.registerPostCommitRecovery(taskID)
+			}
+			return aerr
 		}
 	}
 

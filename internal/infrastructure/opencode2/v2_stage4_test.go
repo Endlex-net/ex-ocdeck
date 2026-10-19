@@ -366,21 +366,18 @@ func TestStage4_Status_ChildSession_Invalidation(t *testing.T) {
 func TestStage4_Status_MultiSub_GenerationGuard(t *testing.T) {
 	p := NewSPIProvider(ProviderOptions{StatusVerified: true})
 	key := domain.SessionKey{ProviderID: ProviderID, ProviderInstanceID: ProviderInstanceID, UpstreamID: "ses_x"}
-	// 旧流写入 busy（gen1）。
-	p.recordStatus(key, domain.StatusBusy)
-	gen1, ok := p.statusGeneration("ses_x")
-	if !ok {
-		t.Fatalf("gen1 must exist")
-	}
+	// 旧流写入 busy（gen1——recordStatus 同临界区返回本次写入代，Round3 I12
+	// 生产记账路径）。
+	gen1 := p.recordStatus(key, domain.StatusBusy)
 	// 新流随后重写（gen2——事实已被新流接管）。
-	p.recordStatus(key, domain.StatusBusy)
+	_ = p.recordStatus(key, domain.StatusBusy)
 	// 旧流断线清扫（按 gen1）：MUST NOT 清除新流的 gen2 事实。
 	p.invalidateStatusGen("ses_x", gen1)
 	if st, ok := p.status["ses_x"]; !ok || st != domain.StatusBusy {
 		t.Fatalf("newer stream fact must survive old-stream sweep, got %v ok=%v", st, ok)
 	}
 	// 新流自身断线（按 gen2）：事实清除（缺项=未知）。
-	gen2, _ := p.statusGeneration("ses_x")
+	gen2 := p.recordStatus(key, domain.StatusIdle)
 	p.invalidateStatusGen("ses_x", gen2)
 	p.statusMu.Lock()
 	_, alive := p.status["ses_x"]

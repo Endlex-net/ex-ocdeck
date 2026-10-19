@@ -456,7 +456,10 @@ func (a *spiEvents) Subscribe(ctx context.Context, b domain.TaskBinding) (appage
 		provider:    a.p,
 		statusNotes: map[string]uint64{},
 	}
-	es.noteStatusGen(b.UpstreamSessionID)
+	// 订阅方领受主 session 既有状态事实的责任（锁内快照当前代——断线清扫守卫）。
+	if gen, ok := a.p.currentStatusGen(b.UpstreamSessionID); ok {
+		es.noteStatusGenValue(b.UpstreamSessionID, gen)
+	}
 	a.p.reportConversion(h, "events.subscribe", nil)
 	// I12 连接代失效：断流即旧代 execution 状态作废（按本流覆盖范围清扫——
 	// Current 缺项 = 未知，不得用旧代 busy 猜测；重连新代仅由新的冻结映射事件
@@ -465,10 +468,11 @@ func (a *spiEvents) Subscribe(ctx context.Context, b domain.TaskBinding) (appage
 		OnReady:      es.markConnected,
 		OnDisconnect: func() { es.markDisconnected(); es.invalidateStreamStatus() },
 	})
-	// statusOf 经流记账后写入 provider（记录本次写入代——清扫守卫依据）。
+	// statusOf 经流记账后写入 provider（同一临界区返回本次写入代——清扫守卫
+	// 依据，评审 Round3 I12：写入与代际归属原子）。
 	statusOf := func(key domain.SessionKey, state domain.AgentStatus) {
-		a.p.recordStatus(key, state)
-		es.noteStatusGen(key.UpstreamID)
+		gen := a.p.recordStatus(key, state)
+		es.noteStatusGenValue(key.UpstreamID, gen)
 	}
 
 	// onReconnect：先入队生命周期信号（调用方对齐屏障），随后同步拉快照自补
@@ -544,6 +548,10 @@ type spiEventStream struct {
 	onReconnect     func()
 	onDisconnected  func()
 	lifecycleEvents []string
+	// connEstablished 当前是否处于已建立连接代（connMu 下；Round3 I10：订阅者
+	// 移交依据——握手消费者已取走 connected 信号后，新 SetCallbacks 依此重放
+	// 当前连接代，正式接管不二次等 ready）。
+	connEstablished bool
 	dispMu          sync.Mutex
 
 	// statusNotes 本流写入过的 session 状态代（评审 I12：失效范围=流覆盖范围
@@ -553,16 +561,10 @@ type spiEventStream struct {
 	provider      *SPIProvider
 }
 
-// noteStatusGen 记录本流对 session 的最新写入代（在 provider.recordStatus 之后
-// 调用——读取的即本次写入代）。
-func (s *spiEventStream) noteStatusGen(upstreamID string) {
-	if s.provider == nil {
-		return
-	}
-	gen, ok := s.provider.statusGeneration(upstreamID)
-	if !ok {
-		return
-	}
+// noteStatusGenValue 记录本流对 session 的本次写入代（由 provider.recordStatus
+// 同临界区返回——Round3 I12 原子性：不得重读全局当前代，交错下会把他流新代记到
+// 本流名下）。
+func (s *spiEventStream) noteStatusGenValue(upstreamID string, gen uint64) {
 	s.statusNotesMu.Lock()
 	if s.statusNotes == nil {
 		s.statusNotes = map[string]uint64{}
@@ -591,9 +593,20 @@ const (
 	lifecycleDisconnected = "disconnected"
 )
 
-func (s *spiEventStream) markConnected()    { s.enqueueLifecycle(lifecycleConnected) }
-func (s *spiEventStream) markDisconnected() { s.enqueueLifecycle(lifecycleDisconnected) }
-func (s *spiEventStream) fireReconnect()    { s.enqueueLifecycle(lifecycleReconnect) }
+func (s *spiEventStream) markConnected() {
+	s.connMu.Lock()
+	s.connEstablished = true
+	s.connMu.Unlock()
+	s.enqueueLifecycle(lifecycleConnected)
+}
+
+func (s *spiEventStream) markDisconnected() {
+	s.connMu.Lock()
+	s.connEstablished = false
+	s.connMu.Unlock()
+	s.enqueueLifecycle(lifecycleDisconnected)
+}
+func (s *spiEventStream) fireReconnect() { s.enqueueLifecycle(lifecycleReconnect) }
 
 // enqueueLifecycle 生命周期事件原子入队，锁外交给统一分派器按序消费。
 func (s *spiEventStream) enqueueLifecycle(kind string) {
@@ -648,12 +661,19 @@ func (s *spiEventStream) dispatchLifecycle() {
 }
 
 // SetCallbacks 注入连接生命周期回调（must 在 Subscribe 返回后、消费循环前；
-// 注入后按事件序补发已发生的信号，恰一次）。
+// 注入后按事件序补发已发生的信号，恰一次）。Round3 I10 移交语义：若当前连接
+// 代已建立且队列已空（原 connected 已被前一订阅者——如候选握手——消费），向
+// 新订阅者重放 connected（不补发历史事件本身——事件经 channel 缓冲自然连续）；
+// 队列非空说明原信号仍待补发，不重放（恰一次）。
 func (s *spiEventStream) SetCallbacks(onConnected, onReconnect func()) {
 	s.connMu.Lock()
 	s.onConnected = onConnected
 	s.onReconnect = onReconnect
+	replay := s.connEstablished && len(s.lifecycleEvents) == 0
 	s.connMu.Unlock()
+	if replay && onConnected != nil {
+		s.enqueueLifecycle(lifecycleConnected)
+	}
 	s.dispatchLifecycle()
 }
 

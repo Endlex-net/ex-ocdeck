@@ -148,8 +148,12 @@ func (a *spiPrompts) Send(ctx context.Context, b domain.TaskBinding, s domain.Se
 }
 
 // recordStatus 供事件路径更新状态追踪（execution 边界事件；见 status.go）。
-func (p *SPIProvider) recordStatus(key domain.SessionKey, state domain.AgentStatus) {
+// 同一临界区内分配并返回本次写入代（评审 Round3 I12：写入与代际归属原子——
+// 交错订阅下流记录的必须是「自己这次写入」的代，重读全局当前代会把别流的新代
+// 记到自己名下，断线时误删新流事实）。
+func (p *SPIProvider) recordStatus(key domain.SessionKey, state domain.AgentStatus) uint64 {
 	p.statusMu.Lock()
+	defer p.statusMu.Unlock()
 	if p.status == nil {
 		p.status = map[string]domain.AgentStatus{}
 	}
@@ -157,13 +161,16 @@ func (p *SPIProvider) recordStatus(key domain.SessionKey, state domain.AgentStat
 		p.statusGen = map[string]uint64{}
 	}
 	p.statusGenCtr++
+	gen := p.statusGenCtr
 	p.status[key.UpstreamID] = state
-	p.statusGen[key.UpstreamID] = p.statusGenCtr
-	p.statusMu.Unlock()
+	p.statusGen[key.UpstreamID] = gen
+	return gen
 }
 
-// statusGeneration 返回 session 当前状态写入代（无记录 → false——无可失效事实）。
-func (p *SPIProvider) statusGeneration(upstreamID string) (uint64, bool) {
+// currentStatusGen 返回 session 当前状态写入代（无记录 → false——无可失效
+// 事实）。仅供订阅方领受既有事实责任时快照；写入方代际由 recordStatus 同临界区
+// 返回（Round3 I12：写路径 MUST NOT 重读全局当前代）。
+func (p *SPIProvider) currentStatusGen(upstreamID string) (uint64, bool) {
 	p.statusMu.Lock()
 	defer p.statusMu.Unlock()
 	gen, ok := p.statusGen[upstreamID]
