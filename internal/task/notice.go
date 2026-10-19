@@ -878,7 +878,11 @@ func (m *Manager) retryTaskNotices(ctx context.Context, t TaskRow, entries []not
 			//（同进程 settle-fail 后真实 ID 经 ledger 落账）；仍未知 → 保持阻断，
 			// 人工处置（MUST NOT 因占位符 DELETE 成功/404 清债）。
 			if sessionName == candidateIntentSessionPending {
-				if knownCandidateReaped {
+				// Round5 J9：CommitFirstBuild 已成功但即时清占位 CAS 失败/进程退出
+				// 的窗口——持久化 v2 binding/anchor/归属行一致即证明该占位对应的
+				// 首建已正式提交，占位直接解除（零 candidate DELETE：已提交的
+				// session 不是残留 candidate）。无提交证明时按 J8 语义继续阻断。
+				if knownCandidateReaped || m.firstBuildCommitted(ctx, t.ID) {
 					clearedKeys[noticeKey(e)] = true
 				} else {
 					log.Printf("task %s: candidate intent identity unknown (pre-POST placeholder); keeping first-build gated until manual resolution", t.ID)
@@ -1103,6 +1107,49 @@ func hasUnknownCandidateIntent(entries []noticeEntry) bool {
 			continue
 		}
 		if sn, _ := e.Data["sessionName"].(string); sn == candidateIntentSessionPending {
+			return true
+		}
+	}
+	return false
+}
+
+// firstBuildCommitted 判定占位意图对应的首建是否已正式提交（Round5 J9）——依据
+// 必须是持久化事实而非任务状态/内存态：v2 binding + v2 anchor 三元组 + anchor 归属行
+// 三者一致（CommitFirstBuild 单事务写入的形状）。仅凭 status=active 不构成证明
+// （其他路径/更早代也可能 active）；三者一致同时排除「占位属于更早失败代」——
+// 该代的 candidate 未被 claim 为 anchor 归属行。返回 false 时调用方按 J8 语义
+// 继续阻断（MUST NOT 猜测）。
+func (m *Manager) firstBuildCommitted(ctx context.Context, taskID string) bool {
+	astore, ok := m.store.(adoptionStore)
+	if !ok {
+		return false
+	}
+	binding, has, err := m.store.GetTaskBinding(ctx, taskID)
+	if err != nil || !has {
+		return false
+	}
+	if binding.ProviderID != ocdeckstore.ProviderIDV2 ||
+		binding.ProviderInstanceID != ocdeckstore.ProviderInstanceV2Default ||
+		binding.UpstreamSessionID == "" {
+		return false
+	}
+	anchorID, anchorProviderID, anchorInstanceID, err := astore.GetTaskAnchor(ctx, taskID)
+	if err != nil {
+		return false
+	}
+	if anchorID == "" || anchorID != binding.UpstreamSessionID ||
+		anchorProviderID != ocdeckstore.ProviderIDV2 ||
+		anchorInstanceID != ocdeckstore.ProviderInstanceV2Default {
+		return false
+	}
+	keys, err := astore.ListTaskSessionKeys(ctx, taskID)
+	if err != nil {
+		return false
+	}
+	for _, k := range keys {
+		if k.ProviderID == ocdeckstore.ProviderIDV2 &&
+			k.ProviderInstanceID == ocdeckstore.ProviderInstanceV2Default &&
+			k.UpstreamID == anchorID {
 			return true
 		}
 	}

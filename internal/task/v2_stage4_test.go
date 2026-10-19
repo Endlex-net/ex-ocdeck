@@ -3523,6 +3523,8 @@ func TestR1_J3_ArmBlocksBeforePOST(t *testing.T) {
 type okAcquireSup struct {
 	upstream string
 	port     int
+	mu       sync.Mutex
+	reaped   []string
 }
 
 func (s *okAcquireSup) Acquire(ctx context.Context, t appagent.TaskRef) (domain.TaskBinding, error) {
@@ -3549,6 +3551,21 @@ func (s *okAcquireSup) AcquireEphemeral(ctx context.Context, t appagent.TaskRef)
 }
 
 func (s *okAcquireSup) Release(ctx context.Context, b domain.TaskBinding) error { return nil }
+
+// ReapCandidateSession 记录收割目标：J9 断言「已提交的 session 不作为 candidate
+// 收割」（提交证明路径 MUST 零 DELETE）。
+func (s *okAcquireSup) ReapCandidateSession(ctx context.Context, taskID, sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reaped = append(s.reaped, sessionID)
+	return nil
+}
+
+func (s *okAcquireSup) reapedSnapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.reaped...)
+}
 
 // TestR1_J3_CrossRestartZeroPOST 落实 Round3 J3 跨重启逃逸闭合：debt 持久化
 // （notice 含 candidate sessionID）→ 重建 Manager（模拟进程重启，内存 ledger
@@ -4004,6 +4021,191 @@ func TestR1_J8_UnknownIdentity_ManualResolutionOnly(t *testing.T) {
 	m2.providerRegistry = reg2
 	if aerr := m2.Activate(ctx, "t-j8u"); aerr != nil {
 		t.Fatalf("Activate after manual resolution: %v", aerr)
+	}
+}
+
+// ---- Round 5：J9 已正式提交的首建占位重放收敛 ----
+
+// commitThenFailClearStore 在任务已 active（CommitFirstBuild 已提交）时让 notice
+// CAS 失败——精确制造「首建提交成功 → 单独清占位失败」窗口（v2_adopt.go 提交后
+// clearCandidateIntent）。active 前的 CAS（arm/settle/状态收敛）不受影响。
+type commitThenFailClearStore struct {
+	*StoreAdapter
+	failActiveNoticeCAS atomic.Bool
+}
+
+func (s *commitThenFailClearStore) UpdateTaskNoticeCAS(ctx context.Context, id string, expected, newNotice sql.NullString) (application.MutationResult, error) {
+	if s.failActiveNoticeCAS.Load() {
+		if row, err := s.StoreAdapter.GetTask(ctx, id); err == nil && row.Status == StatusActive {
+			return application.MutationResult{}, errors.New("notice cas injected failure (post-commit clear)")
+		}
+	}
+	return s.StoreAdapter.UpdateTaskNoticeCAS(ctx, id, expected, newNotice)
+}
+
+// TestR1_J9_CommittedThenClearFail_ReplayConverges 落实 Round5 J9：首建
+// CommitFirstBuild 成功 → 清占位 CAS 失败（窗口内进程重启）→ 持久化 v2
+// binding/anchor/归属行证明已正式提交 → 后台重放与启动 Reconcile 清除占位
+// （零 candidate DELETE——已提交 session 不是残留 candidate）→ 任务保留 active
+// 正式 session，占位不再阻断后续 Activate。
+func TestR1_J9_CommittedThenClearFail_ReplayConverges(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedBranchBTask(t, db, "t-j9")
+	adapter := NewStoreAdapter(db)
+	fstore := &commitThenFailClearStore{StoreAdapter: adapter}
+	fstore.failActiveNoticeCAS.Store(true)
+	sup := &okAcquireSup{upstream: "ses_j9_1", port: 4096}
+	prov := &supOnlyV2Provider{sup: sup}
+	oc := newMockOC(true)
+	// 提交后接管对齐按上游列表保留归属行（空列表会删掉刚 claim 的行——与 J6
+	// 同源的 mock 列表注入模式）；J9 的提交证明依赖该归属行持久化事实。
+	oc.mu.Lock()
+	oc.sessions = []opencode.Session{{ID: "ses_j9_1", Time: opencode.SessionTime{Created: 1, Updated: 1}}}
+	oc.mu.Unlock()
+	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), oc)
+	m.store = fstore
+	m.SetLifecycleCtx(ctx)
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(prov); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+
+	// 首建提交成功；清占位 CAS 失败仅记日志（提交事实已落库）。
+	if aerr := m.Activate(ctx, "t-j9"); aerr != nil {
+		t.Fatalf("first build must commit despite clear failure: %v", aerr)
+	}
+	row, err := adapter.GetTask(ctx, "t-j9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != StatusActive {
+		t.Fatalf("status=%s（首建已提交）", row.Status)
+	}
+	if !strings.Contains(row.Notice.String, `"pending"`) {
+		t.Fatalf("window must leave the placeholder behind: %q", row.Notice.String)
+	}
+	// 提交事实（判定依据）已持久化。
+	binding, has, berr := adapter.GetTaskBinding(ctx, "t-j9")
+	if berr != nil || !has || binding.ProviderID != ocdeckstore.ProviderIDV2 ||
+		binding.UpstreamSessionID != "ses_j9_1" {
+		t.Fatalf("binding: %+v has=%v err=%v", binding, has, berr)
+	}
+
+	// 进程重启形态：全新 Manager（无内存态），同一 DB。
+	m2 := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m2.store = adapter
+	m2.SetLifecycleCtx(ctx)
+	m2.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg2 := appagent.NewRegistry()
+	if err := reg2.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg2.Register(&supOnlyV2Provider{sup: sup}); err != nil {
+		t.Fatal(err)
+	}
+	m2.providerRegistry = reg2
+
+	// 存储恢复 → 后台重放 + 启动 Reconcile：占位按「已正式提交」事实清除。
+	fstore.failActiveNoticeCAS.Store(false)
+	if berr := m2.processRetryableNotices(ctx); berr != nil {
+		t.Fatalf("replay: %v", berr)
+	}
+	rowAfterReplay, _ := adapter.GetTask(ctx, "t-j9")
+	if strings.Contains(rowAfterReplay.Notice.String, `"pending"`) ||
+		strings.Contains(rowAfterReplay.Notice.String, "candidate_cleanup_failed") {
+		t.Fatalf("committed placeholder must be cleared by replay: %q", rowAfterReplay.Notice.String)
+	}
+	if reaped := sup.reapedSnapshot(); len(reaped) != 0 {
+		t.Fatalf("committed session MUST NOT be reaped as candidate, reaped=%v", reaped)
+	}
+	// 正式 session 保留（binding/anchor/归属行未被删除）。
+	if b2, has2, err := adapter.GetTaskBinding(ctx, "t-j9"); err != nil || !has2 || b2.UpstreamSessionID != "ses_j9_1" {
+		t.Fatalf("committed binding must be preserved: %+v has=%v err=%v", b2, has2, err)
+	}
+
+	// 启动 Reconcile（debt pre-pass）同样不复活占位、不杀正式 session。
+	if rerr := m2.Reconcile(ctx); rerr != nil {
+		t.Fatalf("reconcile: %v", rerr)
+	}
+	rowFinal, _ := adapter.GetTask(ctx, "t-j9")
+	if strings.Contains(rowFinal.Notice.String, `"pending"`) {
+		t.Fatalf("reconcile must not resurrect the placeholder: %q", rowFinal.Notice.String)
+	}
+	if reaped := sup.reapedSnapshot(); len(reaped) != 0 {
+		t.Fatalf("reconcile MUST NOT reap the committed session, reaped=%v", reaped)
+	}
+	if b3, has3, err := adapter.GetTaskBinding(ctx, "t-j9"); err != nil || !has3 || b3.UpstreamSessionID != "ses_j9_1" {
+		t.Fatalf("reconcile must preserve the committed session: %+v has=%v err=%v", b3, has3, err)
+	}
+	// 旧占位不再阻断：重启后 Reconcile 按既有语义把无 runtime 的任务收敛
+	// suspended（正式 binding/session 保留）——随后 Activate 不得被旧占位门禁拦截。
+	if serr := m2.Suspend(ctx, "t-j9"); serr != nil &&
+		!strings.Contains(serr.Error(), "suspend requires active") {
+		t.Fatalf("Suspend: %v", serr)
+	}
+	if aerr := m2.Activate(ctx, "t-j9"); aerr != nil {
+		if strings.Contains(aerr.Error(), "uncleaned cleanup debt") {
+			t.Fatalf("stale placeholder must not gate Activate, got %v", aerr)
+		}
+	}
+}
+
+// TestR1_J9_NoCommitProof_StaysGated 落实 Round5 J9 反面对：占位存在但持久化
+// 事实不构成提交证明（v1 钉扎、无 v2 binding）→ 重放 MUST 继续按 J8 阻断，
+// 不得把「任务行状态」或历史事实当作该占位的提交证明。
+func TestR1_J9_NoCommitProof_StaysGated(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedBranchBTask(t, db, "t-j9n")
+	adapter := NewStoreAdapter(db)
+	sup := &debtCandidateSup{realCandidate: "ses_debt_1"}
+	prov := &debtProvider{sup: sup}
+	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m.SetLifecycleCtx(ctx)
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(prov); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+	if aerr := m.armCandidateIntent(ctx, "t-j9n"); aerr != nil {
+		t.Fatalf("arm placeholder: %v", aerr)
+	}
+
+	// 无 v2 binding/anchor/归属行 → 无提交证明 → 占位保持（不调 reaper）。
+	if berr := m.processRetryableNotices(ctx); berr != nil {
+		t.Fatalf("replay: %v", berr)
+	}
+	row, _ := adapter.GetTask(ctx, "t-j9n")
+	if !strings.Contains(row.Notice.String, `"pending"`) {
+		t.Fatalf("no commit proof MUST keep the placeholder: %q", row.Notice.String)
+	}
+	if reaped := sup.reapedSnapshot(); len(reaped) != 0 {
+		t.Fatalf("unknown identity MUST NOT reach reaper, reaped=%v", reaped)
+	}
+	if aerr := m.Activate(ctx, "t-j9n"); aerr == nil ||
+		!strings.Contains(aerr.Error(), "uncleaned cleanup debt") {
+		t.Fatalf("gate must hold without commit proof, got %v", aerr)
+	}
+	if calls := atomic.LoadInt32(&sup.acquireCalls); calls != 0 {
+		t.Fatalf("gated Activate must be zero-POST, acquires=%d", calls)
 	}
 }
 
