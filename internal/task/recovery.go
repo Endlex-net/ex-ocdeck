@@ -261,7 +261,11 @@ func (m *Manager) ensureRecovery(taskID string, tok runtime.InstVersion) {
 		return
 	}
 	rt := m.getRuntime(taskID)
-	if rt == nil || rt.instVersion != tok {
+	// Round4 I10①：rt==nil（registerPostCommitRecovery 的接管前段失败登记——
+	// 无本地运行面）继续恢复：状态守卫 + 注册表代际承担保护（其后任何 runtime
+	// 注册都铸造新代，与本 minted token 失配即 stale skip）。rt 非 nil 且代际
+	// 失配 = 新代已注册非本次触发 → skip。
+	if rt != nil && rt.instVersion != tok {
 		log.Printf("ensureRecovery: stale token (task %s instVersion=%s) skipped", taskID, tok)
 		unlock()
 		return

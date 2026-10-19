@@ -23,7 +23,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"ocdeck/internal/infrastructure/process"
@@ -113,12 +112,17 @@ type V2Supervisor struct {
 	// monitorStop/monitorCancel/monitorDone 监控循环生命周期（I9：supervisor 是
 	// server 监控与重拉的唯一 owner；启动后置——首个成功 ensure 后启动；关停
 	// 停止——persist/kill 两种策略都必须停止）。monitorCancel 持有监控 ctx 的
-	// cancel（Round3 I9：停止入口可取消阻塞中的在途重试后再 join）。
+	// cancel（Round3 I9：停止入口可取消阻塞中的在途重试后再 join）。Round4 I9：
+	// 生命周期字段归 monitorMu（独立小锁，不与 s.mu 互绕——ensureServerOnce 全程
+	// 持 s.mu，停止入口 MUST NOT 等待它才能取消在途重试）；monitorStopped 为
+	// 终态——停止后监控不再被后续 ensure 拉起（停止即终态，非可重启生命周期）。
 	monitorStop     chan struct{}
 	monitorStopOnce sync.Once
 	monitorDone     chan struct{}
 	monitorCancel   context.CancelFunc
-	monitorStarted  atomic.Bool // runMonitor 已派发（join 判据）
+	monitorMu       sync.Mutex
+	monitorStarted  bool // runMonitor 已派发（join 判据）
+	monitorStopped  bool // 停止终态（停止后 startMonitor 不再拉起）
 }
 
 // NewV2Supervisor 构造 supervisor（deps 完整性由调用方保证——生产装配在
@@ -214,18 +218,20 @@ func (s *V2Supervisor) ensureServerOnce(ctx context.Context) (int, string, error
 }
 
 // startMonitorLocked 首个成功 ensure 后置启动监控循环（I9：supervisor 是 server
-// 监控与重拉的唯一 owner；关停停止）。调用方持 s.mu；monitorCancel 非 nil 即在
-// 运行（幂等）。monitor ctx 持有于本函数——StopServerMonitoring 可取消在途
-// ensureServer 重试（Round3 I9：循环内 cancel 不足以打断阻塞中的重试）。
+// 监控与重拉的唯一 owner；关停停止——Round4 I9：停止为终态，停止后不再拉起）。
+// 调用方持 s.mu；生命周期字段归 monitorMu（独立小锁——StopServerMonitoring 不等
+// s.mu 即可取消在途重试）。monitorStopped 终态或已在运行时幂等返回。
 func (s *V2Supervisor) startMonitorLocked() {
-	if s.monitorCancel != nil {
-		return // 已在运行
+	s.monitorMu.Lock()
+	defer s.monitorMu.Unlock()
+	if s.monitorStopped || s.monitorCancel != nil {
+		return // 终态 / 已在运行
 	}
 	monCtx, cancel := context.WithCancel(context.Background())
 	s.monitorCancel = cancel
 	done := make(chan struct{})
 	s.monitorDone = done
-	s.monitorStarted.Store(true)
+	s.monitorStarted = true
 	go func() {
 		defer close(done)
 		defer cancel()
@@ -270,27 +276,30 @@ func (s *V2Supervisor) runMonitor(monCtx context.Context) {
 
 // StopServerMonitoring 停止监控循环并等待退出（评审 I9 生命周期修复：persist 与
 // kill 两种关停策略都必须停止监控——persist 策略不关 server 但同样不得在关停后
-// 继续访问 store/重拉）。三态同步（Round3 I9）：未启动（monitorCancel nil——v2
-// 注册但从未成功 ensure）直接返回不 join；已启动先取消 monitor ctx（打断阻塞中
-// 的 ensureServer/在途重试）再 join；已停止（重复调用）幂等。join 后复位
-// monitorCancel 允许后续 ensure 重新拉起监控。MUST NOT 在持有 s.mu 时调用
-// （join 与循环体互斥需要锁让位）。
+// 继续访问 store/重拉）。Round4 I9：生命周期读/取消走 monitorMu（不等待 s.mu——
+// ensureServerOnce 全程持 s.mu，在途重试中的停止必须即时取消而非等待）；取消后
+// 再 join；未启动（v2 注册但从未成功 ensure）直接标记终态返回不 join。停止为
+// 终态：monitorStopped 置位后 startMonitor 不再拉起（幂等）。
 func (s *V2Supervisor) StopServerMonitoring() {
 	s.monitorStopOnce.Do(func() { close(s.monitorStop) })
-	s.mu.Lock()
+	s.monitorMu.Lock()
 	cancel := s.monitorCancel
-	started := s.monitorStarted.Load()
-	s.mu.Unlock()
+	started := s.monitorStarted
+	s.monitorMu.Unlock()
 	if cancel != nil {
 		cancel() // 打断阻塞中的 ensureServer（在途重试随 monCtx 取消快速返回）
 	}
 	if !started {
-		return // 监控从未派发（未使用 v2/首次启动前关停）：无可 join
+		s.monitorMu.Lock()
+		s.monitorStopped = true // 终态：从未派发也不得被后续 ensure 拉起
+		s.monitorMu.Unlock()
+		return
 	}
 	<-s.monitorDone
-	s.mu.Lock()
+	s.monitorMu.Lock()
 	s.monitorCancel = nil
-	s.mu.Unlock()
+	s.monitorStopped = true
+	s.monitorMu.Unlock()
 }
 
 // verifyAliveLocked 轻量验活（调用方持 s.mu）：实例 pid 存活且身份匹配。

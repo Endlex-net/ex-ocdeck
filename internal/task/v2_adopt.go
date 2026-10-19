@@ -439,6 +439,8 @@ func (m *Manager) commitV2RuntimeReady(ctx context.Context, taskID string, row T
 	if !taskLocked {
 		u, lerr := m.lockTaskForRecovery(taskID)
 		if lerr != nil {
+			// I16：取锁失败出口同样未移交候选流——调用链默认持有关闭责任。
+			m.closeAdoptPreStream(taskID, preStream)
 			return &postCommitTakeoverError{err: newOpErr(codeConflict,
 				fmt.Errorf("承接接管守卫：任务锁不可得（并发生命周期变更）: %w", lerr))}
 		}

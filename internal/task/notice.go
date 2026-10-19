@@ -136,6 +136,11 @@ func (m *Manager) hasRetryableNotice(ctx context.Context, row TaskRow) (bool, er
 		return true, err
 	}
 	for _, e := range entries {
+		// Round4 I2：停止收敛意图同为激活门禁债务（可重试收敛工作在位——激活
+		// MUST NOT 绕过未完成的挂起收敛）。
+		if e.Code == noticeCodeSuspendStop {
+			return true, nil
+		}
 		if e.Code != noticeCodeResidual {
 			continue
 		}
@@ -262,11 +267,46 @@ func (m *Manager) recordSuspendStopIntent(ctx context.Context, taskID, terminalR
 	return fmt.Errorf("record suspend stop intent: CAS did not converge (task %s, session %s)", taskID, terminalRef)
 }
 
+// clearSuspendStopIntents 清除任务的全部停止收敛意图（Round4 I2：后续 Suspend
+// 取得收敛权后，历史意图的前提已被取代——CAS 过滤式移除；无意图幂等成功）。
+func (m *Manager) clearSuspendStopIntents(ctx context.Context, taskID string) error {
+	for attempt := 0; attempt < 8; attempt++ {
+		row, err := m.store.GetTask(ctx, taskID)
+		if err != nil {
+			return fmt.Errorf("clear suspend stop intent: get task: %w", err)
+		}
+		entries, perr := parseNotices(row.Notice)
+		if perr != nil {
+			// JSON 损坏 fail-closed：不得覆盖已落库 notice。
+			return fmt.Errorf("clear suspend stop intent: notice json corrupted (task %s): %w", taskID, perr)
+		}
+		var remaining []noticeEntry
+		changed := false
+		for _, e := range entries {
+			if e.Code == noticeCodeSuspendStop {
+				changed = true
+				continue
+			}
+			remaining = append(remaining, e)
+		}
+		if !changed {
+			return nil
+		}
+		r, _ := m.writeNoticeCAS(ctx, taskID, row.Notice, encodeNotices(remaining))
+		if r.Matched {
+			return nil
+		}
+		// 未收敛：被并发覆盖，继续重试。
+	}
+	return fmt.Errorf("clear suspend stop intent: CAS did not converge (task %s)", taskID)
+}
+
 // retrySuspendStopIntent 消费停止收敛意图（评审 Round3 I2；调用方持任务锁）：
 // 复核（suspended=已收敛/非 active=意图过时/新一代 runtime 在位=旧意图失效——
-// 三者清除意图且不影响现状）→ 完成清关联（clearRuntime + v2 本地单元幂等回收）
-// + active→suspended 条件收敛 → 删除意图。返回 done（true=意图已了结可清除）；
-// DB 仍不可用返回 done=false + err（保留意图下轮重试）。
+// 三者清除意图且不影响现状）→ 复用正常挂起收尾语义完成清关联+残留 notice/tickets
+// 持久化+env 快照清除（Round4 I17——MUST NOT 丢弃清理债务）+ active→suspended
+// 条件收敛 → 删除意图。返回 done（true=意图已了结可清除）；状态写仍失败返回
+// done=false + err（保留意图下轮重试）。
 func (m *Manager) retrySuspendStopIntent(ctx context.Context, taskID string, e noticeEntry) (bool, error) {
 	row, err := m.store.GetTask(ctx, taskID)
 	if err != nil {
@@ -278,26 +318,42 @@ func (m *Manager) retrySuspendStopIntent(ctx context.Context, taskID string, e n
 		return true, nil
 	}
 	token, _ := e.Data["token"].(string)
-	if rt := m.getRuntime(taskID); rt != nil && token != "" && string(rt.instVersion) != token {
-		// 新一代运行中：旧停止意图不影响新一代（清除，不触达新代运行关联）。
-		return true, nil
-	}
-	// 完成挂起的本地半程（上游停止已确认属实）：清运行时关联 + 幂等回收 v2 本地
-	// 单元（TUI/shell——与 Suspend 收敛半程同形）。
-	m.clearRuntime(taskID)
-	terminalRef, _ := e.Data["sessionName"].(string)
-	if terminalRef != "" {
-		_ = m.killTaskSessions(ctx, taskID, []string{terminalRef})
-		if shells, serr := m.listShellSessions(taskID); serr == nil {
-			_ = m.killTaskSessions(ctx, taskID, shells)
+	if rt := m.getRuntime(taskID); rt != nil {
+		// Round4 I2：注册表存在 runtime 即与记录代际严格比对——记录时空 token
+		//（记录时无 runtime）不得授权清理后来出现的 runtime（无可验证身份→视为
+		// 新代，意图过时清除）。
+		if token == "" || string(rt.instVersion) != token {
+			return true, nil
 		}
 	}
-	le := sql.NullString{String: "suspend: 停止收敛意图重放完成（active→suspended）", Valid: true}
+	// 完成挂起的本地半程（上游停止已确认属实）：清运行时关联 + 幂等回收 v2 本地
+	// 单元（TUI/shell）——收集完整结果（含 shell 枚举错误），复用正常挂起收尾
+	// 语义持久化残留 notice/tickets + 清 env 快照（Round4 I17：MUST NOT 丢弃
+	// 清理债务、MUST NOT 残留 env 快照）。
+	m.clearRuntime(taskID)
+	terminalRef, _ := e.Data["sessionName"].(string)
+	var results []killResultEntry
+	if terminalRef != "" {
+		results = append(results, m.killTaskSessions(ctx, taskID, []string{terminalRef})...)
+	}
+	shells, serr := m.listShellSessions(taskID)
+	if serr != nil {
+		// 枚举失败如实入结果集（finishSuspendCommon 记 retryable kill_failed）。
+		results = append(results, killResultEntry{name: terminalRef,
+			killErr: fmt.Errorf("list shells: %w", serr)})
+	} else {
+		results = append(results, m.killTaskSessions(ctx, taskID, shells)...)
+	}
+	le, ferrs := m.finishSuspendCommon(ctx, taskID, results, nil)
+	if joined := errors.Join(ferrs...); joined != nil && !le.Valid {
+		le = sql.NullString{String: joined.Error(), Valid: true}
+	}
 	if _, werr := m.writeStatusConditional(ctx, taskID, StatusActive, StatusSuspended, le); werr != nil {
 		// DB 仍不可用：意图保留，下轮重试（done=false 不删）。
 		return false, fmt.Errorf("suspend stop intent: converge: %w", werr)
 	}
-	// Matched=收敛完成；!Matched=状态已被其他代改写（守卫不覆盖）——意图了结。
+	// Matched=收敛完成（清理失败已固化为残留 notice/tickets 债务）；!Matched=
+	// 状态已被其他代改写（守卫不覆盖）——意图均了结。
 	return true, nil
 }
 

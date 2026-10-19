@@ -109,6 +109,12 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 		}
 		return newOpErr(codeConflict, fmt.Errorf("task %s state changed before suspend", taskID))
 	}
+	// Round4 I2：本次 Suspend 已取得收敛权（CAS Matched）——清除历史停止收敛
+	// 意图（其前提「收敛待完成」已被本次挂起取代；陈旧意图不得在重放中触达
+	// 本次收敛后的状态）。
+	if ierr := m.clearSuspendStopIntents(casCtx, taskID); ierr != nil {
+		log.Printf("suspend: task %s clear stale stop intent: %v", taskID, ierr)
+	}
 	return m.suspendRun(ctx, taskID, mode, sb, hasV2)
 }
 
@@ -412,19 +418,13 @@ func hasKillFailure(results []killResultEntry) bool {
 	return false
 }
 
-// finishSund 落为 suspended：逐项聚合记录残留 notice（killRes + 强制清理中的失败项），
-// 清除 env 快照，置 suspended。
-// cause 为生命周期原因错误（如恢复 active 提交失败），仅并入 last_error 与返回值——
-// F16：MUST NOT 经 killResultEntry 伪造进程清理失败（那会错误产生 retryable kill_failed
-// notice，后续 Activate 被债务拒绝）；只有真实进程清理失败（killRes 内的 killErr）
-// 才产生 residual notice。
-// F20 错误聚合：cause 与全部操作错误（notice 记录失败/env 清理失败/状态提交失败）经
-// errors.Join 聚合返回——状态写失败 MUST 无条件进入返回值（不得被 cause 预先占据 firstErr
-// 而丢失）；last_error 保存提交前已知错误（cause + notice/env 错误），状态提交自身的错误
-// 仅进入返回聚合（无法写进该次失败的持久化操作）。调用方不得用包含 cause 的返回值判断
-// 补偿本身是否失败。
-// suspended 状态提交失败 MUST 处理：不得静默置为无效流转（design.md §19 Suspend 行）。
-func (m *Manager) finishSuspend(ctx context.Context, taskID string, results []killResultEntry, cause error) error {
+// finishSuspendCommon 是挂起收尾的公共半程（评审 Round4 I17 抽取——正常挂起与
+// 停止收敛意图重放共用）：逐项聚合记录残留 notice（killRes 内的 killErr →
+// retryable kill_failed；disposition 非净 → 分类记录）+ 清除 env 快照。返回
+// last_error 载荷与聚合错误（不含状态提交——提交方式由调用方决定：正常路径
+// writeStatus、重放路径 writeStatusConditional 条件守卫）。F16 约束同
+// finishSuspend：MUST NOT 伪造清理失败。
+func (m *Manager) finishSuspendCommon(ctx context.Context, taskID string, results []killResultEntry, cause error) (sql.NullString, []error) {
 	var errs []error
 	if cause != nil {
 		errs = append(errs, cause)
@@ -446,10 +446,27 @@ func (m *Manager) finishSuspend(ctx context.Context, taskID string, results []ki
 	if _, err := m.writeEnvSnapshot(ctx, taskID, sql.NullString{}); err != nil {
 		errs = append(errs, fmt.Errorf("clear env snapshot: %w", err))
 	}
-	le := sql.NullString{}
+	var le sql.NullString
 	if joined := errors.Join(errs...); joined != nil {
 		le = sql.NullString{String: joined.Error(), Valid: true}
 	}
+	return le, errs
+}
+
+// finishSund 落为 suspended：逐项聚合记录残留 notice（killRes + 强制清理中的失败项），
+// 清除 env 快照，置 suspended。
+// cause 为生命周期原因错误（如恢复 active 提交失败），仅并入 last_error 与返回值——
+// F16：MUST NOT 经 killResultEntry 伪造进程清理失败（那会错误产生 retryable kill_failed
+// notice，后续 Activate 被债务拒绝）；只有真实进程清理失败（killRes 内的 killErr）
+// 才产生 residual notice。
+// F20 错误聚合：cause 与全部操作错误（notice 记录失败/env 清理失败/状态提交失败）经
+// errors.Join 聚合返回——状态写失败 MUST 无条件进入返回值（不得被 cause 预先占据 firstErr
+// 而丢失）；last_error 保存提交前已知错误（cause + notice/env 错误），状态提交自身的错误
+// 仅进入返回聚合（无法写进该次失败的持久化操作）。调用方不得用包含 cause 的返回值判断
+// 补偿本身是否失败。
+// suspended 状态提交失败 MUST 处理：不得静默置为无效流转（design.md §19 Suspend 行）。
+func (m *Manager) finishSuspend(ctx context.Context, taskID string, results []killResultEntry, cause error) error {
+	le, errs := m.finishSuspendCommon(ctx, taskID, results, cause)
 	if _, err := m.writeStatus(ctx, taskID, StatusSuspended, le); err != nil {
 		// F20：状态提交失败无条件进入返回值（不得被 cause 掩盖）。
 		errs = append(errs, fmt.Errorf("commit suspended: %w", err))

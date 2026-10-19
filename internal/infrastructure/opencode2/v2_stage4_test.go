@@ -21,6 +21,7 @@ import (
 
 	appagent "ocdeck/internal/application/agentprovider"
 	domain "ocdeck/internal/domain/agentprovider"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // TestStage4_FirstBuildCompensation_ConfigFailAfterPOST 落实首建补偿场景①：
@@ -182,6 +183,111 @@ func TestStage4_ServerMonitor_StopsOnShutdown(t *testing.T) {
 	}
 	if n := restarts.Load(); n != 0 {
 		t.Fatalf("no restart notifications after shutdown, got %d", n)
+	}
+}
+
+// blockingRecordStore 是 Round4 I9 的慢 store 注入：block 置位后首次
+// GetProviderRuntime 阻塞（模拟 ensureServer 在途重试持 s.mu 等待慢存储）。
+type blockingRecordStore struct {
+	*fakeRecordStore
+	block   atomic.Bool
+	gate    chan struct{}
+	entered chan struct{}
+	once    sync.Once
+	calls   atomic.Int32
+}
+
+func (s *blockingRecordStore) GetProviderRuntime(ctx context.Context, providerID, instanceID string) (store.ProviderRuntimeRecord, bool, error) {
+	if s.block.Load() {
+		s.calls.Add(1)
+		s.once.Do(func() { close(s.entered) })
+		<-s.gate
+	}
+	return s.fakeRecordStore.GetProviderRuntime(ctx, providerID, instanceID)
+}
+
+// TestStage4_R4_I9_MonitorCancelWhileInFlightRetry 落实 Round4 I9 取消及时性：
+// 监控在途重试阻塞在慢 store（ensureServerOnce 持 s.mu）时，停止入口经独立
+// monitorMu 即时取消——gate 放行后零额外重试 attempt、join 快速完成。
+func TestStage4_R4_I9_MonitorCancelWhileInFlightRetry(t *testing.T) {
+	srv := fixtureServer(t, route{path: "/api/session", status: 200, body: string(readFixture(t, "session_list_page2.json"))})
+	sup, _, recs := newTestSupervisor(t, srv.URL, nil)
+	bs := &blockingRecordStore{fakeRecordStore: recs, gate: make(chan struct{}), entered: make(chan struct{})}
+	sup.deps.Store = bs
+	sup.deps.MonitorInterval = 5 * time.Millisecond
+	sup.deps.PollInterval = 50 * time.Millisecond
+	sup.deps.StartAttempts = 3
+	if _, _, err := sup.ensureServer(context.Background()); err != nil {
+		t.Fatalf("warmup: %v", err)
+	}
+	// 监控已启动（首个成功 ensure 后置）。杀 server → 下一 tick 走恢复矩阵，
+	// 阻塞在慢 store（ensureServerOnce 持 s.mu）。监控 goroutine 并发读
+	// ready/pid/deps——变更持 s.mu（不得用 makeProcDead：其 deps 换入无锁，且
+	// 内部又自取 s.mu，外层加锁会自死锁）。
+	bs.block.Store(true)
+	sup.mu.Lock()
+	sup.ready = false
+	sup.pid = 0
+	sup.mu.Unlock()
+	select {
+	case <-bs.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("monitor never entered blocked store call")
+	}
+
+	// 停止入口：cancel 即时生效（不等待 s.mu），gate 放行后零额外 attempt。
+	stopDone := make(chan struct{})
+	go func() { sup.StopServerMonitoring(); close(stopDone) }()
+	time.Sleep(100 * time.Millisecond) // 给 cancel 生效窗口
+	close(bs.gate)
+	select {
+	case <-stopDone:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("StopServerMonitoring did not return after cancel (blocked retries not canceled)")
+	}
+	if n := bs.calls.Load(); n != 1 {
+		t.Fatalf("cancel must prevent further retry attempts, store calls=%d", n)
+	}
+}
+
+// TestStage4_R4_I9_StopIsTerminal 落实 Round4 I9 终态语义：停止后监控不再被
+// 后续 ensure 拉起（startMonitor 立即退出——不再出现「monitorStop 已永久关闭
+// 而新监控立即退出」的注释不一致形态）。
+func TestStage4_R4_I9_StopIsTerminal(t *testing.T) {
+	srv := fixtureServer(t, route{path: "/api/session", status: 200, body: string(readFixture(t, "session_list_page2.json"))})
+	sup, _, _ := newTestSupervisor(t, srv.URL, nil)
+	sup.deps.MonitorInterval = 5 * time.Millisecond
+	// 未启动即停止（v2 注册但从未成功 ensure 的关停形态）。
+	sup.StopServerMonitoring()
+	// 终态：后续 startMonitor 不再拉起。
+	sup.startMonitorLocked()
+	sup.monitorMu.Lock()
+	done := sup.monitorDone
+	started := sup.monitorStarted
+	sup.monitorMu.Unlock()
+	if started {
+		t.Fatalf("monitor must not start after terminal stop")
+	}
+	select {
+	case <-done:
+		t.Fatalf("no monitor goroutine should have run after terminal stop")
+	default:
+		// 未派发：monitorDone 保持未关闭（无 goroutine 存在）。
+	}
+	// 已启动后停止 → 再次 startMonitor 仍不拉起（终态幂等）。
+	sup2, _, _ := newTestSupervisor(t, srv.URL, nil)
+	sup2.deps.MonitorInterval = 5 * time.Millisecond
+	if _, _, err := sup2.ensureServer(context.Background()); err != nil {
+		t.Fatalf("warmup: %v", err)
+	}
+	sup2.StopServerMonitoring()
+	sup2.startMonitorLocked()
+	time.Sleep(20 * time.Millisecond) // 数个 tick：若被拉起也已退出
+	sup2.monitorMu.Lock()
+	restarted := sup2.monitorStarted && sup2.monitorCancel != nil
+	sup2.monitorMu.Unlock()
+	if restarted {
+		t.Fatalf("monitor must not restart after terminal stop")
 	}
 }
 

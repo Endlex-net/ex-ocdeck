@@ -606,7 +606,14 @@ func (s *spiEventStream) markDisconnected() {
 	s.connMu.Unlock()
 	s.enqueueLifecycle(lifecycleDisconnected)
 }
-func (s *spiEventStream) fireReconnect() { s.enqueueLifecycle(lifecycleReconnect) }
+func (s *spiEventStream) fireReconnect() {
+	// 评审 I10②：重连即新连接代建立——恢复「当前已建立」事实，使移交消费方的
+	// 首次 ready 不依赖「期间从未断线」。
+	s.connMu.Lock()
+	s.connEstablished = true
+	s.connMu.Unlock()
+	s.enqueueLifecycle(lifecycleReconnect)
+}
 
 // enqueueLifecycle 生命周期事件原子入队，锁外交给统一分派器按序消费。
 func (s *spiEventStream) enqueueLifecycle(kind string) {
@@ -669,6 +676,23 @@ func (s *spiEventStream) SetCallbacks(onConnected, onReconnect func()) {
 	s.connMu.Lock()
 	s.onConnected = onConnected
 	s.onReconnect = onReconnect
+	// 连接代对账（评审 I10②）：移交时按当前连接代整理待派发信号，使首次 ready
+	// 不依赖「期间从未断线」——
+	//   当前未建立：丢弃历史 disconnected（它描述的是「进入当前状态」的迁移，
+	//   对新消费方是陈旧信号，且会阻塞队首派发）；
+	//   当前已建立：保证恰一个 connected 交付给新消费方（队列为空→补发；队首非
+	//   connected→前置 connected，保持 connect→reconnect 序）。
+	if !s.connEstablished {
+		trimmed := s.lifecycleEvents[:0]
+		for _, k := range s.lifecycleEvents {
+			if k != lifecycleDisconnected {
+				trimmed = append(trimmed, k)
+			}
+		}
+		s.lifecycleEvents = trimmed
+	} else if len(s.lifecycleEvents) == 0 || s.lifecycleEvents[0] != lifecycleConnected {
+		s.lifecycleEvents = append([]string{lifecycleConnected}, s.lifecycleEvents...)
+	}
 	replay := s.connEstablished && len(s.lifecycleEvents) == 0
 	s.connMu.Unlock()
 	if replay && onConnected != nil {

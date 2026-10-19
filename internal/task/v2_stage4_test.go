@@ -2575,6 +2575,11 @@ type realStreamHarness struct {
 	conns   atomic.Int32
 	evtDone chan struct{}
 	port    int
+	// allowConns 允许的 /api/event 连接数（默认 1——重订阅即 500 红灯）。
+	allowConns int32
+	// dropConn 非 nil 时：首条连接写出 hello 后等待该 chan 关闭再返回（模拟
+	// 服务端主动断连——触发客户端重连）。
+	dropConn chan struct{}
 }
 
 func newRealStreamHarness(t *testing.T, taskID, upstream, status string) *realStreamHarness {
@@ -2586,7 +2591,7 @@ func newRealStreamHarness(t *testing.T, taskID, upstream, status string) *realSt
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	h := &realStreamHarness{db: db, evtDone: make(chan struct{})}
+	h := &realStreamHarness{db: db, evtDone: make(chan struct{}), allowConns: 1}
 	var evtOnce sync.Once
 	h.proc = newMonitorProcSeam(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -2594,8 +2599,8 @@ func newRealStreamHarness(t *testing.T, taskID, upstream, status string) *realSt
 		case r.URL.Path == "/openapi.json":
 			_, _ = w.Write([]byte(`{"components":{"schemas":{"Session.ID":{"type":"string","pattern":"^ses"},"Session.Message.ID":{"type":"string","pattern":"^msg_"}}}}`))
 		case r.URL.Path == "/api/event":
-			if h.conns.Add(1) >= 2 {
-				// 接管 MUST 复用候选流——第二次订阅即失败信号（重订阅即红）。
+			if h.conns.Add(1) > h.allowConns {
+				// 接管 MUST 复用候选流——超限订阅即失败信号（重订阅即红）。
 				w.WriteHeader(500)
 				return
 			}
@@ -2607,7 +2612,11 @@ func newRealStreamHarness(t *testing.T, taskID, upstream, status string) *realSt
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
-			<-r.Context().Done() // 客户端断开（Close）→ return 产生 EOF
+			if h.conns.Load() == 1 && h.dropConn != nil {
+				<-h.dropConn // 服务端主动断连（触发客户端重连）
+			} else {
+				<-r.Context().Done() // 客户端断开（Close）→ return 产生 EOF
+			}
 			evtOnce.Do(func() { close(h.evtDone) })
 		case r.URL.Path == "/api/session/"+upstream:
 			_, _ = w.Write([]byte(`{"data":{"id":"` + upstream + `","location":{"directory":"/wt"},"time":{"created":1,"updated":1}}}`))
@@ -2794,6 +2803,397 @@ func TestStage4_I16_RejectTakeover_ClosesCandidateStream(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("candidate stream was not closed after rejection")
+	}
+	select {
+	case <-h.evtDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("server must observe candidate stream disconnect")
+	}
+}
+
+// ---- Round 4：I2 空 token/门禁/清除 · I17 重放收尾 · I10 minted token/断线重连 · I16 锁失败关流 ----
+
+// TestStage4_R4_I2_EmptyTokenIntent_GatesActivate 落实 Round4 I2（门禁方向）：
+// 停止收敛意图纳入激活债务门禁——意图在位时 Activate 拒绝（uncleaned cleanup
+// debt），不得绕过未完成的挂起收敛。
+func TestStage4_R4_I2_EmptyTokenIntent_GatesActivate(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-et")
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManager(t, db, prov)
+	if ierr := m.recordSuspendStopIntent(ctx, "t-et", "ocdeck-v2-tui-t-et", ""); ierr != nil {
+		t.Fatal(ierr)
+	}
+	// 债务门禁在 suspended 前置校验之后——种子置 suspended 使 Activate 走到门禁。
+	if _, err := db.Exec(`UPDATE tasks SET status='suspended' WHERE id='t-et'`); err != nil {
+		t.Fatal(err)
+	}
+	if aerr := m.Activate(ctx, "t-et"); aerr == nil || !strings.Contains(aerr.Error(), "uncleaned cleanup debt") {
+		t.Fatalf("pending suspend-stop intent must gate Activate, got %v", aerr)
+	}
+}
+
+// TestStage4_R4_I2_EmptyTokenIntent_StaleWhenRuntimeAppears 落实 Round4 I2
+// （守卫方向）：记录时无 runtime（空 token——无可验证生命周期身份）→ 其后出现
+// 的 runtime 一律视为新代——重放仅清除意图、零触达（空 token 不得授权清理后来
+// 出现的运行关联）。
+func TestStage4_R4_I2_EmptyTokenIntent_StaleWhenRuntimeAppears(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-et")
+	adapter := NewStoreAdapter(db)
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManager(t, db, prov)
+
+	if ierr := m.recordSuspendStopIntent(ctx, "t-et", "ocdeck-v2-tui-t-et", ""); ierr != nil {
+		t.Fatal(ierr)
+	}
+	rt := m.newRuntime("t-et")
+	m.setRuntime("t-et", rt)
+	before := string(rt.instVersion)
+	row, _ := adapter.GetTask(ctx, "t-et")
+	entries, _ := parseNotices(row.Notice)
+	if rerr := m.retryTaskNotices(ctx, row, entries); rerr != nil {
+		t.Fatalf("replay: %v", rerr)
+	}
+	row2, _ := adapter.GetTask(ctx, "t-et")
+	if row2.Status != "active" {
+		t.Fatalf("empty-token intent must not converge a later runtime, status=%s", row2.Status)
+	}
+	if strings.Contains(row2.Notice.String, noticeCodeSuspendStop) {
+		t.Fatalf("stale intent must be cleared: %q", row2.Notice.String)
+	}
+	if rt2 := m.getRuntime("t-et"); rt2 == nil || string(rt2.instVersion) != before {
+		t.Fatalf("new generation runtime must be untouched")
+	}
+	if atomic.LoadInt32(&sup.releaseN) != 0 {
+		t.Fatalf("empty-token intent must not release later runtime, releases=%d", atomic.LoadInt32(&sup.releaseN))
+	}
+}
+
+// TestStage4_R4_I2_SecondSuspendClearsStaleIntent 落实 Round4 I2：停止确认失败
+// 留下的旧意图，被后续成功的 Suspend 取得收敛权时清除（不得在重放中触达本次
+// 收敛后的状态）。
+func TestStage4_R4_I2_SecondSuspendClearsStaleIntent(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-sc")
+	adapter := NewStoreAdapter(db)
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManager(t, db, prov)
+	if ierr := m.recordSuspendStopIntent(ctx, "t-sc", "ocdeck-v2-tui-t-sc", ""); ierr != nil {
+		t.Fatal(ierr)
+	}
+	if serr := m.Suspend(ctx, "t-sc"); serr != nil {
+		t.Fatalf("suspend: %v", serr)
+	}
+	row, err := adapter.GetTask(ctx, "t-sc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != "suspended" {
+		t.Fatalf("status=%s", row.Status)
+	}
+	if strings.Contains(row.Notice.String, noticeCodeSuspendStop) {
+		t.Fatalf("stale intent must be cleared by successful suspend: %q", row.Notice.String)
+	}
+}
+
+// TestStage4_R4_I17_ReplayPersistsCleanupDebtAndClearsEnv 落实 Round4 I17：重放
+// 收敛复用正常挂起收尾语义——kill 失败固化为 retryable 残留 notice（含 reap
+// tickets）、env 快照清除，随后才清除停止意图（suspended 收敛不丢清理债务、
+// 不残留 env 快照）。
+func TestStage4_R4_I17_ReplayPersistsCleanupDebtAndClearsEnv(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-rp")
+	adapter := NewStoreAdapter(db)
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManager(t, db, prov)
+	rt := m.newRuntime("t-rp")
+	m.setRuntime("t-rp", rt)
+	mproc := m.proc.(*mockProc)
+	mproc.mu.Lock()
+	mproc.sessions["ocdeck-v2-tui-t-rp"] = true
+	// kill 失败 + reap tickets（非净 disposition——残留债务信号）。
+	mproc.killResults["ocdeck-v2-tui-t-rp"] = process.KillResult{
+		SessionKilled:  false,
+		Disposition:    process.DispositionKillFailed,
+		CleanupTickets: []string{"tk-reap-1"},
+	}
+	mproc.mu.Unlock()
+
+	ref := "ocdeck-v2-tui-t-rp"
+	if ierr := m.recordSuspendStopIntent(ctx, "t-rp", ref, string(rt.instVersion)); ierr != nil {
+		t.Fatal(ierr)
+	}
+	row, _ := adapter.GetTask(ctx, "t-rp")
+	entries, _ := parseNotices(row.Notice)
+	if rerr := m.retryTaskNotices(ctx, row, entries); rerr != nil {
+		t.Fatalf("replay: %v", rerr)
+	}
+	row2, err := adapter.GetTask(ctx, "t-rp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row2.Status != "suspended" {
+		t.Fatalf("status=%s（收敛完成）", row2.Status)
+	}
+	// 清理债务已持久化（kill_failed + tickets），停止意图已清除。
+	if !strings.Contains(row2.Notice.String, "tk-reap-1") {
+		t.Fatalf("cleanup tickets must be persisted as debt: %q", row2.Notice.String)
+	}
+	if strings.Contains(row2.Notice.String, noticeCodeSuspendStop) {
+		t.Fatalf("intent must be cleared after converged replay: %q", row2.Notice.String)
+	}
+	// env 快照清除（design.md §2：挂起成功清快照——重放同语义）。
+	var snap sql.NullString
+	if err := db.QueryRow(`SELECT env_snapshot FROM tasks WHERE id='t-rp'`).Scan(&snap); err != nil {
+		t.Fatal(err)
+	}
+	if snap.Valid && snap.String != "" {
+		t.Fatalf("env snapshot must be cleared by replay, got %q", snap.String)
+	}
+}
+
+// TestStage4_R4_I17_ReplayShellEnumFail_PersistsDebt 落实枚举失败如实入债务：
+// shell 枚举错误不再被吞——固化为 retryable 残留 notice 后收敛。
+func TestStage4_R4_I17_ReplayShellEnumFail_PersistsDebt(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-re")
+	adapter := NewStoreAdapter(db)
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManager(t, db, prov)
+	lfp := &listFailProc{mockProc: m.proc.(*mockProc)}
+	m.proc = lfp
+	lfp.fail.Store(true)
+	rt := m.newRuntime("t-re")
+	m.setRuntime("t-re", rt)
+
+	ref := "ocdeck-v2-tui-t-re"
+	if ierr := m.recordSuspendStopIntent(ctx, "t-re", ref, string(rt.instVersion)); ierr != nil {
+		t.Fatal(ierr)
+	}
+	row, _ := adapter.GetTask(ctx, "t-re")
+	entries, _ := parseNotices(row.Notice)
+	if rerr := m.retryTaskNotices(ctx, row, entries); rerr != nil {
+		t.Fatalf("replay: %v", rerr)
+	}
+	row2, _ := adapter.GetTask(ctx, "t-re")
+	if row2.Status != "suspended" {
+		t.Fatalf("status=%s", row2.Status)
+	}
+	// 枚举失败固化为 retryable 残留债务（kill_failed 形态）；细节文本入 last_error。
+	if !strings.Contains(row2.Notice.String, "kill_failed") || !strings.Contains(row2.Notice.String, `"retryable":true`) {
+		t.Fatalf("shell enumeration failure must be persisted as retryable debt: %q", row2.Notice.String)
+	}
+	if !strings.Contains(row2.LastError.String, "list shells") {
+		t.Fatalf("enumeration detail must surface in last_error: %q", row2.LastError.String)
+	}
+}
+
+// listFailProc 包装 mockProc 注入 ListSessions 失败（shell 枚举故障注入接缝）。
+type listFailProc struct {
+	*mockProc
+	fail atomic.Bool
+}
+
+func (p *listFailProc) ListSessions() ([]string, error) {
+	if p.fail.Load() {
+		return nil, errors.New("list sessions injected failure")
+	}
+	return p.mockProc.ListSessions()
+}
+
+// TestStage4_R4_I10_MintedTokenRecovery_ExecutesResume 落实 Round4 I10①：无
+// runtime（接管前段失败登记——minted token）的恢复入口实际执行 Resume（此前
+// stale-token 直接返回，恢复闭环断裂）；已注册新代且代际失配仍正确 skip。
+func TestStage4_R4_I10_MintedTokenRecovery_ExecutesResume(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-mt")
+	adapter := NewStoreAdapter(db)
+	rec := &recordingV2Sup{upstream: "ses_keep", port: 4096}
+	prov := &recordingV2Provider{sup: rec}
+	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m.SetLifecycleCtx(ctx)
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(prov); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+
+	// 无 runtime + minted token：恢复入口必须实际执行（Resume 延续原 session）。
+	m.ensureRecovery("t-mt", "minted-token-1")
+	if rec.resumeCalls != 1 {
+		t.Fatalf("minted-token recovery must execute Resume, resumes=%d", rec.resumeCalls)
+	}
+	got, has, err := adapter.GetTaskBinding(ctx, "t-mt")
+	if err != nil || !has || got.UpstreamSessionID != "ses_keep" {
+		t.Fatalf("binding continuity: %+v has=%v err=%v", got, has, err)
+	}
+
+	// 已注册新代且代际失配：skip（stale 守卫方向不回归）。
+	rec.resumeCalls = 0
+	m.setRuntime("t-mt", m.newRuntime("t-mt")) // 新代 token ≠ minted-token-1
+	m.ensureRecovery("t-mt", "minted-token-1")
+	if rec.resumeCalls != 0 {
+		t.Fatalf("stale token against registered newer generation must skip, resumes=%d", rec.resumeCalls)
+	}
+}
+
+// TestStage4_R4_I10_HandoverAfterDisconnectReconnect 落实 Round4 I10②：候选
+// 握手后、正式接管前发生断线+重连——流移交按当前连接代整理待派发信号，首次
+// ready 不依赖「期间从未断线」（接管成功、不二次等 ready 预算）。
+func TestStage4_R4_I10_HandoverAfterDisconnectReconnect(t *testing.T) {
+	ctx := context.Background()
+	h := newRealStreamHarness(t, "t-dr", "ses_keep", "active")
+	h.allowConns = 2
+	h.dropConn = make(chan struct{})
+
+	binding, has, err := h.adapter.GetTaskBinding(ctx, "t-dr")
+	if err != nil || !has {
+		t.Fatalf("binding: %v", err)
+	}
+	warmRealStreamHarness(t, h)
+	es, serr := h.prov.Events().Subscribe(ctx, binding)
+	if serr != nil {
+		t.Fatalf("Subscribe: %v", serr)
+	}
+	connected := make(chan struct{}, 4)
+	reconnected := make(chan struct{}, 4)
+	es.SetCallbacks(func() {
+		select {
+		case connected <- struct{}{}:
+		default:
+		}
+	},
+		func() {
+			select {
+			case reconnected <- struct{}{}:
+			default:
+			}
+		})
+	select {
+	case <-connected:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("handshake connected never fired (conns=%d)", h.conns.Load())
+	}
+
+	// 服务端主动断连 → 客户端重连（conn2 建立；旧消费方队列可能因无
+	// onDisconnected 回调而滞留——移交对账由 SetCallbacks 承担）。
+	close(h.dropConn)
+	deadline := time.Now().Add(5 * time.Second)
+	for h.conns.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("client never reconnected after server drop")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 正式接管（复用候选流）：移交按连接代前置 connected——ready 即达。
+	row, err := h.adapter.GetTask(ctx, "t-dr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if terr := h.m.commitV2RuntimeReady(ctx, "t-dr", row, h.port, "pw", binding, AlignModeRepo, es, true); terr != nil {
+		t.Fatalf("takeover after reconnect: %v", terr)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("ready must be delivered by handover replay, elapsed=%v", elapsed)
+	}
+	if n := h.conns.Load(); n != 2 {
+		t.Fatalf("event connections=%d（断线重连恰一次重连，无重订阅）", n)
+	}
+}
+
+// TestStage4_R4_I16_LockFailClosesCandidateStream 落实 Round4 I16：取锁失败出口
+// 同样未移交候选流——调用链默认持有关闭责任（流关闭+服务端观测断连）。
+func TestStage4_R4_I16_LockFailClosesCandidateStream(t *testing.T) {
+	ctx := context.Background()
+	h := newRealStreamHarness(t, "t-lk", "ses_keep", "active")
+	warmRealStreamHarness(t, h)
+
+	binding, has, err := h.adapter.GetTaskBinding(ctx, "t-lk")
+	if err != nil || !has {
+		t.Fatalf("binding: %v", err)
+	}
+	es, serr := h.prov.Events().Subscribe(ctx, binding)
+	if serr != nil {
+		t.Fatalf("Subscribe: %v", serr)
+	}
+	connected := make(chan struct{}, 4)
+	es.SetCallbacks(func() {
+		select {
+		case connected <- struct{}{}:
+		default:
+		}
+	}, nil)
+	select {
+	case <-connected:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("handshake connected never fired")
+	}
+
+	// 占住任务锁（tryLockTask 快失败语义——避免 lockTaskForRecovery 30s 等待）
+	// → 接管守卫取锁失败。
+	unlock, lerr := h.m.tryLockTask("t-lk")
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	row, err := h.adapter.GetTask(ctx, "t-lk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	terr := h.m.commitV2RuntimeReady(ctx, "t-lk", row, h.port, "pw", binding, AlignModeRepo, es, false)
+	unlock()
+	var pce *postCommitTakeoverError
+	if !errors.As(terr, &pce) {
+		t.Fatalf("lock failure must be post-commit classified, got %v", terr)
+	}
+	select {
+	case _, ok := <-es.Events():
+		if ok {
+			t.Fatalf("candidate stream must be closed on lock failure")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("candidate stream was not closed after lock failure")
 	}
 	select {
 	case <-h.evtDone:
