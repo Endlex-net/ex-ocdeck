@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"ocdeck/internal/application/runtime"
@@ -307,6 +308,9 @@ func (m *Manager) clearSuspendStopIntents(ctx context.Context, taskID string) er
 					remaining = append(remaining, annotateSuspendStopPending(e, rem))
 					continue
 				}
+				// Round9 I21②：义务已补全——同步消除 ledger 中的重复副本
+				//（否则后续 drain 重复执行 env 清除/重复落账 tickets）。
+				m.removeReapLedgerObligations(taskID, pending)
 			}
 			// 无义务或义务已补全：意图可安全移除。
 		}
@@ -372,10 +376,12 @@ func (m *Manager) persistSuspendFinishObligations(ctx context.Context, taskID, t
 				remaining = append(remaining, o)
 			}
 		case "env":
-			// Round8 I20：env 义务携带记录时执行代际——新一代运行在位即视为
-			// 义务过时（旧义务不得清除新一代的 env 快照；对齐 I2 token 机制）。
-			if o.Token != "" {
-				if rt := m.getRuntime(taskID); rt != nil && string(rt.instVersion) != o.Token {
+			// Round9 I21：runtime 存在时，空 token 或 token 失配均不得授权清除
+			// 其 env 快照（空 token 视为新代——对齐停止意图的过时判定规则；
+			// 记录时无 runtime → 其后出现的 runtime 一律为新代）。仅 rt 为空
+			//（无本地运行面）或代际等值时才执行清除。
+			if rt := m.getRuntime(taskID); rt != nil {
+				if o.Token == "" || string(rt.instVersion) != o.Token {
 					continue
 				}
 			}
@@ -443,8 +449,10 @@ func (m *Manager) registerReapObligations(taskID string, obs []suspendFinishObli
 }
 
 // drainReapLedger 尝试落账「当前任务」的受管登记义务，返回仍未完成的（保留在
-// 登记中）。Round8 I20：只取该任务条目，调用方在该任务锁内执行——杜绝跨任务
-// 污染（A 的义务不得按 B 身份执行）。
+// 登记中）。Round8 I20：只取该任务条目。锁契约：调用方 MUST 已持有该任务的
+// keyed mutex（retryTaskNotices/retrySuspendStopIntent 持锁调用；flushReapLedger
+// 经 tryLockTask 取锁）——义务的 env 代际复核与快照写入在锁内执行，与新一代
+// Activate/收敛互斥。
 func (m *Manager) drainReapLedger(ctx context.Context, taskID string) {
 	m.reapLedgerMu.Lock()
 	pending := m.reapLedger[taskID]
@@ -461,14 +469,55 @@ func (m *Manager) drainReapLedger(ctx context.Context, taskID string) {
 	}
 }
 
+// removeReapLedgerObligations 从任务登记中移除已完成/已过时的义务副本
+// （Round9 I21②：pending 补全成功后同步消除 ledger 中的重复义务——否则后续
+// drain 会重复执行 env 清除或重复落账 tickets）。
+func (m *Manager) removeReapLedgerObligations(taskID string, done []suspendFinishObligation) {
+	if len(done) == 0 {
+		return
+	}
+	m.reapLedgerMu.Lock()
+	defer m.reapLedgerMu.Unlock()
+	list := m.reapLedger[taskID]
+	out := list[:0]
+	for _, l := range list {
+		matched := false
+		for _, d := range done {
+			if sameSuspendFinishObligation(l, d) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			out = append(out, l)
+		}
+	}
+	m.reapLedger[taskID] = out
+}
+
+// sameSuspendFinishObligation 义务稳定身份等值（Kind/Name/Reason/Tickets/
+// Retryable/Token——Tickets 逐项一致）。
+func sameSuspendFinishObligation(a, b suspendFinishObligation) bool {
+	return a.Kind == b.Kind && a.Name == b.Name && a.Reason == b.Reason &&
+		a.Retryable == b.Retryable && a.Token == b.Token &&
+		strings.Join(a.Tickets, ",") == strings.Join(b.Tickets, ",")
+}
+
 // flushReapLedger 关停收尾：逐任务 best-effort 落账受管登记，返回仍失败的
-// 任务 ID（Round8 I17：关停尝试 flush 并报告剩余失败）。
+// 任务 ID（Round8 I17：关停尝试 flush 并报告剩余失败）。Round9 I21③：flush
+// 与义务执行同样遵守任务锁约束（busy 任务保留登记并报告，不绕锁执行）。
 func (m *Manager) flushReapLedger(ctx context.Context) []string {
 	var failed []string
 	for _, id := range m.reapLedgerTaskIDs() {
+		unlock, lerr := m.tryLockTask(id)
+		if lerr != nil {
+			failed = append(failed, id)
+			continue
+		}
 		fctx, fcancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		m.drainReapLedger(fctx, id)
 		fcancel()
+		unlock()
 		if m.reapLedgerHasUnfinished(id) {
 			failed = append(failed, id)
 		}
@@ -502,6 +551,8 @@ func (m *Manager) retrySuspendStopIntent(ctx context.Context, taskID string, e n
 		if len(remaining) > 0 {
 			return false, e, fmt.Errorf("suspend stop intent: %d obligation(s) still unpersisted", len(remaining))
 		}
+		// Round9 I21②：义务已补全——同步消除 ledger 中的重复副本。
+		m.removeReapLedgerObligations(taskID, pending)
 	}
 	row, err := m.store.GetTask(ctx, taskID)
 	if err != nil {

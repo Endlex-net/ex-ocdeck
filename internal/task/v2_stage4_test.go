@@ -3382,8 +3382,11 @@ func TestStage4_R8_I17_LedgerGradualRecovery(t *testing.T) {
 	if m.reapLedgerHasUnfinished("t-gr") {
 		t.Fatalf("ledger must be drained")
 	}
-	// Round8 I17：notice 已为空的 ledger 任务仍被后台独立调度（drain 不依赖
-	// 意图存在）。
+	// Round8 I17：notice 真正清空后，ledger 任务仍被后台独立调度（drain 不依赖
+	// 意图存在——无意图则不收敛，仅落账义务）。
+	if _, werr := m.writeNoticeCAS(ctx, "t-gr", row4.Notice, sql.NullString{}); werr != nil {
+		t.Fatal(werr)
+	}
 	m.registerReapObligations("t-gr", []suspendFinishObligation{{
 		Kind: "env", TaskID: "t-gr", Token: string(rt.instVersion),
 	}})
@@ -3392,6 +3395,152 @@ func TestStage4_R8_I17_LedgerGradualRecovery(t *testing.T) {
 	}
 	if m.reapLedgerHasUnfinished("t-gr") {
 		t.Fatalf("empty-notice ledger task must still be scheduled and drained")
+	}
+	if row5, _ := fstore.GetTask(ctx, "t-gr"); strings.Contains(row5.Notice.String, "tk-gr-1") {
+		t.Fatalf("empty notice must not resurrect tickets: %q", row5.Notice.String)
+	}
+}
+
+// ---- Round 9：I21 空 token env 义务的代际隔离 + flush 锁尊重 ----
+
+// TestStage4_R9_I21_EmptyTokenEnvObligation_NewGenerationProtected 落实
+// Round9 I21：空 token 的 env 义务（记录时无 runtime）不得清除后来出现的
+// 新一代 env 快照。序列：无 runtime 停止意图（token=""）→ env 清除失败（义务
+// 进 pending+ledger 副本、收敛 suspended）→ 义务补全（rt 为空=执行清除）→
+// 意图清除+ledger 副本移除 → 重新激活建新 rt+新快照 → 后台 drain 残留的空
+// token/旧 token 义务副本：新快照与 runtime 均原样保留（代际守卫 skip）。
+func TestStage4_R9_I21_EmptyTokenEnvObligation_NewGenerationProtected(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-e9")
+	adapter := NewStoreAdapter(db)
+	fstore := &failReplayPersistStore{StoreAdapter: adapter}
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManagerStore(t, db, fstore, prov)
+	m.lifecycle = nil
+	ref := "ocdeck-v2-tui-t-e9"
+
+	// ①无 runtime 记录停止意图（空 token）；env 清除注入失败 → 义务进
+	// pending+ledger 副本、收敛 suspended、快照残留。
+	if ierr := m.recordSuspendStopIntent(ctx, "t-e9", ref, ""); ierr != nil {
+		t.Fatal(ierr)
+	}
+	fstore.failEnvClear.Store(true)
+	row, _ := fstore.GetTask(ctx, "t-e9")
+	entries, _ := parseNotices(row.Notice)
+	_ = m.retryTaskNotices(ctx, row, entries)
+	row2, _ := fstore.GetTask(ctx, "t-e9")
+	if row2.Status != "suspended" {
+		t.Fatalf("status=%s（标注先于收敛——Round6 排序）", row2.Status)
+	}
+	if !strings.Contains(row2.Notice.String, suspendFinishPendingKey) {
+		t.Fatalf("env obligation must be kept as pending: %q", row2.Notice.String)
+	}
+	if !m.reapLedgerHasUnfinished("t-e9") {
+		t.Fatalf("env obligation copy must be in ledger[t-e9]")
+	}
+
+	// ②恢复 → 重放：pending 补全（rt 为空=执行清除）→ 快照清空+意图清除+
+	// ledger 副本移除（Round8 I21② removeReapLedgerObligations 接线）。
+	fstore.failEnvClear.Store(false)
+	row3, _ := fstore.GetTask(ctx, "t-e9")
+	entries3, _ := parseNotices(row3.Notice)
+	if rerr := m.retryTaskNotices(ctx, row3, entries3); rerr != nil {
+		t.Fatalf("replay: %v", rerr)
+	}
+	if m.reapLedgerHasUnfinished("t-e9") {
+		t.Fatalf("ledger copy must be removed after pending obligations complete")
+	}
+	row4, _ := fstore.GetTask(ctx, "t-e9")
+	if strings.Contains(row4.Notice.String, suspendFinishPendingKey) {
+		t.Fatalf("pending marker must be cleared: %q", row4.Notice.String)
+	}
+
+	// ③重新激活（公开 Activate；fake sup Resume 延续原 session）→ 新 rt 注册 +
+	// 新 env 快照写回。
+	rec := &recordingV2Sup{upstream: "ses_keep", port: 4096}
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(&recordingV2Provider{sup: rec}); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+	if aerr := m.Activate(ctx, "t-e9"); aerr != nil {
+		t.Fatalf("re-activate: %v", aerr)
+	}
+	rtNew := m.getRuntime("t-e9")
+	if rtNew == nil {
+		t.Fatalf("new generation runtime must be registered")
+	}
+	newSnap := sql.NullString{String: `{"vars":{"OCDECK_TASK_ID":"t-e9","GEN":"2"}}`, Valid: true}
+	if _, werr := m.writeEnvSnapshot(ctx, "t-e9", newSnap); werr != nil {
+		t.Fatal(werr)
+	}
+
+	// ④残留的空 token env 义务副本 + 旧代 token 义务副本先后登记 → 后台调度
+	// drain：新快照与 runtime 均原样保留（空 token 视为新代；旧代失配 skip）。
+	m.registerReapObligations("t-e9", []suspendFinishObligation{
+		{Kind: "env", TaskID: "t-e9", Token: ""},
+		{Kind: "env", TaskID: "t-e9", Token: "stale-gen"},
+	})
+	if berr := m.processRetryableNotices(ctx); berr != nil {
+		t.Fatalf("background drain: %v", berr)
+	}
+	var snapAfter sql.NullString
+	if err := db.QueryRow(`SELECT env_snapshot FROM tasks WHERE id='t-e9'`).Scan(&snapAfter); err != nil {
+		t.Fatal(err)
+	}
+	if !snapAfter.Valid || snapAfter.String != newSnap.String {
+		t.Fatalf("new generation env snapshot must be preserved, got %q (want %q)", snapAfter.String, newSnap.String)
+	}
+	if rtCur := m.getRuntime("t-e9"); rtCur == nil || rtCur.instVersion != rtNew.instVersion {
+		t.Fatalf("new generation runtime must be untouched")
+	}
+	if m.reapLedgerHasUnfinished("t-e9") {
+		t.Fatalf("stale obligations must be dropped (skipped), not retained")
+	}
+}
+
+// TestStage4_R9_I21_FlushRespectsTaskLock 落实 Round9 I21③：flushReapLedger
+// 不绕任务锁——busy 任务的登记保留并进入 failed 报告，不无锁执行 drain。
+func TestStage4_R9_I21_FlushRespectsTaskLock(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-fl")
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManager(t, db, prov)
+	m.registerReapObligations("t-fl", []suspendFinishObligation{{
+		Kind: "env", TaskID: "t-fl", Token: "", Name: "ocdeck-v2-tui-t-fl",
+	}})
+	unlock, lerr := m.tryLockTask("t-fl")
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	failed := m.flushReapLedger(ctx)
+	unlock()
+	found := false
+	for _, id := range failed {
+		if id == "t-fl" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("locked task must be reported as flush-failed, failed=%v", failed)
+	}
+	if !m.reapLedgerHasUnfinished("t-fl") {
+		t.Fatalf("locked task ledger must be retained (not drained without lock)")
 	}
 }
 

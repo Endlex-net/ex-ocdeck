@@ -1056,9 +1056,11 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	// 取消在途监控重试并等待退出，先于任何 store 收敛/落库收尾。
 	m.stopV2ServerMonitoring()
 	// Round8 I17：关停 flush 受管义务登记（best-effort 逐任务落账；仍失败者
-	// 留在登记并报告——内存登记不跨进程，跨进程恢复依赖意图 pending 标注）。
+	// 留在登记并报告——Round9 I13：所有持久化出口失败时完整载荷可能仅在内存
+	// 登记中，日志须如实说明仍有未落账的内存义务，不得声称已由意图 pending
+	// 标注兜底）。
 	if failed := m.flushReapLedger(context.WithoutCancel(ctx)); len(failed) > 0 {
-		log.Printf("shutdown: reap ledger flush incomplete for tasks %v (obligations kept in intent pending markers)", failed)
+		log.Printf("shutdown: reap ledger flush incomplete for tasks %v (unpersisted in-memory obligations remain; cross-process recovery depends on intent pending markers persisted before status convergence)", failed)
 		killErr = errors.Join(killErr, fmt.Errorf("shutdown: reap ledger flush incomplete for tasks %v", failed))
 	}
 	// R7：收割内存 orphanFailures（kill 失败的孤儿会话 tickets，非仅 DB notice）。
