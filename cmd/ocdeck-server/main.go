@@ -279,6 +279,9 @@ func run() error {
 					return strings.TrimSpace(string(out)), true, nil
 				},
 				Env: task.NewV2TaskEnvSeam(tm),
+				// tasks 5.3：server 崩溃自动重拉 → 活跃 v2 任务按 binding 重建
+				// session 关联（复用既有恢复入口——Resume 延续原 session，不重复建）。
+				OnServerRestarted: tm.RebuildV2Associations,
 			})
 		v2Provider.WithHealthReporter(
 			func(h appagent.CapabilityHealth) {

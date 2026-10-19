@@ -573,16 +573,8 @@ func TestSupervisor_CrashRepull_Callback(t *testing.T) {
 	if restarts != 0 {
 		t.Fatalf("restarts=%d（首次复用不算重拉）", restarts)
 	}
-	// 崩溃：托管单元消失 + pid 清空。
-	recs.mu.Lock()
-	recs.rec.PID.Valid = false
-	recs.mu.Unlock()
-	proc.mu.Lock()
-	delete(proc.pids, ServeSessionName)
-	proc.mu.Unlock()
-	sup.mu.Lock()
-	sup.ready = false
-	sup.mu.Unlock()
+	// 崩溃：进程真实死亡（G3-F10——托管单元消失 + pid 身份报不存活，无 ready 篡改）。
+	makeProcDead(sup, proc, recs)
 	if err := sup.CheckServerAlive(context.Background()); err != nil {
 		t.Fatalf("CheckServerAlive: %v", err)
 	}

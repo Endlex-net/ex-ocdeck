@@ -139,3 +139,31 @@ func (m *Manager) shutdownV2Server(ctx context.Context) error {
 	}
 	return hook.ShutdownServer(ctx)
 }
+
+// RebuildV2Associations 是 v2 server 重拉后的任务关联重建编排（tasks 5.3 /
+// design D3「重拉后活跃任务按 binding 重建 session 关联」；main.go 装配为
+// supervisor OnServerRestarted 回调）：遍历运行时注册表快照，对 active 的 v2
+// 任务复用既有恢复入口 ensureRecovery——R1 经 Resume 延续原 session
+// （MUST NOT 重复建 session）；非 active/非 v2 任务不触碰。并发触发/恢复在途
+// 去重由 ensureRecovery 的任务锁 + incident 闸门承担，不在此重复。
+func (m *Manager) RebuildV2Associations() {
+	m.rtMu.Lock()
+	snap := make(map[string]*taskRuntime, len(m.runtimes))
+	for id, rt := range m.runtimes {
+		snap[id] = rt
+	}
+	m.rtMu.Unlock()
+	ctx := m.lifecycleCtx()
+	for taskID, rt := range snap {
+		row, err := m.store.GetTask(ctx, taskID)
+		if err != nil || row.Status != StatusActive {
+			continue
+		}
+		b, has, err := m.store.GetTaskBinding(ctx, taskID)
+		if err != nil || !has || b.ProviderID != ocdeckstore.ProviderIDV2 {
+			continue
+		}
+		tok := rt.instVersion
+		go m.ensureRecovery(taskID, tok)
+	}
+}

@@ -56,9 +56,9 @@ func (a *StoreAdapter) CommitAdoption(ctx context.Context, taskID string, b doma
 }
 
 // CommitV2Resume v2 恢复/替换提交（gate3 G3-F2/F8：binding 替换 + 旧 binding
-// 代际守卫 + 状态守卫 CAS）。
-func (a *StoreAdapter) CommitV2Resume(ctx context.Context, taskID string, oldBinding, b domain.TaskBinding, expectedStatus string) (application.TransitionResult, error) {
-	return a.db.CommitV2Resume(ctx, taskID, oldBinding, b, ocdecktask.Status(expectedStatus))
+// 代际守卫 + fromStatus→active 状态收敛，单事务）。
+func (a *StoreAdapter) CommitV2Resume(ctx context.Context, taskID string, oldBinding, b domain.TaskBinding, fromStatus string) (application.TransitionResult, error) {
+	return a.db.CommitV2Resume(ctx, taskID, oldBinding, b, ocdecktask.Status(fromStatus))
 }
 
 // CommitActivation 激活/恢复成功提交事务（tasks 4.3：binding 与状态 CAS 同事务）。

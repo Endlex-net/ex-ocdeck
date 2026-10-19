@@ -132,8 +132,11 @@ func (q *Queries) commitAdoptionInTx(ctx context.Context, taskID string, binding
 func IsAdoptionConflict(err error) bool { return errors.Is(err, ErrAdoptionConflict) }
 
 // CommitV2Resume 是 v2 恢复/替换提交原语（gate3 G3-F2：已有 v2 binding 的恢复
-// 提交——binding 替换 + 状态守卫 CAS 单事务，不走 activating→active 首次语义、
-// 无同值排除（active→active 守卫合法）。仅适用于已是 v2 命名空间的 binding。
+// 提交——binding 替换 + 旧 binding 代际守卫 + 状态收敛（fromStatus→active）单
+// 事务，不走 activating 首次语义、无同值排除（active→active 守卫合法）。
+// D4 生命周期矩阵：已有 v2 binding 的激活/恢复提交 = activating→active CAS
+//（激活/恢复入口先经 beginActivation 置 activating；from=active 守卫时状态不变）。
+// 仅适用于已是 v2 命名空间的 binding。
 //
 // G3-F8：oldBinding 为本次恢复实际读取到的旧 binding（同一次读取的事实，调用方
 // 不得二次读取）——其 Encode 产物作为代际守卫精确匹配列（`AND task_binding = ?`），
@@ -141,7 +144,7 @@ func IsAdoptionConflict(err error) bool { return errors.Is(err, ErrAdoptionConfl
 // → ErrAdoptionConflict（调用方按冲突重试语义处置，回收本次候选连接）。首次安装
 // （R5 无既有 binding）传零值 binding → 守卫退化为仅状态 CAS。
 func (q *Queries) CommitV2Resume(ctx context.Context, taskID string, oldBinding, binding domain.TaskBinding,
-	expectedStatus ocdecktask.Status) (application.TransitionResult, error) {
+	fromStatus ocdecktask.Status) (application.TransitionResult, error) {
 	if binding.ProviderID != ProviderIDV2 || binding.ProviderInstanceID != ProviderInstanceV2Default {
 		return application.TransitionResult{}, fmt.Errorf("%w: binding %s/%s 不属于 v2 命名空间",
 			ErrAdoptionConflict, binding.ProviderID, binding.ProviderInstanceID)
@@ -161,10 +164,11 @@ func (q *Queries) CommitV2Resume(ctx context.Context, taskID string, oldBinding,
 		oldRaw = or
 	}
 	return runTx(ctx, q, func(qx *Queries) (application.TransitionResult, error) {
-		// 守卫谓词：id + status + （有既有 binding 时）task_binding 精确匹配。
-		qry := `UPDATE tasks SET task_binding = ?, updated_at = ?
+		// 守卫谓词：id + fromStatus + （有既有 binding 时）task_binding 精确匹配；
+		// 命中即 binding 替换与 active 收敛同事务落库。
+		qry := `UPDATE tasks SET task_binding = ?, status = 'active', updated_at = ?
 			 WHERE id = ? AND status IS ?`
-		args := []any{raw, nowUnix(), taskID, string(expectedStatus)}
+		args := []any{raw, nowUnix(), taskID, string(fromStatus)}
 		if oldRaw != "" {
 			qry += ` AND task_binding IS ?`
 			args = append(args, oldRaw)
@@ -179,13 +183,13 @@ func (q *Queries) CommitV2Resume(ctx context.Context, taskID string, oldBinding,
 		}
 		if n == 0 {
 			return application.TransitionResult{}, fmt.Errorf("%w: task %s 守卫失配（期望 status=%s、旧 binding 代际一致）",
-				ErrAdoptionConflict, taskID, expectedStatus)
+				ErrAdoptionConflict, taskID, fromStatus)
 		}
 		return application.TransitionResult{
 			MutationResult: application.MutationResult{Matched: true},
-			StatusChanged:  false,
-			From:           expectedStatus,
-			To:             expectedStatus,
+			StatusChanged:  fromStatus != ocdecktask.StatusActive,
+			From:           fromStatus,
+			To:             ocdecktask.StatusActive,
 		}, nil
 	})
 }

@@ -2211,15 +2211,15 @@ func (c *readyOC) ListMessages(ctx context.Context, dir, sessionID string, limit
 }
 
 // CommitV2Resume 镜像 store.CommitV2Resume（gate3 G3-F2/F8 测试支撑）：binding
-// 写入 + 旧 binding 代际守卫（raw 精确匹配）+ 状态守卫 CAS。
-func (s *mockStore) CommitV2Resume(ctx context.Context, taskID string, oldBinding, b domain.TaskBinding, expectedStatus string) (application.TransitionResult, error) {
+// 写入 + 旧 binding 代际守卫（raw 精确匹配）+ fromStatus→active 状态收敛。
+func (s *mockStore) CommitV2Resume(ctx context.Context, taskID string, oldBinding, b domain.TaskBinding, fromStatus string) (application.TransitionResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, ok := s.tasks[taskID]
 	if !ok {
 		return application.TransitionResult{}, ocdeckstore_errAdoptionConflict()
 	}
-	if t.Status != expectedStatus {
+	if t.Status != fromStatus {
 		return application.TransitionResult{}, ocdeckstore_errAdoptionConflict()
 	}
 	// G3-F8 代际守卫：当前存储 raw 必须与本次读取的旧 binding 编码精确一致。
@@ -2237,9 +2237,9 @@ func (s *mockStore) CommitV2Resume(ctx context.Context, taskID string, oldBindin
 		return application.TransitionResult{}, err
 	}
 	s.bindings[taskID] = raw
-	t.Status = "active"
+	t.Status = StatusActive
 	s.tasks[taskID] = t
-	return application.TransitionResult{MutationResult: application.MutationResult{Matched: true}, StatusChanged: expectedStatus != "active", From: ocdecktask.Status(expectedStatus), To: ocdecktask.Status("active")}, nil
+	return application.TransitionResult{MutationResult: application.MutationResult{Matched: true}, StatusChanged: fromStatus != StatusActive, From: ocdecktask.Status(fromStatus), To: ocdecktask.StatusActive}, nil
 }
 
 // ocdeckstore_errAdoptionConflict 是 store 承接冲突哨兵的镜像（测试断言用；

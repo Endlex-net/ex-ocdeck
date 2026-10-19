@@ -33,9 +33,10 @@ import (
 const adoptionHandshakeTimeout = 5 * time.Second
 
 // v2ResumeStore 是 v2 恢复/替换提交的窄能力接口（G3-F2 激活分支；G3-F8：oldBinding
-// 为本次读取事实的代际守卫，调用方 MUST 传同一次读取的 binding，不得二次读取）。
+// 为本次读取事实的代际守卫，调用方 MUST 传同一次读取的 binding，不得二次读取；
+// fromStatus→active 状态收敛与 binding 替换同事务）。
 type v2ResumeStore interface {
-	CommitV2Resume(ctx context.Context, taskID string, oldBinding, b domain.TaskBinding, expectedStatus string) (application.TransitionResult, error)
+	CommitV2Resume(ctx context.Context, taskID string, oldBinding, b domain.TaskBinding, fromStatus string) (application.TransitionResult, error)
 }
 
 // adoptionStore 是承接路径的 store 窄能力接口（tasks 6.4；TaskStore 的可选
@@ -45,7 +46,7 @@ type adoptionStore interface {
 	ListTaskSessionKeys(ctx context.Context, taskID string) ([]domain.SessionKey, error)
 	GetTaskAnchor(ctx context.Context, taskID string) (anchorID, providerID, instanceID string, err error)
 	CommitAdoption(ctx context.Context, taskID string, b domain.TaskBinding, fromStatus string, lastError *string) (application.TransitionResult, error)
-	CommitV2Resume(ctx context.Context, taskID string, oldBinding, b domain.TaskBinding, expectedStatus string) (application.TransitionResult, error)
+	CommitV2Resume(ctx context.Context, taskID string, oldBinding, b domain.TaskBinding, fromStatus string) (application.TransitionResult, error)
 }
 
 // adoptionPendingLossNotice 是承接提交的如实告知 last_error（官方升级已知限制）。
@@ -205,7 +206,11 @@ func (m *Manager) adoptTaskV2(ctx context.Context, taskID string, row TaskRow, m
 
 // adoptBranchB 是 D5-B 首建：从未建立上游会话的新任务由 v2 正常首次创建
 // session（钉扎值不变；该路径不得用于替代丢失的历史 session——分支由判定矩阵
-// 唯一决定）。复用既有激活提交（CommitActivation）与 v2 Acquire。
+// 唯一决定）。提交组合按 D4 生命周期矩阵 B 行与 D4 提交条件（SSE 首帧握手先于
+// 原子提交）：接管前段（runtime+SSE）→ commitActivationBinding（activating→
+// active CAS + binding 单事务）→ 提交后段（调度器/判定就绪）。前段/提交失败 =
+// candidate 未提交：回退本地接管 + 回收 candidate（D3 受限回收例外，D9 首建
+// 补偿场景②③）+ 既有激活补偿出口（suspended + last_error）。
 func (m *Manager) adoptBranchB(ctx context.Context, taskID string, row TaskRow, mode AlignMode) error {
 	sup, _, err := m.admitExecution(ctx, taskID)
 	if err != nil {
@@ -218,10 +223,58 @@ func (m *Manager) adoptBranchB(ctx context.Context, taskID string, row TaskRow, 
 	}
 	port, password, _, eerr := m.bindingEndpoint(binding)
 	if eerr != nil {
-		return m.supervisorStageErrorForTyped(
-			appagent.NewStageError("supervisor.binding_endpoint", appagent.ErrKindBindingInvalid, eerr), taskID)
+		return m.rollbackAdoptBranchB(ctx, taskID, sup, binding,
+			m.supervisorStageErrorForTyped(
+				appagent.NewStageError("supervisor.binding_endpoint", appagent.ErrKindBindingInvalid, eerr), taskID))
 	}
-	return m.commitRuntimeReady(ctx, taskID, row, runtimeSessionName(taskID), port, password, &binding, mode, nil)
+	// 接管前段：runtime 注册 + SSE（提交条件四之一，先于原子提交）。
+	rt, terr := m.beginV2RuntimeTakeover(ctx, taskID, row, port, password, binding, mode)
+	if terr != nil {
+		m.clearRuntime(taskID) // 回退本地接管（SSE/注册表——未提交，不得留半接管）
+		return m.rollbackAdoptBranchB(ctx, taskID, sup, binding, terr)
+	}
+	// 原子提交（D4 B 行）：activating→active CAS + binding（入口 beginActivation
+	// 已置 activating；钉扎值 provider_id 列不变）。
+	cas, cerr := m.commitActivationBinding(ctx, taskID, binding, mode)
+	if cerr == nil && !cas.Matched {
+		// 冲突复读（同 v1 commitRuntimeReady 形态）：并发提交者已收敛 active →
+		// 幂等成功；否则为提交冲突（candidate 未提交，回退+回收）。
+		if fresh, rerr := m.store.GetTask(ctx, taskID); rerr == nil && fresh.Status == StatusActive {
+			m.finishV2RuntimeReady(taskID, rt)
+			return nil
+		}
+		cerr = fmt.Errorf("%w: task %s B 首建提交状态守卫失配", ocdeckstore.ErrAdoptionConflict, taskID)
+	}
+	if cerr != nil {
+		m.clearRuntime(taskID)
+		return m.rollbackAdoptBranchB(ctx, taskID, sup, binding,
+			newOpErr(codeConflict, fmt.Errorf("B 首建提交: %w", cerr)))
+	}
+	m.finishV2RuntimeReady(taskID, rt)
+	return nil
+}
+
+// rollbackAdoptBranchB 是 B 首建提交前失败的 candidate 回收（D3 受限回收例外）：
+// 经 supervisor 的 CandidateSessionRecycler 回收本次 attempt 新建且未提交的
+// session——回收 ctx 用 WithoutCancel 有界预算（activate.go 补偿同型：调用方 ctx
+// 已取消不得跳过回收）；回收失败聚合进错误链（清理债务，MUST NOT 误判「从未
+// 建立」）。recycler 未实现（装配不支持）→ 诊断性 last_error 记残留 candidate，
+// 不静默跳过。
+func (m *Manager) rollbackAdoptBranchB(ctx context.Context, taskID string, sup appagent.RuntimeSupervisor, candidate domain.TaskBinding, cause error) error {
+	rc, ok := sup.(appagent.CandidateSessionRecycler)
+	if !ok {
+		m.recordAdmissionError(ctx, taskID, fmt.Errorf(
+			"B 首建失败补偿：supervisor 未实现 CandidateSessionRecycler，candidate session %s 未回收（残留事实）",
+			candidate.UpstreamSessionID))
+		return cause
+	}
+	rcCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), activateCompensationTimeout)
+	defer cancel()
+	if rerr := rc.RecycleCandidateSession(rcCtx, candidate); rerr != nil {
+		return fmt.Errorf("%w; candidate %s 回收失败（清理债务，残留事实非「从未建立」）: %v",
+			cause, candidate.UpstreamSessionID, rerr)
+	}
+	return cause
 }
 
 // retireLegacyAssociations 承接提交成功后的旧关联退役（best-effort；失败仅
@@ -269,31 +322,52 @@ func (s *V2TaskEnvSeam) ResolveSessionEnv(ctx context.Context, taskID string, re
 	return env, nil
 }
 
-// commitV2RuntimeReady 是 v2 任务运行时就绪提交（gate3 G3-F2/F3）：注册任务
-// runtime + 启动 provider-aware SSE（快照对齐内含）+ 差评调度器/判定就绪——
-// 无 v1 式 runtime 会话探活/watchServeExit（v2 无任务 tmux 单元）、无状态 CAS
-// （调用方已完成 binding/状态事务）。失败（SSE 建立等）= 正式接管失败：任务已
-// active/binding 已提交，MUST NOT 回滚——记 last_error（恢复债务语义），由恢复
-// 循环重建，不得伪装完整可用。
-func (m *Manager) commitV2RuntimeReady(ctx context.Context, taskID string, row TaskRow, port int, password string, binding domain.TaskBinding, mode AlignMode) error {
+// beginV2RuntimeTakeover 是 v2 正式接管的提交前段（D4 提交条件：SSE 首帧握手
+// 先于原子提交）：runtime 注册 + provider-aware SSE（快照对齐内含）——无 v1 式
+// runtime 会话探活/watchServeExit（v2 无任务 tmux 单元）。返回 rt 供提交后段
+// 续用；rt 非 nil 的失败（SSE）由调用方决定回退（未提交：clearRuntime）或保留
+// （已提交：恢复债务重建）。
+func (m *Manager) beginV2RuntimeTakeover(ctx context.Context, taskID string, row TaskRow, port int, password string, binding domain.TaskBinding, mode AlignMode) (*taskRuntime, error) {
 	startMode := row.PermissionMode
 	rt := m.newRuntime(taskID)
 	if err := initPermState(rt, row, startMode); err != nil {
-		m.recordAdmissionError(ctx, taskID, fmt.Errorf("v2 runtime register: init perm state: %v", err))
-		return newOpErr(codeInternal, err)
+		return nil, fmt.Errorf("v2 runtime register: init perm state: %v", err)
 	}
 	m.setRuntime(taskID, rt)
 	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode, &binding); err != nil {
+		return rt, err
+	}
+	return rt, nil
+}
+
+// finishV2RuntimeReady 是 v2 正式接管的提交后段（F3 对齐语义）：active 后启动
+// diff review 调度器 + perm judge 就绪扫描（镜像 commitRuntimeReady Matched
+// 分支的提交后动作；幂等）。
+func (m *Manager) finishV2RuntimeReady(taskID string, rt *taskRuntime) {
+	m.StartDiffReviewSchedulerForTask(m.lifeCtx, taskID)
+	rt.setPermJudgeReady()
+	m.judgeScan(rt)
+}
+
+// commitV2RuntimeReady 是 v2 任务运行时就绪提交（gate3 G3-F2/F3；已提交路径：
+// A 分支接管/已有 v2 binding 激活/恢复）：前段接管（runtime+SSE）+ 提交后段
+// （调度器/判定就绪），无状态 CAS（调用方已完成 binding/状态事务）。失败（SSE
+// 建立等）= 正式接管失败：任务已 active/binding 已提交，MUST NOT 回滚——记
+// last_error（恢复债务语义），由恢复循环重建，不得伪装完整可用。
+func (m *Manager) commitV2RuntimeReady(ctx context.Context, taskID string, row TaskRow, port int, password string, binding domain.TaskBinding, mode AlignMode) error {
+	rt, err := m.beginV2RuntimeTakeover(ctx, taskID, row, port, password, binding, mode)
+	if err != nil {
+		if rt == nil {
+			// 接管前段初始化失败（未产生连接/订阅面）。
+			m.recordAdmissionError(ctx, taskID, err)
+			return newOpErr(codeInternal, err)
+		}
 		// 正式接管失败：已提交事务不可回滚 → last_error（恢复债务），恢复循环
 		// 按既有语义重建（不得伪装完整可用）。
 		m.recordAdmissionError(ctx, taskID, fmt.Errorf("v2 runtime SSE 接管失败（已提交，待恢复重建）: %v", err))
 		return newOpErr(codeProcessError, fmt.Errorf("v2 runtime sse subscribe: %w", err))
 	}
-	// F3 对齐语义：active 后启动 diff review 调度器 + perm judge 就绪扫描
-	//（镜像 commitRuntimeReady Matched 分支的提交后动作，无 CAS）。
-	m.StartDiffReviewSchedulerForTask(m.lifeCtx, taskID)
-	rt.setPermJudgeReady()
-	m.judgeScan(rt)
+	m.finishV2RuntimeReady(taskID, rt)
 	return nil
 }
 
@@ -309,8 +383,9 @@ func (m *Manager) adoptTakeover(ctx context.Context, taskID string, row TaskRow,
 }
 
 // resumeActivateV2 是已有 v2 binding 任务的激活分支（gate3 G3-F2）：Resume
-// 延续原 session（不建替代）→ 恢复/替换提交（binding 替换 + suspended→active
-// CAS 单事务，不走 activating 首次语义）→ 正式运行时就绪（G3-F3 同一原语）。
+// 延续原 session（不建替代）→ 恢复/替换提交（binding 替换 + activating→active
+// 状态收敛单事务——入口 beginActivation 已置 activating，D4 生命周期矩阵；不走
+// 首次语义）→ 正式运行时就绪（G3-F3 同一原语）。
 func (m *Manager) resumeActivateV2(ctx context.Context, taskID string, row TaskRow, sup appagent.RuntimeSupervisor, mode AlignMode) error {
 	astore, ok := m.store.(v2ResumeStore)
 	if !ok {

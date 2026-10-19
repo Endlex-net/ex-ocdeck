@@ -1,5 +1,6 @@
 // v2_gate3_test.go 落实 gate3（ora-9）修复验证：
-//   - F1：ready 失效路径（进程死亡 → CheckServerAlive/Acquire 同端口重拉，无手工 ready 篡改）
+//   - F10：ready 快速路径进程死亡自发现（无手工 ready 篡改——verifyAliveLocked
+//     验活失败 → 清 ready → 恢复矩阵；CheckServerAlive/Acquire 同路径）
 //   - F4：pid 有效但进程已死 → 不换端口重新 spawn
 //   - F6：进程身份 token 化精确匹配（相似 cmdline/端口前缀拒绝）
 //   - F7：并发首次 Acquire 只 spawn 一次；ShutdownServer 后拒绝新业务 ensure
@@ -20,25 +21,45 @@ import (
 	domain "ocdeck/internal/domain/agentprovider"
 )
 
-// makeProcDead 使托管单元消失 + 实例 pid 不存活（进程级 fake 状态——不触碰
-// supervisor.ready；G3-F1 真实失效路径）。
+// makeProcDead 使进程真实死亡（G3-F10：不触碰 supervisor.ready/pid）——托管
+// 单元消失 + 记录/in 内存 pid 经身份 seam 报不存活；ready 快速路径须经
+// verifyAliveLocked 自行发现失效 → 清 ready → 命中恢复矩阵。
 func makeProcDead(sup *V2Supervisor, proc *fakeProcSeam, recs *fakeRecordStore) {
 	proc.mu.Lock()
 	delete(proc.pids, ServeSessionName)
 	proc.mu.Unlock()
-	recs.mu.Lock()
-	recs.rec.PID.Valid = false
-	recs.mu.Unlock()
 	sup.mu.Lock()
-	sup.ready = false
-	sup.pid = 0
+	deadPID := sup.pid
 	sup.mu.Unlock()
+	if deadPID <= 0 {
+		recs.mu.Lock()
+		deadPID = int(recs.rec.PID.Int64)
+		recs.mu.Unlock()
+	}
+	if deadPID <= 0 {
+		return
+	}
+	base := sup.deps.ProcessIdentity
+	sup.deps.ProcessIdentity = func(q int) (string, bool, error) {
+		if q == deadPID {
+			return "", false, nil // 旧 pid 进程已死
+		}
+		return base(q)
+	}
 }
 
-// TestGate3_F1_ReadyInvalidatedOnProcessDeath 落实 G3-F1：初始化成功后使 PID
-// 不存活——CheckServerAlive 必须同端口重拉并触发回调；Acquire 亦经恢复矩阵
-// 重拉（无手工 ready 篡改之外的状态注入）。
-func TestGate3_F1_ReadyInvalidatedOnProcessDeath(t *testing.T) {
+// supervisorReadyLocked 在持锁下读取快速路径验活结果（测试观测面）。
+func supervisorReadyLocked(sup *V2Supervisor) bool {
+	sup.mu.Lock()
+	defer sup.mu.Unlock()
+	return sup.verifyAliveLocked()
+}
+
+// TestGate3_F10_ReadyFastPathDiscoversProcessDeath 落实 G3-F10（增强 F1）：
+// 进程真实死亡（无任何 ready 手工篡改）——ready 快速路径必须经
+// verifyAliveLocked 自行发现（验活失败）→ 清 ready → 命中恢复矩阵重拉；
+// CheckServerAlive 触发回调恰一次、Acquire 亦经同一快速路径恢复后建 session。
+func TestGate3_F10_ReadyFastPathDiscoversProcessDeath(t *testing.T) {
 	srv := fixtureServer(t, route{path: "/api/session", status: 200, body: string(readFixture(t, "session_list_page2.json"))})
 	var restarts int
 	sup, proc, recs := newTestSupervisor(t, srv.URL, nil)
@@ -46,19 +67,41 @@ func TestGate3_F1_ReadyInvalidatedOnProcessDeath(t *testing.T) {
 	if _, _, err := sup.ensureServer(context.Background()); err != nil {
 		t.Fatalf("init: %v", err)
 	}
+	// 快速路径验活初始通过。
+	if !supervisorReadyLocked(sup) {
+		t.Fatalf("fast path must be alive after init")
+	}
 	makeProcDead(sup, proc, recs)
-	// CheckServerAlive：失效 → 重拉同端口 → 回调。
+	// 快速路径验活失败（自行发现进程死亡——非测试注入 ready）。
+	if supervisorReadyLocked(sup) {
+		t.Fatalf("fast path liveness check must fail after real process death")
+	}
+	// CheckServerAlive：快速路径失效 → 重拉同端口 → 回调恰一次。
 	if err := sup.CheckServerAlive(context.Background()); err != nil {
 		t.Fatalf("CheckServerAlive: %v", err)
 	}
 	if restarts != 1 {
 		t.Fatalf("restarts=%d", restarts)
 	}
+	if !supervisorReadyLocked(sup) {
+		t.Fatalf("fast path must be alive after repull")
+	}
+	// 复用：快速路径验活通过 → 不再重拉（回调不增）。
 	if port, _, err := sup.ensureServer(context.Background()); err != nil || port != 4096 {
 		t.Fatalf("port=%d err=%v（同端口重拉）", port, err)
 	}
-	// Acquire 路径：再次死亡 → Acquire 内 ensureServer 重拉（同端口）后建 session。
+	if err := sup.CheckServerAlive(context.Background()); err != nil {
+		t.Fatalf("CheckServerAlive(reuse): %v", err)
+	}
+	if restarts != 1 {
+		t.Fatalf("reuse must not re-callback, restarts=%d", restarts)
+	}
+	// Acquire 路径：再次死亡 → Acquire 内 ensureServer 快速路径自行发现 → 恢复
+	// 矩阵重拉（同端口）后建 session。
 	makeProcDead(sup, proc, recs)
+	if supervisorReadyLocked(sup) {
+		t.Fatalf("fast path must fail after second death")
+	}
 	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/environment") {
@@ -95,7 +138,8 @@ func TestGate3_F4_PidDead_RespawnSamePort(t *testing.T) {
 	if _, _, err := sup.ensureServer(context.Background()); err != nil {
 		t.Fatalf("init: %v", err)
 	}
-	// 记录 pid 仍有效（不手工清）——仅进程侧死亡：身份报不存活 + 托管单元消失。
+	// 记录 pid 仍有效（不手工清）——仅进程侧真实死亡（G3-F10：无 ready 篡改，
+	// 快速路径自发现 → 记录 pid 已死 → 托管单元消失 → 同端口重启）。
 	recs.mu.Lock()
 	pid := int(recs.rec.PID.Int64)
 	recs.mu.Unlock()
@@ -106,12 +150,7 @@ func TestGate3_F4_PidDead_RespawnSamePort(t *testing.T) {
 		// 重新 spawn 的新 pid：存活且 serve 形态（同端口）。
 		return "opencode serve --port 4096 --hostname 127.0.0.1", true, nil
 	}
-	proc.mu.Lock()
-	delete(proc.pids, ServeSessionName)
-	proc.mu.Unlock()
-	sup.mu.Lock()
-	sup.ready = false
-	sup.mu.Unlock()
+	makeProcDead(sup, proc, recs)
 
 	port, _, err := sup.ensureServer(context.Background())
 	if err != nil {

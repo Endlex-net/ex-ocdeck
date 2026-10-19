@@ -299,3 +299,42 @@ func TestCommitV2Resume_OldBindingGenerationGuard(t *testing.T) {
 		t.Fatalf("stale generation must conflict, got %v", err)
 	}
 }
+
+// TestCommitV2Resume_ActivatingConvergesToActive 落实 D4 生命周期矩阵：已有 v2
+// binding 的激活/恢复提交 = activating→active CAS——from=activating 时 binding
+// 替换与 active 收敛同事务（MUST NOT 卡 activating）。
+func TestCommitV2Resume_ActivatingConvergesToActive(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	seedAdoptableTask(t, db, "t1", "active")
+	q := db.Queries
+	base := domain.TaskBinding{
+		Version: domain.TaskBindingVersion, ProviderID: ProviderIDV2,
+		ProviderInstanceID: ProviderInstanceV2Default, UpstreamSessionID: "sess-a",
+		TerminalRef: "ocdeck-v2-tui-t1",
+		Data:        []byte(`{"port":4096,"directory":"/wt","taskId":"t1","origin":"adopted","auth":{"kind":"derived"}}`),
+	}
+	if _, err := q.CommitAdoption(ctx, "t1", base, ocdecktask.StatusActive, nil); err != nil {
+		t.Fatalf("seed v2 binding: %v", err)
+	}
+	// 恢复入口 beginActivation 已置 activating；from=activating 提交 → active。
+	if _, err := db.Exec(`UPDATE tasks SET status='activating' WHERE id='t1'`); err != nil {
+		t.Fatal(err)
+	}
+	cand := base
+	cand.Data = []byte(`{"port":4096,"directory":"/wt","taskId":"t1","origin":"created","auth":{"kind":"derived"}}`)
+	res, err := q.CommitV2Resume(ctx, "t1", base, cand, ocdecktask.StatusActivating)
+	if err != nil {
+		t.Fatalf("CommitV2Resume(activating): %v", err)
+	}
+	if !res.Matched || !res.StatusChanged || res.To != ocdecktask.StatusActive {
+		t.Fatalf("result: %+v（activating→active 收敛）", res)
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM tasks WHERE id='t1'`).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "active" {
+		t.Fatalf("status=%s, want active（不得卡 activating）", status)
+	}
+}

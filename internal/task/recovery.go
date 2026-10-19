@@ -878,10 +878,11 @@ func (m *Manager) runRecoveryAttempt(ctx context.Context, taskID string, trigger
 			return err
 		}
 		if v2Path {
-			// v2 恢复提交（gate3 G3-F2/F3）：binding 替换 + active 守卫 CAS
-			//（CommitV2Resume；无 v1 runtime 会话探活/watchServeExit）+ 正式运行
-			// 时就绪（provider-aware SSE/对齐）。失败记恢复债务（已替换 binding
-			// 不可回滚——不得伪装完整可用），恢复循环重建。
+			// v2 恢复提交（gate3 G3-F2/F3）：binding 替换 + activating→active 状态
+			// 收敛单事务（CommitV2Resume——beginActivation 已置 activating；无 v1
+			// runtime 会话探活/watchServeExit）+ 正式运行时就绪（provider-aware
+			// SSE/对齐）。失败记恢复债务（已替换 binding 不可回滚——不得伪装完整
+			// 可用），恢复循环重建。
 			astore := m.adoptionStoreOf()
 			if astore == nil {
 				inc.releaseProcess()

@@ -559,10 +559,10 @@ run-all 最终返回码：任一阶段返回 2 或 5 时立即终止并直接返
 | # | 必答项 | status | decision / evidence |
 |---|---|---|---|
 | 1 | provider_id 钉扎 | resolved | `tasks.provider_id` 保持创建时钉扎值不变；承接不改变钉扎语义（用户已锁定「任务创建时钉死 providerID」）。实际执行 provider 由分派时的机器实装版本决定，不新增持久化字段。证据：本结论节 + 用户决策记录 |
-| 2 | binding envelope 映射 | pending | 逐项映射规则依赖 v2 Data 编码细节，留待 v2 provider 实现 change 完成；上游侧前置事实（session ID 保留、endpoint/凭据重启后可获得）已由 cutover-check 与 recovery.01 覆盖 |
-| 3 | v1 私有 Data 解析 | pending | 承接时由 v2 provider 按自身编码重建 Data；terminal/endpoint/凭据在承接时重建（recovery.01 实证重启后上游事实可获得）。v1 Data 的逐字段迁移规则待实现 change |
+| 2 | binding envelope 映射 | resolved | envelope 六字段逐项：Version 不变；ProviderID `opencode-v1`→`opencode-v2`；ProviderInstanceID 不变（`default`）；UpstreamSessionID **不变**（官方升级保留，origin=adopted）；TerminalRef 重建为 `ocdeck-v2-tui-<taskID>`；Data 由 v1 私有形状重建为 `v2BindingData{port,directory,taskId,origin:adopted,auth{kind:derived}}`；写入经承接单事务 CommitAdoption（与归属转换/anchor/状态 CAS 同事务）。证据：实现 `internal/infrastructure/store/adoption_tx.go` + `internal/infrastructure/opencode2/binding.go` + 实现 change design D2/D5 |
+| 3 | v1 私有 Data 解析 | resolved | v1 私有 Data **不由 v2 provider 解析**：承接只读 envelope 层 UpstreamSessionID（非 Data）；v1 Data 随旧运行关联退役（best-effort 释放，失败仅 cleanup notice）；terminal/endpoint/凭据由 v2 侧重建（TUI 托管单元 + 固定实例端口 + 实例标识派生凭据）。证据：实现 `internal/task/v2_adopt.go` + 实现 change design D5 归属映射表 |
 | 4 | 迁移保留 session ID | resolved | **保留**。cutover-check 实证 v1 session `ses_ec74cdc2affe4yu6EOZ8oC7KHl` 经官方升级路径后在 v2 原 ID 可见（`evidence/cutover-check-20261014T043705Z/cutover-result.json`）；ID 冲突备选规则不触发 |
-| 5 | 四种路径连续性 | pending | 进程重启路径已实证（recovery.01 PASS）；首次/重复承接与中途失败的连续性语义需随承接设计在实现 change 中定义并用集成测试覆盖 |
+| 5 | 四种路径连续性 | resolved | 四路径均保持同一原 session：首次承接（单事务 CommitAdoption，suspended→active 或 active→active 守卫）；重复激活（Resume 非 Acquire，upstream 不变）；进程/server 重启（supervisor 恢复矩阵重拉 + 按 binding Resume 重建关联）；承接中途失败重试（CAS 冲突/事务失败整体回滚零写入，重试沿用同一 anchor 目标）。测试覆盖：`TestGate3_F3_Adoption_CommittedThenTakeover`、`TestGate3_F2_ExistingV2Binding_ResumeNotAcquire`、`TestStage4_V2Recovery_ServerRestart_ResumeKeepsSameSession`、`TestStage4_AdoptionCommitConflict_RetryKeepsSameSession`、`TestStage4_OnServerRestarted_RebuildResumesActiveV2Only`。证据：`internal/task/v2_stage4_test.go`、`internal/infrastructure/opencode2/v2_stage4_test.go` |
 | 6 | 回滚形态区分 | resolved | 「仅代码回滚（数据未被 v2 改写）」= 回到 v1 原始状态，安全（v1 布局未被触碰）。「数据被 v2 改写后 v1 打开」= **用户锁定的产品边界：单向迁移、不提供反向可读承诺**；反向可读性本身**未验证**（migration.reverse INCONCLUSIVE，最低样本未达成，不作任何方向性推断）。证据：差异清单 #11（存储形态实证）+ migration.reverse 归档记录 |
 | 7 | 承接前置条件关联 | resolved | 承接前置面 = migration.forward 四分类封闭集合（D5）。forward 未命中任何失败分类（INCONCLUSIVE 非负面实证）；官方升级路径 PASS 提供承接数据可用性的替代实证（cutover-check）。关联证据：`evidence/20261014T042602Z-90e9d6ed/results.jsonl`、`evidence/cutover-check-20261014T043705Z/` |
 | 8 | 跨版本兼容边界 | resolved | v2 钉扎任务在 v1 机器激活：fail-closed——比较钉扎 providerID 主版本与机器实装主版本，钉扎 > 实装即拒绝激活；错误语义与提示口径在实现 change 中映射到既有 ErrorKind |
@@ -584,6 +584,8 @@ run-all 最终返回码：任一阶段返回 2 或 5 时立即终止并直接返
 按用户决策修订验收语义后重新推导：第 2 条不命中（官方升级路径 PASS 替代 migration.forward 门槛）。第 3 条——capability.01 经等价实证不再命中；status.01 的 `capability_verdict=不可满足` 是 probe 依据旧 wire 端点失败给出的判定，**只证明端点不兼容、未证明能力缺失**（候选等价映射存在但未实证）——修订判定依据：①该 probe 的契约断言对象是 wire 端点形状（D4 status.01 行），不是能力存在性；②候选等价形态的 schema 依据存在（v2 OpenAPI 快照）；③运行时等价性未验证（event.02d INCONCLUSIVE）。据此 status.01 的能力判定修订为「待验证」，第 3 条不据此判能力缺失，由第 4 条接住。第 4 条——16 项 live/migration INCONCLUSIVE + 11 项静态 FETCH_ERROR（共 27 项，为归档 run 原始计数；terminal.01 的 PASS 更正为 INCONCLUSIVE 另计，见下方「terminal.01 结论更正」）+ D6 第 2/3/5 项 pending + status.01 能力待验证。
 
 **修订后最终结论：待补证据（D8 第 4 条），不输出无条件 GO。** 阻断项为：status.01 等价能力的运行时实证、模型/fixture 依赖项补证、适配缺口类修正后重跑、D6 第 2/3/5 项回填、terminal.01 拒绝语义的覆盖口径决策。这些项全部转为 v2 provider 实现 change 的前置任务，由实现 change 收口后终判。
+
+**终判回填（2026-10-16，v2 provider 实现 change 收口）**：阻断项全部解决——status 等价能力已实证并冻结映射（SSE `session.execution.started/succeeded`→busy/idle，evidence run 20261016T090000Z-0bb6ac6c）；模型/fixture 依赖项补证全部 PASS（同 run）；适配缺口类修正后重跑全部 PASS（run 20261015T165420Z-4013391d）；terminal.01 覆盖口径已定（REST 预验证负责「不存在 session 拒绝」，TUI 自动定位经 `--server`+`--session` 独立实证）；D6 第 2/3/5 项已回填（见上表 resolved）。migration.forward 为有效负面（pending permission 内存态丢失）——属官方升级语义、已记承接已知限制，不命中 `handoff_prerequisite` 四分类。**终判：GO（按用户决策修订验收语义）**——v2 provider 实现与承接路径已按本结论落地并通过实现 change 的阶段门禁。
 
 **terminal.01 结论更正**：run `20261014T045810Z-f125cafd` 中 terminal.01 记为 PASS，其「不存在 ID 拒绝」子断言实证的只是 REST 查询 404 语义，未覆盖原契约的「第二实例选择不存在 session 拒绝启动/连接」语义（v2 serve 无 `--session`，CLI 侧无等价形态）。harness 已修正为整项 INCONCLUSIVE（共享可见事实保留实证）；归档 run 的该条 PASS 按本更正作废。是否将契约覆盖口径修订为 REST 检查，留待实现 change 决策。
 

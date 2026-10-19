@@ -461,23 +461,75 @@ func (s *V2Supervisor) Acquire(ctx context.Context, task appagent.TaskRef) (doma
 		return domain.TaskBinding{}, appagent.NewError("supervisor.acquire",
 			appagent.ErrKindRuntimeUnavailable, err)
 	}
-	// 契约发现校验（2.5；失败 → 本次 attempt 失败，candidate session 由 task 层
-	// 首建补偿受限回收）。
+	// 首建补偿（D3 受限回收例外）：POST 已成功后的 attempt 失败——本次新建且
+	// 未提交的 candidate session 经 SessionControl.Delete 回收（candidate 所有权
+	// 不出本 attempt：失败路径不返回 session id，回收只能在此收口）。
+	binding, aerr := s.finishAcquire(ctx, c, created.ID, task, port)
+	if aerr != nil {
+		s.recycleCandidate(ctx, c, created.ID)
+		return domain.TaskBinding{}, aerr
+	}
+	return binding, nil
+}
+
+// finishAcquire POST 成功后的 attempt 收尾：契约发现校验（2.5）+ 配置应用链
+// （5.4，完成确认先于返回 binding）+ 组装 binding（origin=created）。
+func (s *V2Supervisor) finishAcquire(ctx context.Context, c *Client, createdID string, task appagent.TaskRef, port int) (domain.TaskBinding, error) {
 	contract, err := s.contractOf(ctx, c)
 	if err != nil {
 		return domain.TaskBinding{}, appagent.NewError("supervisor.acquire",
 			appagent.ErrKindCapabilityUnavailable, err)
 	}
-	if !contract.ValidSessionID(created.ID) {
+	if !contract.ValidSessionID(createdID) {
 		return domain.TaskBinding{}, appagent.NewError("supervisor.acquire",
 			appagent.ErrKindRuntimeUnavailable,
-			fmt.Errorf("session id %q 不匹配运行时发现的 pattern %q", created.ID, contract.SessionIDPatternRaw))
+			fmt.Errorf("session id %q 不匹配运行时发现的 pattern %q", createdID, contract.SessionIDPatternRaw))
 	}
 	// 配置应用链（5.4）：首次路径按当前值应用，完成确认先于返回 binding。
-	if err := s.applySessionEnvAt(ctx, c, created.ID, task.TaskID, false); err != nil {
+	if err := s.applySessionEnvAt(ctx, c, createdID, task.TaskID, false); err != nil {
 		return domain.TaskBinding{}, err
 	}
-	return lifecycleBinding(task.TaskID, task.Directory, created.ID, port, originCreated)
+	return lifecycleBinding(task.TaskID, task.Directory, createdID, port, originCreated)
+}
+
+// noteCandidateDebt 记录 candidate 回收清理债务（last_error 位，含残留 session
+// id——不误判「从未建立会话」）。
+func (s *V2Supervisor) noteCandidateDebt(ctx context.Context, candidateID string, derr error) {
+	_ = s.deps.Store.SetProviderRuntimeError(ctx, ProviderID, ProviderInstanceID,
+		fmt.Sprintf("首建补偿回收 candidate session %s 失败（残留事实，非「从未建立」）: %v", candidateID, derr))
+}
+
+// recycleCandidate 首建失败补偿的受限回收（D3）：DELETE 失败记清理债务，不掩盖
+// 原错误（Acquire attempt 内收口——candidate id 未出本 attempt）。
+func (s *V2Supervisor) recycleCandidate(ctx context.Context, c *Client, candidateID string) {
+	if derr := c.DeleteSession(ctx, candidateID); derr != nil {
+		s.noteCandidateDebt(ctx, candidateID, derr)
+	}
+}
+
+// RecycleCandidateSession 是任务层首建失败补偿的 candidate 回收入口（D3 受限
+// 回收例外；application CandidateSessionRecycler 窄接口）：删除本次 attempt 新建
+// 且未提交的上游 session（以 binding upstream 为准）；DELETE 失败记实例清理债务
+// 并返回错误供调用方聚合（不掩盖原失败）。无 upstream（candidate 未返回/已回收）
+// 幂等成功。
+func (s *V2Supervisor) RecycleCandidateSession(ctx context.Context, b domain.TaskBinding) error {
+	if b.UpstreamSessionID == "" {
+		return nil
+	}
+	data, derr := decodeV2Binding(b)
+	if derr != nil {
+		return appagent.NewError("supervisor.recycle_candidate", appagent.ErrKindBindingInvalid, derr)
+	}
+	password, perr := derivePassword()
+	if perr != nil {
+		return appagent.NewError("supervisor.recycle_candidate", appagent.ErrKindBindingInvalid, perr)
+	}
+	c := s.newClient(data.Port, password, Options{})
+	if derr := c.DeleteSession(ctx, b.UpstreamSessionID); derr != nil {
+		s.noteCandidateDebt(ctx, b.UpstreamSessionID, derr)
+		return appagent.NewError("supervisor.recycle_candidate", appagent.ErrKindRuntimeUnavailable, derr)
+	}
+	return nil
 }
 
 // Resume 恢复/承接延续（R1 恢复 + D5-A 承接 A 共用入口）：server 存活检查 →
