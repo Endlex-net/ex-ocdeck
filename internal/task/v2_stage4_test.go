@@ -66,8 +66,8 @@ func seedV2ActiveTaskUpstream(t *testing.T, db *store.DB, taskID, upstream strin
 		t.Fatal(serr)
 	}
 	if _, err := db.Exec(`INSERT INTO tasks (id, project_id, name, branch, status, worktree_path,
-		 provider_id, task_binding, env_snapshot, created_at, updated_at)
-		 VALUES (?, ?, 'task', 'b', 'active', '/wt', ?, ?, ?, ?, ?)`,
+		 base_ref, provider_id, task_binding, env_snapshot, created_at, updated_at)
+		 VALUES (?, ?, 'task', 'b', 'active', '/wt', 'refs/heads/main', ?, ?, ?, ?, ?)`,
 		taskID, "p-"+taskID, ocdeckstore.ProviderIDV2, raw, snap, now, now); err != nil {
 		t.Fatal(err)
 	}
@@ -5459,4 +5459,68 @@ func TestR1_K1_UnknownCreate_KeepsGate_RealProvider(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---- 收尾：v2 重激活同代快照持久化（env snapshot missing 修复） ----
+
+// TestR1_ResumeV2_RepersistsEnvSnapshot 落实生产 bug 回归（Docker 实测：全新
+// 任务重激活死于「resolve session env: env snapshot missing」）：Suspend 清
+// env 快照而 binding 保留（R4 I17）→ 重激活 resumeActivateV2 MUST 在
+// Resume(origin=created, recovery=true) 之前重建同代快照——不预置 env_snapshot
+// 的真实 store + 真实 provider harness，两轮 Activate 均成功且快照落盘。
+func TestR1_ResumeV2_RepersistsEnvSnapshot(t *testing.T) {
+	ctx := context.Background()
+	h := newRealStreamHarness(t, "t-env9", "ses_keep", "suspended")
+	// 模拟 suspend 后形态：env 快照缺失（binding origin=created 保留）。
+	if _, err := h.db.Exec(`UPDATE tasks SET env_snapshot='', base_ref='refs/heads/main' WHERE id='t-env9'`); err != nil {
+		t.Fatal(err)
+	}
+	warmRealStreamHarness(t, h)
+
+	activate := func(round int) {
+		if aerr := h.m.Activate(ctx, "t-env9"); aerr != nil {
+			if strings.Contains(aerr.Error(), "env snapshot missing") {
+				t.Fatalf("round %d: resume must repersist env snapshot before Resume, got %v", round, aerr)
+			}
+			t.Fatalf("round %d Activate: %v", round, aerr)
+		}
+		row, err := h.adapter.GetTask(ctx, "t-env9")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row.Status != "active" {
+			t.Fatalf("round %d status=%s", round, row.Status)
+		}
+		if !row.EnvSnapshot.Valid || row.EnvSnapshot.String == "" {
+			t.Fatalf("round %d env snapshot must be persisted", round)
+		}
+		binding, has, berr := h.adapter.GetTaskBinding(ctx, "t-env9")
+		if berr != nil || !has || binding.UpstreamSessionID != "ses_keep" || binding.ProviderID != ocdeckstore.ProviderIDV2 {
+			t.Fatalf("round %d binding continuity: %+v has=%v err=%v", round, binding, has, berr)
+		}
+	}
+
+	// 第 1 轮：快照缺失 → 重激活重建（修复面）。
+	activate(1)
+	// 收敛第 1 轮运行面（释放 /api/event 连接），模拟进程重启后以全新 Manager
+	// 走第 2 轮（连接计数随之放开 1→2）。
+	h.m.clearRuntime("t-env9")
+	h.allowConns = 2
+	m2 := newTestManagerFull(t, h.adapter, nil, newMockProc(), newMockWorktree(), h.oc)
+	m2.SetLifecycleCtx(ctx)
+	m2.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg2 := appagent.NewRegistry()
+	if err := reg2.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg2.Register(h.prov); err != nil {
+		t.Fatal(err)
+	}
+	m2.providerRegistry = reg2
+	// 第 2 轮：再次清空（模拟又一轮 suspend 清除）→ 重激活再次重建（周期形态）。
+	if _, err := h.db.Exec(`UPDATE tasks SET env_snapshot='', status='suspended', base_ref='refs/heads/main' WHERE id='t-env9'`); err != nil {
+		t.Fatal(err)
+	}
+	h.m = m2
+	activate(2)
 }

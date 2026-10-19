@@ -603,6 +603,20 @@ func (m *Manager) resumeActivateV2(ctx context.Context, taskID string, row TaskR
 		m.recordAdmissionError(ctx, taskID, err)
 		return err
 	}
+	// D8 对齐（v1 attempt 顶部 activate.go:752-757 同语义）：已有 v2 binding 的
+	// 激活 MUST 保证任何 recovery=true 的 env 解析（Resume→applySessionEnvAt→
+	// loadEnvSnapshot）之前快照在位——Suspend 会清 env 快照而 binding 保留
+	// （R4 I17），缺失即在此重建同代快照，否则 Resume(created) 死于
+	// 「env snapshot missing」。快照已在 → 不重分层直接可用（recovery.go:837
+	// 同哲学）；端口在 Resume 前未知传 0（与首建 Acquire 的
+	// ResolveSessionEnv(false)→mergeEnvSnapshot(0) 同口径）；快照损坏不由本处
+	// 修复，仍由 loadEnvSnapshot fail-closed（D8 不变）。
+	if !row.EnvSnapshot.Valid || row.EnvSnapshot.String == "" {
+		if _, merr := m.mergeEnvSnapshot(ctx, row, 0); merr != nil {
+			m.recordAdmissionError(ctx, taskID, merr)
+			return newOpErr(codeInternal, merr)
+		}
+	}
 	cur, has, err := m.store.GetTaskBinding(ctx, taskID)
 	if err != nil {
 		return err

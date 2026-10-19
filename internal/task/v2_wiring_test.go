@@ -99,6 +99,7 @@ func seedTaskRow(t *testing.T, ms *mockStore, taskID string) {
 	ms.tasks[taskID] = TaskRow{
 		ID: taskID, ProjectID: "p1", Name: "task", Branch: "b",
 		Status: "suspended", WorktreePath: "/wt", Mode: "worktree",
+		BaseRef: "refs/heads/main",
 		ProviderID: ocdeckstore.ProviderIDV1,
 	}
 	if ms.projects == nil {
