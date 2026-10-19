@@ -3036,7 +3036,7 @@ func TestStage4_R7_I17_ReapTicketsSurviveViaLedger(t *testing.T) {
 	delete(mproc.sessions, ref)
 	mproc.mu.Unlock()
 	// 本轮义务必须已进受管登记（进程内有生命周期的重试载荷）。
-	if len(m.reapLedgerSnapshot()) == 0 {
+	if len(m.reapLedgerSnapshot("t-r7")) == 0 {
 		t.Fatalf("obligations must be registered in the managed ledger")
 	}
 
@@ -3068,7 +3068,7 @@ func TestStage4_R7_I17_ReapTicketsSurviveViaLedger(t *testing.T) {
 	if strings.Contains(row3.Notice.String, noticeCodeSuspendStop) {
 		t.Fatalf("intent must be cleared after converged replay: %q", row3.Notice.String)
 	}
-	if len(m.reapLedgerSnapshot()) != 0 {
+	if len(m.reapLedgerSnapshot("t-r7")) != 0 {
 		t.Fatalf("ledger must be drained after persistence recovers")
 	}
 }
@@ -3185,6 +3185,213 @@ func TestStage4_R6_I19_SuspendCompletesPendingOrKeepsIt(t *testing.T) {
 	}
 	if !strings.Contains(row6.Notice.String, "tk-r6-2") {
 		t.Fatalf("tickets must be persisted after replay completion: %q", row6.Notice.String)
+	}
+}
+
+// ---- Round 8：I20 ledger 按任务隔离 · I17 重试生命周期闭环 ----
+
+// TestStage4_R8_I20_LedgerPerTaskIsolation 落实 Round8 I20：A 挂起失败留下
+// notice+env 义务（受管登记按任务分组）→ 先触发 B 的重试调度——B 的 notice/
+// env 快照/运行关联零污染（A 的义务不得按 B 身份执行）；随后 A 重试——原
+// tickets 落账收割（收割目标=原 tickets）+ A env 快照清除。
+func TestStage4_R8_I20_LedgerPerTaskIsolation(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-ia")
+	seedV2ActiveTask(t, db, "t-ib")
+	adapter := NewStoreAdapter(db)
+	fstore := &failReplayPersistStore{StoreAdapter: adapter}
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManagerStore(t, db, fstore, prov)
+	m.lifecycle = nil
+	rtA := m.newRuntime("t-ia")
+	m.setRuntime("t-ia", rtA)
+	rtB := m.newRuntime("t-ib")
+	m.setRuntime("t-ib", rtB)
+	mproc := m.proc.(*mockProc)
+	mproc.mu.Lock()
+	mproc.sessions["ocdeck-v2-tui-t-ia"] = true
+	mproc.killResults["ocdeck-v2-tui-t-ia"] = process.KillResult{
+		SessionKilled:  false,
+		Disposition:    process.DispositionKillFailed,
+		CleanupTickets: []string{"tk-iso-1", "tk-iso-2"},
+	}
+	mproc.mu.Unlock()
+
+	// A：停止确认 + 持续失败（notice CAS + env 清除）→ 义务进 ledger[A]，
+	// 标注失败 → A 保持 active。
+	refA := "ocdeck-v2-tui-t-ia"
+	if ierr := m.recordSuspendStopIntent(ctx, "t-ia", refA, string(rtA.instVersion)); ierr != nil {
+		t.Fatal(ierr)
+	}
+	fstore.failNoticeCAS.Store(true)
+	fstore.failEnvClear.Store(true)
+	rowA, _ := fstore.GetTask(ctx, "t-ia")
+	entriesA, _ := parseNotices(rowA.Notice)
+	if rerr := m.retryTaskNotices(ctx, rowA, entriesA); rerr == nil {
+		t.Fatalf("A persistence failure must surface")
+	}
+	if !m.reapLedgerHasUnfinished("t-ia") {
+		t.Fatalf("A obligations must be registered in ledger[t-ia]")
+	}
+	// Round8 I20 污染检测点（A 重放后、B 收敛前）：ledger[A] 持有 env 义务——
+	// 若被按 B 身份误执行，此处 B 的快照已被清。快照必须原样保留。
+	var snapB0 sql.NullString
+	if err := db.QueryRow(`SELECT env_snapshot FROM tasks WHERE id='t-ib'`).Scan(&snapB0); err != nil {
+		t.Fatal(err)
+	}
+	if !snapB0.Valid || snapB0.String == "" {
+		t.Fatalf("B env snapshot must be untouched by A's ledger before B converges")
+	}
+	// B：正常停止收敛（成功）。注入先解除（B 的意图记录与收敛走健康通道）。
+	fstore.failNoticeCAS.Store(false)
+	fstore.failEnvClear.Store(false)
+	refB := "ocdeck-v2-tui-t-ib"
+	if ierr := m.recordSuspendStopIntent(ctx, "t-ib", refB, string(rtB.instVersion)); ierr != nil {
+		t.Fatal(ierr)
+	}
+	if serr := m.Suspend(ctx, "t-ib"); serr != nil {
+		t.Fatalf("suspend B: %v", serr)
+	}
+
+	// 先触发 B 的重试调度（B notice 已空但 Suspend 成功后无意图——直取 B 行重放，
+	// 隔离性断言不受 A 残留影响）。
+	rowB, _ := fstore.GetTask(ctx, "t-ib")
+	entriesB, _ := parseNotices(rowB.Notice)
+	if rerr := m.retryTaskNotices(ctx, rowB, entriesB); rerr != nil {
+		t.Fatalf("replay B: %v", rerr)
+	}
+	// B 零污染断言：env 快照原样保留（A 的 env 义务不得清 B 的快照）、无 A 的
+	// tickets 债务、B 保持 suspended。
+	rowB2, _ := fstore.GetTask(ctx, "t-ib")
+	if rowB2.Status != "suspended" {
+		t.Fatalf("B status=%s", rowB2.Status)
+	}
+	if strings.Contains(rowB2.Notice.String, "tk-iso-1") || strings.Contains(rowB2.Notice.String, "tk-iso-2") {
+		t.Fatalf("A tickets must not leak into B: %q", rowB2.Notice.String)
+	}
+	// B 自身收敛成功后快照清除属正常语义（污染检测见上方 snapB0 断言）。
+
+	// A 恢复 → 重放：原 tickets 落账收割（收割目标=原 tickets）+ A env 清除 +
+	// 收敛 suspended + 意图清除。
+	fstore.failNoticeCAS.Store(false)
+	fstore.failEnvClear.Store(false)
+	rowA2, _ := fstore.GetTask(ctx, "t-ia")
+	entriesA2, _ := parseNotices(rowA2.Notice)
+	if rerr := m.retryTaskNotices(ctx, rowA2, entriesA2); rerr != nil {
+		t.Fatalf("replay A(restore): %v", rerr)
+	}
+	rowA3, _ := fstore.GetTask(ctx, "t-ia")
+	if rowA3.Status != "suspended" {
+		t.Fatalf("A status=%s", rowA3.Status)
+	}
+	if !strings.Contains(rowA3.Notice.String, "tk-iso-1") || !strings.Contains(rowA3.Notice.String, "tk-iso-2") {
+		t.Fatalf("A original tickets must be persisted after recovery: %q", rowA3.Notice.String)
+	}
+	if strings.Contains(rowA3.Notice.String, noticeCodeSuspendStop) {
+		t.Fatalf("A intent must be cleared after converged replay: %q", rowA3.Notice.String)
+	}
+	var snapA sql.NullString
+	if err := db.QueryRow(`SELECT env_snapshot FROM tasks WHERE id='t-ia'`).Scan(&snapA); err != nil {
+		t.Fatal(err)
+	}
+	if snapA.Valid && snapA.String != "" {
+		t.Fatalf("A env snapshot must be cleared by A's own obligation, got %q", snapA.String)
+	}
+	if m.reapLedgerHasUnfinished("t-ia") || m.reapLedgerHasUnfinished("t-ib") {
+		t.Fatalf("ledgers must be drained")
+	}
+}
+
+// TestStage4_R8_I17_LedgerGradualRecovery 落实 Round8 I17 重试生命周期闭环：
+// drain 持续失败（逐步恢复而非一次性）→ 意图作为唯一重试入口持续保有（不得
+// 清除）→ 恢复后按原 tickets 落账收割（union 不膨胀）→ 收敛 suspended + 意图
+// 清除。
+func TestStage4_R8_I17_LedgerGradualRecovery(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-gr")
+	adapter := NewStoreAdapter(db)
+	fstore := &failReplayPersistStore{StoreAdapter: adapter}
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManagerStore(t, db, fstore, prov)
+	m.lifecycle = nil
+	rt := m.newRuntime("t-gr")
+	m.setRuntime("t-gr", rt)
+	mproc := m.proc.(*mockProc)
+	mproc.mu.Lock()
+	mproc.sessions["ocdeck-v2-tui-t-gr"] = true
+	mproc.killResults["ocdeck-v2-tui-t-gr"] = process.KillResult{
+		SessionKilled:  false,
+		Disposition:    process.DispositionKillFailed,
+		CleanupTickets: []string{"tk-gr-1"},
+	}
+	mproc.mu.Unlock()
+	ref := "ocdeck-v2-tui-t-gr"
+	if ierr := m.recordSuspendStopIntent(ctx, "t-gr", ref, string(rt.instVersion)); ierr != nil {
+		t.Fatal(ierr)
+	}
+
+	// 第 1/2 轮：notice CAS 持续失败 → 义务留 ledger、意图保留（唯一重试入口）、
+	// 状态保持 active（Round6 排序：标注未落库不收敛）。
+	fstore.failNoticeCAS.Store(true)
+	for round := 0; round < 2; round++ {
+		row, _ := fstore.GetTask(ctx, "t-gr")
+		entries, _ := parseNotices(row.Notice)
+		if rerr := m.retryTaskNotices(ctx, row, entries); rerr == nil {
+			t.Fatalf("round %d: persistence failure must surface", round)
+		}
+		if !m.reapLedgerHasUnfinished("t-gr") {
+			t.Fatalf("round %d: ledger obligations must be retained", round)
+		}
+		if !strings.Contains(row.Notice.String, noticeCodeSuspendStop) {
+			t.Fatalf("round %d: intent is the sole retry entry and must be kept", round)
+		}
+		if r, _ := fstore.GetTask(ctx, "t-gr"); r.Status != "active" {
+			t.Fatalf("round %d: status must stay active (annotate not persisted), got %s", round, r.Status)
+		}
+	}
+
+	// 恢复 → 后台调度（Round8 I17：processRetryableNotices 独立覆盖 ledger
+	// 任务）：债务落账（tickets union 不膨胀=原 tickets）→ 收敛 suspended →
+	// 意图清除。
+	fstore.failNoticeCAS.Store(false)
+	if berr := m.processRetryableNotices(ctx); berr != nil {
+		t.Fatalf("background scheduling: %v", berr)
+	}
+	row4, _ := fstore.GetTask(ctx, "t-gr")
+	if row4.Status != "suspended" {
+		t.Fatalf("status=%s", row4.Status)
+	}
+	if !strings.Contains(row4.Notice.String, "tk-gr-1") {
+		t.Fatalf("original tickets must be persisted: %q", row4.Notice.String)
+	}
+	if strings.Contains(row4.Notice.String, noticeCodeSuspendStop) {
+		t.Fatalf("intent must be cleared: %q", row4.Notice.String)
+	}
+	if m.reapLedgerHasUnfinished("t-gr") {
+		t.Fatalf("ledger must be drained")
+	}
+	// Round8 I17：notice 已为空的 ledger 任务仍被后台独立调度（drain 不依赖
+	// 意图存在）。
+	m.registerReapObligations("t-gr", []suspendFinishObligation{{
+		Kind: "env", TaskID: "t-gr", Token: string(rt.instVersion),
+	}})
+	if berr := m.processRetryableNotices(ctx); berr != nil {
+		t.Fatalf("background scheduling (empty notice): %v", berr)
+	}
+	if m.reapLedgerHasUnfinished("t-gr") {
+		t.Fatalf("empty-notice ledger task must still be scheduled and drained")
 	}
 }
 

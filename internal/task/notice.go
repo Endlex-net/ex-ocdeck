@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"ocdeck/internal/application/runtime"
 	"ocdeck/internal/infrastructure/process"
@@ -323,13 +324,17 @@ func (m *Manager) clearSuspendStopIntents(ctx context.Context, taskID string) er
 
 // suspendFinishObligation 是挂起收尾未完成的持久化义务（Round5 I17）：清理操作
 // 失败可随收敛固化为债务，但债务/快照「持久化」失败 MUST 保留为未完成义务——
-// 意图不清除、完整 tickets 随意图保留，下轮重放优先补全。
+// 意图不清除、完整 tickets 随意图保留，下轮重放优先补全。Round8 I20：TaskID
+// 为登记与落账的权威归属（ledger 按任务分组，drain 只取本任务条目）；Token 为
+// env 义务的记录时代际（新一代运行不受旧 env 义务影响）。
 type suspendFinishObligation struct {
 	Kind      string   `json:"kind"` // "notice"（残留 notice 未落库）| "env"（env 快照清除失败）
+	TaskID    string   `json:"taskId,omitempty"`
 	Name      string   `json:"name,omitempty"`
 	Tickets   []string `json:"tickets,omitempty"`
 	Reason    string   `json:"reason,omitempty"`
 	Retryable bool     `json:"retryable"`
+	Token     string   `json:"token,omitempty"` // env 义务：记录时的 runtime 执行代际
 }
 
 const suspendFinishPendingKey = "pendingJSON"
@@ -367,6 +372,13 @@ func (m *Manager) persistSuspendFinishObligations(ctx context.Context, taskID, t
 				remaining = append(remaining, o)
 			}
 		case "env":
+			// Round8 I20：env 义务携带记录时执行代际——新一代运行在位即视为
+			// 义务过时（旧义务不得清除新一代的 env 快照；对齐 I2 token 机制）。
+			if o.Token != "" {
+				if rt := m.getRuntime(taskID); rt != nil && string(rt.instVersion) != o.Token {
+					continue
+				}
+			}
 			if _, eerr := m.writeEnvSnapshot(ctx, taskID, sql.NullString{}); eerr != nil {
 				remaining = append(remaining, o)
 			}
@@ -390,31 +402,53 @@ func (m *Manager) recordResidualNoticeFromDisposition(ctx context.Context, taskI
 	return m.recordResidualNotice(ctx, taskID, sessionName, res.CleanupTickets, cls.reason, cls.retryable)
 }
 
-// reapLedgerSnapshot 返回受管登记快照（测试观测面）。
-func (m *Manager) reapLedgerSnapshot() []suspendFinishObligation {
+// reapLedgerSnapshot 返回任务的受管登记快照（测试观测面）。
+func (m *Manager) reapLedgerSnapshot(taskID string) []suspendFinishObligation {
 	m.reapLedgerMu.Lock()
 	defer m.reapLedgerMu.Unlock()
-	return append([]suspendFinishObligation(nil), m.reapLedger...)
+	return append([]suspendFinishObligation(nil), m.reapLedger[taskID]...)
 }
 
-// registerReapObligations 登记未完成持久化义务（Round7 I17：所有持久化出口
-// 失败时的受管重试登记——义务含本次 kill 返回的完整 tickets，单元可能已删，
-// 后续落账/收割 MUST 使用原 tickets，不依赖再次 kill）。
-func (m *Manager) registerReapObligations(obs []suspendFinishObligation) {
+// reapLedgerHasUnfinished 报告任务是否仍有未完成义务（Round8 I17：登记非空
+// 期间意图是唯一重试入口，不得清除）。
+func (m *Manager) reapLedgerHasUnfinished(taskID string) bool {
+	m.reapLedgerMu.Lock()
+	defer m.reapLedgerMu.Unlock()
+	return len(m.reapLedger[taskID]) > 0
+}
+
+// reapLedgerTaskIDs 返回登记中的全部任务 ID（Round8 I17：后台调度独立覆盖——
+// 即使任务 notice 已为空，ledger 义务仍获得调度）。
+func (m *Manager) reapLedgerTaskIDs() []string {
+	m.reapLedgerMu.Lock()
+	defer m.reapLedgerMu.Unlock()
+	ids := make([]string, 0, len(m.reapLedger))
+	for id := range m.reapLedger {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// registerReapObligations 登记任务的未完成持久化义务（Round7 I17：所有持久化
+// 出口失败时的受管重试登记——义务含本次 kill 返回的完整 tickets，单元可能已删，
+// 后续落账/收割 MUST 使用原 tickets，不依赖再次 kill。Round8 I20：按任务分组，
+// drain 只取当前任务条目）。
+func (m *Manager) registerReapObligations(taskID string, obs []suspendFinishObligation) {
 	if len(obs) == 0 {
 		return
 	}
 	m.reapLedgerMu.Lock()
-	m.reapLedger = append(m.reapLedger, obs...)
+	m.reapLedger[taskID] = append(m.reapLedger[taskID], obs...)
 	m.reapLedgerMu.Unlock()
 }
 
-// drainReapLedger 尝试落账受管登记的全部义务，返回仍未完成的（保留在登记中）。
-// 每轮停止收敛意图重放前调用——存储恢复后优先落账原 tickets。
+// drainReapLedger 尝试落账「当前任务」的受管登记义务，返回仍未完成的（保留在
+// 登记中）。Round8 I20：只取该任务条目，调用方在该任务锁内执行——杜绝跨任务
+// 污染（A 的义务不得按 B 身份执行）。
 func (m *Manager) drainReapLedger(ctx context.Context, taskID string) {
 	m.reapLedgerMu.Lock()
-	pending := m.reapLedger
-	m.reapLedger = nil
+	pending := m.reapLedger[taskID]
+	delete(m.reapLedger, taskID)
 	m.reapLedgerMu.Unlock()
 	if len(pending) == 0 {
 		return
@@ -422,9 +456,24 @@ func (m *Manager) drainReapLedger(ctx context.Context, taskID string) {
 	remaining := m.persistSuspendFinishObligations(ctx, taskID, "", pending)
 	if len(remaining) > 0 {
 		m.reapLedgerMu.Lock()
-		m.reapLedger = append(remaining, m.reapLedger...)
+		m.reapLedger[taskID] = append(remaining, m.reapLedger[taskID]...)
 		m.reapLedgerMu.Unlock()
 	}
+}
+
+// flushReapLedger 关停收尾：逐任务 best-effort 落账受管登记，返回仍失败的
+// 任务 ID（Round8 I17：关停尝试 flush 并报告剩余失败）。
+func (m *Manager) flushReapLedger(ctx context.Context) []string {
+	var failed []string
+	for _, id := range m.reapLedgerTaskIDs() {
+		fctx, fcancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		m.drainReapLedger(fctx, id)
+		fcancel()
+		if m.reapLedgerHasUnfinished(id) {
+			failed = append(failed, id)
+		}
+	}
+	return failed
 }
 
 // retrySuspendStopIntent 消费停止收敛意图（评审 Round3 I2；调用方持任务锁）：
@@ -440,6 +489,11 @@ func (m *Manager) retrySuspendStopIntent(ctx context.Context, taskID string, e n
 	// Round7 I17：先落账受管登记的义务（存储恢复后优先落账原 tickets——单元
 	// 可能已删，不能依赖再次 kill 重新派生）。
 	m.drainReapLedger(ctx, taskID)
+	// Round8 I17：登记仍有未完成义务（本轮 drain 失败）——意图是唯一重试入口，
+	// 不得清除（下轮继续调度落账）。
+	if m.reapLedgerHasUnfinished(taskID) {
+		return false, e, fmt.Errorf("suspend stop intent: ledger obligations unfinished")
+	}
 	// Round5 I17：上一轮遗留的未完成持久化义务优先补全（与状态无关——suspended
 	// 已收敛也不得丢弃 tickets 重放能力）。
 	if pending := decodeSuspendFinishObligations(e); len(pending) > 0 {
@@ -490,8 +544,17 @@ func (m *Manager) retrySuspendStopIntent(ctx context.Context, taskID string, e n
 	}
 	if len(obligations) > 0 {
 		// Round7 I17：义务先交受管登记（进程内有生命周期的重试载荷——任何持久化
-		// 出口失败都不至于让完整 tickets 只存在于本次调用返回值）。
-		m.registerReapObligations(obligations)
+		// 出口失败都不至于让完整 tickets 只存在于本次调用返回值）。Round8 I20：
+		// 义务携带权威 taskID；env 义务携带记录时执行代际（新一代运行不受旧
+		// env 义务影响——对齐 I2 token 机制）。
+		token, _ := e.Data["token"].(string)
+		for i := range obligations {
+			obligations[i].TaskID = taskID
+			if obligations[i].Kind == "env" {
+				obligations[i].Token = token
+			}
+		}
+		m.registerReapObligations(taskID, obligations)
 	}
 	// Round6 I17：状态收敛与完整 pending 载荷同一持久化提交边界——义务标注
 	// 先于状态收敛落库。标注失败 → 不收敛（保持 active：tickets 由 kill 结果
@@ -627,7 +690,11 @@ func (m *Manager) processRetryableNotices(ctx context.Context) error {
 			continue
 		}
 		if len(entries) == 0 {
-			continue
+			// Round8 I17：受管义务登记的任务即使 notice 已为空也保有调度入口
+			//（retryTaskNotices 头部在该任务锁内 drain——不无锁跨任务全局取走）。
+			if !m.reapLedgerHasUnfinished(t.ID) {
+				continue
+			}
 		}
 		if rerr := m.retryTaskNotices(ctx, t, entries); rerr != nil {
 			errs = append(errs, fmt.Errorf("task %s: %w", t.ID, rerr))

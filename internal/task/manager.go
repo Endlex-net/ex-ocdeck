@@ -398,13 +398,15 @@ type Manager struct {
 	recoveryIncidents   map[string]*recoveryIncident
 	recoveryWG          sync.WaitGroup
 
-	// reapLedger 是挂起收尾义务的进程内受管重试登记（Round7 I17）：所有持久化
-	// 出口（残留 notice/pending 标注/外层写回）失败时，义务（含本次 kill 返回的
-	// 完整 tickets——单元可能已删、无法重新派生）交此登记；每轮重放优先落账，
-	// 不依赖再次 kill。Manager 生命周期内有效；跨进程恢复依赖意图 pending 标注
-	// 先于状态收敛落库（Round6 I17 排序）。
+	// reapLedger 是挂起收尾义务的进程内受管重试登记（Round7 I17；Round8 I20
+	// 按任务分组——义务携带权威 taskID，drain 只取当前任务条目并在该任务锁内
+	// 执行，杜绝跨任务污染）。所有持久化出口（残留 notice/pending 标注/外层写回）
+	// 失败时，义务（含本次 kill 返回的完整 tickets——单元可能已删、无法重新派生）
+	// 交此登记；每轮重放优先落账，不依赖再次 kill。进程内生命周期；跨进程恢复
+	// 依赖意图 pending 标注先于状态收敛落库（Round6 I17 排序——进程退出后内存
+	// 登记不保证存活，保障范围仅限进程内重试）。
 	reapLedgerMu sync.Mutex
-	reapLedger   []suspendFinishObligation
+	reapLedger   map[string][]suspendFinishObligation
 
 	// recoveryWakes 是恢复退避的状态/token invalidation 唤醒通道（G3-7）：
 	// setRuntime/clearRuntime/状态写入路径 close 当前通道，退避中的 incident 即时
@@ -604,6 +606,7 @@ func New(opts Options) *Manager {
 		branchPrefixFn:          opts.BranchPrefix,
 		uploadCoordination:      opts.UploadCoordination,
 		runtimes:                make(map[string]*taskRuntime),
+		reapLedger:              make(map[string][]suspendFinishObligation),
 		runtimeRegistry:         runtime.New(),
 		rand4Fn:                 rand4,
 		probeColdStartBackoffFn: defaultProbeColdStartBackoff,
@@ -1052,6 +1055,12 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	// 都停止（persist 不关 server 但同样不得在关停后继续访问 store/重拉）——
 	// 取消在途监控重试并等待退出，先于任何 store 收敛/落库收尾。
 	m.stopV2ServerMonitoring()
+	// Round8 I17：关停 flush 受管义务登记（best-effort 逐任务落账；仍失败者
+	// 留在登记并报告——内存登记不跨进程，跨进程恢复依赖意图 pending 标注）。
+	if failed := m.flushReapLedger(context.WithoutCancel(ctx)); len(failed) > 0 {
+		log.Printf("shutdown: reap ledger flush incomplete for tasks %v (obligations kept in intent pending markers)", failed)
+		killErr = errors.Join(killErr, fmt.Errorf("shutdown: reap ledger flush incomplete for tasks %v", failed))
+	}
 	// R7：收割内存 orphanFailures（kill 失败的孤儿会话 tickets，非仅 DB notice）。
 	// 后台周期已停（bgCancel），关停时 MUST 主动调用一次 retryOrphanSessions，避免逃逸进程
 	// tickets 仅存内存随进程退出丢失（design.md §10：runtime 已空 = 无会话且无可重试 cleanup debt，
