@@ -360,10 +360,11 @@ func seedBranchBTask(t *testing.T, db *store.DB, taskID string) {
 	}
 }
 
-// seedAdoptAFormTask 种子承接 A 形态任务（真实 store）：v1 binding(sess-keep)@v1 +
+// seedAdoptAFormTask 种子承接 A 形态任务（真实 store）：v1 binding(upstream)@v1 +
 // anchor@v1 + 归属行（父+子）+ env 快照事实（承接失败保留断言用）。pinned 可指定
-// （承接 A 为 v1；R5 用 v2）。
-func seedAdoptAFormTask(t *testing.T, db *store.DB, taskID, pinned string) {
+// （承接 A 为 v1；R5 用 v2）；upstream 为原 session id（真实流 harness 的 GET
+// 路由按 ^ses_ 前缀匹配，传 ses_keep 形态）。
+func seedAdoptAFormTask(t *testing.T, db *store.DB, taskID, pinned, upstream string) {
 	t.Helper()
 	now := time.Now().Unix()
 	if _, err := db.Exec(`INSERT INTO projects (id, name, path, default_branch, created_at, kind)
@@ -373,7 +374,7 @@ func seedAdoptAFormTask(t *testing.T, db *store.DB, taskID, pinned string) {
 	v1Raw, err := domain.TaskBinding{
 		Version: domain.TaskBindingVersion, ProviderID: ocdeckstore.ProviderIDV1,
 		ProviderInstanceID: ocdeckstore.ProviderInstanceV1Default,
-		UpstreamSessionID:  "sess-keep", TerminalRef: "tui",
+		UpstreamSessionID:  upstream, TerminalRef: "tui",
 		Data: []byte(`{"port":4000,"directory":"/wt","taskId":"` + taskID + `","auth":{"kind":"derived"}}`),
 	}.Encode()
 	if err != nil {
@@ -381,13 +382,13 @@ func seedAdoptAFormTask(t *testing.T, db *store.DB, taskID, pinned string) {
 	}
 	if _, err := db.Exec(`INSERT INTO tasks (id, project_id, name, branch, status, mode, worktree_path,
 		 anchor_session_id, anchor_provider_id, anchor_provider_instance_id, provider_id, task_binding, env_snapshot, created_at, updated_at)
-		 VALUES (?,'p1','task','b','suspended','worktree','/wt','sess-keep','opencode-v1','default',?,?,?, ?, ?)`,
-		taskID, pinned, v1Raw, `{"OCDECK_TASK_ID":"`+taskID+`"}`, now, now); err != nil {
+		 VALUES (?,'p1','task','b','suspended','worktree','/wt',?,'opencode-v1','default',?,?,?, ?, ?)`,
+		taskID, upstream, pinned, v1Raw, `{"OCDECK_TASK_ID":"`+taskID+`"}`, now, now); err != nil {
 		t.Fatal(err)
 	}
-	for _, sid := range []string{"sess-keep", "sess-child"} {
+	for _, sid := range []string{upstream, "sess-child"} {
 		if _, err := db.Exec(`INSERT INTO task_sessions (task_id, session_id, session_created_at, first_seen_at, last_seen_at, parent_id)
-			 VALUES (?, ?, 1, 1, 1, ?)`, taskID, sid, map[bool]string{true: "", false: "sess-keep"}[sid == "sess-keep"]); err != nil {
+			 VALUES (?, ?, 1, 1, 1, ?)`, taskID, sid, map[bool]string{true: "", false: upstream}[sid == upstream]); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1122,7 +1123,7 @@ func TestStage4_AdoptA_PartialHistory_ViaActivate_StopBeforeStateWrite(t *testin
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	seedAdoptAFormTask(t, db, "t-stop", ocdeckstore.ProviderIDV1)
+	seedAdoptAFormTask(t, db, "t-stop", ocdeckstore.ProviderIDV1, "sess-keep")
 	// 部分缺失注入：binding 摘除（anchor+归属行仍在——判定矩阵「其余」→ stop）。
 	if _, err := db.Exec(`UPDATE tasks SET task_binding=NULL WHERE id='t-stop'`); err != nil {
 		t.Fatal(err)
@@ -1354,7 +1355,7 @@ func TestStage4_I15_AdoptCommitSuspendInterleave_NoResurrectedAssociation(t *tes
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	seedAdoptAFormTask(t, db, "t-race", ocdeckstore.ProviderIDV1)
+	seedAdoptAFormTask(t, db, "t-race", ocdeckstore.ProviderIDV1, "sess-keep")
 	if _, err := db.Exec(`UPDATE tasks SET status='active' WHERE id='t-race'`); err != nil {
 		t.Fatal(err)
 	}
@@ -2159,7 +2160,7 @@ func TestStage4_AdoptA_ViaActivate_FailureKeepsAllOldFacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	seedAdoptAFormTask(t, db, "t-a1", ocdeckstore.ProviderIDV1)
+	seedAdoptAFormTask(t, db, "t-a1", ocdeckstore.ProviderIDV1, "sess-keep")
 	failSup := &failResumeV2Sup{}
 	m := newAdoptATestManager(t, db, &supOnlyV2Provider{sup: failSup})
 
@@ -2192,7 +2193,7 @@ func TestStage4_AdoptA_ViaActivate_SuccessKeepsSameSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	seedAdoptAFormTask(t, db, "t-a2", ocdeckstore.ProviderIDV1)
+	seedAdoptAFormTask(t, db, "t-a2", ocdeckstore.ProviderIDV1, "sess-keep")
 	rec := &recordingV2Sup{upstream: "sess-keep", port: 4096}
 	m := newAdoptATestManager(t, db, &supOnlyV2Provider{sup: rec})
 
@@ -2224,7 +2225,7 @@ func TestStage4_AdoptA_ViaRecovery_KeepsFactsOnFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	seedAdoptAFormTask(t, db, "t-a3", ocdeckstore.ProviderIDV1)
+	seedAdoptAFormTask(t, db, "t-a3", ocdeckstore.ProviderIDV1, "sess-keep")
 	if _, err := db.Exec(`UPDATE tasks SET status='active' WHERE id='t-a3'`); err != nil {
 		t.Fatal(err)
 	}
@@ -2312,7 +2313,7 @@ func TestStage4_V2Resume_HandshakeFail_KeepsOldBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	seedAdoptAFormTask(t, db, "t-h1", ocdeckstore.ProviderIDV2)
+	seedAdoptAFormTask(t, db, "t-h1", ocdeckstore.ProviderIDV2, "sess-keep")
 	// v2 钉扎任务持既有 v2 binding（R1 形态：binding 决定执行身份）。
 	old := domain.TaskBinding{
 		Version: domain.TaskBindingVersion, ProviderID: ocdeckstore.ProviderIDV2,
@@ -2604,6 +2605,10 @@ type realStreamHarness struct {
 	// conn2Hello 非 nil 时：第二条连接等待该 chan 关闭后才写 hello（模拟「断线
 	// 期间接管消费者已安装、上游尚未恢复」的可控时序——Round5 I10）。
 	conn2Hello chan struct{}
+	// oc 是 Manager OCFactory 实际返回的内存 mock 上游（startSSE 对齐经
+	// readyOC{inner: oc} 读 ListSessions——真实流 harness 的 HTTP 面只服务
+	// supervisor/事件通道，会话列表事实在此注入）。
+	oc *mockOC
 }
 
 func newRealStreamHarness(t *testing.T, taskID, upstream, status string) *realStreamHarness {
@@ -2690,7 +2695,8 @@ func newRealStreamHarness(t *testing.T, taskID, upstream, status string) *realSt
 	}
 
 	h.adapter = NewStoreAdapter(db)
-	h.m = newTestManagerFull(t, h.adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	h.oc = newMockOC(true)
+	h.m = newTestManagerFull(t, h.adapter, nil, newMockProc(), newMockWorktree(), h.oc)
 	h.m.SetLifecycleCtx(ctx)
 	h.m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
 	var identityAlive atomic.Bool
@@ -3227,10 +3233,15 @@ type debtCandidateSup struct {
 	mu           sync.Mutex
 	acquireCalls int32
 	reaped       []string
+	// acquireHook 非 nil 时在 Acquire 进入后调用（取消/故障注入等时序控制）。
+	acquireHook func()
 }
 
 func (s *debtCandidateSup) Acquire(ctx context.Context, t appagent.TaskRef) (domain.TaskBinding, error) {
 	atomic.AddInt32(&s.acquireCalls, 1)
+	if h := s.acquireHook; h != nil {
+		h()
+	}
 	cfgErr := appagent.NewError("supervisor.env", appagent.ErrKindRuntimeUnavailable,
 		errors.New("env snapshot unavailable"))
 	debt := &appagent.CandidateCleanupDebt{SessionID: "ses_debt_1",
@@ -3437,17 +3448,17 @@ func TestR1_J3_RollbackFail_GatesFirstBuild(t *testing.T) {
 	}
 }
 
-// TestR1_J3_CancelAndDebtPersist 落实收尾 Round2 J3 逃逸路径 1：请求 ctx 取消
-// 且 DELETE 失败 → 残债落库仍成功（withResidualNoticeCtx 独立有界 ctx）→ 门禁
-// 拒绝再次首建；reaper 收割后清除开放。
-func TestR1_J3_CancelAndDebtPersist(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+// TestR1_J3_ArmBlocksBeforePOST 落实 Round3 J3：首建阻断意图在 POST 之前持久
+// 化——notice 持久化失败 → 零 POST（无 candidate 产生 → 无残留事实可丢失）；
+// 恢复后重放正常首建。
+func TestR1_J3_ArmBlocksBeforePOST(t *testing.T) {
+	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	seedBranchBTask(t, db, "t-cn")
+	seedBranchBTask(t, db, "t-am")
 	adapter := NewStoreAdapter(db)
 	sup := &debtCandidateSup{}
 	prov := &debtProvider{sup: sup}
@@ -3463,17 +3474,168 @@ func TestR1_J3_CancelAndDebtPersist(t *testing.T) {
 	}
 	m.providerRegistry = reg
 
-	cancel() // 请求取消
+	// notice 持久化失败（阻断意图写不进去）→ Activate 失败且零 POST。
+	fstore := &failReplayPersistStore{StoreAdapter: adapter}
+	m.store = fstore
+	fstore.failNoticeCAS.Store(true)
+	if aerr := m.Activate(ctx, "t-am"); aerr == nil {
+		t.Fatalf("arm persistence failure must block first-build")
+	}
+	if calls := atomic.LoadInt32(&sup.acquireCalls); calls != 0 {
+		t.Fatalf("blocked first-build must not POST, acquires=%d", calls)
+	}
+	// 恢复（notice 通道健康）→ 正常首建（门禁解除；改用成功形态 sup 验证
+	// arm 意图在首建成功后被清除）。
+	fstore.failNoticeCAS.Store(false)
+	okSup := &okAcquireSup{upstream: "ses_am_1", port: 4096}
+	reg2 := appagent.NewRegistry()
+	if err := reg2.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg2.Register(&supOnlyV2Provider{sup: okSup}); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg2
+	if aerr := m.Activate(ctx, "t-am"); aerr != nil {
+		t.Fatalf("Activate(restore): %v", aerr)
+	}
+	row, _ := adapter.GetTask(ctx, "t-am")
+	if row.Status != "active" {
+		t.Fatalf("status=%s", row.Status)
+	}
+	if strings.Contains(row.Notice.String, noticeCodeSuspendStop) ||
+		strings.Contains(row.Notice.String, "candidate_cleanup_failed") {
+		t.Fatalf("armed intent must be cleared after successful first-build: %q", row.Notice.String)
+	}
+}
+
+// okAcquireSup 是首建成功形态 fake：Acquire 返回 candidate binding（一次）。
+type okAcquireSup struct {
+	upstream string
+	port     int
+}
+
+func (s *okAcquireSup) Acquire(ctx context.Context, t appagent.TaskRef) (domain.TaskBinding, error) {
+	data, _ := json.Marshal(map[string]any{
+		"port": s.port, "directory": "/wt", "taskId": t.TaskID,
+		"origin": "created", "auth": map[string]string{"kind": "derived"},
+	})
+	return domain.TaskBinding{
+		Version:            domain.TaskBindingVersion,
+		ProviderID:         ocdeckstore.ProviderIDV2,
+		ProviderInstanceID: ocdeckstore.ProviderInstanceV2Default,
+		UpstreamSessionID:  s.upstream,
+		TerminalRef:        "ocdeck-v2-tui-" + t.TaskID,
+		Data:               data,
+	}, nil
+}
+
+func (s *okAcquireSup) Resume(ctx context.Context, t appagent.TaskRef, b domain.TaskBinding, p appagent.ResumePolicy) (domain.TaskBinding, error) {
+	return b, nil
+}
+
+func (s *okAcquireSup) AcquireEphemeral(ctx context.Context, t appagent.TaskRef) (domain.TaskBinding, error) {
+	return domain.TaskBinding{}, errors.New("unexpected")
+}
+
+func (s *okAcquireSup) Release(ctx context.Context, b domain.TaskBinding) error { return nil }
+
+// TestR1_J3_CrossRestartZeroPOST 落实 Round3 J3 跨重启逃逸闭合：debt 持久化
+// （notice 含 candidate sessionID）→ 重建 Manager（模拟进程重启，内存 ledger
+// 清空）→ Activate 仍被门禁拒绝（零 POST——残留事实不被误判为从未建立）；
+// reaper 收割后门禁开放。
+func TestR1_J3_CrossRestartZeroPOST(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedBranchBTask(t, db, "t-xr")
+	adapter := NewStoreAdapter(db)
+	sup := &debtCandidateSup{}
+	prov := &debtProvider{sup: sup}
+	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m.SetLifecycleCtx(ctx)
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(prov); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+	if aerr := m.Activate(ctx, "t-xr"); aerr == nil {
+		t.Fatalf("first build must fail (debt injected)")
+	}
+
+	// 进程重启形态：全新 Manager（内存 ledger/登记全空），同一 DB。
+	m2 := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m2.SetLifecycleCtx(ctx)
+	m2.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg2 := appagent.NewRegistry()
+	if err := reg2.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg2.Register(prov); err != nil {
+		t.Fatal(err)
+	}
+	m2.providerRegistry = reg2
+	if aerr := m2.Activate(ctx, "t-xr"); aerr == nil ||
+		!strings.Contains(aerr.Error(), "uncleaned cleanup debt") {
+		t.Fatalf("cross-restart Activate must be gated by persisted debt, got %v", aerr)
+	}
+	if calls := atomic.LoadInt32(&sup.acquireCalls); calls != 1 {
+		t.Fatalf("cross-restart must be zero-POST, acquires=%d", calls)
+	}
+	// reaper 重放清债 → 门禁开放。
+	if berr := m2.processRetryableNotices(ctx); berr != nil {
+		t.Fatalf("replay: %v", berr)
+	}
+	if aerr := m2.Activate(ctx, "t-xr"); aerr == nil ||
+		strings.Contains(aerr.Error(), "uncleaned cleanup debt") {
+		t.Fatalf("gate must open after reap, aerr=%v", aerr)
+	}
+	if calls := atomic.LoadInt32(&sup.acquireCalls); calls != 2 {
+		t.Fatalf("post-reap Activate must attempt Acquire, acquires=%d", calls)
+	}
+}
+
+// TestR1_J3_CancelAndDebtPersist 落实收尾 Round2/3 J3 逃逸路径 1：Acquire 已
+// 进入后请求 ctx 取消且 DELETE 失败 → 占位意图升级为真实残债仍落库（settle 用
+// 独立有界 ctx，不随请求取消）→ 状态写成功回退 suspended → 门禁拒绝再次首建；
+// reaper 收割后清除开放。
+func TestR1_J3_CancelAndDebtPersist(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedBranchBTask(t, db, "t-cn")
+	adapter := NewStoreAdapter(db)
+	sup := &debtCandidateSup{}
+	sup.acquireHook = func() { cancel() } // Acquire 进入后取消（POST 在途形态）
+	prov := &debtProvider{sup: sup}
+	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m.SetLifecycleCtx(ctx)
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(prov); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+
 	if aerr := m.Activate(ctx, "t-cn"); aerr == nil {
 		t.Fatalf("cancelled activate must fail")
 	}
-	// 健康重试：完整链路（Acquire 注入失败+debt）→ 残债落库成功
-	//（withResidualNoticeCtx 生效——Acquire 内部补偿 ctx 独立于请求取消）。
 	// 取消后的 DB 读取一律用 bg（驱动尊重取消 ctx）。
 	bg := context.Background()
-	if aerr := m.Activate(bg, "t-cn"); aerr == nil {
-		t.Fatalf("healthy retry must still fail on injected acquire error")
-	}
 	row, err := adapter.GetTask(bg, "t-cn")
 	if err != nil {
 		t.Fatal(err)
@@ -3482,16 +3644,25 @@ func TestR1_J3_CancelAndDebtPersist(t *testing.T) {
 		!strings.Contains(row.Notice.String, "ses_debt_1") {
 		t.Fatalf("debt must persist despite cancellation: %q (full=%v)", row.Notice.String, row.Notice)
 	}
-	// 门禁拒绝（健康 ctx——拒绝语义来自残债而非取消态）+ ledger 双检。
-	bg2 := context.Background()
-	if aerr := m.Activate(bg2, "t-cn"); aerr == nil ||
+	if strings.Contains(row.Notice.String, `"pending"`) {
+		t.Fatalf("armed intent must be upgraded to real session id, got %q", row.Notice.String)
+	}
+	// 状态写成功回退 suspended（补偿 compCtx WithoutCancel）。
+	if row.Status != "suspended" {
+		t.Fatalf("status must converge suspended despite cancellation, status=%s", row.Status)
+	}
+	if m.reapLedgerHasUnfinished("t-cn") {
+		t.Fatalf("settled debt must not leave managed ledger obligations")
+	}
+	// 门禁拒绝（健康 ctx——拒绝语义来自残债而非取消态）且零 POST。
+	if aerr := m.Activate(bg, "t-cn"); aerr == nil ||
 		!strings.Contains(aerr.Error(), "uncleaned cleanup debt") {
 		t.Fatalf("gated, got %v", aerr)
 	}
-	if !m.reapLedgerHasUnfinished("t-cn") == false && len(m.reapLedgerSnapshot("t-cn")) > 0 {
-		t.Fatalf("unexpected ledger entries for a notice-persisted debt")
+	if calls := atomic.LoadInt32(&sup.acquireCalls); calls != 1 {
+		t.Fatalf("gated retry must not POST, acquires=%d", calls)
 	}
-	// 恢复（新 ctx——存储/取消态解除）→ 重放收割 → 清除。
+	// 重放收割原 session → 清除 → 门禁开放。
 	if berr := m.processRetryableNotices(bg); berr != nil {
 		t.Fatalf("replay: %v", berr)
 	}
@@ -3501,6 +3672,105 @@ func TestR1_J3_CancelAndDebtPersist(t *testing.T) {
 	row2, _ := adapter.GetTask(bg, "t-cn")
 	if strings.Contains(row2.Notice.String, "candidate_cleanup_failed") {
 		t.Fatalf("debt must be cleared after reap: %q", row2.Notice.String)
+	}
+}
+
+// TestR1_J3_SettleFail_StillGatedAfterRestart 落实 Round3 J3 确定性故障链收口：
+// arm 成功（POST 前）→ Acquire 产生 debt → 仅 settle（notice 写）持续失败 →
+// 受管 ledger 兜底 → 状态写成功回退 suspended → 重建 Manager（模拟进程重启，
+// 内存 ledger 清空）→ DB 仍有 retryable 占位意图 → Activate 门禁拒绝（零 POST）；
+// 通道恢复 → 重放清债 → 门禁开放完成首建。
+func TestR1_J3_SettleFail_StillGatedAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedBranchBTask(t, db, "t-sf")
+	adapter := NewStoreAdapter(db)
+	fstore := &failReplayPersistStore{StoreAdapter: adapter}
+	sup := &debtCandidateSup{}
+	// Acquire 进入后打开 notice CAS 失败——arm 已成功落库（POST 前），仅 settle 失败。
+	sup.acquireHook = func() { fstore.failNoticeCAS.Store(true) }
+	prov := &debtProvider{sup: sup}
+	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m.store = fstore
+	m.SetLifecycleCtx(ctx)
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(prov); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+
+	// arm 成功 → Acquire 失败（debt）→ settle 失败（ledger 兜底）→ 状态写成功回退 suspended。
+	if aerr := m.Activate(ctx, "t-sf"); aerr == nil {
+		t.Fatalf("first build must fail (debt + settle persist failure)")
+	}
+	if !m.reapLedgerHasUnfinished("t-sf") {
+		t.Fatalf("settle failure must register managed ledger obligation")
+	}
+	row, err := fstore.GetTask(ctx, "t-sf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Status != "suspended" {
+		t.Fatalf("status write must succeed (fallback suspended), status=%s", row.Status)
+	}
+	if !strings.Contains(row.Notice.String, `"pending"`) ||
+		!strings.Contains(row.Notice.String, "candidate_cleanup_failed") {
+		t.Fatalf("armed pre-POST intent must persist across settle failure: %q", row.Notice.String)
+	}
+
+	// 进程重启形态：全新 Manager（ledger 清空），同一 DB——占位意图持续阻断，零 POST。
+	m2 := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m2.store = fstore
+	m2.SetLifecycleCtx(ctx)
+	m2.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg2 := appagent.NewRegistry()
+	if err := reg2.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg2.Register(prov); err != nil {
+		t.Fatal(err)
+	}
+	m2.providerRegistry = reg2
+	if aerr := m2.Activate(ctx, "t-sf"); aerr == nil ||
+		!strings.Contains(aerr.Error(), "uncleaned cleanup debt") {
+		t.Fatalf("cross-restart Activate must stay gated by persisted intent, got %v", aerr)
+	}
+	if calls := atomic.LoadInt32(&sup.acquireCalls); calls != 1 {
+		t.Fatalf("cross-restart must be zero-POST, acquires=%d", calls)
+	}
+
+	// notice 通道恢复 → 重放收割占位意图 → 门禁开放（换健康 sup 完成首建）。
+	fstore.failNoticeCAS.Store(false)
+	if berr := m2.processRetryableNotices(ctx); berr != nil {
+		t.Fatalf("replay: %v", berr)
+	}
+	okSup := &okAcquireSup{upstream: "ses_sf_1", port: 4096}
+	reg3 := appagent.NewRegistry()
+	if err := reg3.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg3.Register(&supOnlyV2Provider{sup: okSup}); err != nil {
+		t.Fatal(err)
+	}
+	m2.providerRegistry = reg3
+	if aerr := m2.Activate(ctx, "t-sf"); aerr != nil {
+		t.Fatalf("Activate(restore): %v", aerr)
+	}
+	row2, _ := fstore.GetTask(ctx, "t-sf")
+	if row2.Status != "active" {
+		t.Fatalf("status=%s", row2.Status)
+	}
+	if strings.Contains(row2.Notice.String, "candidate_cleanup_failed") ||
+		strings.Contains(row2.Notice.String, `"pending"`) {
+		t.Fatalf("armed intent must be cleared after successful first-build: %q", row2.Notice.String)
 	}
 }
 
@@ -3857,6 +4127,77 @@ func TestStage4_R9_I21_FlushRespectsTaskLock(t *testing.T) {
 	}
 	if !m.reapLedgerHasUnfinished("t-fl") {
 		t.Fatalf("locked task ledger must be retained (not drained without lock)")
+	}
+}
+
+// ---- 收尾 Round1：J6 真实 provider 承接 A 连续性 ----
+
+// TestR1_J6_RealProvider_AdoptA_Continuity 落实收尾 Round1 J6：经真实
+// NewSPIProviderWithDeps 注册的 provider 从 v1 历史事实（v1 binding/anchor/
+// 归属行）承接 A——公开 Activate → 真实 Resume（GET 延续原 session，零创建
+// POST）→ binding/归属/anchor 原子转换（v1→v2 单事务）→ 钉扎不变 → active。
+func TestR1_J6_RealProvider_AdoptA_Continuity(t *testing.T) {
+	ctx := context.Background()
+	// harness 上游 session=ses_keep（GET 路由按 ^ses_ 前缀回显）；其自种行仅为
+	// provider 装配，本测试消费承接 A 历史事实行——移除避免混淆。
+	h := newRealStreamHarness(t, "t-j6x", "ses_keep", "active")
+	if _, err := h.db.Exec(`DELETE FROM tasks WHERE id='t-j6x'`); err != nil {
+		t.Fatal(err)
+	}
+	// v1 历史事实：binding(ses_keep)@v1 + anchor@v1 + 归属行（父+子）。
+	seedAdoptAFormTask(t, h.db, "t-ja", ocdeckstore.ProviderIDV1, "ses_keep")
+	// mock 上游列出承接历史（父+子）——接管首和对齐按上游列表保住承接行
+	//（同 TestStage4_R5_V2PinnedFirstBuild_ViaActivate 的 mock 列表注入模式）。
+	h.oc.mu.Lock()
+	h.oc.sessions = []opencode.Session{
+		{ID: "ses_keep", Time: opencode.SessionTime{Created: 1, Updated: 1}},
+		{ID: "sess-child", ParentID: "ses_keep", Time: opencode.SessionTime{Created: 1, Updated: 1}},
+	}
+	h.oc.mu.Unlock()
+
+	// 公开 Activate 入口（v1 钉扎 + 机器 v2 开关开 → R8 承接 A）。
+	if aerr := h.m.Activate(ctx, "t-ja"); aerr != nil {
+		t.Fatalf("Activate(adopt A via real provider): %v", aerr)
+	}
+	// 零创建 POST：原 session 经真实 Resume（GET）延续。
+	if n := h.created.Load(); n != 0 {
+		t.Fatalf("adopt A MUST NOT create sessions, POSTs=%d", n)
+	}
+	// 原子转换断言：binding v2（upstream 不变）+ 归属行 v1→v2（父+子，session_id
+	// 不变）+ anchor 转 v2（id 不变）+ 钉扎不变 + active 收敛。
+	got, has, err := h.adapter.GetTaskBinding(ctx, "t-ja")
+	if err != nil || !has || got.ProviderID != ocdeckstore.ProviderIDV2 || got.UpstreamSessionID != "ses_keep" {
+		t.Fatalf("binding: %+v has=%v err=%v", got, has, err)
+	}
+	var v2Rows int
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id='t-ja' AND provider_id=? AND provider_instance_id=?`,
+		ocdeckstore.ProviderIDV2, ocdeckstore.ProviderInstanceV2Default).Scan(&v2Rows); err != nil {
+		t.Fatal(err)
+	}
+	if v2Rows != 2 {
+		t.Fatalf("ownership rows must convert v1→v2 (parent+child), v2 rows=%d", v2Rows)
+	}
+	var childParent string
+	if err := h.db.QueryRow(`SELECT parent_id FROM task_sessions WHERE task_id='t-ja' AND session_id='sess-child'`).Scan(&childParent); err != nil || childParent != "ses_keep" {
+		t.Fatalf("child row must keep parent chain after align, parent=%q err=%v", childParent, err)
+	}
+	var anchorProv, anchorID string
+	if err := h.db.QueryRow(`SELECT anchor_provider_id, anchor_session_id FROM tasks WHERE id='t-ja'`).Scan(&anchorProv, &anchorID); err != nil {
+		t.Fatal(err)
+	}
+	if anchorProv != ocdeckstore.ProviderIDV2 || anchorID != "ses_keep" {
+		t.Fatalf("anchor must convert to v2 with id unchanged, got %s/%s", anchorProv, anchorID)
+	}
+	var pinned string
+	if err := h.db.QueryRow(`SELECT provider_id FROM tasks WHERE id='t-ja'`).Scan(&pinned); err != nil {
+		t.Fatal(err)
+	}
+	if pinned != ocdeckstore.ProviderIDV1 {
+		t.Fatalf("pinned provider must stay v1, got %q", pinned)
+	}
+	row, err := h.adapter.GetTask(ctx, "t-ja")
+	if err != nil || row.Status != "active" {
+		t.Fatalf("status=%s err=%v", row.Status, err)
 	}
 }
 

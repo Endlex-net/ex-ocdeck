@@ -268,26 +268,43 @@ func (m *Manager) firstBuildV2(ctx context.Context, taskID string, row TaskRow, 
 		m.recordAdmissionError(ctx, taskID, err)
 		return err
 	}
+	// Round3 J3：首建 POST 前持久化可跨重启的阻断意图（candidate_cleanup_failed
+	// retryable 残债，sessionName=pending）——持久化失败 MUST NOT 发起 POST
+	//（零 POST：无 candidate 产生 → 无残留事实可丢失）；notice 在位期间首建
+	// 准入门禁持续阻断（跨重启：启动恢复不自动激活 suspended，reaper 重放清债）。
+	if aerr := m.armCandidateIntent(ctx, taskID); aerr != nil {
+		return appagent.NewError("activate.v2", appagent.ErrKindCapabilityUnavailable,
+			fmt.Errorf("首建阻断意图持久化失败（零 POST 防残留事实丢失）: %w", aerr))
+	}
 	binding, serr := sup.Acquire(ctx, appagent.TaskRef{TaskID: taskID, Directory: row.WorktreePath})
 	if serr != nil {
-		// 收尾 R1 J3：candidate 回收失败（typed 清理债务）——按 task 持久化
-		// retryable 清理义务（重放经 CandidateDebtReaper 收割；首建准入门禁在
-		// 清理成功/用户处置前拒绝再次首建）。义务写失败 Join 传播（不得静默）。
+		// 收尾 R1 J3：candidate 回收失败（typed 清理债务）——把占位意图升级为
+		// 含真实 candidate sessionID 的持久债务（Round3 J3：跨重启可识别，门禁
+		// 持续阻断直至收割/处置）；升级落库失败 → 受管 ledger 兜底。义务安全
+		// 登记前阻断再次首建。
 		var debt *appagent.CandidateCleanupDebt
 		if errors.As(serr, &debt) {
-			// Round2 J3：原请求 ctx 可能已取消——独立有界 ctx 落账；写失败进受管
-			// 重试链（义务安全登记前阻断再次首建，activate.go 门禁查 ledger）。
-			rcCtx, rcCancel := withResidualNoticeCtx(ctx)
-			nerr := m.recordResidualNotice(rcCtx, taskID, debt.SessionID, nil,
-				noticeReasonCandidateCleanupFailed, true)
-			rcCancel()
-			if nerr != nil {
+			// 请求 ctx 可能已在 Acquire 期间取消（Round2 J3）——升级落库用独立
+			// 有界 ctx，取消不得阻止跨重启身份持久化。
+			sCtx, sCancel := withResidualNoticeCtx(ctx)
+			uerr := m.settleCandidateIntent(sCtx, taskID, debt.SessionID)
+			sCancel()
+			if uerr != nil {
 				m.registerReapObligations(taskID, []suspendFinishObligation{{
 					Kind: "notice", TaskID: taskID, Name: debt.SessionID,
 					Reason: noticeReasonCandidateCleanupFailed, Retryable: true,
 				}})
-				return errors.Join(serr, nerr)
+				serr = errors.Join(serr, uerr)
 			}
+			return m.supervisorStageErrorForTyped(serr, taskID)
+		}
+		// 无 debt（Acquire 前置失败——candidate 未产生）：占位意图清除（独立有界
+		// ctx——清除失败仅留待重放，门禁短期保守持有）。
+		cCtx, cCancel := withResidualNoticeCtx(ctx)
+		cerr := m.clearCandidateIntent(cCtx, taskID)
+		cCancel()
+		if cerr != nil {
+			log.Printf("task %s: clear candidate intent after acquire pre-failure: %v", taskID, cerr)
 		}
 		return m.supervisorStageErrorForTyped(serr, taskID)
 	}
@@ -316,6 +333,11 @@ func (m *Manager) firstBuildV2(ctx context.Context, taskID string, row TaskRow, 
 		return m.rollbackFirstBuild(ctx, taskID, sup, binding,
 			newOpErr(codeConflict, fmt.Errorf("v2 首建提交: %w", cerr)))
 	}
+	// Round3 J3：candidate 已正式提交成为 binding 事实——占位阻断意图 MUST
+	// 解除（残留会被 reaper 误删已提交 session）。best-effort+CAS 重试。
+	if cerr := m.clearCandidateIntent(ctx, taskID); cerr != nil {
+		log.Printf("task %s: clear candidate intent after first-build commit: %v", taskID, cerr)
+	}
 	// 提交后正式接管（候选流复用——评审 I10；正式 SSE/对齐/事件消费启用；
 	// 失败=已提交恢复债务 postCommitTakeoverError，禁普通补偿）。
 	return m.adoptTakeover(ctx, taskID, row, binding, mode, es, taskLocked)
@@ -338,12 +360,16 @@ func (m *Manager) rollbackFirstBuild(ctx context.Context, taskID string, sup app
 	rcCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), activateCompensationTimeout)
 	defer cancel()
 	if rerr := rc.RecycleCandidateSession(rcCtx, candidate); rerr != nil {
-		// Round2 J3：回收失败统一走 CandidateCleanupDebt 持久化门禁链（同路径
-		// 1 的登记与重放）——不得仅拼错误文本后放行再次首建。
+		// Round2/3 J3：回收失败统一走 CandidateCleanupDebt 持久化门禁链——把
+		// 占位意图升级为含真实 sessionID 的持久债务（跨重启可识别，门禁持续
+		// 阻断直至收割/处置）；升级落库失败 → 受管 ledger 兜底。
 		debt := &appagent.CandidateCleanupDebt{SessionID: candidate.UpstreamSessionID, Err: rerr}
 		rcCtx2, rcCancel2 := withResidualNoticeCtx(ctx)
 		nerr := m.recordResidualNotice(rcCtx2, taskID, debt.SessionID, nil,
 			noticeReasonCandidateCleanupFailed, true)
+		if serr := m.settleCandidateIntent(rcCtx2, taskID, candidate.UpstreamSessionID); serr != nil {
+			log.Printf("task %s: settle candidate intent to debt session %s: %v", taskID, candidate.UpstreamSessionID, serr)
+		}
 		rcCancel2()
 		if nerr != nil {
 			m.registerReapObligations(taskID, []suspendFinishObligation{{
@@ -351,8 +377,15 @@ func (m *Manager) rollbackFirstBuild(ctx context.Context, taskID string, sup app
 				Reason: noticeReasonCandidateCleanupFailed, Retryable: true,
 			}})
 		}
-		return fmt.Errorf("%w; candidate %s 回收失败（清理债务，残留事实非「从未建立」）: %v",
-			cause, candidate.UpstreamSessionID, rerr)
+		// notice 直写失败 MUST Join 进返回值（不静默——门禁依赖 notice/ledger
+		// 至少一个通道承载跨重启阻断）。
+		return errors.Join(fmt.Errorf("%w; candidate %s 回收失败（清理债务，残留事实非「从未建立」）: %v",
+			cause, candidate.UpstreamSessionID, rerr), nerr)
+	}
+	// 回收成功：candidate 已不存在——占位阻断意图解除（门禁随之开放；rcCtx 已
+	// WithoutCancel——回收 succeeded 但请求已取消时清除仍须完成）。
+	if cerr := m.clearCandidateIntent(rcCtx, taskID); cerr != nil {
+		log.Printf("task %s: clear candidate intent after successful recycle: %v", taskID, cerr)
 	}
 	return cause
 }

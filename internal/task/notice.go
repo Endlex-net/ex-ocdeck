@@ -779,6 +779,11 @@ func (m *Manager) reapCandidateDebt(ctx context.Context, taskID, sessionID strin
 	if !ok {
 		return false, fmt.Errorf("v2 supervisor does not implement CandidateDebtReaper (candidate debt kept)")
 	}
+	// Round3 J3：任务已 active → 该 candidate 已成为正式 binding 事实（首建成功
+	// 或经承接转换）——MUST NOT 收割，清除债务条目（门禁随事实解除）。
+	if row, err := m.store.GetTask(ctx, taskID); err == nil && row.Status == StatusActive {
+		return true, nil
+	}
 	if rerr := reaper.ReapCandidateSession(ctx, taskID, sessionID); rerr != nil {
 		return false, rerr
 	}
@@ -1043,4 +1048,89 @@ func unionStringSlices(old, neu []string) []string {
 // 新产生 tickets 合并进 notice，不覆盖丢失未收割的旧 tickets）。
 func unionTickets(old, neu []string) []string {
 	return unionStringSlices(old, neu)
+}
+
+// candidateIntentSessionPending 是首建阻断意图的占位 sessionName（POST 前落库；
+// Acquire 拿到真实 candidate id 后经 settleCandidateIntent 替换）。
+const candidateIntentSessionPending = "pending"
+
+// armCandidateIntent 在首建 POST 之前持久化可跨重启的阻断意图（Round3 J3）：
+// retryable candidate_cleanup_failed 残债（sessionName=pending）——持久化失败
+// 返回错误，调用方 MUST NOT 发起首建 POST（零 POST，无 candidate 产生 → 无
+// 残留事实可丢失）。notice 在位期间首建准入门禁持续阻断。
+func (m *Manager) armCandidateIntent(ctx context.Context, taskID string) error {
+	return m.recordResidualNotice(ctx, taskID, candidateIntentSessionPending, nil,
+		noticeReasonCandidateCleanupFailed, true)
+}
+
+// clearCandidateIntent 移除占位阻断意图（candidate 已回收或已正式提交成为
+// binding 事实——门禁随之解除）。CAS 移除；找不到幂等成功。
+func (m *Manager) clearCandidateIntent(ctx context.Context, taskID string) error {
+	for attempt := 0; attempt < 8; attempt++ {
+		row, err := m.store.GetTask(ctx, taskID)
+		if err != nil {
+			return fmt.Errorf("clear candidate intent: get task: %w", err)
+		}
+		entries, perr := parseNotices(row.Notice)
+		if perr != nil {
+			return fmt.Errorf("clear candidate intent: notice json corrupted (task %s): %w", taskID, perr)
+		}
+		var remaining []noticeEntry
+		changed := false
+		for _, e := range entries {
+			if e.Code == noticeCodeResidual {
+				if sn, _ := e.Data["sessionName"].(string); sn == candidateIntentSessionPending {
+					changed = true
+					continue
+				}
+			}
+			remaining = append(remaining, e)
+		}
+		if !changed {
+			return nil
+		}
+		r, _ := m.writeNoticeCAS(ctx, taskID, row.Notice, encodeNotices(remaining))
+		if r.Matched {
+			return nil
+		}
+	}
+	return fmt.Errorf("clear candidate intent: CAS did not converge (task %s)", taskID)
+}
+
+// settleCandidateIntent 把占位意图升级为含真实 candidate sessionID 的持久债务
+// （Round3 J3：DELETE 失败后，candidate 身份跨重启可识别——门禁持续阻断直至
+// reaper 收割或用户处置）。pending 条目不存在（已被并发处理）→ 幂等成功。
+// 落库失败返回错误，调用方 MUST 走 ledger 兜底。
+func (m *Manager) settleCandidateIntent(ctx context.Context, taskID, sessionID string) error {
+	for attempt := 0; attempt < 8; attempt++ {
+		row, err := m.store.GetTask(ctx, taskID)
+		if err != nil {
+			return fmt.Errorf("settle candidate intent: get task: %w", err)
+		}
+		entries, perr := parseNotices(row.Notice)
+		if perr != nil {
+			return fmt.Errorf("settle candidate intent: notice json corrupted (task %s): %w", taskID, perr)
+		}
+		found := false
+		for i, e := range entries {
+			if e.Code != noticeCodeResidual {
+				continue
+			}
+			if sn, _ := e.Data["sessionName"].(string); sn != candidateIntentSessionPending {
+				continue
+			}
+			e.Data["sessionName"] = sessionID
+			entries[i] = e
+			found = true
+			break
+		}
+		if !found {
+			return nil
+		}
+		r, _ := m.writeNoticeCAS(ctx, taskID, row.Notice, encodeNotices(entries))
+		if r.Matched {
+			return nil
+		}
+	}
+	return fmt.Errorf("settle candidate intent: CAS did not converge (task %s)", taskID)
 }
