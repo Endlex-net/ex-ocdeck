@@ -9,14 +9,25 @@ func TestExtractOpenCodeMajor(t *testing.T) {
 		in   string
 		want int
 	}{
+		// 裸版本 / v 前缀。
 		{"1.18.26", 1},
 		{"2.0.28", 2},
 		{"v2.0.28", 2},
-		{"opencode 2.0.28", 0}, // 前导非版本数字 → unknown
-		{"", 0},
-		{"abc", 0},
-		{"0.1", 0},
 		{"2", 2},
+		// `opencode ` 可执行名前缀（probeOpenCodeVersion 真实输出形态）。
+		{"opencode 2.0.28", 2},
+		{"opencode v2.0.28", 2},
+		{"opencode v1.18.26", 1},
+		{"  opencode   v2.0.28  ", 2}, // 多余空白（Fields 分词吸收）
+		// 非法输入 → unknown（0）。
+		{"", 0},
+		{"opencode", 0},
+		{"opencode abc", 0},
+		{"abc", 0},
+		{"v0.1", 0}, // 主版本 0 非正
+		{"0.1", 0},  // 主版本 0 非正
+		{"-1.2", 0}, // 负号开头非版本 token
+		{"opencode v0.9", 0},
 	}
 	for _, tc := range cases {
 		if got := ExtractOpenCodeMajor(tc.in); got != tc.want {

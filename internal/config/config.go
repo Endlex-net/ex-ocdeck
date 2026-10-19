@@ -620,18 +620,24 @@ func v2AdoptionEnabled(lookup EnvLookup) bool {
 }
 
 // ExtractOpenCodeMajor 提取机器实装 opencode 的主版本（design D4 resolver
-// 口径）：容忍 v/V 前缀，取首个点分段的前导数字；解析失败/非正数 → 0
-// （unknown——resolver 按保守口径处理，探测失败同样归 0）。
+// 口径）：容忍 `opencode ` 可执行名前缀与 v/V 版本前缀——按空白分词取以数字
+// 开头的版本 token（与 parseTmuxSemver 的 Fields 口径一致；probeOpenCodeVersion
+// 实测输出形如 "opencode v2.0.28"），再取首个点分段的前导数字；解析失败/非正数
+// → 0（unknown——resolver 按保守口径处理，探测失败同样归 0）。
 func ExtractOpenCodeMajor(version string) int {
-	s := strings.TrimSpace(version)
-	s = strings.TrimPrefix(s, "v")
-	s = strings.TrimPrefix(s, "V")
-	if dot := strings.IndexByte(s, '.'); dot >= 0 {
-		s = s[:dot]
+	for _, tok := range strings.Fields(version) {
+		t := strings.TrimPrefix(strings.TrimPrefix(tok, "v"), "V")
+		if t == "" || t[0] < '0' || t[0] > '9' {
+			continue // 可执行名等非版本 token（如 "opencode"、"abc"）
+		}
+		if dot := strings.IndexByte(t, '.'); dot >= 0 {
+			t = t[:dot]
+		}
+		n, err := strconv.Atoi(t)
+		if err != nil || n <= 0 {
+			return 0
+		}
+		return n
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(s))
-	if err != nil || n <= 0 {
-		return 0
-	}
-	return n
+	return 0
 }
