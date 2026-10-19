@@ -248,7 +248,16 @@ func (m *Manager) recordSuspendStopIntent(ctx context.Context, taskID, terminalR
 		dup := false
 		for i, e := range entries {
 			if noticeKey(e) == key {
-				entries[i] = entry
+				// Round6 I19：同键替换保留未完成持久化义务（pending 随新条目
+				// 延续——重新 kill 同名单元不保证重建原有 cleanup tickets）。
+				nc := entry
+				if old := decodeSuspendFinishObligations(e); len(old) > 0 {
+					if nc.Data == nil {
+						nc.Data = map[string]interface{}{}
+					}
+					nc.Data[suspendFinishPendingKey] = encodeSuspendFinishObligations(old)
+				}
+				entries[i] = nc
 				dup = true
 				break
 			}
@@ -269,6 +278,8 @@ func (m *Manager) recordSuspendStopIntent(ctx context.Context, taskID, terminalR
 
 // clearSuspendStopIntents 清除任务的全部停止收敛意图（Round4 I2：后续 Suspend
 // 取得收敛权后，历史意图的前提已被取代——CAS 过滤式移除；无意图幂等成功）。
+// Round6 I19：删除前必须补全意图携带的未完成持久化义务（notice/tickets、env）——
+// 补全失败则保留意图（含 pending），不得丢弃 tickets 重放能力。
 func (m *Manager) clearSuspendStopIntents(ctx context.Context, taskID string) error {
 	for attempt := 0; attempt < 8; attempt++ {
 		row, err := m.store.GetTask(ctx, taskID)
@@ -283,11 +294,20 @@ func (m *Manager) clearSuspendStopIntents(ctx context.Context, taskID string) er
 		var remaining []noticeEntry
 		changed := false
 		for _, e := range entries {
-			if e.Code == noticeCodeSuspendStop {
-				changed = true
+			if e.Code != noticeCodeSuspendStop {
+				remaining = append(remaining, e)
 				continue
 			}
-			remaining = append(remaining, e)
+			changed = true
+			if pending := decodeSuspendFinishObligations(e); len(pending) > 0 {
+				ref, _ := e.Data["sessionName"].(string)
+				if rem := m.persistSuspendFinishObligations(ctx, taskID, ref, pending); len(rem) > 0 {
+					// 义务仍未持久化：保留意图（含 pending 标注），不得删除。
+					remaining = append(remaining, annotateSuspendStopPending(e, rem))
+					continue
+				}
+			}
+			// 无义务或义务已补全：意图可安全移除。
 		}
 		if !changed {
 			return nil
@@ -428,19 +448,62 @@ func (m *Manager) retrySuspendStopIntent(ctx context.Context, taskID string, e n
 	if joined := errors.Join(ferrs...); joined != nil && !le.Valid {
 		le = sql.NullString{String: joined.Error(), Valid: true}
 	}
+	// Round6 I17：状态收敛与完整 pending 载荷同一持久化提交边界——义务标注
+	// 先于状态收敛落库。标注失败 → 不收敛（保持 active：tickets 由 kill 结果
+	// 下一轮重新派生，零丢失）；标注成功 → 收敛；收敛写失败 → 意图已携带
+	// pending（active 态），下轮先补义务再收敛。消除「已 suspended 而义务载荷
+	// 仅存在于本次调用返回值」的丢失窗口。
+	if len(obligations) > 0 {
+		e = annotateSuspendStopPending(e, obligations)
+		if aerr := m.persistAnnotatedIntent(ctx, taskID, e); aerr != nil {
+			return false, e, fmt.Errorf("suspend stop intent: pending annotate: %w", aerr)
+		}
+	}
 	if _, werr := m.writeStatusConditional(ctx, taskID, StatusActive, StatusSuspended, le); werr != nil {
-		// DB 仍不可用：未完成义务随意图保留，下轮重试（done=false 不删）。
-		return false, annotateSuspendStopPending(e, obligations),
-			fmt.Errorf("suspend stop intent: converge: %w", werr)
+		// 意图已携带 pending（若收敛前段有义务）：active 态下轮先补义务再收敛。
+		return false, e, fmt.Errorf("suspend stop intent: converge: %w", werr)
 	}
 	if len(obligations) > 0 {
-		// Round5 I17：状态已收敛但债务/env 持久化未完成——意图以 pending 形态
-		// 保留（完整 tickets 随条目，由外层 CAS 持久化）；MUST NOT 清除。
-		return false, annotateSuspendStopPending(e, obligations), errors.Join(ferrs...)
+		// Round6 I17：收敛完成但义务（已随意图 pending 持久化）未完成——意图
+		// 保留，下轮 pending 分支补全后才清除（不得随 done 丢弃 pending）。
+		return false, e, errors.Join(ferrs...)
 	}
-	// Matched=收敛完成（清理失败已固化为残留 notice/tickets 债务）；!Matched=
-	// 状态已被其他代改写（守卫不覆盖）——意图均了结。
+	// Matched=收敛完成且无未完成义务；!Matched=状态已被其他代改写（守卫不
+	// 覆盖）——意图均了结。
 	return true, e, nil
+}
+
+// persistAnnotatedIntent 把标注后的停止收敛意图 CAS 落库（Round6 I17：义务标注
+// 与状态收敛的提交边界——标注未落库时调用方 MUST NOT 收敛状态）。
+func (m *Manager) persistAnnotatedIntent(ctx context.Context, taskID string, annotated noticeEntry) error {
+	key := noticeKey(annotated)
+	for attempt := 0; attempt < 8; attempt++ {
+		row, err := m.store.GetTask(ctx, taskID)
+		if err != nil {
+			return fmt.Errorf("persist annotated intent: get task: %w", err)
+		}
+		entries, perr := parseNotices(row.Notice)
+		if perr != nil {
+			return fmt.Errorf("persist annotated intent: notice json corrupted (task %s): %w", taskID, perr)
+		}
+		found := false
+		for i, cur := range entries {
+			if noticeKey(cur) != key {
+				continue
+			}
+			entries[i] = annotated
+			found = true
+			break
+		}
+		if !found {
+			return fmt.Errorf("persist annotated intent: intent vanished (task %s)", taskID)
+		}
+		r, _ := m.writeNoticeCAS(ctx, taskID, row.Notice, encodeNotices(entries))
+		if r.Matched {
+			return nil
+		}
+	}
+	return fmt.Errorf("persist annotated intent: CAS did not converge (task %s)", taskID)
 }
 
 // annotateSuspendStopPending 把未完成持久化义务以 pendingJSON 形态写入条目副本

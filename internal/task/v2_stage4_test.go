@@ -2881,43 +2881,43 @@ func TestStage4_R5_I17_ReplayKeepsIntentOnDebtPersistFail(t *testing.T) {
 	if ierr := m.recordSuspendStopIntent(ctx, "t-dp", ref, string(rt.instVersion)); ierr != nil {
 		t.Fatal(ierr)
 	}
-	// 精确注入：覆盖 recordResidualNotice 的全部 CAS 重试（8 次——它丢弃单次
-	// 写错误并重试至成功）→ 债务落库真失败 → 义务进入意图（pending 标注的意图
-	// 写回=第 9 次写，成功）。
-	fstore.failNextNoticeCAS.Store(8)
+	// Round6 I17（持续失败注入）：覆盖 recordResidualNotice 全部 CAS 重试（8 次）
+	// + pending 标注写回（第 9 次）——债务落库与义务标注均失败 → MUST NOT 收敛
+	// 状态（保持 active：tickets 由 kill 结果下一轮重新派生，零丢失）。
+	fstore.failNoticeCAS.Store(true)
 	row, _ := fstore.GetTask(ctx, "t-dp")
 	entries, _ := parseNotices(row.Notice)
 	if rerr := m.retryTaskNotices(ctx, row, entries); rerr == nil {
 		t.Fatalf("debt persistence failure must surface (done=false)")
 	}
 	row2, _ := fstore.GetTask(ctx, "t-dp")
-	if row2.Status != "suspended" {
-		t.Fatalf("status=%s（收敛写成功）", row2.Status)
+	if row2.Status != "active" {
+		t.Fatalf("status=%s（义务标注未落库 MUST NOT 收敛状态）", row2.Status)
 	}
-	// 债务 notice MUST NOT 在持久化失败时伪装落库；意图 MUST 以 pending 形态
-	// 保留（完整 tickets 随意图——不得仅写错误文本后清除）。
+	if !strings.Contains(row2.Notice.String, noticeCodeSuspendStop) {
+		t.Fatalf("intent must be kept: %q", row2.Notice.String)
+	}
 	if strings.Contains(row2.Notice.String, `"code":"residual_processes"`) {
 		t.Fatalf("debt notice must NOT be persisted while persistence fails: %q", row2.Notice.String)
 	}
-	if !strings.Contains(row2.Notice.String, noticeCodeSuspendStop) {
-		t.Fatalf("intent must be kept (not cleared) on debt persistence failure: %q", row2.Notice.String)
-	}
-	if !strings.Contains(row2.Notice.String, suspendFinishPendingKey) || !strings.Contains(row2.Notice.String, "tk-r5-1") {
-		t.Fatalf("pending obligations with full tickets must be preserved with the intent: %q", row2.Notice.String)
-	}
 
-	// 下一轮重放：义务补全（notice 落库）→ 意图清除。
+	// 恢复 → 重放：债务 notice 落库 → 收敛 suspended → 意图清除（完整 tickets
+	// 可继续重放——not 仅断言错误返回）。
+	fstore.failNoticeCAS.Store(false)
 	row3, _ := fstore.GetTask(ctx, "t-dp")
 	entries3, _ := parseNotices(row3.Notice)
 	if rerr := m.retryTaskNotices(ctx, row3, entries3); rerr != nil {
 		t.Fatalf("replay(restore): %v", rerr)
 	}
 	row4, _ := fstore.GetTask(ctx, "t-dp")
-	if strings.Contains(row4.Notice.String, suspendFinishPendingKey) {
-		t.Fatalf("pending marker must be cleared after obligations complete: %q", row4.Notice.String)
+	if row4.Status != "suspended" {
+		t.Fatalf("status=%s（恢复后收敛 suspended）", row4.Status)
 	}
 	if !strings.Contains(row4.Notice.String, "tk-r5-1") {
-		t.Fatalf("tickets debt must be persisted after obligation completion: %q", row4.Notice.String)
+		t.Fatalf("tickets debt must be persisted after recovery: %q", row4.Notice.String)
+	}
+	if strings.Contains(row4.Notice.String, noticeCodeSuspendStop) {
+		t.Fatalf("intent must be cleared after converged replay: %q", row4.Notice.String)
 	}
 }
 
@@ -2948,9 +2948,10 @@ func TestStage4_R5_I17_ReplayKeepsIntentOnEnvClearFail(t *testing.T) {
 	fstore.failEnvClear.Store(true)
 	row, _ := fstore.GetTask(ctx, "t-ev")
 	entries, _ := parseNotices(row.Notice)
-	if rerr := m.retryTaskNotices(ctx, row, entries); rerr == nil {
-		t.Fatalf("env clear failure must surface (done=false)")
-	}
+	// Round6 I17：义务标注先于收敛落库（notice 通道健康——标注成功）→ 收敛
+	// suspended + 意图携带 env 义务。重放返回值携带义务错误（允许）——以持久化
+	// 状态断言为准。
+	_ = m.retryTaskNotices(ctx, row, entries)
 	row2, _ := fstore.GetTask(ctx, "t-ev")
 	if row2.Status != "suspended" {
 		t.Fatalf("status=%s", row2.Status)
@@ -2985,6 +2986,151 @@ func TestStage4_R5_I17_ReplayKeepsIntentOnEnvClearFail(t *testing.T) {
 	}
 }
 
+// TestStage4_R6_I19_SuspendCompletesPendingOrKeepsIt 落实 Round6 I19：后续
+// Suspend 取得收敛权清除意图前 MUST 补全意图携带的未完成持久化义务——补全成功
+// → tickets 债务落库 + 意图清除；补全失败 → 意图保留（pending 不丢），下轮
+// 重放补全。
+func TestStage4_R6_I19_SuspendCompletesPendingOrKeepsIt(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-pk")
+	adapter := NewStoreAdapter(db)
+	fstore := &failReplayPersistStore{StoreAdapter: adapter}
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManagerStore(t, db, fstore, prov)
+	m.lifecycle = nil
+	rt := m.newRuntime("t-pk")
+	m.setRuntime("t-pk", rt)
+	ref := "ocdeck-v2-tui-t-pk"
+
+	// 意图携带未完成 notice 义务（tk-r6-1）。
+	if ierr := m.recordSuspendStopIntent(ctx, "t-pk", ref, string(rt.instVersion)); ierr != nil {
+		t.Fatal(ierr)
+	}
+	row, _ := fstore.GetTask(ctx, "t-pk")
+	entries, _ := parseNotices(row.Notice)
+	annotated := annotateSuspendStopPending(entries[0], []suspendFinishObligation{{
+		Kind: "notice", Name: ref, Tickets: []string{"tk-r6-1"}, Reason: "kill_failed", Retryable: true,
+	}})
+	if _, werr := m.writeNoticeCAS(ctx, "t-pk", row.Notice, encodeNotices([]noticeEntry{annotated})); werr != nil {
+		t.Fatal(werr)
+	}
+
+	// 成功路径：Suspend 清除意图前补全义务（tickets 债务落库）。
+	if serr := m.Suspend(ctx, "t-pk"); serr != nil {
+		t.Fatalf("suspend: %v", serr)
+	}
+	row2, _ := fstore.GetTask(ctx, "t-pk")
+	if row2.Status != "suspended" {
+		t.Fatalf("status=%s", row2.Status)
+	}
+	if !strings.Contains(row2.Notice.String, "tk-r6-1") {
+		t.Fatalf("pending obligation must be completed before intent removal: %q", row2.Notice.String)
+	}
+	if strings.Contains(row2.Notice.String, noticeCodeSuspendStop) {
+		t.Fatalf("intent must be cleared after obligations complete: %q", row2.Notice.String)
+	}
+
+	// 失败路径：义务补全持续写失败（failNoticeCAS——覆盖义务补全与意图写回的
+	// 全部 notice 写）→ 意图保留（pending+tickets 不丢）；Suspend 本身完成。
+	seedV2ActiveTask(t, db, "t-pk2")
+	rt2 := m.newRuntime("t-pk2")
+	m.setRuntime("t-pk2", rt2)
+	ref2 := "ocdeck-v2-tui-t-pk2"
+	if ierr := m.recordSuspendStopIntent(ctx, "t-pk2", ref2, string(rt2.instVersion)); ierr != nil {
+		t.Fatal(ierr)
+	}
+	row3, _ := fstore.GetTask(ctx, "t-pk2")
+	entries3, _ := parseNotices(row3.Notice)
+	annotated2 := annotateSuspendStopPending(entries3[0], []suspendFinishObligation{{
+		Kind: "notice", Name: ref2, Tickets: []string{"tk-r6-2"}, Reason: "kill_failed", Retryable: true,
+	}})
+	if _, werr := m.writeNoticeCAS(ctx, "t-pk2", row3.Notice, encodeNotices([]noticeEntry{annotated2})); werr != nil {
+		t.Fatal(werr)
+	}
+	fstore.failNoticeCAS.Store(true)
+	if serr := m.Suspend(ctx, "t-pk2"); serr != nil {
+		t.Fatalf("suspend(fail path): %v", serr)
+	}
+	row4, _ := fstore.GetTask(ctx, "t-pk2")
+	if row4.Status != "suspended" {
+		t.Fatalf("status=%s", row4.Status)
+	}
+	// 意图（含 pending+完整 tickets）MUST 保留——补全失败不得删除或降级为文本。
+	if !strings.Contains(row4.Notice.String, noticeCodeSuspendStop) ||
+		!strings.Contains(row4.Notice.String, suspendFinishPendingKey) ||
+		!strings.Contains(row4.Notice.String, "tk-r6-2") {
+		t.Fatalf("intent with pending obligations must be preserved on persist failure: %q", row4.Notice.String)
+	}
+	if strings.Contains(row4.Notice.String, `"code":"residual_processes"`) {
+		t.Fatalf("obligation must not masquerade as persisted debt: %q", row4.Notice.String)
+	}
+	// 恢复 → 重放：义务补全（tickets 债务落库）→ 意图清除。
+	fstore.failNoticeCAS.Store(false)
+	row5, _ := fstore.GetTask(ctx, "t-pk2")
+	entries5, _ := parseNotices(row5.Notice)
+	if rerr := m.retryTaskNotices(ctx, row5, entries5); rerr != nil {
+		t.Fatalf("replay: %v", rerr)
+	}
+	row6, _ := fstore.GetTask(ctx, "t-pk2")
+	if strings.Contains(row6.Notice.String, noticeCodeSuspendStop) {
+		t.Fatalf("intent must be cleared after replay completes obligations: %q", row6.Notice.String)
+	}
+	if !strings.Contains(row6.Notice.String, "tk-r6-2") {
+		t.Fatalf("tickets must be persisted after replay completion: %q", row6.Notice.String)
+	}
+}
+
+// TestStage4_R6_I19_ReRecordPreservesPending 落实 Round6 I19：同键替换保留未
+// 完成义务——重新记录停止意图不得覆盖 pending（重新 kill 同名单元不保证重建
+// 原 cleanup tickets）。
+func TestStage4_R6_I19_ReRecordPreservesPending(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTask(t, db, "t-rr")
+	adapter := NewStoreAdapter(db)
+	sup := &suspendV2Sup{}
+	prov := &suspendV2Provider{sup: sup}
+	m := newSuspendManager(t, db, prov)
+	rt := m.newRuntime("t-rr")
+	m.setRuntime("t-rr", rt)
+	ref := "ocdeck-v2-tui-t-rr"
+
+	if ierr := m.recordSuspendStopIntent(ctx, "t-rr", ref, string(rt.instVersion)); ierr != nil {
+		t.Fatal(ierr)
+	}
+	row, _ := adapter.GetTask(ctx, "t-rr")
+	entries, _ := parseNotices(row.Notice)
+	annotated := annotateSuspendStopPending(entries[0], []suspendFinishObligation{{
+		Kind: "notice", Name: ref, Tickets: []string{"tk-r6-keep"}, Reason: "kill_failed", Retryable: true,
+	}})
+	if _, werr := m.writeNoticeCAS(ctx, "t-rr", row.Notice, encodeNotices([]noticeEntry{annotated})); werr != nil {
+		t.Fatal(werr)
+	}
+
+	// 同键重录（新停止确认失败）→ pending 必须随新条目延续。
+	if ierr := m.recordSuspendStopIntent(ctx, "t-rr", ref, string(rt.instVersion)); ierr != nil {
+		t.Fatal(ierr)
+	}
+	row2, _ := adapter.GetTask(ctx, "t-rr")
+	if !strings.Contains(row2.Notice.String, "tk-r6-keep") {
+		t.Fatalf("same-key re-record must preserve pending tickets: %q", row2.Notice.String)
+	}
+	if !strings.Contains(row2.Notice.String, suspendFinishPendingKey) {
+		t.Fatalf("pending marker must survive re-record: %q", row2.Notice.String)
+	}
+}
+
+// 连接断开 → 正式消费方在断线期间接手（安装回调、进入 ready 等待）→ 上游恢复
 // TestStage4_R5_I10_HandoverDuringDisconnect 落实 Round5 I10：候选握手完成 →
 // 连接断开 → 正式消费方在断线期间接手（安装回调、进入 ready 等待）→ 上游恢复
 // 重连成功 → 首次 ready 由重连满足（对齐执行、接管成功）——不再依赖
