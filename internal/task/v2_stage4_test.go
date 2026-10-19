@@ -727,9 +727,17 @@ type monitorProcSeam struct {
 	port    int
 	ln      net.Listener
 	handler http.Handler
+	spawns  int
 	// onSpawn 在 serve 单元（重新）绑定时回调——模拟「新进程存活」（身份核验
 	// 依据由测试侧持有，测试经此复活 ProcessIdentity 事实）。
 	onSpawn func()
+}
+
+// spawnCount 返回 serve 单元启动次数（Round收尾 J6：共享 serve 断言）。
+func (p *monitorProcSeam) spawnCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.spawns
 }
 
 // newMonitorProcSeam 构造并预占一个空闲端口（构造即关闭——端口在 NewSession 时
@@ -752,6 +760,9 @@ func (p *monitorProcSeam) NewSession(spec process.SessionSpec) error {
 		}
 	}
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	p.mu.Lock()
+	p.spawns++
+	p.mu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -2577,6 +2588,8 @@ type realStreamHarness struct {
 	port    int
 	// allowConns 允许的 /api/event 连接数（默认 1——重订阅即 500 红灯）。
 	allowConns int32
+	// created 记录首建 POST 创建的 session 数（Round收尾 J6）。
+	created atomic.Int32
 	// dropConn 非 nil 时：首条连接写出 hello 后等待该 chan 关闭再返回（模拟
 	// 服务端主动断连——触发客户端重连）。
 	dropConn chan struct{}
@@ -2601,6 +2614,13 @@ func newRealStreamHarness(t *testing.T, taskID, upstream, status string) *realSt
 		switch {
 		case r.URL.Path == "/openapi.json":
 			_, _ = w.Write([]byte(`{"components":{"schemas":{"Session.ID":{"type":"string","pattern":"^ses"},"Session.Message.ID":{"type":"string","pattern":"^msg_"}}}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session":
+			// 首建（Round收尾 J6）：递增 id 的 session 创建。
+			n := h.created.Add(1)
+			id := fmt.Sprintf("ses_c%d", n)
+			_, _ = w.Write([]byte(`{"data":{"id":"` + id + `","location":{"directory":"/wt"},"time":{"created":1,"updated":1}}}`))
+		case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/environment"):
+			w.WriteHeader(http.StatusNoContent)
 		case r.URL.Path == "/api/event":
 			if h.conns.Add(1) > h.allowConns {
 				// 接管 MUST 复用候选流——超限订阅即失败信号（重订阅即红）。
@@ -2624,8 +2644,9 @@ func newRealStreamHarness(t *testing.T, taskID, upstream, status string) *realSt
 				<-r.Context().Done() // 客户端断开（Close）→ return 产生 EOF
 			}
 			evtOnce.Do(func() { close(h.evtDone) })
-		case r.URL.Path == "/api/session/"+upstream:
-			_, _ = w.Write([]byte(`{"data":{"id":"` + upstream + `","location":{"directory":"/wt"},"time":{"created":1,"updated":1}}}`))
+		case strings.HasPrefix(r.URL.Path, "/api/session/ses_"):
+			id := strings.TrimPrefix(r.URL.Path, "/api/session/")
+			_, _ = w.Write([]byte(`{"data":{"id":"` + id + `","location":{"directory":"/wt"},"time":{"created":1,"updated":1}}}`))
 		default:
 			_, _ = w.Write([]byte(`{"data":[],"cursor":{"previous":null,"next":null}}`))
 		}
@@ -3188,6 +3209,137 @@ func TestStage4_R6_I19_SuspendCompletesPendingOrKeepsIt(t *testing.T) {
 	}
 }
 
+// ---- 收尾 Round1：J3 candidate 清理义务按 task 持久化 + 首建准入门禁 ----
+
+// debtCandidateSup 是 J3 测试的 fake supervisor：Acquire 恒失败且错误链携带
+// CandidateCleanupDebt（配置应用失败+DELETE 失败的编排后形态）；实现
+// CandidateDebtReaper 录制收割目标。
+type debtCandidateSup struct {
+	mu           sync.Mutex
+	acquireCalls int32
+	reaped       []string
+}
+
+func (s *debtCandidateSup) Acquire(ctx context.Context, t appagent.TaskRef) (domain.TaskBinding, error) {
+	atomic.AddInt32(&s.acquireCalls, 1)
+	cfgErr := appagent.NewError("supervisor.env", appagent.ErrKindRuntimeUnavailable,
+		errors.New("env snapshot unavailable"))
+	debt := &appagent.CandidateCleanupDebt{SessionID: "ses_debt_1",
+		Err: errors.New("delete ses_debt_1: 500")}
+	return domain.TaskBinding{}, errors.Join(cfgErr, debt)
+}
+
+func (s *debtCandidateSup) Resume(ctx context.Context, t appagent.TaskRef, b domain.TaskBinding, p appagent.ResumePolicy) (domain.TaskBinding, error) {
+	return domain.TaskBinding{}, appagent.NewError("test.resume", appagent.ErrKindNotFound,
+		errors.New("no upstream session (B first-build path)"))
+}
+
+func (s *debtCandidateSup) AcquireEphemeral(ctx context.Context, t appagent.TaskRef) (domain.TaskBinding, error) {
+	return domain.TaskBinding{}, errors.New("unexpected")
+}
+
+func (s *debtCandidateSup) Release(ctx context.Context, b domain.TaskBinding) error { return nil }
+
+func (s *debtCandidateSup) ReapCandidateSession(ctx context.Context, taskID, sessionID string) error {
+	s.mu.Lock()
+	s.reaped = append(s.reaped, sessionID)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *debtCandidateSup) reapedSnapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.reaped...)
+}
+
+// debtProvider 包装 debtCandidateSup（归属校验/端点/Events nil——首建握手回退
+// ocFactory 形态）。
+type debtProvider struct {
+	v2Stub
+	sup *debtCandidateSup
+}
+
+func (p *debtProvider) Supervisor() appagent.RuntimeSupervisor { return p.sup }
+
+func (p *debtProvider) CheckBindingOwnership(b domain.TaskBinding, expectedTaskID, expectedDirectory string) error {
+	return nil
+}
+
+func (p *debtProvider) BindingRuntimeEndpoint(b domain.TaskBinding) (int, string, string, error) {
+	return 4096, "derived", "/wt", nil
+}
+
+// TestR1_J3_CandidateDebt_GatesFirstBuild 落实收尾 Round1 J3：首建 Acquire 失败
+// 且错误链携带 CandidateCleanupDebt → 按 task 落 retryable 残债（reason=
+// candidate_cleanup_failed）→ 再次 Activate 被首建准入门禁拒绝（零 POST）→
+// reaper 可用后重放收割原 session → 残债清除 → Activate 可再次首建。
+func TestR1_J3_CandidateDebt_GatesFirstBuild(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedBranchBTask(t, db, "t-cd")
+	adapter := NewStoreAdapter(db)
+	sup := &debtCandidateSup{}
+	prov := &debtProvider{sup: sup}
+	m := newTestManagerFull(t, adapter, nil, newMockProc(), newMockWorktree(), newMockOC(true))
+	m.SetLifecycleCtx(ctx)
+	m.SetMachineFacts(machineFacts{MachineMajor: 2, V2Enabled: true})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(prov); err != nil {
+		t.Fatal(err)
+	}
+	m.providerRegistry = reg
+
+	// 首次 Activate：Acquire 失败 + 清理义务落残债。
+	if aerr := m.Activate(ctx, "t-cd"); aerr == nil {
+		t.Fatalf("first build must fail on injected config+delete errors")
+	}
+	row, err := adapter.GetTask(ctx, "t-cd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(row.Notice.String, "candidate_cleanup_failed") ||
+		!strings.Contains(row.Notice.String, "ses_debt_1") {
+		t.Fatalf("cleanup debt must be persisted per task: %q", row.Notice.String)
+	}
+	// 残债在位：再次 Activate 被首建准入门禁拒绝（零 POST——不误判零历史）。
+	if aerr := m.Activate(ctx, "t-cd"); aerr == nil ||
+		!strings.Contains(aerr.Error(), "uncleaned cleanup debt") {
+		t.Fatalf("second Activate must be gated by cleanup debt, got %v", aerr)
+	}
+	if calls := atomic.LoadInt32(&sup.acquireCalls); calls != 1 {
+		t.Fatalf("gated Activate must not POST again, acquires=%d", calls)
+	}
+
+	// reaper 就绪 → 后台重放收割原 session → 残债清除 → Activate 可再次首建。
+	if berr := m.processRetryableNotices(ctx); berr != nil {
+		t.Fatalf("replay: %v", berr)
+	}
+	reaped := sup.reapedSnapshot()
+	if len(reaped) != 1 || reaped[0] != "ses_debt_1" {
+		t.Fatalf("reaper target must be the original candidate session, got %v", reaped)
+	}
+	row2, _ := adapter.GetTask(ctx, "t-cd")
+	if strings.Contains(row2.Notice.String, "candidate_cleanup_failed") {
+		t.Fatalf("residual debt must be cleared after reap: %q", row2.Notice.String)
+	}
+	if aerr := m.Activate(ctx, "t-cd"); aerr == nil {
+		t.Fatalf("Activate after reap expected to fail later in the chain (fake sup), but gate must be open; aerr=%v", aerr)
+	} else if strings.Contains(aerr.Error(), "uncleaned cleanup debt") {
+		t.Fatalf("gate must be open after reap, got %v", aerr)
+	}
+	if calls := atomic.LoadInt32(&sup.acquireCalls); calls != 2 {
+		t.Fatalf("ungated Activate must attempt Acquire once more, acquires=%d", calls)
+	}
+}
+
 // ---- Round 8：I20 ledger 按任务隔离 · I17 重试生命周期闭环 ----
 
 // TestStage4_R8_I20_LedgerPerTaskIsolation 落实 Round8 I20：A 挂起失败留下
@@ -3585,6 +3737,82 @@ func TestStage4_R6_I19_ReRecordPreservesPending(t *testing.T) {
 	}
 	if !strings.Contains(row2.Notice.String, suspendFinishPendingKey) {
 		t.Fatalf("pending marker must survive re-record: %q", row2.Notice.String)
+	}
+}
+
+// ---- 收尾 Round1：J6 真实 provider 唯一实例/生命周期 ----
+
+// TestR1_J6_RealProvider_SharedInstanceAndLifecycle 落实收尾 Round1 J1/J6：
+// 经真实 NewSPIProviderWithDeps 注册的 provider——Supervisor() 唯一实例；并发
+// 两任务首建共享同一 serve（spawn==1，全局互斥）、各自独立 upstream session、
+// SSE 订阅各恰一次；Manager 关停（StopServerMonitoring）后 serve 死亡不再重拉
+// （监控已停，spawn 不再增长）。
+func TestR1_J6_RealProvider_SharedInstanceAndLifecycle(t *testing.T) {
+	ctx := context.Background()
+	h := newRealStreamHarness(t, "t-j6", "ses_keep", "active")
+	h.allowConns = 2
+	// 额外两个 v2 钉扎 suspended 首建任务（无 binding；v1 钉扎走 R8-B 同型分支）。
+	now := time.Now().Unix()
+	if _, err := h.db.Exec(`INSERT INTO projects (id, name, path, default_branch, created_at, kind)
+		 VALUES ('p-j6', 'proj', '/repo', 'main', ?, 'repo')`, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"t-f1", "t-f2"} {
+		if _, err := h.db.Exec(`INSERT INTO tasks (id, project_id, name, branch, status, worktree_path,
+			 provider_id, base_ref, created_at, updated_at)
+			 VALUES (?, 'p-j6', 'task', 'b', 'suspended', '/wt', 'opencode-v1', 'refs/heads/main', ?, ?)`,
+			id, now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sA := h.prov.Supervisor()
+	sB := h.prov.Supervisor()
+	if sA != sB {
+		t.Fatalf("Supervisor() must return the single instance")
+	}
+
+	var wg sync.WaitGroup
+	aerrs := [2]error{}
+	ids := []string{"t-f1", "t-f2"}
+	for i := range ids {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			aerrs[i] = h.m.Activate(ctx, ids[i])
+		}(i)
+	}
+	wg.Wait()
+	for i := range ids {
+		if aerrs[i] != nil {
+			t.Fatalf("Activate(%s): %v", ids[i], aerrs[i])
+		}
+	}
+	if spawns := h.proc.spawnCount(); spawns != 1 {
+		t.Fatalf("concurrent first-builds must share one serve, spawns=%d", spawns)
+	}
+	if n := h.conns.Load(); n != 2 {
+		t.Fatalf("two tasks must hold exactly two event subscriptions, conns=%d", n)
+	}
+	for _, id := range ids {
+		row, err := h.adapter.GetTask(ctx, id)
+		if err != nil || row.Status != "active" {
+			t.Fatalf("%s status=%s err=%v", id, row.Status, err)
+		}
+	}
+	b1, _, _ := h.adapter.GetTaskBinding(ctx, "t-f1")
+	b2, _, _ := h.adapter.GetTaskBinding(ctx, "t-f2")
+	if b1.UpstreamSessionID == "" || b2.UpstreamSessionID == "" || b1.UpstreamSessionID == b2.UpstreamSessionID {
+		t.Fatalf("distinct upstream sessions required: %q vs %q", b1.UpstreamSessionID, b2.UpstreamSessionID)
+	}
+
+	// 关停（persist 策略不关 server 但监控必须停）：serve 死亡后零重拉。
+	if ctl, ok := sA.(appagent.ServerMonitorController); ok {
+		ctl.StopServerMonitoring()
+	}
+	h.proc.killUnit()
+	time.Sleep(60 * time.Millisecond) // 数个监控周期：停止后不得重拉
+	if spawns := h.proc.spawnCount(); spawns != 1 {
+		t.Fatalf("monitor must stay stopped after shutdown, spawns=%d", spawns)
 	}
 }
 

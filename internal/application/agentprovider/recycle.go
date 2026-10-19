@@ -7,6 +7,7 @@ package agentprovider
 
 import (
 	"context"
+	"fmt"
 
 	domain "ocdeck/internal/domain/agentprovider"
 )
@@ -25,6 +26,32 @@ type CandidateSessionRecycler interface {
 // 决策），MUST NOT 进入普通任务 attempt 预算循环。
 type ServerAvailabilityWarmer interface {
 	CheckServerAlive(ctx context.Context) error
+}
+
+// CandidateCleanupDebt 标记未提交 candidate session 的回收失败（收尾 R1 J3）：
+// SessionID 为残留上游 session（仍待回收——POST 已成功、任务侧无任何历史事实，
+// 若丢失将误判零历史再次首建）；Err 为 DELETE 错误。编排层据此把清理义务按
+// task 持久化（retryable cleanup debt——纳入首建准入门禁：清理成功或用户处置
+// 前拒绝再次首建）。
+type CandidateCleanupDebt struct {
+	SessionID string
+	Err       error
+}
+
+func (d *CandidateCleanupDebt) Error() string {
+	if d.Err != nil {
+		return fmt.Sprintf("candidate session %s 回收失败（清理债务，残留事实）: %v", d.SessionID, d.Err)
+	}
+	return fmt.Sprintf("candidate session %s 回收失败（清理债务，残留事实）", d.SessionID)
+}
+
+func (d *CandidateCleanupDebt) Unwrap() error { return d.Err }
+
+// CandidateDebtReaper 是 candidate 清理债务的重放收割窄接口（可选能力；J3）：
+// 按 task/session 身份重新执行受限回收（DELETE）。实现者：v2 supervisor。
+// 未实现者由调用方 fail-closed（债务保留，不得静默清除）。
+type CandidateDebtReaper interface {
+	ReapCandidateSession(ctx context.Context, taskID, sessionID string) error
 }
 
 // ServerMonitorController 是 v2 server 监控循环的关停窄接口（可选能力；评审

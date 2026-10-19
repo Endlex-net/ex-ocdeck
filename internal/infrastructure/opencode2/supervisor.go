@@ -351,6 +351,10 @@ func (s *V2Supervisor) ensureServerAttempt(ctx context.Context, password string)
 			if !s.verifyReady(ctx, rec.Port, password) {
 				return 0, fmt.Errorf("%w: pid %d 凭据/协议验证失败", errRuntimeIdentityMismatch, rec.PID.Int64)
 			}
+			// Round-final J2：复用成功同步安装已验证 PID——否则轻量验活对
+			// pid<=0 判死，重启后复用存活 server 仍被监控误判死亡（周期性
+			// 虚假 OnServerRestarted + 反复任务重建）。
+			s.pid = int(rec.PID.Int64)
 			return rec.Port, nil
 		}
 		// pid 不存在（进程已死/身份查询不可得）→ 落入「确认无存活」分支
@@ -370,6 +374,8 @@ func (s *V2Supervisor) ensureServerAttempt(ctx context.Context, password string)
 			// 步骤⑤失败：本轮禁止业务副作用（D3 矩阵「pid 更新失败」分支）。
 			return 0, fmt.Errorf("set provider runtime pid: %w", err)
 		}
+		// Round-final J2：重新发现复用同样安装已验证 PID（同上——监控验活依据）。
+		s.pid = pid
 		return rec.Port, nil
 	}
 	// 分支「pid NULL 且托管单元未发现存活 serve」：同端口从步骤②继续；
@@ -592,7 +598,11 @@ func (s *V2Supervisor) Acquire(ctx context.Context, task appagent.TaskRef) (doma
 	// 不出本 attempt：失败路径不返回 session id，回收只能在此收口）。
 	binding, aerr := s.finishAcquire(ctx, c, created.ID, task, port)
 	if aerr != nil {
-		s.recycleCandidate(ctx, c, created.ID)
+		// J3：回收失败（typed 清理债务）Join 原失败向编排层传播——task 层按
+		// task 持久化清理义务（门禁挡再次首建）。
+		if derr := s.recycleCandidate(ctx, c, created.ID); derr != nil {
+			aerr = errors.Join(aerr, derr)
+		}
 		return domain.TaskBinding{}, aerr
 	}
 	return binding, nil
@@ -625,12 +635,35 @@ func (s *V2Supervisor) noteCandidateDebt(ctx context.Context, candidateID string
 		fmt.Sprintf("首建补偿回收 candidate session %s 失败（残留事实，非「从未建立」）: %v", candidateID, derr))
 }
 
-// recycleCandidate 首建失败补偿的受限回收（D3）：DELETE 失败记清理债务，不掩盖
-// 原错误（Acquire attempt 内收口——candidate id 未出本 attempt）。
-func (s *V2Supervisor) recycleCandidate(ctx context.Context, c *Client, candidateID string) {
-	if derr := c.DeleteSession(ctx, candidateID); derr != nil {
-		s.noteCandidateDebt(ctx, candidateID, derr)
+// recycleCandidate 首建失败补偿的受限回收（D3）：独立有界 ctx（调用方 ctx 已
+// 取消不得跳过回收）；DELETE 失败返回 CandidateCleanupDebt（含 candidate id）
+// 由 Acquire Join 传播——task 层按 task 持久化清理义务（门禁挡再次首建）。
+// 实例 last_error 仍记录（诊断位），但不再是无声的终点。
+const candidateRecycleTimeout = 30 * time.Second
+
+func (s *V2Supervisor) recycleCandidate(ctx context.Context, c *Client, candidateID string) error {
+	rcCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), candidateRecycleTimeout)
+	defer cancel()
+	if derr := c.DeleteSession(rcCtx, candidateID); derr != nil {
+		s.noteCandidateDebt(rcCtx, candidateID, derr)
+		return &appagent.CandidateCleanupDebt{SessionID: candidateID, Err: derr}
 	}
+	return nil
+}
+
+// ReapCandidateSession 实现 CandidateDebtReaper（收尾 R1 J3）：按 task/session
+// 身份重新执行受限回收（DELETE）——清理债务重放收割（candidate 建于共享 serve，
+// 经实例记录端点访问）。
+func (s *V2Supervisor) ReapCandidateSession(ctx context.Context, taskID, sessionID string) error {
+	_ = taskID // session 身份即收割凭据（candidate 建于本实例共享 serve）
+	c, _, _, err := s.serverClient(ctx)
+	if err != nil {
+		return appagent.NewError("supervisor.reap_candidate", appagent.ErrKindRuntimeUnavailable, err)
+	}
+	if derr := c.DeleteSession(ctx, sessionID); derr != nil {
+		return appagent.NewError("supervisor.reap_candidate", appagent.ErrKindRuntimeUnavailable, derr)
+	}
+	return nil
 }
 
 // RecycleCandidateSession 是任务层首建失败补偿的 candidate 回收入口（D3 受限

@@ -37,8 +37,11 @@ type SPIProvider struct {
 	// health 是能力健康上报端口（可选；nil → no-op，测试态）。
 	health *spiHealthPort
 	// supDeps 非 nil 时 Supervisor() 为真实 A+ 承载（NewSPIProviderWithDeps）；
-	// nil 保持阶段 2 的 fail-closed 占位。
+	// nil 保持阶段 2 的 fail-closed 占位。sup/supOnce：唯一实例（Round-final J1
+	// ——每次调用新建会让准入/监控/关停各持独立状态）。
 	supDeps *SupervisorDeps
+	supOnce sync.Once
+	sup     *V2Supervisor
 
 	contractMu sync.Mutex
 	contract   *WireContract
@@ -117,13 +120,19 @@ func (p *SPIProvider) Meta() appagent.ProviderMeta { return p.meta }
 
 // Supervisor 返回 runtime supervisor：deps 已注入（NewSPIProviderWithDeps）时
 // 为真实 A+ 承载；否则保持阶段 2 的 fail-closed 占位（tasks 5.x 前测试依赖）。
+// Round-final J1：实例在首次取用时构造并保存（sync.Once）——provider 是唯一
+// supervisor 持有者，全部生命周期入口（准入/监控停止/关停）共享同一实例的
+// 锁/ready/监控 goroutine/关停状态。
 func (p *SPIProvider) Supervisor() appagent.RuntimeSupervisor {
 	if p.supDeps == nil {
 		return spiSupervisorStub{}
 	}
-	sup := NewV2Supervisor(*p.supDeps)
-	sup.contractOf = p.contractFor
-	return sup
+	p.supOnce.Do(func() {
+		sup := NewV2Supervisor(*p.supDeps)
+		sup.contractOf = p.contractFor
+		p.sup = sup
+	})
+	return p.sup
 }
 
 func (p *SPIProvider) Sessions() appagent.SessionControl { return &spiSessions{p: p} }
@@ -243,8 +252,11 @@ func (p *SPIProvider) contractFor(ctx context.Context, c *Client) (WireContract,
 }
 
 // CheckBindingOwnership 实现 BindingOwnershipChecker（D2 阶段一）：不派生
-// 凭据，解私有字段逐字段比对 taskId/directory；不符/解码失败 →
-// ErrKindBindingInvalid。
+// 凭据，解私有字段逐字段比对 taskId/directory/TerminalRef；不符/解码失败 →
+// ErrKindBindingInvalid。TerminalRef 规则（收尾 R1 J4）：binding 从任务身份
+// 确定性派生（D2）——生命周期 binding 必须 == v2TerminalRef(taskID)（防损坏
+// binding 携带共享 serve 名/他任务 TUI 名被 Suspend 直接 kill）；ephemeral
+// binding（无 upstream）TerminalRef 必须 == EphemeralTerminalRef。
 func (p *SPIProvider) CheckBindingOwnership(b domain.TaskBinding, expectedTaskID, expectedDirectory string) error {
 	data, err := decodeV2Binding(b)
 	if err != nil {
@@ -257,6 +269,15 @@ func (p *SPIProvider) CheckBindingOwnership(b domain.TaskBinding, expectedTaskID
 	if data.Directory != expectedDirectory {
 		return appagent.NewError("check binding ownership", appagent.ErrKindBindingInvalid,
 			fmt.Errorf("binding directory %q 与任务 worktree %q 不一致", data.Directory, expectedDirectory))
+	}
+	wantRef := v2TerminalRef(data.TaskID)
+	if b.UpstreamSessionID == "" {
+		wantRef = EphemeralTerminalRef
+	}
+	if b.TerminalRef != wantRef {
+		return appagent.NewError("check binding ownership", appagent.ErrKindBindingInvalid,
+			fmt.Errorf("binding TerminalRef %q 与任务身份派生值 %q 不一致（拒收：TerminalRef 是 Suspend/Delete 的 kill 目标）",
+				b.TerminalRef, wantRef))
 	}
 	return nil
 }

@@ -270,6 +270,16 @@ func (m *Manager) firstBuildV2(ctx context.Context, taskID string, row TaskRow, 
 	}
 	binding, serr := sup.Acquire(ctx, appagent.TaskRef{TaskID: taskID, Directory: row.WorktreePath})
 	if serr != nil {
+		// 收尾 R1 J3：candidate 回收失败（typed 清理债务）——按 task 持久化
+		// retryable 清理义务（重放经 CandidateDebtReaper 收割；首建准入门禁在
+		// 清理成功/用户处置前拒绝再次首建）。义务写失败 Join 传播（不得静默）。
+		var debt *appagent.CandidateCleanupDebt
+		if errors.As(serr, &debt) {
+			if nerr := m.recordResidualNotice(ctx, taskID, debt.SessionID, nil,
+				noticeReasonCandidateCleanupFailed, true); nerr != nil {
+				return errors.Join(serr, nerr)
+			}
+		}
 		return m.supervisorStageErrorForTyped(serr, taskID)
 	}
 	if _, _, _, eerr := m.bindingEndpoint(binding); eerr != nil {
@@ -376,7 +386,17 @@ func (s *V2TaskEnvSeam) ResolveSessionEnv(ctx context.Context, taskID string, re
 // 续用；rt 非 nil 的失败（SSE）由调用方决定回退（未提交：clearRuntime）或保留
 // （已提交：恢复债务重建）。
 func (m *Manager) beginV2RuntimeTakeover(ctx context.Context, taskID string, row TaskRow, port int, password string, binding domain.TaskBinding, mode AlignMode, preStream appagent.EventStream) (*taskRuntime, error) {
+	// 收尾 R1 J5（D3 冻结前 fail-closed）：v2 共享 serve 由 supervisor
+	// startServer 启动（无 --auto 参数）——SavedMode=all-approve 不能宣称
+	// StartedWithAuto=true（权限模式未实际应用）。按启动事实规则收敛为 ask
+	// 并透出能力缺口；ask/ai-auto 不受影响（AIAutoEnabled 走冻结的 reply
+	// 端点，task 层判定）。
 	startMode := row.PermissionMode
+	if startMode == PermissionModeAllApprove {
+		startMode = PermissionModeAsk
+		log.Printf("task %s: v2 takeover cannot apply all-approve at server start "+
+			"(no frozen session-level permission apply endpoint); starting fact downgraded to ask", taskID)
+	}
 	rt := m.newRuntime(taskID)
 	if err := initPermState(rt, row, startMode); err != nil {
 		return nil, fmt.Errorf("v2 runtime register: init perm state: %v", err)

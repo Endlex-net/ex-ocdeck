@@ -682,3 +682,55 @@ func stage4LifecycleBinding(t *testing.T, taskID, upstream string) domain.TaskBi
 		Data:               raw,
 	}
 }
+
+// TestR1_J3_AcquireDebt_Propagates 落实收尾 Round1 J3：POST 成功后配置应用失败
+// 且 candidate DELETE 也失败 → Acquire 错误链携带 CandidateCleanupDebt（含
+// candidate session id）向编排层传播（task 层据此落清理义务残债），不再仅写
+// 实例 last_error 吞掉。
+func TestR1_J3_AcquireDebt_Propagates(t *testing.T) {
+	var deleteHits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/environment"):
+			w.WriteHeader(http.StatusInternalServerError) // 配置应用失败触发补偿
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session":
+			_, _ = w.Write(readFixture(t, "session_create.json"))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/session/ses_"):
+			deleteHits++
+			w.WriteHeader(http.StatusInternalServerError) // candidate 回收持续失败
+			_, _ = w.Write([]byte(`{"_tag":"InternalError"}`))
+		default:
+			_, _ = w.Write(readFixture(t, "session_list_page2.json"))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	sup, _, recs := newTestSupervisor(t, srv.URL, nil)
+	if _, _, err := sup.ensureServer(context.Background()); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	sup.deps.Env = fakeEnvSeam(func(string, bool) (map[string]string, error) {
+		return nil, errors.New("env snapshot unavailable")
+	})
+	b, err := sup.Acquire(context.Background(), appTaskRef("t1", "/wt"))
+	var debt *appagent.CandidateCleanupDebt
+	if err == nil {
+		t.Fatalf("Acquire must fail, got binding %+v", b)
+	}
+	if !errors.As(err, &debt) {
+		t.Fatalf("cleanup debt must propagate to caller, err=%v", err)
+	}
+	if debt.SessionID != "ses_fixture01a" {
+		t.Fatalf("debt session=%q, want ses_fixture01a", debt.SessionID)
+	}
+	if deleteHits != 1 {
+		t.Fatalf("DELETE attempts=%d, want 1（有界 ctx 单次尝试）", deleteHits)
+	}
+	// 实例 last_error 仍记录（诊断位），但不再是唯一载体。
+	recs.mu.Lock()
+	le := recs.rec.LastError.Valid
+	recs.mu.Unlock()
+	if !le {
+		t.Fatalf("diagnostic last_error should still be recorded")
+	}
+}

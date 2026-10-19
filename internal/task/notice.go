@@ -10,8 +10,10 @@ import (
 	"strings"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/application/runtime"
 	"ocdeck/internal/infrastructure/process"
+	ocdeckstore "ocdeck/internal/infrastructure/store"
 )
 
 // hostEnv 读取宿主环境变量（design.md §2：基础集从宿主取，不继承全部）。
@@ -46,6 +48,10 @@ const (
 	noticeReasonKillFailed      = "kill_failed"
 	noticeReasonReapFailed      = "reap_failed"
 	noticeReasonSnapshotMissing = "snapshot_missing_degraded"
+	// noticeReasonCandidateCleanupFailed 是未提交 candidate 的回收清理债务
+	//（收尾 R1 J3）：重放经 provider 的 CandidateDebtReaper 重新 DELETE；成功
+	// 清条目/失败保留（首建准入门禁持续生效）。
+	noticeReasonCandidateCleanupFailed = "candidate_cleanup_failed"
 )
 
 // dispositionToNotice 将 process.Disposition 唯一映射为 (reason, retryable)（B6）。
@@ -758,6 +764,27 @@ func (m *Manager) processRetryableNotices(ctx context.Context) error {
 // 持锁后重读 notice 再行动（不得用锁外捕获的旧值，B6）。
 // 返回聚合 error：处理过程中的 store 错误与末尾 CAS 失败（CAS 循环耗尽）MUST 聚合返回，
 // 不静默 return（避免后台循环丢失错误、关停残留 debt 被静默丢弃）。
+// reapCandidateDebt 重放收割 candidate 清理债务（收尾 R1 J3）：经 registry 的
+// v2 provider supervisor（CandidateDebtReaper 窄接口）重新 DELETE 原 session。
+// provider/supervisor 未实现 → fail-closed 错误（债务保留，不得静默清除）。
+func (m *Manager) reapCandidateDebt(ctx context.Context, taskID, sessionID string) (bool, error) {
+	if m.providerRegistry == nil {
+		return false, fmt.Errorf("provider registry unavailable (candidate debt kept)")
+	}
+	p, err := m.providerRegistry.Get(ocdeckstore.ProviderIDV2)
+	if err != nil {
+		return false, fmt.Errorf("get v2 provider (candidate debt kept): %w", err)
+	}
+	reaper, ok := p.Supervisor().(appagent.CandidateDebtReaper)
+	if !ok {
+		return false, fmt.Errorf("v2 supervisor does not implement CandidateDebtReaper (candidate debt kept)")
+	}
+	if rerr := reaper.ReapCandidateSession(ctx, taskID, sessionID); rerr != nil {
+		return false, rerr
+	}
+	return true, nil
+}
+
 func (m *Manager) retryTaskNotices(ctx context.Context, t TaskRow, entries []noticeEntry) error {
 	unlock, err := m.tryLockTask(t.ID)
 	if err != nil {
@@ -818,6 +845,22 @@ func (m *Manager) retryTaskNotices(ctx context.Context, t TaskRow, entries []not
 		}
 		sessionName, _ := e.Data["sessionName"].(string)
 		tickets := noticeTickets(e)
+
+		// 收尾 R1 J3：candidate 清理债务——经 provider 的 CandidateDebtReaper
+		// 重新 DELETE（收割目标=原 candidate session id）。成功清条目；失败/
+		// provider 未实现 fail-closed 保留（首建准入门禁持续生效）。
+		if reason, _ := e.Data["reason"].(string); reason == noticeReasonCandidateCleanupFailed {
+			done, rerr := m.reapCandidateDebt(ctx, t.ID, sessionName)
+			if rerr != nil || !done {
+				remaining = append(remaining, e)
+				if rerr != nil {
+					errs = append(errs, fmt.Errorf("task %s: reap candidate debt %s: %w", t.ID, sessionName, rerr))
+				}
+				continue
+			}
+			clearedKeys[noticeKey(e)] = true
+			continue
+		}
 
 		// 后台重试须校验 generation/注册表，不得杀刚修复的 serve（B7）。
 		// 若任务有活跃运行时且 sessionName 属当前代 serve/tui，则跳过（用户操作或 Suspend 修复在管）。
