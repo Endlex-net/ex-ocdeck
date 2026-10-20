@@ -611,13 +611,19 @@ func (m *Manager) deleteOCSessions(ctx context.Context, row TaskRow) error {
 	return errors.Join(errs...)
 }
 
-// deleteV2SessionsViaBridge 经共享 serve 删除 v2 任务的 oc session（逐项，
-// 404 幂等语义由既有删除编排持有——v2 Sessions().Delete 的 NotFound 如实返回，
-// 上层 D3 落账语义与 v1 分支一致）。归属行与 binding 同事务转换（提交协议
-// 不变量），逐项按 binding 命名空间构造 SessionKey——跨命名空间行不得进入
-// v2 端点（fail-closed 聚合，不猜）。serve 不在 → CheckServerAlive 重拉；
-// 未实现 warmer（测试接缝形态）→ 直接打共享 serve，不在则逐项报错（fail-closed）。
+// deleteV2SessionsViaBridge 经共享 serve 删除 v2 任务的 oc session（逐项）。
+// 归属门禁（评审 P1-3）：任何 provider 调用与 warmer（网络/进程/凭据副作用）
+// 之前执行 BindingOwnershipChecker——损坏/串任务 binding（错 taskId/directory/
+// TerminalRef）fail-closed 拒绝，零外部副作用。逐项删除语义：v2 SPI 把 404
+// 映射 ErrKindNotFound（D7），本编排把 NotFound 视为「已不存在=幂等成功」
+// 落账（与 v1 分支 404 幂等同形），其余错误聚合。逐项按 binding 命名空间
+// 构造 SessionKey——跨命名空间行不得进入 v2 端点（fail-closed 聚合，不猜）。
+// serve 不在 → CheckServerAlive 重拉；未实现 warmer（测试接缝形态）→ 直接打
+// 共享 serve，不在则逐项报错（fail-closed）。
 func (m *Manager) deleteV2SessionsViaBridge(ctx context.Context, row TaskRow, sessions []SessionRow, binding domain.TaskBinding) error {
+	if oerr := m.checkBindingOwnershipGate(ctx, row.ID, binding); oerr != nil {
+		return oerr
+	}
 	p, perr := m.providerFor(binding.ProviderID)
 	if perr != nil {
 		return perr
@@ -640,7 +646,8 @@ func (m *Manager) deleteV2SessionsViaBridge(ctx context.Context, row TaskRow, se
 			ProviderInstanceID: binding.ProviderInstanceID,
 			UpstreamID:         s.SessionID,
 		}
-		if derr := sc.Delete(ctx, binding, key); derr != nil {
+		// 404 幂等：v2 SPI 404 → ErrKindNotFound（D7），与 nil 同语义落账。
+		if derr := sc.Delete(ctx, binding, key); derr != nil && appagent.KindOf(derr) != appagent.ErrKindNotFound {
 			errs = append(errs, fmt.Errorf("delete session %s: %w", s.SessionID, derr))
 			continue
 		}

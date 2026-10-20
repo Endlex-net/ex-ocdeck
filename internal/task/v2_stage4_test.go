@@ -2617,6 +2617,25 @@ type realStreamHarness struct {
 	// v1Hits 记录 v1 wire 形态路径命中数（生产装配形态测试：v2 全链路 MUST 零
 	// 命中——命中即被 SPA HTML 回退吞掉的形态，与容器实测一致）。
 	v1Hits atomic.Int32
+	// apiMu/apiPaths 记录 /api/* 命中（method+path——生产装配形态测试的正断言
+	// 面：桥接 SPI 窄接口必须真实打到预期端点，而非仅「零 v1 命中」负断言）。
+	apiMu    sync.Mutex
+	apiPaths []string
+	// deleteStatus 按 id 覆写 DELETE /api/session/{id} 的响应码（0=默认 204；
+	// 删除幂等混合测试注入 404/500）。
+	deleteStatus map[string]int
+}
+
+// apiHit 报告是否发生过 method+pathPrefix 形态的 /api 命中。
+func (h *realStreamHarness) apiHit(method, pathPrefix string) bool {
+	h.apiMu.Lock()
+	defer h.apiMu.Unlock()
+	for _, p := range h.apiPaths {
+		if p == method+" "+pathPrefix || strings.HasPrefix(p, method+" "+pathPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // v1ShapedPath 判定 v1 wire client 的 HTTP 路径形态（v1 client GET/POST /session、
@@ -2656,9 +2675,32 @@ func newRealStreamHarness(t *testing.T, taskID, upstream, status string, opts ..
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			h.apiMu.Lock()
+			h.apiPaths = append(h.apiPaths, r.Method+" "+r.URL.Path)
+			h.apiMu.Unlock()
+		}
 		switch {
 		case r.URL.Path == "/openapi.json":
 			_, _ = w.Write([]byte(`{"components":{"schemas":{"Session.ID":{"type":"string","pattern":"^ses"},"Session.Message.ID":{"type":"string","pattern":"^msg_"}}}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session":
+			// 首建（Round收尾 J6）：递增 id 的 session 创建。
+			n := h.created.Add(1)
+			id := fmt.Sprintf("ses_c%d", n)
+			if h.createFault != nil && h.createFault(w, r, id) {
+				return
+			}
+			_, _ = w.Write([]byte(`{"data":{"id":"` + id + `","location":{"directory":"/wt"},"time":{"created":1,"updated":1}}}`))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/session/"):
+			// 删除端点（CONTRACT §2）：默认 204；deleteStatus 按 id 覆写
+			// （404=已不存在 / 500=服务端故障——幂等混合矩阵）。
+			id := strings.TrimPrefix(r.URL.Path, "/api/session/")
+			switch h.deleteStatus[id] {
+			case 0:
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				w.WriteHeader(h.deleteStatus[id])
+			}
 		case r.Method == http.MethodPost && r.URL.Path == "/api/session":
 			// 首建（Round收尾 J6）：递增 id 的 session 创建。
 			n := h.created.Add(1)
@@ -5547,22 +5589,49 @@ func TestR1_ResumeV2_RepersistsEnvSnapshot(t *testing.T) {
 
 // ---- 生产装配形态（本批次 A/B）：v2 全链路零 v1 wire 路径命中 ----
 
+// useProdDispatchFactory 把 harness 装配切换为生产分派工厂形态（与
+// cmd/ocdeck-server 装配同形）：registry 注册 v1 minimal + 真实 v2 SPI
+// provider，ocFactory = NewRegistryDispatchFactory（对已注册 provider 恒返回
+// v1 wire client、未注册 fail-closed）——消除「mock factory 恒零 v1 命中」
+// 的验证盲区：v2 全链路必须经桥 SPI 窄接口真实命中 /api/* 端点。
+func (h *realStreamHarness) useProdDispatchFactory(t *testing.T) {
+	t.Helper()
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Register(h.prov); err != nil {
+		t.Fatal(err)
+	}
+	h.m.providerRegistry = reg
+	h.m.ocFactory = NewRegistryDispatchFactory(reg)
+}
+
 // TestProdAssembly_V2ResumeZeroV1PathHits 落实生产装配形态回归（A）：生产
-// ocFactory = newRegistryDispatchFactory（对已注册 provider 恒返回 v1 wire
+// ocFactory = NewRegistryDispatchFactory（对已注册 provider 恒返回 v1 wire
 // client）+ 真实 opencode2 SPI provider + startSSE 桥接优先。fake server 对
 // v1 形态路径（/session、/event、/session/status、/global/health——无 /api
 // 前缀）一律回 SPA HTML（模拟真实 v2 serve 未匹配路径回退，容器实测形态）。
 // 断言：v2 任务经公开 Activate（已有 v2 binding → resumeActivateV2）激活后
-// binding/状态/归属连续，且 v1 形态路径零命中（对齐/对账/状态探测全走桥的
-// SPI 窄接口 → /api/* 端点）。
+// binding/状态连续，v1 形态路径零命中，且对齐/SSE 正命中预期 /api/* 端点
+// （正断言：桥接真实承载，非仅「零 v1 命中」；变异——移除 startSSE 桥接 →
+// v1 wire client 打 /session 被 SPA 回退吞掉 → 对齐失败/命中计数红）。
 func TestProdAssembly_V2ResumeZeroV1PathHits(t *testing.T) {
 	ctx := context.Background()
 	h := newRealStreamHarness(t, "t-prod", "ses_keep", "suspended")
+	h.useProdDispatchFactory(t)
 	if aerr := h.m.Activate(ctx, "t-prod"); aerr != nil {
 		t.Fatalf("Activate: %v", aerr)
 	}
 	if n := h.v1Hits.Load(); n != 0 {
 		t.Fatalf("v2 full activation must not hit v1 wire paths, hits=%d", n)
+	}
+	// 正断言：对齐列表与 SSE 事件流经桥真实命中 /api/* 端点。
+	if !h.apiHit("GET", "/api/session") {
+		t.Fatalf("align must hit GET /api/session via bridge, api=%v", h.apiPaths)
+	}
+	if !h.apiHit("GET", "/api/event") {
+		t.Fatalf("SSE takeover must hit GET /api/event via bridge, api=%v", h.apiPaths)
 	}
 	got, has, err := h.adapter.GetTaskBinding(ctx, "t-prod")
 	if err != nil || !has || got.ProviderID != ocdeckstore.ProviderIDV2 || got.UpstreamSessionID != "ses_keep" {
@@ -5577,12 +5646,13 @@ func TestProdAssembly_V2ResumeZeroV1PathHits(t *testing.T) {
 // TestProdAssembly_V2DeleteViaSharedServe 落实生产装配形态回归（B）：v2 任务
 // 删除经共享 serve bridge（provider Sessions().Delete → DELETE /api/session/{id}），
 // MUST NOT 请求临时 runtime（生产实测 acquire_ephemeral capability_unavailable
-// 事故面），v1 wire 路径零命中；oc session 删除成功后归属行落账、任务删除收敛。
-// 任务行 suspended + binding/归属行已提交（挂起后删除的主形态；删除只消费
-// 持久化事实，不需要 Activate）。
+// 事故面），v1 wire 路径零命中且 DELETE 端点正命中；oc session 删除成功后归属
+// 行落账、任务删除收敛。任务行 suspended + binding/归属行已提交（挂起后删除的
+// 主形态；删除只消费持久化事实，不需要 Activate）。
 func TestProdAssembly_V2DeleteViaSharedServe(t *testing.T) {
 	ctx := context.Background()
 	h := newRealStreamHarness(t, "t-prod-del", "ses_keep", "suspended")
+	h.useProdDispatchFactory(t)
 	if _, err := h.db.Exec(`INSERT INTO task_sessions (task_id, session_id, session_created_at, first_seen_at, last_seen_at, parent_id, provider_id, provider_instance_id)
 		 VALUES ('t-prod-del','ses_keep',1,1,1,'',?,?)`, ocdeckstore.ProviderIDV2, ocdeckstore.ProviderInstanceV2Default); err != nil {
 		t.Fatal(err)
@@ -5593,8 +5663,99 @@ func TestProdAssembly_V2DeleteViaSharedServe(t *testing.T) {
 	if n := h.v1Hits.Load(); n != 0 {
 		t.Fatalf("v2 delete must not hit v1 wire paths (no ephemeral runtime), hits=%d", n)
 	}
+	if !h.apiHit("DELETE", "/api/session/ses_keep") {
+		t.Fatalf("delete must hit DELETE /api/session/ses_keep via shared serve, api=%v", h.apiPaths)
+	}
 	if _, err := h.adapter.GetTask(ctx, "t-prod-del"); err == nil {
 		t.Fatalf("task row must be gone after delete")
+	}
+}
+
+// TestProdAssembly_V2DeleteMixedIdempotent 落实删除幂等混合矩阵（评审 P1-2）：
+// v2 SPI 把 404 映射 ErrKindNotFound（D7），删除编排把 NotFound 与成功同语义
+// 落账（已不存在=幂等成功）；服务端故障项（500）聚合报错并保留归属行。
+// 断言：204/404 项删除落账、500 项归属行保留、Delete 报错含故障项。
+func TestProdAssembly_V2DeleteMixedIdempotent(t *testing.T) {
+	ctx := context.Background()
+	h := newRealStreamHarness(t, "t-prod-mix", "ses_keep", "suspended")
+	h.useProdDispatchFactory(t)
+	h.deleteStatus = map[string]int{"ses_gone": http.StatusNotFound, "ses_bad": http.StatusInternalServerError}
+	for _, id := range []string{"ses_keep", "ses_gone", "ses_bad"} {
+		if _, err := h.db.Exec(`INSERT INTO task_sessions (task_id, session_id, session_created_at, first_seen_at, last_seen_at, parent_id, provider_id, provider_instance_id)
+			 VALUES ('t-prod-mix',?,1,1,1,'',?,?)`, id, ocdeckstore.ProviderIDV2, ocdeckstore.ProviderInstanceV2Default); err != nil {
+			t.Fatal(err)
+		}
+	}
+	derr := h.m.Delete(ctx, "t-prod-mix", DeleteNormal, true)
+	if derr == nil || !strings.Contains(derr.Error(), "ses_bad") {
+		t.Fatalf("server-fault item must fail the delete with per-item error, got: %v", derr)
+	}
+	var n int
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id='t-prod-mix' AND session_id IN ('ses_keep','ses_gone')`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("deleted items must be settled (204+404 idempotent), rows=%d err=%v", n, err)
+	}
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id='t-prod-mix' AND session_id='ses_bad'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("server-fault item must keep its ownership row, rows=%d err=%v", n, err)
+	}
+}
+
+// TestProdAssembly_V2Delete_OwnershipGateBlocksForeignBinding 落实删除归属门禁
+// （评审 P1-3）：损坏/串任务 binding（错 taskId/错 directory/错 TerminalRef）
+// 在任何 provider 调用与 warmer 之前被 BindingOwnershipChecker 拒绝——fake
+// server 零请求（无进程/凭据/网络副作用），归属行保留。
+func TestProdAssembly_V2Delete_OwnershipGateBlocksForeignBinding(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name   string
+		mutate func(taskID string, b *domain.TaskBinding)
+	}{
+		{"foreign taskId", func(taskID string, b *domain.TaskBinding) {
+			b.Data = []byte(fmt.Sprintf(`{"port":%d,"directory":"/wt","taskId":"t-evil","origin":"created","auth":{"kind":"derived"}}`, 1))
+		}},
+		{"foreign directory", func(taskID string, b *domain.TaskBinding) {
+			b.Data = []byte(fmt.Sprintf(`{"port":%d,"directory":"/elsewhere","taskId":"%s","origin":"created","auth":{"kind":"derived"}}`, 1, taskID))
+		}},
+		{"foreign TerminalRef", func(taskID string, b *domain.TaskBinding) {
+			b.TerminalRef = "ocdeck-v2-tui-t-evil"
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRealStreamHarness(t, "t-gate-del", "ses_keep", "suspended")
+			h.useProdDispatchFactory(t)
+			if _, err := h.db.Exec(`INSERT INTO task_sessions (task_id, session_id, session_created_at, first_seen_at, last_seen_at, parent_id, provider_id, provider_instance_id)
+				 VALUES ('t-gate-del','ses_keep',1,1,1,'',?,?)`, ocdeckstore.ProviderIDV2, ocdeckstore.ProviderInstanceV2Default); err != nil {
+				t.Fatal(err)
+			}
+			got, has, err := h.adapter.GetTaskBinding(ctx, "t-gate-del")
+			if err != nil || !has {
+				t.Fatalf("seed binding: %+v has=%v err=%v", got, has, err)
+			}
+			tc.mutate("t-gate-del", &got)
+			raw, err := got.Encode()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := h.db.Exec(`UPDATE tasks SET task_binding=? WHERE id='t-gate-del'`, raw); err != nil {
+				t.Fatal(err)
+			}
+			if derr := h.m.Delete(ctx, "t-gate-del", DeleteNormal, true); derr == nil {
+				t.Fatalf("tampered binding must be rejected by ownership gate")
+			}
+			h.apiMu.Lock()
+			if len(h.apiPaths) != 0 {
+				h.apiMu.Unlock()
+				t.Fatalf("ownership gate must run before any provider call, api=%v", h.apiPaths)
+			}
+			h.apiMu.Unlock()
+			if n := h.v1Hits.Load(); n != 0 {
+				t.Fatalf("no v1 wire side effects allowed, hits=%d", n)
+			}
+			var rows int
+			if err := h.db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id='t-gate-del'`).Scan(&rows); err != nil || rows != 1 {
+				t.Fatalf("ownership row must be kept on gate rejection, rows=%d err=%v", rows, err)
+			}
+		})
 	}
 }
 

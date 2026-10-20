@@ -196,7 +196,7 @@ func run() error {
 	healthTracker := appagent.NewHealthTracker()
 	healthTracker.SetProviderID(opencode.ProviderID)
 	registry := appagent.NewRegistry()
-	ocFactory := newRegistryDispatchFactory(registry)
+	ocFactory := task.NewRegistryDispatchFactory(registry)
 	tm := task.New(task.Options{
 		Cfg:                cfg,
 		Store:              adapter,
@@ -396,80 +396,6 @@ func (s *supStoreSeam) GetTaskLastPort(ctx context.Context, taskID string) (int,
 // 上传编排启动（扫描/订阅/清理器）→ Reconcile（失败 fail-closed 拒绝开放 HTTP）→
 // 后台周期重试 → API 装配与阻塞服务 → 关停序列。
 // diffSvc 注入 API 层（diff-review-workbench D8 路由），须在 RebuildRoutes 前生效。
-// unregisteredOCClient 是 registry 分派失败的 fail-closed 占位 client：
-// 工厂无法解析任务 provider 时返回此实现，全部方法返回 provider_not_found 包装
-// 错误——零网络副作用（specs「Provider registry 分派」：未注册 fail-closed）。
-// 本期 registry 仅注册 opencode-v1，该形态仅在 provider_id 持久化损坏时可达。
-type unregisteredOCClient struct{ err *appagent.Error }
-
-func newUnregisteredOCClient() *unregisteredOCClient {
-	return &unregisteredOCClient{err: appagent.NewError("registry.get", appagent.ErrKindProviderNotFound,
-		fmt.Errorf("task provider 未注册"))}
-}
-
-// newRegistryDispatchFactory 构造经 registry 分派的 OCClient 工厂（tasks 3.6/3.7）：
-// C2 残余修复（ora-4 裁决 ②「生产 OCClient 固定查 v1+NewClient 不可接受」）：
-// 按 providerID 分派经 registry.Get（fail-closed）；分派命中后的传输构造委托
-// provider 包内出口（opencode.NewWireClient——「从端点三元组构造传输 client」
-// 的调用点收敛进 provider 面，cmd 不再直构）。未注册 → fail-closed 占位 client
-// （provider_not_found，零网络副作用——specs「Provider registry 分派」）。
-// 生产能力调用（sessions/status/attention/prompts/titles）经 task 层能力出口桥
-// （task.buildTaskOCClient → spiBridgeOCClient）消费 Provider 窄接口，本工厂仅
-// 承接无窄接口对应的探活/原始事件通道（Health/Probe/raw-SubscribeEvents/
-// ProbePromptAsyncCapability——非能力面 fallback）。
-func newRegistryDispatchFactory(registry *appagent.Registry) task.OCClientFactory {
-	return func(providerID string, port int, password string, opts appagent.Options) task.OCClient {
-		// mutation 证据（已验证 → 红 → 还原）：分派判定旁路（Get 调用删除/恒真）
-		// → factory 对未注册 provider 返回传输 client（零 fail-closed）→
-		// TestRegistryDispatchFactory_RegisteredAndFailClosed 的 miss/empty 段红。
-		if _, err := registry.Get(providerID); err != nil {
-			return newUnregisteredOCClient()
-		}
-		return opencode.NewWireClient(port, password, opts)
-	}
-}
-
-func (c *unregisteredOCClient) Health(context.Context) (appagent.HealthResponse, error) {
-	return appagent.HealthResponse{}, c.err
-}
-func (c *unregisteredOCClient) Probe(context.Context) (string, error) { return "", c.err }
-func (c *unregisteredOCClient) ListSessions(context.Context, string, int) ([]appagent.Session, error) {
-	return nil, c.err
-}
-func (c *unregisteredOCClient) GetSession(context.Context, string, string) (appagent.Session, error) {
-	return appagent.Session{}, c.err
-}
-func (c *unregisteredOCClient) CreateSession(context.Context, string, string) (appagent.Session, error) {
-	return appagent.Session{}, c.err
-}
-func (c *unregisteredOCClient) DeleteSession(context.Context, string, string) error { return c.err }
-func (c *unregisteredOCClient) SessionStatus(context.Context, string) (map[string]appagent.SessionStatus, error) {
-	return nil, c.err
-}
-func (c *unregisteredOCClient) SubscribeEvents(context.Context, string, func(appagent.Event), func()) error {
-	return c.err
-}
-func (c *unregisteredOCClient) ListPermissions(context.Context, string) ([]appagent.PermissionRequest, error) {
-	return nil, c.err
-}
-func (c *unregisteredOCClient) ListQuestions(context.Context, string) ([]appagent.QuestionRequest, error) {
-	return nil, c.err
-}
-func (c *unregisteredOCClient) ReplyPermission(context.Context, string, string, string) error {
-	return c.err
-}
-func (c *unregisteredOCClient) PromptAsync(context.Context, string, string, string, string, []appagent.PromptFilePart) appagent.PromptTransportResult {
-	return appagent.PromptTransportResult{Kind: appagent.ResultPreSendFailure, Detail: c.err.Error()}
-}
-func (c *unregisteredOCClient) ProbePromptAsyncCapability(context.Context) appagent.ProbeCapabilityState {
-	return appagent.ProbeCapabilityState("unknown")
-}
-func (c *unregisteredOCClient) UpdateSessionTitle(context.Context, string, string, string) error {
-	return c.err
-}
-
-var _ task.OCClient = (*unregisteredOCClient)(nil)
-
 func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config, db *store.DB, bus *eventbus.Bus, aiStore *ai.Store, wd *process.WatchdogManager, diffSvc *diffreview.Service, uploadOrch *appuploads.Orchestrator, uploadConns *currentConnPort, prefixStore *branchprefix.Store, healthTracker *appagent.HealthTracker) error {
 	// 受管上传启动序列（terminal-file-paste-drop 2.4）：启动恢复扫描（失败记日志，
 	// 不阻断启动——遗留产物按孤儿规则由周期清理收敛）→ 订阅 task.deleted 与周期清理。

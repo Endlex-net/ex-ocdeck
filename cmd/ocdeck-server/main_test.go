@@ -826,7 +826,7 @@ func TestRegistryDispatchFactory_RegisteredAndFailClosed(t *testing.T) {
 	if err := reg.Register(opencode.NewSPIProvider()); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	factory := newRegistryDispatchFactory(reg)
+	factory := task.NewRegistryDispatchFactory(reg)
 	// C2 门禁修复：分派按任务 binding 的 providerID（不再固定查 v1）。
 	oc := factory(opencode.ProviderID, 50001, "pw", appagent.Options{})
 	if _, ok := oc.(*opencode.Client); !ok {
@@ -840,7 +840,7 @@ func TestRegistryDispatchFactory_RegisteredAndFailClosed(t *testing.T) {
 
 	// fail-closed 路径：空 registry。
 	empty := appagent.NewRegistry()
-	fc := newRegistryDispatchFactory(empty)
+	fc := task.NewRegistryDispatchFactory(empty)
 	stub := fc(opencode.ProviderID, 50001, "pw", appagent.Options{})
 	ctx := context.Background()
 	// 代表性方法：REST/SSE/回复路径全部 provider_not_found。

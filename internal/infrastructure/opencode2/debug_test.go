@@ -1,17 +1,20 @@
 // debug_test.go 落实 OCDECK_DEBUG 传输层开关态与脱敏负断言：默认关零输出；
-// 开启后 [debug] method/URI/status 在位、错误 body 前 200 字符在位；凭据
-// （Basic Auth/密码）永不落日志。
+// 开启后 [debug] 仅白名单字段（method/URI/status）在位；响应 body 一律不落
+// 日志（服务器 500 可能回显 Authorization/密码/env——截断≠脱敏）。
 package opencode2
 
 import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	appagent "ocdeck/internal/application/agentprovider"
 )
 
 // captureDebug 捕获包级 log 输出执行 fn，返回原文。
@@ -47,15 +50,20 @@ func TestDebugTransport_OffZeroOutput(t *testing.T) {
 	}
 }
 
+// TestDebugTransport_OnLogsAndRedacts 落实白名单口径：错误响应真实回显
+// Authorization 值/密码/env secret——断言日志零命中（body 一律不落日志，
+// 截断≠脱敏）；method/URI/status 正断言在位。
 func TestDebugTransport_OnLogsAndRedacts(t *testing.T) {
 	SetDebugLogging(true)
 	defer SetDebugLogging(false)
+	const envSecret = "topsecret-env-value"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 服务端回显 Authorization 值（若实现错误地记录 header，会出现在日志里）。
 		if r.URL.Path != "/api/session" {
-			// GetSession 命中 /api/session/{id} → 500（错误 body tee 断言面）。
+			// GetSession 命中 /api/session/{id} → 500 且 body 回显请求敏感信息
+			//（实服务器事故形态：错误处理把 Authorization/env 原样回显）。
 			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte(strings.Repeat("x", 300)))
+			fmt.Fprintf(w, `{"error":"denied","authorization":%q,"password":"sekret-password","env":%q,"pad":%q}`,
+				r.Header.Get("Authorization"), envSecret, strings.Repeat("x", 300))
 			return
 		}
 		_, _ = w.Write([]byte(`{"data":[],"cursor":{"previous":null,"next":null}}`))
@@ -67,7 +75,7 @@ func TestDebugTransport_OnLogsAndRedacts(t *testing.T) {
 			t.Fatalf("ListSessions: %v", err)
 		}
 		if _, err := c.GetSession(context.Background(), "ses_x"); err == nil {
-			t.Fatalf("expected error from /boom")
+			t.Fatalf("expected error from /api/session/ses_x")
 		}
 	})
 	if !strings.Contains(out, "[debug] opencode2: http GET /api/session") {
@@ -79,15 +87,46 @@ func TestDebugTransport_OnLogsAndRedacts(t *testing.T) {
 	if !strings.Contains(out, "-> 500") {
 		t.Fatalf("error status diagnostics missing, got: %q", out)
 	}
-	if !strings.Contains(out, "http error body") {
-		t.Fatalf("error body diagnostics missing, got: %q", out)
+	// 脱敏负断言：错误响应 body（含回显的 Authorization 值/密码/env secret）
+	// 永不落日志——截断≠脱敏，body 一律不输出。
+	for _, secret := range []string{"sekret-password", envSecret, "Basic ", "Authorization", "denied", strings.Repeat("x", 100)} {
+		if strings.Contains(out, secret) {
+			t.Fatalf("error body content %q leaked into debug log: %q", secret, out)
+		}
 	}
-	// 脱敏负断言：密码/Authorization 值永不落日志。
-	if strings.Contains(out, "sekret-password") {
-		t.Fatalf("password leaked into debug log: %q", out)
+	if strings.Contains(out, "http error body") {
+		t.Fatalf("body must not be logged at all, got: %q", out)
 	}
-	if strings.Contains(out, "Authorization") || strings.Contains(out, "Basic ") {
-		t.Fatalf("auth header leaked into debug log: %q", out)
+}
+
+// TestDebugSupervisor_RecycleFailNoBody 覆盖 supervisor 错误日志路径
+// （recycleCandidate DELETE 失败）：debug 日志只含白名单字段
+// （session/status/kind），500 响应回显的 Authorization/密码不落日志。
+func TestDebugSupervisor_RecycleFailNoBody(t *testing.T) {
+	SetDebugLogging(true)
+	defer SetDebugLogging(false)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"error":"boom","authorization":%q,"password":"sekret-password"}`,
+			r.Header.Get("Authorization"))
+	}))
+	defer srv.Close()
+	sup := &V2Supervisor{deps: SupervisorDeps{Store: &fakeRecordStore{}}}
+	c := NewClient(portOf(srv.URL), "sekret-password", Options{})
+	out := captureDebug(t, func() {
+		err := sup.recycleCandidate(context.Background(), c, "ses_bad")
+		var debt *appagent.CandidateCleanupDebt
+		if !errors.As(err, &debt) {
+			t.Fatalf("recycleCandidate must surface CandidateCleanupDebt, got %v", err)
+		}
+	})
+	if !strings.Contains(out, "recycle_candidate: DELETE failed session=ses_bad status=500") {
+		t.Fatalf("whitelisted diagnostics missing, got: %q", out)
+	}
+	for _, secret := range []string{"sekret-password", "Basic ", "boom"} {
+		if strings.Contains(out, secret) {
+			t.Fatalf("error body content %q leaked into debug log: %q", secret, out)
+		}
 	}
 }
 
