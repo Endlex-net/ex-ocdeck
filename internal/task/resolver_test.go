@@ -77,8 +77,9 @@ func TestResolveExecutionPath_R9HintMentionsSwitch(t *testing.T) {
 	if got.DenyKind != appagent.ErrKindCapabilityUnavailable {
 		t.Fatalf("kind: %v", got.DenyKind)
 	}
-	// R9 仅在开关显式关闭时触发：提示须含开关名、显式关闭语义与恢复方式。
-	for _, sub := range []string{"OCDECK_V2_ADOPTION", "显式关闭", "移除该环境变量或设为 1"} {
+	// R9 仅在开关关闭形态触发：提示须含开关名与恢复方式（不断言关闭原因——
+	// 显式关闭与未知值保守关闭均进此分支）。
+	for _, sub := range []string{"OCDECK_V2_ADOPTION", "移除该环境变量或设为 1"} {
 		if !containsSub(got.DenyReason, sub) {
 			t.Fatalf("R9 hint missing %q: %q", sub, got.DenyReason)
 		}

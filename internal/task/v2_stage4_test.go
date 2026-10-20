@@ -249,9 +249,11 @@ func TestStage4_AdoptionCommitConflict_RetryKeepsSameSession(t *testing.T) {
 	if nV2After != 2 || nV1After != 0 {
 		t.Fatalf("ownership conversion: v2=%d v1=%d（session_id 不变的命名空间转换）", nV2After, nV1After)
 	}
-	// pending 丢失如实告知：last_error 指明重新触发（非「已解决」）。
-	if !strings.Contains(row.LastError.String, "pending") || !strings.Contains(row.LastError.String, "重新触发") {
-		t.Fatalf("pending loss must be surfaced in last_error: %q", row.LastError.String)
+	// pending 丢失如实告知：last_error 带迁移承接前缀、指明重新触发（非「已解决」）。
+	for _, sub := range []string{"自动迁移承接", "pending", "重新触发"} {
+		if !strings.Contains(row.LastError.String, sub) {
+			t.Fatalf("pending loss notice must contain %q: %q", sub, row.LastError.String)
+		}
 	}
 }
 
