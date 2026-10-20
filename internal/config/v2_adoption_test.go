@@ -1,5 +1,6 @@
-// v2_adoption_test.go 落实 tasks 6.2/6.7：主版本提取三类输入（v1/v2/解析失败）
-// 与承接开关两态（默认关）。
+// v2_adoption_test.go 落实 tasks 6.2 与 v1-auto-adopt-on-v2 tasks 1.3：主版本
+// 提取三类输入（v1/v2/解析失败）与承接开关真值表（默认开、显式关=关、
+// 未知值保守=关）。
 package config
 
 import "testing"
@@ -37,11 +38,11 @@ func TestExtractOpenCodeMajor(t *testing.T) {
 }
 
 func TestV2AdoptionSwitch(t *testing.T) {
-	if v2AdoptionEnabled(nil) {
-		t.Fatalf("nil lookup must default off")
+	if !v2AdoptionEnabled(nil) {
+		t.Fatalf("nil lookup must default on")
 	}
-	if v2AdoptionEnabled(func(string) (string, bool) { return "", false }) {
-		t.Fatalf("unset must default off")
+	if !v2AdoptionEnabled(func(string) (string, bool) { return "", false }) {
+		t.Fatalf("unset must default on")
 	}
 	for _, on := range []string{"1", "true", "ON", " true "} {
 		v := on
@@ -49,10 +50,17 @@ func TestV2AdoptionSwitch(t *testing.T) {
 			t.Fatalf("%q must enable", on)
 		}
 	}
-	for _, off := range []string{"", "0", "false", "yes-please"} {
+	for _, off := range []string{"0", "false", "OFF", " off "} {
 		v := off
 		if v2AdoptionEnabled(func(string) (string, bool) { return v, true }) {
 			t.Fatalf("%q must stay off", off)
+		}
+	}
+	// 未知显式值保守视为关闭（与既有 default 分支一致）。
+	for _, unknown := range []string{"", "yes", "2", "yes-please"} {
+		v := unknown
+		if v2AdoptionEnabled(func(string) (string, bool) { return v, true }) {
+			t.Fatalf("unknown value %q must stay off", unknown)
 		}
 	}
 }

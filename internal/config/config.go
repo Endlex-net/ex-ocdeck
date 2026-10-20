@@ -98,9 +98,11 @@ type Config struct {
 	// resolver 口径）：2=v2 机器、1=v1 机器、0=unknown（探测失败/解析失败——
 	// resolver 按保守口径处理）。
 	OpenCodeMajor int
-	// V2Adoption 是承接开关（opencode-v2-provider tasks 6.7，默认关）：关闭时
-	// v2 provider 不注册、v2 钉扎任务创建入口不可用；已承接任务的 v2 消费点按
-	// 未注册 provider fail-closed（不自动转回 v1）。
+	// V2Adoption 是承接开关（v1-auto-adopt-on-v2，默认开）：未配置
+	// OCDECK_V2_ADOPTION 时开启承接（v2 provider 在装配期注册）；显式
+	// 0/false/off 关闭——关闭形态不变：v2 provider 不注册、v2 钉扎任务创建
+	// 入口不可用；已承接任务的 v2 消费点按未注册 provider fail-closed（不自动
+	// 转回 v1）。
 	V2Adoption bool
 	// Debug 是调试日志开关（OCDECK_DEBUG，默认关）：开启后 client/resolver/
 	// supervisor/任务分派输出 [debug] 前缀诊断日志（脱敏——凭据与环境快照内容
@@ -602,21 +604,24 @@ func versionAtLeast(maj, min, pat, loMaj, loMin, loPat int) bool {
 	return pat >= loPat
 }
 
-// V2AdoptionEnv 是承接开关（opencode-v2-provider tasks 6.7）的环境变量名；
-// 默认关——关闭形态固定为「v2 provider 不注册」。
+// V2AdoptionEnv 是承接开关（v1-auto-adopt-on-v2）的环境变量名；默认开——
+// 显式 0/false/off 关闭，关闭形态固定为「v2 provider 不注册」。
 const V2AdoptionEnv = "OCDECK_V2_ADOPTION"
 
-// v2AdoptionEnabled 解析承接开关（默认关；真值 = "1"/"true"/"on"，大小写不
-// 敏感、容忍首尾空白）。nil lookup 视为未配置（关）。
+// v2AdoptionEnabled 解析承接开关（默认开；开启值 = "1"/"true"/"on"，关闭值 =
+// "0"/"false"/"off"，大小写不敏感、容忍首尾空白；其他未知值保守视为关闭，
+// 与既有 default 分支一致）。nil lookup 或未配置均视为开启。
 func v2AdoptionEnabled(lookup EnvLookup) bool {
 	if lookup == nil {
-		return false
+		return true
 	}
 	v, ok := lookup(V2AdoptionEnv)
 	if !ok {
-		return false
+		return true
 	}
 	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "0", "false", "off":
+		return false
 	case "1", "true", "on":
 		return true
 	default:
@@ -627,7 +632,7 @@ func v2AdoptionEnabled(lookup EnvLookup) bool {
 // DebugEnv 是调试日志开关的环境变量名；默认关。
 const DebugEnv = "OCDECK_DEBUG"
 
-// debugEnvEnabled 解析调试开关（口径同 v2AdoptionEnabled：真值 =
+// debugEnvEnabled 解析调试开关（默认关；真值形态同 v2AdoptionEnabled 的开启值 =
 // "1"/"true"/"on"，大小写不敏感、容忍首尾空白；nil lookup 视为未配置）。
 func debugEnvEnabled(lookup EnvLookup) bool {
 	if lookup == nil {

@@ -53,8 +53,9 @@ type adoptionStore interface {
 }
 
 // adoptionPendingLossNotice 是承接提交的如实告知 last_error（官方升级已知限制）。
-var adoptionPendingLossNotice = "v2 承接完成：v1 pending attention 为进程内存态，" +
-	"官方升级后不保留；如原任务存在未处理 permission/question，请重新触发对应操作（非已解决）"
+var adoptionPendingLossNotice = "该任务已随 opencode v2 升级自动迁移承接：" +
+	"v1 pending attention 为进程内存态，升级后不保留；" +
+	"如原任务存在未处理 permission/question，请重新触发对应操作（非已解决）"
 
 // adoptionBranch 是 D5 历史判定矩阵结果。
 type adoptionBranch int
