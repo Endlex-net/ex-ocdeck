@@ -48,6 +48,7 @@ type adoptionStore interface {
 	ListTaskSessionKeys(ctx context.Context, taskID string) ([]domain.SessionKey, error)
 	GetTaskAnchor(ctx context.Context, taskID string) (anchorID, providerID, instanceID string, err error)
 	CommitAdoption(ctx context.Context, taskID string, b, oldBinding domain.TaskBinding, fromStatus string, lastError *string) (application.TransitionResult, error)
+	CommitAdoptionLegacy(ctx context.Context, taskID string, b domain.TaskBinding, fromStatus string, lastError *string) (application.TransitionResult, error)
 	CommitFirstBuild(ctx context.Context, taskID string, b domain.TaskBinding, key domain.SessionKey, createdAt, firstSeen, lastSeen int64, parentID string) (application.TransitionResult, error)
 	CommitV2Resume(ctx context.Context, taskID string, oldBinding, b domain.TaskBinding, fromStatus string) (application.TransitionResult, error)
 }
@@ -69,6 +70,9 @@ const (
 // classifyAdoption 实现 D5 历史判定矩阵（只读；纯函数）：
 //   - binding(v1)/anchor(v1)/归属行三者一致（anchor==binding.UpstreamSessionID
 //     且 anchor ∈ v1 归属集合）→ A；
+//   - legacy-A 变体（v1-legacy-anchor-adopt）：binding 持久化（迁移 0018）之前的
+//     老任务——task_binding 为空 + anchor 三元组 v1 完整 + anchor ∈ v1 归属集合
+//     → A（target=anchor；提交走 CommitAdoptionLegacy 的 NULL 代际守卫）；
 //   - 三者一致为空（无 binding、anchor 三元组完整为空、零归属行）→ B；
 //   - 已有 v2 binding → 非承接准入（R1 恢复路径——调用方按 resolver 处置）；
 //   - 其余（部分缺失、id 不一致、混杂、未知命名空间）→ stop（评审 I11：部分
@@ -105,12 +109,23 @@ func classifyAdoption(hasBinding bool, binding domain.TaskBinding, anchorID, anc
 		}
 	}
 	anchorIsV1 := anchorID != "" // 命名空间合法性已在上面的 id 权威守卫内验证
-	if bindingIsV1 && anchorIsV1 && binding.UpstreamSessionID == anchorID {
-		// anchor ∈ v1 归属集合（归属集合可含子 session）。
+	anchorInRows := false        // anchor ∈ v1 归属集合（归属集合可含子 session）
+	if anchorIsV1 {
 		for _, k := range keys {
 			if k.UpstreamID == anchorID {
-				return branchA, anchorID
+				anchorInRows = true
+				break
 			}
+		}
+	}
+	if anchorInRows {
+		if bindingIsV1 && binding.UpstreamSessionID == anchorID {
+			return branchA, anchorID
+		}
+		// legacy-A：无 binding 的老任务合法形态（binding 三列事实为空）；有 binding
+		// 但与 anchor 不一致仍落 stop（下方出口——不猜测）。
+		if !hasBinding {
+			return branchA, anchorID
 		}
 	}
 	if !hasBinding && anchorID == "" && v1Rows == 0 {
@@ -146,7 +161,8 @@ func (m *Manager) adoptTaskV2(ctx context.Context, taskID string, row TaskRow, m
 	if kerr != nil {
 		return kerr
 	}
-	branch, _ := classifyAdoption(hasBinding, binding, anchorID, anchorPID, anchorIID, keys)
+	branch, target := classifyAdoption(hasBinding, binding, anchorID, anchorPID, anchorIID, keys)
+	legacyAdopt := false
 	switch branch {
 	case branchStop:
 		// D5 判定矩阵「其余」：停止承接、保留现状、last_error、提交用户决策。
@@ -163,7 +179,17 @@ func (m *Manager) adoptTaskV2(ctx context.Context, taskID string, row TaskRow, m
 		}
 		return m.firstBuildV2(ctx, taskID, row, mode, supB, taskLocked)
 	case branchA:
-		// target = anchor session id；继续步骤 2-6。
+		// target = anchor session id；继续步骤 2-6。legacy-A（binding 持久化之前的
+		// 老任务）合成内存态 v1 binding 供 Resume 与提交使用——MUST NOT 持久化，
+		// 提交代际守卫由 CommitAdoptionLegacy 以 task_binding IS NULL 复验。
+		if !hasBinding {
+			legacyAdopt = true
+			binding = domain.TaskBinding{
+				ProviderID:         ocdeckstore.ProviderIDV1,
+				ProviderInstanceID: ocdeckstore.ProviderInstanceV1Default,
+				UpstreamSessionID:  target,
+			}
+		}
 	}
 
 	// 步骤 2+3：server 可用性（supervisor 独立有界重试）+ 原 session 验证
@@ -203,7 +229,13 @@ func (m *Manager) adoptTaskV2(ctx context.Context, taskID string, row TaskRow, m
 	default:
 		from = ocdecktask.StatusSuspended
 	}
-	res, cerr := astore.CommitAdoption(ctx, taskID, candidate, binding, string(from), &adoptionPendingLossNotice)
+	var res application.TransitionResult
+	var cerr error
+	if legacyAdopt {
+		res, cerr = astore.CommitAdoptionLegacy(ctx, taskID, candidate, string(from), &adoptionPendingLossNotice)
+	} else {
+		res, cerr = astore.CommitAdoption(ctx, taskID, candidate, binding, string(from), &adoptionPendingLossNotice)
+	}
 	if cerr != nil || !res.Matched {
 		if es != nil {
 			_ = es.Close()
