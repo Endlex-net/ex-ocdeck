@@ -41,7 +41,12 @@ cat > "$config_dir/opencode.json" <<'JSON'
 }
 JSON
 
-if [ -z "${ARCHI_API_KEY:-}" ]; then
+if [ -n "${ARCHI_API_KEY:-}" ]; then
+	# ocdeck 托管的 v2 serve 经 tmux 白名单 env 启动（仅 OPENCODE_SERVER_PASSWORD
+	# + DefaultBaseEnv），{env:ARCHI_API_KEY} 插值在 serve 进程内取不到值——
+	# 测试镜像形态：生成时替换为字面 key（key 仅来自 docker run -e，不进镜像层）。
+	sed -i "s|{env:ARCHI_API_KEY}|${ARCHI_API_KEY}|" "$config_dir/opencode.json"
+else
 	{
 		echo "====================================================================="
 		echo "WARNING: ARCHI_API_KEY 未设置——opencode 模型调用不可用。"
