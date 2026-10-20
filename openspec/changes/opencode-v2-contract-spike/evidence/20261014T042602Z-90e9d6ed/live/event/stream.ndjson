@@ -1,0 +1,62 @@
+data: {"id":"evt_138aa8952001xmlBZ5EzwxepGa","type":"server.connected","data":{}}
+
+: heartbeat
+
+data: {"id":"evt_138aa8a2e0013Bu9HREIYVFR3N","created":1791952063023,"type":"session.created","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec75575e4ffegcIFeuGaqTATVs","slug":"kind-wolf","version":"2.0.28","projectID":"global","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"subpath":"openspec/changes/opencode-v2-contract-spike/sandbox/work","title":"spike-event-create"},"durable":{"aggregateID":"ses_ec75575e4ffegcIFeuGaqTATVs","seq":0,"version":1}}
+
+data: {"id":"evt_138aa8a57001ts6kGTPJ5k9ge3","created":1791952063063,"type":"project.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"id":"global","canonical":"/repo","vcs":"git","time":{"created":1791951064543,"updated":1791951064543,"active":1791952063062},"sandboxes":[]}}
+
+data: {"id":"evt_138aa8b56001z80C0qN6HqU6vp","created":1791952063318,"type":"session.renamed","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec7558267ffeGHwZDsYtioWocI","title":"spike-event-updated"},"durable":{"aggregateID":"ses_ec7558267ffeGHwZDsYtioWocI","seq":1,"version":1}}
+
+data: {"id":"evt_138aa8c9a001hhwivX9bSyLrPk","created":1791952063642,"type":"integration.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138aa8c9d001wW5nW5cmzAALWz","created":1791952063645,"type":"provider.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138aa8ca3001OzQ8rjkXZijych","created":1791952063651,"type":"model.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138aa8cb4001lD6apiYM0KD7Lh","created":1791952063668,"type":"vcs.branch.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"branch":"master"}}
+
+data: {"id":"evt_138aa8cb5001YljfKCnJrKZKpz","created":1791952063669,"type":"agent.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138aa8cb5002Zb8vvvmVj0aPfL","created":1791952063669,"type":"command.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138aa8cb6001owBnbWW5F2GKz4","created":1791952063670,"type":"skill.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138aa8cb80010JVjrvZvtUPNo3","created":1791952063672,"type":"websearch.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138aa8cc7002ZAxY0RD61cb3ZD","created":1791952063687,"type":"reference.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138aa8ccd001JQDE2tj7fnYnik","created":1791952063693,"type":"plugin.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138aa8cce0013sB25G9HP5LSZz","created":1791952063694,"type":"session.inbox.enqueued","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"inboxID":"msg_status_592304e817ded012","sessionID":"ses_ec7558267ffeGHwZDsYtioWocI","item":{"type":"user","payload":{"text":"status probe ping"},"delivery":"steer"}},"durable":{"aggregateID":"ses_ec7558267ffeGHwZDsYtioWocI","seq":2,"version":1}}
+
+data: {"id":"evt_138aa8cd3001ZPO63VpzrsYoyU","created":1791952063699,"type":"session.execution.started","data":{"sessionID":"ses_ec7558267ffeGHwZDsYtioWocI"},"durable":{"aggregateID":"ses_ec7558267ffeGHwZDsYtioWocI","seq":3,"version":1}}
+
+data: {"id":"evt_138aa8cdf001IZ6LZHirVznB2O","created":1791952063711,"metadata":{"instructions":{"initial":true}},"type":"session.instructions.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec7558267ffeGHwZDsYtioWocI","delta":{"core/codemode":"e6428fd7742161f6c3a6c86e53cbbe2c6e4dcc462bbf1a1a07bc4fcbeb9e0b0b","core/skill-guidance":"8394362d28c82fa4d13c7a9f5568c05680f6687e07db8f426a0e3c92f3027dc9","core/date":"69dc8438f9eb203ca34f520e89b000bba5bd89c8b9ebd3624d24e9ee37f64b0c","core/environment":"337fddb6605a55b104b312ab9cd34dcecac32698223dd62577521a929c0a7990"}},"durable":{"aggregateID":"ses_ec7558267ffeGHwZDsYtioWocI","seq":4,"version":2}}
+
+data: {"id":"evt_138aa8ce3001ZlrlyQhM731LUd","created":1791952063715,"type":"session.inbox.delivered","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec7558267ffeGHwZDsYtioWocI","inboxID":"msg_status_592304e817ded012"},"durable":{"aggregateID":"ses_ec7558267ffeGHwZDsYtioWocI","seq":5,"version":1}}
+
+data: {"id":"evt_138aa926e001LfqabP1jDIRn3S","created":1791952065134,"type":"session.step.started","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec7558267ffeGHwZDsYtioWocI","agent":"build","model":{"id":"cat-jam-free","providerID":"opencode"},"assistantMessageID":"msg_138aa8cee001WEao4B0SWjJ7CG","snapshot":"43954615385ae6d044cdd341285e5bb6310031cc","started":1791952063735},"durable":{"aggregateID":"ses_ec7558267ffeGHwZDsYtioWocI","seq":6,"version":1}}
+
+data: {"id":"evt_138aa9276001lPHX2DwpYIln5S","created":1791952065142,"type":"session.reasoning.started","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec7558267ffeGHwZDsYtioWocI","assistantMessageID":"msg_138aa8cee001WEao4B0SWjJ7CG","ordinal":0,"state":{"reasoningField":"reasoning_content"}},"durable":{"aggregateID":"ses_ec7558267ffeGHwZDsYtioWocI","seq":7,"version":1}}
+
+data: {"id":"evt_138aa92b3001zUNacN5GesnfQZ","created":1791952065203,"type":"session.reasoning.delta","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec7558267ffeGHwZDsYtioWocI","assistantMessageID":"msg_138aa8cee001WEao4B0SWjJ7CG","ordinal":0,"delta":"The user sent \"status probe ping\". This seems like a simple connectivity/status check. I should respond affirmatively."}}
+
+data: {"id":"evt_138aa92b3002npRXwIESMeB5nG","created":1791952065203,"type":"session.text.started","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec7558267ffeGHwZDsYtioWocI","assistantMessageID":"msg_138aa8cee001WEao4B0SWjJ7CG","ordinal":0},"durable":{"aggregateID":"ses_ec7558267ffeGHwZDsYtioWocI","seq":8,"version":1}}
+
+data: {"id":"evt_138aa92eb0019cn24Qs5vSMH8k","created":1791952065259,"type":"session.reasoning.ended","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec7558267ffeGHwZDsYtioWocI","assistantMessageID":"msg_138aa8cee001WEao4B0SWjJ7CG","ordinal":0,"text":"The user sent \"status probe ping\". This seems like a simple connectivity/status check. I should respond affirmatively.","state":{"reasoningField":"reasoning_content"}},"durable":{"aggregateID":"ses_ec7558267ffeGHwZDsYtioWocI","seq":9,"version":1}}
+
+data: {"id":"evt_138aa92ee001tfatgwVovRH8gn","created":1791952065262,"type":"session.text.delta","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec7558267ffeGHwZDsYtioWocI","assistantMessageID":"msg_138aa8cee001WEao4B0SWjJ7CG","ordinal":0,"delta":"Pong! I'm here and ready. Let me know what you'd like to work on."}}
+
+data: {"id":"evt_138aa92ef0011VgGH5CRoR9A3k","created":1791952065263,"type":"session.text.ended","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec7558267ffeGHwZDsYtioWocI","assistantMessageID":"msg_138aa8cee001WEao4B0SWjJ7CG","ordinal":0,"text":"Pong! I'm here and ready. Let me know what you'd like to work on."},"durable":{"aggregateID":"ses_ec7558267ffeGHwZDsYtioWocI","seq":10,"version":1}}
+
+data: {"id":"evt_138aa92f10014QeNxQLNr8pUZ1","created":1791952065265,"type":"session.step.streamed","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec7558267ffeGHwZDsYtioWocI","assistantMessageID":"msg_138aa8cee001WEao4B0SWjJ7CG"},"durable":{"aggregateID":"ses_ec7558267ffeGHwZDsYtioWocI","seq":11,"version":1}}
+
+data: {"id":"evt_138aa9302001hoI4RQuoig3QAP","created":1791952065282,"type":"session.step.ended","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec7558267ffeGHwZDsYtioWocI","assistantMessageID":"msg_138aa8cee001WEao4B0SWjJ7CG","finish":"stop","rawFinish":"stop","cost":0,"tokens":{"input":42,"output":22,"reasoning":31,"cache":{"read":4608,"write":0}},"snapshot":"43954615385ae6d044cdd341285e5bb6310031cc","files":[]},"durable":{"aggregateID":"ses_ec7558267ffeGHwZDsYtioWocI","seq":12,"version":1}}
+
+data: {"id":"evt_138aa9305001p5b5XN5JzxV5X1","created":1791952065285,"type":"session.usage.updated","data":{"sessionID":"ses_ec7558267ffeGHwZDsYtioWocI","cost":0,"tokens":{"input":42,"output":22,"reasoning":31,"cache":{"read":4608,"write":0}}}}
+
+data: {"id":"evt_138aa930600155EPFkXwzYvLmz","created":1791952065286,"type":"session.execution.succeeded","data":{"sessionID":"ses_ec7558267ffeGHwZDsYtioWocI"},"durable":{"aggregateID":"ses_ec7558267ffeGHwZDsYtioWocI","seq":13,"version":1}}
+
+: heartbeat
+

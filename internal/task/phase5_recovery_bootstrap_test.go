@@ -125,7 +125,7 @@ func startRecoveryFromActive(t *testing.T, store TaskStore, proc ProcessBackend,
 	rt := m.newRuntime("t1")
 	m.setRuntime("t1", rt)
 	rt.registerGroup(roleRuntime, runtimeSessionName("t1"))
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 	return m
 }
 

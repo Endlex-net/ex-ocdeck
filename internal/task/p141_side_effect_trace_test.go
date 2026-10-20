@@ -29,7 +29,9 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/config"
+	domain "ocdeck/internal/domain/agentprovider"
 	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
 )
@@ -137,6 +139,13 @@ func (s *traceStore) UpdateTaskStatusConditional(ctx context.Context, id, fromSt
 func (s *traceStore) CasActivationIfNoRecoveryDebt(ctx context.Context, id, fromStatus, toStatus string) (application.TransitionResult, error) {
 	s.tr.record("store", "CasActivationIfNoRecoveryDebt", fmt.Sprintf("id=%s %s->%s", id, fromStatus, toStatus))
 	return s.TaskStore.CasActivationIfNoRecoveryDebt(ctx, id, fromStatus, toStatus)
+}
+
+// CommitActivation：tasks 4.3 起激活成功提交事务（binding 写入 + activating→active
+// CAS）走本方法，trace 语义与条件 CAS 一致（同一提交点，入口名变化）。
+func (s *traceStore) CommitActivation(ctx context.Context, id string, b domain.TaskBinding, fromStatus, toStatus string) (application.TransitionResult, error) {
+	s.tr.record("store", "CommitActivation", fmt.Sprintf("id=%s %s->%s", id, fromStatus, toStatus))
+	return s.TaskStore.CommitActivation(ctx, id, b, fromStatus, toStatus)
 }
 
 // CompleteRecoveryFailureAndClearDebts：G3-18 起恢复终态走单事务方法。
@@ -398,17 +407,24 @@ func newTraceTestManager(t *testing.T, store *mockStore, proc *mockProc, wt *moc
 	tStore := wrapTraceStore(store, tr)
 	tProc := wrapTraceProc(proc, tr)
 	tWt := wrapTraceWorktree(wt, tr)
-	wrap := func(port int, password string, opts opencode.Options) OCClient {
+	wrap := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		inner := &readyOC{inner: oc, onReady: opts.OnReady}
 		return wrapTraceOC(inner, tr)
 	}
 	cfg := testCfg(t)
+	// tasks 4.3：trace 流程同契约（runtime 连接分派按 registry；提交事务路由
+	// CommitActivation——traceStore wrapper 覆盖记录）。
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatalf("register test provider: %v", err)
+	}
 	m := New(Options{
-		Cfg:       cfg,
-		Store:     tStore,
-		Proc:      tProc,
-		Worktree:  tWt,
-		OCFactory: wrap,
+		Cfg:              cfg,
+		Store:            tStore,
+		Proc:             tProc,
+		Worktree:         tWt,
+		OCFactory:        wrap,
+		ProviderRegistry: reg,
 	})
 	m.recoveryBackoffFn = func(int) time.Duration { return 0 }
 	return m
@@ -437,7 +453,7 @@ var (
 		"UpdateTaskEnvSnapshot": true, "UpdateTaskLastPort": true, "UpdateTaskNotice": true,
 		"UpdateTaskNoticeCAS": true, "SetTaskDeleteMode": true, "BeginDeleteIntent": true,
 		"BeginRetryDeleteIntent": true,
-		"ArchiveTask": true, "RestoreTask": true, "DeleteTask": true, "CommitCreated": true,
+		"ArchiveTask":            true, "RestoreTask": true, "DeleteTask": true, "CommitCreated": true,
 		"ClaimInitRun": true, "ClaimInitRerun": true, "FinishInitRun": true,
 		"ClaimTaskSession": true, "TouchOwnedTaskSession": true, "DeleteTaskSession": true,
 		"AlignTaskSessions": true,
@@ -753,7 +769,7 @@ func TestP141_Activate_Success_Trace(t *testing.T) {
 
 	// 关键顺序：激活准入（G3-18：CasActivationIfNoRecoveryDebt，suspended→activating）
 	// → NewSession(serve) → UpdateTaskLastPort → SubscribeEvents → AlignTaskSessions
-	// → UpdateTaskStatus(active)。
+	// → CommitActivation（tasks 4.3：binding 写入 + activating→active CAS 同事务）。
 	assertOrdered(t, tr, []traceOp{
 		{src: "store", op: "CasActivationIfNoRecoveryDebt", key: "suspended->activating"},
 		{src: "proc", op: "NewSession", key: runtimeSessionName("t1")},
@@ -762,11 +778,11 @@ func TestP141_Activate_Success_Trace(t *testing.T) {
 		{src: "store", op: "AlignTaskSessions", key: "mode=1"},
 		{src: "oc", op: "Health", key: ""},
 		{src: "store", op: "UpdateTaskLastPort", key: "t1"},
-		{src: "store", op: "UpdateTaskStatusConditional", key: "activating->active"},
+		{src: "store", op: "CommitActivation", key: "activating->active"},
 	}, "Activate.success")
 
-	// G3-18：条件 CAS 仅剩提交步（activating→active）；准入走 CasActivation。
-	assertOpCount(t, tr, "store", "UpdateTaskStatusConditional", 1, "Activate.success")
+	// G3-18：条件 CAS 仅剩提交步（CommitActivation；tasks 4.3 起提交事务统一入口）。
+	assertOpCount(t, tr, "store", "CommitActivation", 1, "Activate.success")
 	assertOpCount(t, tr, "store", "CasActivationIfNoRecoveryDebt", 1, "Activate.success")
 	assertOpNever(t, tr, "store", "UpdateTaskStatus", "Activate.success")
 	// 无 BeginDeleteIntent/ArchiveTask/RestoreTask/DeleteTask（非删除/归档流程）。

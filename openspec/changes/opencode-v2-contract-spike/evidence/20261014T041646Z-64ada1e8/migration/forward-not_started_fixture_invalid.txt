@@ -1,0 +1,3 @@
+state=NOT_STARTED_FIXTURE_INVALID
+failure_classes=['INCONCLUSIVE']
+reason=fixture 造数不完整：无法构造满足发现 pattern 的 messageID

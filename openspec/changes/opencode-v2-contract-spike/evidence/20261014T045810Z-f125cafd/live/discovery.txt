@@ -1,0 +1,5 @@
+level1 /doc returned non-JSON (likely SPA HTML)
+api_prefix=/api
+prompt_path=/api/session/{sessionID}/prompt
+sessionID_pattern=^ses
+messageID_pattern=^msg_

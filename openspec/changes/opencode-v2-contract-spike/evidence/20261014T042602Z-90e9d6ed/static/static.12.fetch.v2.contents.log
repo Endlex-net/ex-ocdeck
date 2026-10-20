@@ -1,0 +1,1 @@
+contents-api probe: ref=026b106bc5d41b679ffc413264229c340871e4d3 path=packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts status=404 err=None

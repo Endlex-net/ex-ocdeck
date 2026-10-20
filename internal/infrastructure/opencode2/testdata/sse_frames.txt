@@ -1,0 +1,21 @@
+: heartbeat comment
+
+data: {"id":"evt_01","created":1792089041087,"type":"server.connected","data":{"clientID":"cli_fixture01"}}
+
+data: {"id":"evt_02","created":1792089041091,"type":"session.execution.started","data":{"sessionID":"ses_fixture01a"},"durable":{"aggregateID":"ses_fixture01a","seq":1,"version":1}}
+
+data: {"id":"evt_03","created":1792089041100,"type":"session.renamed","location":{"directory":"/wt"},"data":{"sessionID":"ses_fixture01a","title":"renamed-title"},"durable":{"aggregateID":"ses_fixture01a","seq":2,"version":1}}
+
+data: {"id":"evt_04","created":1792089041101,"type":"session.unknown.probe","data":{"sessionID":"ses_fixture01a"}}
+
+data: {"id":"evt_05","created":1792089041102,"type":"session.renamed","data":{"title":"no-owner"}}
+
+data: {"id":"evt_06","created":1792089041103,"type":"session.execution.succeeded","data":{"sessionID":"ses_fixture01a"},"durable":{"aggregateID":"ses_fixture01a","seq":3,"version":1}}
+
+data: {"id":"evt_07","created":1792089041104,"type":"effect/http-api/stream/failure","data":{}}
+
+data: {"id":"evt_08","created":1792089041105,"type":"permission.asked","location":{"directory":"/wt"},"data":{"id":"per_fixture01","sessionID":"ses_fixture01a","action":"shell","resources":["touch /tmp/fixture-marker"]}}
+
+data: {"id":"evt_09","created":1792089041106,"type":"session.created","data":{"sessionID":"ses_fixture02b","title":"child","parentID":"ses_fixture01a","time":{"created":1792089041106,"updated":1792089041106}}}
+
+

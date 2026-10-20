@@ -1,0 +1,6 @@
+data: {"id":"evt_138c8a787001MRg2D6djdtSwv7","type":"server.connected","data":{}}
+
+: heartbeat
+
+data: {"id":"evt_138c8a7a0001G51NUvcsjNaLvN","created":1791954036640,"type":"session.created","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec737586dffeq5Ai3uVaTZhdOQ","slug":"misty-garden","version":"2.0.28","projectID":"global","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"subpath":"openspec/changes/opencode-v2-contract-spike/sandbox/work","title":"spike-event-delete"},"durable":{"aggregateID":"ses_ec737586dffeq5Ai3uVaTZhdOQ","seq":0,"version":1}}
+

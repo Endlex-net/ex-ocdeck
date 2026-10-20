@@ -34,7 +34,7 @@ func TestOCClient_PromptAsync_InterfaceCompliance(t *testing.T) {
 }
 
 // TestOCClient_PromptAsync_MockDefaults 验证显式实现的 stub 与 mockOC 默认返回 pre_send_failure
-//（design.md D1：stub 不依赖错误字符串匹配，返回结构化 Kind）。
+// （design.md D1：stub 不依赖错误字符串匹配，返回结构化 Kind）。
 func TestOCClient_PromptAsync_MockDefaults(t *testing.T) {
 	stubs := []OCClient{
 		newMockOC(true), // newMockOC 初始化 pre_send_failure

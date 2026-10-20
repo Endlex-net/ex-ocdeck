@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
@@ -37,6 +38,9 @@ func TestR7_DeleteTempServeKillError_BlocksDBCommit(t *testing.T) {
 		CleanupTickets: []string{"r7-temp-serve-tk"},
 	}
 	m := newR7TestManager(t, tStore, proc, newMockWorktree(), newMockOC(true))
+	// tasks 4.3：一次性 serve 起 AcquireEphemeral 临时 runtime（真实 supervisor 内部
+	// 健康检查直连 fake server 监听端口）。
+	injectEphemeralSupervisorForTestWithPort(t, m, tStore, proc, newFakeOCServer(t).port)
 
 	err := m.Delete(context.Background(), "t1", DeleteNormal, true)
 	if err == nil {
@@ -191,7 +195,7 @@ func TestR7_SSEReplayOrder_BufferedEventsBeforeReal(t *testing.T) {
 		realEvents:     []opencode.Event{makeEventWithDir("session.deleted", "A", 120, "/data/worktrees/p1/t1")},
 		afterReleaseCh: make(chan struct{}),
 	}
-	factory := func(port int, password string, opts opencode.Options) OCClient {
+	factory := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		oc.onReadyCb = opts.OnReady
 		return oc
 	}
@@ -321,7 +325,7 @@ func TestR7_LockTaskWait_DeadlineBoundaryRace(t *testing.T) {
 }
 
 // TestR7_LockTaskForConverge_AcquireAndRelease 验证 R7-4 收敛路径锁获取后正常释放
-//（与 lockTaskWait 同模式，TOCTOU 修复由 lockTaskWait 压力测试覆盖——lockTaskForConverge
+// （与 lockTaskWait 同模式，TOCTOU 修复由 lockTaskWait 压力测试覆盖——lockTaskForConverge
 // 的 waitCtx 挂 Background() + 30s deadline，放弃路径无法在测试中快速触发）。
 func TestR7_LockTaskForConverge_AcquireAndRelease(t *testing.T) {
 	tStore := newMockStore()

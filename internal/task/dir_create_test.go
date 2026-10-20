@@ -20,8 +20,8 @@ import (
 	"testing"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/config"
-	"ocdeck/internal/infrastructure/opencode"
 )
 
 // panicNamer 实现 BranchNamer，被调用即 panic——证明 dir 路径不调用 Namer。
@@ -76,7 +76,7 @@ func newDirTestManager(t *testing.T, store TaskStore, proc ProcessBackend, oc OC
 		ServePortRange: config.PortRange{Min: 50000, Max: 50999},
 		ShutdownPolicy: config.ShutdownPersist,
 	}
-	wrap := func(port int, password string, opts opencode.Options) OCClient {
+	wrap := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOC{inner: oc, onReady: opts.OnReady}
 	}
 	return New(Options{
@@ -185,7 +185,7 @@ func TestCreateDir_PathDoesNotExist_InvalidState_NoCreatingRow(t *testing.T) {
 	store.seedProject(ProjectRow{ID: "pdir", Name: "d", Path: "/nonexistent-xyz-abc-123", DefaultBranch: "", Kind: ProjectKindDir})
 	m := newDirTestManager(t, store, newMockProc(), newMockOC(true))
 
-	_, err := 	m.Create(context.Background(), "pdir", CreateTaskOptions{Name: "task"})
+	_, err := m.Create(context.Background(), "pdir", CreateTaskOptions{Name: "task"})
 	if err == nil {
 		t.Fatal("Create dir with nonexistent path: want error, got nil")
 	}
@@ -210,7 +210,7 @@ func TestCreateDir_PathIsFile_InvalidState(t *testing.T) {
 	store.seedProject(ProjectRow{ID: "pdir", Name: "d", Path: filePath, DefaultBranch: "", Kind: ProjectKindDir})
 	m := newDirTestManager(t, store, newMockProc(), newMockOC(true))
 
-	_, err := 	m.Create(context.Background(), "pdir", CreateTaskOptions{Name: "task"})
+	_, err := m.Create(context.Background(), "pdir", CreateTaskOptions{Name: "task"})
 	if err == nil {
 		t.Fatal("Create dir with file path: want error, got nil")
 	}
@@ -249,7 +249,7 @@ func TestCreateDir_PanicMocksProveNoNamerOrWorktreeBackend(t *testing.T) {
 	m := newDirTestManager(t, store, newMockProc(), newMockOC(true))
 
 	// 成功即证明 Namer/WorktreeBackend 未被调用（panic mock 否则 fail）。
-	if _, err := 	m.Create(context.Background(), "pdir", CreateTaskOptions{Name: "task"}); err != nil {
+	if _, err := m.Create(context.Background(), "pdir", CreateTaskOptions{Name: "task"}); err != nil {
 		t.Fatalf("Create dir: %v", err)
 	}
 }
@@ -318,7 +318,7 @@ func newRepoTestManager(t *testing.T, store TaskStore, wt WorktreeBackend) *Mana
 		ServePortRange: config.PortRange{Min: 50000, Max: 50999},
 		ShutdownPolicy: config.ShutdownPersist,
 	}
-	wrap := func(port int, password string, opts opencode.Options) OCClient {
+	wrap := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOC{inner: newMockOC(true), onReady: opts.OnReady}
 	}
 	return New(Options{
@@ -361,7 +361,7 @@ func TestCreateRepo_BaseRefLocal_ResolvedToHeads(t *testing.T) {
 	}
 	m := newRepoTestManager(t, store, wt)
 
-	row, err := 	m.Create(context.Background(), "prep", CreateTaskOptions{Name: "task", BaseRef: "feature-x"})
+	row, err := m.Create(context.Background(), "prep", CreateTaskOptions{Name: "task", BaseRef: "feature-x"})
 	if err != nil {
 		t.Fatalf("Create repo base_ref local: %v", err)
 	}
@@ -410,7 +410,7 @@ func TestCreateRepo_HeadsPriorityOverRemotes(t *testing.T) {
 	}
 	m := newRepoTestManager(t, store, wt)
 
-	row, err := 	m.Create(context.Background(), "prep", CreateTaskOptions{Name: "task", BaseRef: "feature-x"})
+	row, err := m.Create(context.Background(), "prep", CreateTaskOptions{Name: "task", BaseRef: "feature-x"})
 	if err != nil {
 		t.Fatalf("Create repo heads priority: %v", err)
 	}
@@ -436,7 +436,7 @@ func TestCreateRepo_BaseRefNotExists_InvalidInput_ZeroSideEffect(t *testing.T) {
 	}
 	m := newRepoTestManager(t, store, wt)
 
-	_, err := 	m.Create(context.Background(), "prep", CreateTaskOptions{Name: "task", BaseRef: "nonexistent-branch"})
+	_, err := m.Create(context.Background(), "prep", CreateTaskOptions{Name: "task", BaseRef: "nonexistent-branch"})
 	if err == nil {
 		t.Fatal("Create repo with nonexistent base_ref: want error, got nil")
 	}
@@ -458,7 +458,7 @@ func TestCreateRepo_InvalidBaseRef_InvalidInput(t *testing.T) {
 	m := newRepoTestManager(t, store, wt)
 
 	// base_ref 含非法字符 ".." → ValidateBranchName 拒绝（resolveRepoBaseRef 先校验）。
-	_, err := 	m.Create(context.Background(), "prep", CreateTaskOptions{Name: "task", BaseRef: "foo..bar"})
+	_, err := m.Create(context.Background(), "prep", CreateTaskOptions{Name: "task", BaseRef: "foo..bar"})
 	if err == nil {
 		t.Fatal("Create repo with invalid base_ref: want error, got nil")
 	}
@@ -591,7 +591,7 @@ func TestCreate_UnknownKind_FailClosed(t *testing.T) {
 	store.seedProject(ProjectRow{ID: "p", Name: "p", Path: "/x", DefaultBranch: "main", Kind: "bogus"})
 	m := newDirTestManager(t, store, newMockProc(), newMockOC(true))
 
-	_, err := 	m.Create(context.Background(), "p", CreateTaskOptions{Name: "task"})
+	_, err := m.Create(context.Background(), "p", CreateTaskOptions{Name: "task"})
 	if err == nil {
 		t.Fatal("Create unknown kind: want error, got nil")
 	}

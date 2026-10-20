@@ -1,0 +1,10 @@
+{
+  "request_id": "per_140d4e3fa001rP3P6hNo7fyXxq",
+  "http": 204,
+  "pending_after": {
+    "http": 200,
+    "list": []
+  },
+  "assistant_texts": [],
+  "turn_outcome": null
+}

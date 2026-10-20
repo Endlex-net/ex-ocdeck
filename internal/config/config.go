@@ -94,6 +94,18 @@ type Config struct {
 	// VersionVerified OpenCodeVersion 落在 [ContractMinVersion, ContractBaseline] 的比较结果（design.md §11）。
 	// 仅作告警/UI 提示，不作为激活门禁（门禁是能力探测）。
 	VersionVerified bool
+	// OpenCodeMajor 是机器实装 opencode 的主版本（opencode-v2-provider design D4
+	// resolver 口径）：2=v2 机器、1=v1 机器、0=unknown（探测失败/解析失败——
+	// resolver 按保守口径处理）。
+	OpenCodeMajor int
+	// V2Adoption 是承接开关（opencode-v2-provider tasks 6.7，默认关）：关闭时
+	// v2 provider 不注册、v2 钉扎任务创建入口不可用；已承接任务的 v2 消费点按
+	// 未注册 provider fail-closed（不自动转回 v1）。
+	V2Adoption bool
+	// Debug 是调试日志开关（OCDECK_DEBUG，默认关）：开启后 client/resolver/
+	// supervisor/任务分派输出 [debug] 前缀诊断日志（脱敏——凭据与环境快照内容
+	// 永不落日志）。
+	Debug bool
 	// TmuxVersion 启动时 `tmux -V` 记录（design.md §2），MUST >= 3.2。
 	TmuxVersion string
 }
@@ -293,6 +305,9 @@ func Load(opts Options) (*Config, func(), error) {
 		UploadRetention: uploadRetention,
 		OpenCodeVersion: ocVersion,
 		VersionVerified: VersionSupported(ocVersion),
+		OpenCodeMajor:   ExtractOpenCodeMajor(ocVersion),
+		V2Adoption:      v2AdoptionEnabled(opts.EnvLookup),
+		Debug:           debugEnvEnabled(opts.EnvLookup),
 		TmuxVersion:     tmuxVersion,
 	}
 	if !cfg.VersionVerified {
@@ -585,4 +600,70 @@ func versionAtLeast(maj, min, pat, loMaj, loMin, loPat int) bool {
 		return min > loMin
 	}
 	return pat >= loPat
+}
+
+// V2AdoptionEnv 是承接开关（opencode-v2-provider tasks 6.7）的环境变量名；
+// 默认关——关闭形态固定为「v2 provider 不注册」。
+const V2AdoptionEnv = "OCDECK_V2_ADOPTION"
+
+// v2AdoptionEnabled 解析承接开关（默认关；真值 = "1"/"true"/"on"，大小写不
+// 敏感、容忍首尾空白）。nil lookup 视为未配置（关）。
+func v2AdoptionEnabled(lookup EnvLookup) bool {
+	if lookup == nil {
+		return false
+	}
+	v, ok := lookup(V2AdoptionEnv)
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// DebugEnv 是调试日志开关的环境变量名；默认关。
+const DebugEnv = "OCDECK_DEBUG"
+
+// debugEnvEnabled 解析调试开关（口径同 v2AdoptionEnabled：真值 =
+// "1"/"true"/"on"，大小写不敏感、容忍首尾空白；nil lookup 视为未配置）。
+func debugEnvEnabled(lookup EnvLookup) bool {
+	if lookup == nil {
+		return false
+	}
+	v, ok := lookup(DebugEnv)
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// ExtractOpenCodeMajor 提取机器实装 opencode 的主版本（design D4 resolver
+// 口径）：容忍 `opencode ` 可执行名前缀与 v/V 版本前缀——按空白分词取以数字
+// 开头的版本 token（与 parseTmuxSemver 的 Fields 口径一致；probeOpenCodeVersion
+// 实测输出形如 "opencode v2.0.28"），再取首个点分段的前导数字；解析失败/非正数
+// → 0（unknown——resolver 按保守口径处理，探测失败同样归 0）。
+func ExtractOpenCodeMajor(version string) int {
+	for _, tok := range strings.Fields(version) {
+		t := strings.TrimPrefix(strings.TrimPrefix(tok, "v"), "V")
+		if t == "" || t[0] < '0' || t[0] > '9' {
+			continue // 可执行名等非版本 token（如 "opencode"、"abc"）
+		}
+		if dot := strings.IndexByte(t, '.'); dot >= 0 {
+			t = t[:dot]
+		}
+		n, err := strconv.Atoi(t)
+		if err != nil || n <= 0 {
+			return 0
+		}
+		return n
+	}
+	return 0
 }

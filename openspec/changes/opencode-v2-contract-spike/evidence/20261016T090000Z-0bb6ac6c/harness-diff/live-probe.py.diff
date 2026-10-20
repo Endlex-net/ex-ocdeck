@@ -1,0 +1,138 @@
+--- /Users/mendlex/.ocdeck/worktrees/ex-ocwork/v2-yarg/scripts/spike-v2/live-probe.py	2026-10-16 00:53:42
++++ /var/folders/yk/5bvypw1121s2h7mf08c1x0pr0000gn/T/opencode/p1b-harness/scripts/spike-v2/live-probe.py	2026-10-16 01:42:49
+@@ -456,7 +456,7 @@
+     while p_min.poll() is None and time.time() < deadline:
+         # 实机修正：v2 /global/health 是 SPA HTML；用真实 API 端点判就绪
+         # （带凭证 200 / 无凭证 401 均证明服务已监听）
+-        r = ctx.http("http://127.0.0.1:4096/api/session", timeout=2.0)
++        r = ctx.http("http://127.0.0.1:6096/api/session", timeout=2.0)
+         if r.status in (200, 401):
+             min_ready = True
+             break
+@@ -472,9 +472,9 @@
+     ctx.evidence(f"{ev}/invalid-args.txt", inv.stdout or "")
+     invalid_ok = inv.returncode != 0
+     # 显式参数启动（共享 serve）
+-    rc = ctx.serve_start("main", ctx.locked["v2"]["exec_path"], 29711, ctx.sbroot, ctx.work)
++    rc = ctx.serve_start("main", ctx.locked["v2"]["exec_path"], 31711, ctx.sbroot, ctx.work)
+     if rc == 0:
+-        ctx.base = "http://127.0.0.1:29711"
++        ctx.base = "http://127.0.0.1:31711"
+         # wire 形态发现必须先于认证探针——api_prefix 由发现层填充（v2=/api）
+         ctx.discover_wire_forms()
+         if ctx.sid_pattern:
+@@ -1488,10 +1488,10 @@
+     # F45：列表可比性独立三态——ok=有效列表含目标 / fail=有效列表明确缺目标 /
+     # None=传输失败、非 200、解析失败或形状不符（不可比较，不得折叠为 FAIL）
+     second_list_state: Optional[bool] = None
+-    rc2 = ctx.serve_start("second", ctx.locked["v2"]["exec_path"], 29712,
++    rc2 = ctx.serve_start("second", ctx.locked["v2"]["exec_path"], 31712,
+                           ctx.sbroot, ctx.work)
+     if rc2 == 0:
+-        r_2nd = ctx.http(f"http://127.0.0.1:29712{ctx.api_prefix}/session?directory={enc}")
++        r_2nd = ctx.http(f"http://127.0.0.1:31712{ctx.api_prefix}/session?directory={enc}")
+         ctx.evidence(f"{ev}/second-list.json", r_2nd.body)
+         ids2 = _parse_id_list(r_2nd)
+         if r_2nd.status == 200 and ids2 is not None:
+@@ -1537,7 +1537,7 @@
+         sub_a = S.spawn_upstream(ctx.sbroot, ctx.work,
+                                  ["curl", "-sS", "-N", "--max-time", "60",
+                                   "-u", f"opencode:{ctx.password}",
+-                                  f"http://127.0.0.1:29712/event?directory={enc2}"],
++                                  f"http://127.0.0.1:31712/event?directory={enc2}"],
+                                  log_file=rel_a)
+         try:
+             ctx.registry.add("item", sub_a.pid)
+@@ -1555,7 +1555,7 @@
+         sub_a2 = S.spawn_upstream(ctx.sbroot, ctx.work,
+                                   ["curl", "-sS", "-N", "--max-time", "60",
+                                    "-u", f"opencode:{ctx.password}",
+-                                   f"http://127.0.0.1:29712/event?directory={enc2}"],
++                                   f"http://127.0.0.1:31712/event?directory={enc2}"],
+                                   log_file=rel_a)
+         try:
+             ctx.registry.add("item", sub_a2.pid)
+@@ -1583,13 +1583,13 @@
+     for name in list(ctx.serve_procs):
+         ctx.serve_stop(name)
+     time.sleep(1)
+-    rc3 = ctx.serve_start("restarted", ctx.locked["v2"]["exec_path"], 29711,
++    rc3 = ctx.serve_start("restarted", ctx.locked["v2"]["exec_path"], 31711,
+                           ctx.sbroot, ctx.work)
+     if rc3 != 0:
+         ctx.emit("recovery.01", "INCONCLUSIVE", "待验证", "待验证",
+                  f"serve 重启未就绪（rc={rc3}），恢复事实无法观测", f"{ev}/serve-restarted.log")
+         return
+-    ctx.base = "http://127.0.0.1:29711"
++    ctx.base = "http://127.0.0.1:31711"
+     r_rl = ctx.http(ctx.api(f"/session?directory={enc}"))
+     ctx.evidence(f"{ev}/restart-list.json", r_rl.body)
+     ids_r = _parse_id_list(r_rl)
+@@ -1917,14 +1917,14 @@
+         S.sandbox_mkdir(gen / sub)
+     S.sandbox_write(gen / "cwd" / "opencode.json",
+                     '{"$schema":"https://opencode.ai/config.json","theme":"spike-fixture"}\n')
+-    rc = ctx.serve_start("fixture-gen", ctx.locked["v1"]["exec_path"], 29721, gen, gen / "cwd")
++    rc = ctx.serve_start("fixture-gen", ctx.locked["v1"]["exec_path"], 31721, gen, gen / "cwd")
+     forward_started = False
+     if rc != 0:
+         mig_emit(ctx, "forward", "NOT_STARTED_FIXTURE_INVALID", None, "待验证",
+                  f"fixture 造数失败：v1 serve 未就绪（rc={rc}；1=进程死亡 2=超时——"
+                  "超时/环境不归迁移违约）")
+     else:
+-        gbase = "http://127.0.0.1:29721"
++        gbase = "http://127.0.0.1:31721"
+         gdir = ctx.dir_param(gen / "cwd")
+         # migration 进程独立发现：v1 fixture serve 的 ID pattern（F5 发现驱动）
+         _discover_id_patterns(ctx, gbase, "fixture-gen")
+@@ -2098,7 +2098,7 @@
+                      "改写记录：无（未经记录的手工改写一律禁止）\n")
+     S.evidence_write(ctx.run_dir, f"{ev}/relocation-candidates.txt", "\n".join(hits) + "\n")
+     _ = relocation_hits
+-    rc = ctx.serve_start("forward", ctx.locked["v2"]["exec_path"], 29722,
++    rc = ctx.serve_start("forward", ctx.locked["v2"]["exec_path"], 31722,
+                          fwd / "instance", fwd / "instance" / "cwd")
+     if rc != 0:
+         log = ctx.run_dir / "live" / "serve-forward.log"
+@@ -2121,7 +2121,7 @@
+             mig_emit(ctx, "forward", "STARTED_INCONCLUSIVE", None, "待验证",
+                      f"v2 serve 未就绪（rc={rc}）——超时/环境/配置原因不认定迁移违约")
+         return
+-    fbase = "http://127.0.0.1:29722"
++    fbase = "http://127.0.0.1:31722"
+     fdir = ctx.dir_param(fwd / "instance" / "cwd")
+     # migration 进程独立发现：v2 forward serve 的 ID pattern（F5 发现驱动）
+     _discover_id_patterns(ctx, fbase, "forward")
+@@ -2439,12 +2439,12 @@
+     v2gen = mig_work / "v2-gen"
+     for sub in ("home", "xdg/config", "xdg/data", "xdg/state", "xdg/cache", "tmp", "cwd"):
+         S.sandbox_mkdir(v2gen / sub)
+-    rc = ctx.serve_start("v2-gen", ctx.locked["v2"]["exec_path"], 29723, v2gen, v2gen / "cwd")
++    rc = ctx.serve_start("v2-gen", ctx.locked["v2"]["exec_path"], 31723, v2gen, v2gen / "cwd")
+     if rc != 0:
+         mig_emit(ctx, "reverse", "STARTED_INCONCLUSIVE", None, "待验证",
+                  f"reverse：v2 原生快照造数失败（rc={rc}）；仅记录，不作承诺")
+         return
+-    vbase = "http://127.0.0.1:29723"
++    vbase = "http://127.0.0.1:31723"
+     vdir = ctx.dir_param(v2gen / "cwd")
+     # migration 进程独立发现：v2 v2-gen serve 的 ID pattern（F5 发现驱动）
+     _discover_id_patterns(ctx, vbase, "v2-gen")
+@@ -2508,7 +2508,7 @@
+         mig_emit(ctx, "reverse", "HARNESS_INVALID", None, "待验证",
+                  "reverse 副本与快照不一致")
+         return
+-    rc = ctx.serve_start("reverse", ctx.locked["v1"]["exec_path"], 29724,
++    rc = ctx.serve_start("reverse", ctx.locked["v1"]["exec_path"], 31724,
+                          rev / "instance", rev / "instance" / "cwd")
+     if rc != 0:
+         log = ctx.run_dir / "live" / "serve-reverse.log"
+@@ -2528,7 +2528,7 @@
+                      f"reverse：v1 serve 超时/环境未就绪（rc={rc}）；仅记录，不作承诺")
+         return
+     # 反向读取（API 级证据）：列表含 rsid + 消息历史可读
+-    rbase = "http://127.0.0.1:29724"
++    rbase = "http://127.0.0.1:31724"
+     rdir = ctx.dir_param(rev / "instance" / "cwd")
+     r_rl = ctx.http(f"{rbase}/session?directory={rdir}", timeout=15.0)
+     ctx.evidence(f"{ev}/reverse-list.json", r_rl.body)

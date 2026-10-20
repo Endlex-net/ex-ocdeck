@@ -44,6 +44,10 @@ type fakeTaskBackend struct {
 	permModeSaved   string
 	permModeMu      sync.Mutex
 	permModeDefault bool // true：未显式注入 view 时返回默认两字段视图（ask/ask）
+	// getGetRow 非空时 Get 透返回该行（审查测试注入合法/对抗存储行）。
+	getGetRow *application.TaskRow
+	// listRows 非空时 List 透返回这些行（审查测试注入非空列表投影）。
+	listRows []application.TaskRow
 }
 
 // UpdateTaskPermissionMode 桩：记录 (taskID, mode)，返回注入视图或错误。
@@ -138,9 +142,17 @@ func (f *fakeTaskBackend) CloseShell(ctx context.Context, terminalID application
 	return nil
 }
 func (f *fakeTaskBackend) Get(ctx context.Context, taskID string) (application.TaskRow, error) {
+	// getGetRow 非 nil 时透注入行（sensordata_audit_test 对抗存储行用）。
+	if f.getGetRow != nil {
+		return *f.getGetRow, nil
+	}
 	return application.TaskRow{}, nil
 }
 func (f *fakeTaskBackend) List(ctx context.Context, projectID string) ([]application.TaskRow, error) {
+	// listRows 非空时透注入行（sensordata_audit_test 列表投影用）。
+	if len(f.listRows) > 0 {
+		return f.listRows, nil
+	}
 	return nil, nil
 }
 func (f *fakeTaskBackend) ListTaskSessions(ctx context.Context, taskID string) ([]application.SessionRow, error) {

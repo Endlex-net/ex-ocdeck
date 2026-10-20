@@ -45,7 +45,11 @@ func Open(ctx context.Context, dataDir string) (*DB, error) {
 		return nil, err
 	}
 
-	dsn := "file:" + dbPath + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	// _txlock=immediate（opencode-v1-spi-provider design D4）：database/sql BeginTx
+	// 一律 BEGIN IMMEDIATE——原子 claim 等写事务在 BEGIN 即取写锁，消除 deferred
+	// BEGIN 的锁升级窗口；单连接（MaxOpenConns(1)）下连接级串行不变，既有事务
+	// 语义不受影响。busy_timeout 处理锁冲突。
+	dsn := "file:" + dbPath + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate"
 	sqlDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %s: %w", dbPath, err)

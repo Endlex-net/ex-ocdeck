@@ -278,7 +278,7 @@ func TestGitBranchDiff_BrokenHead_BaseStepEarlyExit(t *testing.T) {
 
 // TestGitBranchDiff_UnbornHead_InvalidState 验证 ErrUnbornHead → invalid_state：
 // main 已提交但 HEAD 为 orphan（--orphan 切换后未提交）→ HEAD 无提交而 base 可解析
-//（/tmp 实测：`rev-parse --verify --quiet --end-of-options HEAD` exit 1）。
+// （/tmp 实测：`rev-parse --verify --quiet --end-of-options HEAD` exit 1）。
 func TestGitBranchDiff_UnbornHead_InvalidState(t *testing.T) {
 	dir := t.TempDir()
 	initMainGitRepo(t, dir)
@@ -348,7 +348,7 @@ func TestGitBranchDiff_MergeBaseFatal_GitErrorStderr(t *testing.T) {
 
 // TestGitBranchDiff_HeadResolveFatal_GitErrorStderr 验证 ResolveHeadOID 致命失败（exit 128，
 // 非 ErrUnbornHead）→ git_error 透传 stderr，其后 MUST NOT 执行 merge-base/numstat
-//（tasks 2.2 声明的 HEAD fatal 分支）。真实 fixture 无法触达（HEAD symref 无法解析的形态
+// （tasks 2.2 声明的 HEAD fatal 分支）。真实 fixture 无法触达（HEAD symref 无法解析的形态
 // git 一律 exit 1 unborn 语义，exit 128 仅源于仓库整体损坏而损坏仓库下 base 解析必先失败，
 // 见文件头），故经 PATH-shim 故障注入：failOn 前缀 rev-parse --verify --quiet 恰好锁定
 // HEAD 端解析（base 端为 rev-parse --verify --end-of-options，第三段不同，不误伤），
@@ -503,7 +503,7 @@ func TestGitBranchDiffFiles_DirtyWorktreeNotIncluded(t *testing.T) {
 
 // TestGitBranchDiffFiles_TooManyFiles_GitError 验证超限 ErrTooManyFilesChanged →
 // git_error 透传（既有 status 口径）。真实仓库提交 MaxStatusFiles+1 个文件，-short 跳过
-//（与 infra 层 TestBranchDiffFilesTooMany 同口径；映射分支与 numstat 执行失败共用）。
+// （与 infra 层 TestBranchDiffFilesTooMany 同口径；映射分支与 numstat 执行失败共用）。
 func TestGitBranchDiffFiles_TooManyFiles_GitError(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping >MaxStatusFiles branch diff test in -short mode")
@@ -534,7 +534,7 @@ func TestGitBranchDiffFiles_TooManyFiles_GitError(t *testing.T) {
 }
 
 // TestGitBranchDiffFiles_NumstatFailure_GitError 验证 BranchDiffFiles numstat 命令执行失败
-//（非超限）→ git_error 透传：损坏 HEAD commit 的 root tree loose 对象——helper 三步只读
+// （非超限）→ git_error 透传：损坏 HEAD commit 的 root tree loose 对象——helper 三步只读
 // commit 对象（rev-parse/rev-parse HEAD/merge-base /tmp 实测均 exit 0），numstat 读 tree
 // 必失败（exit 128 "unable to read tree"）。stderr 透传证据：错误消息携带 tree OID；
 // 非 invalid_input/invalid_state 证明 helper 已通过；非 "too many changed files" 证明
@@ -573,7 +573,7 @@ func TestGitBranchDiffFiles_NumstatFailure_GitError(t *testing.T) {
 // --- file 端点行为 ---
 
 // TestGitBranchDiffFile_SideExistence 验证修改/纯新增/纯删除/二进制四类存在性真值表
-//（两侧 ReadRefSideContent + normalizeDiffSideContent + 既有组装规则）。
+// （两侧 ReadRefSideContent + normalizeDiffSideContent + 既有组装规则）。
 func TestGitBranchDiffFile_SideExistence(t *testing.T) {
 	setup := func(t *testing.T) (*Manager, string) {
 		t.Helper()
@@ -879,7 +879,7 @@ func TestGitBranchDiffFile_OldSideReadFailure_NoNewSideRead(t *testing.T) {
 }
 
 // TestGitBranchDiff_DivergedBase_MergeBaseSemantics 验证 three-dot（merge-base）语义
-//（design.md D3/D4：BranchDiffFiles 与单文件旧侧均以 mbOID 为基）：base 分支在分叉后
+// （design.md D3/D4：BranchDiffFiles 与单文件旧侧均以 mbOID 为基）：base 分支在分叉后
 // 追加独有提交时，列表与归属校验 MUST 只针对 mbOID..HEAD。
 //
 // fixture：mb 上 a.txt/b.txt 均为 "v0"；feature（HEAD）将两者改为 "v1"；main（base）

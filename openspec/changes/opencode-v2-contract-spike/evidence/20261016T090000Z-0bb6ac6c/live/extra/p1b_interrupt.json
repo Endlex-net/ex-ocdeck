@@ -1,0 +1,32 @@
+{
+  "probe_id": "p1b.interrupt",
+  "schema": "p1b-extra-v1",
+  "exec_status": "PASS",
+  "facts": {
+    "attempts": [
+      {
+        "attempt": 1,
+        "submit": 200,
+        "busy_event": false,
+        "interrupt": {
+          "http": 200,
+          "body": {
+            "interrupted": true
+          }
+        },
+        "abort_candidate": {
+          "http": 404,
+          "body": ""
+        },
+        "idle_event_after": false,
+        "turn_outcome": "interrupted",
+        "outcome_http": 200,
+        "continue_submit": 200,
+        "resumed_reply": true
+      }
+    ]
+  },
+  "evidence": [
+    "live/lifecycle/interrupt-facts-1.json"
+  ]
+}

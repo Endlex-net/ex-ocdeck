@@ -1,5 +1,5 @@
 // detail_extract.go：按 D5 提取表从请求 metadata 确定性提取判定详情
-//（task-permission-mode 8.2）。纯函数、无 IO；本表（design.md D5）为跨 artifact
+// （task-permission-mode 8.2）。纯函数、无 IO；本表（design.md D5）为跨 artifact
 // 唯一矩阵——字段 JSON 路径/类型/必填/完整性条件、界值、UTF-8 安全截断、截断顺序
 // 与遍历序、Degraded 三值归一化与优先级均按其执行。
 //
@@ -48,13 +48,13 @@ type RequestDetail struct {
 	Filepath     string // edit|write / external_directory（文件工具来源）
 	Diff         string // edit|write
 	Files        []RequestFileChange
-	URL          string // webfetch
-	Description  string // task
-	SubagentType string // task
-	Pattern      string // grep|glob
-	Path         string // grep|glob
-	Include      string // grep|glob
-	ParentDir    string // external_directory
+	URL          string   // webfetch
+	Description  string   // task
+	SubagentType string   // task
+	Pattern      string   // grep|glob
+	Path         string   // grep|glob
+	Include      string   // grep|glob
+	ParentDir    string   // external_directory
 	Directories  []string // external_directory
 }
 
@@ -140,14 +140,14 @@ func isCriticalCategory(permission string) bool {
 
 // fileEntry apply_patch 成员：内容与截断/关键状态同一身份（F11，随成员一起
 // append/裁剪，无并行索引表）。tr* 为各字段截断状态；crit* 为关键性
-//（type/relativePath/patch 恒关键；movePath 仅 move 关键，F10）。
+// （type/relativePath/patch 恒关键；movePath 仅 move 关键，F10）。
 type fileEntry struct {
-	fc      RequestFileChange
-	isMove  bool
-	trType  bool
-	trRel   bool
-	trPatch bool
-	trMove  bool
+	fc        RequestFileChange
+	isMove    bool
+	trType    bool
+	trRel     bool
+	trPatch   bool
+	trMove    bool
 	critType  bool
 	critRel   bool
 	critPatch bool
@@ -159,20 +159,20 @@ type fileEntry struct {
 type detailBuilder struct {
 	acc detailAcc
 
-	command, filepath, diff string
+	command, filepath, diff       string
 	trCommand, trFilepath, trDiff bool
 
-	url, description, subagentType string
+	url, description, subagentType       string
 	trURL, trDescription, trSubagentType bool
 
-	pattern, path, include string
+	pattern, path, include       string
 	trPattern, trPath, trInclude bool
 
-	parentDir  string
+	parentDir   string
 	trParentDir bool
 
-	files []fileEntry
-	dirs  []string
+	files     []fileEntry
+	dirs      []string
 	dirsTrunc []bool
 }
 
@@ -202,7 +202,7 @@ func (b *detailBuilder) required(p *string, tr *bool, obj map[string]json.RawMes
 
 // optionalDrop 可选字段（webfetch/task/grep/glob，F5）：缺失 → 空（patterns 已含
 // 主要信息，不降级）；类型错 → 舍弃该字段（fallback 判定，不降级）；有值原样
-//（受总量约束）。
+// （受总量约束）。
 func (b *detailBuilder) optionalDrop(p *string, obj map[string]json.RawMessage, key string) {
 	s, present, ok := strField(obj, key)
 	if !present || !ok {
@@ -236,7 +236,7 @@ func (b *detailBuilder) optionalStrict(p *string, tr *bool, obj map[string]json.
 }
 
 // optionalSlice 可选 []string（directories，F3/R1-F1）：缺失/null（整体）→ 空
-//（不降级）；非数组 → malformed_critical；逐成员校验——**字面 null 与非 string
+// （不降级）；非数组 → malformed_critical；逐成员校验——**字面 null 与非 string
 // 成员均视为非法**（null 解码到 string 不报错得到空串，会绕过确定性降级，R1-F1）→
 // malformed_critical 且跳过该成员（合法成员保留，「合法与异常成员并存」）；空串
 // 元素合法但不计入非空目标。
@@ -356,7 +356,7 @@ func (b *detailBuilder) applyPatchFiles(obj map[string]json.RawMessage) {
 }
 
 // extractRequestDetail 按类别提取（严格按 D5 提取表）。metadata 为观察层归一化产物
-//（nil 或 JSON object）；nil 且关键类别 → missing_critical；非关键类别缺失以
+// （nil 或 JSON object）；nil 且关键类别 → missing_critical；非关键类别缺失以
 // permission+patterns 判定（detail 为空）。Degraded 在全部截断/裁剪阶段完成后
 // 最后归一（F1：总量裁剪触发的 truncated 必须回写）。
 func extractRequestDetail(permission string, metadata json.RawMessage) RequestDetail {
@@ -505,7 +505,7 @@ func (b *detailBuilder) markTruncatedIf(critical bool) {
 }
 
 // render 将 builder 内容写入 RequestDetail：截断过的槽渲染时追加标记
-//（总量预算只计内容，F2）。
+// （总量预算只计内容，F2）。
 func (b *detailBuilder) render(d *RequestDetail) {
 	d.Command = rendered(b.command, b.trCommand)
 	d.Filepath = rendered(b.filepath, b.trFilepath)

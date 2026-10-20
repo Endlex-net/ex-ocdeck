@@ -55,7 +55,7 @@ func (m *Manager) attentionVisible(rt *taskRuntime) bool {
 // publishAttentionInvalidation 发布一次 attention 可见失效（design.md D2 异常收敛行：
 // converge 的 cleanup 经 clearRuntime→clearAttention 清空了外部可见注意力快照，MUST
 // 发布 serve_runtime.attention_changed 告知订阅方失效）。仅当清理前快照可见时发布
-//（「无可见字段则不发领域事件」）；RID 经触发令牌定位（该令牌实例的快照才是被失效
+// （「无可见字段则不发领域事件」）；RID 经触发令牌定位（该令牌实例的快照才是被失效
 // 的主体）。
 //
 // 发布所有权在发布点原子认领（ClaimAttentionInvalidation，唯一权威）：持锁回调在
@@ -77,7 +77,7 @@ func (m *Manager) publishAttentionInvalidation(taskID string, tok runtime.InstVe
 // 单锁域内读取投影并落态）得到的 typed delta：事件 from 与事实号只来自本 delta，
 // MUST NOT 另行预读可见性（交错下陈旧）。From 为空即无可失效快照（已失效/不可见/
 // runtime 已清理）→ 不发布不认领。发布所有权在发布点按事实原子认领
-//（ClaimRunStatusInvalidation(taskID, tok, d.FactID)）：同一令牌上同一事实恰好发布
+// （ClaimRunStatusInvalidation(taskID, tok, d.FactID)）：同一令牌上同一事实恰好发布
 // 一次；失效→恢复→再失效为更高事实号的新事实，MUST 获准发布；claim 失败即该事实
 // 已发布，跳过（落态保持幂等）。attention 的 claim 语义不受影响。
 func (m *Manager) publishRunStatusInvalidation(taskID string, tok runtime.InstVersion, d agentStatusDelta) {
@@ -175,7 +175,7 @@ func (m *Manager) deleteConvergeDebt(taskID string) {
 
 // convergeCommitCAS 持锁收敛的提交段：清 env 快照 + last_error 聚合 + active→suspended CAS
 // + D2 嵌套决策表。converge 持锁主路径与债务 worker 共用；调用方持任务锁且清理已完成
-//（或 postCleanup 无需清理）。attentionVisible 为调用方在 cleanup 前捕获的外部可见
+// （或 postCleanup 无需清理）。attentionVisible 为调用方在 cleanup 前捕获的外部可见
 // attention 快照存在性；runStatusInvalidation 为 cleanup 前「捕获即 apply」得到的
 // run_status 失效 delta（From/FactID 取自 apply 时状态；无可失效快照时为零值）。
 // 两者在 cleanup 后快照已清空，不可事后读取；worker postCleanup/nil-runtime 分支传
@@ -208,16 +208,17 @@ func (m *Manager) convergeCommitCAS(ctx context.Context, taskID, reason string, 
 
 // applyConvergeCASMatrix 落实异常收敛 CAS 后的 D2 嵌套决策表（design.md D2 持锁主路径）。
 // 本方法运行时清理已完成（runtime 已清、tombstone 仍为触发令牌），仅按 CAS 结果分叉：
-//   ① committed（Matched，active→suspended 真实迁移）→ task.status_changed 已由
-//      writeStatusConditional 的 commit helper 发布；任务离开 active → compare-and-delete
-//      同令牌债务（若存在）；不发 attention/run_status 失效（迁移事件承载任务级失效）；
-//   ② CAS error → 保守发布一次 attention/run_status 可见失效 + resync.requested（发布
-//      先于重读分叉，覆盖 ②a/②b/②c，design.md D2「②CAS error → 保守发布实际已发生的
-//      可见失效…然后按状态重读结果分叉」）；重读仍 active 或读错误（②a/②c）→ 登记
-//      postCleanup；重读非 active/缺失（②b）→ compare-and-delete，不登记；
-//   ③ !Matched（并发已转走，无错误）→ 重读分叉：③a 仍 active → 发布一次 attention/
-//      run_status 可见失效 + 登记 postCleanup；③b 非 active/缺失 → 不发布，
-//      compare-and-delete；③c 读错误 → 同 ②c（可见失效 + resync + 登记 postCleanup）。
+//
+//	① committed（Matched，active→suspended 真实迁移）→ task.status_changed 已由
+//	   writeStatusConditional 的 commit helper 发布；任务离开 active → compare-and-delete
+//	   同令牌债务（若存在）；不发 attention/run_status 失效（迁移事件承载任务级失效）；
+//	② CAS error → 保守发布一次 attention/run_status 可见失效 + resync.requested（发布
+//	   先于重读分叉，覆盖 ②a/②b/②c，design.md D2「②CAS error → 保守发布实际已发生的
+//	   可见失效…然后按状态重读结果分叉」）；重读仍 active 或读错误（②a/②c）→ 登记
+//	   postCleanup；重读非 active/缺失（②b）→ compare-and-delete，不登记；
+//	③ !Matched（并发已转走，无错误）→ 重读分叉：③a 仍 active → 发布一次 attention/
+//	   run_status 可见失效 + 登记 postCleanup；③b 非 active/缺失 → 不发布，
+//	   compare-and-delete；③c 读错误 → 同 ②c（可见失效 + resync + 登记 postCleanup）。
 func (m *Manager) applyConvergeCASMatrix(taskID string, tok runtime.InstVersion, attentionVisible bool, runStatusInvalidation agentStatusDelta, committed bool, statusErr error) {
 	switch {
 	case statusErr == nil && committed:

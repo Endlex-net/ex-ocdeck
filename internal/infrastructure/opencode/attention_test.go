@@ -3,6 +3,7 @@ package opencode
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -281,5 +282,41 @@ func TestListQuestions_RestFixtures(t *testing.T) {
 				t.Fatalf("expected non-nil result")
 			}
 		})
+	}
+}
+
+// TestListQuestions_DualViewConsistency 落实 tasks 6.8（design D10）：v1 每个
+// QuestionItem 一对一映射为结构化字段（合成稳定 key question-N），Fields 与
+// Questions 双视图同源一致。
+func TestListQuestions_DualViewConsistency(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[{"id":"q1","sessionID":"s1","questions":[
+			{"header":"h1","question":"q1"},
+			{"header":"h2","question":"q2"}]}]`))
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv, "pw")
+	res, err := c.ListQuestions(context.Background(), "/wt")
+	if err != nil {
+		t.Fatalf("ListQuestions: %v", err)
+	}
+	if len(res) != 1 {
+		t.Fatalf("len = %d", len(res))
+	}
+	q := res[0]
+	if len(q.Fields) != len(q.Questions) || len(q.Fields) != 2 {
+		t.Fatalf("dual view length mismatch: fields=%d questions=%d", len(q.Fields), len(q.Questions))
+	}
+	for i, f := range q.Fields {
+		wantKey := fmt.Sprintf("question-%d", i+1)
+		if f.Key != wantKey {
+			t.Fatalf("field %d key = %q, want %q", i, f.Key, wantKey)
+		}
+		if f.Label != q.Questions[i].Header || f.Prompt != q.Questions[i].Question {
+			t.Fatalf("field %d view mismatch: %+v vs %+v", i, f, q.Questions[i])
+		}
+		if f.Type != "text" {
+			t.Fatalf("v1 field type = %q, want text", f.Type)
+		}
 	}
 }

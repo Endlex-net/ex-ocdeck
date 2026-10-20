@@ -20,8 +20,8 @@ import (
 	"errors"
 	"sync"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/application/diffreview"
-	"ocdeck/internal/infrastructure/opencode"
 )
 
 // capabilityCache 为 per-taskID 的 instVersion-bound 能力缓存条目。
@@ -222,7 +222,7 @@ func (a *RuntimePortAdapter) GetSession(ctx context.Context, taskID, sessionID s
 	if err == nil {
 		return diffreview.GetSessionResult{Status: diffreview.GetSessionFound}, nil
 	}
-	if errors.Is(err, opencode.ErrSessionNotFound) {
+	if errors.Is(err, appagent.ErrSessionNotFound) {
 		return diffreview.GetSessionResult{Status: diffreview.GetSessionMissing}, nil
 	}
 	return diffreview.GetSessionResult{Status: diffreview.GetSessionUnknown, Detail: err.Error()}, nil
@@ -239,13 +239,13 @@ func (a *RuntimePortAdapter) probePromptAsync(ctx context.Context, taskID string
 	return mapOCCapabilityState(ocState)
 }
 
-// mapOCCapabilityState 将 opencode.CapabilityState（三值）映射为 diffreview.CapabilityState。
+// mapOCCapabilityState 将 appagent.ProbeCapabilityState（三值）映射为 diffreview.CapabilityState。
 // opencode 三值 supported/unsupported/unknown → domain 四值中的前三个（absent 仅无运行时）。
-func mapOCCapabilityState(s opencode.CapabilityState) diffreview.CapabilityState {
+func mapOCCapabilityState(s appagent.ProbeCapabilityState) diffreview.CapabilityState {
 	switch s {
-	case opencode.CapabilitySupported:
+	case appagent.CapabilitySupported:
 		return diffreview.CapabilitySupported
-	case opencode.CapabilityUnsupported:
+	case appagent.CapabilityUnsupported:
 		return diffreview.CapabilityUnsupported
 	default:
 		return diffreview.CapabilityUnknown

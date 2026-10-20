@@ -9,8 +9,8 @@ import (
 	"log"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/config"
-	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
 )
 
@@ -199,6 +199,23 @@ func (m *Manager) commitSuspendedReconcile(ctx context.Context, taskID, fromStat
 func (m *Manager) reconcilePersist(ctx context.Context, tasks []TaskRow, sessionsByTask map[string][]string, alignByTask map[string]AlignMode) error {
 	var errs []error
 	for _, t := range tasks {
+		// C7 门禁修复：生命周期副作用前按任务声明 provider 做 registry 准入。
+		// 未注册 → 零进程/网络副作用、不改状态/归属/锚定/binding（D10）——仅记
+		// 诊断性 last_error 后跳过（specs「未注册 provider fail-closed」）。
+		// mutation 证据：准入记录旁路（recordAdmissionError 删除）→
+		// TestC7_ReconcileUnknownProviderZeroSideEffects /
+		// TestC7_ReconcileActiveUnknownProviderZeroSideEffects 红（last_error 缺失）。
+		if err := m.registryAdmitTask(ctx, t.ID); err != nil {
+			var ae *appagent.Error
+			if errors.As(err, &ae) && ae.Kind == appagent.ErrKindProviderNotFound {
+				log.Printf("reconcile: task %s provider not registered; skip lifecycle", t.ID)
+				m.recordAdmissionError(ctx, t.ID, err)
+				continue
+			}
+			// store 读取失败属基础设施不可达：聚合返回（不静默）。
+			errs = append(errs, fmt.Errorf("task %s registry admit: %w", t.ID, err))
+			continue
+		}
 		names := sessionsByTask[t.ID]
 		hasRuntime := containsName(names, runtimeSessionName(t.ID))
 		switch t.Status {
@@ -344,8 +361,31 @@ func (m *Manager) reconcilePersist(ctx context.Context, tasks []TaskRow, session
 // P0：kill 清理错误与状态 CAS 错误 MUST 传播（main 对 Reconcile 失败拒开 HTTP 才有效）。
 func (m *Manager) reconcileKill(ctx context.Context, tasks []TaskRow, sessions []string) error {
 	var errs []error
-	// kill 全部 ocdeck 会话（聚合 kill 失败错误，不静默）。
+	// C7 残余（review attempt 2）：kill 模式按任务 provider 准入——未知 provider 任务
+	// 的会话不得按默认 v1 形态清理（specs「未注册 provider」零副作用），仅记诊断性
+	// last_error；状态也不得按默认收敛（任务保持原状）。orphan（无 DB 行）不受准入
+	// 约束（无 provider 声明——真 orphan 清理语义保留）。
+	// mutation 证据（已验证 → 红）：准入段删除（unknownProviders 恒空）→
+	// TestC7_KillReconcileUnknownProviderKeepsSessions 红（会话被 kill + 状态收敛）。
+	unknownProviders := make(map[string]bool, len(tasks))
+	for _, t := range tasks {
+		if aerr := m.registryAdmitTask(ctx, t.ID); aerr != nil {
+			if isProviderNotFound(aerr) {
+				m.recordAdmissionError(ctx, t.ID, aerr)
+				unknownProviders[t.ID] = true
+				continue
+			}
+			errs = append(errs, fmt.Errorf("task %s registry admit: %w", t.ID, aerr))
+			unknownProviders[t.ID] = true
+		}
+	}
+	// kill 全部 ocdeck 会话（聚合 kill 失败错误，不静默）；未知 provider 任务的会话
+	// 保留（有归属会话 ≠ orphan——归属行存在即任务事实，不得越 provider 准入清理）。
 	for _, name := range sessions {
+		if taskIDFromSessionName(name) != "" && unknownProviders[taskIDFromSessionName(name)] {
+			log.Printf("reconcile kill: session %s belongs to unknown-provider task; skip cleanup", name)
+			continue
+		}
 		if kerr := m.killOrphanSession(ctx, name); kerr != nil {
 			errs = append(errs, kerr)
 		}
@@ -353,6 +393,10 @@ func (m *Manager) reconcileKill(ctx context.Context, tasks []TaskRow, sessions [
 	for _, t := range tasks {
 		switch t.Status {
 		case StatusActive, StatusActivating, StatusSuspending:
+			// 未知 provider 任务不按默认收敛（provider 准入失败零副作用）。
+			if unknownProviders[t.ID] {
+				continue
+			}
 			if _, serr := m.writeStatus(ctx, t.ID, StatusSuspended, sql.NullString{String: "kill mode reconcile", Valid: true}); serr != nil {
 				errs = append(errs, fmt.Errorf("task %s commit suspended: %w", t.ID, serr))
 			}
@@ -363,32 +407,61 @@ func (m *Manager) reconcileKill(ctx context.Context, tasks []TaskRow, sessions [
 }
 
 // resumeActive persist 恢复活跃运行时（design.md §5 恢复序列 + single-process D7：
-// 单进程 runtime 会话）。端口以会话内 OCDECK_SERVE_PORT 为准（读回失败 →
-// suspended+last_error，不得静默用 last_port，B9）。env snapshot 解析错误传播（B9）。
+// 单进程 runtime 会话）。连接端点/凭据以持久化 binding 为事实来源（opencode-v1-spi-provider
+// tasks 4.3：binding 缺失/失效 → 恢复失败——specs resumeActive 前置状态；健康检查
+// 失败 → suspended+last_error，不得回退 env 反查）。env snapshot 解析错误传播（B9）。
 // mode 为 Reconcile 入口预检解析的对齐模式（P1-F1：复用预检结果，不在恢复路径重复解析——
 // 非法 kind/mode 组合已在预检阶段 fail-closed 拒开 HTTP，不会走到本函数）。
 func (m *Manager) resumeActive(ctx context.Context, t TaskRow, mode AlignMode) error {
 	runtimeName := runtimeSessionName(t.ID)
-	pw, err := m.proc.ShowSessionEnv(runtimeName, "OPENCODE_SERVER_PASSWORD")
-	if err != nil || pw == "" {
-		return fmt.Errorf("recover password: %w", err)
+	// C2 门禁修复（design D9：恢复类入口经 Resume）：runtimeSupervisor 注入时，
+	// 存活终端验证/复用经 supervisor.Resume 复用分支（tryReuseAliveTerminal——
+	// binding 凭据健康检查 + Probe 在适配层完成；零新进程）。
+	// C2 残余修复（design:482 批准映射接齐）：resumeActive 策略 =
+	// {AllowSessionCreate:true, AllowRebuild:true}。reconciliation 前置（既有 spec
+	// 「会话存活且健康检查通过」才进入 persist 恢复，否则落挂起）使创建路径实际
+	// 不可达——复用分支优先，policy 开关为防御形态；BeforeLaunch=nil（persist 恢复
+	// 无恢复 incident permit 体系，预算闸门仅属 ensureRecovery attempt）。
+	if m.runtimeSupervisor != nil {
+		oldBinding, _, berr := m.store.GetTaskBinding(ctx, t.ID)
+		if berr != nil || oldBinding.TerminalRef == "" {
+			return newOpErr(codeInternal, fmt.Errorf("recover binding: task %s binding 解析失败（恢复前置：必须存在且可解析）", t.ID))
+		}
+		binding, serr := m.runtimeSupervisor.Resume(ctx,
+			appagent.TaskRef{TaskID: t.ID, Directory: t.WorktreePath}, oldBinding,
+			appagent.ResumePolicy{AllowSessionCreate: true, AllowRebuild: true})
+		if serr != nil {
+			return fmt.Errorf("supervisor resume reuse: %w", serr)
+		}
+		port, password, _, eerr := m.bindingEndpoint(binding)
+		if eerr != nil {
+			return newOpErr(codeInternal, fmt.Errorf("provider binding endpoint: %w", eerr))
+		}
+		return m.resumeActiveRegistered(ctx, t, mode, runtimeName, port, password)
 	}
-	// 端口以会话内 OCDECK_SERVE_PORT 为准（design.md §5）。
-	portStr, err := m.proc.ShowSessionEnv(runtimeName, "OCDECK_SERVE_PORT")
-	if err != nil || portStr == "" {
-		// 读回失败 → 激活失败（不得静默用 last_port，B9）。last_port 仅交叉校验。
-		return fmt.Errorf("recover serve port from session: %w", err)
-	}
-	port, ok := parsePort(portStr)
+	// 回退路径（runtimeSupervisor 未注入——测试接缝/过渡形态）：既有内联实现。
+	// 认证健康检查探活（凭据/端口从持久化 binding 解析）。
+	oc, _, ok := m.taskOcBindingClient(ctx, t.ID, appagent.Options{HealthTimeout: 2 * time.Second, OpTimeout: 5 * time.Second})
 	if !ok {
-		return fmt.Errorf("invalid serve port %q", portStr)
+		return newOpErr(codeInternal, fmt.Errorf("recover binding: task %s binding 解析失败（恢复前置：必须存在且可解析）", t.ID))
 	}
-	// 认证健康检查探活（校验会话内 OCDECK_TASK_ID 与任务匹配，design.md §5）。
-	oc := m.ocFactory(port, pw, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 5 * time.Second})
 	if _, err := oc.Health(ctx); err != nil {
 		return fmt.Errorf("health check: %w", err)
 	}
-	// 校验会话内 OCDECK_TASK_ID 与任务匹配（design.md §5）。
+	return m.resumeActiveRegistered(ctx, t, mode, runtimeName, -1, "")
+}
+
+// resumeActiveRegistered 是 resumeActive 的注册段（共享）：OCDECK_TASK_ID 复检
+// → runtime 注册 → SSE（typed 桥经 startSSEFromBinding；C9 finalBinding 语义）
+// → watchers → 提交 active。port<0 表示内联回退路径（SSE 端点经持久化 binding
+// 自解析）。
+func (m *Manager) resumeActiveRegistered(ctx context.Context, t TaskRow, mode AlignMode, runtimeName string, port int, password string) error {
+	// OCDECK_TASK_ID 校验语义保留（阶段 4 tasks 5.1 特许第三类）：该读取是 persist
+	// 恢复的安全校验——确认 tmux 会话 env 携带的任务标识与 DB 任务一致（会话名可能
+	// 被外部伪造/错挂），不解析任何凭据或连接端点（连接事实来源仍是持久化 binding）。
+	// 删除会移除恢复安全网（既有测试 TestCharx_Reconcile_ResumeFailsOnTaskIDMismatch
+	// 锁定 mismatch → resume 失败 → 清理 + suspended 精确 last_error 行为），
+	// 故保留并在此钉死理由；非「凭据/端口反查」清理范围。
 	taskIDInSession, terr := m.proc.ShowSessionEnv(runtimeName, "OCDECK_TASK_ID")
 	if terr != nil || taskIDInSession != t.ID {
 		return fmt.Errorf("OCDECK_TASK_ID mismatch (got %q want %q): %w", taskIDInSession, t.ID, terr)
@@ -410,7 +483,19 @@ func (m *Manager) resumeActive(ctx context.Context, t TaskRow, mode AlignMode) e
 	}
 	m.setRuntime(t.ID, rt)
 	rt.registerGroup(roleRuntime, runtimeName)
-	if err := m.startSSE(ctx, rt, t.ID, t.WorktreePath, port, pw, mode); err != nil {
+	if port > 0 {
+		// C9：finalBinding = 当前持久化 binding（persist 恢复无替换事实——
+		// D9 恢复类入口仅重建时替换；此处按本次连接事实显式传入 startSSE）。
+		binding, berr := m.currentTaskBinding(ctx, t.ID)
+		if berr != nil {
+			m.clearRuntime(t.ID)
+			return newOpErr(codeInternal, fmt.Errorf("resolve binding for sse: %w", berr))
+		}
+		if err := m.startSSE(ctx, rt, t.ID, t.WorktreePath, port, password, mode, &binding, nil); err != nil {
+			m.clearRuntime(t.ID)
+			return err
+		}
+	} else if err := m.startSSEFromBinding(ctx, rt, t.ID, mode); err != nil {
 		m.clearRuntime(t.ID)
 		return err
 	}
@@ -489,24 +574,14 @@ func (m *Manager) listRuntimeSessions(taskID string) []string {
 }
 
 // runtimeHealthyRecoverable 判断单进程 runtime 会话是否健康可恢复（design.md §5
-// + single-process D7）。端口以会话内 OCDECK_SERVE_PORT 为准（读回失败 →
-// 不可恢复，B9，不得静默用 last_port）。
+// + single-process D7）。健康检查凭据/端点从持久化 binding 解析（tasks 4.3 事实
+// 来源切换；无 binding 或解析失败 → 不可恢复，B9）。
 func (m *Manager) runtimeHealthyRecoverable(ctx context.Context, t TaskRow) bool {
-	runtimeName := runtimeSessionName(t.ID)
-	pw, err := m.proc.ShowSessionEnv(runtimeName, "OPENCODE_SERVER_PASSWORD")
-	if err != nil || pw == "" {
-		return false
-	}
-	portStr, err := m.proc.ShowSessionEnv(runtimeName, "OCDECK_SERVE_PORT")
-	if err != nil || portStr == "" {
-		// 读回失败 → 不可恢复（B9，不得静默用 last_port）。
-		return false
-	}
-	port, ok := parsePort(portStr)
+	// 健康判定凭据/端点从持久化 binding 解析（tasks 4.3 事实来源切换）。
+	oc, _, ok := m.taskOcBindingClient(ctx, t.ID, appagent.Options{HealthTimeout: 2 * time.Second, OpTimeout: 5 * time.Second})
 	if !ok {
 		return false
 	}
-	oc := m.ocFactory(port, pw, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 5 * time.Second})
 	h, err := oc.Health(ctx)
 	if err != nil || !h.Healthy {
 		return false

@@ -1,0 +1,11 @@
+{
+  "data": {
+    "id": "frm_fixture01",
+    "sessionID": "ses_fixture01a",
+    "title": "Deploy options",
+    "fields": [
+      { "key": "env", "type": "string", "title": "Environment", "description": "target env" }
+    ],
+    "state": { "status": "pending" }
+  }
+}

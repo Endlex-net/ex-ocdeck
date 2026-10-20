@@ -1,0 +1,98 @@
+# 注：不使用 # syntax 指令——受限网络下避免额外拉取 docker/dockerfile 前端镜像；
+# 本文件全部指令均为 BuildKit 内建前端支持。
+# docker/Dockerfile.ocdeck-v2 —— ocdeck-server（ocdeck/v2 分支）+ opencode v2.0.28
+# 手动测试镜像（多阶段：前端内嵌 → Go 构建 → debian 运行时）。
+#
+# 构建契约（与 docker/entrypoint-ocdeck.sh 头注释同源，均为实证核对项）：
+#   - opencode v2 二进制：URL/sha256 契约冻结（arm64）；tar 内为单文件 `opencode`
+#     （2.0.28 实际解包内容已列取确认，无目录嵌套）。
+#   - ocdeck-server 启动硬需求（internal/config/config.go）：PATH 有 `opencode`
+#     （启动跑 `opencode --version`，config.go:474）；`tmux -V` >= 3.2
+#     （config.go:491 validateTmuxVersion；bookworm = tmux 3.3a ✓）；`git`、
+#     `ps`（procps——main.go ProcessIdentity 用 `ps -p`）。
+#   - 前端内嵌：web/embed.go //go:embed dist——必须先 `pnpm --dir web build`
+#     （web/package.json:9 = `tsc --noEmit && vite build`）产出 web/dist 再 go
+#     build；pnpm 10.30.3 + node 22 与 .github/workflows/ci.yml 同版本，
+#     `pnpm install --frozen-lockfile`（web/pnpm-lock.yaml 在库）。
+#   - Go 构建：CGO_ENABLED=0（sqlite 为 modernc 纯 Go）；`go build
+#     ./cmd/ocdeck-server`。
+#   - 运行时 env：OCDECK_TOKEN（必填，UI 密码）、OCDECK_LISTEN_ADDR=0.0.0.0、
+#     OCDECK_LISTEN_PORT（默认 8788）、OCDECK_DATA_DIR=/data、
+#     OCDECK_V2_ADOPTION=1（internal/config/config.go:602）。
+#
+# 构建：docker build -f docker/Dockerfile.ocdeck-v2 -t ocdeck-v2:manual .
+# 运行：docker run --rm -p 8788:8788 -e OCDECK_TOKEN=... -e ARCHI_API_KEY=... ocdeck-v2:manual
+
+# ---- 阶段 1：前端（node 22 + pnpm 10.30.3，与 CI 同版本） ----
+FROM node:22-bookworm-slim AS web
+RUN corepack enable \
+	&& corepack prepare pnpm@10.30.3 --activate
+WORKDIR /src/web
+COPY web/package.json web/pnpm-lock.yaml ./
+# package.json pnpm.patchedDependencies 引用 patches/（@xterm/xterm 6.0.0），install 前必须就位。
+COPY web/patches ./patches
+RUN pnpm install --frozen-lockfile
+COPY web/ ./
+# build 脚本 = tsc --noEmit && vite build（web/package.json:9），产物输出 dist/。
+RUN pnpm build
+
+# ---- 阶段 2：Go 构建（module go 1.24.3；CGO_ENABLED=0 纯 Go sqlite） ----
+FROM golang:1.24-bookworm AS build
+# 受限网络构建可传 --build-arg GOPROXY=https://goproxy.cn,direct（默认不改）。
+ARG GOPROXY=""
+RUN if [ -n "$GOPROXY" ]; then go env -w GOPROXY="$GOPROXY"; fi
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+# 整仓进入构建上下文（.dockerignore 排除 .git/node_modules/sandbox/evidence 等）。
+COPY . .
+# go:embed 在编译期固化 web/dist——内嵌产物以后端阶段的前端产物为准，
+# 覆盖构建上下文里可能存在的本地 web/dist（web/embed.go 顺序约束）。
+COPY --from=web /src/web/dist /src/web/dist
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/ocdeck-server ./cmd/ocdeck-server
+
+# ---- 阶段 3：运行时（debian:bookworm-slim；tmux 3.3a >= 3.2） ----
+FROM debian:bookworm-slim AS runtime
+# apt 不读 http_proxy env——受限网络构建传 --build-arg BUILD_PROXY=http://host.docker.internal:10808
+# （仅构建期生效，清层时移除，不进运行时配置）。
+ARG BUILD_PROXY=""
+RUN set -e; \
+	if [ -n "$BUILD_PROXY" ]; then \
+		printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "$BUILD_PROXY" "$BUILD_PROXY" > /etc/apt/apt.conf.d/99build-proxy; \
+	fi; \
+	apt-get update \
+	&& apt-get install -y --no-install-recommends tmux git procps ca-certificates curl \
+	&& rm -rf /var/lib/apt/lists/* \
+	&& rm -f /etc/apt/apt.conf.d/99build-proxy
+
+# opencode v2.0.28 二进制（URL/sha256 契约冻结；arm64——Apple Silicon 手动测试
+# 形态。amd64 构建须覆盖 OPENCODE_TARBALL_* 为对应 artifact 并自行核验 sha256）。
+ARG OPENCODE_TARBALL_URL="https://opencode.ai/files/bin/2.0.28/opencode-linux-arm64.tar.gz"
+ARG OPENCODE_TARBALL_SHA256="58fd41544e570ceb9bdb2fa4b445ce66f05538490f6b9ad27d23dcdfe4689670"
+RUN curl -fsSL -o /tmp/opencode.tar.gz "$OPENCODE_TARBALL_URL" \
+	&& echo "$OPENCODE_TARBALL_SHA256  /tmp/opencode.tar.gz" | sha256sum -c - \
+	&& tar -xzf /tmp/opencode.tar.gz -C /usr/local/bin opencode \
+	&& chmod 0755 /usr/local/bin/opencode \
+	&& rm -f /tmp/opencode.tar.gz
+
+# 非 root 运行（HOME=/home/ocdeck；/data 数据卷属 ocdeck）。
+RUN useradd --create-home --shell /bin/bash --uid 10001 ocdeck \
+	&& mkdir -p /data \
+	&& chown ocdeck:ocdeck /data
+
+COPY --from=build /out/ocdeck-server /usr/local/bin/ocdeck-server
+COPY docker/entrypoint-ocdeck.sh /usr/local/bin/entrypoint-ocdeck.sh
+RUN chmod 0755 /usr/local/bin/ocdeck-server /usr/local/bin/entrypoint-ocdeck.sh
+
+# 运行时 env 默认值（键名与默认值来源 internal/config/config.go；均可被 -e 覆盖）。
+ENV OCDECK_LISTEN_ADDR="0.0.0.0" \
+	OCDECK_LISTEN_PORT="8788" \
+	OCDECK_DATA_DIR="/data" \
+	OCDECK_V2_ADOPTION="1"
+
+# supervisor 的 serve 端口段（默认 50000-50999）仅容器内 loopback，不对外映射。
+USER ocdeck
+WORKDIR /data
+VOLUME ["/data"]
+EXPOSE 8788
+ENTRYPOINT ["/usr/local/bin/entrypoint-ocdeck.sh"]

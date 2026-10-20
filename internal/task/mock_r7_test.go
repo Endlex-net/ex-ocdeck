@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
@@ -63,7 +64,7 @@ func (s *sessionTraceStore) DeleteTaskSession(ctx context.Context, taskID, sessi
 }
 
 // add-plain-dir-project D8：ClaimTaskSession 取代 session.created 的 upsert，trace 记为 "upsert:<sid>"
-//（归属创建语义一致，保留 replay 顺序断言不变）。
+// （归属创建语义一致，保留 replay 顺序断言不变）。
 func (s *sessionTraceStore) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
 	s.mu.Lock()
 	s.trace = append(s.trace, "upsert:"+sessionID)
@@ -109,6 +110,7 @@ func newR7TestManager(t *testing.T, store TaskStore, proc ProcessBackend, wt Wor
 }
 
 // newR7TestManagerWithDebt 构造带 CleanupDebtStore 的 Manager（orphan 持久化测试用）。
+// tasks 4.3：统一注入注册了 opencode-v1 的 registry（binding 提交后分派一致）。
 func newR7TestManagerWithDebt(t *testing.T, store TaskStore, debt CleanupDebtStore, proc ProcessBackend, wt WorktreeBackend, oc OCClient) *Manager {
 	t.Helper()
 	cfg := &config.Config{
@@ -116,10 +118,14 @@ func newR7TestManagerWithDebt(t *testing.T, store TaskStore, debt CleanupDebtSto
 		ServePortRange: config.PortRange{Min: 50000, Max: 50999},
 		ShutdownPolicy: config.ShutdownPersist,
 	}
-	wrap := func(port int, password string, opts opencode.Options) OCClient {
+	wrap := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOC{inner: oc, onReady: opts.OnReady}
 	}
-	m := New(Options{Cfg: cfg, Store: store, Proc: proc, Worktree: wt, OCFactory: wrap, DebtStore: debt})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatalf("register test provider: %v", err)
+	}
+	m := New(Options{Cfg: cfg, Store: store, Proc: proc, Worktree: wt, OCFactory: wrap, DebtStore: debt, ProviderRegistry: reg})
 	m.recoveryBackoffFn = func(int) time.Duration { return 0 }
 	return m
 }
@@ -158,7 +164,7 @@ func lastErrorContains(t *testing.T, store TaskStore, taskID, substr string) {
 func makeEvent(typ, sid string, updated float64) opencode.Event {
 	return opencode.Event{Type: typ, Properties: map[string]interface{}{
 		"info": map[string]interface{}{
-			"id": sid,
+			"id":   sid,
 			"time": map[string]interface{}{"updated": updated},
 		},
 	}}
@@ -194,7 +200,7 @@ func (w *procListErrWrapper) ListSessions() ([]string, error) {
 // 用于 killTaskSessions 逐会话 HasSession 错误测试（mockProc.hasSessionErr 是全局的）。
 type procHasSessionByNameWrapper struct {
 	ProcessBackend
-	errFor map[string]error
+	errFor   map[string]error
 	fallback error // 对不在 errFor 的会话返回此错误（nil 表示透传 inner）
 }
 
@@ -258,9 +264,9 @@ func (w *newSessionCapture) specsFor(name string) []process.SessionSpec {
 // 返回注入错误（用于 handleSSEEvent/startTUI 错误传播测试）。
 type sessionStoreErrWrapper struct {
 	TaskStore
-	upsertErr   error
-	deleteErr   error
-	listErr     error
+	upsertErr error
+	deleteErr error
+	listErr   error
 	// listTopErr 注入 ListTopLevelTaskSessions 错误（B3：resolveAnchorSession 走顶层会话查询）。
 	listTopErr error
 }
@@ -295,9 +301,9 @@ func (w *sessionStoreErrWrapper) ListTopLevelTaskSessions(ctx context.Context, t
 }
 
 // add-plain-dir-project D8：claim/touch 归属写入口经 wrapper，复用 upsertErr 触发
-//（实时 session.created 走 ClaimTaskSession、session.updated 走 TouchOwnedTaskSession，
+// （实时 session.created 走 ClaimTaskSession、session.updated 走 TouchOwnedTaskSession，
 // 失败语义同既有 upsert 失败：归属写入错误传播，收敛运行时）。AlignTaskSessions 不在此拦截
-//（对齐错误由专用测试覆盖，且 Activate 内首次对齐失败会导致 Activate 失败而非 SSE 实时收敛路径）。
+// （对齐错误由专用测试覆盖，且 Activate 内首次对齐失败会导致 Activate 失败而非 SSE 实时收敛路径）。
 func (w *sessionStoreErrWrapper) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
 	if w.upsertErr != nil {
 		return application.ClaimResult{}, w.upsertErr
@@ -387,7 +393,7 @@ func (s *failDebtStore) UpsertCleanupDebt(ctx context.Context, sessionName, tick
 }
 
 // statusErrStore 包装 TaskStore，注入 UpdateTaskStatusConditional 错误
-//（用于 convergeToSuspended 状态提交失败测试，非孤立 mock 方法注入——通过 wrapper 覆盖真实 store 方法）。
+// （用于 convergeToSuspended 状态提交失败测试，非孤立 mock 方法注入——通过 wrapper 覆盖真实 store 方法）。
 type statusErrStore struct {
 	TaskStore
 	condErr error

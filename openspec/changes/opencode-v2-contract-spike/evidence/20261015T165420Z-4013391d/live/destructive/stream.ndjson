@@ -1,0 +1,8 @@
+data: {"id":"evt_1407e02ed001T0JFx0Nf2BMAW7","type":"server.connected","data":{}}
+
+: heartbeat
+
+data: {"id":"evt_1407e0318001AJbmpZQVPuQz9N","created":1792083362584,"type":"session.created","location":{"directory":"/Users/mendlex/.ocdeck/worktrees/ex-ocwork/v2-yarg/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ebf81fd04ffeneyzU6RIrNUCR9","slug":"curious-cabin","version":"2.0.28","projectID":"6363f0e18f81ff0a3993b41937ffbbf833d87cd4","location":{"directory":"/Users/mendlex/.ocdeck/worktrees/ex-ocwork/v2-yarg/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"subpath":"openspec/changes/opencode-v2-contract-spike/sandbox/work","title":"spike-event-delete"},"durable":{"aggregateID":"ses_ebf81fd04ffeneyzU6RIrNUCR9","seq":0,"version":1}}
+
+data: {"id":"evt_1407e03280015o0QOgqakCYODa","created":1792083362600,"type":"session.deleted","data":{"sessionID":"ses_ebf81fd04ffeneyzU6RIrNUCR9"},"durable":{"aggregateID":"ses_ebf81fd04ffeneyzU6RIrNUCR9","seq":1,"version":2}}
+

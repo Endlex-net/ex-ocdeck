@@ -1,0 +1,13 @@
+inherited-env-cleared-at-exec: HOME=/tmp
+[2026-10-15T16:54:26Z] REJECTED as expected: /root/spike-canary-20261015T162223Z-2997862e
+errno: 30 (Read-only file system)
+caller-proof: rerun-by-fixer-task: container boundary established by docker --read-only rootfs (design.md L517 form), run-id 20261015T165420Z-4013391d
+[2026-10-15T16:54:54Z] REJECTED as expected: /root/spike-canary-20261015T162223Z-2997862e
+errno: 30 (Read-only file system)
+caller-proof: rerun-by-fixer-task: container boundary established by docker --read-only rootfs (design.md L517 form), run-id 20261015T165420Z-4013391d
+[2026-10-15T16:55:09Z] REJECTED as expected: /root/spike-canary-20261015T162223Z-2997862e
+errno: 30 (Read-only file system)
+caller-proof: rerun-by-fixer-task: container boundary established by docker --read-only rootfs (design.md L517 form), run-id 20261015T165420Z-4013391d
+[2026-10-15T16:57:23Z] REJECTED as expected: /root/spike-canary-20261015T162223Z-2997862e
+errno: 30 (Read-only file system)
+caller-proof: rerun-by-fixer-task: container boundary established by docker --read-only rootfs (design.md L517 form), run-id 20261015T165420Z-4013391d

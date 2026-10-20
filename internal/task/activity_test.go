@@ -5,6 +5,7 @@ import (
 	"sync"
 	"testing"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	ocdeckevent "ocdeck/internal/domain/event"
 )
 
@@ -42,12 +43,12 @@ func seedActivityTask(t *testing.T, store *mockStore, id string) TaskRow {
 }
 
 // TestRecordUserActivity_PublishesEnvelope 断言事件信封四字段与行不变性
-//（任务 2.2：捕获的事件仅为 task.user_activity、任务行（至少 updated_at）不变）。
+// （任务 2.2：捕获的事件仅为 task.user_activity、任务行（至少 updated_at）不变）。
 func TestRecordUserActivity_PublishesEnvelope(t *testing.T) {
 	store := newMockStore()
 	row := seedActivityTask(t, store, "taska1")
 	pub := &activityRecordingPublisher{}
-	m := New(Options{Store: store, Publish: pub})
+	m := New(Options{Store: store, Publish: pub, OCFactory: func(_ string, port int, password string, opts appagent.Options) OCClient { return newMockOC(true) }})
 
 	m.RecordUserActivity(context.Background(), "taska1")
 
@@ -77,7 +78,7 @@ func TestRecordUserActivity_PublishesEnvelope(t *testing.T) {
 func TestRecordUserActivity_NoPublishNoOp(t *testing.T) {
 	store := newMockStore()
 	row := seedActivityTask(t, store, "taska1")
-	m := New(Options{Store: store})
+	m := New(Options{Store: store, OCFactory: func(_ string, port int, password string, opts appagent.Options) OCClient { return newMockOC(true) }})
 
 	m.RecordUserActivity(context.Background(), "taska1")
 
@@ -94,7 +95,7 @@ func TestRecordUserActivity_NoPublishNoOp(t *testing.T) {
 func TestRecordShellUserActivity(t *testing.T) {
 	t.Run("legal shell session name", func(t *testing.T) {
 		pub := &activityRecordingPublisher{}
-		m := New(Options{Publish: pub})
+		m := New(Options{Publish: pub, OCFactory: func(_ string, port int, password string, opts appagent.Options) OCClient { return newMockOC(true) }})
 
 		m.RecordShellUserActivity(context.Background(), "ocdeck-taska1-shell-1")
 
@@ -108,7 +109,7 @@ func TestRecordShellUserActivity(t *testing.T) {
 	})
 	t.Run("illegal tid silent zero publish", func(t *testing.T) {
 		pub := &activityRecordingPublisher{}
-		m := New(Options{Publish: pub})
+		m := New(Options{Publish: pub, OCFactory: func(_ string, port int, password string, opts appagent.Options) OCClient { return newMockOC(true) }})
 
 		m.RecordShellUserActivity(context.Background(), "not-an-ocdeck-session")
 		m.RecordShellUserActivity(context.Background(), "")
@@ -118,7 +119,7 @@ func TestRecordShellUserActivity(t *testing.T) {
 		}
 	})
 	t.Run("no publish injected no-op", func(t *testing.T) {
-		m := New(Options{})
+		m := New(Options{OCFactory: func(_ string, port int, password string, opts appagent.Options) OCClient { return newMockOC(true) }})
 
 		m.RecordShellUserActivity(context.Background(), "ocdeck-taska1-shell-1")
 	})

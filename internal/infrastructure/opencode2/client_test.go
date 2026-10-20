@@ -1,0 +1,246 @@
+// client_test.go 落实 tasks 2.3：v2 client 传输层——/api 前缀拼装、{data}
+// envelope 解包（含畸形 envelope 报错）、Basic auth、错误响应非 envelope 形态。
+package opencode2
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestClient_APIPrefixAssembly(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		if !basicAuthed(t, r, "pw") {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write(readFixture(t, "session_get.json"))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, "pw")
+	if _, err := c.GetSession(context.Background(), "ses_fixture01a"); err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	// 前缀拼装唯一入口：/api + /session/{id}（CONTRACT §1 传输形态）。
+	if gotPath != "/api/session/ses_fixture01a" {
+		t.Fatalf("path: got %q want /api/session/ses_fixture01a", gotPath)
+	}
+}
+
+func TestClient_EnvelopeUnwrap(t *testing.T) {
+	srv := fixtureServer(t, route{path: "/api/session/ses_fixture01a", status: 200, body: string(readFixture(t, "session_get.json"))})
+	c := newTestClient(t, srv, "pw")
+	s, err := c.GetSession(context.Background(), "ses_fixture01a")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if s.ID != "ses_fixture01a" || s.Title != "renamed-title" || s.Location.Directory != "/wt" {
+		t.Fatalf("session: %+v", s)
+	}
+	if s.Time.Created == nil || *s.Time.Created != 1792083316435 {
+		t.Fatalf("time.created: %v", s.Time.Created)
+	}
+}
+
+func TestClient_MalformedEnvelope(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"missing data key", `{"foo": 1}`},
+		{"null data", `{"data": null}`},
+		{"array root", `[1,2,3]`},
+		{"not json", `oops`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := fixtureServer(t, route{path: "/api/session/ses_fixture01a", status: 200, body: tc.body})
+			c := newTestClient(t, srv, "pw")
+			if _, err := c.GetSession(context.Background(), "ses_fixture01a"); err == nil {
+				t.Fatalf("expected error for malformed envelope %q", tc.body)
+			}
+		})
+	}
+}
+
+func TestClient_ErrorBodyNonEnvelope(t *testing.T) {
+	// CONTRACT §1：错误响应非 envelope，{_tag, message, kind} 形态；body 原文
+	// 保留供 _tag 分类。
+	errBody := string(readFixture(t, "error_permission_gone.json"))
+	srv := fixtureServer(t, route{path: "/api/session/ses_fixture01a", status: 400, body: errBody})
+	c := newTestClient(t, srv, "pw")
+	_, err := c.GetSession(context.Background(), "ses_fixture01a")
+	var hse *httpStatusError
+	if !errors.As(err, &hse) {
+		t.Fatalf("expect httpStatusError, got %v", err)
+	}
+	if hse.status != 400 || !strings.Contains(hse.body, "PermissionNotFoundError") {
+		t.Fatalf("status/body: %d %q", hse.status, hse.body)
+	}
+	if errorTag(hse.body) != "PermissionNotFoundError" {
+		t.Fatalf("errorTag: %q", errorTag(hse.body))
+	}
+}
+
+func TestClient_UnauthorizedSentinel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv, "wrong-password")
+	if _, err := c.GetSession(context.Background(), "ses_fixture01a"); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expect ErrUnauthorized, got %v", err)
+	}
+}
+
+func TestClient_BasicAuthHeader(t *testing.T) {
+	var gotUser, gotPass string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUser, gotPass, _ = r.BasicAuth()
+		_, _ = io.WriteString(w, `{"data":{"id":"ses_fixture01a","time":{"created":1,"updated":2},"location":{"directory":"/wt"}}}`)
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv, "derived-password")
+	if _, err := c.GetSession(context.Background(), "ses_fixture01a"); err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if gotUser != "opencode" || gotPass != "derived-password" {
+		t.Fatalf("basic auth: user=%q pass=%q", gotUser, gotPass)
+	}
+}
+
+// TestClient_ListSessionsCursor 落实锚点式游标语义：短页（len<limit）= 完整
+// 快照——cursor.next 非空不表示还有数据（2026-10-20 v2.0.28 实测修正）。
+func TestClient_ListSessionsCursor(t *testing.T) {
+	srv := fixtureServer(t,
+		route{path: "/api/session", status: 200, body: string(readFixture(t, "session_list_page1.json"))})
+	c := newTestClient(t, srv, "pw")
+	page, err := c.ListSessions(context.Background(), "/wt", 1000)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(page.Sessions) != 2 || page.HasMore {
+		t.Fatalf("short page must be complete (anchor next is navigation, not data), len=%d hasMore=%v", len(page.Sessions), page.HasMore)
+	}
+}
+
+// TestClient_ListSessionsMalformedPageMatrix 落实收尾 K2：列表页 envelope
+// required 集合（CONTRACT §2：根 object、data 非 null 数组、cursor object 且
+// previous/next 键齐全、值为 string/null）违约必须报错——MUST NOT 被接受为
+// HasMore=false 的完整列表（否则就绪探测伪 ready + 对账误删归属行）。
+func TestClient_ListSessionsMalformedPageMatrix(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"empty object", `{}`},
+		{"null root", `null`},
+		{"array root", `[]`},
+		{"null data", `{"data":null,"cursor":{"previous":null,"next":null}}`},
+		{"missing data", `{"cursor":{"previous":null,"next":null}}`},
+		{"object data", `{"data":{},"cursor":{"previous":null,"next":null}}`},
+		{"missing cursor", `{"data":[]}`},
+		{"null cursor", `{"data":[],"cursor":null}`},
+		{"cursor missing previous", `{"data":[],"cursor":{"next":null}}`},
+		{"cursor missing next", `{"data":[],"cursor":{"previous":null}}`},
+		{"cursor next wrong type", `{"data":[],"cursor":{"previous":null,"next":123}}`},
+		{"cursor previous wrong type", `{"data":[],"cursor":{"previous":true,"next":null}}`},
+		{"truncated body", `{"data":[],"cursor":{"previous":null`},
+		{"not json", `oops`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := fixtureServer(t, route{path: "/api/session", status: 200, body: tc.body})
+			c := newTestClient(t, srv, "pw")
+			if _, err := c.ListSessions(context.Background(), "/wt", 1000); err == nil {
+				t.Fatalf("malformed list page must be rejected (body=%s)", tc.body)
+			}
+		})
+	}
+}
+
+// TestClient_ListSessionsLegalPagination 落实锚点式游标 HasMore 推导矩阵
+//（2026-10-20 v2.0.28 实测语义）：短页=完整（含实测 base64 anchor 双非空
+// 形态）；len==limit 且 next 非 null → 保守 overflow；len==limit 且 next
+// null → 完整；合法空页 → 完整空快照（对账删除能力保留）。
+func TestClient_ListSessionsLegalPagination(t *testing.T) {
+	t.Run("empty complete page", func(t *testing.T) {
+		srv := fixtureServer(t, route{path: "/api/session", status: 200,
+			body: `{"data":[],"cursor":{"previous":null,"next":null}}`})
+		c := newTestClient(t, srv, "pw")
+		page, err := c.ListSessions(context.Background(), "/wt", 1000)
+		if err != nil {
+			t.Fatalf("legal empty page must be accepted: %v", err)
+		}
+		if len(page.Sessions) != 0 || page.HasMore {
+			t.Fatalf("page: len=%d hasMore=%v", len(page.Sessions), page.HasMore)
+		}
+	})
+	t.Run("short page with anchor cursors is complete", func(t *testing.T) {
+		// 容器实测形态：data 3 条但 cursor.previous/next 均为非空 base64 anchor
+		//（`{"directory":...,"anchor":{"id":...,"direction":"next"}}`）——
+		// MUST NOT 判为 overflow（session_overflow 误报事故面）。
+		srv := fixtureServer(t, route{path: "/api/session", status: 200,
+			body: string(readFixture(t, "session_list_anchor_shortpage.json"))})
+		c := newTestClient(t, srv, "pw")
+		page, err := c.ListSessions(context.Background(), "/wt", 1000)
+		if err != nil {
+			t.Fatalf("legal short page: %v", err)
+		}
+		if len(page.Sessions) != 3 || page.HasMore {
+			t.Fatalf("short page with anchor cursors must be complete, len=%d hasMore=%v", len(page.Sessions), page.HasMore)
+		}
+	})
+	t.Run("full page with next overflows", func(t *testing.T) {
+		srv := fixtureServer(t, route{path: "/api/session", status: 200,
+			body: string(readFixture(t, "session_list_page1.json"))})
+		c := newTestClient(t, srv, "pw")
+		page, err := c.ListSessions(context.Background(), "/wt", 2)
+		if err != nil {
+			t.Fatalf("legal full page: %v", err)
+		}
+		if len(page.Sessions) != 2 || !page.HasMore {
+			t.Fatalf("full page with next must overflow, len=%d hasMore=%v", len(page.Sessions), page.HasMore)
+		}
+	})
+	t.Run("full page without next is complete", func(t *testing.T) {
+		srv := fixtureServer(t, route{path: "/api/session", status: 200,
+			body: string(readFixture(t, "session_list_page2.json"))})
+		c := newTestClient(t, srv, "pw")
+		page, err := c.ListSessions(context.Background(), "/wt", 1)
+		if err != nil {
+			t.Fatalf("legal full page (null next): %v", err)
+		}
+		if len(page.Sessions) != 1 || page.HasMore {
+			t.Fatalf("full page without next must be complete, len=%d hasMore=%v", len(page.Sessions), page.HasMore)
+		}
+	})
+}
+
+func TestClient_SessionShapeViolation(t *testing.T) {
+	// Session.Info required 形状缺失 = 协议违约（fail-closed）。
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"missing time", `{"data":{"id":"ses_fixture01a","location":{"directory":"/wt"}}}`},
+		{"missing location", `{"data":{"id":"ses_fixture01a","time":{"created":1,"updated":2}}}`},
+		{"missing id", `{"data":{"time":{"created":1,"updated":2},"location":{"directory":"/wt"}}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := fixtureServer(t, route{path: "/api/session/ses_fixture01a", status: 200, body: tc.body})
+			c := newTestClient(t, srv, "pw")
+			if _, err := c.GetSession(context.Background(), "ses_fixture01a"); err == nil {
+				t.Fatalf("expected shape violation error")
+			}
+		})
+	}
+}

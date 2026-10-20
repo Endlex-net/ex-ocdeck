@@ -223,13 +223,13 @@ func TestDelete_Dir_TempServeCwdIsProjectDir(t *testing.T) {
 	proc := newMockProc()
 	// newSessionCapture 捕获 SessionSpec 供断言 Dir/CmdArgv。
 	capture := wrapNewSessionCapture(proc)
-	// mockOC 健康 OK 使 startTempServe 成功起 serve。
+	// mockOC 健康 OK 使删除路径成功（oc.DeleteSession 逐项成功）。
+	// tasks 4.3：一次性 serve 起 AcquireEphemeral 临时 runtime（真实 supervisor
+	// 内部健康检查直连 fake server 监听端口）。
+	srv := newFakeOCServer(t)
 	oc := newMockOC(true)
-	// oc.DeleteSession 默认 nil → 成功删除 session。
-	// oc.Health OK → waitServeReady 通过。
-	// 但 mockProc 无真实进程，serve 不会真正 ready——需 oc.Health 返回 healthy。
-	// newMockOC(true) 已设 healthOK=true。
 	m := newTestManager(t, store, capture, wrapPanicWorktree(newMockWorktree()), oc)
+	injectEphemeralSupervisorForTestWithPort(t, m, store, capture, srv.port)
 
 	if err := m.Delete(context.Background(), "t1", DeleteNormal, false); err != nil {
 		t.Fatalf("Delete dir normal with oc sessions: %v", err)
@@ -297,7 +297,10 @@ func TestDelete_DirOCSessions_OnlyOwnedSessions(t *testing.T) {
 	_ = store.UpsertTaskSession(context.Background(), otherSession)
 	proc := newMockProc()
 	oc := newMockOC(true)
+	// tasks 4.3：AcquireEphemeral 临时 runtime（健康检查直连 fake server）。
+	srv := newFakeOCServer(t)
 	m := newTestManager(t, store, proc, wrapPanicWorktree(newMockWorktree()), oc)
+	injectEphemeralSupervisorForTestWithPort(t, m, store, proc, srv.port)
 
 	if err := m.Delete(context.Background(), "t1", DeleteNormal, false); err != nil {
 		t.Fatalf("Delete dir normal: %v", err)

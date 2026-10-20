@@ -14,9 +14,9 @@ import (
 	"sync"
 	"testing"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	apptask "ocdeck/internal/application/task"
 	"ocdeck/internal/config"
-	"ocdeck/internal/infrastructure/opencode"
 )
 
 // TestP148_Delete_Normal_ViaLifecycle：注入 LifecycleService 后 Delete Normal 成功，
@@ -113,7 +113,7 @@ func TestP148_Reconcile_ConvergeFirst_ViaLifecycle(t *testing.T) {
 	store.tasks["t1"] = TaskRow{ID: "t1", ProjectID: "p1", Status: StatusSuspended, WorktreePath: "/wt1", InitStatus: InitStatusRunning}
 
 	oc := newMockOC(true)
-	wrap := func(port int, password string, opts opencode.Options) OCClient {
+	wrap := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOC{inner: oc, onReady: opts.OnReady}
 	}
 	debt := &restoreTraceDebtStore{inner: newMemCleanupDebtStore(), orderMu: orderMu, order: &order}

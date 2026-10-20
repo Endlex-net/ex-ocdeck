@@ -1,0 +1,11 @@
+{
+  "data": {
+    "id": "frm_fixture02",
+    "sessionID": "ses_fixture01a",
+    "title": "Old form",
+    "fields": [
+      { "key": "note", "type": "string", "title": "Note" }
+    ],
+    "state": { "status": "answered", "answer": { "note": "done" } }
+  }
+}

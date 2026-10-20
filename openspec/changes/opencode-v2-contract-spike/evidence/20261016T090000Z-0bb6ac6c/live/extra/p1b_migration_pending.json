@@ -1,0 +1,43 @@
+{
+  "probe_id": "p1b.migration_pending",
+  "schema": "p1b-extra-v1",
+  "exec_status": "FAIL",
+  "facts": {
+    "v1_session": "ses_ebf289939ffe5aLA8A6rY2CJla",
+    "v1_pending": {
+      "id": "per_140d7767a0016nVKYfY3iiAFrq",
+      "sessionID": "ses_ebf289939ffe5aLA8A6rY2CJla",
+      "permission": "external_directory",
+      "patterns": [
+        "/tmp/*"
+      ],
+      "metadata": {
+        "command": "touch /tmp/p1b-perm-marker",
+        "directories": [
+          "/tmp"
+        ],
+        "patterns": [
+          "/tmp/*"
+        ]
+      },
+      "always": [
+        "/tmp/*"
+      ],
+      "tool": {
+        "messageID": "msg_140d7695f001dIPPMrk80nti6I",
+        "callID": "call_00_yiyyqw2ojrm9wifs1wmz5xu4"
+      }
+    },
+    "v2": {
+      "listed": true,
+      "pending_http": 200,
+      "pending": null
+    },
+    "verdict_note": "v2 会话/消息可见但 v1 pending permission 未保留（v1.18.26 pending 为进程内存态：样本 ID 不存在于数据树任何持久化存储——停服即失，升级后v2 pending 列表为空）。有效负面实证。"
+  },
+  "evidence": [
+    "live/migration/facts.json",
+    "live/migration/v1-pending.json",
+    "live/migration/v2-pending.json"
+  ]
+}

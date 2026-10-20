@@ -1,0 +1,15 @@
+{
+  "steps": {
+    "v1_create_session": 200,
+    "v1_session_id": "ses_ec74cdc2affe4yu6EOZ8oC7KHl",
+    "v1_prompt_async": 204,
+    "v1_message_id": "msg_e82e8c8ff2da1ebe",
+    "v1_history_status": 200,
+    "v1_history_has_marker": true,
+    "v2_list_status": 200,
+    "v2_session_listed": true,
+    "v2_history_status": 200,
+    "v2_history_has_marker": true
+  },
+  "verdict": "PASS: 官方升级路径保留 v1 数据（session 可见 + 消息原文一致）"
+}

@@ -1,0 +1,1125 @@
+#!/usr/bin/env python3
+"""p1b-live-probe.py — p1b 并发隔离 run：模型依赖项运行时实证（v2.0.28 带模型凭据）。
+
+opencode-v2-provider tasks 1.1 运行时/1.2/1.3/1.8 探测项：
+  封闭集合（results.jsonl，emit_result 契约）：event.02d/e/f、attention.02、prompt.03
+  新增项（live/extra/*.json，独立记录）：p1b.interrupt、p1b.status_seq、p1b.environment
+
+隔离：本文件为 harness 副本内新增；端口=harness 默认+2000；sandbox/evidence 均在本
+git 副本内（容器 /repo），仓库既有文件零修改。模型凭据仅经容器 env 注入。
+
+用法: p1b-live-probe.py <locked-manifest> <evidence-dir>
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import spikelib as S  # noqa: E402
+import importlib.util as _ilu  # noqa: E402
+# live-probe.py 文件名含连字符，无法常规 import——经 importlib 从同目录加载
+_lp_spec = _ilu.spec_from_file_location(
+    "live_probe", str(Path(__file__).resolve().parent / "live-probe.py"))
+live_probe = _ilu.module_from_spec(_lp_spec)  # noqa: E402
+sys.modules["live_probe"] = live_probe
+_lp_spec.loader.exec_module(live_probe)
+Ctx = live_probe.Ctx
+_create_session = live_probe._create_session
+_extract_session_id = live_probe._extract_session_id
+
+PORT = 31711  # harness 默认 29711 + 2000（并发隔离）
+BASE = f"http://127.0.0.1:{PORT}"
+
+MIN_PROMPT = "reply with exactly: pong"
+TOOL_PROMPT = ("use the bash tool to run exactly this command: "
+               "echo p1b-env-probe && sleep 20 && echo p1b-sleep-done; "
+               "then report the output")
+TOOL_PROMPT_LONG = ("use the bash tool to run exactly this command: "
+                    "echo p1b-env-probe && sleep 45 && echo p1b-sleep-done; "
+                    "then report the output")
+FILE_PROMPT = ("read the attached file attach-probe.txt and reply with exactly "
+               "its single line of content")
+PERM_PROMPT = ("use the bash tool to run exactly this command: "
+               "touch /tmp/p1b-perm-marker; then report the output")
+FILE_MARK = "p1b attachment content 0bb6ac6c"
+
+STATUS_TYPES = ("session.execution.started", "session.execution.succeeded",
+                "session.execution.failed", "session.execution.interrupted")
+
+
+# ---------------------------------------------------------------- SSE 流读取
+
+class _StreamReader:
+    """SSE 增量读取器（从 live-probe._probe_events_run 提取的已实证实现）。"""
+
+    def __init__(self, stream_abs: Path) -> None:
+        import codecs
+        self.stream_abs = stream_abs
+        self.off = 0
+        self.dec = codecs.getincrementaldecoder("utf-8")("replace")
+        self.line_buf = ""
+        self.parser = S.SSEParser()
+        self.frame_start: Optional[int] = None
+        self.next_line_off = 0
+
+    def poll(self) -> list[tuple[int, dict]]:
+        try:
+            with open(self.stream_abs, "rb") as f:
+                f.seek(self.off)
+                chunk = f.read()
+        except OSError:
+            return []
+        self.off += len(chunk)
+        self.line_buf += self.dec.decode(chunk)
+        out: list[tuple[int, dict]] = []
+        while "\n" in self.line_buf:
+            line, _, self.line_buf = self.line_buf.partition("\n")
+            line_off = self.next_line_off
+            self.next_line_off += len((line + "\n").encode("utf-8"))
+            stripped = line.rstrip("\r")
+            if self.frame_start is None and stripped.strip():
+                self.frame_start = line_off
+            ev_obj = self.parser.feed_line(line)
+            if stripped == "":
+                if ev_obj is not None:
+                    fs = self.frame_start if self.frame_start is not None else line_off
+                    out.append((fs, ev_obj))
+                self.frame_start = None
+        return out
+
+    def baseline(self) -> int:
+        self.poll()   # drain 触发前旧帧
+        return self.off
+
+
+def _subscribe(ctx: Ctx, rel: str) -> Optional[tuple[Any, _StreamReader]]:
+    """订阅 /api/event SSE；10s 内无首帧视为失败（返回 None）。"""
+    stream_abs = ctx.run_dir / rel
+    S.evidence_write(ctx.run_dir, rel, "")
+    enc = ctx.dir_param(ctx.work)
+    sub = S.spawn_upstream(ctx.sbroot, ctx.work,
+                           ["curl", "-sS", "-N", "--max-time", "1800",
+                            "-u", f"opencode:{ctx.password}",
+                            f"{ctx.base}{ctx.api_prefix}/event?directory={enc}"],
+                           log_file=stream_abs)
+    try:
+        ctx.registry.add("item", sub.pid)
+    except Exception:
+        S.kill_tree(sub.pid)
+        raise
+    reader = _StreamReader(stream_abs)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if sub.poll() is not None and not stream_abs.stat().st_size:
+            break
+        if reader.poll():
+            return sub, reader
+        time.sleep(0.2)
+    S.kill_tree(sub.pid)
+    return None
+
+
+def _stop_sub(sub: Any) -> None:
+    if sub is None:
+        return
+    S.kill_tree(sub.pid)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if sub.poll() is not None:
+            break
+        time.sleep(0.1)
+
+
+def _wait(reader: _StreamReader, start: int, timeout: float,
+          pred: Any) -> tuple[bool, list[tuple[int, dict]]]:
+    frames: list[tuple[int, dict]] = []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for fs, e in reader.poll():
+            frames.append((fs, e))
+            if fs >= start and pred(e):
+                return True, frames
+        time.sleep(0.2)
+    return False, frames
+
+
+def _dump_frames(ctx: Ctx, rel: str, frames: list[tuple[int, dict]]) -> str:
+    lines = [json.dumps(e, ensure_ascii=False) for _, e in frames]
+    return ctx.evidence(rel, ("\n".join(lines) + "\n") if lines else "(no frames)\n")
+
+
+# ---------------------------------------------------------------- 载荷观察助手
+
+def _scan_ids(x: Any, ids: list[str], sids: list[str]) -> None:
+    """递归收集 permission 请求 ID（per 前缀）与 sessionID 归属（结构化键，非文本正则）。"""
+    if isinstance(x, dict):
+        for k, v in x.items():
+            if isinstance(v, str):
+                kl = k.lower()
+                if kl in ("id", "permissionid", "requestid") and v.startswith("per"):
+                    ids.append(v)
+                if kl == "sessionid" and v:
+                    sids.append(v)
+            else:
+                _scan_ids(v, ids, sids)
+    elif isinstance(x, list):
+        for i in x:
+            _scan_ids(i, ids, sids)
+
+
+def _find_str(x: Any, needle: str) -> bool:
+    """递归查找字符串值包含 needle（JSON 值层面，非整帧文本）。"""
+    if isinstance(x, dict):
+        return any(_find_str(v, needle) for v in x.values())
+    if isinstance(x, list):
+        return any(_find_str(i, needle) for i in x)
+    return isinstance(x, str) and needle in x
+
+
+def _status_value(ev: dict) -> Optional[str]:
+    for d in S._payload_dicts(ev):
+        st = d.get("status")
+        if isinstance(st, str):
+            return st
+        if isinstance(st, dict):
+            v = st.get("type") or st.get("state") or st.get("status")
+            if isinstance(v, str):
+                return v
+    return None
+
+
+def _make_mid(ctx: Ctx, tag: str) -> str:
+    mid = ctx.make_message_id(tag)
+    if mid is not None:
+        return mid
+    # wirecheck 实证：v2 接受 msg_ 前缀自由形态（无发现 pattern 时的兜底构造）
+    return f"msg_{tag}_{hashlib.sha256(os.urandom(8)).hexdigest()[:12]}"
+
+
+def _messages(ctx: Ctx, sid: str, enc: str) -> Optional[list]:
+    r = ctx.http(ctx.api(f"/session/{sid}/message?directory={enc}"), timeout=20.0)
+    if r.status != 200:
+        return None
+    try:
+        doc = json.loads(r.body)
+    except json.JSONDecodeError:
+        return None
+    items = doc.get("data") if isinstance(doc, dict) else doc
+    return items if isinstance(items, list) else None
+
+
+def _assistant_texts(msgs: Optional[list]) -> list[str]:
+    out: list[str] = []
+    for m in msgs or []:
+        if not isinstance(m, dict) or m.get("type") != "assistant":
+            continue
+        for c in m.get("content", []) or []:
+            if isinstance(c, dict) and c.get("type") == "text" \
+                    and isinstance(c.get("text"), str):
+                out.append(c["text"])
+    return out
+
+
+def _wait_reply(ctx: Ctx, sid: str, enc: str, timeout: float) -> list[str]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        texts = _assistant_texts(_messages(ctx, sid, enc))
+        if any(t.strip() for t in texts):
+            return texts
+        time.sleep(2)
+    return []
+
+
+def _session_outcome(ctx: Ctx, sid: str, enc: str) -> tuple[Optional[Any], Optional[int]]:
+    r = ctx.http(ctx.api(f"/session?directory={enc}"), timeout=15.0)
+    if r.status != 200:
+        return None, r.status
+    try:
+        doc = json.loads(r.body)
+    except json.JSONDecodeError:
+        return None, r.status
+    items = doc.get("data") if isinstance(doc, dict) else doc
+    if not isinstance(items, list):
+        return None, r.status
+    for it in items:
+        if isinstance(it, dict) and it.get("id") == sid:
+            return it.get("outcome"), r.status
+    return None, r.status
+
+
+def _poll_pending(ctx: Ctx, sid: str, enc: str, timeout: float
+                  ) -> tuple[Optional[dict], Optional[int]]:
+    deadline = time.monotonic() + timeout
+    last_status: Optional[int] = None
+    while time.monotonic() < deadline:
+        r = ctx.http(ctx.api(f"/session/{sid}/permission?directory={enc}"), timeout=10.0)
+        last_status = r.status
+        if r.status == 200:
+            try:
+                doc = json.loads(r.body)
+                items = doc.get("data") if isinstance(doc, dict) else doc
+                if isinstance(items, list):
+                    for it in items:
+                        if isinstance(it, dict) and isinstance(it.get("id"), str) \
+                                and it.get("id"):
+                            return it, r.status
+            except json.JSONDecodeError:
+                pass
+        time.sleep(2)
+    return None, last_status
+
+
+def _perm_pending_list(ctx: Ctx, sid: str, enc: str) -> tuple[Optional[list], Optional[int]]:
+    r = ctx.http(ctx.api(f"/session/{sid}/permission?directory={enc}"), timeout=10.0)
+    if r.status != 200:
+        return None, r.status
+    try:
+        doc = json.loads(r.body)
+        items = doc.get("data") if isinstance(doc, dict) else doc
+        return (items if isinstance(items, list) else None), r.status
+    except json.JSONDecodeError:
+        return None, r.status
+
+
+def _extra(ctx: Ctx, probe_id: str, exec_status: str, facts: dict,
+           evidence: list[str]) -> None:
+    doc = {"probe_id": probe_id, "schema": "p1b-extra-v1",
+           "exec_status": exec_status, "facts": facts, "evidence": evidence}
+    rel = f"live/extra/{probe_id.replace('.', '_')}.json"
+    ctx.evidence(rel, json.dumps(doc, ensure_ascii=False, indent=2) + "\n")
+
+
+# ---------------------------------------------------------------- 模型门
+
+def _prompt_url(ctx: Ctx, sid: str, enc: str) -> str:
+    """模型 prompt 提交 URL：优先已发现 prompt_path，否则按 v2 wire 默认形态。"""
+    if ctx.prompt_path:
+        return f"{ctx.base}{ctx.prompt_path.replace('{sessionID}', sid)}?directory={enc}"
+    return f"{ctx.base}{ctx.api_prefix}/session/{sid}/prompt?directory={enc}"
+
+def _model_gate(ctx: Ctx, enc: str) -> tuple[bool, str]:
+    """GET /api/model 含目标模型 + 最小 prompt 真实回复（≤2 次尝试）。"""
+    ev = "live/gate"
+    facts: dict[str, Any] = {"model_listed": False, "ping_attempts": []}
+    r = ctx.http(ctx.api("/model"), timeout=15.0)
+    if r.status == 200 and _find_str(_json_or(r.body), "deepseek-v4.1-flash"):
+        facts["model_listed"] = True
+    ctx.evidence(f"{ev}/model-list.json", r.body)
+    for attempt in (1, 2):
+        sid, _, st = _create_session(ctx, ctx.base, ctx.work,
+                                     f"p1b-gate-{attempt}", f"{ev}/session-{attempt}.json")
+        if not sid:
+            facts["ping_attempts"].append({"attempt": attempt, "error": f"create={st}"})
+            continue
+        mid = _make_mid(ctx, f"gate{attempt}")
+        r_p = ctx.http(ctx.api(f"/session/{sid}/prompt?directory={enc}"), method="POST",
+                       json_body={"id": mid, "text": MIN_PROMPT}, timeout=30.0)
+        texts = _wait_reply(ctx, sid, enc, 60)
+        ok = any("pong" in t for t in texts)
+        facts["ping_attempts"].append(
+            {"attempt": attempt, "submit": r_p.status, "texts": texts[:2], "ok": ok})
+        if ok:
+            ep = ctx.evidence(f"{ev}/gate.json",
+                              json.dumps(facts, ensure_ascii=False, indent=2) + "\n")
+            return True, ep
+    ep = ctx.evidence(f"{ev}/gate.json",
+                      json.dumps(facts, ensure_ascii=False, indent=2) + "\n")
+    return False, ep
+
+
+def _json_or(body: bytes) -> Any:
+    try:
+        return json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+# ---------------------------------------------------------------- 探测：event.02d/e/f + status 序列
+
+def probe_p1b_events(ctx: Ctx, enc: str) -> None:
+    ev = "live/event"
+    ids = ("event.02d.status_changed", "event.02e.attention_raised",
+           "event.02f.attention_resolved")
+    rel = f"{ev}/p1b-stream.ndjson"
+    sub = _subscribe(ctx, rel)
+    if sub is None:
+        ep = ctx.evidence(f"{ev}/no-stream.txt", "订阅失败：10s 内无首帧\n")
+        for pid in ids:
+            ctx.emit(pid, "INCONCLUSIVE", "待验证", "待验证", "事件流订阅失败", ep)
+        _extra(ctx, "p1b.status_seq", "INCONCLUSIVE", {"reason": "no stream"}, [ep])
+        return
+    sub_proc, reader = sub
+    try:
+        sid, _, st = _create_session(ctx, ctx.base, ctx.work, "p1b-event",
+                                     f"{ev}/session.json")
+        if not sid:
+            ep = ctx.evidence(f"{ev}/no-session.txt", f"create={st}\n")
+            for pid in ids:
+                ctx.emit(pid, "INCONCLUSIVE", "待验证", "待验证",
+                         "fixture session 创建失败", ep)
+            _extra(ctx, "p1b.status_seq", "INCONCLUSIVE",
+                   {"reason": "no fixture"}, [ep])
+            return
+        # ---- event.02d：模型驱动 turn 的状态事件 + 全序列捕获
+        start = reader.baseline()
+        mid = _make_mid(ctx, "status")
+        r = ctx.http(_prompt_url(ctx, sid, enc),
+                     method="POST", json_body={"id": mid, "text": MIN_PROMPT},
+                     timeout=30.0)
+        ctx.evidence(f"{ev}/prompt-submit.txt",
+                     f"submit={r.status} mid={mid} err={r.error}\n")
+        ok_d, frames = _wait(reader, start, 90, lambda e: S.event_matches(
+            e, STATUS_TYPES, sid))
+        if ok_d:
+            # 继续等 turn 结束边界（execution.succeeded/failed/interrupted），
+            # 完整捕获 busy→idle 序列（tasks 1.2 需要全序列）
+            _, frames_tail = _wait(reader, reader.off, 60, lambda e: S.event_matches(
+                e, ("session.execution.succeeded", "session.execution.failed",
+                    "session.execution.interrupted"), sid))
+            frames = frames + frames_tail
+        ep_frames = _dump_frames(ctx, f"{ev}/p1b-frames.jsonl", frames)
+        if ok_d:
+            ctx.emit("event.02d.status_changed", "PASS", "待验证", "可满足",
+                     "真实模型 turn 驱动：观测到归属本 session 的执行状态事件"
+                     "（v2 实际形态 session.execution.started/succeeded 序列；"
+                     "无 v1 式 idle/busy status 事件——idle/busy 语义由 "
+                     "execution.started/succeeded 边界承载）；原始帧见证据",
+                     ep_frames)
+        else:
+            ctx.emit("event.02d.status_changed", "INCONCLUSIVE", "待验证", "待验证",
+                     "90s 内未观测到归属本 session 的执行状态事件；原始帧已留证",
+                     ep_frames)
+        # ---- status 序列（tasks 1.2 观测）：execution.started→succeeded 边界
+        seq = []
+        for _, e in frames:
+            t = e.get("type")
+            if isinstance(t, str) and t.startswith("session.execution."):
+                seq.append({"type": t, "status": ("busy" if t.endswith("started")
+                                                  else "idle"),
+                            "sessionID": S.event_session_id(e)})
+        busy_last = [i for i, x in enumerate(seq) if x["status"] == "busy"]
+        idle_after = bool(busy_last) and any(
+            x["status"] == "idle" for x in seq[busy_last[-1] + 1:])
+        outcome, oc_st = _session_outcome(ctx, sid, enc)
+        ep_seq = ctx.evidence(f"{ev}/status-seq.json",
+                              json.dumps({"sequence": seq, "outcome": outcome,
+                                          "outcome_http": oc_st},
+                                         ensure_ascii=False, indent=2) + "\n")
+        st_seq = "PASS" if (busy_last and idle_after) else "INCONCLUSIVE"
+        _extra(ctx, "p1b.status_seq", st_seq,
+               {"busy_seen": bool(busy_last), "idle_after_busy": idle_after,
+                "event_types": sorted({x["type"] for x in seq}),
+                "turn_outcome": outcome},
+               [ep_seq, ep_frames])
+        # ---- event.02e/f：permission 升起与解决（模型工具触发 ask 规则）
+        start2 = reader.baseline()
+        sid2, _, st2 = _create_session(ctx, ctx.base, ctx.work, "p1b-event-perm",
+                                       f"{ev}/perm-session.json")
+        if not sid2:
+            ep2 = ctx.evidence(f"{ev}/no-session-2.txt", f"create={st2}\n")
+            ctx.emit("event.02e.attention_raised", "INCONCLUSIVE", "待验证", "待验证",
+                     "permission fixture session 创建失败", ep2)
+            ctx.emit("event.02f.attention_resolved", "INCONCLUSIVE", "待验证", "待验证",
+                     "permission fixture session 创建失败", ep2)
+            return
+        mid2 = _make_mid(ctx, "perm")
+        r2 = ctx.http(_prompt_url(ctx, sid2, enc),
+                      method="POST", json_body={"id": mid2, "text": PERM_PROMPT},
+                      timeout=30.0)
+        ctx.evidence(f"{ev}/perm-submit.txt",
+                     f"submit={r2.status} mid={mid2} err={r2.error}\n")
+        ok_e, frames2 = _wait(reader, start2, 120, lambda e: isinstance(
+            e.get("type"), str) and "permission" in e.get("type", "").lower())
+        ep_f2 = _dump_frames(ctx, f"{ev}/perm-frames.jsonl", frames2)
+        ids_found: list[str] = []
+        sids_found: list[str] = []
+        for _, e in frames2:
+            _scan_ids(e, ids_found, sids_found)
+        if ok_e and ids_found and sid2 in sids_found:
+            ctx.emit("event.02e.attention_raised", "PASS", "待验证", "可满足",
+                     f"模型工具调用触发：观测到 permission 类事件（请求 ID={ids_found[0]}，"
+                     f"归属 session={sid2}）；事件名与负载见原始帧", ep_f2)
+        elif ok_e and ids_found:
+            ctx.emit("event.02e.attention_raised", "INCONCLUSIVE", "待验证", "待验证",
+                     f"观测到 permission 类事件（ID={ids_found[0]}）但负载未解析出 "
+                     f"session 归属（期望 {sid2}）；原始帧已留证", ep_f2)
+        else:
+            ctx.emit("event.02e.attention_raised", "INCONCLUSIVE", "待验证", "待验证",
+                     "120s 内未观测到 permission 类事件（ask 规则或工具触发形态待核）；"
+                     "原始帧已留证", ep_f2)
+        # 解决：REST 读取 pending → reply once → 观测解决事件
+        pend, pend_st = _poll_pending(ctx, sid2, enc, 30)
+        ctx.evidence(f"{ev}/perm-pending.json",
+                     json.dumps({"http": pend_st, "pending": pend},
+                                ensure_ascii=False, indent=2) + "\n")
+        resolved_ok = False
+        reply_st: Optional[int] = None
+        if pend and isinstance(pend.get("id"), str):
+            rid = pend["id"]
+            r_rep = ctx.http(ctx.api(f"/session/{sid2}/permission/{rid}/reply?directory={enc}"),
+                             method="POST", json_body={"decision": "once"},
+                             timeout=15.0)
+            reply_st = r_rep.status
+            ctx.evidence(f"{ev}/perm-reply.txt",
+                         f"reply={r_rep.status} body={r_rep.body!r} err={r_rep.error}\n")
+            start3 = reader.baseline()
+            ok_f, frames3 = _wait(reader, start3, 60, lambda e: (
+                isinstance(e.get("type"), str)
+                and e.get("type", "").startswith("session.execution.")))
+            ep_f3 = _dump_frames(ctx, f"{ev}/perm-after-reply-frames.jsonl", frames3)
+            after_list, after_st = _perm_pending_list(ctx, sid2, enc)
+            ctx.evidence(f"{ev}/perm-after-list.json",
+                         json.dumps({"http": after_st, "list": after_list},
+                                    ensure_ascii=False, indent=2) + "\n")
+            gone = after_list == []
+            resolved_ok = bool(r_rep.ok and gone and ok_f)
+            if resolved_ok:
+                ctx.emit("event.02f.attention_resolved", "PASS", "待验证", "可满足",
+                         f"reply once 被接受（HTTP {r_rep.status}）且 pending 清空；"
+                         "SSE 观测到解决/回 idle 侧事件；原始帧见证据", ep_f3)
+            else:
+                ctx.emit("event.02f.attention_resolved", "INCONCLUSIVE", "待验证", "待验证",
+                         f"reply 接受={r_rep.ok}（HTTP {reply_st}）pending 清空={gone} "
+                         f"解决侧事件观测={ok_f}；原始帧见证据", ep_f3)
+        else:
+            ctx.emit("event.02f.attention_resolved", "INCONCLUSIVE", "待验证", "待验证",
+                     f"未取得 pending 样本（session permission HTTP={pend_st}），"
+                     "解决路径不可观测", ep_f2)
+    finally:
+        _stop_sub(sub_proc)
+
+
+# ---------------------------------------------------------------- 探测：attention.02
+
+def probe_p1b_attention(ctx: Ctx, enc: str) -> None:
+    ev = "live/attention"
+    rel = f"{ev}/p1b-stream.ndjson"
+    sub = _subscribe(ctx, rel)
+    if sub is None:
+        ep = ctx.evidence(f"{ev}/no-stream.txt", "订阅失败\n")
+        ctx.emit("attention.02", "INCONCLUSIVE", "待验证", "待验证", "事件流订阅失败", ep)
+        return
+    sub_proc, reader = sub
+    try:
+        facts: dict[str, Any] = {}
+        # ---- fixture A：once 回复
+        sid_a, _, st_a = _create_session(ctx, ctx.base, ctx.work, "p1b-attn-once",
+                                         f"{ev}/session-once.json")
+        if not sid_a:
+            ctx.emit("attention.02", "INCONCLUSIVE", "待验证", "待验证",
+                     f"fixture A 创建失败（{st_a}）", f"{ev}/session-once.json")
+            return
+        proj_a, _, _ = _create_session(ctx, ctx.base, ctx.work, "p1b-proj-ref",
+                                       f"{ev}/.proj-ref.json")  # 仅取 projectID 用不到
+        mid_a = _make_mid(ctx, "perm")
+        ctx.http(_prompt_url(ctx, sid_a, enc),
+                 method="POST", json_body={"id": mid_a, "text": PERM_PROMPT},
+                 timeout=30.0)
+        pend_a, pend_a_st = _poll_pending(ctx, sid_a, enc, 120)
+        # pending 存续期：双端点 + 双 query 形态观测（合并语义素材）
+        loc_enc = enc
+        r_loc_deep = ctx.http(ctx.api(
+            f"/permission/request?location%5Bdirectory%5D={loc_enc}"), timeout=10.0)
+        r_loc_plain = ctx.http(ctx.api(f"/permission/request?location={loc_enc}"),
+                               timeout=10.0)
+        r_saved = ctx.http(ctx.api(
+            f"/permission/saved?projectID={loc_enc}"), timeout=10.0)
+        facts["pending_session_ep"] = {"http": pend_a_st, "pending": pend_a}
+        facts["location_query_forms"] = {
+            "deepObject": {"http": r_loc_deep.status, "body": _body_head(r_loc_deep)},
+            "plain": {"http": r_loc_plain.status, "body": _body_head(r_loc_plain)}}
+        facts["saved_during_pending"] = {"http": r_saved.status,
+                                         "body": _body_head(r_saved)}
+        ctx.evidence(f"{ev}/pending-observation.json",
+                     json.dumps(facts, ensure_ascii=False, indent=2) + "\n")
+        if not pend_a:
+            ctx.emit("attention.02", "INCONCLUSIVE", "待验证", "待验证",
+                     f"120s 未取得 pending 样本（HTTP={pend_a_st}）——"
+                     "ask 规则/工具触发形态需复核；双端点观测已留证",
+                     f"{ev}/pending-observation.json")
+            return
+        rid_a = pend_a["id"]
+        r_rep = ctx.http(ctx.api(f"/session/{sid_a}/permission/{rid_a}/reply?directory={enc}"),
+                         method="POST", json_body={"decision": "once"}, timeout=15.0)
+        after_a, after_a_st = _perm_pending_list(ctx, sid_a, enc)
+        r_dup = ctx.http(ctx.api(f"/session/{sid_a}/permission/{rid_a}/reply?directory={enc}"),
+                         method="POST", json_body={"decision": "once"}, timeout=15.0)
+        r_ghost = ctx.http(ctx.api(f"/session/{sid_a}/permission/per_p1b_ghost/reply?directory={enc}"),
+                           method="POST", json_body={"decision": "once"}, timeout=15.0)
+        facts["once_reply"] = {"request_id": rid_a, "http": r_rep.status,
+                               "body": _body_head(r_rep)}
+        facts["pending_after_once"] = {"http": after_a_st, "list": after_a}
+        facts["duplicate_reply"] = {"http": r_dup.status, "body": _body_head(r_dup)}
+        facts["ghost_reply"] = {"http": r_ghost.status, "body": _body_head(r_ghost)}
+        ctx.evidence(f"{ev}/once-facts.json",
+                     json.dumps(facts, ensure_ascii=False, indent=2) + "\n")
+        once_ok = bool(r_rep.ok and after_a == [])
+        disc_ok = bool((r_dup.status in (400, 404)) and (r_ghost.status in (400, 404)))
+        # ---- fixture B：reject 回复（独立 pending 实例）
+        sid_b, _, st_b = _create_session(ctx, ctx.base, ctx.work, "p1b-attn-reject",
+                                         f"{ev}/session-reject.json")
+        reject_ok = False
+        if sid_b:
+            mid_b = _make_mid(ctx, "permrej")
+            ctx.http(_prompt_url(ctx, sid_b, enc),
+                     method="POST", json_body={"id": mid_b, "text": PERM_PROMPT},
+                     timeout=30.0)
+            pend_b, pend_b_st = _poll_pending(ctx, sid_b, enc, 120)
+            if pend_b:
+                rid_b = pend_b["id"]
+                r_rej = ctx.http(ctx.api(
+                    f"/session/{sid_b}/permission/{rid_b}/reply?directory={enc}"),
+                    method="POST", json_body={"decision": "reject"}, timeout=15.0)
+                after_b, after_b_st = _perm_pending_list(ctx, sid_b, enc)
+                texts_b = _wait_reply(ctx, sid_b, enc, 45)
+                outcome_b, _ = _session_outcome(ctx, sid_b, enc)
+                reject_ok = bool(r_rej.ok and after_b == [])
+                facts["reject"] = {"request_id": rid_b, "http": r_rej.status,
+                                   "pending_after": {"http": after_b_st,
+                                                     "list": after_b},
+                                   "assistant_texts": texts_b[:2],
+                                   "turn_outcome": outcome_b}
+                ctx.evidence(f"{ev}/reject-facts.json",
+                             json.dumps(facts["reject"], ensure_ascii=False,
+                                        indent=2) + "\n")
+            else:
+                facts["reject"] = {"pending_http": pend_b_st, "pending": None}
+        if once_ok and disc_ok and reject_ok:
+            ctx.emit("attention.02", "PASS", "待验证", "可满足",
+                     "permission 回复实证齐全：once 被接受且 pending 清空、重复回复与"
+                     "不存在目标均被 4xx 拒绝、reject 独立 fixture 回复后清空；"
+                     "request/saved 双端点 pending 期观测已留证（合并语义素材）",
+                     f"{ev}/once-facts.json")
+        elif not once_ok:
+            ctx.emit("attention.02", "FAIL", "待验证", "不可满足",
+                     f"once 回复未达成：reply HTTP={r_rep.status} pending 清空="
+                     f"{after_a == []}", f"{ev}/once-facts.json")
+        else:
+            ctx.emit("attention.02", "INCONCLUSIVE", "待验证", "待验证",
+                     f"once 主路径成立但子断言不全：重复/不存在区分={disc_ok} "
+                     f"reject={reject_ok}", f"{ev}/once-facts.json")
+    finally:
+        _stop_sub(sub_proc)
+
+
+def _body_head(r: Any) -> Any:
+    try:
+        return json.loads(r.body)
+    except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+        return (r.body or b"")[:200].decode("utf-8", "replace") \
+            if hasattr(r, "body") else None
+
+
+# ---------------------------------------------------------------- 探测：prompt.03
+
+def probe_p1b_prompt03(ctx: Ctx, enc: str) -> None:
+    ev = "live/prompt"
+    rel = f"{ev}/p1b-stream.ndjson"
+    sub = _subscribe(ctx, rel)
+    if sub is None:
+        ep = ctx.evidence(f"{ev}/no-stream.txt", "订阅失败\n")
+        ctx.emit("prompt.03", "INCONCLUSIVE", "待验证", "待验证", "事件流订阅失败", ep)
+        return
+    sub_proc, reader = sub
+    try:
+        fpath = ctx.work / "attach-probe.txt"
+        S.sandbox_write(fpath, FILE_MARK + "\n")
+        sid, _, st = _create_session(ctx, ctx.base, ctx.work, "p1b-file",
+                                     f"{ev}/session.json")
+        if not sid:
+            ctx.emit("prompt.03", "INCONCLUSIVE", "待验证", "待验证",
+                     f"fixture session 创建失败（{st}）", f"{ev}/session.json")
+            return
+        mid = _make_mid(ctx, "file")
+        submit = _prompt_url(ctx, sid, enc)
+        r = ctx.http(submit, method="POST",
+                     json_body={"id": mid, "text": FILE_PROMPT,
+                                "files": [{"uri": f"file://{fpath}",
+                                           "name": "attach-probe.txt"}]},
+                     timeout=30.0)
+        ep_sub = ctx.evidence(f"{ev}/file-submit.txt",
+                              f"submit={r.status} mid={mid} err={r.error} "
+                              f"body={r.body[:300]!r}\n")
+        if not r.ok:
+            ctx.emit("prompt.03", "FAIL", "不兼容", "不可满足",
+                     f"file part 形态被拒绝：HTTP {r.status}（拒绝形态记录于证据）",
+                     ep_sub)
+            return
+        start = reader.baseline()
+        ok_f, frames = _wait(reader, start, 120, lambda e: _find_str(e, FILE_MARK))
+        _dump_frames(ctx, f"{ev}/p1b-frames.jsonl", frames)
+        texts = _wait_reply(ctx, sid, enc, 60)
+        hit = any(FILE_MARK in t for t in texts)
+        ctx.evidence(f"{ev}/assistant-texts.json",
+                     json.dumps(texts[:3], ensure_ascii=False, indent=2) + "\n")
+        if hit or ok_f:
+            ctx.emit("prompt.03", "PASS", "待验证", "可满足",
+                     f"file part 被接受（HTTP {r.status}）且 agent 读出文件内容"
+                     f"（消息回显命中={'消息历史' if hit else 'SSE 事件'}；"
+                     f"content={FILE_MARK!r}）", f"{ev}/assistant-texts.json")
+        elif texts:
+            ctx.emit("prompt.03", "INCONCLUSIVE", "待验证", "待验证",
+                     "file part 被接受、assistant 有产出但未见文件内容回显"
+                     "（可能模型行为差异）；原始响应与帧已留证",
+                     f"{ev}/assistant-texts.json")
+        else:
+            ctx.emit("prompt.03", "INCONCLUSIVE", "待验证", "待验证",
+                     "file part 被接受但 120s 内无 agent 产出（模型超时/拒绝）；"
+                     "原始响应与帧已留证", f"{ev}/assistant-texts.json")
+    finally:
+        _stop_sub(sub_proc)
+
+
+# ---------------------------------------------------------------- 探测：interrupt 停止 wire（tasks 1.1 运行时）
+
+def probe_p1b_interrupt(ctx: Ctx, enc: str) -> None:
+    ev = "live/lifecycle"
+    rel = f"{ev}/p1b-stream.ndjson"
+    sub = _subscribe(ctx, rel)
+    if sub is None:
+        _extra(ctx, "p1b.interrupt", "INCONCLUSIVE", {"reason": "no stream"},
+               [f"{ev}/no-stream.txt"])
+        return
+    sub_proc, reader = sub
+    try:
+        facts: dict[str, Any] = {"attempts": []}
+        verdict = "INCONCLUSIVE"
+        for attempt, tool_prompt in ((1, TOOL_PROMPT), (2, TOOL_PROMPT_LONG)):
+            sid, _, st = _create_session(ctx, ctx.base, ctx.work,
+                                         f"p1b-interrupt-{attempt}",
+                                         f"{ev}/session-{attempt}.json")
+            if not sid:
+                facts["attempts"].append({"attempt": attempt,
+                                          "error": f"create={st}"})
+                continue
+            mid = _make_mid(ctx, "tool")
+            r = ctx.http(_prompt_url(ctx, sid, enc),
+                         method="POST", json_body={"id": mid, "text": tool_prompt},
+                         timeout=30.0)
+            start = reader.baseline()
+            ok_busy, frames_busy = _wait(reader, start, 45, lambda e: (
+                S.event_session_id(e) == sid and _status_value(e) == "busy"))
+            r_int = ctx.http(ctx.api(f"/session/{sid}/interrupt?directory={enc}"),
+                             method="POST", timeout=15.0)
+            r_abort = ctx.http(ctx.api(f"/session/{sid}/abort?directory={enc}"),
+                               method="POST", timeout=15.0)
+            start2 = reader.baseline()
+            ok_idle, frames_idle = _wait(reader, start2, 30, lambda e: (
+                S.event_session_id(e) == sid and _status_value(e) == "idle"))
+            _dump_frames(ctx, f"{ev}/p1b-frames-{attempt}.jsonl",
+                         frames_busy + frames_idle)
+            outcome, oc_st = _session_outcome(ctx, sid, enc)
+            mid2 = _make_mid(ctx, "after")
+            r_cont = ctx.http(_prompt_url(ctx, sid, enc),
+                              method="POST",
+                              json_body={"id": mid2, "text": MIN_PROMPT},
+                              timeout=30.0)
+            texts = _wait_reply(ctx, sid, enc, 60)
+            resumed = any("pong" in t for t in texts)
+            att = {"attempt": attempt, "submit": r.status, "busy_event": ok_busy,
+                   "interrupt": {"http": r_int.status,
+                                 "body": _body_head(r_int)},
+                   "abort_candidate": {"http": r_abort.status,
+                                       "body": _body_head(r_abort)},
+                   "idle_event_after": ok_idle, "turn_outcome": outcome,
+                   "outcome_http": oc_st,
+                   "continue_submit": r_cont.status, "resumed_reply": resumed}
+            facts["attempts"].append(att)
+            ctx.evidence(f"{ev}/interrupt-facts-{attempt}.json",
+                         json.dumps(att, ensure_ascii=False, indent=2) + "\n")
+            if (r_int.status == 200 and outcome == "interrupted" and resumed):
+                verdict = "PASS"
+                break
+            if attempt == 2 and r_int.status == 200 and resumed:
+                verdict = "INCONCLUSIVE"   # 停止生效可续但 outcome 未达 interrupted
+        _extra(ctx, "p1b.interrupt", verdict, facts,
+               [f"{ev}/interrupt-facts-1.json", f"{ev}/interrupt-facts-2.json"])
+    finally:
+        _stop_sub(sub_proc)
+
+
+# ---------------------------------------------------------------- 探测：environment 注入（tasks 1.3）
+
+def probe_p1b_env(ctx: Ctx, enc: str) -> None:
+    ev = "live/env"
+    rel = f"{ev}/p1b-stream.ndjson"
+    sub = _subscribe(ctx, rel)
+    if sub is None:
+        _extra(ctx, "p1b.environment", "INCONCLUSIVE", {"reason": "no stream"},
+               [f"{ev}/no-stream.txt"])
+        return
+    sub_proc, reader = sub
+    try:
+        facts: dict[str, Any] = {}
+        sid_a, _, st_a = _create_session(ctx, ctx.base, ctx.work, "p1b-env-a",
+                                         f"{ev}/session-a.json")
+        sid_b, _, st_b = _create_session(ctx, ctx.base, ctx.work, "p1b-env-b",
+                                         f"{ev}/session-b.json")
+        if not sid_a or not sid_b:
+            _extra(ctx, "p1b.environment", "INCONCLUSIVE",
+                   {"create": {"a": st_a, "b": st_b}}, [f"{ev}/session-a.json"])
+            return
+        r_a = ctx.http(ctx.api(f"/session/{sid_a}/environment?directory={enc}"),
+                       method="PUT",
+                       json_body={"variables": {"P1B_PROBE_VAR": "alpha"}},
+                       timeout=15.0)
+        r_b = ctx.http(ctx.api(f"/session/{sid_b}/environment?directory={enc}"),
+                       method="PUT",
+                       json_body={"variables": {"P1B_PROBE_VAR": "beta"}},
+                       timeout=15.0)
+        facts["put"] = {"a": {"http": r_a.status, "body": _body_head(r_a)},
+                        "b": {"http": r_b.status, "body": _body_head(r_b)}}
+        # 会话 shell API 直读（PUT environment 契约的直接作用域）：
+        # 提交后经 SSE session.shell.ended 载荷取输出（GET /shell/{id}/output
+        # 对已完成 shell 返回空游标，.out 文件会被清理——SSE 载荷是权威输出）
+        out_a = _session_shell_env(ctx, sid_a, enc, reader)
+        out_b = _session_shell_env(ctx, sid_b, enc, reader)
+        facts["shell_api"] = {"a": out_a, "b": out_b}
+        ctx.evidence(f"{ev}/env-shell.json",
+                     json.dumps(facts, ensure_ascii=False, indent=2) + "\n")
+        # 模型 bash 工具观察（tasks 1.3 场景：agent 命令继承 session env）。
+        # work config 带 shell ask 规则——prompt 提交后 poll pending 并自动 reply once
+        # （permission 回复仅为达成 env 观测的手段，回复语义已由 attention.02 独立实证）
+        mid = _make_mid(ctx, "env")
+        r_m = ctx.http(_prompt_url(ctx, sid_a, enc),
+                       method="POST",
+                       json_body={"id": mid,
+                                  "text": "run exactly: printenv P1B_PROBE_VAR; "
+                                          "report the raw output"},
+                       timeout=30.0)
+        start = reader.baseline()
+        pend_env, pend_env_st = _poll_pending(ctx, sid_a, enc, 90)
+        replied = None
+        if pend_env and isinstance(pend_env.get("id"), str):
+            r_envrep = ctx.http(ctx.api(
+                f"/session/{sid_a}/permission/{pend_env['id']}/reply?directory={enc}"),
+                method="POST", json_body={"decision": "once"}, timeout=15.0)
+            replied = r_envrep.status
+        ok_alpha, frames = _wait(reader, start, 150, lambda e: _find_str(e, "alpha"))
+        hit_beta, _ = _wait(reader, 0, 1, lambda e: _find_str(e, "beta"))
+        _dump_frames(ctx, f"{ev}/p1b-frames.jsonl", frames)
+        texts = _wait_reply(ctx, sid_a, enc, 60)
+        facts["model_bash_in_a"] = {"submit": r_m.status,
+                                    "pending": {"http": pend_env_st,
+                                                "request_id": (pend_env or {}).get("id")},
+                                    "auto_reply_once": replied,
+                                    "alpha_event": ok_alpha,
+                                    "beta_seen": hit_beta,
+                                    "texts": texts[:2]}
+        ctx.evidence(f"{ev}/env-model.json",
+                     json.dumps(facts["model_bash_in_a"], ensure_ascii=False,
+                                indent=2) + "\n")
+        shell_a_ok = "alpha" in (out_a.get("output") or "") \
+            and "beta" not in (out_a.get("output") or "")
+        shell_b_ok = "beta" in (out_b.get("output") or "") \
+            and "alpha" not in (out_b.get("output") or "")
+        if shell_a_ok and shell_b_ok and ok_alpha:
+            verdict = "PASS"
+        elif shell_a_ok and shell_b_ok:
+            verdict = "INCONCLUSIVE"   # 会话 shell 隔离成立，模型侧未观测到
+        else:
+            verdict = "INCONCLUSIVE"
+        _extra(ctx, "p1b.environment", verdict, facts,
+               [f"{ev}/env-shell.json", f"{ev}/env-model.json",
+                f"{ev}/p1b-frames.jsonl"])
+    finally:
+        _stop_sub(sub_proc)
+
+
+def _session_shell_env(ctx: Ctx, sid: str, enc: str, reader: _StreamReader) -> dict:
+    start = reader.baseline()
+    r = ctx.http(ctx.api(f"/session/{sid}/shell?directory={enc}"), method="POST",
+                 json_body={"command": "printenv P1B_PROBE_VAR"}, timeout=15.0)
+    out: dict[str, Any] = {"submit": r.status, "body": _body_head(r)}
+    if r.status != 204 and r.status != 200:
+        return out
+    # 经 SSE 等 session.shell.ended（output.output 载荷），60s 界
+    ok, frames = _wait(reader, start, 60, lambda e: (
+        e.get("type") == "session.shell.ended"
+        and S.event_session_id(e) == sid))
+    for _, e in frames:
+        if e.get("type") == "session.shell.ended":
+            d = e.get("data", {})
+            outp = d.get("output") or {}
+            if isinstance(outp, dict) and "output" in outp:
+                out["output"] = outp["output"]
+                out["exit"] = (d.get("shell") or {}).get("exit")
+                break
+    out["ended_event"] = ok
+    return out
+
+
+# ---------------------------------------------------------------- 探测：migration.forward pending permission 保留（tasks 1.8/④）
+
+def probe_p1b_migration(ctx: Ctx, enc: str) -> None:
+    """v1 造 pending permission 样本（模型工具触发 shell ask）→ 停写冻结 → v2 打开
+    同一数据树 → v2 侧可见（pending 列表）且可回复。官方升级路径 = v1 serve 造数
+    （同一 envroot/XDG 数据树）→ v1 停止 → v2 serve 打开同一目录。"""
+    ev = "live/migration"
+    v1_port, v2_port = 31721, 31722   # harness 默认 29721/29722 + 2000
+    gen = ctx.sbroot / "migration-p1b" / "fixture-gen"
+    if gen.exists():
+        _extra(ctx, "p1b.migration_pending", "INCONCLUSIVE",
+               {"reason": f"fixture dir exists: {gen}"}, [])
+        return
+    facts: dict[str, Any] = {}
+    # v1 fixture 环境：独立 envroot + 带 permission 规则的 cwd config
+    # v1.18.26 形态：permission 对象（拒绝 v2 permissions 数组——ConfigInvalidError 实证）
+    for sub in ("home", "xdg/config", "xdg/data", "xdg/state", "xdg/cache", "tmp", "cwd"):
+        S.sandbox_mkdir(gen / sub)
+    S.sandbox_write(gen / "cwd" / "opencode.json", json.dumps({
+        "$schema": "https://opencode.ai/config.json",
+        "model": "archi/deepseek-v4.1-flash",
+        "permission": {"bash": "ask"},
+        "provider": {"archi": {"npm": "@ai-sdk/anthropic", "name": "archi",
+                               "options": {"baseURL": "https://archi.marscore.net/v1",
+                                           "apiKey": "{env:ANTHROPIC_AUTH_TOKEN}"},
+                               "models": {"deepseek-v4.1-flash":
+                                          {"name": "deepseek-v4.1-flash"}}}},
+    }, indent=1))
+    rc = ctx.serve_start("mig-v1", ctx.locked["v1"]["exec_path"], v1_port,
+                         gen, gen / "cwd")
+    if rc != 0:
+        _extra(ctx, "p1b.migration_pending", "INCONCLUSIVE",
+               {"reason": f"v1 serve rc={rc}"}, ["live/serve-mig-v1.log"])
+        return
+    gbase = f"http://127.0.0.1:{v1_port}"
+    gdir = ctx.dir_param(gen / "cwd")
+    fsid = None
+    r_c = ctx.http(f"{gbase}/session?directory={gdir}", method="POST",
+                   json_body={"title": "p1b-migration-pending"}, timeout=30.0)
+    ctx.evidence(f"{ev}/v1-session.json", r_c.body)
+    if r_c.ok:
+        tmp_rel = f"{ev}/.v1-session.json"
+        S.evidence_write(ctx.run_dir, tmp_rel, r_c.body.decode("utf-8", "replace"))
+        fsid, _ = _extract_session_id(ctx.run_dir / tmp_rel)
+        (ctx.run_dir / tmp_rel).unlink(missing_ok=True)
+    if not fsid:
+        ctx.serve_stop("mig-v1")
+        _extra(ctx, "p1b.migration_pending", "INCONCLUSIVE",
+               {"reason": "v1 session create failed"}, [f"{ev}/v1-session.json"])
+        return
+    facts["v1_session"] = fsid
+    # v1 wire：prompt_async + parts（1.18.26 形态）
+    r_p = ctx.http(f"{gbase}/session/{fsid}/prompt_async?directory={gdir}",
+                   method="POST",
+                   json_body={"messageID": "msg_p1bmig00000001",
+                              "parts": [{"type": "text", "text": PERM_PROMPT}]},
+                   timeout=60.0)
+    ctx.evidence(f"{ev}/v1-prompt.txt", f"submit={r_p.status} err={r_p.error}\n")
+    # 等 v1 pending permission 样本（模型触发；v1 wire：GET /permission?directory=
+    # 根路径无 /api 前缀——v1 /doc 实证；touch /tmp/* 命中 external_directory 请求）
+    pend = None
+    deadline = time.monotonic() + 150
+    while time.monotonic() < deadline and pend is None:
+        r_perm = ctx.http(f"{gbase}/permission?directory={gdir}", timeout=10.0)
+        if r_perm.status == 200:
+            try:
+                items = json.loads(r_perm.body)
+                if isinstance(items, list) and items \
+                        and isinstance(items[0], dict) and (
+                            items[0].get("id") or items[0].get("permissionID")):
+                    pend = items[0]
+            except json.JSONDecodeError:
+                pass
+        time.sleep(3)
+    ctx.evidence(f"{ev}/v1-pending.json",
+                 json.dumps(pend, ensure_ascii=False, indent=2) + "\n")
+    if not pend:
+        ctx.serve_stop("mig-v1")
+        _extra(ctx, "p1b.migration_pending", "INCONCLUSIVE",
+               {"reason": "v1 pending permission not produced (model trigger)",
+                "v1_session": fsid}, [f"{ev}/v1-pending.json"])
+        return
+    facts["v1_pending"] = pend
+    r_h = ctx.http(f"{gbase}/session/{fsid}/message?directory={gdir}", timeout=15.0)
+    ctx.evidence(f"{ev}/v1-history.json", r_h.body)
+    # 停写冻结（v1 整树停止）
+    if not ctx.serve_stop("mig-v1"):
+        _extra(ctx, "p1b.migration_pending", "INCONCLUSIVE",
+               {"reason": "v1 serve_stop failed"}, [])
+        return
+    # v2 打开同一数据树（官方升级路径：换二进制、同 envroot/数据）
+    rc2 = ctx.serve_start("mig-v2", ctx.locked["v2"]["exec_path"], v2_port,
+                          gen, gen / "cwd")
+    if rc2 != 0:
+        _extra(ctx, "p1b.migration_pending", "INCONCLUSIVE",
+               {"reason": f"v2 serve rc={rc2}"}, ["live/serve-mig-v2.log"])
+        return
+    fbase = f"http://127.0.0.1:{v2_port}"
+    fdir = ctx.dir_param(gen / "cwd")
+    # v2 侧可见性：session 列表 + pending permission 列表
+    r_ls = ctx.http(f"{fbase}/api/session?directory={fdir}", timeout=15.0)
+    ctx.evidence(f"{ev}/v2-session-list.json", r_ls.body)
+    listed = False
+    try:
+        items = json.loads(r_ls.body)
+        items = items.get("data") if isinstance(items, dict) else items
+        listed = isinstance(items, list) and fsid in [i.get("id") for i in items
+                                                      if isinstance(i, dict)]
+    except json.JSONDecodeError:
+        pass
+    r_v2perm = ctx.http(f"{fbase}/api/session/{fsid}/permission?directory={fdir}",
+                        timeout=10.0)
+    ctx.evidence(f"{ev}/v2-pending.json", r_v2perm.body)
+    v2_pend = None
+    try:
+        items = json.loads(r_v2perm.body)
+        items = items.get("data") if isinstance(items, dict) else items
+        if isinstance(items, list) and items:
+            v2_pend = items[0]
+    except json.JSONDecodeError:
+        pass
+    facts["v2"] = {"listed": listed, "pending_http": r_v2perm.status,
+                   "pending": v2_pend}
+    # v2 侧可回复性：对同一 pending 样本 reply once
+    replyable = False
+    reply_http = None
+    if v2_pend and isinstance(v2_pend.get("id"), str):
+        r_rep = ctx.http(f"{fbase}/api/session/{fsid}/permission/"
+                         f"{v2_pend['id']}/reply?directory={fdir}",
+                         method="POST", json_body={"decision": "once"},
+                         timeout=15.0)
+        reply_http = r_rep.status
+        r_after = ctx.http(f"{fbase}/api/session/{fsid}/permission?directory={fdir}",
+                           timeout=10.0)
+        ctx.evidence(f"{ev}/v2-pending-after-reply.json", r_after.body)
+        try:
+            items = json.loads(r_after.body)
+            items = items.get("data") if isinstance(items, dict) else items
+            gone = isinstance(items, list) and items == []
+        except json.JSONDecodeError:
+            gone = False
+        replyable = bool(r_rep.ok and gone)
+        facts["v2"]["reply"] = {"http": r_rep.status, "pending_gone": gone}
+    ctx.serve_stop("mig-v2")
+    ctx.evidence(f"{ev}/facts.json",
+                 json.dumps(facts, ensure_ascii=False, indent=2) + "\n")
+    # 判定基准（tasks 1.8 ④：官方升级路径下 pending 状态保留性）：
+    # PASS = v2 会话可见 + v1 pending 样本在 v2 侧可见且可回复；
+    # FAIL = 会话可见但 pending 丢失（升级路径丢弃 pending —— 有效负面实证）；
+    # 其余 = INCONCLUSIVE（fixture/serve 故障）
+    if listed and v2_pend and replyable:
+        _extra(ctx, "p1b.migration_pending", "PASS",
+               {**facts, "pending_id_preserved": v2_pend.get("id") == pend.get("id")},
+               [f"{ev}/facts.json", f"{ev}/v1-pending.json", f"{ev}/v2-pending.json"])
+    elif listed and not v2_pend:
+        _extra(ctx, "p1b.migration_pending", "FAIL",
+               {**facts, "verdict_note":
+                "v2 会话/消息可见但 v1 pending permission 未保留（v1.18.26 pending 为"
+                "进程内存态：样本 ID 不存在于数据树任何持久化存储——停服即失，升级后"
+                "v2 pending 列表为空）。有效负面实证。"},
+               [f"{ev}/facts.json", f"{ev}/v1-pending.json", f"{ev}/v2-pending.json"])
+    else:
+        _extra(ctx, "p1b.migration_pending", "INCONCLUSIVE",
+               {**facts, "note": "listed/pending/reply 未全部成立"},
+               [f"{ev}/facts.json"])
+
+# ---------------------------------------------------------------- 主流程
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if len(argv) != 2 or argv[0].startswith("-") or argv[1].startswith("-"):
+        print("Usage: p1b-live-probe.py <locked-manifest> <evidence-dir>",
+              file=sys.stderr)
+        return S.EXIT_PRE_REJECT
+    locked_path, evidence_arg = argv
+    if os.environ.get("SPIKE_SELFTEST"):
+        S.pre_reject("SPIKE_SELFTEST must not be set in formal runs")
+    run_dir = S.run_use_existing()
+    if S.canonical(evidence_arg) != S.canonical(run_dir):
+        S.pre_reject(f"<evidence-dir> is not the canonical run root: {evidence_arg}")
+    sbroot = S.sandbox_root()
+    if S.canonical(locked_path) != sbroot / "manifest.json":
+        S.pre_reject("locked manifest must be the authoritative sandbox file")
+    evidence_copy = run_dir / "manifest.json"
+    if not evidence_copy.is_file():
+        S.pre_reject("evidence copy of locked manifest missing")
+    if Path(locked_path).read_bytes() != evidence_copy.read_bytes():
+        S.harness_fail("authoritative manifest and evidence copy diverge")
+    locked = S.validate_manifest(Path(locked_path), "locked")
+    mech, _ = S.boundary_env_check()
+    if mech != locked["boundary_mechanism"]:
+        S.pre_reject("boundary mechanism mismatch with locked manifest")
+    S.canary_verify(locked["canary_target"], "canary.log", run_dir)
+
+    ctx = Ctx(run_dir, locked)
+    S.install_signal_handlers(ctx.registry)
+
+    envroot = ctx.sbroot / "p1b-env"
+    S.sandbox_mkdir(envroot)
+    rc = ctx.serve_start("main", ctx.locked["v2"]["exec_path"], PORT,
+                         envroot, ctx.work)
+    if rc != 0:
+        ep = ctx.evidence("live/no-serve.txt", f"serve rc={rc}\n")
+        print(S.redact_text(f"serve not ready rc={rc}"), file=sys.stderr)
+        for pid in ("event.02d.status_changed", "event.02e.attention_raised",
+                    "event.02f.attention_resolved", "attention.02", "prompt.03"):
+            ctx.emit(pid, "INCONCLUSIVE", "待验证", "待验证", "serve 未就绪", ep)
+        for xid in ("p1b.interrupt", "p1b.status_seq", "p1b.environment"):
+            _extra(ctx, xid, "INCONCLUSIVE", {"reason": "serve not ready"}, [ep])
+        return S.EXIT_INCONCLUSIVE
+    ctx.base = BASE
+    ctx.discover_wire_forms()
+    enc = ctx.dir_param(ctx.work)
+
+    model_ok, gate_ep = _model_gate(ctx, enc)
+    if not model_ok:
+        print(S.redact_text("model gate failed"), file=sys.stderr)
+        for pid in ("event.02d.status_changed", "event.02e.attention_raised",
+                    "event.02f.attention_resolved", "attention.02", "prompt.03"):
+            ctx.emit(pid, "INCONCLUSIVE", "待验证", "待验证",
+                     "模型门未通过（/api/model 无目标模型或最小 prompt 无真实回复，≤2 次）",
+                     gate_ep)
+        for xid in ("p1b.interrupt", "p1b.status_seq", "p1b.environment"):
+            _extra(ctx, xid, "INCONCLUSIVE", {"reason": "model gate failed"},
+                   [gate_ep])
+        ctx.serve_stop("main")
+        return S.EXIT_INCONCLUSIVE
+
+    probes = (probe_p1b_events, probe_p1b_attention, probe_p1b_prompt03,
+              probe_p1b_interrupt, probe_p1b_env, probe_p1b_migration)
+    for fn in probes:
+        try:
+            fn(ctx, enc)
+        except S.SpikeExit as e:
+            if e.code in (S.EXIT_PRE_REJECT, S.EXIT_SAFETY):
+                raise
+            ctx.any_harness = True
+            print(S.redact_text(f"harness error in {fn.__name__}: {e}"),
+                  file=sys.stderr)
+        except Exception as e:
+            ctx.any_harness = True
+            print(S.redact_text(
+                f"harness error in {fn.__name__}: {type(e).__name__}: {e}"),
+                file=sys.stderr)
+
+    ctx.serve_stop("main")
+    ctx.registry.cleanup_all()
+    S.pump_join_all()
+    if S.pump_still_alive() or S.pump_errors():
+        ctx.any_harness = True
+    if ctx.any_harness:
+        return S.EXIT_HARNESS
+    if ctx.any_fail:
+        return S.EXIT_FAIL
+    if ctx.any_inconclusive:
+        return S.EXIT_INCONCLUSIVE
+    return S.EXIT_OK
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except S.SpikeExit as e:
+        sys.exit(e.code)
+    except Exception as e:
+        print(S.redact_text(f"harness error: unexpected: {type(e).__name__}: {e}"),
+              file=sys.stderr)
+        sys.exit(4)

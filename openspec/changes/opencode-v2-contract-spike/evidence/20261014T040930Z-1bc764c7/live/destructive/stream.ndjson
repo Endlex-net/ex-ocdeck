@@ -1,0 +1,6 @@
+data: {"id":"evt_1389bff21001v0qgM7P0aPHFCY","type":"server.connected","data":{}}
+
+: heartbeat
+
+data: {"id":"evt_1389bff3c001TUfdvA4Ht9VgYg","created":1791951109948,"type":"session.created","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec76400d2ffe6IRDT8d05ndQGh","slug":"tidy-comet","version":"2.0.28","projectID":"global","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"subpath":"openspec/changes/opencode-v2-contract-spike/sandbox/work","title":"spike-event-delete"},"durable":{"aggregateID":"ses_ec76400d2ffe6IRDT8d05ndQGh","seq":0,"version":1}}
+

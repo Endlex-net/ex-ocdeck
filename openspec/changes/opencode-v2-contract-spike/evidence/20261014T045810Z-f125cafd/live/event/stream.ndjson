@@ -1,0 +1,70 @@
+data: {"id":"evt_138c801e6001G9BaR6tEZ6Pbc5","type":"server.connected","data":{}}
+
+: heartbeat
+
+data: {"id":"evt_138c802b7001RKJXSLuEVJPRRx","created":1791953994423,"type":"session.created","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec737fd56ffek3VaDCvEbPU0o8","slug":"stellar-wolf","version":"2.0.28","projectID":"global","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"subpath":"openspec/changes/opencode-v2-contract-spike/sandbox/work","title":"spike-event-create"},"durable":{"aggregateID":"ses_ec737fd56ffek3VaDCvEbPU0o8","seq":0,"version":1}}
+
+data: {"id":"evt_138c802db001f8yISc4PJ70iNY","created":1791953994459,"type":"project.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"id":"global","canonical":"/repo","vcs":"git","time":{"created":1791951064543,"updated":1791951064543,"active":1791953994459},"sandboxes":[]}}
+
+data: {"id":"evt_138c803aa001HjJNPO2w0QvVjz","created":1791953994666,"type":"session.renamed","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec73802d2ffe2anxd37pvXaeiD","title":"spike-event-updated"},"durable":{"aggregateID":"ses_ec73802d2ffe2anxd37pvXaeiD","seq":1,"version":1}}
+
+data: {"id":"evt_138c8049d001l3W3RPZukAddnQ","created":1791953994909,"type":"integration.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138c804a2001ro6bon84Pztm1N","created":1791953994914,"type":"provider.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138c804aa001NbuXA4991NV5c0","created":1791953994922,"type":"model.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138c804bd001na7zWPbYSxN6XB","created":1791953994941,"type":"vcs.branch.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"branch":"master"}}
+
+data: {"id":"evt_138c804be0015SGaeYnnvF2TAI","created":1791953994942,"type":"agent.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138c804be002mE2mArRhAlugc2","created":1791953994942,"type":"command.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138c804be003N6590GVP6MXme4","created":1791953994942,"type":"skill.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138c804c0001LDFctasOCgTLjZ","created":1791953994944,"type":"websearch.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138c804ce002jFFDC3vrpH1BzL","created":1791953994958,"type":"reference.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138c804d4001V3IZ57oQFoZXdn","created":1791953994964,"type":"plugin.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138c804d5001IJ689NLaqv0uxP","created":1791953994965,"type":"session.inbox.enqueued","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"inboxID":"msg_status_df10a852464c7806","sessionID":"ses_ec73802d2ffe2anxd37pvXaeiD","item":{"type":"user","payload":{"text":"status probe ping"},"delivery":"steer"}},"durable":{"aggregateID":"ses_ec73802d2ffe2anxd37pvXaeiD","seq":2,"version":1}}
+
+data: {"id":"evt_138c804da001Z52wW7bKYvS1Sf","created":1791953994970,"type":"session.execution.started","data":{"sessionID":"ses_ec73802d2ffe2anxd37pvXaeiD"},"durable":{"aggregateID":"ses_ec73802d2ffe2anxd37pvXaeiD","seq":3,"version":1}}
+
+data: {"id":"evt_138c804ef001TnxEgEEeG2ou07","created":1791953994991,"metadata":{"instructions":{"initial":true}},"type":"session.instructions.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec73802d2ffe2anxd37pvXaeiD","delta":{"core/codemode":"e6428fd7742161f6c3a6c86e53cbbe2c6e4dcc462bbf1a1a07bc4fcbeb9e0b0b","core/skill-guidance":"8394362d28c82fa4d13c7a9f5568c05680f6687e07db8f426a0e3c92f3027dc9","core/date":"69dc8438f9eb203ca34f520e89b000bba5bd89c8b9ebd3624d24e9ee37f64b0c","core/environment":"337fddb6605a55b104b312ab9cd34dcecac32698223dd62577521a929c0a7990"}},"durable":{"aggregateID":"ses_ec73802d2ffe2anxd37pvXaeiD","seq":4,"version":2}}
+
+data: {"id":"evt_138c804f3001RVfRzuGQUIl8Vg","created":1791953994995,"type":"session.inbox.delivered","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec73802d2ffe2anxd37pvXaeiD","inboxID":"msg_status_df10a852464c7806"},"durable":{"aggregateID":"ses_ec73802d2ffe2anxd37pvXaeiD","seq":5,"version":1}}
+
+data: {"id":"evt_138c80d96001RQWjEYEF7vuZBA","created":1791953997206,"type":"models-dev.refreshed","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138c80dde001C1xm3fASe4adYC","created":1791953997278,"type":"integration.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138c80e03001WpTP1EX2L9tiXT","created":1791953997316,"type":"provider.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138c80e0a001vDg2aRnDzTlE2b","created":1791953997322,"type":"model.updated","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{}}
+
+data: {"id":"evt_138c80e0f001JfPI139y4Se863","created":1791953997327,"type":"session.step.started","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec73802d2ffe2anxd37pvXaeiD","agent":"build","model":{"id":"cat-jam-free","providerID":"opencode"},"assistantMessageID":"msg_138c8050100111U7ps4YxzIjBy","snapshot":"43954615385ae6d044cdd341285e5bb6310031cc","started":1791953995017},"durable":{"aggregateID":"ses_ec73802d2ffe2anxd37pvXaeiD","seq":6,"version":1}}
+
+data: {"id":"evt_138c80e20001MqtvbkiNbIARz3","created":1791953997344,"type":"session.reasoning.started","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec73802d2ffe2anxd37pvXaeiD","assistantMessageID":"msg_138c8050100111U7ps4YxzIjBy","ordinal":0,"state":{"reasoningField":"reasoning_content"}},"durable":{"aggregateID":"ses_ec73802d2ffe2anxd37pvXaeiD","seq":7,"version":1}}
+
+data: {"id":"evt_138c80e24001taajq2Xf6I9dlW","created":1791953997348,"type":"session.reasoning.delta","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec73802d2ffe2anxd37pvXaeiD","assistantMessageID":"msg_138c8050100111U7ps4YxzIjBy","ordinal":0,"delta":"The user is asking for a \"status probe ping\". This seems like a simple request to check if the system is working. Let me respond helpfully."}}
+
+data: {"id":"evt_138c80e24002MjFInzshtTSPB1","created":1791953997348,"type":"session.text.started","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec73802d2ffe2anxd37pvXaeiD","assistantMessageID":"msg_138c8050100111U7ps4YxzIjBy","ordinal":0},"durable":{"aggregateID":"ses_ec73802d2ffe2anxd37pvXaeiD","seq":8,"version":1}}
+
+data: {"id":"evt_138c80e28001l430Fv0DLXuxzU","created":1791953997352,"type":"session.reasoning.ended","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec73802d2ffe2anxd37pvXaeiD","assistantMessageID":"msg_138c8050100111U7ps4YxzIjBy","ordinal":0,"text":"The user is asking for a \"status probe ping\". This seems like a simple request to check if the system is working. Let me respond helpfully.","state":{"reasoningField":"reasoning_content"}},"durable":{"aggregateID":"ses_ec73802d2ffe2anxd37pvXaeiD","seq":9,"version":1}}
+
+data: {"id":"evt_138c80e2a001JRFtE0gtiwUD28","created":1791953997354,"type":"session.text.delta","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec73802d2ffe2anxd37pvXaeiD","assistantMessageID":"msg_138c8050100111U7ps4YxzIjBy","ordinal":0,"delta":"Pong! The system is responding and ready for tasks."}}
+
+data: {"id":"evt_138c80e2b001H39IikXOdnB5lT","created":1791953997355,"type":"session.text.ended","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec73802d2ffe2anxd37pvXaeiD","assistantMessageID":"msg_138c8050100111U7ps4YxzIjBy","ordinal":0,"text":"Pong! The system is responding and ready for tasks."},"durable":{"aggregateID":"ses_ec73802d2ffe2anxd37pvXaeiD","seq":10,"version":1}}
+
+data: {"id":"evt_138c80e2e001h4VOjJhclqaHW6","created":1791953997358,"type":"session.step.streamed","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec73802d2ffe2anxd37pvXaeiD","assistantMessageID":"msg_138c8050100111U7ps4YxzIjBy"},"durable":{"aggregateID":"ses_ec73802d2ffe2anxd37pvXaeiD","seq":11,"version":1}}
+
+data: {"id":"evt_138c80e3b001Fkq2pnEG0dEO4M","created":1791953997371,"type":"session.step.ended","location":{"directory":"/repo/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ec73802d2ffe2anxd37pvXaeiD","assistantMessageID":"msg_138c8050100111U7ps4YxzIjBy","finish":"stop","rawFinish":"stop","cost":0,"tokens":{"input":2410,"output":14,"reasoning":39,"cache":{"read":2240,"write":0}},"snapshot":"43954615385ae6d044cdd341285e5bb6310031cc","files":[]},"durable":{"aggregateID":"ses_ec73802d2ffe2anxd37pvXaeiD","seq":12,"version":1}}
+
+data: {"id":"evt_138c80e3d001h1wx9imCQAbeYX","created":1791953997373,"type":"session.usage.updated","data":{"sessionID":"ses_ec73802d2ffe2anxd37pvXaeiD","cost":0,"tokens":{"input":2410,"output":14,"reasoning":39,"cache":{"read":2240,"write":0}}}}
+
+data: {"id":"evt_138c80e3e0012bJaarqvtc9Hal","created":1791953997374,"type":"session.execution.succeeded","data":{"sessionID":"ses_ec73802d2ffe2anxd37pvXaeiD"},"durable":{"aggregateID":"ses_ec73802d2ffe2anxd37pvXaeiD","seq":13,"version":1}}
+
+: heartbeat
+

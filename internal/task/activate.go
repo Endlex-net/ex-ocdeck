@@ -13,11 +13,14 @@ import (
 	"sync"
 	"time"
 
+	"ocdeck/internal/application"
+	appagent "ocdeck/internal/application/agentprovider"
+	appnotif "ocdeck/internal/application/notification"
 	"ocdeck/internal/application/runtime"
 	apptask "ocdeck/internal/application/task"
+	domain "ocdeck/internal/domain/agentprovider"
 	ocdecksess "ocdeck/internal/domain/session"
 	"ocdeck/internal/infrastructure/hostenv"
-	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
 	"ocdeck/internal/infrastructure/store"
 )
@@ -41,6 +44,7 @@ var envBaselineKeys = []string{
 // 均被忽略并提示，不只个别 key）。
 var envReservedKeys = map[string]bool{
 	"OPENCODE_SERVER_PASSWORD": true,
+	"OCDECK_CRED_KIND":         true, // C2c：运行时凭据材料（与 server password 同类，spawn-only）
 	"OCDECK_SERVE_PORT":        true,
 	"OCDECK_TASK_ID":           true,
 	"OCDECK_TASK_NAME":         true,
@@ -238,7 +242,15 @@ func (m *Manager) loadEnvSnapshot(row TaskRow) (map[string]string, error) {
 // exclude：必须跳过的端口（0 = 不排除）；lastPort 快路径与轮转扫描均跳过。
 // 返回可用端口；范围耗尽返回错误。轮转游标避免每次从头扫（B5）。
 // portCursor 记录上次分配位置，下次从此处后轮转，降低并行 Activate 选同端口概率。
+// allocateServePortFn 非 nil 时优先委托（测试注入：fixture 上游监听端口确定性）。
 func (m *Manager) allocatePort(lastPort sql.NullInt64, exclude int) (int, error) {
+	if m.allocateServePortFn != nil {
+		return m.allocateServePortFn(lastPort, exclude)
+	}
+	return m.allocatePortScan(lastPort, exclude)
+}
+
+func (m *Manager) allocatePortScan(lastPort sql.NullInt64, exclude int) (int, error) {
 	pr := m.cfg.ServePortRange
 	// 先试 last_port（跳过 exclude）。
 	if lastPort.Valid {
@@ -308,6 +320,25 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 	if row.Status != StatusSuspended {
 		return newOpErr(codeInvalidState, fmt.Errorf("activate requires suspended, got %s", row.Status))
 	}
+	// C7 门禁修复：registry 准入按任务声明 provider（D10：provider 未注册零副作用
+	// 报错——零进程/网络副作用，仅诊断性 last_error 允许；激活路径以错误返回表达，
+	// 不落 activating）。store 读取错误（基础设施）按 internal 透传。
+	if err := m.registryAdmitTask(ctx, taskID); err != nil {
+		var ae *appagent.Error
+		// C7 门禁修复（mutation 证据：准入判定旁路 `&& false`——activateRun 直接
+		// 执行建程副作用 → 测试 TestC7_ActivateUnknownProviderZeroSideEffects 红
+		//：last_error 缺失 + 建程进程副作用逃逸）。
+		if errors.As(err, &ae) && ae.Kind == appagent.ErrKindProviderNotFound {
+			if diag := m.readStatusForDiagnostic(ctx, taskID); diag != "" {
+				if _, werr := m.writeStatus(ctx, taskID, diag,
+					sql.NullString{String: fmt.Sprintf("provider not registered: %v", err), Valid: true}); werr != nil {
+					log.Printf("activate: task %s record admission last_error: %v", taskID, werr)
+				}
+			}
+			return newOpErr(codeInternal, err)
+		}
+		return newOpErr(codeInternal, err)
+	}
 	// add-plain-dir-project D8 + add-local-path-task-mode D2/D5：早期有效模式门禁——在任何
 	// 状态修改/副作用前解析并校验 kind+mode，非法组合零副作用报错（MUST NOT 在 serve 启动后
 	// 才发现非法组合）。对齐模式显式传入后续 startSSE/alignSessions。
@@ -337,7 +368,22 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 	if hasRetryable, err := m.hasRetryableNotice(ctx, row); err != nil {
 		return newOpErr(codeInternal, err)
 	} else if hasRetryable {
+		// Round4 J8：身份未知的首建意图无法自动收割（占位符不是真实 session），
+		// 门禁不随重放解除——last_error 给出人工处置指引（用户可见）。
+		if entries, perr := parseNotices(row.Notice); perr == nil && hasUnknownCandidateIntent(entries) {
+			if _, werr := m.writeStatus(ctx, taskID, row.Status,
+				sql.NullString{String: unknownCandidateIntentGuidance, Valid: true}); werr != nil {
+				log.Printf("activate: task %s record unknown candidate intent guidance: %v", taskID, werr)
+			}
+			return newOpErr(codeConflict, fmt.Errorf("task %s has uncleaned cleanup debt (%s); resolve or force-delete first",
+				taskID, unknownCandidateIntentGuidance))
+		}
 		return newOpErr(codeConflict, fmt.Errorf("task %s has uncleaned cleanup debt; resolve or force-delete first", taskID))
+	}
+	// Round2 J3：受管登记仍有未完成清理义务（notice 落库失败/下一轮落账前）——
+	// 义务安全登记前同样阻断再次首建（与 notice 门禁同一冲突出口）。
+	if m.reapLedgerHasUnfinished(taskID) {
+		return newOpErr(codeConflict, fmt.Errorf("task %s has uncleaned cleanup debt (managed ledger); resolve or force-delete first", taskID))
 	}
 
 	// init_status 门禁（design.md §5，tasks 3.5）：none|succeeded → 放行；
@@ -376,6 +422,30 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 		return newOpErr(codeConflict, cerr)
 	}
 
+	// 评审 I1（opencode-v2-provider）：执行路径解析先于任何状态写入（零副作用
+	// 准入——resolver 拒绝不得先进 activating 留下需要补偿的状态）。承接 A 按
+	// D4 生命周期矩阵 MUST NOT 写 activating：直接走专用承接出口（suspended→
+	// active 守卫；失败零状态副作用、保留全部旧事实、MUST NOT 走激活失败补偿
+	// ——不清 env 快照）。
+	if m.providerRegistry != nil {
+		adoptA, perr := m.adoptBranchAPrecheck(ctx, taskID)
+		if perr != nil {
+			// resolver 拒绝 / I1 判定不一致：任何状态写入前零副作用停止（保留
+			// 全部旧事实——不经 activating、不清 env 快照），提交用户决策。
+			m.recordAdmissionError(ctx, taskID, perr)
+			return newOpErr(codeConflict, perr)
+		}
+		if adoptA {
+			aerr := m.adoptTaskV2(ctx, taskID, row, mode, true)
+			// I10：已提交但接管失败的恢复登记（提交事实不可回滚——禁普通补偿）。
+			var pce *postCommitTakeoverError
+			if errors.As(aerr, &pce) {
+				m.registerPostCommitRecovery(taskID)
+			}
+			return aerr
+		}
+	}
+
 	// ① 置 activating。G3-18：激活准入原子拒绝未清 recovery debt（Complete 成功
 	// 但删除失败遗留 / CAS mismatch 留存的旧 intent 不得被重放误伤本次激活）。
 	updated, err := m.beginActivation(ctx, taskID, StatusSuspended)
@@ -395,6 +465,14 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 			m.replayHandledCleanup(ctx, taskID, err)
 			return handled.err
 		}
+		var pce *postCommitTakeoverError
+		if errors.As(err, &pce) {
+			// 评审 I10：已提交接管失败——禁普通激活补偿（状态已 active，
+			// activating 谓词回退不可达；清 env/关联会制造矛盾事实）；实际登记
+			// 恢复工作（ensureRecovery 调度闭环）后如实上抛已分类错误。
+			m.registerPostCommitRecovery(taskID)
+			return err
+		}
 		// 失败：清理已建会话（runtime/shell）→ suspended + last_error（design.md §19 补偿）。
 		// 补偿 MUST 用脱离调用方取消的 context：activateRun 可能在 probe 退避/健康检查等
 		// 步骤因 ctx 取消返回，此时调用方 ctx 已取消，真实 store 用 ExecContext 会因 ctx 取消
@@ -409,6 +487,49 @@ func (m *Manager) Activate(ctx context.Context, taskID string) error {
 // errActivateCommitHandled 表示 CAS mismatch 反向清理已按本 attempt token 做完，
 // MUST NOT 再走通用补偿（禁写 status/last_error/env_snapshot/anchor）。
 type errActivateCommitHandled struct{ err error }
+
+// adoptBranchAPrecheck 只读预判当前入口的承接形态（评审 I1：零副作用准入——
+// resolver 决策 + D5 判定矩阵，先于 beginActivation 的任何状态写入）。adoptA=
+// 承接 A（走专用承接出口，不经 activating）；err 非 nil = 停止（判定不一致/
+// 承接能力缺失/resolver 拒绝——MUST 在任何状态写入前直接停止报告，保留全部
+// 旧事实，提交用户决策；旧实现把判定不一致误判为「非承接」放进激活序列，失败
+// 补偿清 env 快照）；二者皆否 = 非承接（含 B/R5/v1）走既有激活序列。
+func (m *Manager) adoptBranchAPrecheck(ctx context.Context, taskID string) (bool, error) {
+	_, dec, _, _, err := m.admitExecution(ctx, taskID)
+	if err != nil {
+		return false, err
+	}
+	if !dec.Adopt {
+		return false, nil
+	}
+	if m.adoptionStoreOf() == nil {
+		// 承接能力缺失：先于任何状态写入 fail-closed（I1）。
+		return false, appagent.NewError("admission.adopt", appagent.ErrKindCapabilityUnavailable,
+			errors.New("store 未实现承接原子转换能力（CommitAdoption）"))
+	}
+	binding, hasBinding, err := m.store.GetTaskBinding(ctx, taskID)
+	if err != nil {
+		return false, err
+	}
+	anchorID, anchorPID, anchorIID, err := m.adoptionStoreOf().GetTaskAnchor(ctx, taskID)
+	if err != nil {
+		return false, err
+	}
+	keys, err := m.adoptionStoreOf().ListTaskSessionKeys(ctx, taskID)
+	if err != nil {
+		return false, err
+	}
+	branch, _ := classifyAdoption(hasBinding, binding, anchorID, anchorPID, anchorIID, keys)
+	switch branch {
+	case branchA:
+		return true, nil
+	case branchStop:
+		return false, appagent.NewError("admission.adopt", appagent.ErrKindBindingInvalid,
+			errors.New("承接准入判定不一致（binding/anchor/归属行部分缺失或不一致）——停止承接，保留任务现状，待用户决策"))
+	default:
+		return false, nil
+	}
+}
 
 func (e *errActivateCommitHandled) Error() string { return e.err.Error() }
 func (e *errActivateCommitHandled) Unwrap() error { return e.err }
@@ -529,9 +650,16 @@ func foldPendingCleanups(cause error, observations []cleanupObservation) []pendi
 	}
 
 	// cause 路径 pending：按 errors.As 检出（发生在 cleanup observations 之前）。
+	// C17 残余修复（Activate 回放合同扩展）：supervisor（runtimeSupervisor 路径）
+	// 的失败以 StageError 携带 CleanupPayload——与内联路径 pendingCleanupError 同
+	// 契约面归并（sessionName/tickets/reason/retryable 按 foldPendingCleanups 规则）。
 	var pce *pendingCleanupError
 	if errors.As(cause, &pce) && pce != nil {
 		apply(pce.pending.sessionName, pce.pending.reason, pce.pending.retryable, pce.pending.cleanupTickets, false)
+	}
+	var se *appagent.StageError
+	if errors.As(cause, &se) && se != nil && se.Cleanup != nil {
+		apply(se.Cleanup.SessionName, se.Cleanup.Reason, se.Cleanup.Retryable, se.Cleanup.Tickets, false)
 	}
 	for _, obs := range observations {
 		apply(obs.sessionName, obs.reason, obs.retryable, obs.cleanupTickets, obs.persisted)
@@ -566,11 +694,83 @@ func (m *Manager) replayPendingCleanups(ctx context.Context, taskID string, pend
 
 // activateRun 执行激活的外部副作用序列（runtime → probe/ready → D5 bootstrap → SSE → last_port）。
 // mode 由 Activate 早期 kind 门禁解析后传入（add-plain-dir-project D8）。
+//
+// D9 binding 提交协议（opencode-v1-spi-provider tasks 4.3）：bootstrap 成功后的
+// 最终 binding 随 commitRuntimeReady 传入——提交事务（CommitActivation）中与任务
+// 状态 CAS 同事务写入；提交前 SSE/对齐使用该内存 binding（端点/凭据已知不经 DB）；
+// 提交失败 → binding 零持久化副作用（旧 binding 保留）。
+//
+// C2 门禁修复（design D9 结构化主流程）：runtimeSupervisor 注入时建程经
+// Provider.Supervisor() Acquire（supervisor 只确定并返回最终 binding，MUST NOT
+// 自行持久化）；未注入（测试接缝/渐进迁移）回退 task 层内联 bootstrapRuntime。
 func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode) error {
 	row, err := m.store.GetTask(ctx, taskID)
 	if err != nil {
 		return err
 	}
+
+	// 单一 resolver 准入（opencode-v2-provider tasks 6.3/6.6，design D4）：
+	// 拒绝（R2/R3/R6/R7/R9）零副作用 + 用户可感知 last_error；registry 未注入
+	// 时回退固定 v1 supervisor（既有装配/测试现状行为不变）。
+	// 评审 I7：决策读取的 binding 事实随 admitExecution 一并返回，分派复用同一
+	// 读取（消除二次读取漂移窗口）。
+	var sup appagent.RuntimeSupervisor
+	var dec execDecision
+	var decBinding domain.TaskBinding
+	var decHasBinding bool
+	if m.providerRegistry != nil {
+		var aerr error
+		sup, dec, decBinding, decHasBinding, aerr = m.admitExecution(ctx, taskID)
+		if aerr != nil {
+			// fail-closed：零副作用 + 诊断性 last_error/用户提示（D4 允许行）。
+			m.recordAdmissionError(ctx, taskID, aerr)
+			return newOpErr(codeConflict, aerr)
+		}
+		// R8：承接主流程（D5 六步；B 首建/A 延续由判定矩阵在流程内分派）。
+		// taskLocked=true：Activate 全程持任务锁。
+		if dec.Adopt {
+			return m.adoptTaskV2(ctx, taskID, row, mode, true)
+		}
+		// G3-F2 + 评审 I4：已有 v2 binding → resumeActivateV2（连续性——MUST NOT
+		// 再 POST 建 session）；v2 执行但无 v2 binding（R5 首建——v2 钉扎新任务）
+		// → firstBuildV2（与 R8-B 共用同一首建准备+原子提交+candidate 补偿流程）。
+		if dec.ExecProviderID == store.ProviderIDV2 {
+			if decHasBinding && decBinding.ProviderID == store.ProviderIDV2 {
+				return m.resumeActivateV2(ctx, taskID, row, sup, mode, true)
+			}
+			return m.firstBuildV2(ctx, taskID, row, mode, sup, true)
+		}
+	} else {
+		sup = m.runtimeSupervisor
+	}
+	if sup != nil {
+		// D8：激活即持久化 env 快照（含 OCDECK_SERVE_PORT 复用提示）——恢复 incident
+		// 的 loadEnvSnapshot 与 supervisor BuildServeEnv 同源（内联路径 mergeEnvSnapshot
+		// 同形，语义对齐）。
+		port0, aerr := m.allocatePort(row.LastPort, 0)
+		if aerr != nil {
+			return &portAllocationError{err: newOpErr(codeConflict, aerr)}
+		}
+		if _, merr := m.mergeEnvSnapshot(ctx, row, port0); merr != nil {
+			return newOpErr(codeInternal, merr)
+		}
+		binding, serr := sup.Acquire(ctx, appagent.TaskRef{TaskID: taskID, Directory: row.WorktreePath})
+		if serr != nil {
+			// C17 残余修复（Activate 回放合同扩展）：Acquire 失败经同一桥接——
+			// CleanupPayload 落账/折叠进 pending（runActivateFailureCompensation
+			// 的 foldPendingCleanups 现检出 StageError 载荷）；probe/claim/端口
+			// 耗尽等阶段语义同步进 typed 分派（与 Recovery 同矩阵）。
+			return m.supervisorStageErrorForTyped(serr, taskID)
+		}
+		port, password, _, eerr := m.bindingEndpoint(binding)
+		if eerr != nil {
+			return newOpErr(codeInternal, fmt.Errorf("provider binding endpoint: %w", eerr))
+		}
+		return m.commitRuntimeReady(ctx, taskID, row, runtimeSessionName(taskID), port, password, &binding, mode, nil)
+	}
+	// mutation 证据注释：supervisor 判定删除（恒走内联 bootstrapRuntime 回退）：
+	// TestActivate_AcquireViaRuntimeSupervisor 红——Acquire calls = 0（C2 建程未接
+	// supervisor 入口）。判定条件旁路形态 `if false && m.runtimeSupervisor != nil`。
 
 	port, err := m.allocatePort(row.LastPort, 0)
 	if err != nil {
@@ -582,18 +782,79 @@ func (m *Manager) activateRun(ctx context.Context, taskID string, mode AlignMode
 	}
 
 	runtimeName := runtimeSessionName(taskID)
-	password := newRandomPassword()
-	port, password, err = m.bootstrapRuntime(ctx, row, runtimeName, port, password, env, nil, false)
-	if err != nil {
-		return err
+	// C2c（tasks 4.1）：派生凭据——同任务恒定；主密钥缺失 fail-closed（不建进程）。
+	password, derr := derivedServePassword(taskID)
+	if derr != nil {
+		return newOpErr(codeInternal, derr)
 	}
-	return m.commitRuntimeReady(ctx, taskID, row, runtimeName, port, password, mode, nil)
+	port, password, berr := m.bootstrapRuntime(ctx, row, runtimeName, port, password, env, nil, false)
+	if berr != nil {
+		return berr
+	}
+	binding := m.activationBinding(row.ID, row.WorktreePath, runtimeName, port)
+	return m.commitRuntimeReady(ctx, taskID, row, runtimeName, port, password, &binding, mode, nil)
 }
 
-// commitRuntimeReady 成功提交序列（D3/Phase 2）：token/group/watcher → SSE+align → final health → last_port → CAS active。
+// bindingEndpoint 解析 binding 的 runtime 连接事实（port/password/directory）。
+// 经 provider.BindingRuntimeEndpoint（application port，C2）；provider 拒绝
+// （BindingInvalid/instance 不匹配/目录缺失/凭据派生失败）原样传播——仅
+// isTestSeamBindingErr（CapabilityUnavailable 接缝形态）允许回退 task 层 v1
+// 镜像（过渡裁决 B）——与 resolveRuntimeBinding 同一闸门（两条路径一致，回退
+// 镜像只查 port/auth.kind 会重新接受 adapter 拒绝的 binding）。
+func (m *Manager) bindingEndpoint(binding domain.TaskBinding) (int, string, string, error) {
+	p, perr := m.providerFor(binding.ProviderID)
+	if perr != nil {
+		return 0, "", "", perr
+	}
+	if port, pw, dir, eerr := p.BindingRuntimeEndpoint(binding); eerr == nil {
+		return port, pw, dir, nil
+	} else if !isTestSeamBindingErr(eerr) {
+		return 0, "", "", eerr
+	}
+	data, derr := decodeV1BindingData(binding)
+	if derr != nil {
+		return 0, "", "", derr
+	}
+	pw, pwerr := data.password()
+	if pwerr != nil {
+		return 0, "", "", pwerr
+	}
+	return data.Port, pw, data.Directory, nil
+}
+
+// activationBinding 按 D3 envelope 构造本次内存 binding（与 supervisor
+// buildBinding 形状一致：version/provider/instance/upstream=锚定/terminal_ref/
+// data={port,directory,taskId,auth.kind=derived}）。锚定取 bootstrap 后任务行的
+// anchor（bootstrapRuntime 已 claim+set anchor；双启动 created.ID）。
+func (m *Manager) activationBinding(taskID, directory, terminalRef string, port int) domain.TaskBinding {
+	anchor := ""
+	if row, err := m.store.GetTask(context.Background(), taskID); err == nil && row.AnchorSessionID.Valid {
+		anchor = row.AnchorSessionID.String
+	}
+	data, _ := json.Marshal(map[string]interface{}{
+		"port":      port,
+		"directory": directory,
+		"taskId":    taskID,
+		"auth":      map[string]string{"kind": appagent.DerivedCredKind},
+	})
+	return domain.TaskBinding{
+		Version:            domain.TaskBindingVersion,
+		ProviderID:         store.ProviderIDV1,
+		ProviderInstanceID: store.ProviderInstanceV1Default,
+		UpstreamSessionID:  anchor,
+		TerminalRef:        terminalRef,
+		Data:               data,
+	}
+}
+
+// commitRuntimeReady 成功提交序列（D3/Phase 2）：token/group/watcher → SSE+align → final health → last_port → 提交事务。
+// binding 非 nil 时（D9 提交协议）与任务状态 CAS 同事务写入——激活写入本次 binding，
+// 恢复重建写入替换 binding（C3：端口轮换/锚定重建/legacy→derived 后的最终值）；
+// 提交失败（CAS 失配/事务失败）binding 零持久化副作用（旧值保留）。nil 时仅状态
+// CAS（当前无调用方传 nil——保留形态供防御）。
 // onRegister（仅 Recovery 传入，G3-19）：runtime 发布前回调，把本 attempt 的新
 // token 显式绑定到发起 incident（不经 setRuntime 通用挂钩，避免误绑新代 token）。
-func (m *Manager) commitRuntimeReady(ctx context.Context, taskID string, row TaskRow, runtimeName string, port int, password string, mode AlignMode, onRegister func(rt *taskRuntime)) error {
+func (m *Manager) commitRuntimeReady(ctx context.Context, taskID string, row TaskRow, runtimeName string, port int, password string, binding *domain.TaskBinding, mode AlignMode, onRegister func(rt *taskRuntime)) error {
 	// 注册前探活：HasSession infra 与 absent 必须拆开。本函数 MUST NOT 本地
 	// KillSession——KillResult（含 nil error + reap_failed tickets，reaper.go）
 	// 若在此丢弃，会话已删后外层补偿只看到 absent，tickets 永久丢失。
@@ -623,10 +884,16 @@ func (m *Manager) commitRuntimeReady(ctx context.Context, taskID string, row Tas
 	m.setRuntime(taskID, rt)
 	rt.registerGroup(roleRuntime, runtimeName)
 	m.watchServeExit(taskID, runtimeName)
-	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode); err != nil {
+	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode, binding, nil); err != nil {
 		return newOpErr(codeProcessError, fmt.Errorf("sse subscribe: %w", err))
 	}
-	oc := m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 10 * time.Second})
+	ocProviderID := store.ProviderIDV1
+	if binding != nil {
+		ocProviderID = binding.ProviderID
+	} else if row.ProviderID != "" {
+		ocProviderID = row.ProviderID
+	}
+	oc := m.ocFactory(ocProviderID, port, password, appagent.Options{HealthTimeout: 2 * time.Second, OpTimeout: 10 * time.Second})
 	if _, herr := oc.Health(ctx); herr != nil {
 		return newOpErr(codeProcessError, fmt.Errorf("final health: %w", herr))
 	}
@@ -638,15 +905,23 @@ func (m *Manager) commitRuntimeReady(ctx context.Context, taskID string, row Tas
 	if fatalErr := m.incidentFatalFor(taskID, rt.instVersion); fatalErr != nil {
 		return newOpErr(codeProcessError, fmt.Errorf("sse fatal before commit: %w", fatalErr))
 	}
-	cas, err := m.writeStatusConditional(ctx, taskID, StatusActivating, StatusActive, sql.NullString{})
-	if err != nil {
-		return newOpErr(codeInternal, fmt.Errorf("commit active: %w", err))
+	// 提交事务（D9 binding 提交协议）：binding 与任务状态 CAS 同事务。binding 非 nil
+	//（激活路径）写入本次内存 binding，恢复/修复路径 nil→旧 binding 保留。
+	var cas application.TransitionResult
+	var cerr error
+	if binding != nil {
+		cas, cerr = m.commitActivationBinding(ctx, taskID, *binding, mode)
+	} else {
+		cas, cerr = m.writeStatusConditional(ctx, taskID, StatusActivating, StatusActive, sql.NullString{})
+	}
+	if cerr != nil {
+		return newOpErr(codeInternal, fmt.Errorf("commit active: %w", cerr))
 	}
 	if cas.Matched {
 		// G3-1：CAS 后 fatal → 已提交 active，经幂等 ensureRecovery 立即开新 incident
 		//（same-token 状态/锁校验保证不产生并发双恢复）。
 		if fatalErr := m.incidentFatalFor(taskID, rt.instVersion); fatalErr != nil {
-			go m.ensureRecovery(taskID, rt.instVersion)
+			go m.ensureRecovery(taskID, rt.instVersion, false)
 		}
 		// F3：active 提交后才启动 diff review 调度器（此前启动会让首探抢跑，
 		// taskOcClient 拒绝非 active task）。幂等（已运行则 no-op）。
@@ -844,11 +1119,11 @@ func (e *capabilityProbeError) Unwrap() error { return e.err }
 // 返回错误统一包 capabilityProbeError（typed 分派，G3-5；文本不变）。
 func probeErrToOpCode(err error) (string, error) {
 	switch {
-	case errors.Is(err, opencode.ErrCapabilityMismatch):
+	case errors.Is(err, appagent.ErrCapabilityMismatch):
 		return codeOCIncompatible, &capabilityProbeError{err: fmt.Errorf("capability probe: %w", err)}
-	case errors.Is(err, opencode.ErrUnauthorized):
+	case errors.Is(err, appagent.ErrUnauthorized):
 		return codeInternal, &capabilityProbeError{err: fmt.Errorf("capability probe (unauthorized, internal bug): %w", err)}
-	case errors.Is(err, opencode.ErrServeNotReady):
+	case errors.Is(err, appagent.ErrServeNotReady):
 		return codeProcessError, &capabilityProbeError{err: fmt.Errorf("capability probe (serve not ready): %w", err)}
 	default:
 		// 未知错误保守按 process_error（可重试），避免误判为不可恢复。
@@ -908,7 +1183,7 @@ func runProbeColdStartRetry(ctx context.Context, oc OCClient, backoff []time.Dur
 			return nil
 		}
 		lastErr = err
-		if !errors.Is(err, opencode.ErrServeNotReady) {
+		if !errors.Is(err, appagent.ErrServeNotReady) {
 			// 非冷启动错误：立即失败，不重试（mismatch/unauthorized/未知）。
 			return err
 		}
@@ -981,37 +1256,12 @@ type killNoticeClass struct {
 // classifyKillResult 将 KillResult 收敛为共享 fail-closed 分类。
 // 未知 disposition 或 disposition 与 SessionKilled 矛盾 → kill_failed / retryable / terminal。
 // MUST NOT 经 dispositionToNotice 静默忽略未知值。
+// 委托 appagent 单点实现（C2a：RuntimeCmdArgv/KillNoticeClass 搬运为 provider
+// 中性原语——supervisor 与 task 层共用同一分类，行为逐字等价；输入经原语值
+// 传参，application 层不依赖 infrastructure/process）。
 func classifyKillResult(res process.KillResult) killNoticeClass {
-	// 已知 disposition 的 SessionKilled 一致性（与 process.KillSession 语义对齐）。
-	switch res.Disposition {
-	case process.DispositionClean:
-		if !res.SessionKilled {
-			return killNoticeClass{action: "terminal", reason: noticeReasonKillFailed, retryable: true}
-		}
-		return killNoticeClass{action: "none"}
-	case process.DispositionReapFailed:
-		if !res.SessionKilled {
-			return killNoticeClass{action: "terminal", reason: noticeReasonKillFailed, retryable: true}
-		}
-		return killNoticeClass{action: "terminal", reason: noticeReasonReapFailed, retryable: true}
-	case process.DispositionSnapshotFailed:
-		if res.SessionKilled {
-			return killNoticeClass{action: "terminal", reason: noticeReasonKillFailed, retryable: true}
-		}
-		return killNoticeClass{action: "terminal", reason: noticeReasonSnapshotFailed, retryable: true}
-	case process.DispositionKillFailed:
-		if res.SessionKilled {
-			return killNoticeClass{action: "terminal", reason: noticeReasonKillFailed, retryable: true}
-		}
-		return killNoticeClass{action: "terminal", reason: noticeReasonKillFailed, retryable: true}
-	case process.DispositionSnapshotMissingDegraded:
-		if res.SessionKilled {
-			return killNoticeClass{action: "terminal", reason: noticeReasonKillFailed, retryable: true}
-		}
-		return killNoticeClass{action: "continue", reason: noticeReasonSnapshotMissing, retryable: false}
-	default:
-		return killNoticeClass{action: "terminal", reason: noticeReasonKillFailed, retryable: true}
-	}
+	cls := appagent.ClassifyKill(string(res.Disposition), res.SessionKilled)
+	return killNoticeClass{action: cls.Action, reason: cls.Reason, retryable: cls.Retryable}
 }
 
 // withResidualNoticeCtx 返回脱离请求取消、有界 10s 的 notice 写 ctx。
@@ -1069,15 +1319,9 @@ func wrapServeWaitCause(waitErr error, finalErr error, parts ...string) error {
 // permissionMode 为已解析的有效权限模式（task-permission-mode D3）：all-approve 追加
 // `--auto`（未被显式 deny 的权限请求自动批准）；ask/ai-auto 与现状逐字一致。
 // 调用方 MUST 先经 resolvePermissionMode 解析（未知值 fail-closed 拒绝启动）。
+// 委托 appagent 单点实现（C2a，与 v1 supervisor 共用——行为逐字等价）。
 func runtimeCmdArgv(port int, sessionID, permissionMode string) []string {
-	argv := []string{"opencode", "--port", strconv.Itoa(port), "--hostname", "127.0.0.1"}
-	if sessionID != "" {
-		argv = append(argv, "--session", sessionID)
-	}
-	if permissionMode == PermissionModeAllApprove {
-		argv = append(argv, "--auto")
-	}
-	return argv
+	return appagent.RuntimeCmdArgv(port, sessionID, permissionMode)
 }
 
 // startServeWithPortRetry 创建 runtime 会话并健康检查；未就绪时按既有门禁换端口重试
@@ -1136,13 +1380,19 @@ func (m *Manager) startRuntimeWithPortRetry(ctx context.Context, row TaskRow, se
 				return port, password, newOpErr(codeInternal, &persistEnvSnapshotError{err: wrapServeWaitCause(prevWaitErr, perr, prevRotateParts...)})
 			}
 		}
-		// Recovery 每次创建进程重新生成密码（G3-4：MUST NOT 循环复用同密码；
-		// Activate 沿用传入密码不变）。
-		if freshPassword {
-			password = newRandomPassword()
+		// C2c（D3 派生切换）：密码同任务恒定——不再随轮换/重启重新生成
+		//（G3-4 的随机轮换语义经派生切换退役）。主密钥缺失 fail-closed
+		//（不建进程，MUST NOT 回退随机密码）。
+		if freshPassword || password == "" {
+			p, derr := derivedServePassword(row.ID)
+			if derr != nil {
+				return port, "", newOpErr(codeInternal, derr)
+			}
+			password = p
 		}
 		serveEnv := copyMap(env)
 		serveEnv["OPENCODE_SERVER_PASSWORD"] = password
+		serveEnv[appagent.CredKindEnvKey] = appagent.DerivedCredKind
 		serveEnv["OCDECK_SERVE_PORT"] = strconv.Itoa(port)
 		if err := m.proc.NewSession(process.SessionSpec{
 			Name:    serveName,
@@ -1152,7 +1402,7 @@ func (m *Manager) startRuntimeWithPortRetry(ctx context.Context, row TaskRow, se
 		}); err != nil {
 			return port, password, newOpErr(codeProcessError, fmt.Errorf("runtime session: %w", err))
 		}
-		oc := m.ocFactory(port, password, opencode.Options{
+		oc := m.ocFactory(row.ProviderID, port, password, appagent.Options{
 			HealthTimeout: 2 * time.Second,
 			OpTimeout:     10 * time.Second,
 		})
@@ -1271,7 +1521,24 @@ func (m *Manager) persistEnvSnapshot(ctx context.Context, taskID string, merged 
 // onReady 后先全量对齐再放行业务事件：对齐竞态期间 SSE 事件 MUST 缓冲，
 // 对齐完成后按序重放（缓冲起止与对齐替换 MUST 原子，B5）。
 // 对齐错误传播（返回 error，不吞，B5）。
-func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath string, port int, password string, mode AlignMode) error {
+//
+// D9 binding 提交协议（tasks 4.3）：client 端点/凭据来源于 binding 携带值——
+// bindPort/bindPassword 由调用方从本次内存 binding 解出（提交前订阅对象恒为
+// 最终 runtime，不经 DB）；wtPath 沿用任务行（fake/真实上游 directory 校验一致）。
+// ocProviderIDForSSE 返回 SSE 通道 client 构造的 provider 标识（C2 门禁修复：
+// OCFactory 按 provider 分派——最终 binding 已知时用其 ProviderID；防御形态
+// （nil binding）经任务行 provider 判定，行读取失败回退 v1）。
+func (m *Manager) ocProviderIDForSSE(taskID string, finalBinding *domain.TaskBinding) string {
+	if finalBinding != nil && finalBinding.ProviderID != "" {
+		return finalBinding.ProviderID
+	}
+	if row, err := m.store.GetTask(context.Background(), taskID); err == nil && row.ProviderID != "" {
+		return row.ProviderID
+	}
+	return store.ProviderIDV1
+}
+
+func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath string, port int, password string, mode AlignMode, finalBinding *domain.TaskBinding, preStream appagent.EventStream) error {
 	// SSE 挂 Manager 生命周期 context，非传入的 HTTP request ctx。
 	sseCtx, cancel := context.WithCancel(m.lifecycleCtx())
 	sseDone := make(chan struct{})
@@ -1292,7 +1559,7 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 	// 的 epoch 匹配被拒，不得误伤新连接代。
 	var connEpochMu sync.Mutex
 	var connEpoch uint64
-	ocWithReady := m.ocFactory(port, password, opencode.Options{
+	ocWithReady := m.ocFactory(m.ocProviderIDForSSE(taskID, finalBinding), port, password, appagent.Options{
 		HealthTimeout:    2 * time.Second,
 		HeartbeatTimeout: 60 * time.Second,
 		OnReady: func() {
@@ -1314,10 +1581,30 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 			m.handleAgentStatusDisconnect(taskID, rt, epoch)
 		},
 	})
+	// 生产装配修复：v2 binding 任务的 align/对账客户端 MUST 桥接优先（与
+	// buildTaskOCClient 同形）——生产 ocFactory 对已注册 provider 恒返回 v1
+	// wire client，直接对 v2 serve 打 GET /session 会被 SPA HTML 回退吞掉
+	//（invalid character '<'）。桥接仅对 v2 binding 生效（v1/无 binding 保持
+	// 既有 ocFactory 路径，v1 行为零变化）；测试接缝形态（Sessions() 窄接口
+	// nil）bridgeClientFor 返回 nil → 同样维持 ocFactory。finalBinding 即 D9
+	// 内存 binding——连接事实（port/password/wtPath）由调用方从同一 binding
+	// 解出传入，此处不二次读 DB。
+	if finalBinding != nil && finalBinding.ProviderID == store.ProviderIDV2 {
+		data := &opencodeBindingData{ProviderID: finalBinding.ProviderID, Port: port, Directory: wtPath, TaskID: taskID}
+		if bridge := m.bridgeClientFor(data, *finalBinding, ocWithReady); bridge != nil {
+			debugf("sse client task=%s provider=%s form=bridge", taskID, finalBinding.ProviderID)
+			ocWithReady = bridge
+		} else {
+			debugf("sse client task=%s provider=%s form=factory（测试接缝形态）", taskID, finalBinding.ProviderID)
+		}
+	}
 
 	// 缓冲屏障：对齐完成前 SSE 事件缓冲；对齐完成后放行（design.md §4）。
+	// C2 typed 桥：typed 通道事件与原始通道共享同一屏障（buffering/bufMu/alignMu），
+	// 各自独立缓冲队列，drainAndRelease 统一排空两类缓冲。
 	var bufMu sync.Mutex
-	buffered := []opencode.Event{}
+	buffered := []appagent.Event{}
+	bufferedTyped := []domain.AgentEvent{}
 	buffering := true
 
 	// align 串行化屏障（design.md §4）：任一时刻最多一个 align 在执行（首次 align + reconnect align 互斥）。
@@ -1335,7 +1622,9 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 		for {
 			bufMu.Lock()
 			replay := buffered
+			replayTyped := bufferedTyped
 			buffered = nil
+			bufferedTyped = nil
 			bufMu.Unlock()
 			// 处理本批缓冲事件（buffering 仍为 true，期间到达的事件继续缓冲）。
 			// R7 failpoint：session 落库错误 MUST 收敛运行时（design.md §4/§19）。
@@ -1347,9 +1636,16 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 					return
 				}
 			}
+			// C2 typed 桥：typed 缓冲经 handleAgentEvent 应用（与原始支同一屏障语义）。
+			for _, ev := range replayTyped {
+				if err := m.handleAgentEvent(sseCtx, taskID, ev); err != nil {
+					m.reportRuntimeFatal(taskID, rt.instVersion, fmt.Errorf("sse buffered event: %w", err))
+					return
+				}
+			}
 			// 处理完后再取一批：若重放期间有新事件缓冲，继续处理；否则放行。
 			bufMu.Lock()
-			if len(buffered) == 0 {
+			if len(buffered) == 0 && len(bufferedTyped) == 0 {
 				// 缓冲已彻底排空且无新增：放行实时事件。
 				buffering = false
 				bufMu.Unlock()
@@ -1360,9 +1656,56 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 		}
 	}
 
+	// C2 typed 桥（opencode-v1-spi-provider）：provider 提供 EventSource 时订阅经
+	// Provider.Events()（typed domain.AgentEvent——spec「原始事件不出适配层」；
+	// directory 校验由适配层 translateEvent 按 binding.directory 承担），typed 流
+	// 消费与原始通道共享缓冲屏障/alignMu/首次 align。
+	// C9 门禁修复（design:471 提交前用内存最终 binding）：finalBinding 非 nil 时
+	// 直接用它订阅（激活提交前无持久化 binding；恢复路径为本次最终 binding——含
+	// 重建后的新端口/锚定），MUST NOT 读持久化旧值；分发失败/Subscribe 拒绝 → 同步
+	// 返回错误进失败补偿（零 SSE 假 ready），不再静默回退原始通道吞掉适配器拒绝
+	//（C2/D10 fail-closed：真实 provider 错误直接传播）。
+	// finalBinding 为 nil（测试接缝/防御形态）→ 回退原始 ocFactory 通道。
+	// 订阅在主 goroutine 同步受理（C10：ready 由 SetCallbacks 的连接建立回调驱动，
+	// 非订阅受理即 ready）。
+	finalStream, streamErr := (func() (appagent.EventStream, error) {
+		if preStream != nil {
+			// 评审 I10：候选流复用为正式接管流（保留缓冲事件——提交到接管之间
+			// 不重订阅，消除第二次订阅失败面）。
+			return preStream, nil
+		}
+		if finalBinding == nil {
+			return nil, nil
+		}
+		p, perr := m.providerFor(finalBinding.ProviderID)
+		if perr != nil {
+			return nil, perr
+		}
+		es := p.Events()
+		if es == nil {
+			// 测试接缝（Phase D 清理）：minimalProvider 等无 EventSource 形态。
+			return nil, nil
+		}
+		s, serr := es.Subscribe(sseCtx, *finalBinding)
+		if serr != nil {
+			return nil, serr
+		}
+		return s, nil
+	})()
+	if streamErr != nil {
+		// C14 门禁修复（orchestration spec「反向清理」）：同步订阅失败分支在此
+		// 收口 sseDone——close(sseDone) 的 SSE goroutine（下方）尚未启动，无
+		// close 竞争；否则 rt.sseCancel 的阻塞 join（cancel+<-sseDone）在后续
+		// rollback/Shutdown 补偿路径永久死锁。
+		cancel()
+		close(sseDone)
+		return fmt.Errorf("sse subscribe: %w", streamErr)
+	}
+
 	go func() {
 		defer close(sseDone)
-		onEvent := func(ev opencode.Event) {
+		// 原始通道回调（回退路径 ocFactory SubscribeEvents 用——C2 过渡接缝）。
+		onEvent := func(ev appagent.Event) {
 			bufMu.Lock()
 			if buffering {
 				buffered = append(buffered, ev)
@@ -1377,39 +1720,114 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 				return
 			}
 		}
+		// 原始通道重连对齐（回退路径 ocFactory SubscribeEvents 的 onReconnect——C2 过渡接缝）。
 		onReconnect := func() {
 			// 串行化：等待进行中的 align（首次 align 或上一轮 reconnect align）完成后再重对齐，
 			// 不并发清空 buffered（design.md §4）。等待期间 buffering 仍为 true，事件继续缓冲；
 			// 待 align 完成后重新进入缓冲模式 + 全量对齐（合并为一次重对齐，幂等 upsert 安全）。
 			alignMu.Lock()
 			defer alignMu.Unlock()
-			// 重连后全量对齐屏障（design.md §4）：重新进入缓冲模式 + 全量对齐。
 			bufMu.Lock()
 			buffering = true
 			buffered = nil
+			bufferedTyped = nil
 			bufMu.Unlock()
 			// P1.8：重连建立 → 新连接代 + aligning（对齐串行域内，断流的旧 epoch 已失效）。
 			connEpochMu.Lock()
 			connEpoch = rt.ensureAgentStatusState().apply(agentStatusOp{kind: agentOpConnect}).Epoch
 			connEpochMu.Unlock()
 			if err := m.alignSessions(sseCtx, taskID, wtPath, ocWithReady, mode); err != nil {
-				// 重连对齐失败 MUST 收敛任务状态（design.md §4）：不得只取消 SSE 留 active 假象。
-				// serve 可能仍存活但无法追踪会话，视同运行时不可确定 → 经统一 fatal 上报
-				//（G3-1：incident 同步域 + 幂等 ensureRecovery）。
 				cancel()
 				m.reportRuntimeFatal(taskID, rt.instVersion, fmt.Errorf("sse reconnect align: %w", err))
 				return
 			}
-			// D6 注意力对账（align 路径）：session align 成功后、drainAndRelease 前。失败不影响任务状态机。
 			m.reconcileTaskAttention(sseCtx, rt, ocWithReady, wtPath)
-			// task-permission-mode D4 (b2)：已 active 实例重连 align 对账完成后扫描。
-			// 该路径不重新 CAS，准入以任务仍 active 为准（对账写回发现的 pending 在此纳入）。
 			m.judgeScan(rt)
-			// P1.8.3：agentStatus 对账（align 成功后、drainAndRelease 前；失败仅保持不可用，
-			// 不影响任务生命周期）。
 			m.reconcileAgentStatus(sseCtx, rt, taskID, wtPath, ocWithReady)
 			// B4b：先排空全部缓冲事件再置 buffering=false 放行实时事件（design.md §4）。
 			drainAndRelease()
+		}
+		if finalStream != nil {
+			// Close 由 sseCancel（rt.sseCancel 阻塞 join）承担——流关闭后事件面终止。
+			defer finalStream.Close()
+			// C10 门禁修复：ready 信号与重连对齐屏障由真实连接生命周期驱动
+			//（client onReady/onReconnect 同步回调——实际首事件到达才 ready；
+			// 重连建立先于新连接事件触发既有串行对齐屏障）。
+			finalStream.SetCallbacks(
+				func() {
+					connEpochMu.Lock()
+					connEpoch = rt.ensureAgentStatusState().apply(agentStatusOp{kind: agentOpConnect}).Epoch
+					connEpochMu.Unlock()
+					select {
+					case readyCh <- struct{}{}:
+					default:
+					}
+				},
+				func() {
+					alignMu.Lock()
+					defer alignMu.Unlock()
+					bufMu.Lock()
+					buffering = true
+					buffered = nil
+					bufferedTyped = nil
+					bufMu.Unlock()
+					connEpochMu.Lock()
+					connEpoch = rt.ensureAgentStatusState().apply(agentStatusOp{kind: agentOpConnect}).Epoch
+					connEpochMu.Unlock()
+					if err := m.alignSessions(sseCtx, taskID, wtPath, ocWithReady, mode); err != nil {
+						cancel()
+						m.reportRuntimeFatal(taskID, rt.instVersion, fmt.Errorf("sse reconnect align: %w", err))
+						return
+					}
+					m.reconcileTaskAttention(sseCtx, rt, ocWithReady, wtPath)
+					m.judgeScan(rt)
+					m.reconcileAgentStatus(sseCtx, rt, taskID, wtPath, ocWithReady)
+					drainAndRelease()
+				},
+			)
+			// C16 门禁修复（既有 spec「断流降级」合同扩展至 typed EventStream）：
+			// typed 流断流与原始通道同语义——已建立连接终止（非主动取消）→ 按捕获
+			// 的连接代失效 agent status（与 ocWithReady 的 OnDisconnect 同形；回调由
+			// 适配层 client onDisconnect 同步串行触发，捕获值即刚断连接的代）。
+			finalStream.SetDisconnectCallback(func() {
+				connEpochMu.Lock()
+				epoch := connEpoch
+				connEpochMu.Unlock()
+				m.handleAgentStatusDisconnect(taskID, rt, epoch)
+			})
+			events := finalStream.Events()
+			for {
+				select {
+				case <-sseCtx.Done():
+					return
+				case ev, ok := <-events:
+					if !ok {
+						// 流关闭（C10：events 在流退出时关闭——!ok 可达）：ctx 未主动取消
+						// → 运行时不可确定 → fatal（volatile 语义：流终止即失去事件面，
+						// 经恢复 attempt 重建订阅 + 重新对齐）。
+						if sseCtx.Err() == nil {
+							if streamErr := finalStream.Err(); streamErr != nil {
+								m.reportRuntimeFatal(taskID, rt.instVersion, fmt.Errorf("sse stream ended: %w", streamErr))
+							} else {
+								m.reportRuntimeFatal(taskID, rt.instVersion, errors.New("sse stream ended"))
+							}
+						}
+						return
+					}
+					bufMu.Lock()
+					if buffering {
+						bufferedTyped = append(bufferedTyped, ev)
+						bufMu.Unlock()
+						continue
+					}
+					bufMu.Unlock()
+					if err := m.handleAgentEvent(sseCtx, taskID, ev); err != nil {
+						// R7 failpoint 等价：会话归属丢失 → 运行时不可确定（G3-1）。
+						m.reportRuntimeFatal(taskID, rt.instVersion, fmt.Errorf("sse event: %w", err))
+						return
+					}
+				}
+			}
 		}
 		// B4c：SubscribeEvents 永久返回 MUST 有处理路径（converge suspended + last_error）。
 		// 返回非 nil 或正常返回（流结束）都意味着 SSE 不再托管 → 不得留 active 无 SSE 假象。
@@ -1437,6 +1855,7 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 			cancel()
 			return fmt.Errorf("sse initial align: %w", err)
 		}
+		debugf("sse initial align ok task=%s mode=%v", taskID, mode)
 		// D6 注意力对账（align 路径）：首次 align 成功后、drainAndRelease 前。
 		m.reconcileTaskAttention(sseCtx, rt, ocWithReady, wtPath)
 		// P1.8.3：agentStatus 对账（首次 align 成功后、drainAndRelease 前）。
@@ -1451,6 +1870,238 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 	return nil
 }
 
+// handleAgentEvent 消费 provider typed 事件（C2 门禁修复：spec「原始事件不出
+// 适配层」——task 层只看 domain.AgentEvent 的 7 Kind，字段语义由各 provider 适配层
+// 保证；B3a directory 防线在适配层 translateEvent 以 binding.directory 承担）。
+// R7 failpoint 等价：store 落库错误 MUST 返回，调用方收敛运行时（G3-1）。
+func (m *Manager) handleAgentEvent(ctx context.Context, taskID string, ev domain.AgentEvent) error {
+	switch ev.Kind {
+	case domain.EventSessionCreated:
+		sess := ev.Session
+		if sess == nil || sess.Key.UpstreamID == "" {
+			return nil
+		}
+		// v2 typed created MUST NOT claim（跨任务偷 candidate 事故修复）：v2 SSE
+		// 是共享 serve 的全局事件流（归属键仅 data.sessionID，envelope location
+		// 可选且未实证），任何活跃任务都会收到他任务 candidate 的 created 广播
+		// ——claim 会在首建任务提交前抢走归属（CommitFirstBuild/CommitAdoption
+		// 守卫 fail-closed 拒绝提交 → 候选被误回收、激活失败，容器实测事故链）。
+		// v2 归属唯一合法来源 = 首建/承接原子提交协议 + 对齐（design D4 替换表：
+		// 事件消费在提交成功后=消费非认领；D3 attach 钉住 binding 原 session，
+		// 无外部认领流程；子 session 归属由对齐落账）。丢弃 + debug 日志（非协议
+		// 违约，不 fatal）。v1 原始通道（B3a 目录防线 + claim）行为不变。
+		if sess.Key.ProviderID == store.ProviderIDV2 {
+			debugf("v2 typed session.created %s ignored: ownership only via atomic commit/align, never event claim", sess.Key.UpstreamID)
+			return nil
+		}
+		sid := sess.Key.UpstreamID
+		// created 零值时间可（C8：适配层不要求时间字段存在）。
+		createdAt, lastSeen := sess.CreatedAt, sess.UpdatedAt
+		if lastSeen < createdAt {
+			lastSeen = createdAt
+		}
+		var parentID string
+		if sess.Parent != nil {
+			parentID = sess.Parent.UpstreamID
+		}
+		// 评审 I5：会话写端口保留完整 SessionKey（事件携带 provider/instance 命名
+		// 空间——v2 会话归属行落 v2 命名空间）。事件 key 命名空间为空（未感知
+		// 命名空间的事件源）→ 走既有 v1 缺省 claim 路径（行为不变）。
+		if m.lifecycle != nil {
+			obs := ocdecksess.Observation{
+				ID: ocdecksess.ID(sid), ParentID: parentID,
+				CreatedAt: createdAt, UpdatedAt: lastSeen, FirstSeenAt: nowUnixI(),
+				ProviderID: sess.Key.ProviderID, ProviderInstanceID: sess.Key.ProviderInstanceID,
+			}
+			cres, cerr := m.lifecycle.ClaimSession(ctx, taskID, obs)
+			if cerr != nil {
+				return fmt.Errorf("claim session %s: %w", sid, cerr)
+			}
+			if !cres.Claimed {
+				log.Printf("task %s: sse session.created for session %s conflict (owned by task %s); skipping",
+					taskID, sid, cres.OwnerTaskID)
+				return nil
+			}
+			m.noteAgentSessionClaimed(taskID, sid)
+			return nil
+		}
+		var cres application.ClaimResult
+		var cerr error
+		if sess.Key.ProviderID == "" {
+			cres, cerr = m.store.ClaimTaskSession(ctx, taskID, sid, createdAt, nowUnixI(), lastSeen, parentID)
+		} else {
+			cres, cerr = m.store.ClaimTaskSessionKey(ctx, taskID, sess.Key, createdAt, nowUnixI(), lastSeen, parentID)
+		}
+		if cerr != nil {
+			return fmt.Errorf("claim session %s: %w", sid, cerr)
+		}
+		if !cres.Claimed {
+			log.Printf("task %s: sse session.created for session %s conflict (owned by task %s); skipping",
+				taskID, sid, cres.OwnerTaskID)
+			return nil
+		}
+		m.noteAgentSessionClaimed(taskID, sid)
+	case domain.EventSessionUpdated:
+		sess := ev.Session
+		if sess == nil || sess.Key.UpstreamID == "" || sess.UpdatedAt == 0 {
+			return nil
+		}
+		sid := sess.Key.UpstreamID
+		if m.lifecycle != nil {
+			res, uerr := m.lifecycle.TouchOwnedSession(ctx, taskID, ocdecksess.ID(sid), sess.UpdatedAt)
+			if uerr != nil {
+				return fmt.Errorf("touch owned session %s: %w", sid, uerr)
+			}
+			if !res.Matched {
+				log.Printf("task %s: session.updated for unowned session %s; ignoring", taskID, sid)
+			}
+			return nil
+		}
+		res, uerr := m.store.TouchOwnedTaskSession(ctx, taskID, sid, sess.UpdatedAt)
+		if uerr != nil {
+			return fmt.Errorf("touch owned session %s: %w", sid, uerr)
+		}
+		if !res.Matched {
+			log.Printf("task %s: session.updated for unowned session %s; ignoring", taskID, sid)
+		}
+	case domain.EventSessionDeleted:
+		sess := ev.Session
+		if sess == nil || sess.Key.UpstreamID == "" {
+			return nil
+		}
+		sid := sess.Key.UpstreamID
+		if m.lifecycle != nil {
+			if _, err := m.lifecycle.DeleteOwnedSession(ctx, taskID, ocdecksess.ID(sid)); err != nil {
+				return fmt.Errorf("delete session %s: %w", sid, err)
+			}
+			m.noteAgentSessionDeleted(taskID, sid)
+			return nil
+		}
+		if _, err := m.store.DeleteTaskSession(ctx, taskID, sid); err != nil {
+			return fmt.Errorf("delete session %s: %w", sid, err)
+		}
+		m.noteAgentSessionDeleted(taskID, sid)
+	case domain.EventAttentionRaised, domain.EventAttentionResolved:
+		if ev.Attention == nil {
+			return nil
+		}
+		aev := attentionEventFromAgentEvent(*ev.Attention, ev.Kind == domain.EventAttentionResolved)
+		if rt := m.getRuntime(taskID); rt != nil {
+			if rt.applyAttentionEvent(aev) {
+				m.commitAttentionChanged(taskID, rt, true)
+			}
+			// task-permission-mode D4 (a)：SSE asked 应用后扫描（与原始通道同义）。
+			if aev.Type == appagent.AttentionPermission && aev.Kind == appagent.AttentionAsked {
+				m.judgeScan(rt)
+			}
+		}
+	case domain.EventSessionError:
+		m.observeSessionErrorFromAgentEvent(ctx, taskID, ev)
+	case domain.EventStatusChanged:
+		m.applyAgentStatusEventFromAgent(taskID, ev)
+	}
+	return nil
+}
+
+// attentionEventFromAgentEvent 把 provider-neutral Attention 负载转换为 attention
+// 状态机消费形态（appagent.AttentionEvent——apply 聚合域既有入口）。Resolved 覆盖
+// replied/rejected 两类终态（adapter 层已按 Kind 分派，这里统一为已有终态语义：
+// removePermLocked 按 RequestID 命中，replied/rejected 处置一致）。
+func attentionEventFromAgentEvent(att domain.Attention, resolved bool) appagent.AttentionEvent {
+	out := appagent.AttentionEvent{
+		RequestID: att.ID,
+		SessionID: att.Session.UpstreamID,
+	}
+	if resolved {
+		out.Kind = appagent.AttentionReplied
+	} else {
+		out.Kind = appagent.AttentionAsked
+	}
+	switch {
+	case att.Permission != nil:
+		out.Type = appagent.AttentionPermission
+		out.Permission = att.Permission.Permission
+		out.Patterns = att.Permission.Patterns
+		out.Metadata = att.Permission.Metadata
+	case att.Question != nil:
+		out.Type = appagent.AttentionQuestion
+		// 方案 B（design D10）：结构化视图（Title/Fields）优先透传；
+		// Questions 兼容视图保持既有填充（v1 事件路径无字段级信息，
+		// 消费方经 EffectiveFields 回退）。
+		out.Title = att.Question.Title
+		out.Fields = att.Question.Fields
+		for _, q := range att.Question.Questions {
+			out.Questions = append(out.Questions, appagent.QuestionItem{Header: q.Header, Question: q.Question})
+		}
+	}
+	return out
+}
+
+// observeSessionErrorFromAgentEvent 是 observeSessionErrorEvent 的 typed 等价
+// （字段从 SessionErrorDetail 负载直取，不做原始事件解析）。
+func (m *Manager) observeSessionErrorFromAgentEvent(ctx context.Context, taskID string, ev domain.AgentEvent) {
+	if ev.Error == nil {
+		return
+	}
+	sid := ev.Key.UpstreamID
+	if m.lifecycle == nil {
+		return
+	}
+	owner, found, err := m.lifecycle.OwnerOf(ctx, ocdecksess.ID(sid))
+	if err != nil {
+		log.Printf("task %s: session.error ownership check for %s failed: %v (event dropped)", taskID, sid, err)
+		return
+	}
+	if !found || owner != taskID {
+		return
+	}
+	rt := m.getRuntime(taskID)
+	if rt == nil {
+		return
+	}
+	var statusCode *int
+	if ev.Error.StatusCode != nil {
+		sc := *ev.Error.StatusCode
+		statusCode = &sc
+	}
+	var retryable *bool
+	if ev.Error.IsRetryable != nil {
+		r := *ev.Error.IsRetryable
+		retryable = &r
+	}
+	m.lifecycle.CommitSessionError(taskID, string(rt.instVersion), sid,
+		ev.Error.Name, ev.Error.Message, statusCode, retryable)
+}
+
+// applyAgentStatusEventFromAgentEvent 是 applySessionStatusEvent 的 typed 等价：
+// StatusChanged 负载直取（domain.AgentStatus → appagent.SessionStatusType 映射，
+// unknown 拒绝应用——与 ParseSessionStatusEvent 的三值枚举约束一致）。
+func (m *Manager) applyAgentStatusEventFromAgent(taskID string, ev domain.AgentEvent) {
+	if ev.Status == nil {
+		return
+	}
+	var status appagent.SessionStatusType
+	switch ev.Status.State {
+	case domain.StatusIdle:
+		status = appagent.StatusIdle
+	case domain.StatusBusy:
+		status = appagent.StatusBusy
+	case domain.StatusRetry:
+		status = appagent.StatusRetry
+	default:
+		return // unknown/缺枚举不 apply（与原始通道「未知枚举忽略」一致）
+	}
+	rt := m.getRuntime(taskID)
+	if rt == nil {
+		return
+	}
+	op := agentStatusOp{kind: agentOpStatusEvent, sessionID: ev.Key.UpstreamID, status: status}
+	if ev.Status.State == domain.StatusRetry {
+		op.retry = &appnotif.RetryDetail{Attempt: ev.Status.Attempt, Message: ev.Status.Message, Next: ev.Status.NextAt}
+	}
+	m.applyAgentStatusAndCommit(taskID, rt, op)
+}
+
 // handleSSEEvent 处理 SSE 事件：session.created/updated → upsert；session.deleted → 删行。
 // R7 failpoint：store 落库错误 MUST 返回（不得 _ = 丢弃，design.md §19 failpoint 表）。
 // 调用方据返回错误收敛运行时（convergeToSuspended）：会话归属丢失意味着运行时不可确定
@@ -1463,7 +2114,7 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 //   - status/diff 事件无 properties.info、仅 properties.sessionID（VERIFICATION.md 实测）：
 //     用 properties.sessionID 反查 task_sessions 归属，命中本任务才处理（SessionIDProp 优先
 //     properties.sessionID 回退 properties.info.id）。
-func (m *Manager) handleSSEEvent(ctx context.Context, taskID, wtPath string, ev opencode.Event) error {
+func (m *Manager) handleSSEEvent(ctx context.Context, taskID, wtPath string, ev appagent.Event) error {
 	switch ev.Type {
 	case "session.created", "session.updated":
 		sid := ev.SessionID()
@@ -1566,14 +2217,14 @@ func (m *Manager) handleSSEEvent(ctx context.Context, taskID, wtPath string, ev 
 		// 未知/缺字段静默忽略。注意力事件处理永不返回错误（不影响任务状态机）。
 		// P1.4.5：apply 返回 changed，经 commit helper 发布 serve_runtime.attention_changed
 		//（NoopPublisher 阶段调用位就绪无实际发布）。
-		if aev, ok := opencode.ParseAttentionEvent(ev); ok {
+		if aev, ok := appagent.ParseAttentionEvent(ev); ok {
 			if rt := m.getRuntime(taskID); rt != nil {
 				if rt.applyAttentionEvent(aev) {
 					m.commitAttentionChanged(taskID, rt, true)
 				}
 				// task-permission-mode D4 (a)：SSE asked 应用后扫描。准入未过自然拒绝
 				//（暂缓或忽略）；judged-set 保证重放/重复 asked 不放大判定。
-				if aev.Type == opencode.AttentionPermission && aev.Kind == opencode.AttentionAsked {
+				if aev.Type == appagent.AttentionPermission && aev.Kind == appagent.AttentionAsked {
 					m.judgeScan(rt)
 				}
 			}
@@ -1661,20 +2312,32 @@ func (m *Manager) alignSessions(ctx context.Context, taskID, wtPath string, oc O
 			return fmt.Errorf("list sessions: %w", err)
 		}
 	}
+	// 评审 I5：对齐归属命名空间随任务 binding（v2 任务 → v2 命名空间 claim；无
+	// binding → 零值 = store 按 v1 缺省处理——既有 v1 行为不变）。
+	nsProvider, nsInstance := "", ""
+	if b, has, berr := m.store.GetTaskBinding(ctx, taskID); berr != nil {
+		return berr
+	} else if has {
+		nsProvider, nsInstance = b.ProviderID, b.ProviderInstanceID
+	}
 	obs := make([]ocdecksess.Observation, 0, len(sessions))
 	for _, s := range sessions {
 		obs = append(obs, ocdecksess.Observation{
-			ID:        ocdecksess.ID(s.ID),
-			ParentID:  s.ParentID,
-			CreatedAt: int64(s.Time.Created),
-			UpdatedAt: int64(s.Time.Updated),
+			ID:                 ocdecksess.ID(s.ID),
+			ParentID:           s.ParentID,
+			CreatedAt:          int64(s.Time.Created),
+			UpdatedAt:          int64(s.Time.Updated),
+			ProviderID:         nsProvider,
+			ProviderInstanceID: nsInstance,
 		})
 	}
 	if m.lifecycle != nil {
 		_, aerr := m.lifecycle.AlignSessions(ctx, taskID, toDomainAlignMode(mode), obs, complete)
+		debugf("align task=%s mode=%v listed=%d complete=%t err=%v", taskID, mode, len(obs), complete, aerr)
 		return aerr
 	}
 	_, aerr := apptask.RunAlign(ctx, storeAlignPortsAdapter{store: m.store}, taskID, toDomainAlignMode(mode), obs, complete)
+	debugf("align task=%s mode=%v listed=%d complete=%t err=%v", taskID, mode, len(obs), complete, aerr)
 	return aerr
 }
 
@@ -1707,7 +2370,7 @@ func (m *Manager) bootstrapRuntime(ctx context.Context, row TaskRow, runtimeName
 			if err != nil {
 				return port, password, err
 			}
-			oc := m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 10 * time.Second})
+			oc := m.ocFactory(row.ProviderID, port, password, appagent.Options{HealthTimeout: 2 * time.Second, OpTimeout: 10 * time.Second})
 			ok, verr := m.anchorPresentInList(ctx, oc, row.WorktreePath, anchor)
 			if verr != nil {
 				return port, password, newOpErr(codeProcessError, verr)
@@ -1730,7 +2393,12 @@ func (m *Manager) bootstrapRuntime(ctx context.Context, row TaskRow, runtimeName
 					if err := m.confirmRuntimeTerminated(ctx, row.ID, runtimeName); err != nil {
 						return port, password, err
 					}
-					password = newRandomPassword()
+					// 换代密码：派生凭据同任务恒定（D3）——派生失败 fail-closed。
+					p, derr := derivedServePassword(row.ID)
+					if derr != nil {
+						return port, password, newOpErr(codeInternal, derr)
+					}
+					password = p
 					continue
 				} else {
 					return port, password, &anchorStageError{err: newOpErr(codeInternal, fmt.Errorf("clear stale anchor: CAS mismatch with unchanged anchor %s", anchor))}
@@ -1739,7 +2407,11 @@ func (m *Manager) bootstrapRuntime(ctx context.Context, row TaskRow, runtimeName
 			if err := m.confirmRuntimeTerminated(ctx, row.ID, runtimeName); err != nil {
 				return port, password, err
 			}
-			password = newRandomPassword()
+			p, derr := derivedServePassword(row.ID)
+			if derr != nil {
+				return port, password, newOpErr(codeInternal, derr)
+			}
+			password = p
 		}
 
 		var err error
@@ -1747,7 +2419,7 @@ func (m *Manager) bootstrapRuntime(ctx context.Context, row TaskRow, runtimeName
 		if err != nil {
 			return port, password, err
 		}
-		oc := m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 10 * time.Second})
+		oc := m.ocFactory(row.ProviderID, port, password, appagent.Options{HealthTimeout: 2 * time.Second, OpTimeout: 10 * time.Second})
 		created, cerr := oc.CreateSession(ctx, row.WorktreePath, row.Name)
 		if cerr != nil {
 			return port, password, &anchorStageError{err: newOpErr(codeProcessError, fmt.Errorf("create anchor session: %w", cerr))}
@@ -1764,12 +2436,16 @@ func (m *Manager) bootstrapRuntime(ctx context.Context, row TaskRow, runtimeName
 		if err := m.confirmRuntimeTerminated(ctx, row.ID, runtimeName); err != nil {
 			return port, password, err
 		}
-		password = newRandomPassword()
+		p2, derr := derivedServePassword(row.ID)
+		if derr != nil {
+			return port, password, newOpErr(codeInternal, derr)
+		}
+		password = p2
 		port, password, err = m.startRuntimeWithPortRetry(ctx, row, runtimeName, port, password, env, created.ID, beforeCreate, freshPassword)
 		if err != nil {
 			return port, password, err
 		}
-		oc = m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 10 * time.Second})
+		oc = m.ocFactory(row.ProviderID, port, password, appagent.Options{HealthTimeout: 2 * time.Second, OpTimeout: 10 * time.Second})
 		ok, verr := m.anchorPresentInList(ctx, oc, row.WorktreePath, created.ID)
 		if verr != nil {
 			return port, password, newOpErr(codeProcessError, verr)
@@ -1876,7 +2552,7 @@ func (m *Manager) watchServeExit(taskID, serveName string) {
 		case process.WatchEventSessionExit:
 			m.handleServeExit(taskID, tok)
 		case process.WatchEventInfraError:
-			m.ensureRecovery(taskID, tok)
+			m.ensureRecovery(taskID, tok, false)
 		}
 	})
 	if cur := m.getRuntime(taskID); cur != nil {
@@ -1893,7 +2569,7 @@ func (m *Manager) watchServeExit(taskID, serveName string) {
 // single-process Phase 4：watchTUIExit 已随独立 TUI 会话模型删除（TUI 与任务进程
 // 同体，-tui 遗留会话仅由 reconcile 清理路径处置）。
 func (m *Manager) handleServeExit(taskID string, tok runtime.InstVersion) {
-	m.ensureRecovery(taskID, tok)
+	m.ensureRecovery(taskID, tok, false)
 }
 
 // convergeToSuspended 收敛活跃任务到 suspended（design.md §4：不得留 active 但无 SSE 托管的运行时）。

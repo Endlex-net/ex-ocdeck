@@ -5,6 +5,7 @@ import (
 	"database/sql"
 
 	"ocdeck/internal/application"
+	domain "ocdeck/internal/domain/agentprovider"
 	ocdecksess "ocdeck/internal/domain/session"
 	ocdecktask "ocdeck/internal/domain/task"
 	"ocdeck/internal/infrastructure/git"
@@ -21,6 +22,62 @@ type StoreAdapter struct {
 
 // NewStoreAdapter 构造 TaskStore 适配器。
 func NewStoreAdapter(db *store.DB) *StoreAdapter { return &StoreAdapter{db: db} }
+
+// GetTaskBinding 读取任务绑定 envelope（tasks 4.2 迁移导入 runner seam；
+// domain.TaskBinding 经 domain 包传递——无 infrastructure-opencode 依赖）。
+func (a *StoreAdapter) GetTaskBinding(ctx context.Context, taskID string) (domain.TaskBinding, bool, error) {
+	return a.db.GetTaskBinding(ctx, taskID)
+}
+
+// GetTaskProviderID 读取任务声明的 provider 标识（C7 门禁修复：生命周期副作用
+// 前按任务行 provider_id 做 registry 准入）。
+func (a *StoreAdapter) GetTaskProviderID(ctx context.Context, taskID string) (string, error) {
+	return a.db.GetTaskProviderID(ctx, taskID)
+}
+
+// SetTaskBinding 写入任务绑定 envelope（Encode 校验在 domain 层）。
+func (a *StoreAdapter) SetTaskBinding(ctx context.Context, taskID string, b domain.TaskBinding) error {
+	return a.db.SetTaskBinding(ctx, taskID, b)
+}
+
+// ListTaskSessionKeys 读任务归属行 SessionKey（承接判定矩阵）。
+func (a *StoreAdapter) ListTaskSessionKeys(ctx context.Context, taskID string) ([]domain.SessionKey, error) {
+	return a.db.ListTaskSessionKeys(ctx, taskID)
+}
+
+// GetTaskAnchor 读锚定三元组。
+func (a *StoreAdapter) GetTaskAnchor(ctx context.Context, taskID string) (string, string, string, error) {
+	return a.db.GetTaskAnchor(ctx, taskID)
+}
+
+// CommitAdoption 承接原子提交（tasks 6.4：归属转换+anchor+binding+状态守卫 CAS
+// 单事务；评审 I11：携带同次读取旧 binding 做事务内代际复验）。
+func (a *StoreAdapter) CommitAdoption(ctx context.Context, taskID string, b, oldBinding domain.TaskBinding, fromStatus string, lastError *string) (application.TransitionResult, error) {
+	return a.db.CommitAdoption(ctx, taskID, b, oldBinding, ocdecktask.Status(fromStatus), lastError)
+}
+
+// CommitFirstBuild 首建原子提交（评审 I5：candidate claim+anchor+binding+状态
+// activating→active CAS 单事务）。
+func (a *StoreAdapter) CommitFirstBuild(ctx context.Context, taskID string, b domain.TaskBinding, key domain.SessionKey, createdAt, firstSeen, lastSeen int64, parentID string) (application.TransitionResult, error) {
+	return a.db.CommitFirstBuild(ctx, taskID, b, key, createdAt, firstSeen, lastSeen, parentID)
+}
+
+// ClaimTaskSessionKey 按完整 SessionKey 原子 claim（评审 I5：事件消费保留命名
+// 空间；三列谓词冲突语义同 ClaimTaskSession）。
+func (a *StoreAdapter) ClaimTaskSessionKey(ctx context.Context, taskID string, key domain.SessionKey, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
+	return a.db.ClaimSessionKey(ctx, taskID, key, createdAt, firstSeen, lastSeen, parentID)
+}
+
+// CommitV2Resume v2 恢复/替换提交（gate3 G3-F2/F8：binding 替换 + 旧 binding
+// 代际守卫 + fromStatus→active 状态收敛，单事务）。
+func (a *StoreAdapter) CommitV2Resume(ctx context.Context, taskID string, oldBinding, b domain.TaskBinding, fromStatus string) (application.TransitionResult, error) {
+	return a.db.CommitV2Resume(ctx, taskID, oldBinding, b, ocdecktask.Status(fromStatus))
+}
+
+// CommitActivation 激活/恢复成功提交事务（tasks 4.3：binding 与状态 CAS 同事务）。
+func (a *StoreAdapter) CommitActivation(ctx context.Context, taskID string, b domain.TaskBinding, fromStatus, toStatus string) (application.TransitionResult, error) {
+	return a.db.CommitActivation(ctx, taskID, b, ocdecktask.Status(fromStatus), ocdecktask.Status(toStatus))
+}
 
 func (a *StoreAdapter) GetProject(ctx context.Context, id string) (ProjectRow, error) {
 	p, err := a.db.GetProject(ctx, id)
@@ -379,6 +436,7 @@ func (a *StoreAdapter) AlignTaskSessions(ctx context.Context, taskID string, mod
 	for _, s := range listed {
 		obs = append(obs, store.SessionObservation{
 			SessionID: s.SessionID, CreatedAt: s.CreatedAt, UpdatedAt: s.UpdatedAt, ParentID: s.ParentID,
+			ProviderID: s.ProviderID, ProviderInstanceID: s.ProviderInstanceID,
 		})
 	}
 	return a.db.AlignTaskSessions(ctx, taskID, toStoreAlignMode(mode), obs, complete, notice)
@@ -410,6 +468,7 @@ func (a storeAlignPortsAdapter) Align(ctx context.Context, taskID string, mode o
 	for _, o := range observed {
 		listed = append(listed, SessionObservation{
 			SessionID: string(o.ID), CreatedAt: o.CreatedAt, UpdatedAt: o.UpdatedAt, ParentID: o.ParentID,
+			ProviderID: o.ProviderID, ProviderInstanceID: o.ProviderInstanceID,
 		})
 	}
 	return a.store.AlignTaskSessions(ctx, taskID, fromDomainAlignMode(mode), listed, complete, notice)
@@ -617,7 +676,7 @@ func (a *WorktreeAdapter) ValidateBranchName(ctx context.Context, repoPath, bran
 }
 
 // WorktreeHeadBranch 返回 worktree 的 symbolic HEAD 短分支名并校验仓库归属
-//（task-info-editable D2）。委托 internal/infrastructure/git.WorktreeHeadBranch。
+// （task-info-editable D2）。委托 internal/infrastructure/git.WorktreeHeadBranch。
 func (a *WorktreeAdapter) WorktreeHeadBranch(ctx context.Context, repoPath, wtPath string) (string, error) {
 	return git.WorktreeHeadBranch(ctx, repoPath, wtPath)
 }

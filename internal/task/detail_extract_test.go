@@ -12,11 +12,11 @@ import (
 // 类别字段路径/类型/必填/完整性条件、missing/malformed/truncated 归一与优先级。
 func TestExtractRequestDetail_Matrix(t *testing.T) {
 	cases := []struct {
-		name        string
-		permission  string
-		metadata    string // "" = 观察层归 nil；否则 JSON object 字面量
+		name         string
+		permission   string
+		metadata     string // "" = 观察层归 nil；否则 JSON object 字面量
 		wantDegraded string
-		check       func(t *testing.T, d RequestDetail)
+		check        func(t *testing.T, d RequestDetail)
 	}{
 		{
 			name: "bash command 完整", permission: "bash",
@@ -29,22 +29,22 @@ func TestExtractRequestDetail_Matrix(t *testing.T) {
 		},
 		{
 			name: "bash command 缺失 → missing_critical", permission: "bash",
-			metadata:   `{}`,
+			metadata:     `{}`,
 			wantDegraded: DegradedMissing,
 		},
 		{
 			name: "bash metadata 缺失（观察层 nil）→ missing_critical", permission: "bash",
-			metadata:   "",
+			metadata:     "",
 			wantDegraded: DegradedMissing,
 		},
 		{
 			name: "bash command 非 string → malformed_critical", permission: "bash",
-			metadata:   `{"command":42}`,
+			metadata:     `{"command":42}`,
 			wantDegraded: DegradedMalformed,
 		},
 		{
 			name: "bash command 空串 → malformed_critical", permission: "bash",
-			metadata:   `{"command":""}`,
+			metadata:     `{"command":""}`,
 			wantDegraded: DegradedMalformed,
 		},
 		{
@@ -58,7 +58,7 @@ func TestExtractRequestDetail_Matrix(t *testing.T) {
 		},
 		{
 			name: "edit diff 缺失 → missing_critical", permission: "write",
-			metadata:   `{"filepath":"a.go"}`,
+			metadata:     `{"filepath":"a.go"}`,
 			wantDegraded: DegradedMissing,
 		},
 		{
@@ -96,22 +96,22 @@ func TestExtractRequestDetail_Matrix(t *testing.T) {
 		},
 		{
 			name: "apply_patch 空数组 → malformed_critical", permission: "apply_patch",
-			metadata:   `{"files":[]}`,
+			metadata:     `{"files":[]}`,
 			wantDegraded: DegradedMalformed,
 		},
 		{
 			name: "apply_patch 枚举外 type → malformed_critical", permission: "apply_patch",
-			metadata:   `{"files":[{"type":"chmod","relativePath":"a.go","patch":"x"}]}`,
+			metadata:     `{"files":[{"type":"chmod","relativePath":"a.go","patch":"x"}]}`,
 			wantDegraded: DegradedMalformed,
 		},
 		{
 			name: "apply_patch 成员必填 relativePath 缺失 → malformed_critical", permission: "apply_patch",
-			metadata:   `{"files":[{"type":"update","patch":"x"}]}`,
+			metadata:     `{"files":[{"type":"update","patch":"x"}]}`,
 			wantDegraded: DegradedMalformed,
 		},
 		{
 			name: "apply_patch move 缺 movePath → malformed_critical", permission: "apply_patch",
-			metadata:   `{"files":[{"type":"move","relativePath":"b.go"}]}`,
+			metadata:     `{"files":[{"type":"move","relativePath":"b.go"}]}`,
 			wantDegraded: DegradedMalformed,
 		},
 		{
@@ -172,7 +172,7 @@ func TestExtractRequestDetail_Matrix(t *testing.T) {
 		},
 		{
 			name: "external_directory 全缺失 → missing_critical", permission: "external_directory",
-			metadata:   `{}`,
+			metadata:     `{}`,
 			wantDegraded: DegradedMissing,
 		},
 		{
@@ -186,13 +186,13 @@ func TestExtractRequestDetail_Matrix(t *testing.T) {
 		},
 		{
 			name: "metadata 合法 JSON 非 object → 观察层 nil → 关键类别 missing", permission: "bash",
-			metadata:    `["not","object"]`,
+			metadata:     `["not","object"]`,
 			wantDegraded: DegradedMissing,
 		},
 		{
 			name: "多原因优先级 malformed > missing > truncated", permission: "apply_patch",
 			// 成员形状错误（malformed）与顶层 files 存在但含缺失（不会到 missing——构造：patch 截断 + 枚举外 type）
-			metadata:   `{"files":[{"type":"chmod","relativePath":"a.go","patch":"` + strings.Repeat("x", 5000) + `"}]}`,
+			metadata:     `{"files":[{"type":"chmod","relativePath":"a.go","patch":"` + strings.Repeat("x", 5000) + `"}]}`,
 			wantDegraded: DegradedMalformed,
 		},
 	}
@@ -266,7 +266,7 @@ func TestExtractRequestDetail_Truncation(t *testing.T) {
 		if d.Degraded != "" || len(d.Files) != detailMaxFiles {
 			t.Errorf("exactly 20 files: degraded=%q len=%d", d.Degraded, len(d.Files))
 		}
-		d21 := extractRequestDetail("apply_patch", json.RawMessage(mk(detailMaxFiles + 1)))
+		d21 := extractRequestDetail("apply_patch", json.RawMessage(mk(detailMaxFiles+1)))
 		if d21.Degraded != DegradedTruncated || len(d21.Files) != detailMaxFiles {
 			t.Errorf("21 files: degraded=%q len=%d, want truncated + 20", d21.Degraded, len(d21.Files))
 		}
@@ -456,7 +456,7 @@ func TestExtractRequestDetail_Truncation(t *testing.T) {
 	})
 
 	t.Run("F9 command 2049B → 2048B 截断 + truncated_critical", func(t *testing.T) {
-		d := extractRequestDetail("external_directory", json.RawMessage(`{"command":"` + strings.Repeat("c", 2049) + `","filepath":"/outside/a"}`))
+		d := extractRequestDetail("external_directory", json.RawMessage(`{"command":"`+strings.Repeat("c", 2049)+`","filepath":"/outside/a"}`))
 		if d.Degraded != DegradedTruncated {
 			t.Errorf("Degraded = %q, want truncated_critical", d.Degraded)
 		}
@@ -513,10 +513,10 @@ func TestSummarizeRequestDetail(t *testing.T) {
 // 等价语义在 task 侧验证——nil/非 object 一律按缺失处理，见 detail_extract.go 入口）。
 func TestExtractRequestDetail_NilAndNonObject(t *testing.T) {
 	cases := []struct {
-		name           string
-		permission     string
-		meta           json.RawMessage // nil 表示观察层归 nil
-		wantDegraded   string
+		name         string
+		permission   string
+		meta         json.RawMessage // nil 表示观察层归 nil
+		wantDegraded string
 	}{
 		{name: "nil + bash → missing", permission: "bash", wantDegraded: DegradedMissing},
 		{name: "nil + read → 无降级", permission: "read"},
@@ -531,4 +531,3 @@ func TestExtractRequestDetail_NilAndNonObject(t *testing.T) {
 		})
 	}
 }
-

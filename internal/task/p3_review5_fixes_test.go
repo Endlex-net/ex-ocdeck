@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
@@ -124,7 +125,7 @@ func TestSubscribeEvents_ReturnsWithError_ConvergesToSuspended(t *testing.T) {
 		sseErr:     errors.New("sse stream reset by peer"),
 		returnedCh: make(chan struct{}),
 	}
-	m := newTestManagerWithFactory(t, store, proc, newMockWorktree(), func(port int, password string, opts opencode.Options) OCClient {
+	m := newTestManagerWithFactory(t, store, proc, newMockWorktree(), func(_ string, port int, password string, opts appagent.Options) OCClient {
 		oc.onReadyCb = opts.OnReady
 		return oc
 	})

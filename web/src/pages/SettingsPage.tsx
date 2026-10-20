@@ -35,11 +35,13 @@ import {
 } from '../terminal/preferences';
 import {
   useDiffStyle,
+  usePoll,
   useTheme,
   type DiffStylePreference,
   type ThemePreference,
 } from '../hooks';
-import type { OcConfigContent, OcConfigInfo } from '../types';
+import type { OcConfigContent, OcConfigInfo, ServerStatus } from '../types';
+import { detectAgentVersion } from './agent-version';
 import './settings.css';
 
 /* ============================ 设置多合一（tasks.md 7.1-7.5 + task-notifications D12） ============================
@@ -51,7 +53,7 @@ import './settings.css';
 const TABS: { key: ConfigsTab; label: string; id: string; panel: string }[] = [
   { key: 'appearance', label: '终端外观', id: 'tab-appearance', panel: 'panel-appearance' },
   { key: 'env', label: '环境变量', id: 'tab-env', panel: 'panel-env' },
-  { key: 'opencode', label: 'opencode 配置', id: 'tab-opencode', panel: 'panel-opencode' },
+  { key: 'opencode', label: 'Agent 配置', id: 'tab-opencode', panel: 'panel-opencode' },
   { key: 'ai', label: 'AI 配置', id: 'tab-ai', panel: 'panel-ai' },
   { key: 'notifications', label: '通知', id: 'tab-notifications', panel: 'panel-notifications' },
   { key: 'palette', label: '命令面板', id: 'tab-palette', panel: 'panel-palette' },
@@ -163,6 +165,7 @@ export function SettingsPage({
       )}
       {tab === 'opencode' && (
         <div role="tabpanel" id="panel-opencode" aria-labelledby="tab-opencode">
+          <AgentSectionHeader />
           <OcConfigPanel />
         </div>
       )}
@@ -757,6 +760,35 @@ function EditorToolsPanel() {
         </button>
       </div>
     </section>
+  );
+}
+
+/* ============================ Agent 配置子项区块头 ============================
+ * 「opencode」子项标题 + 版本标识 badge：版本来自 GET /server/status 的
+ * opencodeVersion 主版本号（capabilities 空闲时 session 恒为 null，不含 provider
+ * 身份，不能作版本信号）；复用 ServerStatusBanner 的 30s 轮询模式（usePoll 卸载
+ * 自清理）；拉取失败静默显示「版本未知」。 */
+function AgentSectionHeader() {
+  const [status, setStatus] = useState<ServerStatus | null>(null);
+
+  usePoll(() => {
+    api
+      .serverStatus()
+      .then(setStatus)
+      .catch(() => {
+        /* 静默：badge 仅辅助标识，不覆盖页面级错误提示 */
+      });
+  }, 30_000);
+
+  const version = detectAgentVersion(status);
+  const badgeClass = version === '未知' ? 'od-badge od-badge-neutral' : 'od-badge od-badge-type';
+  const badgeText = version === '未知' ? '版本未知' : `版本 ${version}`;
+
+  return (
+    <div className="set-agent-subhead">
+      <h3 className="od-section-title">opencode</h3>
+      <span className={badgeClass}>{badgeText}</span>
+    </div>
   );
 }
 

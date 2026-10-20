@@ -3,6 +3,8 @@ package task
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -13,7 +15,9 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/config"
+	domain "ocdeck/internal/domain/agentprovider"
 	ocdecksess "ocdeck/internal/domain/session"
 	ocdecktask "ocdeck/internal/domain/task"
 	"ocdeck/internal/infrastructure/hostenv"
@@ -25,8 +29,13 @@ import (
 
 // TestMain 将 login shell 兜底捕获替换为空结果：宿主隔离类测试只依赖进程环境，
 // 不受运行机 shell 配置干扰（hostenv 兜底行为由 hostenv 包内单测覆盖）。
+// C2c（裁决 2）：包级注入固定测试 master secret——D3 派生序（env 优先）使全部
+// 经 spawn 的测试确定性；单测需要不同值时用 t.Setenv 覆盖。
 func TestMain(m *testing.M) {
 	hostenv.Capture = func() map[string]string { return nil }
+	if err := os.Setenv(appagent.MasterSecretEnv, "task-test-master-secret"); err != nil {
+		panic("test main: set master secret env: " + err.Error())
+	}
 	os.Exit(m.Run())
 }
 
@@ -37,7 +46,18 @@ type mockStore struct {
 	projects map[string]ProjectRow
 	tasks    map[string]TaskRow
 	sessions map[string][]SessionRow // taskID -> sessions
-	taskSeq  int
+	// bindings 镜像 tasks.task_binding（taskID → 已编码 envelope JSON；nil/缺失 = NULL）。
+	// bindingRawOf 提供原始列值断言（含未写场景）。
+	bindings map[string]string
+	// getTaskBindingErr 非空时 GetTaskBinding 返回该错误（C5 fixture：store 读取
+	// 失败 vs envelope 解析失败分派）。
+	getTaskBindingErr error
+	// getTaskProviderIDErr 非空时 GetTaskProviderID 返回该错误（C7 fixture）。
+	getTaskProviderIDErr error
+	// commitActivationErr 非空时 CommitActivation 返回该错误（C3 情形④ failpoint：
+	// 恢复提交失败旧 binding 保留）。
+	commitActivationErr error
+	taskSeq             int
 	// 记录状态转移历史，供断言。
 	statusCalls []statusCall
 	// deleteTaskCount 记录 DeleteTask 调用次数（测试经 deleteTaskCount() accessor 读取，避免直接读字段）。
@@ -66,8 +86,12 @@ type mockStore struct {
 	// --- task-info-editable：rename_pending 镜像与 failpoint ---
 	// renamePending 镜像 tasks.rename_pending（taskID → JSON）。setRenamePendingErr /
 	// commitInfoErr / clearRenamePendingErr 非空时对应方法返回该错误（失败矩阵 failpoint）。
-	renamePending         map[string]string
-	setRenamePendingErr   error
+	renamePending       map[string]string
+	setRenamePendingErr error
+	// projEnvVars/taskEnvVars 可注入 env 配置层（C22 同代快照测试；nil = 空层，
+	// 保持既有行为零变化）。
+	projEnvVars           map[string][]EnvVarRow
+	taskEnvVars           map[string][]EnvVarRow
 	commitInfoErr         error
 	clearRenamePendingErr error
 	// --- task-permission-mode：启动事实镜像与 failpoint ---
@@ -90,6 +114,7 @@ func newMockStore() *mockStore {
 		projects:              map[string]ProjectRow{},
 		tasks:                 map[string]TaskRow{},
 		sessions:              map[string][]SessionRow{},
+		bindings:              map[string]string{},
 		recoveryAttempts:      map[string][]int64{},
 		recoveryDebts:         map[string]RecoveryDebtRow{},
 		renamePending:         map[string]string{},
@@ -731,14 +756,27 @@ func (s *mockStore) deleteTaskCountVal() int {
 	return s.deleteTaskCount
 }
 
+// projEnvVars/taskEnvVars 可注入的项目级/任务级 env 配置行（key=projectID/taskID；
+// C22 同代快照测试用：快照持久化后再新增配置，验证 supervisor seam 不混入）。
+// 为 nil 时保持既有空返回行为。
 func (s *mockStore) ListProjectEnvVars(ctx context.Context, projectID string) ([]EnvVarRow, error) {
-	return nil, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.projEnvVars == nil {
+		return nil, nil
+	}
+	return s.projEnvVars[projectID], nil
 }
 func (s *mockStore) ListGlobalEnvVars(ctx context.Context) ([]GlobalEnvVarRow, error) {
 	return nil, nil
 }
 func (s *mockStore) ListTaskEnvVars(ctx context.Context, taskID string) ([]EnvVarRow, error) {
-	return nil, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.taskEnvVars == nil {
+		return nil, nil
+	}
+	return s.taskEnvVars[taskID], nil
 }
 
 func (s *mockStore) UpsertTaskSession(ctx context.Context, sess SessionRow) error {
@@ -856,6 +894,12 @@ func (s *mockStore) ClaimTaskSession(ctx context.Context, taskID, sessionID stri
 		FirstSeenAt: firstSeen, LastSeenAt: lastSeen, ParentID: parentID,
 	})
 	return application.ClaimResult{Claimed: true, Changed: true}, nil
+}
+
+// ClaimTaskSessionKey 按完整 SessionKey 原子 claim（评审 I5）。mock 为单命名
+// 空间内存实现：冲突/归属判定按 upstream id（与 ClaimTaskSession 同域）。
+func (s *mockStore) ClaimTaskSessionKey(ctx context.Context, taskID string, key domain.SessionKey, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
+	return s.ClaimTaskSession(ctx, taskID, key.UpstreamID, createdAt, firstSeen, lastSeen, parentID)
 }
 
 func (s *mockStore) ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
@@ -1029,6 +1073,268 @@ func (s *mockStore) TouchOwnedTaskSession(ctx context.Context, taskID, sessionID
 // AlignTaskSessions 镜像 store.AlignTaskSessions：按 mode 对齐（repo 逐个 claim、冲突上报、
 // ownedOnly 仅刷新 listed∩owned），complete 删 owned 缺席行并对 tasks.notice 做 CAS 镜像
 // （expected 失配返回 application.AlignConflict；同值 no-op），返回结构化 AlignResult。
+// --- 任务绑定 envelope（tasks 4.2 迁移导入 runner mock；镜像 store 列语义） ---
+
+// GetTaskBinding 镜像 store.GetTaskBinding：无绑定 → (zero,false,nil)；存在但
+// 解码失败 fail-closed。
+func (s *mockStore) GetTaskBinding(ctx context.Context, taskID string) (domain.TaskBinding, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.getTaskBindingErr != nil {
+		return domain.TaskBinding{}, false, s.getTaskBindingErr
+	}
+	raw, ok := s.bindings[taskID]
+	if !ok || raw == "" {
+		return domain.TaskBinding{}, false, nil
+	}
+	b, err := domain.DecodeTaskBinding(raw)
+	if err != nil {
+		return domain.TaskBinding{}, false, err
+	}
+	return b, true, nil
+}
+
+// GetTaskProviderID 镜像 tasks.provider_id 读取（C7 门禁修复）。行不存在 →
+// sql.ErrNoRows；getTaskProviderIDErr 非 nil 时前置返回（fixture 注入）。
+func (s *mockStore) GetTaskProviderID(ctx context.Context, taskID string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.getTaskProviderIDErr != nil {
+		return "", s.getTaskProviderIDErr
+	}
+	t, ok := s.tasks[taskID]
+	if !ok {
+		return "", sql.ErrNoRows
+	}
+	if t.ProviderID == "" {
+		return store.ProviderIDV1, nil // 0018 DEFAULT 语义
+	}
+	return t.ProviderID, nil
+}
+
+// SetTaskBinding 镜像 store.SetTaskBinding：Encode 校验失败报错；行不存在 →
+// sql.ErrNoRows；成功后 bindings[taskID] = envelope JSON（列值原文）。
+func (s *mockStore) SetTaskBinding(ctx context.Context, taskID string, b domain.TaskBinding) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.tasks[taskID]; !ok {
+		return sql.ErrNoRows
+	}
+	raw, err := b.Encode()
+	if err != nil {
+		return err
+	}
+	s.bindings[taskID] = raw
+	return nil
+}
+
+// CommitActivation 镜像 store.CommitActivation（tasks 4.3 binding 提交协议）：
+// binding 写入 + 状态 CAS 顺序执行（mock 持单锁，两写对测试观测原子）；
+// CAS 失配 → 零修改返回（与 store 一致：binding 先写后随事务语义不可回滚的
+// 例外仅状态失配——mock 按真实路径镜像为状态失配时不落 binding）。
+func (s *mockStore) CommitActivation(ctx context.Context, taskID string, b domain.TaskBinding, fromStatus, toStatus string) (application.TransitionResult, error) {
+	s.mu.Lock()
+	if s.commitActivationErr != nil {
+		e := s.commitActivationErr
+		s.mu.Unlock()
+		return application.TransitionResult{}, e
+	}
+	if _, ok := s.tasks[taskID]; !ok {
+		s.mu.Unlock()
+		return application.TransitionResult{}, sql.ErrNoRows
+	}
+	s.mu.Unlock()
+	// 状态 CAS（镜像 updateTaskStatus 条件语义）。
+	cas, err := s.UpdateTaskStatusConditional(ctx, taskID, fromStatus, toStatus, sql.NullString{})
+	if err != nil {
+		return application.TransitionResult{}, err
+	}
+	if !cas.Matched {
+		return application.TransitionResult{}, nil
+	}
+	if werr := s.SetTaskBinding(ctx, taskID, b); werr != nil {
+		return application.TransitionResult{}, werr
+	}
+	return cas, nil
+}
+
+// bindingRawOf 返回列值原文（未写 → 空 + false）。
+func (s *mockStore) bindingRawOf(taskID string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	raw, ok := s.bindings[taskID]
+	return raw, ok
+}
+
+// rawBindingOf 解码已写 binding（断言 helper；未写/解码失败 → zero,false）。
+func (s *mockStore) rawBindingOf(taskID string) (domain.TaskBinding, bool) {
+	raw, ok := s.bindingRawOf(taskID)
+	if !ok {
+		return domain.TaskBinding{}, false
+	}
+	b, err := domain.DecodeTaskBinding(raw)
+	if err != nil {
+		return domain.TaskBinding{}, false
+	}
+	return b, true
+}
+
+// seedDerivedBinding 按真实 buildBinding 形状预置任务的持久化 binding（tasks 4.3
+// 事实来源切换后 taskOcClient/AgentStatus/resumeActive 等消费点全部经 binding 解析；
+// derived 凭据不落库，消费点现场派生——auth.Password 例外仅迁移导入 fixture 用）。
+// port/directory 为 fixture 上游映射值。
+func seedDerivedBinding(s *mockStore, taskID string, port int, directory string) {
+	rawTaskID := taskID
+	data, _ := json.Marshal(map[string]interface{}{
+		"port":      port,
+		"directory": directory,
+		"taskId":    rawTaskID,
+		"auth":      map[string]string{"kind": appagent.DerivedCredKind},
+	})
+	_ = s.SetTaskBinding(context.Background(), taskID, domain.TaskBinding{
+		Version:            domain.TaskBindingVersion,
+		ProviderID:         "opencode-v1",
+		ProviderInstanceID: "default",
+		UpstreamSessionID:  "ses-anchor-" + taskID,
+		TerminalRef:        runtimeSessionName(taskID),
+		Data:               data,
+	})
+}
+
+// seedLegacyBinding 预置 legacy 形态 binding（迁移导入 runner fixture 专用：
+// auth.kind=legacy + 存量随机密码落库）。
+func seedLegacyBinding(s *mockStore, taskID, directory, password string, port int) {
+	data, _ := json.Marshal(map[string]interface{}{
+		"port":      port,
+		"directory": directory,
+		"auth":      map[string]string{"kind": appagent.LegacyCredKind, "password": password},
+	})
+	_ = s.SetTaskBinding(context.Background(), taskID, domain.TaskBinding{
+		Version:            domain.TaskBindingVersion,
+		ProviderID:         "opencode-v1",
+		ProviderInstanceID: "default",
+		UpstreamSessionID:  "ses-anchor-" + taskID,
+		TerminalRef:        runtimeSessionName(taskID),
+		Data:               data,
+	})
+}
+
+// DeleteTaskBindingForTest 删除任务 binding（failpoint：client 构造失败注入）。
+func (s *mockStore) DeleteTaskBindingForTest(taskID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.bindings, taskID)
+}
+
+// injectEphemeralSupervisorForTest 为测试 Manager 注入删除清理临时绑定入口
+// （tasks 4.3 AcquireEphemeral；fixture 用真实 supervisor deps：进程 seam 复用
+// 传入 proc、store seam 复用 TaskStore、SideFx 委托 Manager 现状实现——与生产
+// NewSPIProviderWithDeps 装配同形）。portOverride 非 0 时端口分配固定返回该值
+// （fixture 上游监听端口：supervisor 内部的健康检查经真实 opencode.NewClient
+// 直连该端口，与 Manager 侧 ocFactory 的端口映射解耦）。proc 可为 nil。
+func injectEphemeralSupervisorForTestWithPort(t *testing.T, m *Manager, ms *mockStore, proc ProcessBackend, portOverride int) {
+	t.Helper()
+	p := proc
+	if p == nil {
+		p = m.proc
+	}
+	var seam *mockSupStoreSeam
+	if ms != nil {
+		seam = &mockSupStoreSeam{store: ms}
+	}
+	alloc := func(lastPort int, lastValid bool, exclude int) (int, error) {
+		return m.AllocateServePort(lastPort, lastValid, exclude)
+	}
+	if portOverride != 0 {
+		alloc = func(lastPort int, lastValid bool, exclude int) (int, error) {
+			if portOverride != exclude {
+				return portOverride, nil
+			}
+			return portOverride + 1, nil
+		}
+	}
+	deps := opencode.SupervisorDeps{
+		Proc:         p,
+		Store:        seam,
+		SideFx:       &mockSupSideFx{m: m},
+		AllocatePort: alloc,
+		ReadyTimeout: 50 * time.Millisecond, PollInterval: 5 * time.Millisecond,
+	}
+	m.ephemeralSupervisor = opencode.NewSPIProviderWithDeps(deps).Supervisor()
+	// 注入完整 supervisor 而非仅 Ephemeral：Acquire/Resume 建程（C2 生产接线）
+	// 与 AcquireEphemeral 消费同一实现；fixture 按 ora-4 约束经
+	// m.SetRuntimeSupervisor 显式选择生产路径（charx 行为保持矩阵默认走内联
+	// golden 锚定路径——fake server 单端口拓扑与 factory 映射耦合，见 harness）。
+}
+
+func injectEphemeralSupervisorForTest(t *testing.T, m *Manager, ms *mockStore, proc ProcessBackend) {
+	t.Helper()
+	injectEphemeralSupervisorForTestWithPort(t, m, ms, proc, 0)
+}
+
+// mockSupStoreSeam 是 supervisor store seam 的 mock 适配（get anchor / claim /
+// clear / last port；镜像 *store.DB 语义的最小子集）。
+type mockSupStoreSeam struct {
+	store *mockStore
+	// claimConflict 置位时下次 ClaimSessionKeyAndSetAnchor 返回他任务持有
+	//（C12 注入 fixture：claim 冲突经真实 supervisor 触发）。
+	claimConflict bool
+}
+
+func (s *mockSupStoreSeam) GetTaskAnchor(_ context.Context, taskID string) (string, error) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	row, ok := s.store.tasks[taskID]
+	if !ok {
+		return "", fmt.Errorf("not found")
+	}
+	if !row.AnchorSessionID.Valid {
+		return "", nil
+	}
+	return row.AnchorSessionID.String, nil
+}
+
+func (s *mockSupStoreSeam) ClaimSessionKeyAndSetAnchor(_ context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
+	if s.claimConflict {
+		return application.ClaimResult{Claimed: false, OwnerTaskID: "t-other"}, nil
+	}
+	return s.store.ClaimTaskSessionAndSetAnchor(context.Background(), taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+}
+
+func (s *mockSupStoreSeam) ClearTaskAnchorConditional(_ context.Context, taskID, oldAnchor string) (application.MutationResult, error) {
+	return s.store.ClearTaskAnchorConditional(context.Background(), taskID, oldAnchor)
+}
+
+func (s *mockSupStoreSeam) GetTaskLastPort(_ context.Context, taskID string) (int, bool, error) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	row, ok := s.store.tasks[taskID]
+	if !ok {
+		return 0, false, fmt.Errorf("not found")
+	}
+	return int(row.LastPort.Int64), row.LastPort.Valid, nil
+}
+
+// mockSupSideFx 是 supervisor SideFx seam 的 mock 适配（委托 Manager 现状实现）。
+type mockSupSideFx struct {
+	m *Manager
+}
+
+func (s *mockSupSideFx) ResolvePermissionMode(ctx context.Context, taskID string) (string, error) {
+	a := NewSupervisorSideEffects(s.m)
+	return a.ResolvePermissionMode(ctx, taskID)
+}
+
+func (s *mockSupSideFx) PersistServePort(ctx context.Context, taskID string, env map[string]string) error {
+	a := NewSupervisorSideEffects(s.m)
+	return a.PersistServePort(ctx, taskID, env)
+}
+
+func (s *mockSupSideFx) BuildServeEnv(ctx context.Context, taskID string) (map[string]string, error) {
+	a := NewSupervisorSideEffects(s.m)
+	return a.BuildServeEnv(ctx, taskID)
+}
+
 func (s *mockStore) AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, notice application.NoticeMutation) (application.AlignResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1178,6 +1484,9 @@ type mockProc struct {
 	killSessionErr error
 	watchCb        map[string]func(process.WatchEvent)
 	envValues      map[string]map[string]string // sessionName -> env
+	// showEnvErr 非空时 ShowSessionEnv 对所有会话返回该错误（模拟 tmux 故障，
+	// C5 来源标记读取失败 failpoint）。
+	showEnvErr error
 	// cmdArgvValues 记录 NewSession 的 CmdArgv（§4 锚定测试断言 --session <id>）。
 	cmdArgvValues map[string][]string
 	// killOrder 记录 KillSession 调用顺序（D1 测试断言 kill 顺序 tui→shells→serve）。
@@ -1261,6 +1570,9 @@ func (p *mockProc) EnsureServerOptions() error { return nil }
 func (p *mockProc) ShowSessionEnv(name, key string) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.showEnvErr != nil {
+		return "", p.showEnvErr
+	}
 	if env, ok := p.envValues[name]; ok {
 		return env[key], nil
 	}
@@ -1495,9 +1807,12 @@ type mockOC struct {
 	// mu 串行化 sessions 的并发读写（附带项：SSE 对齐 goroutine 读 ListSessions 与
 	// 恢复/激活路径 CreateSession append 并发，-race 下报 data race）。测试在并发
 	// 开始前的直接字段赋值经 goroutine 创建构成 happens-before，不受影响。
-	mu            sync.Mutex
-	probeErr      error
-	healthOK      bool
+	mu       sync.Mutex
+	probeErr error
+	healthOK bool
+	// healthyField=false 时 Health 返回 err==nil + Healthy=false（C5 fixture：
+	// 协议应答违约形态；默认 true 维持既有行为）。
+	healthyField  bool
 	sessions      []opencode.Session
 	getSessionErr error
 	deleteErr     error
@@ -1562,6 +1877,7 @@ type replyPermissionCall struct {
 func newMockOC(healthOK bool) *mockOC {
 	return &mockOC{
 		healthOK:           healthOK,
+		healthyField:       true,
 		onReadyCh:          make(chan struct{}, 1),
 		deleteErrByID:      map[string]error{},
 		updateTitleErrByID: map[string]error{},
@@ -1572,6 +1888,10 @@ func newMockOC(healthOK bool) *mockOC {
 func (c *mockOC) Health(ctx context.Context) (opencode.HealthResponse, error) {
 	if !c.healthOK {
 		return opencode.HealthResponse{}, opencode.ErrServeNotReady
+	}
+	if !c.healthyField {
+		// 协议应答 200 + healthy=false（C5 fixture：字段级违约）。
+		return opencode.HealthResponse{Healthy: false, Version: opencode.ContractBaseline}, nil
 	}
 	return opencode.HealthResponse{Healthy: true, Version: opencode.ContractBaseline}, nil
 }
@@ -1738,23 +2058,101 @@ func (c *mockOC) updateTitleCallsSnapshot() []updateTitleCall {
 
 func newTestManager(t *testing.T, store TaskStore, proc ProcessBackend, wt WorktreeBackend, oc OCClient) *Manager {
 	t.Helper()
+	ms, _ := store.(*mockStore)
+	return newTestManagerFull(t, store, ms, proc, wt, oc)
+}
+
+// newTestManagerFull 是 newTestManager 的显式形态：ms 为底座 mockStore
+// （binding seed / supervisor store seam 读取；store 为包装类型时非 nil 传入）。
+func newTestManagerFull(t *testing.T, store TaskStore, ms *mockStore, proc ProcessBackend, wt WorktreeBackend, oc OCClient) *Manager {
+	t.Helper()
 	cfg := &config.Config{
 		DataDir:        t.TempDir(),
 		ServePortRange: config.PortRange{Min: 50000, Max: 50999},
 		ShutdownPolicy: config.ShutdownPersist,
 	}
 	// wrapOC 包装 mock，使 Options.OnReady 在 SubscribeEvents 首次调用时同步触发。
-	wrap := func(port int, password string, opts opencode.Options) OCClient {
+	wrap := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOC{inner: oc, onReady: opts.OnReady}
+	}
+	// tasks 4.3：测试 Manager 统一注入注册了 opencode-v1 的 registry（runtime
+	// 连接分派在生产与契约 fixture 中 fail-closed 语义一致）。需要未注册形态
+	// 的 fixture 自行以空 registry 构造。
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatalf("register test provider: %v", err)
 	}
 	m := New(Options{
 		Cfg: cfg, Store: store, Proc: proc, Worktree: wt,
-		OCFactory: wrap,
+		OCFactory:        wrap,
+		ProviderRegistry: reg,
 	})
+	// tasks 4.3：删除清理的临时绑定入口同步注入（与生产 registry.Supervisor()
+	// 装配同形——真实 supervisor deps；端口 seam 复用 Manager 分配器）。
+	injectEphemeralSupervisorForTest(t, m, ms, proc)
 	// 测试默认跳过 D3 退避，避免 watcher/SSE 恢复把套件拖进 5s/15s/45s。
 	m.recoveryBackoffFn = func(int) time.Duration { return 0 }
 	return m
 }
+
+// newTestRegistryProvider 构造 registry 注册用的最小 Provider（仅 Meta 可用；
+// 本注册只服务 runtime 连接分派的 provider 存在性校验）。
+func newTestRegistryProvider() appagent.Provider { return minimalProvider{} }
+
+// newTestRegistry 构造注册了 opencode-v1 的 registry（C7：Activate/Reconcile
+// 准入按任务 provider 查表——直构 Manager 的测试统一经此注入）。
+func newTestRegistry() *appagent.Registry {
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		panic(err) // dup/empty 均为测试基建 bug
+	}
+	return reg
+}
+
+// minimalProvider 是 registry 注册的最小 Provider 形态。窄接口 nil 允许：
+// registry 仅被 task 层分派存在性校验消费，能力端口经 opencode.SPIProvider
+// 走生产装配（契约 harness 的 supervisor 流程不经 registry.Supervisor）。
+type minimalProvider struct{}
+
+func (minimalProvider) Meta() appagent.ProviderMeta {
+	return appagent.ProviderMeta{ProviderID: "opencode-v1", DisplayName: "test v1"}
+}
+
+// failClosedSupervisor 是 minimalProvider 的 RuntimeSupervisor（显式 fail-closed，
+// 不猜测行为；nil interface 会在运行时 panic——违反「不为单一场景保留半成品」约束）。
+type failClosedSupervisor struct{}
+
+func (failClosedSupervisor) Acquire(ctx context.Context, task appagent.TaskRef) (domain.TaskBinding, error) {
+	return domain.TaskBinding{}, appagent.NewError("test.acquire", appagent.ErrKindCapabilityUnavailable, errors.New("test stub"))
+}
+func (failClosedSupervisor) Resume(ctx context.Context, task appagent.TaskRef, old domain.TaskBinding, policy appagent.ResumePolicy) (domain.TaskBinding, error) {
+	return domain.TaskBinding{}, appagent.NewError("test.resume", appagent.ErrKindCapabilityUnavailable, errors.New("test stub"))
+}
+func (failClosedSupervisor) AcquireEphemeral(ctx context.Context, task appagent.TaskRef) (domain.TaskBinding, error) {
+	return domain.TaskBinding{}, appagent.NewError("test.acquire_ephemeral", appagent.ErrKindCapabilityUnavailable, errors.New("test stub"))
+}
+func (failClosedSupervisor) Release(ctx context.Context, b domain.TaskBinding) error {
+	return appagent.NewError("test.release", appagent.ErrKindCapabilityUnavailable, errors.New("test stub"))
+}
+
+func (minimalProvider) Supervisor() appagent.RuntimeSupervisor { return failClosedSupervisor{} }
+func (minimalProvider) Sessions() appagent.SessionControl      { return nil }
+func (minimalProvider) Events() appagent.EventSource           { return nil }
+func (minimalProvider) Attention() appagent.AttentionIO        { return nil }
+func (minimalProvider) Prompts() appagent.AsyncPrompt          { return nil }
+func (minimalProvider) Status() appagent.StatusReader          { return nil }
+func (minimalProvider) Terminal() appagent.TerminalIO          { return nil }
+func (minimalProvider) Titles() appagent.TitleUpdater          { return nil }
+
+// BindingRuntimeEndpoint fail-closed：测试 provider 不承载端点解码（C2 窄接口；
+// task 层 startSSE 对 Events()==nil 的 provider 回退原始通道，本方法不参与）。
+func (minimalProvider) BindingRuntimeEndpoint(domain.TaskBinding) (int, string, string, error) {
+	return 0, "", "", appagent.NewError("test.endpoint", appagent.ErrKindCapabilityUnavailable, errors.New("test stub"))
+}
+
+// ocRegistryProviderForCharx 构造契约 harness 的 registry 注册 Provider
+// （charx harness 用；同 minimalProvider）。
+func ocRegistryProviderForCharx() appagent.Provider { return minimalProvider{} }
 
 // readyOC 在 SubscribeEvents 时同步触发 onReady（测试用，避免 startSSE 超时）。
 type readyOC struct {
@@ -1817,3 +2215,44 @@ func (c *readyOC) ListMessages(ctx context.Context, dir, sessionID string, limit
 	}
 	return lm.ListMessages(ctx, dir, sessionID, limit)
 }
+
+// CommitV2Resume 镜像 store.CommitV2Resume（gate3 G3-F2/F8 测试支撑）：binding
+// 写入 + 旧 binding 代际守卫（raw 精确匹配）+ fromStatus→active 状态收敛。
+func (s *mockStore) CommitV2Resume(ctx context.Context, taskID string, oldBinding, b domain.TaskBinding, fromStatus string) (application.TransitionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.tasks[taskID]
+	if !ok {
+		return application.TransitionResult{}, ocdeckstore_errAdoptionConflict()
+	}
+	if t.Status != fromStatus {
+		return application.TransitionResult{}, ocdeckstore_errAdoptionConflict()
+	}
+	// G3-F8 代际守卫：当前存储 raw 必须与本次读取的旧 binding 编码精确一致。
+	if oldBinding.ProviderID != "" || oldBinding.UpstreamSessionID != "" {
+		oldRaw, oerr := oldBinding.Encode()
+		if oerr != nil {
+			return application.TransitionResult{}, oerr
+		}
+		if s.bindings[taskID] != oldRaw {
+			return application.TransitionResult{}, ocdeckstore_errAdoptionConflict()
+		}
+	}
+	raw, err := b.Encode()
+	if err != nil {
+		return application.TransitionResult{}, err
+	}
+	s.bindings[taskID] = raw
+	t.Status = StatusActive
+	s.tasks[taskID] = t
+	return application.TransitionResult{MutationResult: application.MutationResult{Matched: true}, StatusChanged: fromStatus != StatusActive, From: ocdecktask.Status(fromStatus), To: ocdecktask.StatusActive}, nil
+}
+
+// ocdeckstore_errAdoptionConflict 是 store 承接冲突哨兵的镜像（测试断言用；
+// 错误文本对齐 store.ErrAdoptionConflict）。
+func ocdeckstore_errAdoptionConflict() error {
+	return errors.New("store: adoption commit rejected")
+}
+
+// ocdecktask_status 是 domain status 的窄转换（mock 镜像用）。
+func ocdecktask_status(s string) string { return s }

@@ -11,11 +11,12 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/application/runtime"
 	apptask "ocdeck/internal/application/task"
 	"ocdeck/internal/config"
+	domain "ocdeck/internal/domain/agentprovider"
 	"ocdeck/internal/infrastructure/lifecycle"
-	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
 )
 
@@ -70,6 +71,10 @@ type TaskStore interface {
 	// 实际推进（P1.4.5 结构化）。不加跨任务唯一索引；冲突语义由调用方按入口处理
 	//（SSE/对齐忽略+诊断，锚定失败+last_error）。
 	ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error)
+	// ClaimTaskSessionKey 按完整 SessionKey（provider/instance/upstream 三列谓词）
+	// 原子 claim（opencode-v2-provider 评审 I5：事件消费保留命名空间——v2 会话
+	// 归属行落 v2 命名空间）。冲突语义同 ClaimTaskSession。
+	ClaimTaskSessionKey(ctx context.Context, taskID string, key domain.SessionKey, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error)
 	// ClaimTaskSessionAndSetAnchor 单事务 claim + 写入 tasks.anchor_session_id（D5）。
 	// 冲突时归属与 anchor 均不修改。
 	ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error)
@@ -98,6 +103,20 @@ type TaskStore interface {
 	//（expected 失配整事务回滚返回 application.AlignConflict）。返回结构化 AlignResult
 	//（计数/AffectedSessionIDs/OwnedSessionIDs/TaskMutation/Conflicts）。
 	AlignTaskSessions(ctx context.Context, taskID string, mode AlignMode, listed []SessionObservation, complete bool, notice application.NoticeMutation) (application.AlignResult, error)
+	// GetTaskBinding 读取任务绑定 envelope（D3；无绑定 → (zero,false,nil)；存在但
+	// 版本未知/畸形 fail-closed 错误）。tasks 4.2 迁移导入 runner 消费。
+	GetTaskBinding(ctx context.Context, taskID string) (domain.TaskBinding, bool, error)
+	// GetTaskProviderID 读取任务声明的 provider 标识（C7 门禁修复：生命周期副作用
+	// 前按任务行 provider_id 做 registry 准入；行缺失 → sql.ErrNoRows）。
+	GetTaskProviderID(ctx context.Context, taskID string) (string, error)
+	// SetTaskBinding 写入任务绑定 envelope（Encode 校验结构完整性；行不存在 →
+	// sql.ErrNoRows）。
+	SetTaskBinding(ctx context.Context, taskID string, b domain.TaskBinding) error
+	// CommitActivation 激活/恢复成功提交事务（opencode-v1-spi-provider tasks 4.3 /
+	// design D9 binding 提交协议）：binding 写入与任务状态 CAS 同事务；CAS 失配
+	// 或事务失败零持久化副作用（单命名空间单实现，不强制 mock 实现——sqlite
+	// adapter 与 mockStore 满足；直接组合接口断言见 TaskStoreBindingCommitter）。
+	CommitActivation(ctx context.Context, taskID string, b domain.TaskBinding, fromStatus, toStatus string) (application.TransitionResult, error)
 	// ListActiveTaskOverview 聚合全部 active 任务的跨项目概览
 	//（cross-project-active-sessions D2：JOIN projects + LEFT JOIN task_sessions）。
 	ListActiveTaskOverview(ctx context.Context) ([]ActiveTaskOverviewRow, error)
@@ -226,6 +245,21 @@ type Manager struct {
 	proc      ProcessBackend
 	wt        WorktreeBackend
 	ocFactory OCClientFactory
+	// providerRegistry 是 provider SPI registry（opencode-v1-spi-provider tasks 4.3
+	// 事实来源切换）：runtime 连接一律按任务持久化 binding 的 provider 标识经本表
+	// 分派（未注册 fail-closed，零网络副作用）。经 Options.ProviderRegistry 注入。
+	providerRegistry *appagent.Registry
+	// ephemeralSupervisor 是删除清理临时绑定入口（tasks 4.3 AcquireEphemeral 分支；
+	// design D9a 分支②）：仅消费 AcquireEphemeral（临时 runtime——不落库、不锚定、
+	// 不建 SSE、不提交 active）。经 Options.EphemeralSupervisor 注入。
+	// machine 是 resolver 机器事实（tasks 6.3；setMachineFacts/Options 注入）。
+	machine             machineFacts
+	ephemeralSupervisor appagent.RuntimeSupervisor
+	// runtimeSupervisor 是激活/恢复建程入口（C2 门禁修复）：非 nil 时 activateRun
+	// 经 Acquire、runRecoveryAttempt 经 Resume 建程（supervisor 返回最终 binding，
+	// D9 提交协议）；nil（未注入）时回退 task 层内联 bootstrapRuntime（测试接缝
+	// 与渐进迁移保留）。经 Options.RuntimeSupervisor 注入。
+	runtimeSupervisor appagent.RuntimeSupervisor
 	// namer 将任务名提炼为分支 slug（ai-worktree-naming）。nil 时 Create 回退到 Slugify
 	//（构造期或测试未注入时的防御）。生产 wiring 在 main.go 注入 ai.SlugNamer（tasks 3.3）。
 	namer BranchNamer
@@ -250,6 +284,11 @@ type Manager struct {
 	// nil 时 nowUnixFn 回退 time.Now().Unix()；recoveryBackoffFn 回退 5s/15s/45s。
 	nowUnixFn         func() int64
 	recoveryBackoffFn func(ordinal int) time.Duration
+
+	// allocateServePortFn 测试注入：覆盖 allocatePort 分配（fixture 上游监听端口
+	// 确定性——ora-4 attempt 2 约束 charx 经生产装配路径时 fake server 端口锚定）。
+	// nil 回退既有扫描实现。
+	allocateServePortFn func(lastPort sql.NullInt64, exclude int) (int, error)
 
 	// serveReadyTimeout / serveReadyPollInterval 控制 waitServeReady* 健康轮询墙钟预算。
 	// 生产默认 10s / 500ms（零值回退）；测试可注入更短值，不得改变生产默认。
@@ -359,6 +398,16 @@ type Manager struct {
 	recoveryIncidents   map[string]*recoveryIncident
 	recoveryWG          sync.WaitGroup
 
+	// reapLedger 是挂起收尾义务的进程内受管重试登记（Round7 I17；Round8 I20
+	// 按任务分组——义务携带权威 taskID，drain 只取当前任务条目并在该任务锁内
+	// 执行，杜绝跨任务污染）。所有持久化出口（残留 notice/pending 标注/外层写回）
+	// 失败时，义务（含本次 kill 返回的完整 tickets——单元可能已删、无法重新派生）
+	// 交此登记；每轮重放优先落账，不依赖再次 kill。进程内生命周期；跨进程恢复
+	// 依赖意图 pending 标注先于状态收敛落库（Round6 I17 排序——进程退出后内存
+	// 登记不保证存活，保障范围仅限进程内重试）。
+	reapLedgerMu sync.Mutex
+	reapLedger   map[string][]suspendFinishObligation
+
 	// recoveryWakes 是恢复退避的状态/token invalidation 唤醒通道（G3-7）：
 	// setRuntime/clearRuntime/状态写入路径 close 当前通道，退避中的 incident 即时
 	// 复核 continuation（状态已离 activating / token 失效 → 立即取消，不等满 timer）。
@@ -467,6 +516,23 @@ type Options struct {
 	Proc      ProcessBackend
 	Worktree  WorktreeBackend
 	OCFactory OCClientFactory
+	// ProviderRegistry 注入 provider SPI registry（opencode-v1-spi-provider tasks
+	// 4.3 事实来源切换）：全部 runtime 连接按任务持久化 binding 的 provider 标识
+	// 经 registry 分派（未注册 fail-closed）。nil 时分派降级为 provider-not-found
+	// fail-closed（仅测试直构可达；生产装配与契约测试 MUST 注入）。
+	ProviderRegistry *appagent.Registry
+	// MachineFacts 注入 resolver 的机器事实（opencode-v2-provider tasks 6.3：
+	// config.OpenCodeMajor/V2Adoption；零值 = unknown + 开关关）。
+	MachineFacts machineFacts
+	// EphemeralSupervisor 注入删除清理临时绑定入口（tasks 4.3 AcquireEphemeral 分支；
+	// 生产装配 = registry 内 v1 provider 的 Supervisor()；nil 时临时绑定请求
+	// fail-closed 报 supervisor 未注入）。
+	EphemeralSupervisor appagent.RuntimeSupervisor
+	// RuntimeSupervisor 注入激活/恢复建程入口（opencode-v1-spi-provider C2 门禁
+	// 修复：激活/恢复经 Provider.Supervisor() Acquire/Resume 建程——design D9
+	// 结构化主流程；task 层内联 bootstrapRuntime 保留为未注入时的回退形态，
+	// 供测试接缝与渐进迁移）。生产装配 = 同一 v1Provider.Supervisor()。
+	RuntimeSupervisor appagent.RuntimeSupervisor
 	// Namer 可选：注入后 Create 用其提炼分支 slug（ai-worktree-naming）。
 	// 为 nil 时回退到本包 Slugify（构造期或测试未注入时防御）。
 	Namer BranchNamer
@@ -510,14 +576,23 @@ type Options struct {
 	BranchPrefix func() string
 }
 
-// New 构造 Manager。OCFactory 为 nil 时用默认 opencode.Client 工厂。
+// New 构造 Manager。OCFactory 为必注入依赖（生产经 provider registry 工厂装配，
+// 测试注入 mock/fake 工厂）——缺失即 panic，构造期暴露装配错误
+// （opencode-v1-spi-provider tasks 3.6：defaultOCFactory 随编译期断言一并移除）。
 func New(opts Options) *Manager {
+	if opts.OCFactory == nil {
+		panic("task: New requires Options.OCFactory (provider registry wiring; see cmd/ocdeck-server)")
+	}
 	m := &Manager{
 		cfg:                     opts.Cfg,
 		store:                   opts.Store,
 		proc:                    opts.Proc,
 		wt:                      opts.Worktree,
 		ocFactory:               opts.OCFactory,
+		providerRegistry:        opts.ProviderRegistry,
+		machine:                 opts.MachineFacts,
+		ephemeralSupervisor:     opts.EphemeralSupervisor,
+		runtimeSupervisor:       opts.RuntimeSupervisor,
 		namer:                   opts.Namer,
 		judge:                   opts.PermissionJudge,
 		permAudit:               opts.PermAuditLogger,
@@ -531,15 +606,13 @@ func New(opts Options) *Manager {
 		branchPrefixFn:          opts.BranchPrefix,
 		uploadCoordination:      opts.UploadCoordination,
 		runtimes:                make(map[string]*taskRuntime),
+		reapLedger:              make(map[string][]suspendFinishObligation),
 		runtimeRegistry:         runtime.New(),
 		rand4Fn:                 rand4,
 		probeColdStartBackoffFn: defaultProbeColdStartBackoff,
 		recoveryIncidents:       make(map[string]*recoveryIncident),
 		recoveryWakes:           make(map[string]chan struct{}),
 		shutdownCh:              make(chan struct{}),
-	}
-	if m.ocFactory == nil {
-		m.ocFactory = defaultOCFactory
 	}
 	// task-info-editable D3：titleSync seam 未注入时接线生产实现（best-effort，
 	// 无 runtime/锚定时 no-op——测试构造未激活任务的路径行为与 Phase 2 一致）。
@@ -570,9 +643,17 @@ func (m *Manager) lifecycleCtx() context.Context {
 	return context.Background()
 }
 
-// defaultOCFactory 用 opencode.NewClient 构造 OCClient。
-func defaultOCFactory(port int, password string, opts opencode.Options) OCClient {
-	return opencode.NewClient(port, password, opts)
+// SetEphemeralSupervisor 注入删除清理的临时绑定入口（opencode-v1-spi-provider
+// tasks 4.3：生产装配在 provider 注册后调用——Manager 构造早于 provider 实例；
+// design D9a 分支②）。幂等覆盖（re-register 场景以最新实例为准）。
+func (m *Manager) SetEphemeralSupervisor(sup appagent.RuntimeSupervisor) {
+	m.ephemeralSupervisor = sup
+}
+
+// SetRuntimeSupervisor 注入激活/恢复建程入口（C2 门禁修复；生产装配 = 同一
+// v1Provider.Supervisor()——与 EphemeralSupervisor 同一实现，消费不同入口）。
+func (m *Manager) SetRuntimeSupervisor(sup appagent.RuntimeSupervisor) {
+	m.runtimeSupervisor = sup
 }
 
 // tryLockTask 尝试获取任务级互斥锁，不阻塞。成功返回 unlock，失败返回 nil + 409 错误。
@@ -970,6 +1051,18 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 		log.Printf("shutdown: replay recovery debts: %v", err)
 		killErr = errors.Join(killErr, fmt.Errorf("shutdown: replay recovery debts: %w", err))
 	}
+	// 评审 I9（监控生命周期）：v2 共享 server 的监控 owner 必须在两种关停策略下
+	// 都停止（persist 不关 server 但同样不得在关停后继续访问 store/重拉）——
+	// 取消在途监控重试并等待退出，先于任何 store 收敛/落库收尾。
+	m.stopV2ServerMonitoring()
+	// Round8 I17：关停 flush 受管义务登记（best-effort 逐任务落账；仍失败者
+	// 留在登记并报告——Round9 I13：所有持久化出口失败时完整载荷可能仅在内存
+	// 登记中，日志须如实说明仍有未落账的内存义务，不得声称已由意图 pending
+	// 标注兜底）。
+	if failed := m.flushReapLedger(context.WithoutCancel(ctx)); len(failed) > 0 {
+		log.Printf("shutdown: reap ledger flush incomplete for tasks %v (unpersisted in-memory obligations remain; cross-process recovery depends on intent pending markers persisted before status convergence)", failed)
+		killErr = errors.Join(killErr, fmt.Errorf("shutdown: reap ledger flush incomplete for tasks %v", failed))
+	}
 	// R7：收割内存 orphanFailures（kill 失败的孤儿会话 tickets，非仅 DB notice）。
 	// 后台周期已停（bgCancel），关停时 MUST 主动调用一次 retryOrphanSessions，避免逃逸进程
 	// tickets 仅存内存随进程退出丢失（design.md §10：runtime 已空 = 无会话且无可重试 cleanup debt，
@@ -992,6 +1085,7 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 			killErr = errors.Join(killErr, fmt.Errorf("shutdown: converge rename pendings: %w", rerr))
 		}
 		killErr = errors.Join(killErr, m.shutdownKillAllSessions(ctx))
+		killErr = errors.Join(killErr, m.shutdownV2Server(ctx))
 		if killErr != nil {
 			// 记录但继续停 runtime goroutine，避免 goroutine 泄漏；错误向上传播。
 			log.Printf("shutdown: kill all sessions: %v", killErr)
@@ -1044,6 +1138,10 @@ func (m *Manager) stopAndJoinAllRuntimes() {
 	}
 }
 
+// v2ServeSessionName 是 v2 共享 serve 托管单元名（跨层契约镜像；
+// opencode-v2-provider design D3：opencode2.ServeSessionName）。
+const v2ServeSessionName = "ocdeck-v2-serve"
+
 // shutdownKillAllSessions kill 全部 ocdeck 会话并确认 runtime 已空（design.md §10 kill 模式）。
 // 确认空 = 无 tmux 会话且无可重试 cleanup debt。
 // KillResult 的 disposition/tickets/error MUST 检查：残留（非 clean）MUST 持久化 tickets
@@ -1058,6 +1156,12 @@ func (m *Manager) shutdownKillAllSessions(ctx context.Context) error {
 	}
 	killFailed := false
 	for _, name := range sessions {
+		if name == v2ServeSessionName {
+			// v2 共享 serve 单元：supervisor 单 owner 关闭（shutdownV2Server），
+			// 不参与逐任务 kill/orphan 语义（opencode-v2-provider design D4）。
+			// 常量镜像（单元名为跨层契约；禁止 task→provider 传输包 import）。
+			continue
+		}
 		res, kerr := m.proc.KillSession(name)
 		if kerr != nil {
 			// kill 基础设施错误（tmux 不可达）：视为未净，返回错误让调用方保留 watchdog 兜底（design.md §10）。

@@ -77,12 +77,12 @@ func New(in NewInput) (*Session, error) {
 
 // --- 只读访问器 ---
 
-func (s *Session) ID() ID           { return s.id }
+func (s *Session) ID() ID              { return s.id }
 func (s *Session) OwnerTaskID() string { return s.ownerTaskID }
-func (s *Session) ParentID() string  { return s.parentID }
-func (s *Session) CreatedAt() int64  { return s.createdAt }
-func (s *Session) FirstSeenAt() int64 { return s.firstSeenAt }
-func (s *Session) LastSeenAt() int64  { return s.lastSeenAt }
+func (s *Session) ParentID() string    { return s.parentID }
+func (s *Session) CreatedAt() int64    { return s.createdAt }
+func (s *Session) FirstSeenAt() int64  { return s.firstSeenAt }
+func (s *Session) LastSeenAt() int64   { return s.lastSeenAt }
 
 // --- claim/touch/delete 规则（domain 表达合法性，不做 IO/事务） ---
 //
@@ -106,8 +106,8 @@ type ClaimDecision struct {
 // 规则（design D0 Session 行 + session_id 唯一性口径）：
 //   - 若 OwnerTaskID 为空（不应发生，Session 须有归属）：返回 Changed=true，归属写入 taskID。
 //   - 若 OwnerTaskID == taskID（幂等 upsert）：
-//     - lastSeenAt/parentID 推进 → Changed=true
-//     - 全列同值 → Changed=false（幂等无变化，不发布 session.claimed）
+//   - lastSeenAt/parentID 推进 → Changed=true
+//   - 全列同值 → Changed=false（幂等无变化，不发布 session.claimed）
 //   - 若 OwnerTaskID != taskID（他主持有）→ ConflictOwner=OwnerTaskID，Changed=false，
 //     application MUST 不覆盖（Repository 事务 fail-closed）。
 func (s *Session) ClaimBy(taskID string, lastSeenAt int64, parentID string) ClaimDecision {
@@ -228,13 +228,19 @@ const (
 // Observation 为持久化中立的会话观测（application 从 opencode DTO 转换后传入 domain）。
 // 仅含归属写回所需字段，不含 opencode session 内容。
 type Observation struct {
-	ID         ID
-	ParentID   string
-	CreatedAt  int64
-	UpdatedAt  int64
+	ID        ID
+	ParentID  string
+	CreatedAt int64
+	UpdatedAt int64
 	// FirstSeenAt ocdeck 首次观测时间（Unix 秒）。claim 路径由调用点决定：
 	// SSE 事件为本地到达时刻，锚定/对齐为观测 UpdatedAt。
 	FirstSeenAt int64
+	// ProviderID/ProviderInstanceID 归属命名空间（opencode-v2-provider 评审 I5：
+	// 会话写端口保留完整 SessionKey）。零值 = v1 缺省命名空间（既有 v1 调用方
+	// 行为不变）；ProviderID 非空而 ProviderInstanceID 为空 = 不完整 key，
+	// repository fail-closed 拒绝。
+	ProviderID         string
+	ProviderInstanceID string
 }
 
 // FromObservation 在 align 路径从观测构造归属明确的新 Session（待 Claim 事务写入）。

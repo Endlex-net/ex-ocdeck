@@ -82,9 +82,11 @@ func TestParsePermissionAsked_Metadata(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ev, ok := parsePermissionAsked(tc.props)
+			// parse 家族已迁至 application/agentprovider（C2a 中性化）；经导出的
+			// ParseAttentionEvent 委托走同一实现。
+			ev, ok := ParseAttentionEvent(Event{Type: "permission.asked", Properties: tc.props})
 			if !ok {
-				t.Fatal("parsePermissionAsked must not drop the request")
+				t.Fatal("permission.asked must not drop the request")
 			}
 			if tc.wantNil {
 				if len(ev.Metadata) != 0 {

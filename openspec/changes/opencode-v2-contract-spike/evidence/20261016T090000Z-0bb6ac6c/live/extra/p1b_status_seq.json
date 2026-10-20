@@ -1,0 +1,18 @@
+{
+  "probe_id": "p1b.status_seq",
+  "schema": "p1b-extra-v1",
+  "exec_status": "PASS",
+  "facts": {
+    "busy_seen": true,
+    "idle_after_busy": true,
+    "event_types": [
+      "session.execution.started",
+      "session.execution.succeeded"
+    ],
+    "turn_outcome": "succeeded"
+  },
+  "evidence": [
+    "live/event/status-seq.json",
+    "live/event/p1b-frames.jsonl"
+  ]
+}

@@ -252,7 +252,7 @@ func resolveBranchDiffRefs(ctx context.Context, worktree, base string) (baseOID,
 }
 
 // GitBranchDiffFiles 返回任务 worktree 中 base（merge-base，three-dot）到 HEAD 的变更文件列表
-//（git-page-enhancements D2/D3）。持任务锁（与生命周期操作互斥，冲突 409）。
+// （git-page-enhancements D2/D3）。持任务锁（与生命周期操作互斥，冲突 409）。
 // 门禁链与 GitStatus/GitDiff 一致：base 词法校验（空 → invalid_input 零 git 调用）→
 // tryLockTask → GetTask（not_found）→ worktree_path 空（invalid_state）→ assertGitRepoTask
 // → helper → git.BranchDiffFiles。只读，不进 repo 写锁。
@@ -302,12 +302,12 @@ func (m *Manager) GitBranchDiffFiles(ctx context.Context, taskID, base string) (
 }
 
 // GitBranchDiffFile 返回 base（merge-base，three-dot）到 HEAD 单文件 path 两侧内容
-//（git-page-enhancements D4）。门禁链同 GitBranchDiffFiles；path 词法校验
-//（git.ValidateDiffPath）先于锁与任何 git 调用。helper 后先做归属校验：经 BranchDiffFiles
+// （git-page-enhancements D4）。门禁链同 GitBranchDiffFiles；path 词法校验
+// （git.ValidateDiffPath）先于锁与任何 git 调用。helper 后先做归属校验：经 BranchDiffFiles
 // 取得变更集合，path 不在集合（rename 按列表新路径判定）→ invalid_input 且零 blob 读取。
 // 归属通过后旧侧（merge-base）先读：失败 git_error 透传且 MUST NOT 读新侧；再读新侧
-//（失败 git_error）。两侧 normalizeDiffSideContent 后按既有组装规则产出 GitDiffDTO
-//（isBinary 清空两侧、truncated 或运算）。只读，不进 repo 写锁。
+// （失败 git_error）。两侧 normalizeDiffSideContent 后按既有组装规则产出 GitDiffDTO
+// （isBinary 清空两侧、truncated 或运算）。只读，不进 repo 写锁。
 func (m *Manager) GitBranchDiffFile(ctx context.Context, taskID, base, path string) (application.GitDiffDTO, error) {
 	if base == "" {
 		return application.GitDiffDTO{}, newOpErr(codeInvalidInput, errors.New("base is required"))
@@ -387,7 +387,7 @@ func (m *Manager) GitBranchDiffFile(ctx context.Context, taskID, base, path stri
 }
 
 // normalizeDiffSideContent 对单侧内容施加 UTF-8 规范化与 rune 边界 524288 byte 上限
-//（specs/git-operations「文件 diff 查看」单侧内容处理管线后两步）。
+// （specs/git-operations「文件 diff 查看」单侧内容处理管线后两步）。
 // rawTruncated 为 git 包 finalizeSideContent 已判定的原始读取超限标志。
 // 返回 (normalized, truncated)：truncated=true iff rawTruncated 或规范化结果因 rune 边界裁短。
 func normalizeDiffSideContent(content string, rawTruncated bool) (string, bool) {
@@ -416,7 +416,7 @@ func truncateAtRuneBoundary(s string, maxBytes int) string {
 	end := maxBytes
 	for end > 0 {
 		// utf8.RuneStart: 该字节是 rune 的首字节（非 continuation byte 10xxxxxx）。
-		if (s[end]&0xC0) != 0x80 {
+		if (s[end] & 0xC0) != 0x80 {
 			break
 		}
 		end--

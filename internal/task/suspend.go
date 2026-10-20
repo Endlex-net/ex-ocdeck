@@ -3,13 +3,17 @@ package task
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/infrastructure/opencode"
+	appagent "ocdeck/internal/application/agentprovider"
+	domain "ocdeck/internal/domain/agentprovider"
 	"ocdeck/internal/infrastructure/process"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // Suspend 挂起任务（design.md §19 Suspend 行 + §5 互斥决策树三分支）。
@@ -43,27 +47,115 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 	if kerr != nil {
 		return newOpErr(codeInternal, kerr)
 	}
+	// C7 残余（review attempt 2）：挂起准入——首次状态/进程副作用前按任务 provider
+	// 做 registry 准入（specs「Provider registry 分派」：未注册 fail-closed 零副作用，
+	// 诊断性 last_error 允许）。准入失败：任务保持 active，零 kill 零 suspending。
+	// mutation 证据（已验证 → 红）：准入旁路（`if false &&`）→ TestC7_Suspend
+	// UnknownProviderZeroSideEffects 红（suspending 提交逃逸——status 偏离 active）。
+	if aerr := m.registryAdmitTask(ctx, taskID); aerr != nil {
+		if isProviderNotFound(aerr) {
+			m.recordAdmissionError(ctx, taskID, aerr)
+			return newOpErr(codeInternal, aerr)
+		}
+		return newOpErr(codeInternal, aerr)
+	}
 	// task-info-editable D2 仲裁表：Suspend 在 active→suspending 状态流转前先执行 R1 收敛
 	//（防止清快照后恢复补提交复活快照）。不可收敛 → conflict 拒绝挂起（状态与快照不变）。
 	if cerr := m.convergePendingBeforeLifecycle(ctx, row, proj); cerr != nil {
 		return newOpErr(codeConflict, cerr)
 	}
+	// 评审 I2（D4 挂起行）：v2 挂起门禁——active→suspending CAS 前完成归属校验与
+	// 停止（interrupt 确认；停止确认前 MUST 保留运行关联）。失败 → 任务保持 active
+	// + last_error（零状态写入；禁入 v1 强杀补偿/serve 修复树）。
+	sb, hasV2, gerr := m.suspendGateV2(ctx, taskID, row)
+	if gerr != nil {
+		return gerr
+	}
 	// P1.4.7：DB 写入经 write* helper 路由（注入 LifecycleService 时走 persist+commit 封装）。
 	// terminal-file-paste-drop 2.5：active→suspending 提交（离开 active）在 per-task
 	// 协调锁临界区内执行（本方法已持任务锁，锁顺序：任务锁 → 协调锁），与上传
 	// finalize/投递临界区互斥——挂起提交先行时 finalize 复查必见非 active、不发布。
+	// 评审 I2（停止已确认独立收敛出口）：v2 停止确认后，状态收敛 MUST NOT 因调用方
+	// ctx 取消半途而废（否则上游已停而状态报 active——矛盾事实）——WithoutCancel
+	// 有界预算完成收敛；持续写库失败留可重放意图（durable retryable notice）。
+	casCtx := ctx
+	if hasV2 {
+		var ccancel context.CancelFunc
+		casCtx, ccancel = context.WithTimeout(context.WithoutCancel(ctx), activateCompensationTimeout)
+		defer ccancel()
+	}
 	var updated application.TransitionResult
-	if err := m.inUploadCoordination(ctx, taskID, func() error {
+	if err := m.inUploadCoordination(casCtx, taskID, func() error {
 		var werr error
-		updated, werr = m.writeStatusConditional(ctx, taskID, StatusActive, StatusSuspending, sql.NullString{})
+		updated, werr = m.writeStatusConditional(casCtx, taskID, StatusActive, StatusSuspending, sql.NullString{})
 		return werr
 	}); err != nil {
+		if hasV2 {
+			// 停止已确认 + 收敛写失败：落停止收敛意图（评审 Round3 I2——durable
+			// retryable，后台重放持锁复核后完成清关联+suspended；带执行代际，
+			// 新一代运行不受旧意图影响）；不掩盖原错误。
+			if nerr := m.recordSuspendStopIntent(casCtx, taskID, sb.TerminalRef, m.suspendStopToken(taskID)); nerr != nil {
+				log.Printf("suspend: task %s stop confirmed but convergence intent notice failed: %v", taskID, nerr)
+			}
+		}
 		return newOpErr(codeInternal, err)
 	}
 	if !updated.Matched {
+		if hasV2 {
+			// 停止已确认但状态已被其他代收敛/改写：守卫生效不覆盖；如实留痕。
+			if nerr := m.recordSuspendStopIntent(casCtx, taskID, sb.TerminalRef, m.suspendStopToken(taskID)); nerr != nil {
+				log.Printf("suspend: task %s stop confirmed but CAS mismatch, intent notice failed: %v", taskID, nerr)
+			}
+		}
 		return newOpErr(codeConflict, fmt.Errorf("task %s state changed before suspend", taskID))
 	}
-	return m.suspendRun(ctx, taskID, mode)
+	// Round4 I2：本次 Suspend 已取得收敛权（CAS Matched）——清除历史停止收敛
+	// 意图（其前提「收敛待完成」已被本次挂起取代；陈旧意图不得在重放中触达
+	// 本次收敛后的状态）。
+	if ierr := m.clearSuspendStopIntents(casCtx, taskID); ierr != nil {
+		log.Printf("suspend: task %s clear stale stop intent: %v", taskID, ierr)
+	}
+	return m.suspendRun(ctx, taskID, mode, sb, hasV2)
+}
+
+// suspendStopToken 返回停止确认时的 runtime 执行代际（停止收敛意图的可校验
+// 执行代际——重放时与注册表当前代等值比对；空串=runtime 未注册，重放仅按状态
+// 守卫复核）。
+func (m *Manager) suspendStopToken(taskID string) string {
+	if rt := m.getRuntime(taskID); rt != nil {
+		return string(rt.instVersion)
+	}
+	return ""
+}
+
+// suspendGateV2 是 v2 挂起门禁（评审 I2，D4 挂起行）：active→suspending CAS 前
+// 读实际 binding → 归属校验（supervisorForTaskConsumption 统一入口）→ 按实际
+// binding 分派 supervisor 停止执行（Release=interrupt；停止确认成功才放行后续
+// 退订/清理）。非 v2 binding（无 binding/v1）返回 hasV2=false 走既有流程。
+// 停止失败：任务保持 active、保留运行关联、last_error，零状态转换（禁止进 v1
+// forceKillAll+finishSuspend 补偿——对共享 server 禁用）。
+func (m *Manager) suspendGateV2(ctx context.Context, taskID string, row TaskRow) (domain.TaskBinding, bool, error) {
+	b, has, err := m.store.GetTaskBinding(ctx, taskID)
+	if err != nil {
+		return domain.TaskBinding{}, false, newOpErr(codeInternal, fmt.Errorf("suspend gate: get binding: %w", err))
+	}
+	if !has || b.ProviderID != store.ProviderIDV2 {
+		return domain.TaskBinding{}, false, nil
+	}
+	sup, serr := m.supervisorForTaskConsumption(ctx, taskID, b, row.WorktreePath)
+	if serr != nil {
+		m.recordAdmissionError(ctx, taskID, serr)
+		return domain.TaskBinding{}, false, newOpErr(codeConflict, serr)
+	}
+	if rerr := sup.Release(ctx, b); rerr != nil {
+		// 停止失败如实报错：状态/运行关联/快照全部不动（active 保留）。
+		le := sql.NullString{String: fmt.Sprintf("suspend stop failed (kept active): %v", rerr), Valid: true}
+		if _, werr := m.writeStatus(ctx, taskID, m.readStatusForDiagnostic(ctx, taskID), le); werr != nil {
+			log.Printf("suspend gate: task %s record last_error: %v", taskID, werr)
+		}
+		return domain.TaskBinding{}, false, newOpErr(codeProcessError, fmt.Errorf("suspend stop: %w", rerr))
+	}
+	return b, true, nil
 }
 
 // suspendRun 执行挂起的外部副作用并按互斥决策树收敛（design.md §5）。
@@ -80,9 +172,25 @@ func (m *Manager) Suspend(ctx context.Context, taskID string) error {
 // 落 suspended + last_error，不得直接返回 error 留 suspending。
 //
 // mode 为 Suspend 入口已解析的对齐模式，传入 repair 路径复用（D8：不重复查询项目 kind）。
-func (m *Manager) suspendRun(ctx context.Context, taskID string, mode AlignMode) error {
+func (m *Manager) suspendRun(ctx context.Context, taskID string, mode AlignMode, sb domain.TaskBinding, hasV2 bool) error {
 	// 停 SSE 订阅 + 退出监视。
 	m.clearRuntime(taskID)
+
+	// 评审 I2：v2 挂起收敛（停止已在 Suspend 门禁确认——先停止后退订，D3 顺序）。
+	// 本地清理仅限任务自有 tmux 单元（v2 TUI/shell；无 v1 serve/runtime 单元判定，
+	// 禁入 forceKillAll 强杀树与 tryRepairRuntime 修复树——共享 server 与 v1 单元
+	// 语义均不适用）。清理失败仍收敛 suspended + notice（D4：执行已停止属实，
+	// 清理遗留按 cleanup notice 后台重试；MUST NOT 停留 suspending）。
+	if hasV2 {
+		killRes := m.killTaskSessions(ctx, taskID, []string{sb.TerminalRef})
+		shellNames, serr := m.listShellSessions(taskID)
+		if serr != nil {
+			killRes = append(killRes, killResultEntry{name: sb.TerminalRef, killErr: serr})
+			return m.finalizeSuspendDetached(ctx, taskID, killRes, nil)
+		}
+		killRes = append(killRes, m.killTaskSessions(ctx, taskID, shellNames)...)
+		return m.finalizeSuspendDetached(ctx, taskID, killRes, nil)
+	}
 
 	// 分支判定时机：kill 前查进程会话是否已死。Phase 2 进程名为 -runtime，
 	// leftover -serve 仍参与判定与清理。
@@ -213,6 +321,52 @@ type killResultEntry struct {
 	killErr  error // KillSession 本身的基础设施错误（非 nil 时 disposition 不可信）
 }
 
+// minimalReleaseBinding 构造 supervisor.Release 的最小 envelope：Release 只消费
+// TerminalRef（终止目标）与 data.taskId（provider 侧换代观测身份）；终止目标是
+// 任务会话名事实，非 binding 事实来源切换（不读写持久化 binding）。
+func minimalReleaseBinding(taskID, name string) domain.TaskBinding {
+	data, _ := json.Marshal(map[string]string{"taskId": taskID})
+	return domain.TaskBinding{
+		Version:            domain.TaskBindingVersion,
+		ProviderID:         store.ProviderIDV1,
+		ProviderInstanceID: store.ProviderInstanceV1Default,
+		TerminalRef:        name,
+		Data:               data,
+	}
+}
+
+// releaseStageToKillEntry 把 supervisor.Release 的 CleanupStageError 映射回既有
+// killResultEntry 通道（阶段 4 Release 接线）：disposition 决策树与 notice 语义
+// 不变——Reason 反向映射 process.Disposition 并按 ClassifyKill 语义保真
+// SessionKilled（reap_failed=已杀收割失败；snapshot_missing=未净终止 degraded；
+// snapshot_failed/kill_failed=会话仍在），tickets 透传；kill_failed 映射为
+// killErr 形态（finishSuspend 的 infra 分派：notice kill_failed + tickets +
+// "kill session" 错误聚合，与内联 KillSession 基础设施错误同通道）。
+func releaseStageToKillEntry(name string, err error) killResultEntry {
+	se, ok := appagent.StageErrorOf(err)
+	if !ok || se.Cleanup == nil {
+		// 非 cleanup 形态（理论不可达——Release 只产 CleanupStageError/nil）：
+		// 保守按基础设施错误聚合，不伪造 disposition。
+		return killResultEntry{name: name, killErr: err}
+	}
+	tickets := se.Cleanup.Tickets
+	mk := func(killed bool, disp process.CleanupDisposition) killResultEntry {
+		return killResultEntry{name: name, result: process.KillResult{
+			SessionKilled: killed, Disposition: disp, CleanupTickets: tickets}}
+	}
+	switch se.Cleanup.Reason {
+	case appagent.KillReasonReapFailed:
+		return mk(true, process.DispositionReapFailed)
+	case appagent.KillReasonSnapshotFailed:
+		return mk(false, process.DispositionSnapshotFailed)
+	case appagent.KillReasonSnapshotMissing:
+		return mk(false, process.DispositionSnapshotMissingDegraded)
+	default: // kill_failed：HasSession/KillSession 基础设施错误。
+		return killResultEntry{name: name, killErr: err,
+			result: process.KillResult{Disposition: process.DispositionKillFailed, CleanupTickets: tickets}}
+	}
+}
+
 // killTaskSessions 对 names 中存在的会话执行 KillSession，返回结果集。
 // 仅收集，不记 notice：逐项 notice 由调用方（finishSuspend）统一聚合记录，
 // 避免在此处记录后被 finishSund 再次记录导致同一清理失败双写两条 notice。
@@ -221,6 +375,19 @@ type killResultEntry struct {
 func (m *Manager) killTaskSessions(ctx context.Context, taskID string, names []string) []killResultEntry {
 	var out []killResultEntry
 	for _, name := range names {
+		// 阶段 4 Release 接线（opencode-v1-spi-provider）：agent runtime（serve，
+		// binding.TerminalRef 对应会话）的终止经 supervisor.Release（registry 分派
+		// 到 provider——Release 成为生产路径）；C7 provider 准入已在 Suspend 入口
+		// 完成。CleanupStageError 映射回 killResultEntry，disposition/notice 通道
+		// 不变。TUI/shell 与 legacy -serve（迁移导入桥接特许域，binding 未覆盖）
+		// 仍由 task 层直接管理；runtimeSupervisor 未注入（内联测试接缝/golden
+		// 矩阵）保持内联实现——与 resumeActive 的回退形态同一模式。
+		if name == runtimeSessionName(taskID) && m.runtimeSupervisor != nil {
+			if rerr := m.runtimeSupervisor.Release(ctx, minimalReleaseBinding(taskID, name)); rerr != nil {
+				out = append(out, releaseStageToKillEntry(name, rerr))
+			}
+			continue
+		}
 		exists, herr := m.proc.HasSession(name)
 		if herr != nil && !errors.Is(herr, process.ErrNoTmuxServer) {
 			// infra 错误收集为 killErr，由 hasKillFailure 判定失败 → 触发分支 c 修复或强制收敛。
@@ -251,6 +418,48 @@ func hasKillFailure(results []killResultEntry) bool {
 	return false
 }
 
+// finishSuspendCommon 是挂起收尾的公共半程（评审 Round4 I17 抽取——正常挂起与
+// 停止收敛意图重放共用）：逐项聚合记录残留 notice（killRes 内的 killErr →
+// retryable kill_failed；disposition 非净 → 分类记录）+ 清除 env 快照。返回
+// last_error 载荷、聚合错误与「未完成的持久化义务」（Round5 I17：notice/env
+// 写失败——调用方 MUST 保留为意图 pending 形态，不得仅写错误文本后清除）。F16
+// 约束同 finishSuspend：MUST NOT 伪造清理失败。
+func (m *Manager) finishSuspendCommon(ctx context.Context, taskID string, results []killResultEntry, cause error) (sql.NullString, []error, []suspendFinishObligation) {
+	var errs []error
+	var obligations []suspendFinishObligation
+	if cause != nil {
+		errs = append(errs, cause)
+	}
+	for _, r := range results {
+		if r.killErr != nil {
+			// 基础设施错误：记 notice（reason=kill_failed, retryable=true，保留 tickets）。
+			if nerr := m.recordResidualNotice(ctx, taskID, r.name, r.result.CleanupTickets, noticeReasonKillFailed, true); nerr != nil {
+				obligations = append(obligations, suspendFinishObligation{Kind: "notice",
+					Name: r.name, Tickets: r.result.CleanupTickets, Reason: noticeReasonKillFailed, Retryable: true})
+				errs = append(errs, fmt.Errorf("record notice %s: %w", r.name, nerr))
+			}
+			errs = append(errs, fmt.Errorf("kill session %s: %w", r.name, r.killErr))
+			continue
+		}
+		if nerr := m.recordResidualNoticeFromDisposition(ctx, taskID, r.name, r.result); nerr != nil {
+			cls := classifyKillResult(r.result)
+			obligations = append(obligations, suspendFinishObligation{Kind: "notice",
+				Name: r.name, Tickets: r.result.CleanupTickets, Reason: cls.reason, Retryable: cls.retryable})
+			errs = append(errs, fmt.Errorf("record notice %s: %w", r.name, nerr))
+		}
+	}
+	// 清除 env 快照（design.md §2：Suspend 成功清快照）。
+	if _, err := m.writeEnvSnapshot(ctx, taskID, sql.NullString{}); err != nil {
+		obligations = append(obligations, suspendFinishObligation{Kind: "env"})
+		errs = append(errs, fmt.Errorf("clear env snapshot: %w", err))
+	}
+	var le sql.NullString
+	if joined := errors.Join(errs...); joined != nil {
+		le = sql.NullString{String: joined.Error(), Valid: true}
+	}
+	return le, errs, obligations
+}
+
 // finishSund 落为 suspended：逐项聚合记录残留 notice（killRes + 强制清理中的失败项），
 // 清除 env 快照，置 suspended。
 // cause 为生命周期原因错误（如恢复 active 提交失败），仅并入 last_error 与返回值——
@@ -264,31 +473,7 @@ func hasKillFailure(results []killResultEntry) bool {
 // 补偿本身是否失败。
 // suspended 状态提交失败 MUST 处理：不得静默置为无效流转（design.md §19 Suspend 行）。
 func (m *Manager) finishSuspend(ctx context.Context, taskID string, results []killResultEntry, cause error) error {
-	var errs []error
-	if cause != nil {
-		errs = append(errs, cause)
-	}
-	for _, r := range results {
-		if r.killErr != nil {
-			// 基础设施错误：记 notice（reason=kill_failed, retryable=true，保留 tickets）。
-			if nerr := m.recordResidualNotice(ctx, taskID, r.name, r.result.CleanupTickets, noticeReasonKillFailed, true); nerr != nil {
-				errs = append(errs, fmt.Errorf("record notice %s: %w", r.name, nerr))
-			}
-			errs = append(errs, fmt.Errorf("kill session %s: %w", r.name, r.killErr))
-			continue
-		}
-		if nerr := m.recordResidualNoticeFromDisposition(ctx, taskID, r.name, r.result); nerr != nil {
-			errs = append(errs, fmt.Errorf("record notice %s: %w", r.name, nerr))
-		}
-	}
-	// 清除 env 快照（design.md §2：Suspend 成功清快照）。
-	if _, err := m.writeEnvSnapshot(ctx, taskID, sql.NullString{}); err != nil {
-		errs = append(errs, fmt.Errorf("clear env snapshot: %w", err))
-	}
-	le := sql.NullString{}
-	if joined := errors.Join(errs...); joined != nil {
-		le = sql.NullString{String: joined.Error(), Valid: true}
-	}
+	le, errs, _ := m.finishSuspendCommon(ctx, taskID, results, cause)
 	if _, err := m.writeStatus(ctx, taskID, StatusSuspended, le); err != nil {
 		// F20：状态提交失败无条件进入返回值（不得被 cause 掩盖）。
 		errs = append(errs, fmt.Errorf("commit suspended: %w", err))
@@ -320,32 +505,60 @@ func (m *Manager) tryRepairRuntime(ctx context.Context, taskID string, mode Alig
 	if err != nil || !alive {
 		return false, fmt.Errorf("runtime gone before repair: %w", err)
 	}
-	row, gerr := m.store.GetTask(ctx, taskID)
-	if gerr != nil {
-		return false, fmt.Errorf("get task: %w", gerr)
+	// C2 门禁修复（design D9a 入口映射：tryRepairRuntime → Resume 仅修复（不建程）
+	// {AllowSessionCreate=false, AllowRebuild=false, BeforeLaunch=nil}）：runtimeSupervisor
+	// 注入时，存活终端健康验证经 supervisor.Resume 复用分支——会话仍在为前置
+	//（上方 HasSession 已校验；复用零 NewSession），策略矩阵与 D9 一致。
+	if m.runtimeSupervisor != nil {
+		oldBinding, _, berr := m.store.GetTaskBinding(ctx, taskID)
+		if berr != nil || oldBinding.TerminalRef == "" {
+			return false, fmt.Errorf("cannot recover binding for repair")
+		}
+		binding, serr := m.runtimeSupervisor.Resume(ctx,
+			appagent.TaskRef{TaskID: taskID, Directory: m.worktreePathForRepair(taskID, serveName)},
+			oldBinding, appagent.ResumePolicy{AllowSessionCreate: false, AllowRebuild: false})
+		if serr != nil {
+			return false, fmt.Errorf("supervisor resume reuse: %w", serr)
+		}
+		port, password, _, eerr := m.bindingEndpoint(binding)
+		if eerr != nil {
+			return false, fmt.Errorf("provider binding endpoint: %w", eerr)
+		}
+		return m.repairRuntimeRegistered(ctx, taskID, mode, serveName, port, password)
 	}
-	// 读回 serve 密码与端口（端口以会话内 OCDECK_SERVE_PORT 为唯一权威来源，design.md §3/§5：
-	// last_port 非事实来源，MUST NOT 回退）。读回失败/空 MUST 返回错误，不得用 last_port 兜底。
-	password := m.recoverPassword(ctx, taskID)
-	if password == "" {
-		return false, fmt.Errorf("cannot recover serve password")
-	}
-	portStr, perr := m.proc.ShowSessionEnv(serveName, "OCDECK_SERVE_PORT")
-	if perr != nil || portStr == "" {
-		return false, fmt.Errorf("cannot recover serve port from session: %w", perr)
-	}
-	port, ok := parsePort(portStr)
+	// 健康检查凭据/端点从持久化 binding 解析（tasks 4.3 事实来源切换）；任务行由
+	// repairRuntimeRegistered 读取（initPermState 需要）。
+	oc, _, ok := m.taskOcBindingClient(ctx, taskID, appagent.Options{HealthTimeout: 2 * time.Second, OpTimeout: 5 * time.Second})
 	if !ok {
-		return false, fmt.Errorf("invalid serve port %q", portStr)
+		return false, fmt.Errorf("cannot recover binding for repair")
 	}
-	// 认证健康检查探活（校验 serve 仍健康）。
-	oc := m.ocFactory(port, password, opencode.Options{HealthTimeout: 2 * time.Second, OpTimeout: 5 * time.Second})
 	if _, err := oc.Health(ctx); err != nil {
 		return false, fmt.Errorf("health check: %w", err)
 	}
+	return m.repairRuntimeRegistered(ctx, taskID, mode, serveName, -1, "")
+}
+
+// worktreePathForRepair 返回修复路径的 supervisor TaskRef 目录（任务行 worktree；
+// 读取失败回退空串——supervisor checkDeps 对空目录 fail-closed，等价既有失败语义）。
+func (m *Manager) worktreePathForRepair(taskID, serveName string) string {
+	if row, err := m.store.GetTask(context.Background(), taskID); err == nil {
+		return row.WorktreePath
+	}
+	_ = serveName
+	return ""
+}
+
+// repairRuntimeRegistered 是 tryRepairRuntime 的注册段（共享）：启动事实校验 →
+// runtime 注册 → SSE（C9 finalBinding 语义：supervisor 路径显式传入 binding）→
+// watchServeExit。port<0 表示内联回退路径（SSE 端点经持久化 binding 自解析）。
+func (m *Manager) repairRuntimeRegistered(ctx context.Context, taskID string, mode AlignMode, serveName string, port int, password string) (bool, error) {
 	// 重建运行时 → SSE 订阅 + 全量对齐（B7：恢复完整运行时）。mode 由 Suspend 入口传入。
 	// 启动事实读校验（task-permission-mode D5 三路径矩阵②）：有存活进程但启动事实
 	// NULL/非法 MUST 失败不注册（fail-closed）。
+	row, grerr := m.store.GetTask(ctx, taskID)
+	if grerr != nil {
+		return false, fmt.Errorf("get task: %w", grerr)
+	}
 	startMode, serr := m.readStartFactForRegister(ctx, taskID)
 	if serr != nil {
 		return false, serr
@@ -356,7 +569,17 @@ func (m *Manager) tryRepairRuntime(ctx context.Context, taskID string, mode Alig
 	}
 	m.setRuntime(taskID, rt)
 	rt.registerGroup(roleRuntime, serveName)
-	if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode); err != nil {
+	if port > 0 {
+		binding, berr := m.currentTaskBinding(ctx, taskID)
+		if berr != nil {
+			m.clearRuntime(taskID)
+			return false, fmt.Errorf("resolve binding for sse: %w", berr)
+		}
+		if err := m.startSSE(ctx, rt, taskID, row.WorktreePath, port, password, mode, &binding, nil); err != nil {
+			m.clearRuntime(taskID)
+			return false, fmt.Errorf("sse resubscribe: %w", err)
+		}
+	} else if err := m.startSSEFromBinding(ctx, rt, taskID, mode); err != nil {
 		m.clearRuntime(taskID)
 		return false, fmt.Errorf("sse resubscribe: %w", err)
 	}
@@ -369,6 +592,9 @@ func (m *Manager) tryRepairRuntime(ctx context.Context, taskID string, mode Alig
 // 不得吞错——无法清理的会话经 finishSund 记 retryable notice 形成可重试 debt
 // （否则残留会话下次 Activate 被 residual 门禁永久阻塞，design.md §5/§8）。
 // ErrNoTmuxServer 视为 absent（无 server 即无会话可清）。
+// 阶段 4 Release 接线说明：本函数是挂起补偿的强制清场兜底（tui/shell/serve 混合
+// 集合、「尽力清理」语义），保持 task 层直接管理不经 Release——agent runtime 的
+// Release 接线覆盖主清理路径（killTaskSessions），补偿兜底不改变。
 func (m *Manager) forceKillAll(ctx context.Context, names []string) []killResultEntry {
 	var out []killResultEntry
 	for _, name := range names {
@@ -407,19 +633,6 @@ func (m *Manager) listShellSessions(taskID string) ([]string, error) {
 		}
 	}
 	return out, nil
-}
-
-// recoverPassword 从 serve 会话环境恢复密码（persist 恢复 / suspend 修复用，design.md §2）。
-func (m *Manager) recoverPassword(ctx context.Context, taskID string) string {
-	pw, err := m.proc.ShowSessionEnv(runtimeSessionName(taskID), "OPENCODE_SERVER_PASSWORD")
-	if err == nil && pw != "" {
-		return pw
-	}
-	pw, err = m.proc.ShowSessionEnv(serveSessionName(taskID), "OPENCODE_SERVER_PASSWORD")
-	if err != nil {
-		return ""
-	}
-	return pw
 }
 
 // newSessionSpec 构造 SessionSpec 辅助。

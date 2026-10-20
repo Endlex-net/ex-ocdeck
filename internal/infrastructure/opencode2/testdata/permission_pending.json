@@ -1,0 +1,12 @@
+{
+  "data": [
+    {
+      "id": "per_fixture01",
+      "sessionID": "ses_fixture01a",
+      "action": "shell",
+      "resources": ["touch /tmp/fixture-marker"],
+      "save": ["touch *"],
+      "source": { "type": "tool", "messageID": "msg_fixture01", "id": "call_fixture01" }
+    }
+  ]
+}

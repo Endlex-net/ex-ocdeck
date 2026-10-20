@@ -150,7 +150,7 @@ func TestPromptAsync_TransportUnknown_CtxCancelled(t *testing.T) {
 }
 
 // TestPromptAsync_PreSendFailure_NewRequest 构造非法 baseURL 稳定触发 NewRequest 失败
-//（design.md D1：pre_send_failure 覆盖 marshal/NewRequest 两路；marshal 路径输入全 string
+// （design.md D1：pre_send_failure 覆盖 marshal/NewRequest 两路；marshal 路径输入全 string
 // 永不失败，不可达，无需注入点——NewRequest 路径足以覆盖 pre_send_failure 分类）。
 func TestPromptAsync_PreSendFailure_NewRequest(t *testing.T) {
 	srv := httptest.NewServer(promptAsyncHandler(t, http.StatusNoContent, &promptAsyncBody{}))
@@ -224,7 +224,7 @@ func mustMarshalPromptBody(t *testing.T, b promptAsyncBody) []byte {
 // ---- file parts（批注 7：随 prompt 引用 worktree 文件） ----
 
 // TestPromptAsync_FileParts 验证携带 files 时 parts = text part + 逐 file part
-//（file part 字段形态契约：type/mime/filename/url，url 为 file:// 绝对路径 URI）。
+// （file part 字段形态契约：type/mime/filename/url，url 为 file:// 绝对路径 URI）。
 func TestPromptAsync_FileParts(t *testing.T) {
 	var body promptAsyncBody
 	srv := httptest.NewServer(promptAsyncHandler(t, http.StatusNoContent, &body))

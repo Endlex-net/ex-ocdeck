@@ -59,8 +59,10 @@ func lastOutputFixture(t *testing.T, oc *lastOutputOC, anchor string, sessions .
 	for _, s := range sessions {
 		_ = store.UpsertTaskSession(context.Background(), s)
 	}
+	// tasks 4.3：LastAgentOutput 经 taskOcClient → persisted binding 解析连接；
+	// tmux env 预置退役。
+	seedDerivedBinding(store, "t1", 50001, "/wt")
 	proc := newMockProc()
-	p18SetServeEnv(proc, "t1")
 	if oc == nil {
 		oc = &lastOutputOC{}
 	}

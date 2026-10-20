@@ -8,7 +8,7 @@ package application
 import (
 	"database/sql"
 
-	"ocdeck/internal/infrastructure/opencode"
+	appagent "ocdeck/internal/application/agentprovider"
 )
 
 // DeleteMode 删除模式（design.md §19）。
@@ -73,6 +73,7 @@ type TaskRow struct {
 	AnchorSessionID sql.NullString
 	Mode            string
 	PermissionMode  string
+	ProviderID      string
 }
 
 // CreateTaskOptions 创建任务的请求选项（add-local-path-task-mode D3）：
@@ -142,14 +143,17 @@ type ActiveTaskOverviewRow struct {
 
 // PendingPermission task 层 pending 权限请求。Since 为本地首次观察 Unix 秒
 // （SSE asked 到达时刻；REST 对账同 ID 保留原 since，新 ID 取对账时刻，design.md D6）。
+// 嵌入 provider-neutral PermissionPayload（opencode-v1-spi-provider tasks 3.6：
+// DTO 去除 opencode.* 类型依赖；嵌入字段名保持 PermissionRequest，JSON 序列化
+// 字段形状不变）。
 type PendingPermission struct {
-	opencode.PermissionRequest
+	appagent.PermissionRequest
 	Since int64
 }
 
 // PendingQuestion task 层 pending 问题请求。Since 同 PendingPermission。
 type PendingQuestion struct {
-	opencode.QuestionRequest
+	appagent.QuestionRequest
 	Since int64
 }
 

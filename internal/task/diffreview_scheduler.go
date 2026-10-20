@@ -10,7 +10,7 @@
 //   - 3.8 重启恢复：服务启动收敛（ConvergeOnStartup）+ runtime 启动恢复本任务 queued。
 //
 // diffreview.Service 由外部注入（SetDiffReviewService），避免 Manager 直接依赖 store.Queries
-//（TaskStore 接口不含 diff_review 原语；Service + 5 ports 由 main/组装层构造后注入）。
+// （TaskStore 接口不含 diff_review 原语；Service + 5 ports 由 main/组装层构造后注入）。
 package task
 
 import (
@@ -30,9 +30,9 @@ type schedulerHandle struct {
 // schedulerController 管理 per-task 调度器 goroutine 的启动/停止。
 // 以 *Manager 为 key 隔离（与 capRegistry 同模式，避免侵入 Manager 结构体）。
 type schedulerController struct {
-	mu       sync.Mutex
-	handles  map[string]*schedulerHandle // taskID → 调度器句柄
-	wg       sync.WaitGroup              // 全部调度器 goroutine join（Shutdown 用）
+	mu      sync.Mutex
+	handles map[string]*schedulerHandle // taskID → 调度器句柄
+	wg      sync.WaitGroup              // 全部调度器 goroutine join（Shutdown 用）
 }
 
 // schedControllers 以 *Manager 为 key 存放 per-Manager 调度器控制器（懒初始化）。

@@ -287,7 +287,7 @@ func (m *Manager) branchPrefixSnapshot() string {
 // permissionMode 已由 Create 归一化/复核（task-permission-mode D2），原样落库。
 // branchSlug 为 Create 已 trim 的显式分支 slug（空 = 未提供）：非空时直接使用（跳过 LLM
 // 与机械 slugify），沿既有 check-ref-format + 冲突检查。分支前缀在命名前单次读取快照
-//（D5：以同一快照值驱动分支命名与 worktree 路径段生成）。
+// （D5：以同一快照值驱动分支命名与 worktree 路径段生成）。
 func (m *Manager) createRepo(ctx context.Context, projectID, taskName string, proj ProjectRow, baseRef, permissionMode, branchSlug string) (TaskRow, error) {
 	taskID := newTaskID()
 	// 分支命名：显式 slug 直接使用（跳过 LLM/slugify）；未提供经 Namer 提炼

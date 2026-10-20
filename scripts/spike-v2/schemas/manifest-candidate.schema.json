@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "manifest-candidate",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "v1", "v2"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "canary_target": { "type": "string", "pattern": "^/" },
+    "v1": { "$ref": "#/$defs/sideCandidate" },
+    "v2": { "$ref": "#/$defs/sideCandidate" }
+  },
+  "$defs": {
+    "fields": {
+      "side": { "enum": ["v1", "v2"] },
+      "version": { "type": "string", "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$" },
+      "release_url": { "type": "string", "format": "uri", "pattern": "^https://" },
+      "tag": { "type": "string", "minLength": 1 },
+      "commit_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+      "asset_name": { "type": "string", "minLength": 1 },
+      "os": { "type": "string", "minLength": 1 },
+      "arch": { "type": "string", "minLength": 1 },
+      "download_url": { "type": "string", "format": "uri", "pattern": "^https://" },
+      "official_sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+      "source_chain_status": { "enum": ["verified", "unverified"] }
+    },
+    "sideCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["side", "version", "release_url", "tag", "commit_sha", "asset_name", "os", "arch", "download_url", "official_sha256", "source_chain_status"],
+      "properties": {
+        "side": { "$ref": "#/$defs/fields/side" },
+        "version": { "$ref": "#/$defs/fields/version" },
+        "release_url": { "$ref": "#/$defs/fields/release_url" },
+        "tag": { "$ref": "#/$defs/fields/tag" },
+        "commit_sha": { "$ref": "#/$defs/fields/commit_sha" },
+        "asset_name": { "$ref": "#/$defs/fields/asset_name" },
+        "os": { "$ref": "#/$defs/fields/os" },
+        "arch": { "$ref": "#/$defs/fields/arch" },
+        "download_url": { "$ref": "#/$defs/fields/download_url" },
+        "official_sha256": { "$ref": "#/$defs/fields/official_sha256" },
+        "source_chain_status": { "$ref": "#/$defs/fields/source_chain_status" }
+      }
+    }
+  }
+}

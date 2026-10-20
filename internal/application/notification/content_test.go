@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"ocdeck/internal/application"
+	appagent "ocdeck/internal/application/agentprovider"
+	domain "ocdeck/internal/domain/agentprovider"
 	ocdeckevent "ocdeck/internal/domain/event"
 	"ocdeck/internal/domain/notification"
 )
@@ -295,5 +297,27 @@ func TestResolveBase(t *testing.T) {
 	}, newFakeClock())
 	if _, err := n2.resolveBase(cfg); err == nil {
 		t.Fatal("resolver failure must surface as error")
+	}
+}
+
+// TestQuestionIntent_StructuredFieldsPreferred 落实 tasks 6.8（design D10）：
+// 通知正文优先消费结构化 Fields（Prompt 为正文），Fields 为空时经
+// EffectiveFields 回退兼容视图（Questions）。
+func TestQuestionIntent_StructuredFieldsPreferred(t *testing.T) {
+	snap := contentSnap()
+	pq := application.PendingQuestion{
+		QuestionRequest: appagent.QuestionRequest{
+			ID: "q1", SessionID: "s1",
+			// 结构化主视图：Prompt 参与正文；Label 不进入通知正文。
+			Fields: []domain.QuestionField{
+				{Key: "branch", Label: "分支", Prompt: "用哪个分支？", Type: "text"},
+			},
+		},
+		Since: 1,
+	}
+	snap.Attention.Questions = []application.PendingQuestion{pq}
+	got := questionIntent(snap, pq, "http://x/#/task/t1")
+	if got.Body != "用哪个分支？" {
+		t.Fatalf("structured fields body = %q", got.Body)
 	}
 }

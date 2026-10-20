@@ -10,7 +10,8 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
-	"ocdeck/internal/infrastructure/opencode"
+	appagent "ocdeck/internal/application/agentprovider"
+	domain "ocdeck/internal/domain/agentprovider"
 )
 
 // --- 三层类型模型（含 Since，本地首次观察时间） ---
@@ -43,7 +44,7 @@ const (
 // bufferedEvent 增量缓冲项：携带本地首次观察时间（design.md D6：since 为本地首次观察时间，
 // 缓冲与 align 共享缓冲只存原始事件 + observedAt，重放时用 observedAt 而非重放时刻）。
 type bufferedEvent struct {
-	ev         opencode.AttentionEvent
+	ev         appagent.AttentionEvent
 	observedAt int64
 }
 
@@ -98,12 +99,12 @@ func newAttentionState() *attentionState {
 // unsupported 类型忽略；replied/rejected 枚举值不校验一律了结；未知 ID 忽略。
 // 后台对账在途时该类型事件追加到增量缓冲而非直接写集合（外部快照未变，changed=false），
 // 缓冲项携带 observedAt。
-func (a *attentionState) applyAttentionEvent(ev opencode.AttentionEvent) bool {
+func (a *attentionState) applyAttentionEvent(ev appagent.AttentionEvent) bool {
 	now := nowUnixI()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	switch ev.Type {
-	case opencode.AttentionPermission:
+	case appagent.AttentionPermission:
 		if a.perm.cap == capUnsupported {
 			return false
 		}
@@ -112,7 +113,7 @@ func (a *attentionState) applyAttentionEvent(ev opencode.AttentionEvent) bool {
 			return false
 		}
 		return a.applyPermLocked(ev, now)
-	case opencode.AttentionQuestion:
+	case appagent.AttentionQuestion:
 		if a.quest.cap == capUnsupported {
 			return false
 		}
@@ -125,21 +126,21 @@ func (a *attentionState) applyAttentionEvent(ev opencode.AttentionEvent) bool {
 	return false
 }
 
-func (a *attentionState) applyPermLocked(ev opencode.AttentionEvent, observedAt int64) bool {
+func (a *attentionState) applyPermLocked(ev appagent.AttentionEvent, observedAt int64) bool {
 	switch ev.Kind {
-	case opencode.AttentionAsked:
+	case appagent.AttentionAsked:
 		return a.upsertPermLocked(ev, observedAt)
-	case opencode.AttentionReplied, opencode.AttentionRejected:
+	case appagent.AttentionReplied, appagent.AttentionRejected:
 		return a.removePermLocked(ev.RequestID)
 	}
 	return false
 }
 
-func (a *attentionState) applyQuestLocked(ev opencode.AttentionEvent, observedAt int64) bool {
+func (a *attentionState) applyQuestLocked(ev appagent.AttentionEvent, observedAt int64) bool {
 	switch ev.Kind {
-	case opencode.AttentionAsked:
+	case appagent.AttentionAsked:
 		return a.upsertQuestLocked(ev, observedAt)
-	case opencode.AttentionReplied, opencode.AttentionRejected:
+	case appagent.AttentionReplied, appagent.AttentionRejected:
 		return a.removeQuestLocked(ev.RequestID)
 	}
 	return false
@@ -150,7 +151,7 @@ func (a *attentionState) applyQuestLocked(ev opencode.AttentionEvent, observedAt
 // 等值判断修正（task-permission-mode D12）：SessionID/Permission/Patterns 原条件不变；
 // 仅 metadata 单方变化时更新内部存储但不视为外部可见变化（changed=false，不触发
 // attention_changed 发布——前端投影不含 metadata）。
-func (a *attentionState) upsertPermLocked(ev opencode.AttentionEvent, observedAt int64) bool {
+func (a *attentionState) upsertPermLocked(ev appagent.AttentionEvent, observedAt int64) bool {
 	id := ev.RequestID
 	if id == "" {
 		return false
@@ -165,7 +166,7 @@ func (a *attentionState) upsertPermLocked(ev opencode.AttentionEvent, observedAt
 		}
 		// 仅 metadata 单方变化 → 更新内部、不发布；否则视为外部可见变化。
 		a.perm.perms[id] = PendingPermission{
-			PermissionRequest: opencode.PermissionRequest{
+			PermissionRequest: appagent.PermissionRequest{
 				ID: id, SessionID: ev.SessionID, Permission: ev.Permission,
 				Patterns: ev.Patterns, Metadata: copyMetadata(ev.Metadata),
 			},
@@ -176,7 +177,7 @@ func (a *attentionState) upsertPermLocked(ev opencode.AttentionEvent, observedAt
 		}
 	}
 	a.perm.perms[id] = PendingPermission{
-		PermissionRequest: opencode.PermissionRequest{
+		PermissionRequest: appagent.PermissionRequest{
 			ID: id, SessionID: ev.SessionID, Permission: ev.Permission,
 			Patterns: ev.Patterns, Metadata: copyMetadata(ev.Metadata),
 		},
@@ -203,7 +204,7 @@ func copyMetadata(raw json.RawMessage) json.RawMessage {
 	return out
 }
 
-func (a *attentionState) upsertQuestLocked(ev opencode.AttentionEvent, observedAt int64) bool {
+func (a *attentionState) upsertQuestLocked(ev appagent.AttentionEvent, observedAt int64) bool {
 	id := ev.RequestID
 	if id == "" {
 		return false
@@ -211,13 +212,17 @@ func (a *attentionState) upsertQuestLocked(ev opencode.AttentionEvent, observedA
 	since := observedAt
 	if old, ok := a.quest.quests[id]; ok {
 		since = old.Since
-		if old.SessionID == ev.SessionID && equalQuestionItems(old.Questions, ev.Questions) {
+		// 结构化视图（Fields/Title）与兼容视图共同参与外部可见等值——
+		// 仅结构化字段变化同样触发发布（design D10）。
+		if old.SessionID == ev.SessionID && old.Title == ev.Title &&
+			equalQuestionFields(old.Fields, ev.Fields) &&
+			equalQuestionItems(old.Questions, ev.Questions) {
 			return false
 		}
 	}
 	a.quest.quests[id] = PendingQuestion{
-		QuestionRequest: opencode.QuestionRequest{
-			ID: id, SessionID: ev.SessionID, Questions: ev.Questions,
+		QuestionRequest: appagent.QuestionRequest{
+			ID: id, SessionID: ev.SessionID, Title: ev.Title, Fields: ev.Fields, Questions: ev.Questions,
 		},
 		Since: since,
 	}
@@ -289,6 +294,7 @@ func (a *attentionState) questSnapshotLocked() []PendingQuestion {
 	quests := make([]PendingQuestion, 0, len(a.quest.order))
 	for _, id := range a.quest.order {
 		q := a.quest.quests[id]
+		q.Fields = copyQuestionFields(q.Fields)
 		q.Questions = copyQuestionItems(q.Questions)
 		quests = append(quests, q)
 	}
@@ -318,6 +324,8 @@ func equalQuestSnapshots(x, y []PendingQuestion) bool {
 	for i := range x {
 		a, b := x[i], y[i]
 		if a.ID != b.ID || a.SessionID != b.SessionID || a.Since != b.Since ||
+			a.Title != b.Title ||
+			!equalQuestionFields(a.Fields, b.Fields) ||
 			!equalQuestionItems(a.Questions, b.Questions) {
 			return false
 		}
@@ -339,7 +347,7 @@ func equalStringSlices(x, y []string) bool {
 }
 
 // equalQuestionItems 判断两个 QuestionItem slice 逐元素等值（nil 与空切片视为等值）。
-func equalQuestionItems(x, y []opencode.QuestionItem) bool {
+func equalQuestionItems(x, y []appagent.QuestionItem) bool {
 	if len(x) != len(y) {
 		return false
 	}
@@ -349,6 +357,47 @@ func equalQuestionItems(x, y []opencode.QuestionItem) bool {
 		}
 	}
 	return true
+}
+
+// equalQuestionFields 判断两个结构化字段 slice 逐元素等值（design D10：
+// 结构化视图是外部可见状态的一部分；Metadata 为 JSON 原文比较，nil 与空等值）。
+func equalQuestionFields(x, y []domain.QuestionField) bool {
+	if len(x) != len(y) {
+		return false
+	}
+	for i := range x {
+		a, b := x[i], y[i]
+		if a.Key != b.Key || a.Label != b.Label || a.Prompt != b.Prompt ||
+			a.Type != b.Type || a.Required != b.Required ||
+			!equalMetadata(a.Metadata, b.Metadata) ||
+			len(a.Options) != len(b.Options) {
+			return false
+		}
+		for j := range a.Options {
+			if a.Options[j] != b.Options[j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// copyQuestionFields 深拷贝结构化字段 slice（含 Options 与 Metadata，
+// 快照隔离）。
+func copyQuestionFields(fs []domain.QuestionField) []domain.QuestionField {
+	if fs == nil {
+		return nil
+	}
+	out := make([]domain.QuestionField, len(fs))
+	for i, f := range fs {
+		out[i] = f
+		if f.Options != nil {
+			out[i].Options = make([]domain.QuestionOption, len(f.Options))
+			copy(out[i].Options, f.Options)
+		}
+		out[i].Metadata = copyMetadata(f.Metadata)
+	}
+	return out
 }
 
 // clearAttention 推进 attentionEpoch（atomic，不依赖 mu）并清空全部集合（短暂持 mu）。
@@ -388,20 +437,20 @@ const (
 )
 
 // reconcileAttention 对单类型对账。unsupported 停止。context.Canceled 中性。
-func (a *attentionState) reconcileAttention(ctx context.Context, oc OCClient, dir string, typ opencode.AttentionType, mode reconcileMode, publish func()) {
+func (a *attentionState) reconcileAttention(ctx context.Context, oc OCClient, dir string, typ appagent.AttentionType, mode reconcileMode, publish func()) {
 	switch mode {
 	case reconcileAlign:
 		switch typ {
-		case opencode.AttentionPermission:
+		case appagent.AttentionPermission:
 			a.reconcilePermAlign(ctx, oc, dir, publish)
-		case opencode.AttentionQuestion:
+		case appagent.AttentionQuestion:
 			a.reconcileQuestAlign(ctx, oc, dir, publish)
 		}
 	case reconcileBackground:
 		switch typ {
-		case opencode.AttentionPermission:
+		case appagent.AttentionPermission:
 			a.reconcilePermBackground(ctx, oc, dir, publish)
-		case opencode.AttentionQuestion:
+		case appagent.AttentionQuestion:
 			a.reconcileQuestBackground(ctx, oc, dir, publish)
 		}
 	}
@@ -525,7 +574,7 @@ func (a *attentionState) reconcilePermBackground(ctx context.Context, oc OCClien
 	// ② REST 写回：200 替换+缓冲重放 / 404 清空 / degraded 缓冲重放，快照 diff 判定。
 	before := a.permSnapshotLocked()
 	if err != nil {
-		if errors.Is(err, opencode.ErrCapabilityUnsupported) {
+		if errors.Is(err, appagent.ErrCapabilityUnsupported) {
 			// 404→unsupported：清空集合 + 丢弃缓冲（design.md D6 增量缓冲结果表）。
 			a.perm.cap = capUnsupported
 			a.perm.perms = map[string]PendingPermission{}
@@ -555,7 +604,7 @@ func (a *attentionState) reconcilePermBackground(ctx context.Context, oc OCClien
 	}
 }
 
-func (a *attentionState) replacePermLocked(perms []opencode.PermissionRequest, givenSince int64) {
+func (a *attentionState) replacePermLocked(perms []appagent.PermissionRequest, givenSince int64) {
 	newMap := map[string]PendingPermission{}
 	newOrder := make([]string, 0, len(perms))
 	for _, p := range perms {
@@ -580,7 +629,7 @@ func (a *attentionState) transitionPermCapLocked(err error) {
 		a.perm.cap = capAvailable
 		return
 	}
-	if errors.Is(err, opencode.ErrCapabilityUnsupported) {
+	if errors.Is(err, appagent.ErrCapabilityUnsupported) {
 		a.perm.cap = capUnsupported
 		a.perm.perms = map[string]PendingPermission{}
 		a.perm.order = nil
@@ -699,7 +748,7 @@ func (a *attentionState) reconcileQuestBackground(ctx context.Context, oc OCClie
 	// ② REST 写回：200 替换+缓冲重放 / 404 清空 / degraded 缓冲重放，快照 diff 判定。
 	before := a.questSnapshotLocked()
 	if err != nil {
-		if errors.Is(err, opencode.ErrCapabilityUnsupported) {
+		if errors.Is(err, appagent.ErrCapabilityUnsupported) {
 			a.quest.cap = capUnsupported
 			a.quest.quests = map[string]PendingQuestion{}
 			a.quest.order = nil
@@ -726,7 +775,7 @@ func (a *attentionState) reconcileQuestBackground(ctx context.Context, oc OCClie
 	}
 }
 
-func (a *attentionState) replaceQuestLocked(quests []opencode.QuestionRequest, givenSince int64) {
+func (a *attentionState) replaceQuestLocked(quests []appagent.QuestionRequest, givenSince int64) {
 	newMap := map[string]PendingQuestion{}
 	newOrder := make([]string, 0, len(quests))
 	for _, q := range quests {
@@ -746,7 +795,7 @@ func (a *attentionState) transitionQuestCapLocked(err error) {
 		a.quest.cap = capAvailable
 		return
 	}
-	if errors.Is(err, opencode.ErrCapabilityUnsupported) {
+	if errors.Is(err, appagent.ErrCapabilityUnsupported) {
 		a.quest.cap = capUnsupported
 		a.quest.quests = map[string]PendingQuestion{}
 		a.quest.order = nil
@@ -772,7 +821,7 @@ func (rt *taskRuntime) ensureAttentionState() *attentionState {
 
 // applyAttentionEvent 经 runtime 应用一个注意力事件，返回是否改变外部可见快照
 // （attention 未懒初始化时为 no-op，changed=false）。
-func (rt *taskRuntime) applyAttentionEvent(ev opencode.AttentionEvent) bool {
+func (rt *taskRuntime) applyAttentionEvent(ev appagent.AttentionEvent) bool {
 	rt.mu.Lock()
 	a := rt.attention
 	rt.mu.Unlock()
@@ -824,11 +873,11 @@ func (m *Manager) reconcileTaskAttention(ctx context.Context, rt *taskRuntime, o
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		a.reconcileAttention(ctx, oc, dir, opencode.AttentionPermission, reconcileAlign, publish)
+		a.reconcileAttention(ctx, oc, dir, appagent.AttentionPermission, reconcileAlign, publish)
 	}()
 	go func() {
 		defer wg.Done()
-		a.reconcileAttention(ctx, oc, dir, opencode.AttentionQuestion, reconcileAlign, publish)
+		a.reconcileAttention(ctx, oc, dir, appagent.AttentionQuestion, reconcileAlign, publish)
 	}()
 	wg.Wait()
 }
@@ -887,14 +936,14 @@ func (m *Manager) retryAttentionDegraded(ctx context.Context) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				a.reconcileAttention(ctx, oc, dir, opencode.AttentionPermission, reconcileBackground, publish)
+				a.reconcileAttention(ctx, oc, dir, appagent.AttentionPermission, reconcileBackground, publish)
 			}()
 		}
 		if questDegraded {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				a.reconcileAttention(ctx, oc, dir, opencode.AttentionQuestion, reconcileBackground, publish)
+				a.reconcileAttention(ctx, oc, dir, appagent.AttentionQuestion, reconcileBackground, publish)
 			}()
 		}
 		wg.Wait()
@@ -909,29 +958,19 @@ func (m *Manager) retryAttentionDegraded(ctx context.Context) {
 }
 
 // taskOcClient 为活跃任务构造一次性 OCClient 与 directory（后台对账用）。
+// 事实来源切换（opencode-v1-spi-provider tasks 4.3）：连接端点/凭据一律从持久化
+// binding 解析，MUST NOT 再从 tmux env 反查（design D9/specs「运行时托管」；
+// 特许例外仅 migration runner 与删除清理临时路径）。任务行/active 门禁由调用方
+// 持有，本函数仅负责 binding 解析；失败 → ok=false（零网络副作用 fail-closed）。
 func (m *Manager) taskOcClient(ctx context.Context, taskID string) (OCClient, string, bool) {
 	row, err := m.store.GetTask(ctx, taskID)
 	if err != nil || row.Status != StatusActive {
 		return nil, "", false
 	}
-	serveName := runtimeSessionName(taskID)
-	password, perr := m.proc.ShowSessionEnvContext(ctx, serveName, "OPENCODE_SERVER_PASSWORD")
-	if perr != nil || password == "" {
-		return nil, "", false
-	}
-	portStr, perr := m.proc.ShowSessionEnvContext(ctx, serveName, "OCDECK_SERVE_PORT")
-	if perr != nil || portStr == "" {
-		return nil, "", false
-	}
-	port, ok := parsePort(portStr)
-	if !ok {
-		return nil, "", false
-	}
-	oc := m.ocFactory(port, password, opencode.Options{
+	return m.taskOcBindingClient(ctx, taskID, appagent.Options{
 		HealthTimeout: 2 * time.Second,
 		OpTimeout:     5 * time.Second,
 	})
-	return oc, row.WorktreePath, true
 }
 
 // --- ProjectTaskSummary（GET /projects tasks 摘要，design.md D4 11 字段） ---
@@ -1013,11 +1052,11 @@ func copyStrings(s []string) []string {
 	return out
 }
 
-func copyQuestionItems(qs []opencode.QuestionItem) []opencode.QuestionItem {
+func copyQuestionItems(qs []appagent.QuestionItem) []appagent.QuestionItem {
 	if qs == nil {
 		return nil
 	}
-	out := make([]opencode.QuestionItem, len(qs))
+	out := make([]appagent.QuestionItem, len(qs))
 	copy(out, qs)
 	return out
 }

@@ -1,0 +1,4 @@
+inherited-env-cleared-at-exec: HOME=/root
+[2026-10-14T04:09:10Z] REJECTED as expected: /root/spike-canary-20261014T040909Z-c68e2320
+errno: 30 (Read-only file system)
+caller-proof: docker --read-only rootfs; canary target /root/spike-canary requires remount

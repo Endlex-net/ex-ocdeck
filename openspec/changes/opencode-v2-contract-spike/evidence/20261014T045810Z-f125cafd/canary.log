@@ -1,0 +1,13 @@
+inherited-env-cleared-at-exec: HOME=/root
+[2026-10-14T04:58:12Z] REJECTED as expected: /root/spike-canary-20261014T045810Z-f125cafd
+errno: 30 (Read-only file system)
+caller-proof: docker --read-only rootfs; canary target /root/spike-canary requires remount
+[2026-10-14T04:58:41Z] REJECTED as expected: /root/spike-canary-20261014T045810Z-f125cafd
+errno: 30 (Read-only file system)
+caller-proof: docker --read-only rootfs; canary target /root/spike-canary requires remount
+[2026-10-14T04:59:47Z] REJECTED as expected: /root/spike-canary-20261014T045810Z-f125cafd
+errno: 30 (Read-only file system)
+caller-proof: docker --read-only rootfs; canary target /root/spike-canary requires remount
+[2026-10-14T05:00:47Z] REJECTED as expected: /root/spike-canary-20261014T045810Z-f125cafd
+errno: 30 (Read-only file system)
+caller-proof: docker --read-only rootfs; canary target /root/spike-canary requires remount

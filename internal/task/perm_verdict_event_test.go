@@ -113,17 +113,16 @@ func TestJudgeAndReply_VerdictBranchTable(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			judge := newFakeJudge(tc.verdict)
 			judge.err = tc.judgeErr
-			m, _, oc, rt, _ := newAutoTaskEnv(t, judge)
+			m, store, oc, rt, _ := newAutoTaskEnv(t, judge)
 			rec := &recordingPublisher{}
 			m.publish = rec
 			if tc.replyErr != nil {
 				oc.replyPermissionErrByID = map[string]error{"r1": tc.replyErr}
 			}
 			if tc.dropEnv {
-				proc := m.proc.(*mockProc)
-				proc.mu.Lock()
-				delete(proc.envValues, runtimeSessionName("t1"))
-				proc.mu.Unlock()
+				// tasks 4.3：client 构造失败注入改为删除持久化 binding（tmux env
+				// 反查退役——原 delete envValues 语义等价迁移）。
+				store.DeleteTaskBindingForTest("t1")
 			}
 			rt.ensureAttentionState().applyAttentionEvent(permAsked("r1", "s1", "bash", "rm"))
 			m.judgeScan(rt)

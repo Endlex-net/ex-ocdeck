@@ -229,7 +229,9 @@ func TestMergeEnvSnapshot_GlobalLayer(t *testing.T) {
 
 // TestIsReservedEnvKey 验证保留 key 集合（design.md §2）。
 func TestIsReservedEnvKey(t *testing.T) {
-	reserved := []string{"OPENCODE_SERVER_PASSWORD", "OCDECK_SERVE_PORT", "OCDECK_TASK_ID"}
+	// C2c（tasks 4.1 + 裁决 2）：OCDECK_CRED_KIND 与 OPENCODE_SERVER_PASSWORD
+	// 同类——运行时凭据材料（spawn-only），MUST NOT 进持久化快照/被用户覆盖。
+	reserved := []string{"OPENCODE_SERVER_PASSWORD", "OCDECK_CRED_KIND", "OCDECK_SERVE_PORT", "OCDECK_TASK_ID"}
 	for _, k := range reserved {
 		if !isReservedEnvKey(k) {
 			t.Errorf("isReservedEnvKey(%q) = false, want true", k)

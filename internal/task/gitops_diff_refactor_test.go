@@ -234,7 +234,7 @@ func TestGitDiff_UTF8Normalization_FourByteRuneSpanningBoundary(t *testing.T) {
 	rune4 := "😀" // U+1F600, 4 字节 UTF-8: F0 9F 98 80
 	// 524285 字节 ASCII + 1 个四字节 rune = 524289 字节（= 工作区有界读取上限）。
 	prefix := strings.Repeat("a", git.FileContentMaxBytes-3) // 524285
-	raw := prefix + rune4                                      // 524289
+	raw := prefix + rune4                                    // 524289
 	if len(raw) != git.FileContentMaxBytes+1 {
 		t.Fatalf("setup: raw len = %d, want %d", len(raw), git.FileContentMaxBytes+1)
 	}
@@ -273,11 +273,11 @@ func TestGitDiff_UTF8Normalization_FourByteRuneSpanningBoundary(t *testing.T) {
 // TestNormalizeDiffSideContent_TruthTable 直接测规范化 helper 的真值表（不依赖 git 仓库）。
 func TestNormalizeDiffSideContent_TruthTable(t *testing.T) {
 	cases := []struct {
-		name        string
-		content     string
-		rawTrunc    bool
-		wantNorm    string
-		wantTrunc   bool
+		name      string
+		content   string
+		rawTrunc  bool
+		wantNorm  string
+		wantTrunc bool
 	}{
 		{"empty passthrough", "", false, "", false},
 		{"valid utf8 unchanged", "hello\n", false, "hello\n", false},
@@ -309,18 +309,18 @@ func TestNormalizeDiffSideContent_TruthTable(t *testing.T) {
 // TestTruncateAtRuneBoundary 验证 rune 边界截断不产生残缺字节。
 func TestTruncateAtRuneBoundary(t *testing.T) {
 	cases := []struct {
-		s       string
-		max     int
-		want    string
+		s    string
+		max  int
+		want string
 	}{
-		{"abc", 10, "abc"},          // 未超上限原样返回
-		{"abc", 3, "abc"},           // 恰好等于上限
-		{"abcdef", 4, "abcd"},       // 单字节 rune 边界
-		{"世世世", 4, "世"},          // 3 字节 rune，max=4 回退到 3（第一个完整 rune）
-		{"世世世", 6, "世世"},        // 恰好两个 rune
-		{"世世世", 7, "世世"},        // max=7 回退到 6
-		{"a世b", 2, "a"},            // max=2 在 "世" 之前停止（"a"=1 字节，下一 rune=3 字节超限）
-		{"", 5, ""},                 // 空串
+		{"abc", 10, "abc"},    // 未超上限原样返回
+		{"abc", 3, "abc"},     // 恰好等于上限
+		{"abcdef", 4, "abcd"}, // 单字节 rune 边界
+		{"世世世", 4, "世"},       // 3 字节 rune，max=4 回退到 3（第一个完整 rune）
+		{"世世世", 6, "世世"},      // 恰好两个 rune
+		{"世世世", 7, "世世"},      // max=7 回退到 6
+		{"a世b", 2, "a"},       // max=2 在 "世" 之前停止（"a"=1 字节，下一 rune=3 字节超限）
+		{"", 5, ""},           // 空串
 	}
 	for _, c := range cases {
 		got := truncateAtRuneBoundary(c.s, c.max)

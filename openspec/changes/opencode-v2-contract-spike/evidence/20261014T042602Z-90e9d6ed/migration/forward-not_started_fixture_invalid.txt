@@ -1,0 +1,3 @@
+state=NOT_STARTED_FIXTURE_INVALID
+failure_classes=['INCONCLUSIVE']
+reason=fixture 造数不完整：消息历史读取=有 权限样本非空=False（可能需真实模型）

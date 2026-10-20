@@ -12,16 +12,19 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"ocdeck/internal/api"
 	"ocdeck/internal/application"
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/application/diffreview"
 	appnotification "ocdeck/internal/application/notification"
 	apptask "ocdeck/internal/application/task"
@@ -35,6 +38,8 @@ import (
 	"ocdeck/internal/infrastructure/eventbus"
 	"ocdeck/internal/infrastructure/lifecycle"
 	"ocdeck/internal/infrastructure/notify"
+	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/opencode2"
 	"ocdeck/internal/infrastructure/palette"
 	"ocdeck/internal/infrastructure/process"
 	sqlite "ocdeck/internal/infrastructure/sqlite"
@@ -177,11 +182,28 @@ func run() error {
 	// Conns 数据源（api WS 注册表）构造晚于此处，serveAndShutdown 中 setServer 回填。
 	uploadConns := &currentConnPort{}
 	uploadOrch := newUploadOrchestrator(cfg, appAdapter, bus, uploadConns)
+	// agent-provider-spi（opencode-v1-spi-provider tasks 3.7/3.6）：provider registry
+	// 手工装配（无 Fx）——本期仅注册 opencode-v1；v1 缺失即启动失败（fail-closed）。
+	// OCFactory 经 registry 查表分派：任务 provider 未注册 → fail-closed 错误
+	//（零网络副作用，task 层已有处置）。transport 由 opencode 包共享 loopback
+	// transport 承载（design「连接管理」）。
+	// provider 实例在 tm 构造后注册（supervisor deps 的 SideFx/AllocatePort 指向
+	// task.Manager 现状实现）；ocFactory 闭包只在分派时查 registry——分派晚于
+	// 注册，先建 factory 后注册实例不改变语义。
+	// 能力健康 tracker（tasks 3.8 + 4.x）：内存按 runtime 代际维护，run() 顶层
+	// 构造——供状态端点透出（serveAndShutdown 注入 api）与 supervisor 换代回调
+	//（OnRuntimeReady → BumpRuntimeEpoch）共用同一实例。
+	healthTracker := appagent.NewHealthTracker()
+	healthTracker.SetProviderID(opencode.ProviderID)
+	registry := appagent.NewRegistry()
+	ocFactory := task.NewRegistryDispatchFactory(registry)
 	tm := task.New(task.Options{
 		Cfg:                cfg,
 		Store:              adapter,
 		Proc:               task.NewProcessAdapter(procMgr),
 		Worktree:           task.NewWorktreeAdapter(wtMgr),
+		OCFactory:          ocFactory,       // tasks 3.6/3.7：registry 分派工厂（上方）
+		ProviderRegistry:   registry,        // C1 门禁修复：binding 分派（binding_dispatch）按任务 provider 查本表
 		DebtStore:          adapter,         // R7：orphan tickets 持久化跨重启恢复（design.md §10）
 		LifecycleRunner:    lifecycle.New(), // design.md §7.1：init/pre-delete 脚本与 inherit
 		LogDir:             cfg.DataDir + "/logs",
@@ -195,6 +217,90 @@ func run() error {
 	})
 	// 注入 Manager 生命周期 context（design.md §4：SSE/退出监视挂进程 ctx，非 HTTP request ctx）。
 	tm.SetLifecycleCtx(ctx)
+
+	// SPI supervisor 生产装配（tasks 4.x；D11）：v1 provider 携带真实 supervisor deps
+	//（进程托管 seam = procMgr 适配；持久化 seam = supStoreSeam；旁路副作用委托
+	// task 层现状实现，行为与 startRuntimeWithPortRetry 建进程前三步逐字一致；
+	// 换代回调 → healthTracker epoch 递增）。注册失败 = 装配错误，拒绝启动。
+	supDeps := opencode.SupervisorDeps{
+		Proc:           task.NewProcessAdapter(procMgr),
+		Store:          &supStoreSeam{db: db},
+		SideFx:         task.NewSupervisorSideEffects(tm),
+		AllocatePort:   tm.AllocateServePort,
+		OnRuntimeReady: func(taskID string) { healthTracker.BumpRuntimeEpoch(taskID) },
+		// C6 门禁修复：释放侧换代重置——Release 成功终止 runtime 后回收该任务
+		// 的旧观测与代际（runtime/session 作用域清空；provider 作用域保留）。
+		OnRuntimeRelease: func(taskID string) { healthTracker.ResetRuntime(taskID) },
+		// ReadyTimeout/PollInterval 省略 → 生产默认 10s/500ms（spi_supervisor.go）。
+	}
+	v1Provider := opencode.NewSPIProviderWithDeps(supDeps)
+	// C6 门禁修复：能力适配器健康上报接线（SPI spec「能力故障透出」）——
+	// 真实能力调用的出口（成功/协议违约/明确不支持）经 provider 报告端口
+	// Transition 进 tracker（携带 runtime epoch）；装配方不直接制造观测。
+	v1Provider.WithHealthReporter(
+		func(h appagent.CapabilityHealth) {
+			if h.ProviderID == "" {
+				h.ProviderID = opencode.ProviderID
+			}
+			healthTracker.Transition(h)
+		},
+		healthTracker.RuntimeEpoch,
+	)
+	if err := registry.Register(v1Provider); err != nil {
+		return fmt.Errorf("register opencode-v1 provider: %w", err)
+	}
+	// opencode-v1-spi-provider tasks 4.3：删除清理的 AcquireEphemeral 入口接线
+	//（design D9a 分支②）——v1 provider 的 RuntimeSupervisor 注入 Manager，
+	// 临时绑定分支经 registry 分派同源实现。
+	tm.SetEphemeralSupervisor(v1Provider.Supervisor())
+	// C2 门禁修复：激活/恢复建程入口接线（design D9 结构化主流程）——activateRun
+	// 经 Acquire、runRecoveryAttempt 经 Resume 建程；与临时绑定入口同一 supervisor
+	// 实现。
+	tm.SetRuntimeSupervisor(v1Provider.Supervisor())
+
+	// opencode-v2-provider tasks 6.1/6.7：v2 provider 双注册装配（承接开关开时；
+	// 关闭形态固定为「v2 不注册」）。注册失败拒绝启动；机器事实注入 resolver。
+	// OCDECK_DEBUG（默认关）：三层 [debug] 诊断日志注入——MUST 先于任何 client
+	// 构造生效（debugTransport 在 client 构造期装配）。
+	task.SetDebugLogging(cfg.Debug)
+	opencode.SetDebugLogging(cfg.Debug)
+	opencode2.SetDebugLogging(cfg.Debug)
+	tm.SetMachineFacts(task.MachineFacts{
+		MachineMajor: cfg.OpenCodeMajor,
+		V2Enabled:    cfg.V2Adoption,
+	})
+	if cfg.V2Adoption {
+		v2Provider := opencode2.NewSPIProviderWithDeps(
+			opencode2.ProviderOptions{StatusVerified: true},
+			&opencode2.SupervisorDeps{
+				Proc:         procMgr,
+				Store:        &providerRuntimeStoreSeam{db: db},
+				AllocatePort: tm.AllocateServePort,
+				ProcessIdentity: func(pid int) (string, bool, error) {
+					out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
+					if err != nil {
+						return "", false, nil // 进程不存在
+					}
+					return strings.TrimSpace(string(out)), true, nil
+				},
+				Env: task.NewV2TaskEnvSeam(tm),
+				// tasks 5.3：server 崩溃自动重拉 → 活跃 v2 任务按 binding 重建
+				// session 关联（复用既有恢复入口——Resume 延续原 session，不重复建）。
+				OnServerRestarted: tm.RebuildV2Associations,
+			})
+		v2Provider.WithHealthReporter(
+			func(h appagent.CapabilityHealth) {
+				if h.ProviderID == "" {
+					h.ProviderID = opencode2.ProviderID
+				}
+				healthTracker.Transition(h)
+			},
+			healthTracker.RuntimeEpoch,
+		)
+		if err := registry.Register(v2Provider); err != nil {
+			return fmt.Errorf("register opencode-v2 provider: %w", err)
+		}
+	}
 
 	// diff-review-workbench composition root（design.md D9/F1）。
 	// 在 Reconcile/启动调度/HTTP 开放前构造 diffreview service 并注入 Manager。
@@ -223,18 +329,74 @@ func run() error {
 	//（测试断言的是生产编排的 fail-closed 语义，而非复制模拟编排）。
 	// task-permission-mode D8/tasks 4.5：回填→开放序列同样收口在 permissionModeStartupGate
 	//（顺序钉死 SQL add column → Backfill → Reconcile → HTTP open，回填失败拒开 HTTP）。
-	return diffReviewStartupGate(ctx, tm, func() error {
-		return permissionModeStartupGate(ctx, tm, func() error {
-			return serveAndShutdown(ctx, tm, cfg, db, bus, aiStore, wd, diffSvc, uploadOrch, uploadConns, prefixStore)
+	// 命名空间防御性补齐门禁（opencode-v1-spi-provider tasks 2.2 / design D6 阶段 1）：
+	// 每次启动、在任何命名空间消费者（diffreview 收敛、权限事实回填、Reconcile、
+	// HTTP）运行前执行；补齐失败 fail-closed 拒绝启动。顺序钉死：
+	// migration 0018 加列（Open→Migrate，更早）→ 命名空间补齐（本门禁）→ 迁移导入
+	// runner（tasks 4.2，master 准入门失败 fail-closed 拒绝就绪；候选出结论前
+	// 生命周期消费者不启动——屏障即序列）→ 既有收敛门禁序列 → Reconcile → HTTP
+	// open。补齐与导入 runner 相互独立（D6）。
+	return namespaceBackfillGate(ctx, db, func() error {
+		return migrationImportGate(ctx, tm, func() error {
+			return diffReviewStartupGate(ctx, tm, func() error {
+				return permissionModeStartupGate(ctx, tm, func() error {
+					return serveAndShutdown(ctx, tm, cfg, db, bus, aiStore, wd, diffSvc, uploadOrch, uploadConns, prefixStore, healthTracker)
+				})
+			})
 		})
 	})
+}
+
+// migrationImporter 迁移导入门禁依赖的最小端口（task.Manager 满足）。
+type migrationImporter interface {
+	RunMigrationImport(ctx context.Context) error
+}
+
+// migrationImportGate 迁移导入启动门禁（opencode-v1-spi-provider tasks 4.2 /
+// design D6 阶段 3）：主密钥不可用/快照失败 → runner 返回错误 → fail-closed
+// 拒绝启动（MUST NOT 调用 open——候选屏障不释放、不耗恢复预算、不改任务状态）；
+// 成功 → 调用 open 并透传错误。
+func migrationImportGate(ctx context.Context, mi migrationImporter, open func() error) error {
+	if err := mi.RunMigrationImport(ctx); err != nil {
+		return fmt.Errorf("migration import gate: %w", err)
+	}
+	return open()
+}
+
+// supStoreSeam 是 SPI supervisor 的持久化 seam 适配（store 层方法包装；
+// 锚定读写走 v1 统一命名空间版本）。
+type supStoreSeam struct{ db *store.DB }
+
+func (s *supStoreSeam) GetTaskAnchor(ctx context.Context, taskID string) (string, error) {
+	row, err := s.db.GetTask(ctx, taskID)
+	if err != nil {
+		return "", err
+	}
+	return row.AnchorSessionID.String, nil
+}
+
+func (s *supStoreSeam) ClaimSessionKeyAndSetAnchor(ctx context.Context, taskID, sessionID string,
+	createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
+	return s.db.ClaimTaskSessionAndSetAnchor(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
+}
+
+func (s *supStoreSeam) ClearTaskAnchorConditional(ctx context.Context, taskID, oldAnchor string) (application.MutationResult, error) {
+	return s.db.ClearTaskAnchorConditional(ctx, taskID, oldAnchor)
+}
+
+func (s *supStoreSeam) GetTaskLastPort(ctx context.Context, taskID string) (int, bool, error) {
+	row, err := s.db.GetTask(ctx, taskID)
+	if err != nil {
+		return 0, false, err
+	}
+	return int(row.LastPort.Int64), row.LastPort.Valid, nil
 }
 
 // serveAndShutdown 执行收敛通过后的启动序列（design.md §5/§10）：
 // 上传编排启动（扫描/订阅/清理器）→ Reconcile（失败 fail-closed 拒绝开放 HTTP）→
 // 后台周期重试 → API 装配与阻塞服务 → 关停序列。
 // diffSvc 注入 API 层（diff-review-workbench D8 路由），须在 RebuildRoutes 前生效。
-func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config, db *store.DB, bus *eventbus.Bus, aiStore *ai.Store, wd *process.WatchdogManager, diffSvc *diffreview.Service, uploadOrch *appuploads.Orchestrator, uploadConns *currentConnPort, prefixStore *branchprefix.Store) error {
+func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config, db *store.DB, bus *eventbus.Bus, aiStore *ai.Store, wd *process.WatchdogManager, diffSvc *diffreview.Service, uploadOrch *appuploads.Orchestrator, uploadConns *currentConnPort, prefixStore *branchprefix.Store, healthTracker *appagent.HealthTracker) error {
 	// 受管上传启动序列（terminal-file-paste-drop 2.4）：启动恢复扫描（失败记日志，
 	// 不阻断启动——遗留产物按孤儿规则由周期清理收敛）→ 订阅 task.deleted 与周期清理。
 	// 先扫描后订阅：订阅起点覆盖 Reconcile 期间的删除事件。Reconcile 失败提前返回时
@@ -258,6 +420,10 @@ func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config,
 
 	srv := api.New(cfg, db)
 	srv.SetTaskBackend(tm)
+	// 能力健康透出（opencode-v1-spi-provider tasks 3.8）：run() 顶层构造的
+	// tracker（provider 作用域预填 unknown；supervisor OnRuntimeReady 换代
+	// 递增 epoch）注入状态端点——只读 capabilities 数组为唯一增量字段。
+	srv.SetCapabilitiesProvider(healthTracker.Snapshot)
 	// terminal-file-paste-drop：Conns 端口数据源回填（api WS 注册表）与投递编排注入
 	//（(bool, DeliverErrorCode) → api 窄接口 (bool, string)），须在 RebuildRoutes 前生效。
 	uploadConns.setServer(srv)
@@ -426,6 +592,22 @@ type startupConverger interface {
 // permissionBackfiller 回填门禁依赖的最小端口（task.Manager 满足）。
 type permissionBackfiller interface {
 	BackfillPermissionModeAtStart(ctx context.Context) error
+}
+
+// namespaceBackfiller 命名空间补齐门禁依赖的最小端口（*store.DB 满足）。
+type namespaceBackfiller interface {
+	BackfillProviderNamespaces(ctx context.Context) error
+}
+
+// namespaceBackfillGate 命名空间防御性补齐启动门禁（opencode-v1-spi-provider
+// tasks 2.2）：BackfillProviderNamespaces 失败 → fail-closed 拒绝启动（MUST NOT
+// 调用 open，任何命名空间消费者不得运行在补齐前）；成功 → 调用 open 并透传
+// 其返回错误。
+func namespaceBackfillGate(ctx context.Context, nb namespaceBackfiller, open func() error) error {
+	if err := nb.BackfillProviderNamespaces(ctx); err != nil {
+		return fmt.Errorf("backfill provider namespaces: %w", err)
+	}
+	return open()
 }
 
 // permissionModeStartupGate 启动权限事实回填门禁（task-permission-mode D8/tasks 4.5）：
@@ -613,4 +795,23 @@ func (a permAuditAdapter) Record(rec task.PermAuditRecord) error {
 		Reply:       rec.Reply,
 		Detail:      rec.Detail,
 	})
+}
+
+// providerRuntimeStoreSeam 适配 store 实例记录读写（opencode2.RuntimeRecordSeam）。
+type providerRuntimeStoreSeam struct{ db *store.DB }
+
+func (s *providerRuntimeStoreSeam) GetProviderRuntime(ctx context.Context, providerID, instanceID string) (store.ProviderRuntimeRecord, bool, error) {
+	return s.db.Queries.GetProviderRuntime(ctx, providerID, instanceID)
+}
+
+func (s *providerRuntimeStoreSeam) PutProviderRuntimeStart(ctx context.Context, providerID, instanceID string, port int) error {
+	return s.db.Queries.PutProviderRuntimeStart(ctx, providerID, instanceID, port)
+}
+
+func (s *providerRuntimeStoreSeam) SetProviderRuntimePID(ctx context.Context, providerID, instanceID string, pid int) error {
+	return s.db.Queries.SetProviderRuntimePID(ctx, providerID, instanceID, pid)
+}
+
+func (s *providerRuntimeStoreSeam) SetProviderRuntimeError(ctx context.Context, providerID, instanceID string, cause string) error {
+	return s.db.Queries.SetProviderRuntimeError(ctx, providerID, instanceID, cause)
 }

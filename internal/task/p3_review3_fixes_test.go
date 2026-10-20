@@ -373,10 +373,12 @@ func TestReconcilePrePassDigestsDebtThenResumesActive(t *testing.T) {
 	store.mutTask("t1", func(r *TaskRow) { r.Notice = encodeNotices(notice) })
 
 	proc := newMockProc()
-	// runtime 会话健康（存在 + env + OCDECK_TASK_ID 匹配）；shell 会话不存在（pre-pass 跳过 kill）。
+	// runtime 会话健康（存在 + env OCDECK_TASK_ID 匹配）；shell 会话不存在（pre-pass 跳过 kill）。
+	// tasks 4.3：恢复凭据/端口从 persisted binding 解析。
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 	proc.sessions[runtimeSessionName("t1")] = true
 	proc.envValues[runtimeSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
+		"OCDECK_TASK_ID": "t1",
 	}
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	m.cfg.ShutdownPolicy = config.ShutdownPersist
@@ -418,9 +420,11 @@ func TestReconcileStaleNoticeNotUsed(t *testing.T) {
 	store.mutTask("t1", func(r *TaskRow) { r.Notice = encodeNotices(notice) })
 
 	proc := newMockProc()
+	// tasks 4.3：恢复凭据/端口从 persisted binding 解析。
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 	proc.sessions[runtimeSessionName("t1")] = true
 	proc.envValues[runtimeSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
+		"OCDECK_TASK_ID": "t1",
 	}
 	m := newTestManager(t, store, proc, newMockWorktree(), newMockOC(true))
 	m.cfg.ShutdownPolicy = config.ShutdownPersist

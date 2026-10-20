@@ -6,10 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
+	"strings"
+	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/application/runtime"
 	"ocdeck/internal/infrastructure/process"
+	ocdeckstore "ocdeck/internal/infrastructure/store"
 )
 
 // hostEnv 读取宿主环境变量（design.md §2：基础集从宿主取，不继承全部）。
@@ -31,6 +36,10 @@ type noticeEntry struct {
 const (
 	noticeCodeResidual        = "residual_processes"
 	noticeCodeSessionOverflow = "session_overflow"
+	// noticeCodeSuspendStop 是 v2 停止收敛意图（评审 Round3 I2）：停止已确认但
+	// 状态收敛写失败时落库；后台重放持任务锁复核后完成清关联+active→suspended
+	// 再删意图。带执行代际（token）——新一代运行时旧意图失效清除，不影响新一代。
+	noticeCodeSuspendStop = "suspend_stop_confirmed"
 )
 
 // notice reason 枚举（§8：residual_processes.data.reason）。
@@ -40,6 +49,10 @@ const (
 	noticeReasonKillFailed      = "kill_failed"
 	noticeReasonReapFailed      = "reap_failed"
 	noticeReasonSnapshotMissing = "snapshot_missing_degraded"
+	// noticeReasonCandidateCleanupFailed 是未提交 candidate 的回收清理债务
+	//（收尾 R1 J3）：重放经 provider 的 CandidateDebtReaper 重新 DELETE；成功
+	// 清条目/失败保留（首建准入门禁持续生效）。
+	noticeReasonCandidateCleanupFailed = "candidate_cleanup_failed"
 )
 
 // dispositionToNotice 将 process.Disposition 唯一映射为 (reason, retryable)（B6）。
@@ -132,6 +145,11 @@ func (m *Manager) hasRetryableNotice(ctx context.Context, row TaskRow) (bool, er
 		return true, err
 	}
 	for _, e := range entries {
+		// Round4 I2：停止收敛意图同为激活门禁债务（可重试收敛工作在位——激活
+		// MUST NOT 绕过未完成的挂起收敛）。
+		if e.Code == noticeCodeSuspendStop {
+			return true, nil
+		}
 		if e.Code != noticeCodeResidual {
 			continue
 		}
@@ -209,6 +227,180 @@ func (m *Manager) recordResidualNotice(ctx context.Context, taskID, sessionName 
 	return fmt.Errorf("record residual notice: CAS did not converge (task %s, session %s)", taskID, sessionName)
 }
 
+// recordSuspendStopIntent 落 v2 停止收敛意图（评审 Round3 I2）：停止已确认
+// （Release interrupt 成功）但状态收敛写失败——durable retryable 意图，后台重放
+// 持任务锁复核后完成清关联+active→suspended 再删意图。token 为停止确认时的
+// runtime 执行代际（可校验：重放时与注册表当前代比对，新一代运行即意图过时
+// 清除，不影响新一代）。CAS 同键替换不膨胀（形态同 recordResidualNotice）。
+func (m *Manager) recordSuspendStopIntent(ctx context.Context, taskID, terminalRef, token string) error {
+	entry := noticeEntry{
+		Code:    noticeCodeSuspendStop,
+		Message: fmt.Sprintf("suspend stop confirmed; convergence pending for %s", terminalRef),
+		TS:      nowUnixI(),
+		Data: map[string]interface{}{
+			"sessionName": terminalRef,
+			"token":       token,
+			"retryable":   true,
+		},
+	}
+	key := noticeKey(entry)
+	for attempt := 0; attempt < 8; attempt++ {
+		row, err := m.store.GetTask(ctx, taskID)
+		if err != nil {
+			return fmt.Errorf("record suspend stop intent: get task: %w", err)
+		}
+		entries, perr := parseNotices(row.Notice)
+		if perr != nil {
+			// JSON 损坏 fail-closed（同 residual——不得覆盖已落库 notice）。
+			return fmt.Errorf("record suspend stop intent: notice json corrupted (task %s): %w", taskID, perr)
+		}
+		dup := false
+		for i, e := range entries {
+			if noticeKey(e) == key {
+				// Round6 I19：同键替换保留未完成持久化义务（pending 随新条目
+				// 延续——重新 kill 同名单元不保证重建原有 cleanup tickets）。
+				nc := entry
+				if old := decodeSuspendFinishObligations(e); len(old) > 0 {
+					if nc.Data == nil {
+						nc.Data = map[string]interface{}{}
+					}
+					nc.Data[suspendFinishPendingKey] = encodeSuspendFinishObligations(old)
+				}
+				entries[i] = nc
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			entries = append(entries, entry)
+		}
+		r, _ := m.writeNoticeCAS(ctx, taskID, row.Notice, encodeNotices(entries))
+		if !r.Matched {
+			continue
+		}
+		if m.noticeReadbackContains(ctx, taskID, entry) {
+			return nil
+		}
+	}
+	return fmt.Errorf("record suspend stop intent: CAS did not converge (task %s, session %s)", taskID, terminalRef)
+}
+
+// clearSuspendStopIntents 清除任务的全部停止收敛意图（Round4 I2：后续 Suspend
+// 取得收敛权后，历史意图的前提已被取代——CAS 过滤式移除；无意图幂等成功）。
+// Round6 I19：删除前必须补全意图携带的未完成持久化义务（notice/tickets、env）——
+// 补全失败则保留意图（含 pending），不得丢弃 tickets 重放能力。
+func (m *Manager) clearSuspendStopIntents(ctx context.Context, taskID string) error {
+	for attempt := 0; attempt < 8; attempt++ {
+		row, err := m.store.GetTask(ctx, taskID)
+		if err != nil {
+			return fmt.Errorf("clear suspend stop intent: get task: %w", err)
+		}
+		entries, perr := parseNotices(row.Notice)
+		if perr != nil {
+			// JSON 损坏 fail-closed：不得覆盖已落库 notice。
+			return fmt.Errorf("clear suspend stop intent: notice json corrupted (task %s): %w", taskID, perr)
+		}
+		var remaining []noticeEntry
+		changed := false
+		for _, e := range entries {
+			if e.Code != noticeCodeSuspendStop {
+				remaining = append(remaining, e)
+				continue
+			}
+			changed = true
+			if pending := decodeSuspendFinishObligations(e); len(pending) > 0 {
+				ref, _ := e.Data["sessionName"].(string)
+				if rem := m.persistSuspendFinishObligations(ctx, taskID, ref, pending); len(rem) > 0 {
+					// 义务仍未持久化：保留意图（含 pending 标注），不得删除。
+					remaining = append(remaining, annotateSuspendStopPending(e, rem))
+					continue
+				}
+				// Round9 I21②：义务已补全——同步消除 ledger 中的重复副本
+				//（否则后续 drain 重复执行 env 清除/重复落账 tickets）。
+				m.removeReapLedgerObligations(taskID, pending)
+			}
+			// 无义务或义务已补全：意图可安全移除。
+		}
+		if !changed {
+			return nil
+		}
+		r, _ := m.writeNoticeCAS(ctx, taskID, row.Notice, encodeNotices(remaining))
+		if r.Matched {
+			return nil
+		}
+		// 未收敛：被并发覆盖，继续重试。
+	}
+	return fmt.Errorf("clear suspend stop intent: CAS did not converge (task %s)", taskID)
+}
+
+// suspendFinishObligation 是挂起收尾未完成的持久化义务（Round5 I17）：清理操作
+// 失败可随收敛固化为债务，但债务/快照「持久化」失败 MUST 保留为未完成义务——
+// 意图不清除、完整 tickets 随意图保留，下轮重放优先补全。Round8 I20：TaskID
+// 为登记与落账的权威归属（ledger 按任务分组，drain 只取本任务条目）；Token 为
+// env 义务的记录时代际（新一代运行不受旧 env 义务影响）。
+type suspendFinishObligation struct {
+	Kind      string   `json:"kind"` // "notice"（残留 notice 未落库）| "env"（env 快照清除失败）
+	TaskID    string   `json:"taskId,omitempty"`
+	Name      string   `json:"name,omitempty"`
+	Tickets   []string `json:"tickets,omitempty"`
+	Reason    string   `json:"reason,omitempty"`
+	Retryable bool     `json:"retryable"`
+	Token     string   `json:"token,omitempty"` // env 义务：记录时的 runtime 执行代际
+}
+
+const suspendFinishPendingKey = "pendingJSON"
+
+func encodeSuspendFinishObligations(obs []suspendFinishObligation) string {
+	if len(obs) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(obs)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func decodeSuspendFinishObligations(e noticeEntry) []suspendFinishObligation {
+	raw, _ := e.Data[suspendFinishPendingKey].(string)
+	if raw == "" {
+		return nil
+	}
+	var obs []suspendFinishObligation
+	if err := json.Unmarshal([]byte(raw), &obs); err != nil {
+		return nil
+	}
+	return obs
+}
+
+// persistSuspendFinishObligations 补全持久化义务，返回仍未完成的义务。
+func (m *Manager) persistSuspendFinishObligations(ctx context.Context, taskID, terminalRef string, obs []suspendFinishObligation) []suspendFinishObligation {
+	var remaining []suspendFinishObligation
+	for _, o := range obs {
+		switch o.Kind {
+		case "notice":
+			if nerr := m.recordResidualNotice(ctx, taskID, o.Name, o.Tickets, o.Reason, o.Retryable); nerr != nil {
+				remaining = append(remaining, o)
+			}
+		case "env":
+			// Round9 I21：runtime 存在时，空 token 或 token 失配均不得授权清除
+			// 其 env 快照（空 token 视为新代——对齐停止意图的过时判定规则；
+			// 记录时无 runtime → 其后出现的 runtime 一律为新代）。仅 rt 为空
+			//（无本地运行面）或代际等值时才执行清除。
+			if rt := m.getRuntime(taskID); rt != nil {
+				if o.Token == "" || string(rt.instVersion) != o.Token {
+					continue
+				}
+			}
+			if _, eerr := m.writeEnvSnapshot(ctx, taskID, sql.NullString{}); eerr != nil {
+				remaining = append(remaining, o)
+			}
+		}
+	}
+	_ = terminalRef
+	return remaining
+}
+
 // recordResidualNoticeFromDisposition 按 KillResult 完整处置表记 notice（B6/G4-4
 // 同款语义，Phase 5 技术债 a）：复用 classifyKillResult——仅一致 clean 不记；
 // snapshot_missing_degraded 记 non-retryable；kill/disposition 失败、未知 disposition
@@ -221,6 +413,280 @@ func (m *Manager) recordResidualNoticeFromDisposition(ctx context.Context, taskI
 		return nil
 	}
 	return m.recordResidualNotice(ctx, taskID, sessionName, res.CleanupTickets, cls.reason, cls.retryable)
+}
+
+// reapLedgerSnapshot 返回任务的受管登记快照（测试观测面）。
+func (m *Manager) reapLedgerSnapshot(taskID string) []suspendFinishObligation {
+	m.reapLedgerMu.Lock()
+	defer m.reapLedgerMu.Unlock()
+	return append([]suspendFinishObligation(nil), m.reapLedger[taskID]...)
+}
+
+// reapLedgerHasUnfinished 报告任务是否仍有未完成义务（Round8 I17：登记非空
+// 期间意图是唯一重试入口，不得清除）。
+func (m *Manager) reapLedgerHasUnfinished(taskID string) bool {
+	m.reapLedgerMu.Lock()
+	defer m.reapLedgerMu.Unlock()
+	return len(m.reapLedger[taskID]) > 0
+}
+
+// reapLedgerTaskIDs 返回登记中的全部任务 ID（Round8 I17：后台调度独立覆盖——
+// 即使任务 notice 已为空，ledger 义务仍获得调度）。
+func (m *Manager) reapLedgerTaskIDs() []string {
+	m.reapLedgerMu.Lock()
+	defer m.reapLedgerMu.Unlock()
+	ids := make([]string, 0, len(m.reapLedger))
+	for id := range m.reapLedger {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// registerReapObligations 登记任务的未完成持久化义务（Round7 I17：所有持久化
+// 出口失败时的受管重试登记——义务含本次 kill 返回的完整 tickets，单元可能已删，
+// 后续落账/收割 MUST 使用原 tickets，不依赖再次 kill。Round8 I20：按任务分组，
+// drain 只取当前任务条目）。
+func (m *Manager) registerReapObligations(taskID string, obs []suspendFinishObligation) {
+	if len(obs) == 0 {
+		return
+	}
+	m.reapLedgerMu.Lock()
+	m.reapLedger[taskID] = append(m.reapLedger[taskID], obs...)
+	m.reapLedgerMu.Unlock()
+}
+
+// drainReapLedger 尝试落账「当前任务」的受管登记义务，返回仍未完成的（保留在
+// 登记中）。Round8 I20：只取该任务条目。锁契约：调用方 MUST 已持有该任务的
+// keyed mutex（retryTaskNotices/retrySuspendStopIntent 持锁调用；flushReapLedger
+// 经 tryLockTask 取锁）——义务的 env 代际复核与快照写入在锁内执行，与新一代
+// Activate/收敛互斥。
+func (m *Manager) drainReapLedger(ctx context.Context, taskID string) {
+	m.reapLedgerMu.Lock()
+	pending := m.reapLedger[taskID]
+	delete(m.reapLedger, taskID)
+	m.reapLedgerMu.Unlock()
+	if len(pending) == 0 {
+		return
+	}
+	remaining := m.persistSuspendFinishObligations(ctx, taskID, "", pending)
+	if len(remaining) > 0 {
+		m.reapLedgerMu.Lock()
+		m.reapLedger[taskID] = append(remaining, m.reapLedger[taskID]...)
+		m.reapLedgerMu.Unlock()
+	}
+}
+
+// removeReapLedgerObligations 从任务登记中移除已完成/已过时的义务副本
+// （Round9 I21②：pending 补全成功后同步消除 ledger 中的重复义务——否则后续
+// drain 会重复执行 env 清除或重复落账 tickets）。
+func (m *Manager) removeReapLedgerObligations(taskID string, done []suspendFinishObligation) {
+	if len(done) == 0 {
+		return
+	}
+	m.reapLedgerMu.Lock()
+	defer m.reapLedgerMu.Unlock()
+	list := m.reapLedger[taskID]
+	out := list[:0]
+	for _, l := range list {
+		matched := false
+		for _, d := range done {
+			if sameSuspendFinishObligation(l, d) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			out = append(out, l)
+		}
+	}
+	m.reapLedger[taskID] = out
+}
+
+// sameSuspendFinishObligation 义务稳定身份等值（Kind/Name/Reason/Tickets/
+// Retryable/Token——Tickets 逐项一致）。
+func sameSuspendFinishObligation(a, b suspendFinishObligation) bool {
+	return a.Kind == b.Kind && a.Name == b.Name && a.Reason == b.Reason &&
+		a.Retryable == b.Retryable && a.Token == b.Token &&
+		strings.Join(a.Tickets, ",") == strings.Join(b.Tickets, ",")
+}
+
+// flushReapLedger 关停收尾：逐任务 best-effort 落账受管登记，返回仍失败的
+// 任务 ID（Round8 I17：关停尝试 flush 并报告剩余失败）。Round9 I21③：flush
+// 与义务执行同样遵守任务锁约束（busy 任务保留登记并报告，不绕锁执行）。
+func (m *Manager) flushReapLedger(ctx context.Context) []string {
+	var failed []string
+	for _, id := range m.reapLedgerTaskIDs() {
+		unlock, lerr := m.tryLockTask(id)
+		if lerr != nil {
+			failed = append(failed, id)
+			continue
+		}
+		fctx, fcancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		m.drainReapLedger(fctx, id)
+		fcancel()
+		unlock()
+		if m.reapLedgerHasUnfinished(id) {
+			failed = append(failed, id)
+		}
+	}
+	return failed
+}
+
+// retrySuspendStopIntent 消费停止收敛意图（评审 Round3 I2；调用方持任务锁）：
+// 复核（suspended=已收敛/非 active=意图过时/新一代 runtime 在位=旧意图失效——
+// 三者清除意图且不影响现状）→ 复用正常挂起收尾语义完成清关联+残留 notice/tickets
+// 持久化+env 快照清除（Round4 I17）→ active→suspended 条件收敛。Round5 I17：
+// 未完成的持久化义务（notice/env 写失败）以 pending 形态随条目保留（updated
+// 返回给外层 CAS 持久化）——done=false 不清意图、完整 tickets 不丢；下轮重放
+// 优先补全义务（与状态无关——suspended 已收敛也不得丢弃 tickets 重放能力）。
+// 返回 done（true=意图已了结可清除）、更新后的条目与错误。
+func (m *Manager) retrySuspendStopIntent(ctx context.Context, taskID string, e noticeEntry) (bool, noticeEntry, error) {
+	terminalRef, _ := e.Data["sessionName"].(string)
+	// Round7 I17：先落账受管登记的义务（存储恢复后优先落账原 tickets——单元
+	// 可能已删，不能依赖再次 kill 重新派生）。
+	m.drainReapLedger(ctx, taskID)
+	// Round8 I17：登记仍有未完成义务（本轮 drain 失败）——意图是唯一重试入口，
+	// 不得清除（下轮继续调度落账）。
+	if m.reapLedgerHasUnfinished(taskID) {
+		return false, e, fmt.Errorf("suspend stop intent: ledger obligations unfinished")
+	}
+	// Round5 I17：上一轮遗留的未完成持久化义务优先补全（与状态无关——suspended
+	// 已收敛也不得丢弃 tickets 重放能力）。
+	if pending := decodeSuspendFinishObligations(e); len(pending) > 0 {
+		remaining := m.persistSuspendFinishObligations(ctx, taskID, terminalRef, pending)
+		e = annotateSuspendStopPending(e, remaining)
+		if len(remaining) > 0 {
+			return false, e, fmt.Errorf("suspend stop intent: %d obligation(s) still unpersisted", len(remaining))
+		}
+		// Round9 I21②：义务已补全——同步消除 ledger 中的重复副本。
+		m.removeReapLedgerObligations(taskID, pending)
+	}
+	row, err := m.store.GetTask(ctx, taskID)
+	if err != nil {
+		return false, e, fmt.Errorf("suspend stop intent: reread task: %w", err)
+	}
+	if row.Status != StatusActive {
+		// suspended=已收敛；activating/其他=用户新一代动作已接管——意图过时清除
+		//（守卫语义：MUST NOT 覆盖其他代的状态事实；未完成义务已在上方补全）。
+		return true, e, nil
+	}
+	token, _ := e.Data["token"].(string)
+	if rt := m.getRuntime(taskID); rt != nil {
+		// Round4 I2：注册表存在 runtime 即与记录代际严格比对——记录时空 token
+		//（记录时无 runtime）不得授权清理后来出现的 runtime（无可验证身份→视为
+		// 新代，意图过时清除）。
+		if token == "" || string(rt.instVersion) != token {
+			return true, e, nil
+		}
+	}
+	// 完成挂起的本地半程（上游停止已确认属实）：清运行时关联 + 幂等回收 v2 本地
+	// 单元（TUI/shell）——收集完整结果（含 shell 枚举错误），复用正常挂起收尾
+	// 语义持久化残留 notice/tickets + 清 env 快照（Round4 I17：MUST NOT 丢弃
+	// 清理债务、MUST NOT 残留 env 快照）。
+	m.clearRuntime(taskID)
+	var results []killResultEntry
+	if terminalRef != "" {
+		results = append(results, m.killTaskSessions(ctx, taskID, []string{terminalRef})...)
+	}
+	shells, serr := m.listShellSessions(taskID)
+	if serr != nil {
+		// 枚举失败如实入结果集（finishSuspendCommon 记 retryable kill_failed）。
+		results = append(results, killResultEntry{name: terminalRef,
+			killErr: fmt.Errorf("list shells: %w", serr)})
+	} else {
+		results = append(results, m.killTaskSessions(ctx, taskID, shells)...)
+	}
+	le, ferrs, obligations := m.finishSuspendCommon(ctx, taskID, results, nil)
+	if joined := errors.Join(ferrs...); joined != nil && !le.Valid {
+		le = sql.NullString{String: joined.Error(), Valid: true}
+	}
+	if len(obligations) > 0 {
+		// Round7 I17：义务先交受管登记（进程内有生命周期的重试载荷——任何持久化
+		// 出口失败都不至于让完整 tickets 只存在于本次调用返回值）。Round8 I20：
+		// 义务携带权威 taskID；env 义务携带记录时执行代际（新一代运行不受旧
+		// env 义务影响——对齐 I2 token 机制）。
+		token, _ := e.Data["token"].(string)
+		for i := range obligations {
+			obligations[i].TaskID = taskID
+			if obligations[i].Kind == "env" {
+				obligations[i].Token = token
+			}
+		}
+		m.registerReapObligations(taskID, obligations)
+	}
+	// Round6 I17：状态收敛与完整 pending 载荷同一持久化提交边界——义务标注
+	// 先于状态收敛落库。标注失败 → 不收敛（保持 active：tickets 由 kill 结果
+	// 下一轮重新派生，零丢失）；标注成功 → 收敛；收敛写失败 → 意图已携带
+	// pending（active 态），下轮先补义务再收敛。消除「已 suspended 而义务载荷
+	// 仅存在于本次调用返回值」的丢失窗口。
+	if len(obligations) > 0 {
+		e = annotateSuspendStopPending(e, obligations)
+		if aerr := m.persistAnnotatedIntent(ctx, taskID, e); aerr != nil {
+			return false, e, fmt.Errorf("suspend stop intent: pending annotate: %w", aerr)
+		}
+	}
+	if _, werr := m.writeStatusConditional(ctx, taskID, StatusActive, StatusSuspended, le); werr != nil {
+		// 意图已携带 pending（若收敛前段有义务）：active 态下轮先补义务再收敛。
+		return false, e, fmt.Errorf("suspend stop intent: converge: %w", werr)
+	}
+	if len(obligations) > 0 {
+		// Round6 I17：收敛完成但义务（已随意图 pending 持久化）未完成——意图
+		// 保留，下轮 pending 分支补全后才清除（不得随 done 丢弃 pending）。
+		return false, e, errors.Join(ferrs...)
+	}
+	// Matched=收敛完成且无未完成义务；!Matched=状态已被其他代改写（守卫不
+	// 覆盖）——意图均了结。
+	return true, e, nil
+}
+
+// persistAnnotatedIntent 把标注后的停止收敛意图 CAS 落库（Round6 I17：义务标注
+// 与状态收敛的提交边界——标注未落库时调用方 MUST NOT 收敛状态）。
+func (m *Manager) persistAnnotatedIntent(ctx context.Context, taskID string, annotated noticeEntry) error {
+	key := noticeKey(annotated)
+	for attempt := 0; attempt < 8; attempt++ {
+		row, err := m.store.GetTask(ctx, taskID)
+		if err != nil {
+			return fmt.Errorf("persist annotated intent: get task: %w", err)
+		}
+		entries, perr := parseNotices(row.Notice)
+		if perr != nil {
+			return fmt.Errorf("persist annotated intent: notice json corrupted (task %s): %w", taskID, perr)
+		}
+		found := false
+		for i, cur := range entries {
+			if noticeKey(cur) != key {
+				continue
+			}
+			entries[i] = annotated
+			found = true
+			break
+		}
+		if !found {
+			return fmt.Errorf("persist annotated intent: intent vanished (task %s)", taskID)
+		}
+		r, _ := m.writeNoticeCAS(ctx, taskID, row.Notice, encodeNotices(entries))
+		if r.Matched {
+			return nil
+		}
+	}
+	return fmt.Errorf("persist annotated intent: CAS did not converge (task %s)", taskID)
+}
+
+// annotateSuspendStopPending 把未完成持久化义务以 pendingJSON 形态写入条目副本
+// （obs 空=清除标记）。条目的持久化由外层 retryTaskNotices 的 CAS 承担。
+func annotateSuspendStopPending(e noticeEntry, obs []suspendFinishObligation) noticeEntry {
+	data := map[string]interface{}{}
+	for k, v := range e.Data {
+		if k != suspendFinishPendingKey {
+			data[k] = v
+		}
+	}
+	if raw := encodeSuspendFinishObligations(obs); raw != "" {
+		data[suspendFinishPendingKey] = raw
+	}
+	c := e
+	c.Data = data
+	return c
 }
 
 // casWriteNotices 将 remaining notice CAS 写回（design.md §8：新 tickets 不丢失）。
@@ -282,7 +748,11 @@ func (m *Manager) processRetryableNotices(ctx context.Context) error {
 			continue
 		}
 		if len(entries) == 0 {
-			continue
+			// Round8 I17：受管义务登记的任务即使 notice 已为空也保有调度入口
+			//（retryTaskNotices 头部在该任务锁内 drain——不无锁跨任务全局取走）。
+			if !m.reapLedgerHasUnfinished(t.ID) {
+				continue
+			}
 		}
 		if rerr := m.retryTaskNotices(ctx, t, entries); rerr != nil {
 			errs = append(errs, fmt.Errorf("task %s: %w", t.ID, rerr))
@@ -295,6 +765,32 @@ func (m *Manager) processRetryableNotices(ctx context.Context) error {
 // 持锁后重读 notice 再行动（不得用锁外捕获的旧值，B6）。
 // 返回聚合 error：处理过程中的 store 错误与末尾 CAS 失败（CAS 循环耗尽）MUST 聚合返回，
 // 不静默 return（避免后台循环丢失错误、关停残留 debt 被静默丢弃）。
+// reapCandidateDebt 重放收割 candidate 清理债务（收尾 R1 J3）：经 registry 的
+// v2 provider supervisor（CandidateDebtReaper 窄接口）重新 DELETE 原 session。
+// provider/supervisor 未实现 → fail-closed 错误（债务保留，不得静默清除）。
+func (m *Manager) reapCandidateDebt(ctx context.Context, taskID, sessionID string) (bool, error) {
+	if m.providerRegistry == nil {
+		return false, fmt.Errorf("provider registry unavailable (candidate debt kept)")
+	}
+	p, err := m.providerRegistry.Get(ocdeckstore.ProviderIDV2)
+	if err != nil {
+		return false, fmt.Errorf("get v2 provider (candidate debt kept): %w", err)
+	}
+	reaper, ok := p.Supervisor().(appagent.CandidateDebtReaper)
+	if !ok {
+		return false, fmt.Errorf("v2 supervisor does not implement CandidateDebtReaper (candidate debt kept)")
+	}
+	// Round3 J3：任务已 active → 该 candidate 已成为正式 binding 事实（首建成功
+	// 或经承接转换）——MUST NOT 收割，清除债务条目（门禁随事实解除）。
+	if row, err := m.store.GetTask(ctx, taskID); err == nil && row.Status == StatusActive {
+		return true, nil
+	}
+	if rerr := reaper.ReapCandidateSession(ctx, taskID, sessionID); rerr != nil {
+		return false, rerr
+	}
+	return true, nil
+}
+
 func (m *Manager) retryTaskNotices(ctx context.Context, t TaskRow, entries []noticeEntry) error {
 	unlock, err := m.tryLockTask(t.ID)
 	if err != nil {
@@ -302,6 +798,9 @@ func (m *Manager) retryTaskNotices(ctx context.Context, t TaskRow, entries []not
 		return nil
 	}
 	defer unlock()
+
+	// Round7 I17：受管义务登记优先落账（含意图已清但义务尚在登记的边角）。
+	m.drainReapLedger(ctx, t.ID)
 
 	var errs []error
 
@@ -319,7 +818,44 @@ func (m *Manager) retryTaskNotices(ctx context.Context, t TaskRow, entries []not
 	// clearedKeys 记录本轮成功清除的 notice key（B6：CAS 失败重试时不得从最新读回的
 	// 并发新增中复活本轮已清除项）。CAS 新值 MUST 基于同一次读取的最新版本计算。
 	clearedKeys := make(map[string]bool)
+	// Round4 J8：已知身份（真实 session id）的 candidate 债务先处理，占位意图后置
+	// ——占位是否可解除取决于本轮已知身份的收割结果（身份找回 + 回收证明）。若先
+	// 处理占位，会误把「本轮尚有机会证明已回收」当成身份永久未知。
+	ordered := make([]noticeEntry, 0, len(entries))
+	var pendingIntents []noticeEntry
 	for _, e := range entries {
+		if e.Code == noticeCodeResidual {
+			if reason, _ := e.Data["reason"].(string); reason == noticeReasonCandidateCleanupFailed {
+				if sn, _ := e.Data["sessionName"].(string); sn == candidateIntentSessionPending {
+					pendingIntents = append(pendingIntents, e)
+					continue
+				}
+			}
+		}
+		ordered = append(ordered, e)
+	}
+	ordered = append(ordered, pendingIntents...)
+	var knownCandidateReaped bool
+	for _, e := range ordered {
+		if e.Code == noticeCodeSuspendStop {
+			// 停止收敛意图（评审 Round3 I2）：上游已停+收敛写曾失败——持任务锁
+			// 复核后完成清关联+状态收敛（suspended）再删意图；旧意图不得影响
+			// 新一代运行（执行代际守卫）。done=false（DB 仍不可用/义务未完成）
+			// 保留重试——updated 条目（含 Round5 I17 pending 义务标注）随外层
+			// CAS 持久化。
+			done, updated, herr := m.retrySuspendStopIntent(ctx, t.ID, e)
+			if herr != nil {
+				remaining = append(remaining, updated)
+				errs = append(errs, herr)
+				continue
+			}
+			if !done {
+				remaining = append(remaining, updated)
+				continue
+			}
+			clearedKeys[noticeKey(updated)] = true
+			continue
+		}
 		if e.Code != noticeCodeResidual {
 			// 非 residual（如 session_overflow）保留，后台不处理。
 			remaining = append(remaining, e)
@@ -333,6 +869,39 @@ func (m *Manager) retryTaskNotices(ctx context.Context, t TaskRow, entries []not
 		}
 		sessionName, _ := e.Data["sessionName"].(string)
 		tickets := noticeTickets(e)
+
+		// 收尾 R1 J3：candidate 清理债务——经 provider 的 CandidateDebtReaper
+		// 重新 DELETE（收割目标=原 candidate session id）。成功清条目；失败/
+		// provider 未实现 fail-closed 保留（首建准入门禁持续生效）。
+		if reason, _ := e.Data["reason"].(string); reason == noticeReasonCandidateCleanupFailed {
+			// Round4 J8：占位意图只有在同一轮已用真实身份证明回收后才可解除
+			//（同进程 settle-fail 后真实 ID 经 ledger 落账）；仍未知 → 保持阻断，
+			// 人工处置（MUST NOT 因占位符 DELETE 成功/404 清债）。
+			if sessionName == candidateIntentSessionPending {
+				// Round5 J9：CommitFirstBuild 已成功但即时清占位 CAS 失败/进程退出
+				// 的窗口——持久化 v2 binding/anchor/归属行一致即证明该占位对应的
+				// 首建已正式提交，占位直接解除（零 candidate DELETE：已提交的
+				// session 不是残留 candidate）。无提交证明时按 J8 语义继续阻断。
+				if knownCandidateReaped || m.firstBuildCommitted(ctx, t.ID) {
+					clearedKeys[noticeKey(e)] = true
+				} else {
+					log.Printf("task %s: candidate intent identity unknown (pre-POST placeholder); keeping first-build gated until manual resolution", t.ID)
+					remaining = append(remaining, e)
+				}
+				continue
+			}
+			done, rerr := m.reapCandidateDebt(ctx, t.ID, sessionName)
+			if rerr != nil || !done {
+				remaining = append(remaining, e)
+				if rerr != nil {
+					errs = append(errs, fmt.Errorf("task %s: reap candidate debt %s: %w", t.ID, sessionName, rerr))
+				}
+				continue
+			}
+			knownCandidateReaped = true
+			clearedKeys[noticeKey(e)] = true
+			continue
+		}
 
 		// 后台重试须校验 generation/注册表，不得杀刚修复的 serve（B7）。
 		// 若任务有活跃运行时且 sessionName 属当前代 serve/tui，则跳过（用户操作或 Suspend 修复在管）。
@@ -515,4 +1084,155 @@ func unionStringSlices(old, neu []string) []string {
 // 新产生 tickets 合并进 notice，不覆盖丢失未收割的旧 tickets）。
 func unionTickets(old, neu []string) []string {
 	return unionStringSlices(old, neu)
+}
+
+// candidateIntentSessionPending 是首建阻断意图的占位 sessionName（POST 前落库；
+// Acquire 拿到真实 candidate id 后经 settleCandidateIntent 替换）。
+const candidateIntentSessionPending = "pending"
+
+// unknownCandidateIntentGuidance 是身份未知首建意图的人工处置指引（Round4 J8：
+// 占位意图不随占位符 DELETE 成功/404 解除——真实 candidate 是否存活未知，自动
+// 重放保持阻断；跨重启后真实 ID 只存在于已丢失的内存 ledger，无法自动恢复）。
+const unknownCandidateIntentGuidance = "v2 首建候选身份未知（POST 后真实 session id 未能跨重启落库）：" +
+	"原 candidate 可能仍存活于共享 serve，自动重放不会解除阻断——请人工确认并清理该上游 session 后清除任务 notice（或强制删除任务）"
+
+// hasUnknownCandidateIntent 报告 notice 中是否存在身份未知的首建意图
+// （candidate_cleanup_failed + sessionName=pending）。
+func hasUnknownCandidateIntent(entries []noticeEntry) bool {
+	for _, e := range entries {
+		if e.Code != noticeCodeResidual {
+			continue
+		}
+		if reason, _ := e.Data["reason"].(string); reason != noticeReasonCandidateCleanupFailed {
+			continue
+		}
+		if sn, _ := e.Data["sessionName"].(string); sn == candidateIntentSessionPending {
+			return true
+		}
+	}
+	return false
+}
+
+// firstBuildCommitted 判定占位意图对应的首建是否已正式提交（Round5 J9）——依据
+// 必须是持久化事实而非任务状态/内存态：v2 binding + v2 anchor 三元组 + anchor 归属行
+// 三者一致（CommitFirstBuild 单事务写入的形状）。仅凭 status=active 不构成证明
+// （其他路径/更早代也可能 active）；三者一致同时排除「占位属于更早失败代」——
+// 该代的 candidate 未被 claim 为 anchor 归属行。返回 false 时调用方按 J8 语义
+// 继续阻断（MUST NOT 猜测）。
+func (m *Manager) firstBuildCommitted(ctx context.Context, taskID string) bool {
+	astore, ok := m.store.(adoptionStore)
+	if !ok {
+		return false
+	}
+	binding, has, err := m.store.GetTaskBinding(ctx, taskID)
+	if err != nil || !has {
+		return false
+	}
+	if binding.ProviderID != ocdeckstore.ProviderIDV2 ||
+		binding.ProviderInstanceID != ocdeckstore.ProviderInstanceV2Default ||
+		binding.UpstreamSessionID == "" {
+		return false
+	}
+	anchorID, anchorProviderID, anchorInstanceID, err := astore.GetTaskAnchor(ctx, taskID)
+	if err != nil {
+		return false
+	}
+	if anchorID == "" || anchorID != binding.UpstreamSessionID ||
+		anchorProviderID != ocdeckstore.ProviderIDV2 ||
+		anchorInstanceID != ocdeckstore.ProviderInstanceV2Default {
+		return false
+	}
+	keys, err := astore.ListTaskSessionKeys(ctx, taskID)
+	if err != nil {
+		return false
+	}
+	for _, k := range keys {
+		if k.ProviderID == ocdeckstore.ProviderIDV2 &&
+			k.ProviderInstanceID == ocdeckstore.ProviderInstanceV2Default &&
+			k.UpstreamID == anchorID {
+			return true
+		}
+	}
+	return false
+}
+
+// armCandidateIntent 在首建 POST 之前持久化可跨重启的阻断意图（Round3 J3）：
+// retryable candidate_cleanup_failed 残债（sessionName=pending）——持久化失败
+// 返回错误，调用方 MUST NOT 发起首建 POST（零 POST，无 candidate 产生 → 无
+// 残留事实可丢失）。notice 在位期间首建准入门禁持续阻断。
+func (m *Manager) armCandidateIntent(ctx context.Context, taskID string) error {
+	return m.recordResidualNotice(ctx, taskID, candidateIntentSessionPending, nil,
+		noticeReasonCandidateCleanupFailed, true)
+}
+
+// clearCandidateIntent 移除占位阻断意图（candidate 已回收或已正式提交成为
+// binding 事实——门禁随之解除）。CAS 移除；找不到幂等成功。
+func (m *Manager) clearCandidateIntent(ctx context.Context, taskID string) error {
+	for attempt := 0; attempt < 8; attempt++ {
+		row, err := m.store.GetTask(ctx, taskID)
+		if err != nil {
+			return fmt.Errorf("clear candidate intent: get task: %w", err)
+		}
+		entries, perr := parseNotices(row.Notice)
+		if perr != nil {
+			return fmt.Errorf("clear candidate intent: notice json corrupted (task %s): %w", taskID, perr)
+		}
+		var remaining []noticeEntry
+		changed := false
+		for _, e := range entries {
+			if e.Code == noticeCodeResidual {
+				if sn, _ := e.Data["sessionName"].(string); sn == candidateIntentSessionPending {
+					changed = true
+					continue
+				}
+			}
+			remaining = append(remaining, e)
+		}
+		if !changed {
+			return nil
+		}
+		r, _ := m.writeNoticeCAS(ctx, taskID, row.Notice, encodeNotices(remaining))
+		if r.Matched {
+			return nil
+		}
+	}
+	return fmt.Errorf("clear candidate intent: CAS did not converge (task %s)", taskID)
+}
+
+// settleCandidateIntent 把占位意图升级为含真实 candidate sessionID 的持久债务
+// （Round3 J3：DELETE 失败后，candidate 身份跨重启可识别——门禁持续阻断直至
+// reaper 收割或用户处置）。pending 条目不存在（已被并发处理）→ 幂等成功。
+// 落库失败返回错误，调用方 MUST 走 ledger 兜底。
+func (m *Manager) settleCandidateIntent(ctx context.Context, taskID, sessionID string) error {
+	for attempt := 0; attempt < 8; attempt++ {
+		row, err := m.store.GetTask(ctx, taskID)
+		if err != nil {
+			return fmt.Errorf("settle candidate intent: get task: %w", err)
+		}
+		entries, perr := parseNotices(row.Notice)
+		if perr != nil {
+			return fmt.Errorf("settle candidate intent: notice json corrupted (task %s): %w", taskID, perr)
+		}
+		found := false
+		for i, e := range entries {
+			if e.Code != noticeCodeResidual {
+				continue
+			}
+			if sn, _ := e.Data["sessionName"].(string); sn != candidateIntentSessionPending {
+				continue
+			}
+			e.Data["sessionName"] = sessionID
+			entries[i] = e
+			found = true
+			break
+		}
+		if !found {
+			return nil
+		}
+		r, _ := m.writeNoticeCAS(ctx, taskID, row.Notice, encodeNotices(entries))
+		if r.Matched {
+			return nil
+		}
+	}
+	return fmt.Errorf("settle candidate intent: CAS did not converge (task %s)", taskID)
 }

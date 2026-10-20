@@ -1,8 +1,8 @@
 // diffreview_fileedit.go 实现 diffreview.FileEditPort 的 task 层 adapter（design.md D5/D9）。
 //
 // FileEditPortAdapter 包装 Manager：tryLockTask + task/worktree/repo 校验 + 文件系统操作
-//（禁锢/Lstat/regular 判定/原始字节读取/临时文件写入/chmod/终检/rename）。领域逻辑
-//（reasonCode 判定、BOM 推导、换行重建、SHA-256）由 diffreview 包纯函数承载，adapter 调用之。
+// （禁锢/Lstat/regular 判定/原始字节读取/临时文件写入/chmod/终检/rename）。领域逻辑
+// （reasonCode 判定、BOM 推导、换行重建、SHA-256）由 diffreview 包纯函数承载，adapter 调用之。
 //
 // 分层（design.md D9）：adapter 仅协调文件系统操作与任务锁，MUST NOT 包含领域判定逻辑。
 package task
@@ -511,7 +511,7 @@ func writeTempFileAt(dirFd int, data []byte, baseMode uint32) (string, error) {
 }
 
 // walkOpenatDir 从 rootFd（已打开的 worktree root FD）逐组件 openat 建立 rel 目录的 FD
-//（F15）。每组件 O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC——resolve 后组件被替换为
+// （F15）。每组件 O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC——resolve 后组件被替换为
 // symlink 即 ELOOP 拒绝；组件消失即 ENOENT。rel 为 "." 或空时返回 rootFd 的 Dup。
 // 返回的 FD 由调用方负责关闭；中途失败已打开的 FD 一律关闭。
 // F19：Dup 使用 F_DUPFD_CLOEXEC（dup(2) 语义新 FD 不带 close-on-exec，写事务期间不得可继承）。
@@ -620,11 +620,12 @@ func verifyDirIdentity(worktree, reqPath, wantRootIdentity, wantIdentity string)
 	}
 	return nil
 }
+
 // octalToFileMode 将完整 chmod 值（uint32，含特殊位）映射为 os.FileMode。
 // design.md D5：Perm() | ModeSetuid(0o4000) | ModeSetgid(0o2000) | ModeSticky(0o1000)。
 func octalToFileMode(mode uint32) os.FileMode {
-	fm := os.FileMode(mode & 0o777)      // permission bits
-	if mode&0o4000 != 0 {                // setuid
+	fm := os.FileMode(mode & 0o777) // permission bits
+	if mode&0o4000 != 0 {           // setuid
 		fm |= os.ModeSetuid
 	}
 	if mode&0o2000 != 0 { // setgid

@@ -13,7 +13,7 @@ import (
 
 // TestReplyPermission_ResultMapping 回复结果映射表驱动（task-permission-mode D6/D9）：
 // 200 true 成功；200 false/空体/非法 JSON → 结果未知普通错误；401 → 普通错误
-//（ErrUnauthorized，调用方 MUST NOT 标记 unsupported）；404 _tag 双语义；
+// （ErrUnauthorized，调用方 MUST NOT 标记 unsupported）；404 _tag 双语义；
 // 其他 4xx/5xx → 结果未知普通错误。
 func TestReplyPermission_ResultMapping(t *testing.T) {
 	cases := []struct {
@@ -127,7 +127,7 @@ func TestReplyPermission_Timeout_结果未知(t *testing.T) {
 }
 
 // TestReplyPermission_404ChunkedGone 分块到达的合法 PermissionNotFoundError 404
-//（task-permission-mode F1）：404 分类 MUST 基于完整读取的响应体——单次 Read 会把
+// （task-permission-mode F1）：404 分类 MUST 基于完整读取的响应体——单次 Read 会把
 // 第一段 `{"_tag":` 当完整 body，json 解析失败误判为路由 404（错误标记 unsupported，
 // 永久停止后续自动判定）。分块下 MUST 仍返回 ErrPermissionRequestGone。
 func TestReplyPermission_404ChunkedGone(t *testing.T) {

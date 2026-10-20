@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
@@ -131,14 +132,21 @@ func newPortRetryManager(t *testing.T, store TaskStore, proc ProcessBackend, fai
 		ServePortRange: config.PortRange{Min: 50000, Max: 50999},
 		ShutdownPolicy: config.ShutdownPersist,
 	}
-	factory := func(port int, password string, opts opencode.Options) OCClient {
+	var factory OCClientFactory = func(_ string, port int, password string, opts appagent.Options) OCClient {
 		oc := &portHealthOC{port: port, failPort: failPort, probeErr: probeErr}
 		// startSSE 依赖 OnReady 触发 readyCh，包裹以在 SubscribeEvents 时调用 onReady。
 		return &readyOCWrap{inner: oc, onReady: opts.OnReady}
 	}
+	// C7：Activate 入口 registry 准入（测试 Manager 统一注入注册了 opencode-v1 的
+	// registry，与 newTestManager 同形）。
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatalf("register test provider: %v", err)
+	}
 	m := New(Options{
 		Cfg: cfg, Store: store, Proc: proc, Worktree: newMockWorktree(),
-		OCFactory: factory,
+		OCFactory:        factory,
+		ProviderRegistry: reg,
 	})
 	m.recoveryBackoffFn = func(int) time.Duration { return 0 }
 	return m

@@ -2,11 +2,14 @@ package task
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
+	domain "ocdeck/internal/domain/agentprovider"
 	"ocdeck/internal/infrastructure/opencode"
 )
 
@@ -759,9 +762,7 @@ func TestAttention_BackgroundRetry_ConcurrentTypes(t *testing.T) {
 	store := newMockStore()
 	seedActiveTask(store, "t1", "p1")
 	proc := newMockProc()
-	proc.envValues[runtimeSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001",
-	}
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 
 	// 先把两类型推到 degraded（对齐种子），再挂到 runtime
 	seed := newMockOC(true)
@@ -786,7 +787,7 @@ func TestAttention_BackgroundRetry_ConcurrentTypes(t *testing.T) {
 	wrap := &blockingBothOC{inner: oc, block: blockCh, permEntered: permEntered, questEntered: questEntered}
 
 	// OCFactory 返回 blockingBothOC，经 taskOcClient → retryAttentionDegraded 生产路径
-	factory := func(port int, password string, opts opencode.Options) OCClient { return wrap }
+	factory := func(_ string, port int, password string, opts appagent.Options) OCClient { return wrap }
 	m := newTestManagerWithFactory(t, store, proc, newMockWorktree(), factory)
 	rt := m.newRuntime("t1")
 	rt.attention = a
@@ -854,3 +855,53 @@ func TestAttention_DegradedScanNoRace(t *testing.T) {
 
 // 等待变量使用以避免 unused（time 用于 context.WithTimeout 在其他测试中）
 var _ = time.Second
+
+// TestAttention_StructuredFieldsPropagation 落实 tasks 6.8（design D10）：
+// 结构化 Fields/Title 随事件传播进快照；仅结构化字段变化触发外部可见变化；
+// 快照深拷贝隔离。
+func TestAttention_StructuredFieldsPropagation(t *testing.T) {
+	a := newAttentionState()
+	fields := []domain.QuestionField{
+		{Key: "env", Label: "Env", Prompt: "pick", Type: "select", Required: true,
+			Options:  []domain.QuestionOption{{Value: "prod", Label: "Prod"}},
+			Metadata: json.RawMessage(`{"k":1}`)},
+	}
+	ev := appagent.AttentionEvent{
+		Kind: appagent.AttentionAsked, Type: appagent.AttentionQuestion,
+		RequestID: "q1", SessionID: "s1", Title: "Deploy",
+		Fields:    fields,
+		Questions: []appagent.QuestionItem{{Header: "h", Question: "q"}},
+	}
+	if !a.applyAttentionEvent(ev) {
+		t.Fatalf("first upsert must change")
+	}
+	snap := a.attentionSnapshot()
+	if len(snap.Questions) != 1 || snap.Questions[0].Title != "Deploy" || len(snap.Questions[0].Fields) != 1 {
+		t.Fatalf("snapshot: %+v", snap.Questions)
+	}
+	got := snap.Questions[0].Fields[0]
+	if got.Key != "env" || got.Type != "select" || !got.Required || len(got.Options) != 1 {
+		t.Fatalf("field: %+v", got)
+	}
+	// 快照深拷贝：改快照不得影响内部状态。
+	snap.Questions[0].Fields[0].Options[0].Value = "MUTATED"
+	snap2 := a.attentionSnapshot()
+	if snap2.Questions[0].Fields[0].Options[0].Value != "prod" {
+		t.Fatalf("snapshot must be isolated, got %+v", snap2.Questions[0].Fields[0].Options)
+	}
+	// 同值重放：no-op。
+	if a.applyAttentionEvent(ev) {
+		t.Fatalf("same-content replay must be no-op")
+	}
+	// 仅结构化字段变化（Title）→ 外部可见变化。
+	ev.Title = "Deploy v2"
+	if !a.applyAttentionEvent(ev) {
+		t.Fatalf("title-only change must be visible change")
+	}
+	// 仅结构化字段变化（Fields 内容）→ 外部可见变化。
+	ev.Title = "Deploy"
+	ev.Fields = []domain.QuestionField{{Key: "env", Label: "Env2", Type: "select"}}
+	if !a.applyAttentionEvent(ev) {
+		t.Fatalf("fields-only change must be visible change")
+	}
+}

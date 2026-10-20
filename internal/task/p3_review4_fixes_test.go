@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
@@ -37,6 +38,9 @@ func TestDeleteOCSessions_TempServeKillTicketsRecorded(t *testing.T) {
 	// newTestManager 的 readyOC 包装会在 SubscribeEvents 时触发 onReady；
 	// 但 deleteOCSessions 不用 SSE，只用 oc.DeleteSession + health。
 	m := newTestManager(t, store, proc, newMockWorktree(), oc)
+	// tasks 4.3：一次性 serve 起 AcquireEphemeral 临时 runtime（真实 supervisor
+	// 内部健康检查直连 fake server 监听端口）。
+	injectEphemeralSupervisorForTestWithPort(t, m, store, proc, newFakeOCServer(t).port)
 
 	// 直接调用 deleteOCSessions（它内部起 temp serve + 删 session + defer kill temp serve）。
 	// 注意：startTempServe 调用 waitServeReady（oc.Health OK），NewSession 创建 serve 会话。
@@ -286,7 +290,7 @@ func TestSSEReconnectAlignFailure_ConvergesToSuspended(t *testing.T) {
 		listErrOnReconn: errors.New("opencode list sessions infra error on reconnect"),
 	}
 	// 用直接 OCFactory：所有调用返回同一 oc 实例；捕获 startSSE 的 OnReady 供 SubscribeEvents 触发。
-	m := newTestManagerWithFactory(t, store, proc, newMockWorktree(), func(port int, password string, opts opencode.Options) OCClient {
+	m := newTestManagerWithFactory(t, store, proc, newMockWorktree(), func(_ string, port int, password string, opts appagent.Options) OCClient {
 		oc.onReadyCb = opts.OnReady
 		return oc
 	})
@@ -386,8 +390,11 @@ func TestReconcileResumeActive_FullPath(t *testing.T) {
 	store.mutTask("t1", func(r *TaskRow) { r.EnvSnapshot = snapBytes })
 	proc := newMockProc()
 	proc.sessions[runtimeSessionName("t1")] = true
+	// tasks 4.3：恢复凭据/端口从 persisted binding 解析；env 反查退役。
+	// OCDECK_TASK_ID 会话内复检保留（resumeActive 语义）。
+	seedDerivedBinding(store, "t1", 50001, "/data/worktrees/p1/t1")
 	proc.envValues[runtimeSessionName("t1")] = map[string]string{
-		"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
+		"OCDECK_TASK_ID": "t1",
 	}
 	// 有 sessions 行（对齐后应保留）。
 	oc := newMockOC(true)
@@ -424,14 +431,19 @@ var _ = time.Second
 var _ = sql.NullString{}
 
 // newTestManagerWithFactory 用自定义 OCClientFactory 构造 Manager（供需要自定义 SubscribeEvents/onReady 触发的测试）。
+// tasks 4.3：统一注入注册了 opencode-v1 的 registry（runtime 连接按 binding 分派）。
 func newTestManagerWithFactory(t *testing.T, store TaskStore, proc ProcessBackend, wt WorktreeBackend, factory OCClientFactory) *Manager {
 	t.Helper()
 	cfg := &config.Config{
-		DataDir:       t.TempDir(),
+		DataDir:        t.TempDir(),
 		ServePortRange: config.PortRange{Min: 50000, Max: 50999},
 		ShutdownPolicy: config.ShutdownPersist,
 	}
-	m := New(Options{Cfg: cfg, Store: store, Proc: proc, Worktree: wt, OCFactory: factory})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatalf("register test provider: %v", err)
+	}
+	m := New(Options{Cfg: cfg, Store: store, Proc: proc, Worktree: wt, OCFactory: factory, ProviderRegistry: reg})
 	m.recoveryBackoffFn = func(int) time.Duration { return 0 }
 	return m
 }

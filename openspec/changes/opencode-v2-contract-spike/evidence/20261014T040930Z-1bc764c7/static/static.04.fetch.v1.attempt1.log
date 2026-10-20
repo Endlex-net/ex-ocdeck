@@ -1,0 +1,1 @@
+GET https://raw.githubusercontent.com/anomalyco/opencode/774cc7c1914e4329eefde5a669f938b0cf566661/packages/schema/src/v1/legacy-event.ts attempt=1 status=200 err=None

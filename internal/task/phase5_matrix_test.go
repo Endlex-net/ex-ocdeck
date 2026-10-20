@@ -7,9 +7,11 @@ import (
 	"testing"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/process"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // TestRecordResidualNoticeFromDisposition_FailClosedTable 验证 Phase 5 技术债 a：
@@ -120,6 +122,16 @@ func TestSuspendDuringActivating_TransitionalReject(t *testing.T) {
 	assertStatus(t, store, "t1", StatusActivating)
 }
 
+// deriveTestPassword 按任务测试常量 master secret 独立计算任务的派生密码
+// （D3 公式；与 charx 契约组同一期望值来源——TestMain 注入的 env 值）。
+func deriveTestPassword(taskID string) string {
+	master, err := appagent.ResolveMasterSecret()
+	if err != nil {
+		panic("test: master secret unavailable: " + err.Error())
+	}
+	return appagent.DeriveRuntimePassword(master, store.ProviderIDV1, taskID)
+}
+
 // envCaptureProc 捕获每次 NewSession 的 env（8.4 每次新密码断言用；
 // mockProc.envValues 按会话名覆盖，无法比对同名双启动的历史值）。
 type envCaptureProc struct {
@@ -135,8 +147,12 @@ func (p *envCaptureProc) NewSession(spec process.SessionSpec) error {
 	return nil
 }
 
-// TestRecovery_FreshPasswordPerCreate 验证 8.4/预算协议：Recovery 双启动子事务的
-// 两次进程创建各自生成新随机密码（端口复用已持久化值，密码 MUST NOT 复用）。
+// TestRecovery_FreshPasswordPerCreate 验证双启动子事务的两次进程创建密码语义
+// 。D3 用户批准的内部变更：
+//  1. 密码同任务恒定（不再随创建轮换）——断言两次创建注入同一派生值；
+//  2. 派生值经 master secret 派生（TestMain 注入的任务测试常量），与独立计算比对；
+//  3. spawn env 携带非秘密来源标记 OCDECK_CRED_KIND=derived（tasks 4.1）；
+//  4. 端口复用已持久化值（不变量保留）。
 func TestRecovery_FreshPasswordPerCreate(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")
@@ -147,7 +163,7 @@ func TestRecovery_FreshPasswordPerCreate(t *testing.T) {
 	m.setRuntime("t1", rt)
 	rt.registerGroup(roleRuntime, runtimeSessionName("t1"))
 
-	m.ensureRecovery("t1", rt.instVersion)
+	m.ensureRecovery("t1", rt.instVersion, false)
 	waitStatusAny(t, store, "t1", 3*time.Second, StatusActive)
 
 	if len(proc.envs) != 2 {
@@ -155,8 +171,17 @@ func TestRecovery_FreshPasswordPerCreate(t *testing.T) {
 	}
 	pw1 := proc.envs[0]["OPENCODE_SERVER_PASSWORD"]
 	pw2 := proc.envs[1]["OPENCODE_SERVER_PASSWORD"]
-	if pw1 == "" || pw2 == "" || pw1 == pw2 {
-		t.Fatalf("password must be regenerated per create (pw1==pw2: %v)", pw1 == pw2)
+	if pw1 == "" || pw2 == "" || pw1 != pw2 {
+		t.Fatalf("derived password must be constant per task (pw1==pw2: %v)", pw1 == pw2)
+	}
+	want := deriveTestPassword("t1")
+	if pw1 != want {
+		t.Errorf("spawn password = %.8s..., want derived %.8s...", pw1, want)
+	}
+	for i, env := range proc.envs {
+		if env["OCDECK_CRED_KIND"] != "derived" {
+			t.Errorf("create[%d] OCDECK_CRED_KIND = %q, want derived", i, env["OCDECK_CRED_KIND"])
+		}
 	}
 	if proc.envs[0]["OCDECK_SERVE_PORT"] != proc.envs[1]["OCDECK_SERVE_PORT"] {
 		t.Errorf("dual-start MUST reuse the persisted port: %v vs %v",

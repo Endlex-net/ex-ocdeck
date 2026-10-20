@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/config"
-	"ocdeck/internal/infrastructure/opencode"
 )
 
 // newTestManagerWithLifecycle 构造 Manager 并注入可取消 lifecycle ctx（供自动激活测试，
@@ -21,10 +21,14 @@ func newTestManagerWithLifecycle(t *testing.T, store TaskStore, proc ProcessBack
 		ServePortRange: config.PortRange{Min: 50000, Max: 50999},
 		ShutdownPolicy: config.ShutdownPersist,
 	}
-	wrap := func(port int, password string, opts opencode.Options) OCClient {
+	wrap := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOC{inner: oc, onReady: opts.OnReady}
 	}
-	m := New(Options{Cfg: cfg, Store: store, Proc: proc, Worktree: wt, OCFactory: wrap})
+	reg := appagent.NewRegistry()
+	if err := reg.Register(newTestRegistryProvider()); err != nil {
+		t.Fatalf("register test provider: %v", err)
+	}
+	m := New(Options{Cfg: cfg, Store: store, Proc: proc, Worktree: wt, OCFactory: wrap, ProviderRegistry: reg})
 	m.recoveryBackoffFn = func(int) time.Duration { return 0 }
 	m.SetLifecycleCtx(lifeCtx)
 	t.Cleanup(cancel)

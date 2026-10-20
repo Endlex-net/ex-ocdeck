@@ -108,7 +108,7 @@ func hasDegradedForSession(entries []noticeEntry, sessionName string) bool {
 
 // TestP4_RecordResidualNotice_SameSessionReplacesNotDuplicates 验证 P4 阻塞 1：
 // 同一会话多次 recordResidualNotice MUST 按会话替换（保留最新 reason），但 tickets MUST union
-//（旧 + 新去重合并，不 latest-wins 丢失未收割旧 tickets，design.md §5）。
+// （旧 + 新去重合并，不 latest-wins 丢失未收割旧 tickets，design.md §5）。
 func TestP4_RecordResidualNotice_SameSessionReplacesNotDuplicates(t *testing.T) {
 	store := newMockStore()
 	seedSuspendedTask(store, "t1", "p1")

@@ -240,7 +240,7 @@ func TestGitDiff_RefResolutionBeforeNewSide(t *testing.T) {
 // --- 八字段真值表 ---
 
 // TestGitDiff_TruthTable 覆盖八字段契约各分支。每个子测试在旧实现下都会失败
-//（旧实现返回 unified diff 文本或对 untracked 仅返回新文件 diff，无 old/new content 八字段）。
+// （旧实现返回 unified diff 文本或对 untracked 仅返回新文件 diff，无 old/new content 八字段）。
 func TestGitDiff_TruthTable(t *testing.T) {
 	t.Run("untracked_new_file", func(t *testing.T) {
 		dir := t.TempDir()

@@ -73,7 +73,11 @@ func TestGetTask_AttentionFields(t *testing.T) {
 			{ID: "perm1", Permission: "bash", Patterns: []string{"rm", "ls"}, Since: 1700000000},
 		},
 		Questions: []questionDTO{
-			{ID: "quest1", Questions: []questionItemDTO{{Header: "h1", Question: "what?"}}, Since: 1700000001},
+			// 方案 B（design D10）：Fields 优先视图（Fields 为空时自 Questions
+			// 合成 question-N）；Questions 兼容视图保持原样。
+			{ID: "quest1", Fields: []questionFieldDTO{
+				{Key: "question-1", Label: "h1", Prompt: "what?", Type: "text"},
+			}, Questions: []questionItemDTO{{Header: "h1", Question: "what?"}}, Since: 1700000001},
 		},
 	}
 	if !reflect.DeepEqual(dto.Attention, wantAtt) {

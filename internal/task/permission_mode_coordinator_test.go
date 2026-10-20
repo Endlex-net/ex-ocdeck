@@ -211,7 +211,11 @@ func TestUpdateTaskPermissionMode_TransitionMatrix(t *testing.T) {
 		if !convergedAtFirstEvent {
 			t.Fatal("runtime convergence must precede activity_changed publish")
 		}
-		events := rec.snapshot()
+		// 切入补判是异步 goroutine（judgeScan），其 permission_verdict 事件与
+		// UpdateTaskPermissionMode 同步发布的两事件并发——先等判定收敛，再只对
+		// 同步事件断言（K3：既有异步发布竞态，单跑不显，完整包负载下暴露）。
+		eventually(t, 2*time.Second, func() bool { return len(judge.judgeCalls()) >= 1 })
+		events := permissionModeSaveEvents(rec.snapshot())
 		if len(events) != 2 || events[0].Type != ocdeckevent.TypeTaskActivityChanged ||
 			events[1].Type != ocdeckevent.TypeServeRuntimePermissionModeChanged {
 			t.Fatalf("events = %+v, want [activity_changed, permission_mode_changed]", events)
@@ -249,7 +253,7 @@ func TestUpdateTaskPermissionMode_TransitionMatrix(t *testing.T) {
 		if got := len(judge.judgeCalls()); got != 0 {
 			t.Fatalf("judge calls = %d, want 0（切出不补判）", got)
 		}
-		if got := len(rec.snapshot()); got != 2 {
+		if got := len(permissionModeSaveEvents(rec.snapshot())); got != 2 {
 			t.Fatalf("events = %d, want 2", got)
 		}
 		if row, _ := store.GetTask(context.Background(), "t1"); row.PermissionMode != "ask" {
@@ -282,7 +286,7 @@ func TestUpdateTaskPermissionMode_TransitionMatrix(t *testing.T) {
 			t.Fatalf("judge calls = %d, want 0（DR1 不补判）", got)
 		}
 		// 存在 runtime：真实变更双事件均发布（D7）。
-		if got := len(rec.snapshot()); got != 2 {
+		if got := len(permissionModeSaveEvents(rec.snapshot())); got != 2 {
 			t.Fatalf("events = %d, want 2", got)
 		}
 		if row, _ := store.GetTask(context.Background(), "t1"); row.PermissionMode != "ai-auto" {
@@ -302,7 +306,7 @@ func TestUpdateTaskPermissionMode_TransitionMatrix(t *testing.T) {
 		if view != (application.PermissionModeView{PermissionMode: "ai-auto", EffectivePermissionMode: "ai-auto"}) {
 			t.Fatalf("view = %+v", view)
 		}
-		events := rec.snapshot()
+		events := permissionModeSaveEvents(rec.snapshot())
 		if len(events) != 1 || events[0].Type != ocdeckevent.TypeTaskActivityChanged {
 			t.Fatalf("events = %+v, want only activity_changed（D7：无 runtime MUST NOT 发 mode-changed）", events)
 		}
@@ -334,10 +338,25 @@ func TestUpdateTaskPermissionMode_PONR(t *testing.T) {
 	if epoch != 1 || !aiAuto {
 		t.Fatalf("epoch/AIAuto = %d/%v, want 1/true（取消不阻断收敛）", epoch, aiAuto)
 	}
-	if got := len(rec.snapshot()); got != 2 {
+	if got := len(permissionModeSaveEvents(rec.snapshot())); got != 2 {
 		t.Fatalf("events = %d, want 2（取消不阻断发布）", got)
 	}
 	if row, _ := store.GetTask(context.Background(), "t1"); row.PermissionMode != "ai-auto" {
 		t.Fatalf("persisted = %q, want ai-auto", row.PermissionMode)
 	}
+}
+
+// permissionModeSaveEvents 过滤出「权限模式保存」路径的同步事件（activity_changed /
+// permission_mode_changed）——切入 ai-auto 触发的异步补判（judgeScan goroutine）会在
+// 稍后发布 permission_verdict，与保存路径无关，不得计入其事件断言（K3：既有异步
+// 发布竞态，单跑不显、完整包负载下混入）。
+func permissionModeSaveEvents(events []ocdeckevent.Event) []ocdeckevent.Event {
+	out := make([]ocdeckevent.Event, 0, len(events))
+	for _, ev := range events {
+		if ev.Type == ocdeckevent.TypeTaskActivityChanged ||
+			ev.Type == ocdeckevent.TypeServeRuntimePermissionModeChanged {
+			out = append(out, ev)
+		}
+	}
+	return out
 }

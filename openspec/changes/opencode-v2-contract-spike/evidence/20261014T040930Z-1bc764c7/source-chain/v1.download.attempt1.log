@@ -1,0 +1,2 @@
+GET https://github.com/anomalyco/opencode/releases/download/v1.18.26/opencode-linux-arm64.tar.gz attempt=1 status=200 err=None
+downloaded sha256: 90b99cc2356fea188d67352418ad7223559841178142f719848ca2c88a689c3e

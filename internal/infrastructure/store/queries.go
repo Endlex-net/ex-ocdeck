@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
+	domain "ocdeck/internal/domain/agentprovider"
 	ocdecksess "ocdeck/internal/domain/session"
 	ocdecktask "ocdeck/internal/domain/task"
 )
@@ -84,6 +85,7 @@ type TaskRow struct {
 	Mode            string
 	PermissionMode  string
 	RenamePending   sql.NullString
+	ProviderID      string
 }
 
 // LifecycleConfigRow project_lifecycle_configs 表行映射（design.md §2，migration 0007）。
@@ -368,7 +370,7 @@ func (q *Queries) GetTask(ctx context.Context, id string) (TaskRow, error) {
 	row := q.db.QueryRowContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
 		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
-		        anchor_session_id, mode, permission_mode, rename_pending
+		        anchor_session_id, mode, permission_mode, rename_pending, provider_id
 		 FROM tasks WHERE id = ?`, id)
 	return scanTaskRow(row)
 }
@@ -378,7 +380,7 @@ func (q *Queries) ListTasksByProject(ctx context.Context, projectID string) ([]T
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
 		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
-		        anchor_session_id, mode, permission_mode, rename_pending
+		        anchor_session_id, mode, permission_mode, rename_pending, provider_id
 		 FROM tasks WHERE project_id = ? ORDER BY created_at ASC`, projectID)
 	if err != nil {
 		return nil, err
@@ -392,7 +394,7 @@ func (q *Queries) ListAllTasks(ctx context.Context) ([]TaskRow, error) {
 	rows, err := q.db.QueryContext(ctx,
 		`SELECT id, project_id, name, branch, status, worktree_path, last_port, last_error, notice,
 		        delete_mode, env_snapshot, created_at, updated_at, archived_at, init_status, init_error, base_ref,
-		        anchor_session_id, mode, permission_mode, rename_pending
+		        anchor_session_id, mode, permission_mode, rename_pending, provider_id
 		 FROM tasks ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
@@ -1566,7 +1568,7 @@ func scanTaskRow(row rowScanner) (TaskRow, error) {
 	err := row.Scan(&t.ID, &t.ProjectID, &t.Name, &t.Branch, &t.Status, &t.WorktreePath,
 		&t.LastPort, &t.LastError, &t.Notice, &t.DeleteMode, &t.EnvSnapshot,
 		&t.CreatedAt, &t.UpdatedAt, &t.ArchivedAt, &t.InitStatus, &t.InitError, &t.BaseRef,
-		&t.AnchorSessionID, &t.Mode, &t.PermissionMode, &t.RenamePending)
+		&t.AnchorSessionID, &t.Mode, &t.PermissionMode, &t.RenamePending, &t.ProviderID)
 	return t, err
 }
 
@@ -1604,6 +1606,11 @@ type SessionObservation struct {
 	CreatedAt int64
 	UpdatedAt int64
 	ParentID  string
+	// ProviderID/ProviderInstanceID 归属命名空间（完整 SessionKey 三列之二；
+	// opencode-v2-provider 评审 I5：对齐 claim 保留完整命名空间）。零值 = v1
+	// 缺省命名空间（既有 v1 调用方行为不变）。
+	ProviderID         string
+	ProviderInstanceID string
 }
 
 // ClaimTaskSession 原子 claim 一个 session 至本任务（add-plain-dir-project D8）。
@@ -1619,75 +1626,16 @@ type SessionObservation struct {
 // 无任何归属 → 插入本任务行。
 //
 // created/firstSeen/lastSeen 与既有 UpsertTaskSession 语义一致。
-func (q *Queries) ClaimTaskSession(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
-	if _, isTx := q.db.(*sql.Tx); isTx {
-		return q.claimTaskSessionInTx(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
-	}
-	var res application.ClaimResult
-	txErr := withTxQueries(ctx, q.db, func(qtx *Queries) error {
-		var cerr error
-		res, cerr = qtx.claimTaskSessionInTx(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
-		return cerr
-	})
-	return res, txErr
-}
+// 实现迁移至 session_key_queries.go（tasks 3.5：BEGIN IMMEDIATE + 完整
+// SessionKey 三列谓词，v1 常量命名空间——单命名空间下行为等价）。
 
 // claimTaskSessionInTx 在已绑定事务内执行 claim 逻辑，供事务与非事务路径复用。
-func (q *Queries) claimTaskSessionInTx(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
-	// 先查是否被他任务拥有。
-	row := q.db.QueryRowContext(ctx,
-		`SELECT task_id FROM task_sessions WHERE session_id = ? AND task_id != ?`, sessionID, taskID)
-	var owner string
-	err := row.Scan(&owner)
-	if err == nil {
-		// 被他任务拥有 → 冲突，不写入。
-		return application.ClaimResult{Claimed: false, OwnerTaskID: owner}, nil
-	}
-	if err != sql.ErrNoRows {
-		return application.ClaimResult{}, err
-	}
-	// 无冲突：读本任务既有行，判定 changed（新插入或 last_seen_at/parent_id 实际推进）。
-	orow := q.db.QueryRowContext(ctx,
-		`SELECT last_seen_at, parent_id FROM task_sessions WHERE task_id = ? AND session_id = ?`, taskID, sessionID)
-	var curLast int64
-	var curParent sql.NullString
-	changed := true
-	if oerr := orow.Scan(&curLast, &curParent); oerr == sql.ErrNoRows {
-		changed = true // 新插入。
-	} else if oerr != nil {
-		return application.ClaimResult{}, oerr
-	} else {
-		changed = lastSeen > curLast || parentID != nullStringValue(curParent)
-	}
-	// upsert 本任务行（与 UpsertTaskSession 一致语义）。
-	_, err = q.db.ExecContext(ctx,
-		`INSERT INTO task_sessions (task_id, session_id, session_created_at, first_seen_at, last_seen_at, parent_id)
-		 VALUES (?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(task_id, session_id) DO UPDATE SET
-		   last_seen_at = MAX(excluded.last_seen_at, task_sessions.last_seen_at),
-		   parent_id = excluded.parent_id`,
-		taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
-	if err != nil {
-		return application.ClaimResult{}, err
-	}
-	return application.ClaimResult{Claimed: true, Changed: changed}, nil
-}
+// claimTaskSessionInTx 的实现迁移至 session_key_queries.go（tasks 3.5：完整
+// SessionKey 三列谓词，v1 常量命名空间——单命名空间下行为等价）。
 
 // ClaimTaskSessionAndSetAnchor 单事务 claim session 并写入 tasks.anchor_session_id（D5）。
 // claim 成功后 sessionID 立即成为权威锚定；冲突时归属与 anchor 均不修改。
-func (q *Queries) ClaimTaskSessionAndSetAnchor(ctx context.Context, taskID, sessionID string, createdAt, firstSeen, lastSeen int64, parentID string) (application.ClaimResult, error) {
-	return runTx(ctx, q, func(qtx *Queries) (application.ClaimResult, error) {
-		res, err := qtx.claimTaskSessionInTx(ctx, taskID, sessionID, createdAt, firstSeen, lastSeen, parentID)
-		if err != nil || !res.Claimed {
-			return res, err
-		}
-		if _, err := qtx.db.ExecContext(ctx,
-			`UPDATE tasks SET anchor_session_id = ? WHERE id = ?`, sessionID, taskID); err != nil {
-			return application.ClaimResult{}, err
-		}
-		return res, nil
-	})
-}
+// 实现迁移至 session_key_queries.go（BEGIN IMMEDIATE + 锚定三元组写入）。
 
 // ClearTaskAnchorConditional 条件清空锚定（D5 CAS）：
 // `anchor_session_id=NULL WHERE id=? AND anchor_session_id=<old>`。
@@ -2040,10 +1988,17 @@ func (q *Queries) alignTaskSessionsInTx(ctx context.Context, taskID string, mode
 	var affected []ocdecksess.ID
 	switch mode {
 	case AlignModeRepo:
-		// listed 逐个原子 claim（冲突 ID 上报，不写入）。
+		// listed 逐个原子 claim（冲突 ID 上报，不写入）。命名空间随 observation
+		//（评审 I5）；零值 → v1 缺省（既有 v1 行为不变）。
 		var conflicts []ocdecksess.ID
 		for _, s := range listed {
-			cres, cerr := q.claimTaskSessionInTx(ctx, taskID, s.SessionID, s.CreatedAt, nowUnix(), s.UpdatedAt, s.ParentID)
+			nsID, nsInst := s.ProviderID, s.ProviderInstanceID
+			if nsID == "" {
+				nsID, nsInst = nsProviderIDV1, nsProviderInstanceV1Default
+			}
+			cres, cerr := q.claimSessionKeyInTx(ctx, taskID,
+				domain.SessionKey{ProviderID: nsID, ProviderInstanceID: nsInst, UpstreamID: s.SessionID},
+				s.CreatedAt, nowUnix(), s.UpdatedAt, s.ParentID)
 			if cerr != nil {
 				return res, cerr
 			}

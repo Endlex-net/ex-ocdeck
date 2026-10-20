@@ -195,10 +195,14 @@ func EnsureTmpDir(dataDir string) (string, error) {
 const (
 	sessionNameMaxLen = 128
 	ocdeckPrefix      = "ocdeck-"
-	suffixRuntime     = "runtime"
-	suffixServe       = "serve"
-	suffixTUI         = "tui"
-	suffixShellPrefix = "shell-"
+	// v2TUISessionPrefix 是 v2 交互 TUI 托管单元名前缀（opencode-v2-provider
+	// design D3 TerminalIO：ocdeck-v2-tui-<taskID>，从 binding TerminalRef 派生）。
+	v2TUISessionPrefix = "ocdeck-v2-tui-"
+	suffixRuntime      = "runtime"
+	suffixServe        = "serve"
+	suffixTUI          = "tui"
+	suffixV2TUI        = "v2-tui"
+	suffixShellPrefix  = "shell-"
 )
 
 // ParseSessionName 是会话名的单一 canonical parser（design D2 / G1-3）。
@@ -211,6 +215,16 @@ func ParseSessionName(name string) (taskID, suffix string, err error) {
 	}
 	if len(name) > sessionNameMaxLen {
 		return "", "", fmt.Errorf("process: session name too long (%d)", len(name))
+	}
+	// v2 交互 TUI 托管单元（评审 I14：canonical parser 统一扩展——与
+	// validateParsedSessionName 同规。归属解析/启动 reconcile 分组/关停 tickets
+	// 归属都经本 parser，不认该形态会丢任务归属）。
+	if strings.HasPrefix(name, v2TUISessionPrefix) {
+		taskID := name[len(v2TUISessionPrefix):]
+		if !validTaskID(taskID) {
+			return "", "", fmt.Errorf("process: invalid v2 tui session name %q (want %s<taskID>, charset [a-z0-9-])", name, v2TUISessionPrefix)
+		}
+		return taskID, suffixV2TUI, nil
 	}
 	if !strings.HasPrefix(name, ocdeckPrefix) || len(name) <= len(ocdeckPrefix) {
 		return "", "", fmt.Errorf("process: invalid session name %q (want ocdeck-<taskID>-<role>, charset [a-z0-9-])", name)
@@ -290,7 +304,18 @@ func parseShellIndex(suffix string) (int, bool) {
 }
 
 func validateParsedSessionName(name string, createOnly bool) error {
-	_, suffix, err := ParseSessionName(name)
+	// v2 交互 TUI 托管单元（opencode-v2-provider design D3 TerminalIO）：名称
+	// ocdeck-v2-tui-<taskID>（与 v2 serve 同一 "v2" 特许段；名字从 binding
+	// TerminalRef 确定性派生，延迟创建/幂等）。既有 ocdeck-<taskID>-<role> 文法
+	// 不含该形态，独立识别（创建与管理路径同规——Has/Kill/Attach 需同名寻址）。
+	if strings.HasPrefix(name, v2TUISessionPrefix) {
+		remainder := name[len(v2TUISessionPrefix):]
+		if validTaskID(remainder) {
+			return nil
+		}
+		return fmt.Errorf("process: invalid v2 tui session name %q (want %s<taskID>, charset [a-z0-9-])", name, v2TUISessionPrefix)
+	}
+	taskID, suffix, err := ParseSessionName(name)
 	if err != nil {
 		if createOnly {
 			return fmt.Errorf("process: invalid session name %q (want ocdeck-<taskID>-<role>, role ∈ {runtime,shell-<n>}, charset [a-z0-9-])", name)
@@ -298,6 +323,11 @@ func validateParsedSessionName(name string, createOnly bool) error {
 		return err
 	}
 	if !createOnly {
+		return nil
+	}
+	// v2 共享 serve 托管单元（opencode-v2-provider design D3）：全局单例基础设施
+	// 单元（taskID 固定 "v2"、role serve），非任务单元；create-only 路径单独放行。
+	if taskID == "v2" && suffix == suffixServe {
 		return nil
 	}
 	if suffix == suffixRuntime {
@@ -576,11 +606,13 @@ func (m *Manager) ensureServerPrechain() {
 
 // EnsureServerOptions 幂等配置专属 tmux server 的全部目标选项（design D1 三步）：
 //
-//  ①剪贴板配置（ensureClipboardOptions，内部版本分段/安全顺序/fail-closed 补救
-//    语义一字不动）；
-//  ②幂等 set -s extended-keys on（<3.2 或版本不可解析时仅跳过本步记日志）；
+//	①剪贴板配置（ensureClipboardOptions，内部版本分段/安全顺序/fail-closed 补救
+//	  语义一字不动）；
+//	②幂等 set -s extended-keys on（<3.2 或版本不可解析时仅跳过本步记日志）；
+//
 // ③恢复 set -s exit-empty on（前置链曾临时置 off，恢复既有生命周期语义：全部
-//    会话结束后 server 自动退出）。
+//
+//	会话结束后 server 自动退出）。
 //
 // 三步互相独立、互不跳过：除确定无 server（ErrNoTmuxServer 直通返回，无 server 即
 // 无任何可配置对象）外，任一步失败 MUST 仍执行其余步骤，各步错误 errors.Join 汇总
@@ -1130,4 +1162,30 @@ func isUnknownOptionErr(err error) bool {
 	}
 	low := strings.ToLower(ce.stderr)
 	return strings.Contains(low, "invalid option") || strings.Contains(low, "unknown option")
+}
+
+// SessionPID 返回指定托管单元的 pane pid（opencode-v2-provider design D3 步骤
+// ③/崩溃窗口重新发现：serve 托管单元存活进程的身份来源）。单元不存在 →
+// (0, false, nil)；查询失败 → 错误。
+func (m *Manager) SessionPID(name string) (int, bool, error) {
+	stdout, stderr, err := m.execTmux(context.Background(), "list-panes", "-s", "-t", "="+name, "-F", "#{pane_pid}")
+	if err != nil {
+		var ce *tmuxCmdError
+		if errors.As(err, &ce) && (isSessionNotFoundExit(ce) || isNoServerExit(ce)) {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("process: session pid %s: %w (%s)", name, err, stderr)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		pid, perr := strconv.Atoi(line)
+		if perr != nil || pid <= 0 {
+			continue
+		}
+		return pid, true, nil
+	}
+	return 0, false, nil
 }

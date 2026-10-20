@@ -1,0 +1,81 @@
+{
+  "channel": "latest",
+  "name": "cli",
+  "distribution": "opencode",
+  "version": "2.0.29",
+  "metadata": {
+    "files": {
+      "opencode-linux-x64.tar.gz": {
+        "url": "https://opencode.ai/files/bin/2.0.29/opencode-linux-x64.tar.gz",
+        "sha256": "17d0a4219178f982a08fdc3d19e9252edf815b23f2f26e3e77b800b43c853598",
+        "size": 98494746
+      },
+      "opencode-darwin-arm64.zip": {
+        "url": "https://opencode.ai/files/bin/2.0.29/opencode-darwin-arm64.zip",
+        "sha256": "cde9292948a79f910384b246ebec90dce02654158ad63cec61ed912aabc7f601",
+        "size": 85372410
+      },
+      "opencode-linux-x64-musl.tar.gz": {
+        "url": "https://opencode.ai/files/bin/2.0.29/opencode-linux-x64-musl.tar.gz",
+        "sha256": "6dd8221dfbf92d1555a950c18c1b8e1ca7a5c83702eefe12d6344e380e1ff018",
+        "size": 97853863
+      },
+      "opencode-linux-arm64-musl.tar.gz": {
+        "url": "https://opencode.ai/files/bin/2.0.29/opencode-linux-arm64-musl.tar.gz",
+        "sha256": "daba540f230a0745f3ac879acf4bcd1103904f09244d0d5cdb20e14ecf172a92",
+        "size": 96451638
+      },
+      "opencode-linux-x64-baseline.tar.gz": {
+        "url": "https://opencode.ai/files/bin/2.0.29/opencode-linux-x64-baseline.tar.gz",
+        "sha256": "639ed8b3d19085c7a62c6ba418dafd3c8edbc9e1116d1efc6d8846554b271d96",
+        "size": 98494816
+      },
+      "opencode-linux-x64-baseline-musl.tar.gz": {
+        "url": "https://opencode.ai/files/bin/2.0.29/opencode-linux-x64-baseline-musl.tar.gz",
+        "sha256": "cb4db0c0cf8b7405a239c2db391ba3cc104339bf587c45751d2290f9b40c5cd5",
+        "size": 97853948
+      },
+      "opencode-linux-arm64.tar.gz": {
+        "url": "https://opencode.ai/files/bin/2.0.29/opencode-linux-arm64.tar.gz",
+        "sha256": "39d0aa787531b0be9e67d087e8ff665cda1f8e748124fe790fe35f1fdd005c38",
+        "size": 97311002
+      },
+      "opencode-windows-x64-baseline.zip": {
+        "url": "https://opencode.ai/files/bin/2.0.29/opencode-windows-x64-baseline.zip",
+        "sha256": "0da2657f7c8a09df6cae91f2dc1eeaabb1a73eb3bf9e284950fd72ef756483de",
+        "size": 100356813
+      },
+      "opencode-darwin-x64.zip": {
+        "url": "https://opencode.ai/files/bin/2.0.29/opencode-darwin-x64.zip",
+        "sha256": "678400c2acc2c4f14aa261840fa2a35f907fbfc6d5edb102441b0275fd8cc605",
+        "size": 90412770
+      },
+      "opencode-darwin-x64-baseline.zip": {
+        "url": "https://opencode.ai/files/bin/2.0.29/opencode-darwin-x64-baseline.zip",
+        "sha256": "ab33099a0c36f593e92c6ca567410558ca1d90593604ef20674aa44f090d85db",
+        "size": 90412543
+      },
+      "opencode-windows-arm64.zip": {
+        "url": "https://opencode.ai/files/bin/2.0.29/opencode-windows-arm64.zip",
+        "sha256": "70d46f8f82f98b32bcf2561e75b9ffcbf4e3d71c6234c50bf1c28b50c6eb997e",
+        "size": 95798685
+      },
+      "opencode-windows-x64.zip": {
+        "url": "https://opencode.ai/files/bin/2.0.29/opencode-windows-x64.zip",
+        "sha256": "609369d081f5fd861a351b0ca390d3c41f8e47470d12c50f48a1f7b2f9708b38",
+        "size": 100356812
+      }
+    },
+    "github": {
+      "sha": "3a69bae8459b1aa9b122456a55d9535b23125f33",
+      "run_id": "38536124977",
+      "run_attempt": "1",
+      "actor": "Hona",
+      "ref": "refs/heads/dev"
+    }
+  },
+  "active": true,
+  "minimum": false,
+  "time_created": 1791968446782,
+  "time_updated": 1791968446782
+}

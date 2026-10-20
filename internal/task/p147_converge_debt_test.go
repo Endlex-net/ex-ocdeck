@@ -84,7 +84,7 @@ func p147RuntimeWithSessions(t *testing.T, m *Manager) runtime.InstVersion {
 }
 
 // TestP147_LockTimeout_RegistersPreCleanup_NoUnlockCleanup 直接单测锁超时分支
-//（onConvergeLockTimeout）：当前 runtime 令牌 == 触发令牌 → 登记 preCleanup；
+// （onConvergeLockTimeout）：当前 runtime 令牌 == 触发令牌 → 登记 preCleanup；
 // MUST NOT 无锁清理（runtime 仍在、会话仍在）且 MUST NOT CAS（状态仍 active）。
 func TestP147_LockTimeout_RegistersPreCleanup_NoUnlockCleanup(t *testing.T) {
 	store := newMockStore()
@@ -350,7 +350,7 @@ func p147ManagerWithRecordingPublisher(t *testing.T, store TaskStore) (*Manager,
 }
 
 // p147SeedPostCleanupDebt 构造 runtime 并登记其令牌的 postCleanup 债务
-//（runtime 已清、tombstone 保留令牌，与 worker postCleanup 前置一致）。
+// （runtime 已清、tombstone 保留令牌，与 worker postCleanup 前置一致）。
 func p147SeedPostCleanupDebt(t *testing.T, m *Manager) runtime.InstVersion {
 	t.Helper()
 	rt := m.newRuntime("t1")

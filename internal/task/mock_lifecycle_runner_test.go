@@ -23,12 +23,12 @@ type mockLifecycleRunner struct {
 }
 
 type mockRunScriptCall struct {
-	dir      string
-	env      map[string]string
-	script   string
-	logPath  string
-	timeout  time.Duration
-	ctxDone  bool // 记录 RunScript 调用时 ctx 是否已 Done（区分 runnerCtx / request ctx / signal ctx）
+	dir     string
+	env     map[string]string
+	script  string
+	logPath string
+	timeout time.Duration
+	ctxDone bool // 记录 RunScript 调用时 ctx 是否已 Done（区分 runnerCtx / request ctx / signal ctx）
 }
 
 type mockCopyCall struct {

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,7 +13,8 @@ import (
 // ErrPermissionRequestGone 表示权限请求已了结（404 且 _tag=PermissionNotFoundError，
 // 人工已在终端抢先批准/拒绝的竞态，task-permission-mode D6 失败分类 ③）。
 // 调用方视为正常忽略：不报错、不重试。
-var ErrPermissionRequestGone = errors.New("opencode: permission request not found")
+// 定义已迁至 internal/application/agentprovider（provider-neutral），本包经
+// neutral_compat.go 别名引用。
 
 // maxReplyBodyBytes 单响应体读取上限（1MB，与 ai 包请求/响应上限同量级；
 // 回复响应体极小，上限仅作防御）。
@@ -38,7 +38,7 @@ func readReplyBody(r io.Reader) (string, error) {
 
 // ReplyPermission POST /permission/{requestID}/reply?directory=<dir>（opencode 1.18.18 契约，
 // task-permission-mode D6）。body `{"reply": reply}`；reply 由调用方限定 once/reject
-//（本特性 MUST NOT 传 always，spec 契约）。
+// （本特性 MUST NOT 传 always，spec 契约）。
 //
 // 结果映射（client.go 错误分类先例：区分 401/404/其他非 2xx）：
 //   - 200 true → 成功（nil）；200 false、空体、非法 JSON、尾随内容 → 普通错误（发送结果未知，

@@ -1,6 +1,6 @@
 // p146_create_activate_wiring_test.go 验证 P1.4.6 Manager facade 注入 LifecycleService 后
 // Create/Retry/Activate 的行为与 legacy 直连 store 路径等价
-//（design.md D0:142 迁移第 6 步：DB 事实经 application persist+commit 封装，
+// （design.md D0:142 迁移第 6 步：DB 事实经 application persist+commit 封装，
 // worktree/tmux/opencode/锁与调度留在 Manager）。
 //
 // 经 mockAppAdapter（TaskRepository + TaskReadRepository + SessionRepository）注入
@@ -8,7 +8,7 @@
 //   - Create repo/dir 成功路径状态收敛（自动激活推进 active）与 guard 拒绝零落库；
 //   - Retry creation_failed 解锁后再调度自动激活（不自锁）；
 //   - Retry deletion_failed 重入：原子意图写 BeginRetryDeleteIntent（delete_mode + deleting
-//     + last_error=NULL）先于 dirty preflight；
+//   - last_error=NULL）先于 dirty preflight；
 //   - Activate guard 拒绝零 CAS；成功路径推进 active。
 package task
 

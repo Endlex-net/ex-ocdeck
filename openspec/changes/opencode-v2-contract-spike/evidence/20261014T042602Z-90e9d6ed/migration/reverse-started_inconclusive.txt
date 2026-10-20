@@ -1,0 +1,3 @@
+state=STARTED_INCONCLUSIVE
+failure_classes=['INCONCLUSIVE']
+reason=reverse 最低样本不满足：session=有 消息落盘=无；仅记录，不作承诺

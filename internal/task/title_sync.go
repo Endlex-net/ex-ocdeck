@@ -19,7 +19,7 @@ import (
 	"log"
 	"sync"
 
-	"ocdeck/internal/infrastructure/opencode"
+	appagent "ocdeck/internal/application/agentprovider"
 )
 
 // noticeCodeTitleSync 标题同步失败 notice 固定 code（D3）。
@@ -100,7 +100,7 @@ func (m *Manager) probeTitleCapability(ctx context.Context, taskID, instVersion 
 	// 稳定缓存命中（仅 unsupported 稳定；网络失败未缓存自然错过）。
 	if e, ok := reg.cache[taskID]; ok && e.instVersion == instVersion && e.unsupported {
 		reg.mu.Unlock()
-		return titleProbeOutcome{unsupported: true, err: opencode.ErrSessionTitleUnsupported}
+		return titleProbeOutcome{unsupported: true, err: appagent.ErrSessionTitleUnsupported}
 	}
 	// 挂入既有 flight：共享 leader 实测结果，不重发 PATCH。
 	if fl, inflight := reg.inflight[key]; inflight {
@@ -118,7 +118,7 @@ func (m *Manager) probeTitleCapability(ctx context.Context, taskID, instVersion 
 	reg.mu.Unlock()
 
 	terr := probe()
-	unsupported := errors.Is(terr, opencode.ErrSessionTitleUnsupported)
+	unsupported := errors.Is(terr, appagent.ErrSessionTitleUnsupported)
 
 	// 收敛 flight 并 fence 写缓存：仅当前实例一致时写入（探测期间可能挂起/替换）。
 	// outcome 先于 close 写入（done 关闭对等待者提供 happens-before），全部等待者共享。

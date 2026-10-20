@@ -9,9 +9,11 @@ import (
 	"strings"
 	"sync/atomic"
 
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/application/runtime"
 	"ocdeck/internal/infrastructure/process"
 	"ocdeck/internal/infrastructure/pty"
+	"ocdeck/internal/infrastructure/store"
 )
 
 // ReopenAttach 返回任务进程终端 ID（D8）。单进程终端链路（Phase 4）：
@@ -63,6 +65,14 @@ func (m *Manager) ReopenAttach(ctx context.Context, taskID string) (TerminalID, 
 		// 非法持久化 kind/mode 组合（DB 损坏值）→ internal（add-local-path-task-mode D1/D2）。
 		return "", newOpErr(codeInternal, kerr)
 	}
+	// 评审 I3：v2 任务终端 = 交互 TUI 托管单元（D3 TerminalIO）——按实际 binding
+	// 分派 TerminalIO：REST 预验证（session 存在且归属本任务）先于创建；幂等创建
+	// ocdeck-v2-tui-<taskID>（AttachCommand argv + 派生凭据 env），AttachPty 按名
+	// 附着同一单元。非 v2 binding → 走既有 v1 runtime 单元判定。
+	tid, handled, terr := m.reopenAttachV2(ctx, taskID, row)
+	if handled {
+		return tid, terr
+	}
 	runtimeName := runtimeSessionName(taskID)
 	exists, herr := m.proc.HasSession(runtimeName)
 	if herr != nil && !errors.Is(herr, process.ErrNoTmuxServer) {
@@ -81,6 +91,74 @@ func (m *Manager) ReopenAttach(ctx context.Context, taskID string) (TerminalID, 
 // 由 WS 层调用：根据终端类型（TUI/sessionName 或 shell/terminalID）创建 PTY。
 func (m *Manager) AttachPty(sessionName string, cols, rows int) (*pty.Pty, error) {
 	return m.proc.AttachPty(sessionName, cols, rows)
+}
+
+// reopenAttachV2 是 v2 任务的终端 attach 分支（评审 I3，D3 TerminalIO 契约）：
+// EnsureTerminal REST 预验证（binding 的 upstream session 存在且归属本任务；
+// 不存在→NotFound、归属不符→BindingInvalid，MUST NOT 建替代 session）先于创建；
+// 随后幂等确保托管单元（binding.TerminalRef = ocdeck-v2-tui-<taskID>）存在——
+// 创建参数 = AttachCommand argv（--server <url> --session <id>，自动选中机制
+// D8-7）+ 派生凭据 env（OPENCODE_SERVER_PASSWORD；凭据经 bindingEndpoint 端口
+// 提供，门禁已过）。返回 (id, handled=true)；非 v2 binding → (零值, false) 走
+// v1 分支。
+func (m *Manager) reopenAttachV2(ctx context.Context, taskID string, row TaskRow) (TerminalID, bool, error) {
+	b, has, err := m.store.GetTaskBinding(ctx, taskID)
+	if err != nil {
+		return "", true, newOpErr(codeInternal, fmt.Errorf("reopen attach: get binding: %w", err))
+	}
+	if !has || b.ProviderID != store.ProviderIDV2 {
+		return "", false, nil
+	}
+	// I7：归属门禁先于 endpoint/凭据（同一 binding 读取）。
+	if oerr := m.checkBindingOwnershipGate(ctx, taskID, b); oerr != nil {
+		return "", true, newOpErr(codeConflict, oerr)
+	}
+	p, perr := m.providerFor(b.ProviderID)
+	if perr != nil {
+		return "", true, newOpErr(codeInternal, perr)
+	}
+	ref, verr := p.Terminal().EnsureTerminal(ctx, b)
+	if verr != nil {
+		return "", true, newOpErr(attachErrCode(verr), fmt.Errorf("v2 terminal ensure: %w", verr))
+	}
+	exists, herr := m.proc.HasSession(ref)
+	if herr != nil && !errors.Is(herr, process.ErrNoTmuxServer) {
+		return "", true, newOpErr(codeInternal, fmt.Errorf("reopen attach: has v2 tui unit: %w", herr))
+	}
+	if exists {
+		// 幂等：单元已在（TUI 延迟创建语义——引用稳定，attach 复用）。
+		return TerminalID(ref), true, nil
+	}
+	argv, aerr := p.Terminal().AttachCommand(ctx, b)
+	if aerr != nil {
+		return "", true, newOpErr(attachErrCode(aerr), fmt.Errorf("v2 terminal attach argv: %w", aerr))
+	}
+	_, password, _, eerr := m.bindingEndpoint(b)
+	if eerr != nil {
+		return "", true, newOpErr(codeInternal, fmt.Errorf("v2 terminal credentials: %w", eerr))
+	}
+	if cerr := m.proc.NewSession(newSessionSpec(ref, row.WorktreePath,
+		map[string]string{"OPENCODE_SERVER_PASSWORD": password}, argv)); cerr != nil {
+		return "", true, newOpErr(codeProcessError, fmt.Errorf("create v2 tui unit: %w", cerr))
+	}
+	return TerminalID(ref), true, nil
+}
+
+// attachErrCode 把 TerminalIO typed 错误映射到 opErr 码（D3：NotFound→not_found、
+// BindingInvalid→invalid_state、其余按 internal/transport 归 internal）。
+func attachErrCode(err error) string {
+	var ae *appagent.Error
+	if !errors.As(err, &ae) {
+		return codeInternal
+	}
+	switch ae.Kind {
+	case appagent.ErrKindNotFound:
+		return codeNotFound
+	case appagent.ErrKindBindingInvalid:
+		return codeInvalidState
+	default:
+		return codeInternal
+	}
 }
 
 // --- shell 终端（design.md §18 CreateShell/CloseShell + §2 shell 会话序号） ---

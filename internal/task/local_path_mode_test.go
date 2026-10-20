@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
+	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/application/diffreview"
 	"ocdeck/internal/config"
 	"ocdeck/internal/infrastructure/opencode"
@@ -402,7 +403,7 @@ func newLocalPathCreateManager(t *testing.T, store TaskStore, proc ProcessBacken
 		ServePortRange: config.PortRange{Min: 50000, Max: 50999},
 		ShutdownPolicy: config.ShutdownPersist,
 	}
-	wrap := func(port int, password string, opts opencode.Options) OCClient {
+	wrap := func(_ string, port int, password string, opts appagent.Options) OCClient {
 		return &readyOC{inner: oc, onReady: opts.OnReady}
 	}
 	m := New(Options{
@@ -1237,7 +1238,7 @@ func TestLocalPath_RuntimeEntries_AlignOwnedOnly(t *testing.T) {
 		return m, capStore, proc
 	}
 	// markActiveWithSnapshot 模拟 persist 重启前的活跃任务：active + env 快照 + 存活健康
-	// runtime 会话（runtimeHealthyRecoverable 的读回素材）。
+	// runtime 会话（tasks 4.3：健康判定经 persisted binding；OCDECK_TASK_ID 复检保留）。
 	markActiveWithSnapshot := func(capStore *alignCaptureStore, proc *mockProc) {
 		snap := envSnapshot{Vars: map[string]string{"OCDECK_TASK_ID": "t1"}}
 		snapBytes, _ := encodeEnvSnapshot(snap)
@@ -1247,9 +1248,10 @@ func TestLocalPath_RuntimeEntries_AlignOwnedOnly(t *testing.T) {
 		})
 		// 启动事实（D5 三路径矩阵②）：persist 前进程经 startRuntimeWithPortRetry 写入。
 		capStore.seedPermissionModeAtStart("t1", PermissionModeAIAuto)
+		seedDerivedBinding(capStore.mockStore, "t1", 50001, capStore.tasks["t1"].WorktreePath)
 		proc.sessions[runtimeSessionName("t1")] = true
 		proc.envValues[runtimeSessionName("t1")] = map[string]string{
-			"OPENCODE_SERVER_PASSWORD": "pw", "OCDECK_SERVE_PORT": "50001", "OCDECK_TASK_ID": "t1",
+			"OCDECK_TASK_ID": "t1",
 		}
 	}
 	assertAllOwnedOnly := func(t *testing.T, modes []AlignMode, tids []string, what string) {
@@ -1473,7 +1475,7 @@ func TestIllegalCombo_RuntimeEntries_FailClosed(t *testing.T) {
 				rt := m.newRuntime("t1")
 				m.setRuntime("t1", rt)
 				regBefore := runtimeRegistrySnapshot(m, "t1")
-				m.ensureRecovery("t1", rt.instVersion)
+				m.ensureRecovery("t1", rt.instVersion, false)
 				m.ensureRecoveryFromAttach("t1")
 				assertStatus(t, store, "t1", StatusActive)
 				if n := store.recoveryPermitCount("t1"); n != 0 {
@@ -1895,8 +1897,12 @@ func TestDelete_LocalPath_FinalizeReliability(t *testing.T) {
 	t.Run("oc_session_delete_fail_finalize_write_fail_joins", func(t *testing.T) {
 		projDir := t.TempDir()
 		tstore := seedDeletingLocalPath(t, projDir)
-		// owned session + 无密码 env 的存活 runtime：deleteOCSessions 走「恢复密码失败」出口。
+		// owned session + 持久化 binding（可复用分支）+ 存活 runtime：deleteOCSessions
+		// 经 binding 建连后逐项删除失败（tasks 4.3：tmux env 反查退役——「recover serve
+		// password」出口由 binding 解析失败取代；本用例断言 Join 语义故用 binding 可解析
+		// + 客户端删除失败注入）。
 		_ = tstore.UpsertTaskSession(context.Background(), SessionRow{TaskID: "t1", SessionID: "sess-owned"})
+		seedDerivedBinding(tstore.mockStore, "t1", 50001, projDir)
 		proc := &traceDeleteProc{mockProc: newMockProc()}
 		proc.sessions[runtimeSessionName("t1")] = true
 		oc := newMockOC(true)
@@ -1908,7 +1914,7 @@ func TestDelete_LocalPath_FinalizeReliability(t *testing.T) {
 		if err == nil || !isOpErrCode(err, codeInternal) {
 			t.Fatalf("err = %v, want internal（落账失败升级）", err)
 		}
-		for _, want := range []string{"recover serve password", "db write failed"} {
+		for _, want := range []string{"oc delete boom", "db write failed"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("err = %v, want contain %q（errors.Join 保留原错误与落账错误）", err, want)
 			}

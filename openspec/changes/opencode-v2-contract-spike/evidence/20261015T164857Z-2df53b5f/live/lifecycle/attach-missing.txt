@@ -1,0 +1,1 @@
+GET /api/session/ses_doesnotexist00000000000000 -> 404 err=None

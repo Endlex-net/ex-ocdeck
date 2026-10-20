@@ -517,7 +517,7 @@ func TestRecovery_ReuseSameGenerationSnapshot(t *testing.T) {
 			m.setRuntime("t1", rt)
 			rt.registerGroup(roleRuntime, runtimeSessionName("t1"))
 
-			m.ensureRecovery("t1", rt.instVersion)
+			m.ensureRecovery("t1", rt.instVersion, false)
 			waitStatusAny(t, store, "t1", 3*time.Second, StatusActive)
 
 			serveEnv := proc.envValues[runtimeSessionName("t1")]
@@ -614,7 +614,7 @@ func TestRecovery_BadSnapshotTerminalBeforePermit(t *testing.T) {
 			m.setRuntime("t1", rt)
 			rt.registerGroup(roleRuntime, runtimeSessionName("t1"))
 
-			m.ensureRecovery("t1", rt.instVersion)
+			m.ensureRecovery("t1", rt.instVersion, false)
 
 			// 终态补偿事务照常落账且恰好执行一次：suspended + last_error + env_snapshot=NULL
 			// 全部走 CompleteRecoveryFailureAndClearDebts 单事务，而非普通 env 写入。

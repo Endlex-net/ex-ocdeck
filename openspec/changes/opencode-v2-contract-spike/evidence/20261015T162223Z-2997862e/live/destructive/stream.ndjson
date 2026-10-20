@@ -1,0 +1,8 @@
+data: {"id":"evt_14073fff0001eoZdMnA686zZYf","type":"server.connected","data":{}}
+
+: heartbeat
+
+data: {"id":"evt_1407400210013uTLEba4tVT67U","created":1792082706465,"type":"session.created","location":{"directory":"/Users/mendlex/.ocdeck/worktrees/ex-ocwork/v2-yarg/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"data":{"sessionID":"ses_ebf8bfffbffeT7RXL2ILsuj1Zq","slug":"brave-wolf","version":"2.0.28","projectID":"6363f0e18f81ff0a3993b41937ffbbf833d87cd4","location":{"directory":"/Users/mendlex/.ocdeck/worktrees/ex-ocwork/v2-yarg/openspec/changes/opencode-v2-contract-spike/sandbox/work"},"subpath":"openspec/changes/opencode-v2-contract-spike/sandbox/work","title":"spike-event-delete"},"durable":{"aggregateID":"ses_ebf8bfffbffeT7RXL2ILsuj1Zq","seq":0,"version":1}}
+
+data: {"id":"evt_140740033001CwUtmLuB9Dky0R","created":1792082706483,"type":"session.deleted","data":{"sessionID":"ses_ebf8bfffbffeT7RXL2ILsuj1Zq"},"durable":{"aggregateID":"ses_ebf8bfffbffeT7RXL2ILsuj1Zq","seq":1,"version":2}}
+
