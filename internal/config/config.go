@@ -102,6 +102,10 @@ type Config struct {
 	// v2 provider 不注册、v2 钉扎任务创建入口不可用；已承接任务的 v2 消费点按
 	// 未注册 provider fail-closed（不自动转回 v1）。
 	V2Adoption bool
+	// Debug 是调试日志开关（OCDECK_DEBUG，默认关）：开启后 client/resolver/
+	// supervisor/任务分派输出 [debug] 前缀诊断日志（脱敏——凭据与环境快照内容
+	// 永不落日志）。
+	Debug bool
 	// TmuxVersion 启动时 `tmux -V` 记录（design.md §2），MUST >= 3.2。
 	TmuxVersion string
 }
@@ -303,6 +307,7 @@ func Load(opts Options) (*Config, func(), error) {
 		VersionVerified: VersionSupported(ocVersion),
 		OpenCodeMajor:   ExtractOpenCodeMajor(ocVersion),
 		V2Adoption:      v2AdoptionEnabled(opts.EnvLookup),
+		Debug:           debugEnvEnabled(opts.EnvLookup),
 		TmuxVersion:     tmuxVersion,
 	}
 	if !cfg.VersionVerified {
@@ -608,6 +613,27 @@ func v2AdoptionEnabled(lookup EnvLookup) bool {
 		return false
 	}
 	v, ok := lookup(V2AdoptionEnv)
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// DebugEnv 是调试日志开关的环境变量名；默认关。
+const DebugEnv = "OCDECK_DEBUG"
+
+// debugEnvEnabled 解析调试开关（口径同 v2AdoptionEnabled：真值 =
+// "1"/"true"/"on"，大小写不敏感、容忍首尾空白；nil lookup 视为未配置）。
+func debugEnvEnabled(lookup EnvLookup) bool {
+	if lookup == nil {
+		return false
+	}
+	v, ok := lookup(DebugEnv)
 	if !ok {
 		return false
 	}

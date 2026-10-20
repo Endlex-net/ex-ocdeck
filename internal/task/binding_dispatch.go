@@ -254,9 +254,11 @@ func (m *Manager) buildTaskOCClient(ctx context.Context, taskID string, opts app
 	fallback := m.ocFactory(data.ProviderID, data.Port, password, opts)
 	if binding, berr := m.currentTaskBinding(ctx, taskID); berr == nil {
 		if bridge := m.bridgeClientFor(data, binding, fallback); bridge != nil {
+			debugf("oc client task=%s provider=%s form=bridge", taskID, data.ProviderID)
 			return bridge, nil
 		}
 	}
+	debugf("oc client task=%s provider=%s form=fallback", taskID, data.ProviderID)
 	return fallback, nil
 }
 

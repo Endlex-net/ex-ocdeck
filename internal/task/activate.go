@@ -1581,6 +1581,23 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 			m.handleAgentStatusDisconnect(taskID, rt, epoch)
 		},
 	})
+	// 生产装配修复：v2 binding 任务的 align/对账客户端 MUST 桥接优先（与
+	// buildTaskOCClient 同形）——生产 ocFactory 对已注册 provider 恒返回 v1
+	// wire client，直接对 v2 serve 打 GET /session 会被 SPA HTML 回退吞掉
+	//（invalid character '<'）。桥接仅对 v2 binding 生效（v1/无 binding 保持
+	// 既有 ocFactory 路径，v1 行为零变化）；测试接缝形态（Sessions() 窄接口
+	// nil）bridgeClientFor 返回 nil → 同样维持 ocFactory。finalBinding 即 D9
+	// 内存 binding——连接事实（port/password/wtPath）由调用方从同一 binding
+	// 解出传入，此处不二次读 DB。
+	if finalBinding != nil && finalBinding.ProviderID == store.ProviderIDV2 {
+		data := &opencodeBindingData{ProviderID: finalBinding.ProviderID, Port: port, Directory: wtPath, TaskID: taskID}
+		if bridge := m.bridgeClientFor(data, *finalBinding, ocWithReady); bridge != nil {
+			debugf("sse client task=%s provider=%s form=bridge", taskID, finalBinding.ProviderID)
+			ocWithReady = bridge
+		} else {
+			debugf("sse client task=%s provider=%s form=factory（测试接缝形态）", taskID, finalBinding.ProviderID)
+		}
+	}
 
 	// 缓冲屏障：对齐完成前 SSE 事件缓冲；对齐完成后放行（design.md §4）。
 	// C2 typed 桥：typed 通道事件与原始通道共享同一屏障（buffering/bufMu/alignMu），
@@ -1838,6 +1855,7 @@ func (m *Manager) startSSE(ctx context.Context, rt *taskRuntime, taskID, wtPath 
 			cancel()
 			return fmt.Errorf("sse initial align: %w", err)
 		}
+		debugf("sse initial align ok task=%s mode=%v", taskID, mode)
 		// D6 注意力对账（align 路径）：首次 align 成功后、drainAndRelease 前。
 		m.reconcileTaskAttention(sseCtx, rt, ocWithReady, wtPath)
 		// P1.8.3：agentStatus 对账（首次 align 成功后、drainAndRelease 前）。
@@ -2302,9 +2320,11 @@ func (m *Manager) alignSessions(ctx context.Context, taskID, wtPath string, oc O
 	}
 	if m.lifecycle != nil {
 		_, aerr := m.lifecycle.AlignSessions(ctx, taskID, toDomainAlignMode(mode), obs, complete)
+		debugf("align task=%s mode=%v listed=%d complete=%t err=%v", taskID, mode, len(obs), complete, aerr)
 		return aerr
 	}
 	_, aerr := apptask.RunAlign(ctx, storeAlignPortsAdapter{store: m.store}, taskID, toDomainAlignMode(mode), obs, complete)
+	debugf("align task=%s mode=%v listed=%d complete=%t err=%v", taskID, mode, len(obs), complete, aerr)
 	return aerr
 }
 

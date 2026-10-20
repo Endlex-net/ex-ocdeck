@@ -56,3 +56,24 @@ func TestV2AdoptionSwitch(t *testing.T) {
 		}
 	}
 }
+
+func TestDebugSwitch(t *testing.T) {
+	if debugEnvEnabled(nil) {
+		t.Fatalf("nil lookup must default off")
+	}
+	if debugEnvEnabled(func(string) (string, bool) { return "", false }) {
+		t.Fatalf("unset must default off")
+	}
+	for _, on := range []string{"1", "true", "ON", " True "} {
+		v := on
+		if !debugEnvEnabled(func(string) (string, bool) { return v, true }) {
+			t.Fatalf("%q must enable", on)
+		}
+	}
+	for _, off := range []string{"", "0", "false", "yes-please"} {
+		v := off
+		if debugEnvEnabled(func(string) (string, bool) { return v, true }) {
+			t.Fatalf("%q must stay off", off)
+		}
+	}
+}

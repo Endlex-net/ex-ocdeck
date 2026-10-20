@@ -141,12 +141,18 @@ func NewClient(port int, password string, opts Options) *Client {
 	baseURL := "http://127.0.0.1:" + strconv.Itoa(port)
 	// httpClient / sseClient 各有独立 http.Client（超时语义不同），共享包级
 	// loopbackTransport 以跨实例复用 loopback 连接池，消除短连接 churn。
+	// debug 开启时包装传输层（[debug] 每请求 method/URI/status + 错误 body 前
+	// 200 字符；凭据在 Authorization header，不经过传输层日志——见 debug.go）。
+	var transport http.RoundTripper = loopbackTransport
+	if debugEnabled() {
+		transport = debugTransport{base: loopbackTransport}
+	}
 	return &Client{
 		baseURL:           baseURL,
 		username:          "opencode",
 		password:          password,
-		httpClient:        &http.Client{Timeout: opts.OpTimeout, Transport: loopbackTransport},
-		sseClient:         &http.Client{Timeout: 0, Transport: loopbackTransport}, // SSE 无读超时，靠 heartbeat 与重连（§20）
+		httpClient:        &http.Client{Timeout: opts.OpTimeout, Transport: transport},
+		sseClient:         &http.Client{Timeout: 0, Transport: transport}, // SSE 无读超时，靠 heartbeat 与重连（§20）
 		reconnectBase:     opts.ReconnectBase,
 		reconnectMax:      opts.ReconnectMax,
 		reconnectMaxTries: opts.ReconnectMaxTries,

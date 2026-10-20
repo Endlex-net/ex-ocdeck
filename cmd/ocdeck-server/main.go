@@ -260,6 +260,11 @@ func run() error {
 
 	// opencode-v2-provider tasks 6.1/6.7：v2 provider 双注册装配（承接开关开时；
 	// 关闭形态固定为「v2 不注册」）。注册失败拒绝启动；机器事实注入 resolver。
+	// OCDECK_DEBUG（默认关）：三层 [debug] 诊断日志注入——MUST 先于任何 client
+	// 构造生效（debugTransport 在 client 构造期装配）。
+	task.SetDebugLogging(cfg.Debug)
+	opencode.SetDebugLogging(cfg.Debug)
+	opencode2.SetDebugLogging(cfg.Debug)
 	tm.SetMachineFacts(task.MachineFacts{
 		MachineMajor: cfg.OpenCodeMajor,
 		V2Enabled:    cfg.V2Adoption,

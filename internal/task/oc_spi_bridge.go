@@ -96,11 +96,27 @@ func sessionStatusMap(in map[domain.SessionKey]domain.AgentStatus) map[string]ap
 	return out
 }
 
+// Health/Probe 无 SPI 窄接口对应，v1 binding 委托 fallback（v1 wire
+// /global/health，既有行为）。v2 binding fail-closed（生产装配修复）：v2 serve
+// 对 /global/health 回 SPA HTML（v1 解码必失败，容器实测形态），静默委托必然
+// 产生假阴性健康判定——v2 生产消费点（startSSE 对齐/attention/agentStatus 对
+// 账、删除 v2 分支）均不经桥调 Health/Probe（对账语义自带可用性判定）；若未来
+// 出现 v2 健康探测消费点，MUST 经 provider 窄接口实现，不得落 fallback 的 v1
+// 路径。
 func (c *spiBridgeOCClient) Health(ctx context.Context) (appagent.HealthResponse, error) {
+	if c.binding.ProviderID == store.ProviderIDV2 {
+		return appagent.HealthResponse{}, appagent.NewError("bridge.health",
+			appagent.ErrKindCapabilityUnavailable,
+			errors.New("v2 健康探测无 SPI 窄接口对应（fallback 的 v1 wire 形态对 v2 serve 无效），不得静默打 v1 路径"))
+	}
 	return c.fallback.Health(ctx)
 }
 
 func (c *spiBridgeOCClient) Probe(ctx context.Context) (string, error) {
+	if c.binding.ProviderID == store.ProviderIDV2 {
+		return "", appagent.NewError("bridge.probe", appagent.ErrKindCapabilityUnavailable,
+			errors.New("v2 能力探测无 SPI 窄接口对应（fallback 的 v1 wire 形态对 v2 serve 无效），不得静默打 v1 路径"))
+	}
 	return c.fallback.Probe(ctx)
 }
 
@@ -155,8 +171,15 @@ func (c *spiBridgeOCClient) SessionStatus(ctx context.Context, dir string) (map[
 func (c *spiBridgeOCClient) SubscribeEvents(ctx context.Context, dir string, onEvent func(appagent.Event), onReconnect func()) error {
 	_ = dir
 	// SPI EventSource 是 typed 流（D8 映射后 domain.AgentEvent）——与 raw
-	// appagent.Event 回调形态不同：typed 流的原始投影面不经本桥（raw 订阅保留
-	// fallback——startSSE 的原始回退通道既有形态）。
+	// appagent.Event 回调形态不同：typed 流的原始投影面不经本桥。
+	// v2 binding fail-closed（生产装配修复）：v2 事件面唯一通道是 typed 流
+	//（startSSE finalStream——真实 provider Events() 在位，桥接 align 客户端
+	// 永不走到本方法）；委托 fallback 会静默打 v1 GET /event 被 SPA 回退吞掉，
+	// MUST NOT 静默降级。v1 binding 保持 fallback 委托（raw wire SSE 即 v1 事件面）。
+	if c.binding.ProviderID == store.ProviderIDV2 {
+		return appagent.NewError("bridge.subscribe_events", appagent.ErrKindCapabilityUnavailable,
+			errors.New("v2 事件订阅 MUST 经 typed EventSource（raw SSE 投影面不存在，不得静默打 v1 路径）"))
+	}
 	return c.fallback.SubscribeEvents(ctx, c.dir, onEvent, onReconnect)
 }
 

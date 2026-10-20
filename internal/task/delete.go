@@ -508,6 +508,16 @@ func (m *Manager) deleteOCSessions(ctx context.Context, row TaskRow) error {
 	if len(sessions) == 0 {
 		return nil
 	}
+	// v2 分支（opencode-v2-provider 删除语义）：共享 serve 常驻——经 provider
+	// Sessions() 窄接口对持久化 binding 直接删除（CheckServerAlive 保证 serve
+	// 在），MUST NOT 请求临时 runtime：v2 无任务 tmux 单元，且 v1 wire 形态的
+	// Health/Delete 对 v2 serve 均被 SPA HTML 回退吞掉（生产实测 acquire_ephemeral
+	// capability_unavailable 事故链）。
+	if binding, has, berr := m.store.GetTaskBinding(ctx, row.ID); berr != nil {
+		return fmt.Errorf("resolve binding for delete: %w", berr)
+	} else if has && binding.ProviderID == store.ProviderIDV2 {
+		return m.deleteV2SessionsViaBridge(ctx, row, sessions, binding)
+	}
 	// 取得连接事实（opencode-v1-spi-provider tasks 4.3 / design D9 删除清理行 +
 	// D10 例外行）：
 	//   分支① 有持久化 binding 且 runtime 会话存活 → 直接复用 binding 端点/凭据；
@@ -601,11 +611,59 @@ func (m *Manager) deleteOCSessions(ctx context.Context, row TaskRow) error {
 	return errors.Join(errs...)
 }
 
+// deleteV2SessionsViaBridge 经共享 serve 删除 v2 任务的 oc session（逐项，
+// 404 幂等语义由既有删除编排持有——v2 Sessions().Delete 的 NotFound 如实返回，
+// 上层 D3 落账语义与 v1 分支一致）。归属行与 binding 同事务转换（提交协议
+// 不变量），逐项按 binding 命名空间构造 SessionKey——跨命名空间行不得进入
+// v2 端点（fail-closed 聚合，不猜）。serve 不在 → CheckServerAlive 重拉；
+// 未实现 warmer（测试接缝形态）→ 直接打共享 serve，不在则逐项报错（fail-closed）。
+func (m *Manager) deleteV2SessionsViaBridge(ctx context.Context, row TaskRow, sessions []SessionRow, binding domain.TaskBinding) error {
+	p, perr := m.providerFor(binding.ProviderID)
+	if perr != nil {
+		return perr
+	}
+	sc := p.Sessions()
+	if sc == nil {
+		return appagent.NewError("delete oc sessions", appagent.ErrKindCapabilityUnavailable,
+			errors.New("v2 provider 未实现 Sessions 窄接口（删除不可经临时 runtime 降级）"))
+	}
+	if warmer, ok := p.Supervisor().(appagent.ServerAvailabilityWarmer); ok {
+		if werr := warmer.CheckServerAlive(ctx); werr != nil {
+			return fmt.Errorf("ensure v2 serve for delete: %w", werr)
+		}
+	}
+	debugf("delete v2 sessions task=%s provider=%s count=%d", row.ID, binding.ProviderID, len(sessions))
+	var errs []error
+	for _, s := range sessions {
+		key := domain.SessionKey{
+			ProviderID:         binding.ProviderID,
+			ProviderInstanceID: binding.ProviderInstanceID,
+			UpstreamID:         s.SessionID,
+		}
+		if derr := sc.Delete(ctx, binding, key); derr != nil {
+			errs = append(errs, fmt.Errorf("delete session %s: %w", s.SessionID, derr))
+			continue
+		}
+		// oc 删除成功（含 404 幂等）→ 落账删除 DB session 行（与 v1 分支同形）。
+		if m.lifecycle != nil {
+			if _, derr := m.lifecycle.DeleteOwnedSession(ctx, row.ID, ocdecksess.ID(s.SessionID)); derr != nil {
+				errs = append(errs, fmt.Errorf("delete session row %s: %w", s.SessionID, derr))
+			}
+			continue
+		}
+		if _, derr := m.store.DeleteTaskSession(ctx, row.ID, s.SessionID); derr != nil {
+			errs = append(errs, fmt.Errorf("delete session row %s: %w", s.SessionID, derr))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // deleteCleanupConnect 按删除清理分支规则建立 oc session 删除的连接事实：
 // 返回 (port, password, runtime 会话名, 是否临时 runtime, 临时绑定, error)。
 // 临时绑定仅分支②返回（阶段 4 Release 接线：临时 runtime 终止经 Release 消费
 // 该绑定；其余分支零值）。分支语义见 deleteOCSessions 头注释（design D9 删除
-// 清理行 / D10 例外行）。
+// 清理行 / D10 例外行）。v2 binding 任务不经本函数（deleteOCSessions 前置分支
+// 经共享 serve bridge 删除——v2 无临时 runtime 语义）。
 func (m *Manager) deleteCleanupConnect(ctx context.Context, row TaskRow) (int, string, string, bool, domain.TaskBinding, error) {
 	runtimeName := runtimeSessionName(row.ID)
 	serveName := runtimeName
@@ -651,44 +709,8 @@ func (m *Manager) deleteCleanupConnect(ctx context.Context, row TaskRow) (int, s
 	// 分派 supervisor（未注册 fail-closed），端口+进程+健康；无锚定 bootstrap、无
 	// claim、无对齐、无任务状态提交、不读/不写 env 快照与启动事实；返回值仅存内存
 	//（MUST NOT 持久化）。陈旧 binding 不参与（MUST NOT 走普通 Resume 触发恢复）。
-	// R4 消费点路由（opencode-v2-provider tasks 6.5）：按任务 binding 命名空间
-	// 分派——v2 binding → v2 provider supervisor（归属校验门禁先于凭据派生）；
-	// v1/无 binding → 既有 v1 路径（registryDispatch + ephemeralSupervisor）。
-	b, hasBinding, berr := m.store.GetTaskBinding(ctx, row.ID)
-	if berr != nil {
-		return 0, "", "", false, domain.TaskBinding{}, berr
-	}
-	if hasBinding && b.ProviderID == store.ProviderIDV2 {
-		sup, serr := m.supervisorForTaskConsumption(ctx, row.ID, b, row.WorktreePath)
-		if serr != nil {
-			return 0, "", "", false, domain.TaskBinding{}, serr
-		}
-		binding, aerr := sup.AcquireEphemeral(ctx, appagent.TaskRef{
-			TaskID:    row.ID,
-			Directory: row.WorktreePath,
-			Mode:      taskModeForRef(row),
-		})
-		if aerr != nil {
-			return 0, "", "", false, domain.TaskBinding{}, fmt.Errorf("acquire ephemeral runtime for oc session delete: %w", aerr)
-		}
-		// v2 临时 binding 端点解析经 provider 侧下沉（EphemeralRuntimeEndpoint——
-		// lifecycle 解码拒绝 ephemeral 形态，独立端口；密码仅经派生注入）。
-		p, gerr := m.providerRegistry.Get(store.ProviderIDV2)
-		if gerr != nil {
-			return 0, "", "", false, domain.TaskBinding{}, gerr
-		}
-		er, ok := p.(appagent.EphemeralEndpointResolver)
-		if !ok {
-			return 0, "", "", false, domain.TaskBinding{}, appagent.NewError(
-				"supervisor.acquire_ephemeral", appagent.ErrKindCapabilityUnavailable,
-				errors.New("provider 未实现 EphemeralRuntimeEndpoint"))
-		}
-		port, pw, _, eerr := er.EphemeralRuntimeEndpoint(binding)
-		if eerr != nil {
-			return 0, "", "", false, domain.TaskBinding{}, eerr
-		}
-		return port, pw, binding.TerminalRef, true, binding, nil
-	}
+	// 仅 v1/无 binding 任务可达（v2 binding 由 deleteOCSessions 前置分支经共享
+	// serve bridge 删除——v2 无任务 tmux 单元，临时 runtime 语义不适用）。
 	if err := m.registryDispatch(store.ProviderIDV1); err != nil {
 		return 0, "", "", false, domain.TaskBinding{}, err
 	}

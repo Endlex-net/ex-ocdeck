@@ -181,8 +181,10 @@ func (s *V2Supervisor) ensureServerOnce(ctx context.Context) (int, string, error
 		// 杜绝「ready 恒真」拿到失效端口/凭据。
 		if s.verifyAliveLocked() {
 			s.startMonitorLocked()
+			debugf("ensure_server: reuse ready serve port=%d", s.port)
 			return s.port, password, nil, false
 		}
+		debugf("ensure_server: ready state stale（进程/身份失效），进入恢复矩阵")
 		s.ready = false
 		s.pid = 0
 	}
@@ -196,6 +198,7 @@ func (s *V2Supervisor) ensureServerOnce(ctx context.Context) (int, string, error
 			s.password = password
 			s.everReady = true
 			s.startMonitorLocked()
+			debugf("ensure_server: serve ready port=%d attempt=%d restarted=%t", port, attempt, wasEverReady)
 			return port, password, nil, wasEverReady
 		}
 		s.pid = 0
@@ -561,6 +564,7 @@ func lifecycleBinding(taskID, directory, upstreamID string, port int, origin bin
 // /api/session/{id}/environment 204 替换式——1.3 冻结结论；应用完成确认先于
 // 就绪提交与首个 prompt——本调用在返回 binding 之前）。
 func (s *V2Supervisor) applySessionEnvAt(ctx context.Context, c *Client, upstreamID, taskID string, recovery bool) error {
+	debugf("apply_env: task=%s session=%s recovery=%t", taskID, upstreamID, recovery)
 	if s.deps.Env == nil {
 		return appagent.NewError("supervisor.apply_env", appagent.ErrKindCapabilityUnavailable,
 			errors.New("任务环境事实 seam 未注入（配置应用链不可用）"))
@@ -581,6 +585,7 @@ func (s *V2Supervisor) applySessionEnvAt(ctx context.Context, c *Client, upstrea
 // 返回 binding（origin=created）。配置应用失败 → 不返回 binding（保留旧事实，
 // 零持久化——binding 提交协议）。
 func (s *V2Supervisor) Acquire(ctx context.Context, task appagent.TaskRef) (domain.TaskBinding, error) {
+	debugf("acquire: task=%s dir=%s", task.TaskID, task.Directory)
 	c, port, _, err := s.serverClient(ctx)
 	if err != nil {
 		return domain.TaskBinding{}, err
@@ -589,6 +594,7 @@ func (s *V2Supervisor) Acquire(ctx context.Context, task appagent.TaskRef) (doma
 	if aerr != nil {
 		return domain.TaskBinding{}, aerr
 	}
+	debugf("acquire: created candidate session=%s port=%d", created.ID, port)
 	// 首建补偿（D3 受限回收例外）：POST 已成功后的 attempt 失败——本次新建且
 	// 未提交的 candidate session 经 SessionControl.Delete 回收（candidate 所有权
 	// 不出本 attempt：失败路径不返回 session id，回收只能在此收口）。
@@ -652,6 +658,7 @@ func (s *V2Supervisor) finishAcquire(ctx context.Context, c *Client, createdID s
 	if err := s.applySessionEnvAt(ctx, c, createdID, task.TaskID, false); err != nil {
 		return domain.TaskBinding{}, err
 	}
+	debugf("acquire: finish task=%s session=%s origin=created", task.TaskID, createdID)
 	return lifecycleBinding(task.TaskID, task.Directory, createdID, port, originCreated)
 }
 
@@ -672,9 +679,11 @@ func (s *V2Supervisor) recycleCandidate(ctx context.Context, c *Client, candidat
 	rcCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), candidateRecycleTimeout)
 	defer cancel()
 	if derr := c.DeleteSession(rcCtx, candidateID); derr != nil {
+		debugf("recycle_candidate: DELETE failed session=%s: %v", candidateID, derr)
 		s.noteCandidateDebt(rcCtx, candidateID, derr)
 		return &appagent.CandidateCleanupDebt{SessionID: candidateID, Err: derr}
 	}
+	debugf("recycle_candidate: session=%s recycled", candidateID)
 	return nil
 }
 
@@ -799,6 +808,7 @@ func (s *V2Supervisor) Resume(ctx context.Context, task appagent.TaskRef, old do
 			return domain.TaskBinding{}, err
 		}
 	}
+	debugf("resume: task=%s session=%s origin=%s port=%d", task.TaskID, old.UpstreamSessionID, origin, port)
 	return lifecycleBinding(task.TaskID, task.Directory, old.UpstreamSessionID, port, origin)
 }
 

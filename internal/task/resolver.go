@@ -35,6 +35,13 @@ type execDecision struct {
 // bindingProviderID 为空表示无 binding（存量任务/新任务）；pinnedProviderID 为
 // 任务行钉扎值（tasks.provider_id，恒非空——回填门禁保证）。
 func resolveExecutionPath(bindingProviderID, pinnedProviderID string, mf machineFacts) execDecision {
+	dec := resolveExecutionPathTable(bindingProviderID, pinnedProviderID, mf)
+	debugf("resolver: binding=%q pinned=%q machineMajor=%d v2Enabled=%t -> exec=%q adopt=%t denyKind=%v denyReason=%q",
+		bindingProviderID, pinnedProviderID, mf.MachineMajor, mf.V2Enabled, dec.ExecProviderID, dec.Adopt, dec.DenyKind, dec.DenyReason)
+	return dec
+}
+
+func resolveExecutionPathTable(bindingProviderID, pinnedProviderID string, mf machineFacts) execDecision {
 	const v1 = ocdeckstore.ProviderIDV1
 	const v2 = ocdeckstore.ProviderIDV2
 	machineV2 := mf.MachineMajor >= 2

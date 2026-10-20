@@ -2614,6 +2614,19 @@ type realStreamHarness struct {
 	// createFault 非 nil 时接管 POST /api/session 的响应（K1：服务端已创建
 	// session 但连接在响应前断开/响应截断）。返回 true = 已自行写响应。
 	createFault func(w http.ResponseWriter, r *http.Request, createdID string) bool
+	// v1Hits 记录 v1 wire 形态路径命中数（生产装配形态测试：v2 全链路 MUST 零
+	// 命中——命中即被 SPA HTML 回退吞掉的形态，与容器实测一致）。
+	v1Hits atomic.Int32
+}
+
+// v1ShapedPath 判定 v1 wire client 的 HTTP 路径形态（v1 client GET/POST /session、
+// GET /event、GET /session/status、GET /global/health——均无 /api 前缀）。
+func v1ShapedPath(p string) bool {
+	switch p {
+	case "/session", "/event", "/session/status", "/global/health":
+		return true
+	}
+	return strings.HasPrefix(p, "/session/")
 }
 
 // harnessOpt 在 harness 构造期调整装配（必须在 Manager 构造前生效的注入点）。
@@ -2634,6 +2647,14 @@ func newRealStreamHarness(t *testing.T, taskID, upstream, status string, opts ..
 	}
 	var evtOnce sync.Once
 	h.proc = newMonitorProcSeam(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// v1 wire 形态路径（无 /api 前缀）：计数 + 回 SPA HTML（模拟真实 v2 serve
+		// 对未匹配路径的 SPA 回退——v1 client 解码必失败，与容器实测一致）。
+		if v1ShapedPath(r.URL.Path) {
+			h.v1Hits.Add(1)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<!doctype html><html><body>opencode</body></html>`))
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/openapi.json":
@@ -4597,14 +4618,13 @@ func TestR1_J6_RealProvider_AdoptA_Continuity(t *testing.T) {
 	}
 	// v1 历史事实：binding(ses_keep)@v1 + anchor@v1 + 归属行（父+子）。
 	seedAdoptAFormTask(t, h.db, "t-ja", ocdeckstore.ProviderIDV1, "ses_keep")
-	// mock 上游列出承接历史（父+子）——接管首和对齐按上游列表保住承接行
-	//（同 TestStage4_R5_V2PinnedFirstBuild_ViaActivate 的 mock 列表注入模式）。
-	h.oc.mu.Lock()
-	h.oc.sessions = []opencode.Session{
-		{ID: "ses_keep", Time: opencode.SessionTime{Created: 1, Updated: 1}},
-		{ID: "sess-child", ParentID: "ses_keep", Time: opencode.SessionTime{Created: 1, Updated: 1}},
-	}
-	h.oc.mu.Unlock()
+	// 上游列表种子走 HTTP 面（listPageBody——生产装配保真：startSSE 对齐客户端
+	// 经桥接优先打真实 provider 的 GET /api/session，mock ocFactory 面不再承载
+	// v2 对齐事实），列出承接历史（父+子）保住承接行。
+	h.listPageBody = `{"data":[` +
+		`{"id":"ses_keep","time":{"created":1,"updated":1},"location":{"directory":"/wt"}},` +
+		`{"id":"sess-child","parentID":"ses_keep","time":{"created":1,"updated":1},"location":{"directory":"/wt"}}` +
+		`],"cursor":{"previous":null,"next":null}}`
 
 	// 公开 Activate 入口（v1 钉扎 + 机器 v2 开关开 → R8 承接 A）。
 	if aerr := h.m.Activate(ctx, "t-ja"); aerr != nil {
@@ -5523,4 +5543,88 @@ func TestR1_ResumeV2_RepersistsEnvSnapshot(t *testing.T) {
 	}
 	h.m = m2
 	activate(2)
+}
+
+// ---- 生产装配形态（本批次 A/B）：v2 全链路零 v1 wire 路径命中 ----
+
+// TestProdAssembly_V2ResumeZeroV1PathHits 落实生产装配形态回归（A）：生产
+// ocFactory = newRegistryDispatchFactory（对已注册 provider 恒返回 v1 wire
+// client）+ 真实 opencode2 SPI provider + startSSE 桥接优先。fake server 对
+// v1 形态路径（/session、/event、/session/status、/global/health——无 /api
+// 前缀）一律回 SPA HTML（模拟真实 v2 serve 未匹配路径回退，容器实测形态）。
+// 断言：v2 任务经公开 Activate（已有 v2 binding → resumeActivateV2）激活后
+// binding/状态/归属连续，且 v1 形态路径零命中（对齐/对账/状态探测全走桥的
+// SPI 窄接口 → /api/* 端点）。
+func TestProdAssembly_V2ResumeZeroV1PathHits(t *testing.T) {
+	ctx := context.Background()
+	h := newRealStreamHarness(t, "t-prod", "ses_keep", "suspended")
+	if aerr := h.m.Activate(ctx, "t-prod"); aerr != nil {
+		t.Fatalf("Activate: %v", aerr)
+	}
+	if n := h.v1Hits.Load(); n != 0 {
+		t.Fatalf("v2 full activation must not hit v1 wire paths, hits=%d", n)
+	}
+	got, has, err := h.adapter.GetTaskBinding(ctx, "t-prod")
+	if err != nil || !has || got.ProviderID != ocdeckstore.ProviderIDV2 || got.UpstreamSessionID != "ses_keep" {
+		t.Fatalf("binding continuity: %+v has=%v err=%v", got, has, err)
+	}
+	row, err := h.adapter.GetTask(ctx, "t-prod")
+	if err != nil || row.Status != "active" {
+		t.Fatalf("status=%s err=%v", row.Status, err)
+	}
+}
+
+// TestProdAssembly_V2DeleteViaSharedServe 落实生产装配形态回归（B）：v2 任务
+// 删除经共享 serve bridge（provider Sessions().Delete → DELETE /api/session/{id}），
+// MUST NOT 请求临时 runtime（生产实测 acquire_ephemeral capability_unavailable
+// 事故面），v1 wire 路径零命中；oc session 删除成功后归属行落账、任务删除收敛。
+// 任务行 suspended + binding/归属行已提交（挂起后删除的主形态；删除只消费
+// 持久化事实，不需要 Activate）。
+func TestProdAssembly_V2DeleteViaSharedServe(t *testing.T) {
+	ctx := context.Background()
+	h := newRealStreamHarness(t, "t-prod-del", "ses_keep", "suspended")
+	if _, err := h.db.Exec(`INSERT INTO task_sessions (task_id, session_id, session_created_at, first_seen_at, last_seen_at, parent_id, provider_id, provider_instance_id)
+		 VALUES ('t-prod-del','ses_keep',1,1,1,'',?,?)`, ocdeckstore.ProviderIDV2, ocdeckstore.ProviderInstanceV2Default); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Delete(ctx, "t-prod-del", DeleteNormal, true); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if n := h.v1Hits.Load(); n != 0 {
+		t.Fatalf("v2 delete must not hit v1 wire paths (no ephemeral runtime), hits=%d", n)
+	}
+	if _, err := h.adapter.GetTask(ctx, "t-prod-del"); err == nil {
+		t.Fatalf("task row must be gone after delete")
+	}
+}
+
+// TestStage4_Bridge_V2_RawFacesFailClosed 落实桥内 v2 fail-closed（生产装配
+// 修复）：v2 binding 的桥 SubscribeEvents/Health/Probe MUST 拒绝（typed
+// EventSource 是 v2 唯一事件面；fallback 的 v1 wire 形态对 v2 serve 均被 SPA
+// 回退吞掉——静默委托会产生假 ready/假健康/假事件面）。
+func TestStage4_Bridge_V2_RawFacesFailClosed(t *testing.T) {
+	db, err := store.Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedV2ActiveTaskUpstream(t, db, "t-brc", "ses_main")
+	prov := &suspendV2Provider{sup: &suspendV2Sup{}, sessions: stubSessions{}}
+	m := newSuspendManager(t, db, prov)
+	binding := v2BindingFor("t-brc", "ses_main")
+	data := &opencodeBindingData{ProviderID: ocdeckstore.ProviderIDV2, Port: 4096, Directory: "/wt", TaskID: "t-brc"}
+	bridge := m.bridgeClientFor(data, binding, m.ocFactory(ocdeckstore.ProviderIDV2, 4096, "pw", appagent.Options{}))
+	if bridge == nil {
+		t.Fatalf("bridge must be constructed for provider with capability exits")
+	}
+	err = bridge.SubscribeEvents(context.Background(), "/wt", func(appagent.Event) {}, func() {})
+	if appagent.KindOf(err) != appagent.ErrKindCapabilityUnavailable {
+		t.Fatalf("v2 bridge SubscribeEvents must fail closed (capability_unavailable), got: %v", err)
+	}
+	if _, herr := bridge.Health(context.Background()); appagent.KindOf(herr) != appagent.ErrKindCapabilityUnavailable {
+		t.Fatalf("v2 bridge Health must fail closed, got: %v", herr)
+	}
+	if _, perr := bridge.Probe(context.Background()); appagent.KindOf(perr) != appagent.ErrKindCapabilityUnavailable {
+		t.Fatalf("v2 bridge Probe must fail closed, got: %v", perr)
+	}
 }
