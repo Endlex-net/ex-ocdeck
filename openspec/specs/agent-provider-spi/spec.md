@@ -278,3 +278,22 @@ SPI 的 question 模型 SHALL 为 provider-neutral 的结构化字段模型（de
 
 - **WHEN** v1 钉扎任务经 R8 自动承接且历史判定矩阵命中 A 分支（已有历史 session）提交成功
 - **THEN** 任务 last_error 写入迁移承接通知，说明该任务已随 opencode v2 升级自动承接、原 v1 pending attention 为进程内存态不保留；B 分支（从未建立上游会话的首建）不产生迁移通知——无历史可丢失
+
+### Requirement: 无 binding 老任务的 anchor 承接（legacy-A）
+
+钉扎 `opencode-v1`、`task_binding` 为空、anchor 三元组为 v1 命名空间（`anchor_provider_id=opencode-v1`、`anchor_provider_instance_id=default`）且 `anchor_session_id` 存在于该任务 v1 归属集合的任务，承接准入 SHALL 判为 A 分支（承接目标 = `anchor_session_id`），承接流程以合成的内存态 v1 binding（不持久化）完成原 session 验证。承接事务的旧 binding 代际守卫 MUST 相应复验 `task_binding` 仍为空（NULL）：提交时若 `task_binding` 已被并发写入非空值 MUST 拒绝（ErrAdoptionConflict），零写入。anchor 不在归属集合、anchor 命名空间非 v1、或归属行含非 v1 命名空间时 MUST 维持停止承接（stop），不得猜测。
+
+#### Scenario: 无 binding 老任务承接成功
+
+- **WHEN** 钉扎 v1、`task_binding` 为 NULL、anchor 为 v1 且 anchor ∈ v1 归属集合的任务在 v2 机器上激活或恢复
+- **THEN** 判定矩阵命中 legacy-A，以 anchor_session_id 为承接目标完成承接，binding 翻转为 v2、anchor 三元组翻转为 v2、归属行转换命名空间，写入迁移承接通知
+
+#### Scenario: 并发写入 binding 后承接拒绝
+
+- **WHEN** legacy-A 承接提交时，该任务的 `task_binding` 已被并发路径写入非空值
+- **THEN** 承接事务 CAS 失配拒绝（ErrAdoptionConflict），整体回滚零写入，按冲突重试语义处理
+
+#### Scenario: 存在不完整历史时维持停止
+
+- **WHEN** 钉扎 v1、`task_binding` 为 NULL，且任务存在不完整历史——anchor_session_id 为空但存在 v1 归属行、或 anchor_session_id 不在该任务 v1 归属集合中、或 anchor 命名空间非 v1/default、或归属行含非 v1 命名空间
+- **THEN** 判定矩阵维持 stop：停止承接、保留现状、last_error 如实告知，待用户决策；三者全空（无 binding、无 anchor、零归属行）继续走 B 分支（v2 首建），不属本停止场景
