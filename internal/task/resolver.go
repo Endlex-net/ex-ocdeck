@@ -15,7 +15,8 @@ import (
 type machineFacts struct {
 	// MachineMajor 机器实装 opencode 主版本；0 = unknown（探测/解析失败）。
 	MachineMajor int
-	// V2Enabled 承接开关（默认关）。
+	// V2Enabled 承接开关事实（装配期取自 config.V2Adoption：未配置=开；
+	// false=开关关闭形态——显式关闭或未知值保守关闭）。
 	V2Enabled bool
 }
 
@@ -27,7 +28,7 @@ type execDecision struct {
 	Adopt bool
 	// DenyKind 非 nil-Kind 时为 fail-closed 分类（零副作用 + 用户可感知提示）。
 	DenyKind appagent.ErrorKind
-	// DenyReason 是 fail-closed 的用户可感知原因（R9 附提示开开关）。
+	// DenyReason 是 fail-closed 的用户可感知原因（R9 附关闭状态说明与恢复方式）。
 	DenyReason string
 }
 
@@ -87,9 +88,11 @@ func resolveExecutionPathTable(bindingProviderID, pinnedProviderID string, mf ma
 				return execDecision{ExecProviderID: v2, Adopt: true}
 			}
 			// R9：开关关 + 机器 v2 + v1 钉扎 → fail-closed 不静默 v1
-			//（v1 provider 无法驱动 v2 二进制）+ 用户提示开开关。
+			//（v1 provider 无法驱动 v2 二进制）+ 提示关闭状态与恢复方式
+			//（resolver 只有 bool 事实，MUST NOT 断言关闭原因——显式关闭与
+			// 未知值保守关闭均进此分支）。
 			return execDecision{DenyKind: appagent.ErrKindCapabilityUnavailable,
-				DenyReason: "本机 opencode 已升级到 v2 且任务钉扎 v1：需开启承接开关（" + ocdeckV2AdoptionHint + "）后激活/恢复；v1 provider 无法驱动 v2 二进制"}
+				DenyReason: "本机 opencode 已升级到 v2 且任务钉扎 v1：承接开关当前关闭（请检查环境变量 OCDECK_V2_ADOPTION 配置）；如需恢复承接，请移除该环境变量或设为 1 后重启服务；v1 provider 无法驱动 v2 二进制"}
 		}
 		// R10：机器 1 → 纯 v1；R11：unknown → 纯 v1（保守不承接）。
 		return execDecision{ExecProviderID: v1}
@@ -100,9 +103,6 @@ func resolveExecutionPathTable(bindingProviderID, pinnedProviderID string, mf ma
 			DenyReason: "任务钉扎 provider " + pinnedProviderID + " 未注册"}
 	}
 }
-
-// ocdeckV2AdoptionHint 是 R9 用户提示的开关位置说明。
-const ocdeckV2AdoptionHint = "环境变量 OCDECK_V2_ADOPTION=1"
 
 // hasV2Binding 便捷判定（binding ProviderID 是否 v2 命名空间）。
 func hasV2Binding(providerID string) bool { return providerID == ocdeckstore.ProviderIDV2 }
