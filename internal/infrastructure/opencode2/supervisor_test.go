@@ -430,6 +430,51 @@ func TestSupervisor_Resume_OK_And_PortMismatch(t *testing.T) {
 	}
 }
 
+// TestSupervisor_Resume_LegacyV1BindingMinimalFields 落实 v1-legacy-anchor-adopt：
+// legacy-A 合成 binding（仅 ProviderID/ProviderInstanceID/UpstreamSessionID 三字段，
+// 无 Version/Data/TerminalRef）经真实 V2Supervisor.Resume 兼容——v1 命名空间跳过
+// v2 结构校验与端口校验，origin 按 adopted（不 POST 新 session、不 PUT 环境），
+// 返回完整 v2 lifecycle binding（upstream 保留）。fixtureServer 按 path 匹配不分
+// method：POST /api/session 会命中列表 route（body 无法解码为 create 结果）、
+// PUT .../environment 未注册 404——两者任一发生 Resume 即报错（负断言隐式成立）。
+func TestSupervisor_Resume_LegacyV1BindingMinimalFields(t *testing.T) {
+	srv := fixtureServer(t,
+		route{path: "/api/session/ses_fixture01a", status: 200, body: string(readFixture(t, "session_get.json"))},
+		route{path: "/api/session", status: 200, body: string(readFixture(t, "session_list_page2.json"))})
+	sup, _, _ := newTestSupervisor(t, srv.URL, nil)
+	if _, _, err := sup.ensureServer(context.Background()); err != nil {
+		t.Fatalf("ensureServer: %v", err)
+	}
+	// adopted 形态 MUST NOT 应用环境（零 env seam 调用）。
+	sup.deps.Env = fakeEnvSeam(func(taskID string, recovery bool) (map[string]string, error) {
+		t.Errorf("adopted resume MUST NOT apply env (taskID=%s recovery=%v)", taskID, recovery)
+		return nil, nil
+	})
+	old := domain.TaskBinding{ // 与 task 层 legacy-A 合成形态逐字段一致（仅三字段）
+		ProviderID:         store.ProviderIDV1,
+		ProviderInstanceID: store.ProviderInstanceV1Default,
+		UpstreamSessionID:  "ses_fixture01a",
+	}
+	got, err := sup.Resume(context.Background(),
+		appagent.TaskRef{TaskID: "task_fixture01", Directory: "/wt"}, old, appagent.ResumePolicy{})
+	if err != nil {
+		t.Fatalf("Resume(legacy minimal v1 binding): %v", err)
+	}
+	if got.UpstreamSessionID != "ses_fixture01a" || got.ProviderID != ProviderID || got.ProviderInstanceID != ProviderInstanceID {
+		t.Fatalf("binding: %+v", got)
+	}
+	data, derr := decodeV2Binding(got)
+	if derr != nil {
+		t.Fatalf("result must be a complete v2 binding: %v", derr)
+	}
+	if data.Origin != originAdopted || data.Port != 4096 || data.Directory != "/wt" || data.TaskID != "task_fixture01" {
+		t.Fatalf("lifecycle data: %+v", data)
+	}
+	if got.TerminalRef != v2TerminalRef("task_fixture01") {
+		t.Fatalf("terminal ref: %q", got.TerminalRef)
+	}
+}
+
 // fakeEnvSeam 按 func 适配 TaskEnvSeam。
 type fakeEnvSeam func(taskID string, recovery bool) (map[string]string, error)
 

@@ -71,6 +71,32 @@ func TestClassifyAdoption_LegacyAnchorVariants(t *testing.T) {
 			keys:       nil,
 			wantBranch: branchB,
 		},
+		{
+			// 负例钉住（回归保护）：既有 v1 binding 但 upstream 与 anchor 不一致
+			//（anchor 在册也不放行——id 不一致属判定不一致，MUST NOT 走 legacy-A）。
+			name:       "stop：v1 binding upstream ≠ anchor",
+			hasBinding: true,
+			binding:    domain.TaskBinding{ProviderID: ocdeckstore.ProviderIDV1, ProviderInstanceID: ocdeckstore.ProviderInstanceV1Default, UpstreamSessionID: "sess-b"},
+			anchorID:   "sess-a", anchorPID: ocdeckstore.ProviderIDV1, anchorIID: ocdeckstore.ProviderInstanceV1Default,
+			keys:       []domain.SessionKey{v1Key("sess-a")},
+			wantBranch: branchStop,
+		},
+		{
+			// 负例钉住：anchor 已在 v2 命名空间（已承接过/损坏）→ stop。
+			name:       "stop：anchor 命名空间非 v1/default",
+			hasBinding: false, binding: noBinding,
+			anchorID: "sess-a", anchorPID: ocdeckstore.ProviderIDV2, anchorIID: ocdeckstore.ProviderInstanceV2Default,
+			keys:       []domain.SessionKey{v1Key("sess-a")},
+			wantBranch: branchStop,
+		},
+		{
+			// 负例钉住：归属行含未知命名空间 → stop（不猜测）。
+			name:       "stop：归属行含未知命名空间",
+			hasBinding: false, binding: noBinding,
+			anchorID: "sess-a", anchorPID: ocdeckstore.ProviderIDV1, anchorIID: ocdeckstore.ProviderInstanceV1Default,
+			keys:       []domain.SessionKey{v1Key("sess-a"), {ProviderID: "other", ProviderInstanceID: "default", UpstreamID: "sess-x"}},
+			wantBranch: branchStop,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

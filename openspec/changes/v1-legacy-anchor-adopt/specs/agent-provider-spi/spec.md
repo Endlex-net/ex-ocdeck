@@ -16,7 +16,7 @@
 - **WHEN** legacy-A 承接提交时，该任务的 `task_binding` 已被并发路径写入非空值
 - **THEN** 承接事务 CAS 失配拒绝（ErrAdoptionConflict），整体回滚零写入，按冲突重试语义处理
 
-#### Scenario: anchor 不在归属集合维持停止
+#### Scenario: 存在不完整历史时维持停止
 
-- **WHEN** 钉扎 v1、`task_binding` 为 NULL，但 anchor_session_id 不在该任务 v1 归属集合中（或 anchor 为空、或命名空间非 v1）
-- **THEN** 判定矩阵维持 stop：停止承接、保留现状、last_error 如实告知，待用户决策
+- **WHEN** 钉扎 v1、`task_binding` 为 NULL，且任务存在不完整历史——anchor_session_id 为空但存在 v1 归属行、或 anchor_session_id 不在该任务 v1 归属集合中、或 anchor 命名空间非 v1/default、或归属行含非 v1 命名空间
+- **THEN** 判定矩阵维持 stop：停止承接、保留现状、last_error 如实告知，待用户决策；三者全空（无 binding、无 anchor、零归属行）继续走 B 分支（v2 首建），不属本停止场景

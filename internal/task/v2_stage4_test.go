@@ -2333,6 +2333,51 @@ func TestStage4_AdoptA_ViaRecovery_KeepsFactsOnFailure(t *testing.T) {
 	}
 }
 
+// TestStage4_LegacyAnchorAdopt_ViaRecovery_KeepsFactsOnFailure 落实 v1-legacy-anchor-adopt
+// 恢复面：legacy 形态（NULL binding + anchor 三元组 v1 + 归属在册）的 active 任务
+// 恢复、Resume 失败（原 session 不可读）→ 零持久化副作用——task_binding 仍 NULL、
+// anchor/归属/状态/env 快照不变，仅诊断性 last_error 写入。
+func TestStage4_LegacyAnchorAdopt_ViaRecovery_KeepsFactsOnFailure(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedLegacyAnchorFormTask(t, db, "t-la2", ocdeckstore.ProviderIDV1, "sess-keep")
+	if _, err := db.Exec(`UPDATE tasks SET status='active' WHERE id='t-la2'`); err != nil {
+		t.Fatal(err)
+	}
+	failSup := &failResumeV2Sup{}
+	m := newAdoptATestManager(t, db, &supOnlyV2Provider{sup: failSup})
+	// ensureRecovery 前置校验要求注册表 runtime + token 匹配（watcher 语义）。
+	rt := m.newRuntime("t-la2")
+	m.setRuntime("t-la2", rt)
+
+	m.ensureRecovery("t-la2", rt.instVersion, false)
+	if atomic.LoadInt32(&failSup.resumeCalls) != 1 {
+		t.Fatalf("resume=%d（恢复入口 legacy-A 分派）", atomic.LoadInt32(&failSup.resumeCalls))
+	}
+	status, upstream, nV1, env := adoptAFactsSnapshot(t, db, "t-la2")
+	if status != "active" {
+		t.Fatalf("status=%s（active→active 守卫失败零状态副作用）", status)
+	}
+	if upstream != "sess-keep" || nV1 != 2 || !strings.Contains(env, "OCDECK_TASK_ID") {
+		t.Fatalf("old facts must be intact: upstream=%s nV1=%d env=%q", upstream, nV1, env)
+	}
+	var binding sql.NullString
+	if err := db.QueryRow(`SELECT task_binding FROM tasks WHERE id='t-la2'`).Scan(&binding); err != nil {
+		t.Fatal(err)
+	}
+	if binding.Valid {
+		t.Fatalf("task_binding must stay NULL after failed legacy adopt, got %q", binding.String)
+	}
+	row, err := adapterGetTask(t, db, "t-la2")
+	if err != nil || !row.LastError.Valid || !strings.Contains(row.LastError.String, "承接失败") {
+		t.Fatalf("diagnostic last_error expected: %v %q", err, row.LastError.String)
+	}
+}
+
 // ---- 评审 I4：R5（v2 钉扎新任务）首建经公开 Activate 可达 ----
 
 // TestStage4_R5_V2PinnedFirstBuild_ViaActivate 落实评审 I4：v2 钉扎、无 binding 的
