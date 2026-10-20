@@ -680,8 +680,11 @@ func (s *V2Supervisor) recycleCandidate(ctx context.Context, c *Client, candidat
 	defer cancel()
 	if derr := c.DeleteSession(rcCtx, candidateID); derr != nil {
 		// 白名单字段（status/kind）：原始错误文本含响应 body（服务器可能回显
-		// 请求敏感信息），不进 debug 日志。
-		debugf("recycle_candidate: DELETE failed session=%s status=%d kind=%s", candidateID, debugHTTPStatus(derr), appagent.KindOf(derr))
+		// 请求敏感信息），不进 debug 日志；debug 关闭 = 零求值零输出
+		//（debugHTTPStatus/KindOf 是函数调用，MUST NOT 在 debugf 参数位无条件求值）。
+		if debugEnabled() {
+			debugf("recycle_candidate: DELETE failed session=%s status=%d kind=%s", candidateID, debugHTTPStatus(derr), appagent.KindOf(derr))
+		}
 		s.noteCandidateDebt(rcCtx, candidateID, derr)
 		return &appagent.CandidateCleanupDebt{SessionID: candidateID, Err: derr}
 	}

@@ -54,8 +54,9 @@ func validateOwnedKey(s domain.SessionKey) error {
 
 type spiSessions struct{ p *SPIProvider }
 
-// List 经 GET /api/session?directory=<d>：cursor 分页取单页（limit=1000），
-// cursor.next 非 null → ListResult.Overflow（不完整快照信号，非错误——D7）。
+// List 经 GET /api/session?directory=<d>：cursor 分页取单页（limit=1000）。
+// 不完整快照（锚点式游标：len==limit 且 next 非 null——next 非空≠多页、短页=
+// 完整，2026-10-20 v2.0.28 实测）→ ListResult.Overflow（非错误——D7）。
 func (a *spiSessions) List(ctx context.Context, b domain.TaskBinding) (appagent.ListResult, error) {
 	h := a.p.healthBase(b, appagent.PrimitiveSessionControl, appagent.ScopeRuntime, nil)
 	c, data, err := a.p.resolveBinding(b)

@@ -397,8 +397,9 @@ func truncateForError(raw []byte) string {
 	return string(raw[:max]) + "…"
 }
 
-// SessionPage 是一页 session 列表；HasMore = cursor.next 非 null（不完整快照
-// 信号，SPI ListResult.Overflow 的 v2 映射）。
+// SessionPage 是一页 session 列表；HasMore = 不完整快照信号（SPI
+// ListResult.Overflow 的 v2 映射）——推导见 ListSessions（锚点式游标：短页=
+// 完整，next 非空≠多页）。
 type SessionPage struct {
 	Sessions []wireSession
 	HasMore  bool
@@ -407,6 +408,13 @@ type SessionPage struct {
 // ListSessions GET /api/session?directory=<d>&limit=<N>（CONTRACT §2 cursor
 // 分页；limit 精确生效已实证 R1）。适配层取单页，HasMore 由调用方按溢出语义
 // 处置（MUST NOT 当作错误中止）。cursor 非对象或缺 cursor 键 = 协议违约。
+//
+// HasMore 推导（锚点式游标，2026-10-20 v2.0.28 容器实测——修正 K2 冻结的
+// 「next 非 null → HasMore」假设）：v2 的 cursor.next 是导航锚点（base64
+// anchor，内含 directory/anchor.id/direction），**永远给出、非空不表示还有
+// 数据**；完整性信号 = 短页（len(data) < limit）或跟随 next 得空页。故
+// HasMore = len(data)==limit && next 非 null——len==limit 且 next 非空的保守
+// overflow 罕见边界（恰好满页）可接受。
 func (c *Client) ListSessions(ctx context.Context, dir string, limit int) (SessionPage, error) {
 	q := url.Values{}
 	q.Set("directory", dir)
@@ -428,7 +436,7 @@ func (c *Client) ListSessions(ctx context.Context, dir string, limit int) (Sessi
 	if derr != nil {
 		return SessionPage{}, derr
 	}
-	page := SessionPage{HasMore: body.Cursor.Next != nil}
+	page := SessionPage{HasMore: len(body.Data) == limit && body.Cursor.Next != nil}
 	for _, raw := range body.Data {
 		s, perr := parseWireSession(raw)
 		if perr != nil {

@@ -5,7 +5,9 @@ package opencode2
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	appagent "ocdeck/internal/application/agentprovider"
@@ -102,7 +104,11 @@ func TestSessions_Create_ContractUnavailable_NoSideEffect(t *testing.T) {
 	}
 }
 
-func TestSessions_List_OverflowOnCursor(t *testing.T) {
+// TestSessions_List_ShortPageComplete 落实锚点式游标语义（2026-10-20 v2.0.28
+// 实测）：SPI List（limit=1000）对短页（2 条）即使 cursor.next 非空也是完整
+// 快照——Overflow=false（next 是导航锚点，非空≠多页；session_overflow 误报
+// 事故面）。
+func TestSessions_List_ShortPageComplete(t *testing.T) {
 	srv := fixtureServer(t,
 		route{path: "/api/session", status: 200, body: string(readFixture(t, "session_list_page1.json"))})
 	p := newTestProvider(t, srv.URL, ProviderOptions{})
@@ -110,8 +116,30 @@ func TestSessions_List_OverflowOnCursor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	// cursor.next 非 null → Overflow=true（不完整快照信号，非错误——D7）。
-	if !res.Overflow || len(res.Sessions) != 2 {
+	if res.Overflow || len(res.Sessions) != 2 {
+		t.Fatalf("list: overflow=%v n=%d", res.Overflow, len(res.Sessions))
+	}
+}
+
+// TestSessions_List_FullPageOverflows 落实保守 overflow 边界：len(data)==limit
+//（SPI 固定 1000）且 next 非 null → Overflow=true（不完整快照信号，非错误）。
+func TestSessions_List_FullPageOverflows(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString(`{"data":[`)
+	for i := 0; i < 1000; i++ {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		fmt.Fprintf(&sb, `{"id":"ses_full%04d","time":{"created":1,"updated":1},"location":{"directory":"/wt"}}`, i)
+	}
+	sb.WriteString(`],"cursor":{"previous":null,"next":"anchor-next"}}`)
+	srv := fixtureServer(t, route{path: "/api/session", status: 200, body: sb.String()})
+	p := newTestProvider(t, srv.URL, ProviderOptions{})
+	res, err := p.Sessions().List(context.Background(), testBinding(t))
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if !res.Overflow || len(res.Sessions) != 1000 {
 		t.Fatalf("list: overflow=%v n=%d", res.Overflow, len(res.Sessions))
 	}
 }

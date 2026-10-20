@@ -116,6 +116,8 @@ func TestClient_BasicAuthHeader(t *testing.T) {
 	}
 }
 
+// TestClient_ListSessionsCursor 落实锚点式游标语义：短页（len<limit）= 完整
+// 快照——cursor.next 非空不表示还有数据（2026-10-20 v2.0.28 实测修正）。
 func TestClient_ListSessionsCursor(t *testing.T) {
 	srv := fixtureServer(t,
 		route{path: "/api/session", status: 200, body: string(readFixture(t, "session_list_page1.json"))})
@@ -124,8 +126,8 @@ func TestClient_ListSessionsCursor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListSessions: %v", err)
 	}
-	if len(page.Sessions) != 2 || !page.HasMore {
-		t.Fatalf("page: len=%d hasMore=%v", len(page.Sessions), page.HasMore)
+	if len(page.Sessions) != 2 || page.HasMore {
+		t.Fatalf("short page must be complete (anchor next is navigation, not data), len=%d hasMore=%v", len(page.Sessions), page.HasMore)
 	}
 }
 
@@ -164,8 +166,10 @@ func TestClient_ListSessionsMalformedPageMatrix(t *testing.T) {
 	}
 }
 
-// TestClient_ListSessionsLegalPagination 落实收尾 K2 正面对：合法分页保持
-// 既有语义（cursor.next 非 null → HasMore/Overflow；空数组 + 双 null → 完整空快照）。
+// TestClient_ListSessionsLegalPagination 落实锚点式游标 HasMore 推导矩阵
+//（2026-10-20 v2.0.28 实测语义）：短页=完整（含实测 base64 anchor 双非空
+// 形态）；len==limit 且 next 非 null → 保守 overflow；len==limit 且 next
+// null → 完整；合法空页 → 完整空快照（对账删除能力保留）。
 func TestClient_ListSessionsLegalPagination(t *testing.T) {
 	t.Run("empty complete page", func(t *testing.T) {
 		srv := fixtureServer(t, route{path: "/api/session", status: 200,
@@ -179,16 +183,43 @@ func TestClient_ListSessionsLegalPagination(t *testing.T) {
 			t.Fatalf("page: len=%d hasMore=%v", len(page.Sessions), page.HasMore)
 		}
 	})
-	t.Run("next cursor keeps overflow", func(t *testing.T) {
+	t.Run("short page with anchor cursors is complete", func(t *testing.T) {
+		// 容器实测形态：data 3 条但 cursor.previous/next 均为非空 base64 anchor
+		//（`{"directory":...,"anchor":{"id":...,"direction":"next"}}`）——
+		// MUST NOT 判为 overflow（session_overflow 误报事故面）。
 		srv := fixtureServer(t, route{path: "/api/session", status: 200,
-			body: string(readFixture(t, "session_list_page1.json"))})
+			body: string(readFixture(t, "session_list_anchor_shortpage.json"))})
 		c := newTestClient(t, srv, "pw")
 		page, err := c.ListSessions(context.Background(), "/wt", 1000)
 		if err != nil {
-			t.Fatalf("legal page: %v", err)
+			t.Fatalf("legal short page: %v", err)
 		}
-		if !page.HasMore {
-			t.Fatalf("cursor.next must keep HasMore/Overflow semantics")
+		if len(page.Sessions) != 3 || page.HasMore {
+			t.Fatalf("short page with anchor cursors must be complete, len=%d hasMore=%v", len(page.Sessions), page.HasMore)
+		}
+	})
+	t.Run("full page with next overflows", func(t *testing.T) {
+		srv := fixtureServer(t, route{path: "/api/session", status: 200,
+			body: string(readFixture(t, "session_list_page1.json"))})
+		c := newTestClient(t, srv, "pw")
+		page, err := c.ListSessions(context.Background(), "/wt", 2)
+		if err != nil {
+			t.Fatalf("legal full page: %v", err)
+		}
+		if len(page.Sessions) != 2 || !page.HasMore {
+			t.Fatalf("full page with next must overflow, len=%d hasMore=%v", len(page.Sessions), page.HasMore)
+		}
+	})
+	t.Run("full page without next is complete", func(t *testing.T) {
+		srv := fixtureServer(t, route{path: "/api/session", status: 200,
+			body: string(readFixture(t, "session_list_page2.json"))})
+		c := newTestClient(t, srv, "pw")
+		page, err := c.ListSessions(context.Background(), "/wt", 1)
+		if err != nil {
+			t.Fatalf("legal full page (null next): %v", err)
+		}
+		if len(page.Sessions) != 1 || page.HasMore {
+			t.Fatalf("full page without next must be complete, len=%d hasMore=%v", len(page.Sessions), page.HasMore)
 		}
 	})
 }
