@@ -30,10 +30,10 @@ var ErrAdoptionConflict = errors.New("store: adoption commit rejected")
 // CommitAdoption 承接原子提交。binding 必须已是 v2 形状（ProviderID=opencode-v2、
 // UpstreamSessionID=锚定原 session id）；oldBinding 为只读判定阶段实际读取的旧
 // binding（同一次读取的事实，事务内代际复验——评审 I11：杜绝「判定读 A → 并发
-// 改写 → 提交覆盖」漂移；无 binding 传零值 → 守卫为 task_binding IS NULL）；
-// fromStatus ∈ {suspended, active}（suspended→active 手动激活 / active→active
-// 守卫——状态不变，仅防并发漂移）。lastError 随 CAS 一并写入（承接失败的如实
-// 告知位；nil 不改写）。
+// 改写 → 提交覆盖」漂移；必须为既有 v1 binding——旧 binding 为空的老任务形态走
+// CommitAdoptionLegacy）；fromStatus ∈ {suspended, active}（suspended→active 手动
+// 激活 / active→active 守卫——状态不变，仅防并发漂移）。lastError 随 CAS 一并
+// 写入（承接失败的如实告知位；nil 不改写）。
 func (q *Queries) CommitAdoption(ctx context.Context, taskID string, binding, oldBinding domain.TaskBinding,
 	fromStatus ocdecktask.Status, lastError *string) (application.TransitionResult, error) {
 	if binding.ProviderID != ProviderIDV2 || binding.ProviderInstanceID != ProviderInstanceV2Default {
@@ -63,8 +63,36 @@ func (q *Queries) CommitAdoption(ctx context.Context, taskID string, binding, ol
 	})
 }
 
+// CommitAdoptionLegacy 是承接 A 的 legacy 变体（v1-legacy-anchor-adopt）：binding
+// 持久化（迁移 0018）之前创建的老任务——task_binding 为空 + anchor 三元组 v1 完整
+// + anchor ∈ v1 归属集合（判定矩阵 legacy-A 行）。binding 必须已是 v2 形状（新
+// binding）；fromStatus/lastError 语义同 CommitAdoption。代际守卫：事务内复验
+// task_binding 仍为 NULL——并发写入非空 binding 后提交失配拒绝（ErrAdoptionConflict，
+// 整体回滚零写入）。
+func (q *Queries) CommitAdoptionLegacy(ctx context.Context, taskID string, binding domain.TaskBinding,
+	fromStatus ocdecktask.Status, lastError *string) (application.TransitionResult, error) {
+	if binding.ProviderID != ProviderIDV2 || binding.ProviderInstanceID != ProviderInstanceV2Default {
+		return application.TransitionResult{}, fmt.Errorf("%w: binding %s/%s 不属于 v2 命名空间",
+			ErrAdoptionConflict, binding.ProviderID, binding.ProviderInstanceID)
+	}
+	if fromStatus != ocdecktask.StatusSuspended && fromStatus != ocdecktask.StatusActive {
+		return application.TransitionResult{}, fmt.Errorf("%w: 承接 CAS fromStatus %s 非法（仅 suspended/active）",
+			ErrAdoptionConflict, fromStatus)
+	}
+	raw, err := binding.Encode()
+	if err != nil {
+		return application.TransitionResult{}, fmt.Errorf("store: adoption legacy commit: encode binding: %w", err)
+	}
+	return runTx(ctx, q, func(qx *Queries) (application.TransitionResult, error) {
+		return qx.commitAdoptionInTx(ctx, taskID, binding, raw, nil, fromStatus, lastError)
+	})
+}
+
+// commitAdoptionInTx 的 oldRaw 为旧 binding 代际守卫参数：string（Encode 产物）
+// = 精确匹配既有 binding；nil = legacy 形态守卫 task_binding IS NULL（SQLite
+// `IS ?` 绑定 NULL 参数即匹配 NULL 列）。
 func (q *Queries) commitAdoptionInTx(ctx context.Context, taskID string, binding domain.TaskBinding,
-	raw, oldRaw string, fromStatus ocdecktask.Status, lastError *string) (application.TransitionResult, error) {
+	raw string, oldRaw any, fromStatus ocdecktask.Status, lastError *string) (application.TransitionResult, error) {
 	// ① 归属行命名空间一致性：任务存在 task_sessions 行时必须全部为 v1 命名
 	// 空间（混杂/已转换 → 拒绝——D5 判定矩阵「其余」出口；重复承接被 R1 恢复
 	// 路径承担，不走本事务）。

@@ -56,6 +56,12 @@ func (a *StoreAdapter) CommitAdoption(ctx context.Context, taskID string, b, old
 	return a.db.CommitAdoption(ctx, taskID, b, oldBinding, ocdecktask.Status(fromStatus), lastError)
 }
 
+// CommitAdoptionLegacy 承接原子提交 legacy 变体（v1-legacy-anchor-adopt：旧
+// binding 事实为空的老任务，代际守卫为 task_binding IS NULL 事务内复验）。
+func (a *StoreAdapter) CommitAdoptionLegacy(ctx context.Context, taskID string, b domain.TaskBinding, fromStatus string, lastError *string) (application.TransitionResult, error) {
+	return a.db.CommitAdoptionLegacy(ctx, taskID, b, ocdecktask.Status(fromStatus), lastError)
+}
+
 // CommitFirstBuild 首建原子提交（评审 I5：candidate claim+anchor+binding+状态
 // activating→active CAS 单事务）。
 func (a *StoreAdapter) CommitFirstBuild(ctx context.Context, taskID string, b domain.TaskBinding, key domain.SessionKey, createdAt, firstSeen, lastSeen int64, parentID string) (application.TransitionResult, error) {

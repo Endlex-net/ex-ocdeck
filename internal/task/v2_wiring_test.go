@@ -99,7 +99,7 @@ func seedTaskRow(t *testing.T, ms *mockStore, taskID string) {
 	ms.tasks[taskID] = TaskRow{
 		ID: taskID, ProjectID: "p1", Name: "task", Branch: "b",
 		Status: "suspended", WorktreePath: "/wt", Mode: "worktree",
-		BaseRef: "refs/heads/main",
+		BaseRef:    "refs/heads/main",
 		ProviderID: ocdeckstore.ProviderIDV1,
 	}
 	if ms.projects == nil {
@@ -256,6 +256,10 @@ type recordingV2Sup struct {
 	resumeCalls  int
 	upstream     string
 	port         int
+	// lastResumeOld 记录最近一次 Resume 收到的 old binding（legacy-A 合成 binding
+	// 断言用；lastResumeSet=false 表示未被调用）。
+	lastResumeOld domain.TaskBinding
+	lastResumeSet bool
 }
 
 func (s *recordingV2Sup) Acquire(ctx context.Context, t appagent.TaskRef) (domain.TaskBinding, error) {
@@ -266,6 +270,8 @@ func (s *recordingV2Sup) Acquire(ctx context.Context, t appagent.TaskRef) (domai
 
 func (s *recordingV2Sup) Resume(ctx context.Context, t appagent.TaskRef, old domain.TaskBinding, p appagent.ResumePolicy) (domain.TaskBinding, error) {
 	s.resumeCalls++
+	s.lastResumeOld = old
+	s.lastResumeSet = true
 	return domain.TaskBinding{
 		Version:            domain.TaskBindingVersion,
 		ProviderID:         ocdeckstore.ProviderIDV2,

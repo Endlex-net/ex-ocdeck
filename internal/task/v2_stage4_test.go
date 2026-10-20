@@ -1126,8 +1126,12 @@ func TestStage4_AdoptA_PartialHistory_ViaActivate_StopBeforeStateWrite(t *testin
 	}
 	t.Cleanup(func() { db.Close() })
 	seedAdoptAFormTask(t, db, "t-stop", ocdeckstore.ProviderIDV1, "sess-keep")
-	// 部分缺失注入：binding 摘除（anchor+归属行仍在——判定矩阵「其余」→ stop）。
+	// 判定不一致注入：binding 摘除 + anchor 归属行删除（anchor ∉ 归属集合——
+	// legacy-A 仅放行 anchor 在册的完整老形态；不一致仍属判定矩阵「其余」→ stop）。
 	if _, err := db.Exec(`UPDATE tasks SET task_binding=NULL WHERE id='t-stop'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM task_sessions WHERE task_id='t-stop' AND session_id='sess-keep'`); err != nil {
 		t.Fatal(err)
 	}
 	m := newAdoptATestManager(t, db, &supOnlyV2Provider{sup: &recordingV2Sup{upstream: "sess-keep", port: 4096}})
@@ -1140,7 +1144,7 @@ func TestStage4_AdoptA_PartialHistory_ViaActivate_StopBeforeStateWrite(t *testin
 	if status != "suspended" {
 		t.Fatalf("status=%s（任何状态写入前停止——MUST NOT 写 activating）", status)
 	}
-	if upstream != "sess-keep" || nV1 != 2 || !strings.Contains(env, "OCDECK_TASK_ID") {
+	if upstream != "sess-keep" || nV1 != 1 || !strings.Contains(env, "OCDECK_TASK_ID") {
 		t.Fatalf("old facts must be fully preserved: upstream=%s nV1=%d env=%q", upstream, nV1, env)
 	}
 	row, err := adapterGetTask(t, db, "t-stop")
@@ -2213,6 +2217,85 @@ func TestStage4_AdoptA_ViaActivate_SuccessKeepsSameSession(t *testing.T) {
 	row, err := adapter.GetTask(ctx, "t-a2")
 	if err != nil || row.Status != "active" {
 		t.Fatalf("status: %s %v", row.Status, err)
+	}
+}
+
+// seedLegacyAnchorFormTask 种子 legacy-A 形态任务（v1-legacy-anchor-adopt）：无
+// task_binding（binding 持久化/迁移 0018 之前的存量形态）+ anchor 三元组 v1 完整 +
+// 归属行（父+子）+ env 快照事实。upstream 为原 session id。
+func seedLegacyAnchorFormTask(t *testing.T, db *store.DB, taskID, pinned, upstream string) {
+	t.Helper()
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO projects (id, name, path, default_branch, created_at, kind)
+		 VALUES ('p1','proj','/repo','main',?,'repo')`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO tasks (id, project_id, name, branch, status, mode, worktree_path,
+		 anchor_session_id, anchor_provider_id, anchor_provider_instance_id, provider_id, env_snapshot, created_at, updated_at)
+		 VALUES (?,'p1','task','b','suspended','worktree','/wt',?,'opencode-v1','default',?,?, ?, ?)`,
+		taskID, upstream, pinned, `{"OCDECK_TASK_ID":"`+taskID+`"}`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, sid := range []string{upstream, "sess-child"} {
+		if _, err := db.Exec(`INSERT INTO task_sessions (task_id, session_id, session_created_at, first_seen_at, last_seen_at, parent_id)
+			 VALUES (?, ?, 1, 1, 1, ?)`, taskID, sid, map[bool]string{true: "", false: upstream}[sid == upstream]); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestStage4_LegacyAnchorAdopt_ViaActivate 落实 v1-legacy-anchor-adopt：无
+// task_binding 的老任务形态（anchor 三元组 v1 + 归属行）经公开 Activate 自动承接
+// ——Resume 收到合成内存态 v1 binding（MUST NOT 持久化）、提交走 CommitAdoptionLegacy
+// （task_binding IS NULL 代际守卫）、迁移承接通知写入 last_error。
+func TestStage4_LegacyAnchorAdopt_ViaActivate(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seedLegacyAnchorFormTask(t, db, "t-la", ocdeckstore.ProviderIDV1, "sess-keep")
+	rec := &recordingV2Sup{upstream: "sess-keep", port: 4096}
+	m := newAdoptATestManager(t, db, &supOnlyV2Provider{sup: rec})
+
+	if err := m.Activate(ctx, "t-la"); err != nil {
+		t.Fatalf("Activate(legacy anchor adopt): %v", err)
+	}
+	if rec.resumeCalls != 1 || rec.acquireCalls != 0 {
+		t.Fatalf("resume=%d acquire=%d（legacy 承接只 Resume 原 anchor，不建替代）", rec.resumeCalls, rec.acquireCalls)
+	}
+	// Resume 收到合成 v1 binding（仅内存态；v1/default 命名空间 + anchor upstream）。
+	if !rec.lastResumeSet ||
+		rec.lastResumeOld.ProviderID != ocdeckstore.ProviderIDV1 ||
+		rec.lastResumeOld.ProviderInstanceID != ocdeckstore.ProviderInstanceV1Default ||
+		rec.lastResumeOld.UpstreamSessionID != "sess-keep" {
+		t.Fatalf("Resume must receive synthesized v1 binding: set=%v got=%+v", rec.lastResumeSet, rec.lastResumeOld)
+	}
+	// 原子转换：binding v2（upstream 不变）+ anchor 转 v2（归属行命名空间转换的
+	// 事务语义由 store 层 TestCommitAdoptionLegacy_* 权威覆盖——本 harness 的 fake
+	// supervisor 无会话列表事实，takeover 对齐按空快照清理缺席归属行，故此处不断言）。
+	adapter := NewStoreAdapter(db)
+	got, has, err := adapter.GetTaskBinding(ctx, "t-la")
+	if err != nil || !has || got.ProviderID != ocdeckstore.ProviderIDV2 || got.UpstreamSessionID != "sess-keep" {
+		t.Fatalf("binding: %+v has=%v err=%v", got, has, err)
+	}
+	var anchorProv, anchorID string
+	if err := db.QueryRow(`SELECT anchor_provider_id, anchor_session_id FROM tasks WHERE id='t-la'`).Scan(&anchorProv, &anchorID); err != nil {
+		t.Fatal(err)
+	}
+	if anchorProv != ocdeckstore.ProviderIDV2 || anchorID != "sess-keep" {
+		t.Fatalf("anchor: %s/%s", anchorProv, anchorID)
+	}
+	row, err := adapter.GetTask(ctx, "t-la")
+	if err != nil || row.Status != "active" {
+		t.Fatalf("status: %s %v", row.Status, err)
+	}
+	// 迁移承接通知（A 分支如实告知语义沿用 adoptionPendingLossNotice）。
+	for _, sub := range []string{"自动迁移承接", "pending", "重新触发"} {
+		if !strings.Contains(row.LastError.String, sub) {
+			t.Fatalf("adoption notice must contain %q: %q", sub, row.LastError.String)
+		}
 	}
 }
 

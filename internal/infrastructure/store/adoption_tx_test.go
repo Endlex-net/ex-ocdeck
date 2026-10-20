@@ -504,3 +504,117 @@ func TestCommitAdoption_AnchorOwnershipMissing(t *testing.T) {
 		t.Fatalf("missing anchor ownership must conflict, got %v", err)
 	}
 }
+
+// ---- legacy-A：无 binding 老任务形态（v1-legacy-anchor-adopt）----
+
+// seedLegacyAnchorTask 构造 legacy-A 形态任务：task_binding 为空 + anchor 三元组
+// v1 完整（anchor_session_id='sess-a'）+ 归属行（父+子）全 v1——binding 持久化
+// （迁移 0018）之前的存量形态。
+func seedLegacyAnchorTask(t *testing.T, db *DB, taskID, status string) {
+	t.Helper()
+	seedNamespaceProjectTask(t, db, taskID, "sess-a")
+	seedNamespaceSession(t, db, taskID, "sess-a")
+	seedNamespaceSession(t, db, taskID, "sess-a-child") // parent 链子 session
+	if _, err := db.Exec(`UPDATE task_sessions SET parent_id = 'sess-a' WHERE task_id = ? AND session_id = 'sess-a-child'`, taskID); err != nil {
+		t.Fatalf("set parent: %v", err)
+	}
+	if _, err := db.Exec(
+		`UPDATE tasks SET status = ?, provider_id = ?, anchor_provider_id = ?, anchor_provider_instance_id = ?
+		 WHERE id = ?`,
+		status, ProviderIDV1, ProviderIDV1, ProviderInstanceV1Default, taskID); err != nil {
+		t.Fatalf("seed legacy anchor task: %v", err)
+	}
+}
+
+// TestCommitAdoptionLegacy_Success 落实 tasks 2.4：NULL binding 代际守卫（task_binding
+// IS NULL）下提交成功——归属转换/anchor 翻转/binding 写入与既有 A 同事务语义。
+func TestCommitAdoptionLegacy_Success(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	seedLegacyAnchorTask(t, db, "t1", "suspended")
+	q := db.Queries
+
+	res, err := q.CommitAdoptionLegacy(ctx, "t1", v2AdoptionBinding("sess-a"), ocdecktask.StatusSuspended, nil)
+	if err != nil {
+		t.Fatalf("CommitAdoptionLegacy: %v", err)
+	}
+	if !res.Matched || !res.StatusChanged {
+		t.Fatalf("result: %+v", res)
+	}
+	// 全部归属行（含子 session）已转换、session_id 不变。
+	var nV2, nV1 int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id='t1' AND provider_id=?`, ProviderIDV2).Scan(&nV2); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id='t1' AND provider_id=?`, ProviderIDV1).Scan(&nV1); err != nil {
+		t.Fatal(err)
+	}
+	if nV2 != 2 || nV1 != 0 {
+		t.Fatalf("converted rows: v2=%d v1=%d", nV2, nV1)
+	}
+	// anchor 三元组 → v2、session_id 不变；binding 已写入（NULL → v2 envelope）。
+	got, has, err := q.GetTaskBinding(ctx, "t1")
+	if err != nil || !has || got.ProviderID != ProviderIDV2 || got.UpstreamSessionID != "sess-a" {
+		t.Fatalf("binding: %+v has=%v err=%v", got, has, err)
+	}
+	var anchorPID, anchorSID string
+	if err := db.QueryRow(`SELECT anchor_provider_id, anchor_session_id FROM tasks WHERE id='t1'`).Scan(&anchorPID, &anchorSID); err != nil {
+		t.Fatal(err)
+	}
+	if anchorPID != ProviderIDV2 || anchorSID != "sess-a" {
+		t.Fatalf("anchor: %s/%s", anchorPID, anchorSID)
+	}
+}
+
+// TestCommitAdoptionLegacy_ActiveGuard 落实 active→active 守卫形态（状态不变，
+// binding/anchor 原子更新）。
+func TestCommitAdoptionLegacy_ActiveGuard(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	seedLegacyAnchorTask(t, db, "t1", "active")
+	res, err := db.Queries.CommitAdoptionLegacy(ctx, "t1", v2AdoptionBinding("sess-a"), ocdecktask.StatusActive, nil)
+	if err != nil {
+		t.Fatalf("CommitAdoptionLegacy: %v", err)
+	}
+	if !res.Matched || res.StatusChanged {
+		t.Fatalf("active→active: matched=%v changed=%v", res.Matched, res.StatusChanged)
+	}
+}
+
+// TestCommitAdoptionLegacy_ConcurrentBindingWriteRejects 落实 delta spec「并发写入
+// binding 后承接拒绝」：提交时 task_binding 已被并发路径写入非空值 → CAS 失配
+// 拒绝（ErrAdoptionConflict），整体回滚零写入。
+func TestCommitAdoptionLegacy_ConcurrentBindingWriteRejects(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	seedLegacyAnchorTask(t, db, "t1", "suspended")
+	// 并发路径写入非空 binding（判定阶段读到 NULL 之后）。
+	concurrent, err := v1AdoptionBinding("sess-a").Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE tasks SET task_binding = ? WHERE id = 't1'`, concurrent); err != nil {
+		t.Fatal(err)
+	}
+
+	_, cerr := db.Queries.CommitAdoptionLegacy(ctx, "t1", v2AdoptionBinding("sess-a"), ocdecktask.StatusSuspended, nil)
+	if !IsAdoptionConflict(cerr) {
+		t.Fatalf("concurrent binding write must conflict, got %v", cerr)
+	}
+	// 零写入复验：归属行仍 v1、task_binding 保持并发写入值、anchor/status 未漂移。
+	var nV2 int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id='t1' AND provider_id=?`, ProviderIDV2).Scan(&nV2); err != nil {
+		t.Fatal(err)
+	}
+	if nV2 != 0 {
+		t.Fatalf("ownership must stay v1 after rollback, v2 rows=%d", nV2)
+	}
+	var anchorPID, status string
+	var binding sql.NullString
+	if err := db.QueryRow(`SELECT anchor_provider_id, status, task_binding FROM tasks WHERE id='t1'`).Scan(&anchorPID, &status, &binding); err != nil {
+		t.Fatal(err)
+	}
+	if anchorPID != ProviderIDV1 || status != "suspended" || !binding.Valid || binding.String != string(concurrent) {
+		t.Fatalf("zero-write violation: anchor=%s status=%s binding=%v", anchorPID, status, binding)
+	}
+}
