@@ -1881,6 +1881,19 @@ func (m *Manager) handleAgentEvent(ctx context.Context, taskID string, ev domain
 		if sess == nil || sess.Key.UpstreamID == "" {
 			return nil
 		}
+		// v2 typed created MUST NOT claim（跨任务偷 candidate 事故修复）：v2 SSE
+		// 是共享 serve 的全局事件流（归属键仅 data.sessionID，envelope location
+		// 可选且未实证），任何活跃任务都会收到他任务 candidate 的 created 广播
+		// ——claim 会在首建任务提交前抢走归属（CommitFirstBuild/CommitAdoption
+		// 守卫 fail-closed 拒绝提交 → 候选被误回收、激活失败，容器实测事故链）。
+		// v2 归属唯一合法来源 = 首建/承接原子提交协议 + 对齐（design D4 替换表：
+		// 事件消费在提交成功后=消费非认领；D3 attach 钉住 binding 原 session，
+		// 无外部认领流程；子 session 归属由对齐落账）。丢弃 + debug 日志（非协议
+		// 违约，不 fatal）。v1 原始通道（B3a 目录防线 + claim）行为不变。
+		if sess.Key.ProviderID == store.ProviderIDV2 {
+			debugf("v2 typed session.created %s ignored: ownership only via atomic commit/align, never event claim", sess.Key.UpstreamID)
+			return nil
+		}
 		sid := sess.Key.UpstreamID
 		// created 零值时间可（C8：适配层不要求时间字段存在）。
 		createdAt, lastSeen := sess.CreatedAt, sess.UpdatedAt

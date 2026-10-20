@@ -5789,3 +5789,69 @@ func TestStage4_Bridge_V2_RawFacesFailClosed(t *testing.T) {
 		t.Fatalf("v2 bridge Probe must fail closed, got: %v", perr)
 	}
 }
+
+// ---- 跨任务偷 candidate 事故回归（typed created 不认领） ----
+
+// TestV2_TypedCreated_NeverClaims 落实跨任务偷 candidate 事故修复：v2 SSE 是
+// 共享 serve 的全局事件流（归属键仅 data.sessionID，envelope location 可选且
+// 未实证），他任务首建 candidate 的 session.created 广播会到达任何活跃任务的
+// typed 流——MUST NOT claim（v2 归属唯一合法来源 = 原子提交协议 + 对齐）。
+// 三形态（容器事故无 location / location 缺 directory / 同目录他任务 session）
+// 均零归属新增；随后 B 任务对同一 candidate 的原子首建提交成功（事故闭环：
+// 修复前 A 已偷 → CommitFirstBuild 守卫 ErrAdoptionConflict → 候选被误回收、
+// 激活失败，容器实测）。丢弃判定位于 handleAgentEvent EventSessionCreated
+// 公共入口（lifecycle/legacy 两条落库分支分叉之前）——真实 harness 即事故链
+// 形态（legacy 落库分支）。
+func TestV2_TypedCreated_NeverClaims(t *testing.T) {
+	const candidate = "ses_ea8bee95"
+	ctx := context.Background()
+	// 任务 A：v2 binding 挂起（公开 Activate 激活 → active，typed 流在位）。
+	h := newRealStreamHarness(t, "t-vsteal", "ses_a", "suspended")
+	if aerr := h.m.Activate(ctx, "t-vsteal"); aerr != nil {
+		t.Fatalf("Activate A: %v", aerr)
+	}
+	// 与适配层翻译产物同构的 typed created 事件（translateV2Event 只看
+	// data.sessionID——envelope 三形态差异不影响 AgentEvent 形状，翻译层事实
+	// 由 opencode2 events_test 记录；此处断言 task 层不认领）。
+	stealEvent := func() domain.AgentEvent {
+		sess := domain.AgentSession{
+			Key:       domain.SessionKey{ProviderID: ocdeckstore.ProviderIDV2, ProviderInstanceID: ocdeckstore.ProviderInstanceV2Default, UpstreamID: candidate},
+			CreatedAt: 100, UpdatedAt: 100,
+		}
+		ev, err := domain.NewSessionEvent(domain.EventSessionCreated, sess)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ev
+	}
+	for i := 0; i < 3; i++ {
+		if err := h.m.handleAgentEvent(ctx, "t-vsteal", stealEvent()); err != nil {
+			t.Fatalf("typed created must be dropped without error, round %d: %v", i, err)
+		}
+	}
+	var stolen int
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM task_sessions WHERE task_id='t-vsteal' AND session_id=?`, candidate).Scan(&stolen); err != nil {
+		t.Fatal(err)
+	}
+	if stolen != 0 {
+		t.Fatalf("A must not claim cross-task candidate via typed created, rows=%d", stolen)
+	}
+	// 事故闭环：B 对同一 candidate 的原子首建提交成功（修复前被 A 偷走
+	// → 守卫 ErrAdoptionConflict → candidate 回收、激活失败）。
+	now := time.Now().Unix()
+	if _, err := h.db.Exec(`INSERT INTO projects (id, name, path, default_branch, created_at, kind)
+		 VALUES ('p-t-b', 'proj', '/repo', 'main', ?, 'repo')`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.Exec(`INSERT INTO tasks (id, project_id, name, branch, status, worktree_path,
+		 provider_id, created_at, updated_at)
+		 VALUES ('t-b','p-t-b','task-b','b','activating','/data/worktrees/other-b',?,?,?)`,
+		ocdeckstore.ProviderIDV2, now, now); err != nil {
+		t.Fatal(err)
+	}
+	bBinding := v2BindingFor("t-b", candidate)
+	bKey := domain.SessionKey{ProviderID: ocdeckstore.ProviderIDV2, ProviderInstanceID: ocdeckstore.ProviderInstanceV2Default, UpstreamID: candidate}
+	if _, err := h.db.CommitFirstBuild(ctx, "t-b", bBinding, bKey, 100, 100, 100, ""); err != nil {
+		t.Fatalf("B first build commit must succeed (candidate not stolen by A): %v", err)
+	}
+}

@@ -292,3 +292,32 @@ func expectStatus(t *testing.T, es appagent.EventStream, state domain.AgentStatu
 	}
 	return ev
 }
+
+// TestTranslateV2Event_CreatedEnvelopeMatrix 记录翻译层事实（跨任务偷
+// candidate 事故的输入面）：session.created 的 envelope location 三形态
+// （无 location=容器事故形态 / location 缺 directory / location 等于任意目录）
+// 都产出同一 EventSessionCreated——归属仅凭 data.sessionID（spec 冻结），
+// directory 不参与翻译。因此「他任务 candidate 广播不被认领」的防线在 task 层
+// （handleAgentEvent 对 v2 typed created 一律丢弃——归属唯一来源=原子提交
+// 协议+对齐），不在本层。
+func TestTranslateV2Event_CreatedEnvelopeMatrix(t *testing.T) {
+	frames := []string{
+		`{"id":"evt1","type":"session.created","data":{"sessionID":"ses_ea8bee95","time":{"created":100,"updated":100}}}`,
+		`{"id":"evt2","type":"session.created","location":{},"data":{"sessionID":"ses_ea8bee95","time":{"created":100,"updated":100}}}`,
+		`{"id":"evt3","type":"session.created","location":{"directory":"/home/ocdeck"},"data":{"sessionID":"ses_ea8bee95","time":{"created":100,"updated":100}}}`,
+	}
+	for _, frame := range frames {
+		ev, err := parseWireEvent([]byte(frame))
+		if err != nil {
+			t.Fatalf("parse %s: %v", frame, err)
+		}
+		out, ok := translateV2Event(ev, nil)
+		if !ok || out.Kind != domain.EventSessionCreated {
+			t.Fatalf("created must translate regardless of envelope location, frame=%s ok=%v", frame, ok)
+		}
+		if out.Session == nil || out.Session.Key.UpstreamID != "ses_ea8bee95" ||
+			out.Session.Key.ProviderID != ProviderID || out.Session.Key.ProviderInstanceID != ProviderInstanceID {
+			t.Fatalf("key mismatch: %+v", out.Session)
+		}
+	}
+}
