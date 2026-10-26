@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"ocdeck/internal/application"
+	"ocdeck/internal/infrastructure/hostenv"
 	"ocdeck/internal/infrastructure/opencode"
 	"ocdeck/internal/infrastructure/opencode2"
 	"ocdeck/internal/infrastructure/process"
@@ -1793,6 +1794,14 @@ func TestStage4_Suspend_V2_Isolation_ANotB(t *testing.T) {
 // 预验证先于创建；幂等创建 ocdeck-v2-tui-<taskID>（AttachCommand argv + 派生
 // 凭据 env OPENCODE_SERVER_PASSWORD + worktree dir）；预验证失败零创建。
 func TestStage4_ReopenAttach_V2_TUIUnit(t *testing.T) {
+	hostenv.ResetForTest()
+	origCapture := hostenv.Capture
+	hostenv.Capture = func() map[string]string { return map[string]string{} }
+	t.Cleanup(func() {
+		hostenv.Capture = origCapture
+		hostenv.ResetForTest()
+	})
+	t.Setenv("ARCHI_API_KEY_OPENAI", "sk-test-tui-host")
 	ctx := context.Background()
 	db, err := store.Open(ctx, t.TempDir())
 	if err != nil {
@@ -1833,6 +1842,12 @@ func TestStage4_ReopenAttach_V2_TUIUnit(t *testing.T) {
 	}
 	if env["OPENCODE_SERVER_PASSWORD"] == "" {
 		t.Fatalf("derived credential env missing")
+	}
+	if env["TERM"] != "xterm-256color" {
+		t.Fatalf("v2 tui TERM = %q, want xterm-256color", env["TERM"])
+	}
+	if env["ARCHI_API_KEY_OPENAI"] != "sk-test-tui-host" {
+		t.Fatalf("v2 tui host env ARCHI_API_KEY_OPENAI = %q, want sk-test-tui-host", env["ARCHI_API_KEY_OPENAI"])
 	}
 	if atomic.LoadInt32(&term.argvCalls) != 1 {
 		t.Fatalf("AttachCommand calls=%d, want 1", term.argvCalls)

@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"ocdeck/internal/infrastructure/hostenv"
 	"ocdeck/internal/infrastructure/process"
 
 	appagent "ocdeck/internal/application/agentprovider"
@@ -386,8 +387,8 @@ func (s *V2Supervisor) ensureServerAttempt(ctx context.Context, password string)
 	return s.startServer(ctx, rec.Port, password)
 }
 
-// startServer 启动顺序②③④⑤：spawn serve（OPENCODE_SERVER_PASSWORD 注入，
-// 仅 runtime 级事实）→ 取 pid → 验证 → 落 pid。
+// startServer 启动顺序②③④⑤：spawn serve（宿主 env 并集 + OPENCODE_SERVER_PASSWORD）
+// → 取 pid → 验证 → 落 pid。任务/项目 env 仍不得写入共享 serve。
 func (s *V2Supervisor) startServer(ctx context.Context, port int, password string) (int, error) {
 	// 端口固定不轮换：确认端口未被占用（D3「确认无存活托管 serve 且端口未被占用」
 	// 分支前置；被占用 → fail-closed 报错，不换端口）。
@@ -404,9 +405,9 @@ func (s *V2Supervisor) startServer(ctx context.Context, port int, password strin
 	spec := process.SessionSpec{
 		Name: ServeSessionName,
 		Dir:  "/",
-		Env: map[string]string{
+		Env: hostenv.MergeSpawnEnv(map[string]string{
 			"OPENCODE_SERVER_PASSWORD": password,
-		},
+		}),
 		CmdArgv: []string{
 			s.deps.OpencodeBin, "serve",
 			"--port", strconv.Itoa(port),

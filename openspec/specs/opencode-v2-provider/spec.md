@@ -126,7 +126,7 @@ status 等价能力已实证通过（run 20261016T090000Z-0bb6ac6c）。系统 S
 
 ### Requirement: v2 凭据与 binding 私有数据
 
-系统 SHALL 以 v2 provider 私有 data 形状持久化连接事实（端点/目录/session 来源等）；session 来源 MUST 记录为 `origin`（`created`=ocdeck 首建 / `adopted`=承接延续 / `ephemeral`=仅内存临时连接），作为恢复配置策略的识别事实：承接延续的 session（`adopted`）在后续恢复中 MUST NOT 被覆盖既有环境/权限配置。认证密码 MUST 经确定性派生获得（主密钥 + 稳定的 v2 runtime 实例标识；连接同一全局 server 的全部任务 MUST 使用同一派生凭据，任务身份与目录归属独立校验），MUST NOT 持久化于 binding 或任何存储。v2 私有 data 的编解码 MUST fail-closed：畸形或缺字段时拒绝使用并报错。认证注入 MUST 使用 `OPENCODE_SERVER_PASSWORD` env 注入 serve 进程；未设置密码时上游打印随机密码的行为 MUST NOT 被依赖（自管 server 必须显式注入）。
+系统 SHALL 以 v2 provider 私有 data 形状持久化连接事实（端点/目录/session 来源等）；session 来源 MUST 记录为 `origin`（`created`=ocdeck 首建 / `adopted`=承接延续 / `ephemeral`=仅内存临时连接），作为恢复配置策略的识别事实：承接延续的 session（`adopted`）在后续恢复中 MUST NOT 被覆盖既有环境/权限配置。认证密码 MUST 经确定性派生获得（主密钥 + 稳定的 v2 runtime 实例标识；连接同一全局 server 的全部任务 MUST 使用同一派生凭据，任务身份与目录归属独立校验），MUST NOT 持久化于 binding 或任何存储。v2 私有 data 的编解码 MUST fail-closed：畸形或缺字段时拒绝使用并报错。认证注入 MUST 使用 `OPENCODE_SERVER_PASSWORD` env 注入 serve 进程；未设置密码时上游打印随机密码的行为 MUST NOT 被依赖（自管 server 必须显式注入）。v2 共享 serve 与 v2 TUI 的进程环境 SHALL 在派生密码之外叠加宿主环境并集（进程 env ∪ login-shell 捕获；非法 KEY / `OCDECK_*` / 宿主 `OPENCODE_SERVER_PASSWORD` 除外；`TERM` 强制 `xterm-256color`），使插件与 `{env:VAR}` 能读取宿主机变量。项目级/任务级 env MUST NOT 写入共享 serve 进程，仍仅经 session `PUT /environment` 应用。
 
 #### Scenario: binding 私有数据 fail-closed
 

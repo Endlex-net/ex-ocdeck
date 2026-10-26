@@ -458,7 +458,7 @@ type V2TaskEnvSeam struct{ m *Manager }
 func NewV2TaskEnvSeam(m *Manager) *V2TaskEnvSeam { return &V2TaskEnvSeam{m: m} }
 
 // ResolveSessionEnv 按 phase 返回会话环境事实（键值对；不含 runtime 级事实——
-// 共享 serve 进程环境仅含端口/凭据/实例标识，任务配置仅 session 级）。
+// 共享 serve 进程环境含宿主并集 + 派生凭据，任务/项目配置仅 session 级）。
 func (s *V2TaskEnvSeam) ResolveSessionEnv(ctx context.Context, taskID string, recovery bool) (map[string]string, error) {
 	row, err := s.m.store.GetTask(ctx, taskID)
 	if err != nil {

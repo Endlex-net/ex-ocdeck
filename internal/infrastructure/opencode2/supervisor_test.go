@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"ocdeck/internal/infrastructure/hostenv"
+
 	"ocdeck/internal/infrastructure/process"
 
 	appagent "ocdeck/internal/application/agentprovider"
@@ -189,6 +191,14 @@ var _ = json.Marshal
 var _ = strconv.Itoa
 
 func TestSupervisor_EnsureServer_SixStepWriteOrder(t *testing.T) {
+	hostenv.ResetForTest()
+	origCapture := hostenv.Capture
+	hostenv.Capture = func() map[string]string { return map[string]string{} }
+	t.Cleanup(func() {
+		hostenv.Capture = origCapture
+		hostenv.ResetForTest()
+	})
+	t.Setenv("ARCHI_API_KEY_OPENAI", "sk-test-host")
 	srv := fixtureServer(t, route{path: "/api/session", status: 200, body: string(readFixture(t, "session_list_page2.json"))})
 	sup, proc, recs := newTestSupervisor(t, srv.URL, nil)
 	port, password, err := sup.ensureServer(context.Background())
@@ -214,6 +224,12 @@ func TestSupervisor_EnsureServer_SixStepWriteOrder(t *testing.T) {
 	}
 	if spec.Env["OPENCODE_SERVER_PASSWORD"] == "" {
 		t.Fatalf("OPENCODE_SERVER_PASSWORD must be injected")
+	}
+	if spec.Env["ARCHI_API_KEY_OPENAI"] != "sk-test-host" {
+		t.Fatalf("host env ARCHI_API_KEY_OPENAI = %q, want sk-test-host", spec.Env["ARCHI_API_KEY_OPENAI"])
+	}
+	if spec.Env["TERM"] != "xterm-256color" {
+		t.Fatalf("TERM = %q, want xterm-256color", spec.Env["TERM"])
 	}
 	// ①先于启动（记录先行）、⑤落 pid：最终记录 pid 有效。
 	rec, ok, _ := recs.GetProviderRuntime(context.Background(), ProviderID, ProviderInstanceID)

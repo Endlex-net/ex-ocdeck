@@ -11,6 +11,7 @@ import (
 
 	appagent "ocdeck/internal/application/agentprovider"
 	"ocdeck/internal/application/runtime"
+	"ocdeck/internal/infrastructure/hostenv"
 	"ocdeck/internal/infrastructure/process"
 	"ocdeck/internal/infrastructure/pty"
 	"ocdeck/internal/infrastructure/store"
@@ -98,9 +99,9 @@ func (m *Manager) AttachPty(sessionName string, cols, rows int) (*pty.Pty, error
 // 不存在→NotFound、归属不符→BindingInvalid，MUST NOT 建替代 session）先于创建；
 // 随后幂等确保托管单元（binding.TerminalRef = ocdeck-v2-tui-<taskID>）存在——
 // 创建参数 = AttachCommand argv（--server <url> --session <id>，自动选中机制
-// D8-7）+ 派生凭据 env（OPENCODE_SERVER_PASSWORD；凭据经 bindingEndpoint 端口
-// 提供，门禁已过）。返回 (id, handled=true)；非 v2 binding → (零值, false) 走
-// v1 分支。
+// D8-7）+ 宿主 env 并集 + 派生凭据 OPENCODE_SERVER_PASSWORD（凭据经
+// bindingEndpoint 端口提供，门禁已过）。返回 (id, handled=true)；非 v2
+// binding → (零值, false) 走 v1 分支。
 func (m *Manager) reopenAttachV2(ctx context.Context, taskID string, row TaskRow) (TerminalID, bool, error) {
 	b, has, err := m.store.GetTaskBinding(ctx, taskID)
 	if err != nil {
@@ -138,7 +139,7 @@ func (m *Manager) reopenAttachV2(ctx context.Context, taskID string, row TaskRow
 		return "", true, newOpErr(codeInternal, fmt.Errorf("v2 terminal credentials: %w", eerr))
 	}
 	if cerr := m.proc.NewSession(newSessionSpec(ref, row.WorktreePath,
-		map[string]string{"OPENCODE_SERVER_PASSWORD": password}, argv)); cerr != nil {
+		hostenv.MergeSpawnEnv(map[string]string{"OPENCODE_SERVER_PASSWORD": password}), argv)); cerr != nil {
 		return "", true, newOpErr(codeProcessError, fmt.Errorf("create v2 tui unit: %w", cerr))
 	}
 	return TerminalID(ref), true, nil

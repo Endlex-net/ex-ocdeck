@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -83,6 +84,57 @@ func Snapshot() map[string]string {
 		return nil
 	}
 	return maps.Clone(env)
+}
+
+// envKeyRe 与 process.validateEnvKey 同形：tmux -e 只接受合法 KEY，bash 函数导出
+// （BASH_FUNC_foo%%）等非法键必须跳过，否则整次 NewSession 失败。
+var envKeyRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]*$`)
+
+const (
+	hostReservedExact  = "OPENCODE_SERVER_PASSWORD"
+	hostReservedPrefix = "OCDECK_"
+	hostForcedTERM     = "xterm-256color"
+)
+
+func validHostEnvKey(k string) bool {
+	if k == "" || len(k) > 256 {
+		return false
+	}
+	return envKeyRe.MatchString(k)
+}
+
+func reservedHostEnvKey(k string) bool {
+	return k == hostReservedExact || strings.HasPrefix(k, hostReservedPrefix)
+}
+
+// ProcessEnvForSpawn 返回可经 tmux -e 注入 v2 serve / v2 TUI 的宿主环境副本。
+// 并集 = login-shell 捕获 ∪ 进程 os.Environ()（同名非空进程值覆盖捕获值，与 Lookup
+// 一致）；跳过空值、非法 KEY、OCDECK_* 与 OPENCODE_SERVER_PASSWORD（由调用方写入
+// 派生凭据）。TERM 强制 xterm-256color，不继承宿主 TERM。
+func ProcessEnvForSpawn() map[string]string {
+	out := map[string]string{}
+	for k, v := range Snapshot() {
+		if v == "" || !validHostEnvKey(k) || reservedHostEnvKey(k) {
+			continue
+		}
+		out[k] = v
+	}
+	for _, kv := range os.Environ() {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || v == "" || !validHostEnvKey(k) || reservedHostEnvKey(k) {
+			continue
+		}
+		out[k] = v
+	}
+	out["TERM"] = hostForcedTERM
+	return out
+}
+
+// MergeSpawnEnv 把 runtime 级键叠到宿主 spawn env 上（runtime 覆盖同名键）。
+func MergeSpawnEnv(runtime map[string]string) map[string]string {
+	out := ProcessEnvForSpawn()
+	maps.Copy(out, runtime)
+	return out
 }
 
 // Refresh 重新执行 login shell 捕获并原子替换缓存，供系统环境变量区手动刷新

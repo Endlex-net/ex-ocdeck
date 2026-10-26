@@ -6,9 +6,15 @@
 ### Requirement: env 基线与宿主隔离
 任务进程环境 MUST NOT 继承 ocdeck 服务端宿主 env。注入基线 SHALL 仅为最小基础集：`TERM/COLORTERM/HOME/USER/PATH/SHELL/LANG/LC_ALL/LC_CTYPE/TMPDIR/SSH_AUTH_SOCK` 与代理变量（`HTTP_PROXY/HTTPS_PROXY/NO_PROXY`，若宿主存在）。locale 变量（`LANG/LC_ALL/LC_CTYPE`）仅透传宿主非空值；三者均未设置或为空时系统 MUST 注入默认 `LANG=en_US.UTF-8`（保证 tmux attach 客户端 `client_utf8=1`，CJK 输出不被转写为 `_`）。执行 tmux 命令时 MUST 以清洗后的 env 调用，防止宿主 env 经 tmux server 全局环境隐式流入会话。provider 凭据主通道为 opencode 自身 auth store；需要 env 凭据的场景由用户经项目级/任务级 env 显式配置。
 
+**显式例外——v2 共享 serve 与 v2 TUI**：spawn `ocdeck-v2-serve` / `ocdeck-v2-tui-*` 时 SHALL 将宿主进程环境与 login-shell 捕获的并集经 tmux `-e` 注入（进程非空值覆盖捕获值），供插件与 `{env:VAR}` 读取 `process.env`。MUST 跳过非法 KEY、空值、`OCDECK_*` 与宿主侧 `OPENCODE_SERVER_PASSWORD`；`TERM` MUST 强制 `xterm-256color`；派生 `OPENCODE_SERVER_PASSWORD` MUST 覆盖同名宿主值。任务 shell 会话与 v1 任务进程 MUST 仍遵守本条隔离。项目级/任务级 env MUST NOT 写入共享 serve 进程。
+
 #### Scenario: 宿主变量不流入
 - **WHEN** ocdeck 服务端 env 中存在 AWS_SECRET_ACCESS_KEY 等未配置变量，任务激活
 - **THEN** 任务进程环境中不存在该变量（基础集除外）
+
+#### Scenario: v2 serve 注入宿主环境
+- **WHEN** 宿主进程或 login shell 存在 `ARCHI_API_KEY_OPENAI` 等非保留变量，系统启动 v2 共享 serve 或 v2 TUI
+- **THEN** 该变量出现在对应托管单元的 `-e` 环境中；任务 shell 与 v1 serve 仍不继承该变量（除非经全局/项目/任务 env 层叠配置）
 
 #### Scenario: 高位 locale 变量原样透传
 - **WHEN** 宿主设置了非空 LC_ALL 或 LC_CTYPE（LANG 未设置）

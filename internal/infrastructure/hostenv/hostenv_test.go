@@ -129,6 +129,65 @@ func TestLookupShellCacheEmptyValueMisses(t *testing.T) {
 	}
 }
 
+func TestProcessEnvForSpawnMergesHostAndSkipsReserved(t *testing.T) {
+	withFakeCapture(t, func() map[string]string {
+		return map[string]string{
+			"HOSTENV_SPAWN_SHELL":      "from-shell",
+			"HOSTENV_SPAWN_OVERRIDE":   "from-shell",
+			"HOSTENV_SPAWN_EMPTY":      "",
+			"BASH_FUNC_foo%%":          "() { :; }",
+			"OPENCODE_SERVER_PASSWORD": "from-shell",
+			"OCDECK_TOKEN":             "from-shell",
+		}
+	})
+	t.Setenv("HOSTENV_SPAWN_PROC", "from-process")
+	t.Setenv("HOSTENV_SPAWN_OVERRIDE", "from-process")
+	t.Setenv("HOSTENV_SPAWN_EMPTYPROC", "")
+	t.Setenv("TERM", "xterm-ghostty")
+	t.Setenv("OPENCODE_SERVER_PASSWORD", "from-process")
+	t.Setenv("OCDECK_TOKEN", "from-process")
+
+	got := ProcessEnvForSpawn()
+	if got["HOSTENV_SPAWN_SHELL"] != "from-shell" {
+		t.Fatalf("shell key = %q, want from-shell", got["HOSTENV_SPAWN_SHELL"])
+	}
+	if got["HOSTENV_SPAWN_PROC"] != "from-process" {
+		t.Fatalf("process key = %q, want from-process", got["HOSTENV_SPAWN_PROC"])
+	}
+	if got["HOSTENV_SPAWN_OVERRIDE"] != "from-process" {
+		t.Fatalf("override = %q, want process to win", got["HOSTENV_SPAWN_OVERRIDE"])
+	}
+	if _, ok := got["HOSTENV_SPAWN_EMPTY"]; ok {
+		t.Fatal("empty shell value must be skipped")
+	}
+	if _, ok := got["HOSTENV_SPAWN_EMPTYPROC"]; ok {
+		t.Fatal("empty process value must be skipped")
+	}
+	if _, ok := got["BASH_FUNC_foo%%"]; ok {
+		t.Fatal("invalid env key must be skipped")
+	}
+	if validHostEnvKey("BASH_FUNC_bar%%") {
+		t.Fatal("process-side invalid env key must fail charset check")
+	}
+	if _, ok := got["OPENCODE_SERVER_PASSWORD"]; ok {
+		t.Fatal("host OPENCODE_SERVER_PASSWORD must not enter spawn env")
+	}
+	if _, ok := got["OCDECK_TOKEN"]; ok {
+		t.Fatal("OCDECK_* must not enter spawn env")
+	}
+	if got["TERM"] != "xterm-256color" {
+		t.Fatalf("TERM = %q, want xterm-256color", got["TERM"])
+	}
+
+	merged := MergeSpawnEnv(map[string]string{"OPENCODE_SERVER_PASSWORD": "derived"})
+	if merged["OPENCODE_SERVER_PASSWORD"] != "derived" {
+		t.Fatalf("password = %q, want derived", merged["OPENCODE_SERVER_PASSWORD"])
+	}
+	if merged["HOSTENV_SPAWN_PROC"] != "from-process" {
+		t.Fatalf("merged lost process key: %q", merged["HOSTENV_SPAWN_PROC"])
+	}
+}
+
 // TestRefreshFailureFromUnloadedEntersFailedState 未加载态首次 Refresh 失败 MUST 迁移为
 // 失败缓存：后续普通读取按失败缓存服务、不再次捕获（仅下一次显式 Refresh 可重试，D3）。
 func TestRefreshFailureFromUnloadedEntersFailedState(t *testing.T) {
