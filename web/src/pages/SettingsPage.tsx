@@ -41,7 +41,7 @@ import {
   type ThemePreference,
 } from '../hooks';
 import type { OcConfigContent, OcConfigInfo, ServerStatus } from '../types';
-import { detectAgentVersion } from './agent-version';
+import { detectAgentVersion, shouldShowOpenCodeRestart } from './agent-version';
 import './settings.css';
 
 /* ============================ 设置多合一（tasks.md 7.1-7.5 + task-notifications D12） ============================
@@ -788,7 +788,75 @@ function AgentSectionHeader() {
     <div className="set-agent-subhead">
       <h3 className="od-section-title">opencode</h3>
       <span className={badgeClass}>{badgeText}</span>
+      <AgentRestartControl visible={shouldShowOpenCodeRestart(version)} />
     </div>
+  );
+}
+
+/* ============================ 重启 OpenCode 服务（v2 专属） ============================
+ * 重启的是全局共享的 opencode serve 进程，不是 ocdeck-server，也不是单个任务：
+ * 所有活跃 v2 任务中断（进行中的请求丢失、SSE 断开），随后按原会话恢复。
+ * 因此必须显式确认（复用 od-modal 模式），且按钮仅 v2 可见。 */
+function AgentRestartControl({ visible }: { visible: boolean }) {
+  const [confirming, setConfirming] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [error, setError] = useState('');
+
+  if (!visible) return null;
+
+  const doRestart = async () => {
+    setPending(true);
+    setError('');
+    setNotice('');
+    try {
+      await api.restartAgentService();
+      setConfirming(false);
+      setNotice('OpenCode 服务已重启');
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '重启失败');
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <>
+      <button
+        type="button"
+        className="od-btn od-btn-sm"
+        style={{ marginLeft: 'auto' }}
+        disabled={pending}
+        onClick={() => {
+          setError('');
+          setNotice('');
+          setConfirming(true);
+        }}
+      >
+        重启 OpenCode
+      </button>
+      {notice && <span className="od-hint">{notice}</span>}
+      {error && <span className="od-hint" role="alert">{error}</span>}
+
+      {confirming && (
+        <div className="od-modal-mask" onClick={() => !pending && setConfirming(false)}>
+          <div className="od-modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+            <h2>重启 OpenCode 服务？</h2>
+            <div className="od-modal-body">
+              将重启全局共享的 OpenCode 服务。所有正在运行的 v2 任务都会中断，进行中的请求会丢失，随后按原会话恢复。不会重启 ocdeck 本身。
+            </div>
+            <div className="od-modal-actions">
+              <button className="od-btn od-btn-ghost" disabled={pending} onClick={() => setConfirming(false)}>
+                取消
+              </button>
+              <button className="od-btn od-btn-danger" disabled={pending} onClick={() => void doRestart()}>
+                {pending ? '重启中…' : '确认重启'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 

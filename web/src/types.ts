@@ -338,6 +338,11 @@ export interface ServerStatus {
   contractBaseline: string;
   versionVerified: boolean;
   /**
+   * 机器实装 opencode 主版本（后端 ExtractOpenCodeMajor）：1=v1、2=v2、0=unknown。
+   * 后端始终下发；0 表示探测/解析失败。前端版本标识优先读取该字段。
+   */
+  opencodeMajor?: number;
+  /**
    * 能力健康快照（opencode-v1-spi-provider tasks 3.8；internal/api
    * capabilityHealthDTO）。后端未装配 provider 时整个字段省略。
    */

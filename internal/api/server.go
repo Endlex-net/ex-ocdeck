@@ -20,6 +20,7 @@ import (
 	"ocdeck/internal/infrastructure/ai"
 	"ocdeck/internal/infrastructure/branchprefix"
 	"ocdeck/internal/infrastructure/notify"
+	"ocdeck/internal/infrastructure/opencode2"
 	"ocdeck/internal/infrastructure/palette"
 	storepkg "ocdeck/internal/infrastructure/store"
 )
@@ -67,6 +68,12 @@ type Server struct {
 	// capabilitiesProvider 返回能力健康快照（tasks 3.8）；nil 时 /server/status
 	// 省略 capabilities 字段（既有响应形状不变）。
 	capabilitiesProvider func() []appagent.CapabilityHealth
+
+	// agentRuntimeController 操作者发起 agent runtime 控制的窄端口
+	// （SetAgentRuntimeController 注入；POST /api/v1/server/agent/restart 消费）。
+	// nil 时该端点回 422 invalid_state（未装配）。*task.Manager 经
+	// RestartV2Server 满足。
+	agentRuntimeController agentRuntimeController
 
 	// wsClients 单交互客户端注册表（design.md §21：同一终端新连接替换旧连接，4009）。
 	wsClients *wsClientRegistry
@@ -252,6 +259,7 @@ func staticExemptPaths(path string) bool {
 func (s *Server) registerRoutes() {
 	apiMux := http.NewServeMux()
 	apiMux.HandleFunc("GET /api/v1/server/status", s.handleServerStatus)
+	apiMux.HandleFunc("POST /api/v1/server/agent/restart", s.handleAgentRestart)
 	s.registerProjectRoutes(apiMux)
 	s.registerTaskRoutes(apiMux)            // task 路由接入主 api 子 mux
 	s.registerGitRoutes(apiMux)             // git 状态/diff/commit/push（design.md §21）
@@ -447,6 +455,19 @@ func (s *Server) SetCapabilitiesProvider(fn func() []appagent.CapabilityHealth) 
 	s.capabilitiesProvider = fn
 }
 
+// agentRuntimeController 是操作者发起 agent runtime 控制的窄端口
+// （POST /api/v1/server/agent/restart 消费）。*task.Manager 经 RestartV2Server
+// 满足；未注入时端点回 422 invalid_state。
+type agentRuntimeController interface {
+	RestartV2Server(ctx context.Context) error
+}
+
+// SetAgentRuntimeController 注入 agent runtime 控制端口（形态同
+// SetCapabilitiesProvider；组合根在 SetTaskBackend 后注入 *task.Manager）。
+func (s *Server) SetAgentRuntimeController(ctrl agentRuntimeController) {
+	s.agentRuntimeController = ctrl
+}
+
 // capabilityHealthDTO 是 capabilities 数组元素的 HTTP JSON 形状（tasks 3.7 T9
 // 决议，逐字段断言）：小驼峰键；session 可空对象（null | {providerId,
 // providerInstanceId, upstreamId}）。
@@ -498,17 +519,28 @@ func (s *Server) handleServerStatus(w http.ResponseWriter, r *http.Request) {
 	if s.watchdogStateProvider != nil {
 		watchdogState = s.watchdogStateProvider()
 	}
+	// v2 机器走独立族核验：契约字段使用 v2 基线（opencode2.ContractVersion），
+	// 下限放宽到 2.0.0 表达「2.x 同族已验证」；v1 机器沿用 [ContractMinVersion, ContractBaseline]。
+	contractBaseline := config.ContractBaseline
+	contractMinVersion := config.ContractMinVersion
+	if s.cfg.OpenCodeMajor >= 2 {
+		contractBaseline = opencode2.ContractVersion
+		contractMinVersion = "2.0.0"
+	}
 	status := map[string]any{
 		"opencodeVersion":    s.cfg.OpenCodeVersion,
+		"opencodeMajor":      s.cfg.OpenCodeMajor,
 		"tmuxVersion":        s.cfg.TmuxVersion,
 		"shutdownPolicy":     string(s.cfg.ShutdownPolicy),
 		"watchdogState":      watchdogState,
-		"contractBaseline":   config.ContractBaseline,
-		"contractMinVersion": config.ContractMinVersion,
+		"contractBaseline":   contractBaseline,
+		"contractMinVersion": contractMinVersion,
 		"versionVerified":    s.cfg.VersionVerified,
 	}
-	// capabilities 为唯一增量字段（tasks 3.8；比较例外——旧基线无对应，单独按
-	// 新契约验证）；未装配 provider 时省略，既有响应形状不变。
+	// capabilities 为条件增量字段（tasks 3.8；比较例外——旧基线无对应，单独按
+	// 新契约验证）；未装配 provider 时省略。opencodeMajor 与 v2 契约字段选择
+	// （contractBaseline/contractMinVersion 按 OpenCodeMajor 分流）为常驻增量，
+	// 不受 provider 装配影响。
 	if s.capabilitiesProvider != nil {
 		status["capabilities"] = toCapabilityDTOs(s.capabilitiesProvider())
 	}

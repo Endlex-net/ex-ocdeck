@@ -293,6 +293,9 @@ export const api = {
 
   serverStatus: () => request<ServerStatus>('GET', '/server/status'),
 
+  /** 重启全局共享的 OpenCode 服务（v2 专属）：204 成功；422 invalid_state（v1 / 能力不可用 / 关闭中）；500 internal。 */
+  restartAgentService: () => request<void>('POST', '/server/agent/restart'),
+
   /** 跨项目活跃会话列表（design.md D3）：快照语义，agentStatus 不可用时缺省。 */
   listActiveSessions: () => request<ActiveSessionItem[]>('GET', '/tasks/active'),
 

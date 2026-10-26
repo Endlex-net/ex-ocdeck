@@ -370,6 +370,34 @@ func TestVersionSupported(t *testing.T) {
 	}
 }
 
+func TestVersionSupported_V2Family(t *testing.T) {
+	cases := []struct {
+		detected string
+		want     bool
+	}{
+		// v2 同族独立核验：解析成功且 major==2 即 verified，不与 1.18.x 跨族比较。
+		{"opencode v2.1.4", true},
+		{"2.1.4", true},
+		{"opencode v2.0.28", true},
+		{"2.0.28", true},
+		{"2.0.0", true},
+		// v1 区间仍按原闭区间核验（回归保护）。
+		{"1.18.18", true},
+		{"1.17.0", false},
+		{"1.18.27", false},
+		// 非 1/2 主版本或解析失败 → false。
+		{"3.0.0", false},
+		{"opencode", false},
+		{"2.0", false},
+	}
+	for _, c := range cases {
+		got := VersionSupported(c.detected)
+		if got != c.want {
+			t.Errorf("VersionSupported(%q) = %v, want %v", c.detected, got, c.want)
+		}
+	}
+}
+
 func TestLoad_VersionVerifiedMismatch(t *testing.T) {
 	dir := t.TempDir()
 	cfg, release, err := Load(Options{

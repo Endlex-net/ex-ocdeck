@@ -97,6 +97,12 @@
 - **WHEN** 全局 server 进程异常退出并被重拉
 - **THEN** 活跃 v2 任务按持久化 binding 重建 upstream session 关联；重建失败的任务按既有恢复失败语义处理
 
+#### Scenario: 操作者发起重启全局 serve
+
+- **WHEN** 操作者经 `POST /api/v1/server/agent/restart` 请求重启全局共享 serve
+- **THEN** 系统 MUST 杀掉当前 serve 并以**同一固定端口**重新拉起（端口固定不轮换）；重拉成功后 MUST 经既有 `OnServerRestarted` / `RebuildV2Associations` 恢复活跃 v2 任务在原 session 上的关联（MUST NOT 创建替代 session、MUST NOT 自行重建关联）；监控循环 MUST 保持运行；MUST NOT 使用 `ShutdownServer`（其为终态关停——置 `shuttingDown` 并停止监控，不可用于重启）；supervisor 处于 `shuttingDown` 时 MUST 拒绝重启；v2 provider 未注册或未实现 `ServerRestarter` 窄接口时 MUST fail-closed（用户可见能力，不得 no-op）
+- **AND** 影响范围 = 该 server 承载的全部 v2 任务：在途 prompt 丢失、SSE 连接断开，按既有崩溃重拉语义恢复
+
 ### Requirement: v2 状态读取保守语义
 
 status 等价能力已实证通过（run 20261016T090000Z-0bb6ac6c）。系统 SHALL 按冻结映射实现 StatusReader：SSE `session.execution.started` → busy；`session.execution.succeeded` / `session.execution.failed` / `session.execution.interrupted` 均为执行终态 → idle（实证：run 20261014T040930Z-1bc764c7 `live/event/stream.ndjson` failed 带 `data.error`、run 20261016T090000Z-0bb6ac6c `live/lifecycle/p1b-frames-1.jsonl` interrupted 带 `reason=user`；真实中断/失败流可能不跟随 succeeded，不映射则状态永停 busy）；`Session.Message.Idle.outcome ∈ {succeeded, failed, interrupted}` MUST 仅作完成诊断，MUST NOT 映射为用户可见 idle/busy；事件 `data` 的 `error`/`reason` 等载荷同样仅诊断、MUST NOT 参与状态推导。能力健康透出 MUST 上报 `CapAvailable`。事件断线时 MUST 重连并以 session 快照自补状态。

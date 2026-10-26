@@ -78,3 +78,13 @@ type CandidateDebtReaper interface {
 type ServerMonitorController interface {
 	StopServerMonitoring()
 }
+
+// ServerRestarter 是 v2 共享 server 操作者发起重启的窄接口（可选能力，形态同
+// ServerAvailabilityWarmer）：杀掉当前 serve 并以同端口重新拉起——everReady 已
+// 置位后 ensureServer 会异步触发 OnServerRestarted 重建活跃 v2 任务关联
+// （MUST NOT 自行重建/创建替代 session）。与 ShutdownServer 不同：不置
+// shuttingDown、不停止监控、端口固定不轮换。supervisor 关停中（shuttingDown）
+// MUST 拒绝。未实现该端口的 provider 由调用方 fail-closed（用户可见能力）。
+type ServerRestarter interface {
+	RestartServer(ctx context.Context) error
+}

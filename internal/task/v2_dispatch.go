@@ -184,6 +184,30 @@ func (m *Manager) shutdownV2Server(ctx context.Context) error {
 	return hook.ShutdownServer(ctx)
 }
 
+// RestartV2Server 操作者发起重启全局 v2 共享 serve（用户可见能力，与
+// shutdownV2Server 不同：v2 未注册/未实现 ServerRestarter MUST fail-closed，不
+// no-op）。经 registry 取 v2 provider 的 Supervisor，未实现 ServerRestarter 窄
+// 接口 → capability_unavailable。实现侧（V2Supervisor.RestartServer）杀掉当前
+// serve 并以同端口重新拉起，由 ensureServer 异步触发 OnServerRestarted 重建
+// 活跃 v2 任务关联。
+func (m *Manager) RestartV2Server(ctx context.Context) error {
+	if m.providerRegistry == nil {
+		return appagent.NewError("task.restart_v2_server", appagent.ErrKindCapabilityUnavailable,
+			fmt.Errorf("provider registry 未注入（v2 重启能力不可用）"))
+	}
+	p, err := m.providerRegistry.Get(ocdeckstore.ProviderIDV2)
+	if err != nil {
+		return appagent.NewError("task.restart_v2_server", appagent.ErrKindCapabilityUnavailable,
+			fmt.Errorf("opencode-v2 provider 未注册（重启能力不可用）: %w", err))
+	}
+	restarter, ok := p.Supervisor().(appagent.ServerRestarter)
+	if !ok {
+		return appagent.NewError("task.restart_v2_server", appagent.ErrKindCapabilityUnavailable,
+			fmt.Errorf("provider %s 未实现 ServerRestarter（重启能力不可用）", ocdeckstore.ProviderIDV2))
+	}
+	return restarter.RestartServer(ctx)
+}
+
 // RebuildV2Associations 是 v2 server 重拉后的任务关联重建编排（tasks 5.3 /
 // design D3「重拉后活跃任务按 binding 重建 session 关联」；main.go 装配为
 // supervisor OnServerRestarted 回调）：遍历运行时注册表快照，对 active 的 v2

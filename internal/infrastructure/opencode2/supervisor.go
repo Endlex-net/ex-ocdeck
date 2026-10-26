@@ -124,6 +124,22 @@ type V2Supervisor struct {
 	monitorMu       sync.Mutex
 	monitorStarted  bool // runMonitor 已派发（join 判据）
 	monitorStopped  bool // 停止终态（停止后 startMonitor 不再拉起）
+
+	// restartMu 串行 RestartServer leader 选举 + per-flight 共享结果单飞：调用在
+	// restartMu 下观察当前 flight——in-flight（done 未关闭）则 join（捕获 per-flight
+	// 指针后等 done 返回其 err，不独立 ensureServer）；否则成 leader，发布 flight
+	// 指针后**释放 restartMu**再跑 kill+重拉（让并发 waiter 能在 leader 运行期间捕
+	// 获本 flight 指针，不受后续新 leader 覆盖 s.restartFlight 影响——新 leader 只能
+	// 在观察到前一 flight 已完成后启动）。leader 完成后写 flight.err 并 close done。
+	restartMu     sync.Mutex
+	restartFlight *restartFlight
+}
+
+// restartFlight 是一次 RestartServer 单飞的 per-flight 完成结果：leader 创建，
+// waiters 捕获引用后等 done，返回 err。done 关闭即本次 flight 终态。
+type restartFlight struct {
+	done chan struct{}
+	err  error
 }
 
 // NewV2Supervisor 构造 supervisor（deps 完整性由调用方保证——生产装配在
@@ -173,6 +189,13 @@ func (s *V2Supervisor) ensureServerOnce(ctx context.Context) (int, string, error
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.ensureServerLocked(ctx, password)
+}
+
+// ensureServerLocked 是 ensureServerOnce 的锁内核心（调用方持 s.mu）。RestartServer
+// 复用此核心在持锁期间完成 kill + 重拉，使并发 RestartServer 经同一 s.mu 完全
+// 串行（避免释放-重抢窗口内后到者杀掉刚拉起的新 serve）。
+func (s *V2Supervisor) ensureServerLocked(ctx context.Context, password string) (int, string, error, bool) {
 	if s.shuttingDown {
 		return 0, "", appagent.NewError("supervisor.ensure_server",
 			appagent.ErrKindRuntimeUnavailable, errShuttingDown), false
@@ -329,6 +352,11 @@ var errShuttingDown = errors.New("opencode2: server shutting down")
 
 // errRuntimeIdentityMismatch 标记实例身份核验失败（fail-closed 不接管）。
 var errRuntimeIdentityMismatch = errors.New("opencode2: runtime identity mismatch")
+
+// errRestartKillFailed 标记操作者重启时杀/等旧 serve 死亡失败（KillSession 未
+// 杀掉或 waitServeDead 超时旧 pid 仍存活）。fail-closed：MUST NOT 进入
+// ensureServerLocked 复用旧 pid、MUST NOT 触发 OnServerRestarted。
+var errRestartKillFailed = errors.New("opencode2: restart kill/death-wait failed (old serve still alive)")
 
 // ensureServerAttempt 单次启动/恢复尝试（矩阵六分支）。
 func (s *V2Supervisor) ensureServerAttempt(ctx context.Context, password string) (int, error) {
@@ -886,6 +914,176 @@ func (s *V2Supervisor) CheckServerAlive(ctx context.Context) error {
 	s.mu.Unlock()
 	_, _, err := s.ensureServer(ctx)
 	return err
+}
+
+// RestartServer 操作者发起重启（可选窄接口 ServerRestarter；与 ShutdownServer
+// 语义独立——不置 shuttingDown、不停止监控、端口固定不轮换）：杀掉当前 serve
+// 并以同端口重新拉起。everReady 已置位后异步触发 OnServerRestarted 重建活跃
+// v2 任务关联（MUST NOT 自行重建/创建替代 session）。
+//
+// 关停中（shuttingDown）MUST 拒绝。当前 owned serve 发现不依赖内存 ready/pid——
+// invalidateServer 清 ready+pid 时进程可能仍存活；新构造 supervisor 也可能有
+// 持久化 serve。故从内存 pid → 持久化记录 PID → SessionPID(ServeSessionName)
+// 三级发现 owned pid。KillSession 可能返回 SessionKilled=false+nil error——按
+// Disposition 区分：SnapshotMissingDegraded（会话已消失）仍经 waitServeDead 确认
+// 旧 pid 死亡后重拉；其余（SnapshotFailed/KillFailed，会话仍存活 kill 未成功）
+// fail-closed。waitServeDead MUST 以 ProcessIdentity 报 !alive 确认死亡
+// （HasSession=false 不充分——托管单元消失但进程可能逃逸存活）；超时旧 pid 仍
+// 存活 → errRestartKillFailed，MUST NOT 进入 ensureServerLocked（否则恢复矩阵
+// 复用旧 pid 报成功 + 误触发 OnServerRestarted）。
+//
+// 并发 RestartServer 单飞共享结果（per-flight）：leader 在 restartMu 下创建本次
+// flight（done+err）存入 s.restartFlight 后释放 restartMu 跑 kill+重拉；并发后到者
+// （TryLock 失败）在 restartMu 下捕获当前 s.restartFlight 引用，等该 flight 的 done
+// 后返回其 err——不独立 ensureServer，且不受后续新 leader 覆盖 s.restartFlight 影响
+// （waiter 持 per-flight 引用，非共享可变字段）。leader 完成后写 flight.err 并 close
+// flight.done。
+func (s *V2Supervisor) RestartServer(ctx context.Context) error {
+	// 单飞 leader 选举 + per-flight 共享结果：在 restartMu 下观察当前 flight——
+	// 若存在且未完成（done 未关闭），join 它（捕获 per-flight 指针后等 done，返回
+	// 其 err，不独立 ensureServer）；否则成为 leader，创建本次 flight 并存入
+	// s.restartFlight，**释放 restartMu 后**再跑 restartLeader（让并发 waiter 能在
+	// leader 运行期间捕获本 flight 指针——持 restartMu 跑重启会使 waiter 阻塞至
+	// leader 完成，届时新 leader 可能已覆盖 s.restartFlight，waiter 错误捕获新
+	// flight）。leader 完成后写 flight.err 并 close done。
+	//
+	// join 规则：当前 flight 存在且 done 未关闭 → join（同一操作者请求的并发合并）；
+	// 当前 flight 已完成（done 已关闭）→ 开新 flight（新操作者请求）。新 leader C
+	// 只能在观察到前一 flight 已完成（或 nil）后启动，故 C 不会覆盖尚有 waiter 的
+	// in-flight 指针。
+	s.restartMu.Lock()
+	if cur := s.restartFlight; cur != nil && !isClosed(cur.done) {
+		// waiter：捕获当前 in-flight 指针后释放 restartMu，等其 done 返回其 err。
+		flight := cur
+		s.restartMu.Unlock()
+		select {
+		case <-flight.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		return flight.err
+	}
+	// leader：创建本次 flight 并发布指针，释放 restartMu 后跑重启（waiter 此后即可
+	// 捕获本 flight 指针）。
+	flight := &restartFlight{done: make(chan struct{})}
+	s.restartFlight = flight
+	s.restartMu.Unlock()
+	err := s.restartLeader(ctx)
+	// 先写 err 再 close done（waiter 据此返回；happens-before 由 close 建立）。
+	flight.err = err
+	close(flight.done)
+	return err
+}
+
+// isClosed 非阻塞探测 chan 是否已关闭（select default 即未关闭/无值）。仅用于
+// restartFlight.done 的 join 判定——不消费值（done 仅作完成信号，无 payload）。
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// restartLeader 是单飞 leader 的重启主体（kill + 等死 + ensureServerLocked 重拉）。
+// 由 RestartServer 在 per-flight 注册后调用；返回值写入 flight.err。Issue 1/2 行为
+// 收口于此：discoverOwnedPidLocked 三级发现 owned pid；KillSession 按 Disposition
+// 区分失败；waitServeDead 以 ProcessIdentity !alive 确认死亡；任一失败 →
+// errRestartKillFailed，MUST NOT 进入 ensureServerLocked / 触发 OnServerRestarted。
+func (s *V2Supervisor) restartLeader(ctx context.Context) error {
+	password, err := derivePassword()
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if s.shuttingDown {
+		s.mu.Unlock()
+		return appagent.NewError("supervisor.restart_server",
+			appagent.ErrKindRuntimeUnavailable, errShuttingDown)
+	}
+	// 发现当前 owned serve pid（三级：内存 → 持久化记录 → 托管单元）。
+	oldPid := s.discoverOwnedPidLocked(ctx)
+	if oldPid > 0 {
+		// 杀旧 serve。KillSession 可能返回 SessionKilled=false+nil error——须按
+		// Disposition 区分：SnapshotMissingDegraded = 会话已消失（无需 kill，进程
+		// 可能已死或逃逸），仍经 waitServeDead 以 ProcessIdentity 确认死亡后重拉；
+		// SnapshotFailed/KillFailed = 会话仍存活但 kill 未成功，进程很可能仍活 →
+		// fail-closed，MUST NOT 进入 ensureServerLocked。
+		kr, kerr := s.deps.Proc.KillSession(ServeSessionName)
+		if kerr != nil {
+			s.mu.Unlock()
+			return appagent.NewError("supervisor.restart_server",
+				appagent.ErrKindRuntimeUnavailable,
+				fmt.Errorf("%w: kill-session 错误: %v", errRestartKillFailed, kerr))
+		}
+		if !kr.SessionKilled && kr.Disposition != process.DispositionSnapshotMissingDegraded {
+			s.mu.Unlock()
+			return appagent.NewError("supervisor.restart_server",
+				appagent.ErrKindRuntimeUnavailable,
+				fmt.Errorf("%w: kill-session 未成功 (disposition=%s)",
+					errRestartKillFailed, kr.Disposition))
+		}
+		// 等旧 pid 真正死亡（ProcessIdentity !alive 为准）。超时仍存活 → 失败。
+		// 覆盖逃逸进程（kill-session 发 SIGHUP，忽略 HUP 的子孙 reparent 到 init
+		// 仍存活）与会话已消失但进程逃逸两种形态。MUST NOT 仅凭 HasSession=false
+		// 判死。
+		if dead := s.waitServeDead(ctx, oldPid); !dead {
+			s.mu.Unlock()
+			return appagent.NewError("supervisor.restart_server",
+				appagent.ErrKindRuntimeUnavailable,
+				fmt.Errorf("%w: 旧 pid %d 仍存活", errRestartKillFailed, oldPid))
+		}
+		// 清就绪态与 pid：监控验活据此判死，ensureServerLocked 走恢复矩阵同端口重启。
+		s.ready = false
+		s.pid = 0
+	}
+	_, _, e, restarted := s.ensureServerLocked(ctx, password)
+	err = e
+	if e == nil && restarted && s.deps.OnServerRestarted != nil {
+		go s.deps.OnServerRestarted()
+	}
+	s.mu.Unlock()
+	return err
+}
+
+// discoverOwnedPidLocked 三级发现当前 owned serve pid（调用方持 s.mu）：内存
+// s.pid → 持久化记录 PID → SessionPID(ServeSessionName)。返回 >0 表示存在可见
+// owned 进程需杀；0 表示无可见 serve（直接重拉）。记录读取/SessionPID 错误
+// 降级为「该来源无 pid」继续下一级（不阻断重启——最终 ensureServerLocked 兜底）。
+func (s *V2Supervisor) discoverOwnedPidLocked(ctx context.Context) int {
+	if s.pid > 0 {
+		return s.pid
+	}
+	if rec, ok, err := s.deps.Store.GetProviderRuntime(ctx, ProviderID, ProviderInstanceID); err == nil && ok && rec.PID.Valid {
+		return int(rec.PID.Int64)
+	}
+	if pid, found, err := s.deps.Proc.SessionPID(ServeSessionName); err == nil && found {
+		return pid
+	}
+	return 0
+}
+
+// waitServeDead 等待旧 serve 进程真正死亡（端口可重新绑定）。死亡判据 MUST 为
+// ProcessIdentity 报 !alive——HasSession=false 不充分（托管单元消失但进程可能
+// 逃逸存活，恢复矩阵会复用旧 pid 报成功）。预算取 ReadyTimeout（与就绪轮询同一
+// 界），ctx 取消即返回 false（调用方按失败处置）。返回 true=已确认死亡。
+// 调用方持 s.mu。
+func (s *V2Supervisor) waitServeDead(ctx context.Context, oldPid int) bool {
+	deadline := time.Now().Add(s.deps.ReadyTimeout)
+	for {
+		if _, alive, err := s.deps.ProcessIdentity(oldPid); err == nil && !alive {
+			return true
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(s.deps.PollInterval):
+		}
+	}
 }
 
 // ShutdownServer 关闭全局共享 server（supervisor 单 owner——design D4 shutdown

@@ -23,6 +23,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"ocdeck/internal/infrastructure/opencode"
+	"ocdeck/internal/infrastructure/opencode2"
 )
 
 // ShutdownPolicy 关停策略（design.md §10）。
@@ -313,7 +314,13 @@ func Load(opts Options) (*Config, func(), error) {
 		TmuxVersion:     tmuxVersion,
 	}
 	if !cfg.VersionVerified {
-		log.Printf("warning: opencode version %s outside verified contract range [%s, %s]; ocdeck may behave unexpectedly (activation is gated by capability probe, not version)", ocVersion, opencode.ContractMinVersion, ContractBaseline)
+		// v2 机器走独立族核验（major==2 即 verified），告警区间用 v2 契约基线；
+		// 否则按 v1 已验证区间 [ContractMinVersion, ContractBaseline] 提示。
+		if cfg.OpenCodeMajor >= 2 {
+			log.Printf("warning: opencode version %s could not be verified against v2 contract baseline %s; ocdeck may behave unexpectedly (activation is gated by capability probe, not version)", ocVersion, opencode2.ContractVersion)
+		} else {
+			log.Printf("warning: opencode version %s outside verified contract range [%s, %s]; ocdeck may behave unexpectedly (activation is gated by capability probe, not version)", ocVersion, opencode.ContractMinVersion, ContractBaseline)
+		}
 	}
 	return cfg, release, nil
 }
@@ -536,14 +543,20 @@ func stripVersionSuffix(s string) string {
 	return s
 }
 
-// VersionSupported 判断探测到的 opencode 版本是否落在已验证契约区间
-// [ContractMinVersion, ContractBaseline]（design.md §11）。
+// VersionSupported 判断探测到的 opencode 版本是否落在已验证契约区间。
 // 形如 "opencode 1.18.18" 或 "1.18.18"；按 semver major.minor.patch 比较。
-// 无法解析或不含三段数字时返回 false（触发告警）。
+//
+// v1 机器（major==1）：沿用 [ContractMinVersion, ContractBaseline] 闭区间（design.md §11）。
+// v2 机器（major>=2）：v2 契约独立于 v1 区间核验——只要解析成功且主版本为 2 即视为
+// 已验证（v2 契约以 opencode2.ContractVersion 为冻结基线，2.x 同族向后兼容，
+// 不与 1.18.x 跨族比较）。无法解析或主版本非 1/2 → false（触发告警）。
 func VersionSupported(detected string) bool {
 	maj, min, pat, ok := parseOCSemver(detected)
 	if !ok {
 		return false
+	}
+	if maj >= 2 {
+		return maj == 2
 	}
 	loMaj, loMin, loPat, loOk := parseOCSemver(ContractMinVersion)
 	hiMaj, hiMin, hiPat, hiOk := parseOCSemver(ContractBaseline)

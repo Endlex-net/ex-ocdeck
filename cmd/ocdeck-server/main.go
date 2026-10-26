@@ -420,6 +420,10 @@ func serveAndShutdown(ctx context.Context, tm *task.Manager, cfg *config.Config,
 
 	srv := api.New(cfg, db)
 	srv.SetTaskBackend(tm)
+	// 操作者发起 agent runtime 重启端口（POST /api/v1/server/agent/restart）：
+	// *task.Manager 经 RestartV2Server 满足窄接口；v2 未注册/未实现 ServerRestarter
+	// 时端点 fail-closed（422 invalid_state）。沿用 SetTaskBackend 位置模式。
+	srv.SetAgentRuntimeController(tm)
 	// 能力健康透出（opencode-v1-spi-provider tasks 3.8）：run() 顶层构造的
 	// tracker（provider 作用域预填 unknown；supervisor OnRuntimeReady 换代
 	// 递增 epoch）注入状态端点——只读 capabilities 数组为唯一增量字段。

@@ -1,11 +1,11 @@
 package api
 
 // capabilities_test.go 覆盖 opencode-v1-spi-provider tasks 3.8 的状态端点透出：
-//   - capabilities 为唯一增量：未装配 provider 时响应不含该字段（既有形状不变）；
+//   - capabilities 为条件增量：未装配 provider 时响应不含该字段；
 //   - 装配后 JSON 精确形状（tasks 3.7 T9 决议，逐字段断言）：primitive/scope/
 //     epoch/state/reason/taskId 顶层小驼峰 + session 可空对象（null |
 //     {providerId, providerInstanceId, upstreamId}）；
-//   - 既有七字段不受装配影响。
+//   - 常驻字段（含 opencodeMajor 在内八字段）不受 capabilities 装配影响。
 
 import (
 	"encoding/json"
@@ -15,6 +15,8 @@ import (
 
 	appagent "ocdeck/internal/application/agentprovider"
 	domain "ocdeck/internal/domain/agentprovider"
+	"ocdeck/internal/config"
+	"ocdeck/internal/infrastructure/opencode2"
 )
 
 func getStatusJSON(t *testing.T, srv *Server) map[string]json.RawMessage {
@@ -39,13 +41,13 @@ func getStatusJSON(t *testing.T, srv *Server) map[string]json.RawMessage {
 }
 
 func TestServerStatus_CapabilitiesAbsentWithoutProvider(t *testing.T) {
-	// 行为保持：未装配时响应不含 capabilities 字段，既有七字段齐全。
+	// 行为保持：未装配时响应不含 capabilities 字段，常驻八字段齐全。
 	srv := New(testConfig(), nil)
 	body := getStatusJSON(t, srv)
 	if _, ok := body["capabilities"]; ok {
 		t.Error("未装配 provider 时不得出现 capabilities 字段")
 	}
-	for _, field := range []string{"opencodeVersion", "tmuxVersion", "shutdownPolicy", "watchdogState", "contractBaseline", "contractMinVersion", "versionVerified"} {
+	for _, field := range []string{"opencodeVersion", "opencodeMajor", "tmuxVersion", "shutdownPolicy", "watchdogState", "contractBaseline", "contractMinVersion", "versionVerified"} {
 		if _, ok := body[field]; !ok {
 			t.Errorf("既有字段 %s 缺失", field)
 		}
@@ -138,8 +140,8 @@ func TestServerStatus_CapabilitiesExactShape(t *testing.T) {
 		t.Errorf("session = %v, want null", string(c1["session"]))
 	}
 
-	// 既有字段不受装配影响（七字段仍齐全）。
-	for _, field := range []string{"opencodeVersion", "tmuxVersion", "shutdownPolicy", "watchdogState", "contractBaseline", "contractMinVersion", "versionVerified"} {
+	// 既有字段不受装配影响（含 opencodeMajor 在内八字段仍齐全）。
+	for _, field := range []string{"opencodeVersion", "opencodeMajor", "tmuxVersion", "shutdownPolicy", "watchdogState", "contractBaseline", "contractMinVersion", "versionVerified"} {
 		if _, ok := body[field]; !ok {
 			t.Errorf("既有字段 %s 缺失", field)
 		}
@@ -165,4 +167,61 @@ func TestServerStatus_CapabilitiesPrefilledUnknown(t *testing.T) {
 			t.Errorf("预填记录 = %v", c)
 		}
 	}
+}
+
+// v2 机器：handleServerStatus 应下发 v2 契约基线字段且 opencodeMajor=2，
+// 不再透出 v1 区间 [1.18.14, 1.18.26]；v1 机器保持 v1 常量。
+func TestServerStatus_ContractFieldsByMajor(t *testing.T) {
+	decode := func(t *testing.T, raw json.RawMessage, dst any) {
+		t.Helper()
+		if err := json.Unmarshal(raw, dst); err != nil {
+			t.Fatalf("unmarshal %s: %v", string(raw), err)
+		}
+	}
+	t.Run("v2 major", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.OpenCodeMajor = 2
+		cfg.OpenCodeVersion = "opencode v2.1.4"
+		cfg.VersionVerified = config.VersionSupported(cfg.OpenCodeVersion)
+		srv := New(cfg, nil)
+		body := getStatusJSON(t, srv)
+		var major float64
+		decode(t, body["opencodeMajor"], &major)
+		if int(major) != 2 {
+			t.Errorf("opencodeMajor = %v, want 2", major)
+		}
+		var vv bool
+		decode(t, body["versionVerified"], &vv)
+		if !vv {
+			t.Errorf("versionVerified = %v, want true for v2 family", vv)
+		}
+		var cb string
+		decode(t, body["contractBaseline"], &cb)
+		if cb != opencode2.ContractVersion {
+			t.Errorf("contractBaseline = %q, want %s", cb, opencode2.ContractVersion)
+		}
+		var cm string
+		decode(t, body["contractMinVersion"], &cm)
+		if cm != "2.0.0" {
+			t.Errorf("contractMinVersion = %q, want 2.0.0", cm)
+		}
+	})
+	t.Run("v1 major", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.OpenCodeMajor = 1
+		cfg.OpenCodeVersion = "1.18.18"
+		cfg.VersionVerified = config.VersionSupported(cfg.OpenCodeVersion)
+		srv := New(cfg, nil)
+		body := getStatusJSON(t, srv)
+		var cb string
+		decode(t, body["contractBaseline"], &cb)
+		if cb != config.ContractBaseline {
+			t.Errorf("contractBaseline = %q, want %s", cb, config.ContractBaseline)
+		}
+		var cm string
+		decode(t, body["contractMinVersion"], &cm)
+		if cm != config.ContractMinVersion {
+			t.Errorf("contractMinVersion = %q, want %s", cm, config.ContractMinVersion)
+		}
+	})
 }
