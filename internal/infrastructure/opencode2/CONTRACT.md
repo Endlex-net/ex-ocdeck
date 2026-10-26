@@ -56,13 +56,13 @@ ocdeck 对 opencode v2 的兼容性按**冻结基线**声明，当前锚点：
 ## 7. 事件
 
 - SSE = `GET /api/event`；事件结构 `{id: evt_*, created, type, location: {directory}?, data: {..., sessionID}, durable: {aggregateID, seq, version}?}`；**归属键 = `data.sessionID`**。〔实证〕R2 `live/event/p1b-frames.jsonl`（`session.inbox.enqueued` / `session.execution.started` 逐字段可见）
-- 执行边界事件：`session.execution.started` / `session.execution.succeeded`（**无** v1 式 `session.status` idle/busy 事件）。〔实证〕R2 `live/extra/p1b_status_seq.json` + `live/event/p1b-frames.jsonl`
+- 执行边界事件：`session.execution.started` / `session.execution.succeeded` / `session.execution.failed` / `session.execution.interrupted`（**无** v1 式 `session.status` idle/busy 事件）。〔实证〕R2 `live/extra/p1b_status_seq.json` + `live/event/p1b-frames.jsonl`；failed（data 含 error 对象）run 20261014T040930Z-1bc764c7 `live/event/stream.ndjson`、interrupted（data 含 reason=user）run 20261016T090000Z-0bb6ac6c `live/lifecycle/p1b-frames-1.jsonl`
 - 删除事件 `session.deleted`，归属目标 session（独立 fixture 精确 type + 归属）。〔实证〕R1 `live/destructive/stream.ndjson` + `results.jsonl`（event.02c.session_deleted PASS）
 - 事件类型**无封闭枚举**（OpenAPI `V2EventEncoded.type: string`）〔静态schema〕`packages/schema/src/event-manifest.ts` + `packages/protocol/src/groups/event.ts`（union + `server.connected` + `rpc.*` template）；唯一 failureEvent 字面量 `effect/http-api/stream/failure`（stream 级）〔OpenAPI 静态提取观察〕R1 `live/static-extract.openapi-forms.md` A9——该字面量**不存在于 opencode 源码锚点文件**（effect 框架运行时产物），不得作为静态锚点
 
 ## 8. Status 冻结映射
 
-- busy = SSE `session.execution.started`；idle = `session.execution.succeeded`；v2 已移除 `GET /session/status`（400）。〔实证〕R2 `live/extra/p1b_status_seq.json` + R1 `live/misc/status.json`
+- busy = SSE `session.execution.started`；idle = `session.execution.succeeded` / `session.execution.failed` / `session.execution.interrupted`（三者均为执行终态；真实中断/失败流可能不跟随 succeeded，不映射则状态永停 busy）；v2 已移除 `GET /session/status`（400）。〔实证〕R2 `live/extra/p1b_status_seq.json` + R1 `live/misc/status.json`；failed run 20261014T040930Z-1bc764c7 `live/event/stream.ndjson`、interrupted run 20261016T090000Z-0bb6ac6c `live/lifecycle/p1b-frames-1.jsonl`
 - `Session.Info.outcome ∈ {succeeded, failed, interrupted}`：仅诊断字段，**不映射**用户可见状态。〔静态schema〕R1 `live/static-extract.endpoint-dumps.json`（`Session.Info.outcome` Literals）；〔实证〕R1 `live/supervisor/health-body.json`（`"outcome":"succeeded"`）
 
 ## 9. 未实证项（保守语义冻结）

@@ -94,12 +94,12 @@
 
 ### Requirement: v2 状态读取保守语义
 
-status 等价能力已实证通过（run 20261016T090000Z-0bb6ac6c）。系统 SHALL 按冻结映射实现 StatusReader：SSE `session.execution.started` → busy、`session.execution.succeeded` → idle；`Session.Message.Idle.outcome ∈ {succeeded, failed, interrupted}` MUST 仅作完成诊断，MUST NOT 映射为用户可见 idle/busy；能力健康透出 MUST 上报 `CapAvailable`。事件断线时 MUST 重连并以 session 快照自补状态。
+status 等价能力已实证通过（run 20261016T090000Z-0bb6ac6c）。系统 SHALL 按冻结映射实现 StatusReader：SSE `session.execution.started` → busy；`session.execution.succeeded` / `session.execution.failed` / `session.execution.interrupted` 均为执行终态 → idle（实证：run 20261014T040930Z-1bc764c7 `live/event/stream.ndjson` failed 带 `data.error`、run 20261016T090000Z-0bb6ac6c `live/lifecycle/p1b-frames-1.jsonl` interrupted 带 `reason=user`；真实中断/失败流可能不跟随 succeeded，不映射则状态永停 busy）；`Session.Message.Idle.outcome ∈ {succeeded, failed, interrupted}` MUST 仅作完成诊断，MUST NOT 映射为用户可见 idle/busy；事件 `data` 的 `error`/`reason` 等载荷同样仅诊断、MUST NOT 参与状态推导。能力健康透出 MUST 上报 `CapAvailable`。事件断线时 MUST 重连并以 session 快照自补状态。
 
 #### Scenario: 执行边界事件映射状态
 
-- **WHEN** v2 SSE 流出现 `session.execution.started` / `session.execution.succeeded` 事件
-- **THEN** 分别归一化为 busy / idle；事件断线后重连并以 session 快照自补
+- **WHEN** v2 SSE 流出现 `session.execution.started` / `session.execution.succeeded` / `session.execution.failed` / `session.execution.interrupted` 事件
+- **THEN** started 归一化为 busy；succeeded/failed/interrupted 为执行终态，归一化为 idle；事件断线后重连并以 session 快照自补
 
 #### Scenario: outcome 不作状态来源
 

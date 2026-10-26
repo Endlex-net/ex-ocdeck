@@ -145,6 +145,70 @@ func TestEvents_FixtureStreamNormalization(t *testing.T) {
 	_ = es.Close()
 }
 
+// TestEvents_TerminalExecutionEventsMapIdle 回归：真实停止/失败的 v2 会话只发
+// session.execution.interrupted / session.execution.failed、不跟随 succeeded
+//（实证 evidence/20261016T090000Z-0bb6ac6c live/lifecycle/p1b-frames-1.jsonl:20
+// interrupted reason=user、evidence/20261014T040930Z-1bc764c7 live/event/
+// stream.ndjson:43 failed data.error）——两者均为执行终态，MUST 映射回 idle，
+// 否则 UI 永久 busy。error/reason 载荷仅诊断，不参与映射。
+func TestEvents_TerminalExecutionEventsMapIdle(t *testing.T) {
+	var clientRef *Client
+	srv := httptestServerFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/event" {
+			t.Errorf("path: %s", r.URL.Path)
+			w.WriteHeader(404)
+			return
+		}
+		writeSSE(t, w, "data: {\"id\":\"e0\",\"type\":\"server.connected\",\"data\":{}}\n\n"+
+			"data: {\"id\":\"e1\",\"type\":\"session.execution.started\",\"data\":{\"sessionID\":\"ses_fixture01a\"}}\n\n"+
+			// 实证形态：failed 附 data.error（诊断载荷，不参与映射）。
+			"data: {\"id\":\"e2\",\"type\":\"session.execution.failed\",\"data\":{\"sessionID\":\"ses_fixture01a\",\"error\":{\"type\":\"provider.invalid-request\",\"message\":\"Model exo-free has been deprecated.\"}}}\n\n"+
+			"data: {\"id\":\"e3\",\"type\":\"session.execution.started\",\"data\":{\"sessionID\":\"ses_fixture01a\"}}\n\n"+
+			// 实证形态：interrupted 附 reason=user。
+			"data: {\"id\":\"e4\",\"type\":\"session.execution.interrupted\",\"data\":{\"sessionID\":\"ses_fixture01a\",\"reason\":\"user\"}}\n\n")
+		<-r.Context().Done()
+	})
+	setMasterSecret(t)
+	p := NewSPIProvider(ProviderOptions{StatusVerified: true})
+	p.newClient = func(port int, password string, opts Options) *Client {
+		c := NewClient(port, password, opts)
+		c.baseURL = srv.URL
+		clientRef = c
+		return c
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	es, err := p.Events().Subscribe(ctx, testBinding(t))
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	es.SetCallbacks(func() {}, nil)
+
+	// busy →（failed 终态）idle → busy →（interrupted 终态）idle。
+	expectStatus(t, es, domain.StatusBusy)
+	expectStatus(t, es, domain.StatusIdle)
+	expectStatus(t, es, domain.StatusBusy)
+	idle := expectStatus(t, es, domain.StatusIdle)
+	if idle.Key != testSessionKey() {
+		t.Fatalf("terminal idle key: %v", idle.Key)
+	}
+
+	// provider 可见当前状态（StatusVerified 冻结映射）= idle，不残留 busy。
+	out, err := p.Status().Current(ctx, testBinding(t))
+	if err != nil {
+		t.Fatalf("Current: %v", err)
+	}
+	if out[testSessionKey()] != domain.StatusIdle {
+		t.Fatalf("provider-visible status: %v", out)
+	}
+	// 终态事件是已知事件，MUST NOT 走保守丢弃。
+	if clientRef == nil || clientRef.MalformedCount() != 0 {
+		t.Fatalf("terminal events must not count as conservative drops: %v", clientRef)
+	}
+	cancel()
+	_ = es.Close()
+}
+
 func TestEvents_Reconnect_SnapshotSelfHeal(t *testing.T) {
 	var conns int32
 	srv := httptestServerFunc(t, func(w http.ResponseWriter, r *http.Request) {

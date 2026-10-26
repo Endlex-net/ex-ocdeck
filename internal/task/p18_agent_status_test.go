@@ -16,9 +16,11 @@ import (
 	"ocdeck/internal/application/runtime"
 	apptask "ocdeck/internal/application/task"
 	"ocdeck/internal/config"
+	domain "ocdeck/internal/domain/agentprovider"
 	ocdeckevent "ocdeck/internal/domain/event"
 	ocdecksess "ocdeck/internal/domain/session"
 	"ocdeck/internal/infrastructure/opencode"
+	ocdeckstore "ocdeck/internal/infrastructure/store"
 )
 
 // --- 测试基建 ---
@@ -610,6 +612,73 @@ func TestP18_HandleSSEEvent_StatusAndMembership(t *testing.T) {
 	}
 	if rs := pub.runStatus(); len(rs) != 3 || rs[2].From != "" || rs[2].To != "idle" || !rs[2].Available {
 		t.Fatalf("claim publish = %+v, want \"\"→idle available", rs)
+	}
+}
+
+// TestP18_TypedStatusEvent_OwnershipGate 验证 typed StatusChanged 事件归属
+// fail-closed（与原始通道 handleSSEEvent 同源，spec 模式 A「未命中一律忽略」）：
+// 共享 v2 全局事件流会携带他任务/未归属 session 的状态事件，MUST NOT 写入
+// agentStatus 内存态（残留他任务 busy 会造成假持续忙碌）；已归属 session 的
+// busy/idle 正常聚合并发布。
+func TestP18_TypedStatusEvent_OwnershipGate(t *testing.T) {
+	store := newMockStore()
+	seedActiveTask(store, "t1", "p1")
+	store.sessions["t1"] = []SessionRow{{TaskID: "t1", SessionID: "s1"}}
+	// 他任务归属 session（共享流上到达 t1 的事件形态）。
+	store.sessions["t2"] = []SessionRow{{TaskID: "t2", SessionID: "s2"}}
+	m, pub, _ := newP18Manager(t, store, newMockProc(), newMockOC(true))
+	_, a := p18ReadyRuntime(m, "t1", "s1")
+	ctx := context.Background()
+
+	// typed 状态事件（真实契约形状：NewStatusEvent 工厂 + v2 命名空间 SessionKey）。
+	statusEvent := func(sid string, state domain.AgentStatus) domain.AgentEvent {
+		ev, err := domain.NewStatusEvent(domain.SessionKey{
+			ProviderID:         ocdeckstore.ProviderIDV2,
+			ProviderInstanceID: ocdeckstore.ProviderInstanceV2Default,
+			UpstreamID:         sid,
+		}, domain.StatusDetail{State: state})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ev
+	}
+
+	// 孤儿（未归属）状态事件：忽略，无变化无发布。
+	if err := m.handleAgentEvent(ctx, "t1", statusEvent("s-orphan", domain.StatusBusy)); err != nil {
+		t.Fatalf("orphan typed status event: %v", err)
+	}
+	if got := a.snapshotValue(); got != "idle" || len(pub.runStatus()) != 0 {
+		t.Fatalf("orphan typed event must be ignored; snapshot=%q events=%d", got, len(pub.runStatus()))
+	}
+
+	// 他任务归属 session 的状态事件：同样忽略，无变化无发布。
+	if err := m.handleAgentEvent(ctx, "t1", statusEvent("s2", domain.StatusBusy)); err != nil {
+		t.Fatalf("other-task typed status event: %v", err)
+	}
+	if got := a.snapshotValue(); got != "idle" || len(pub.runStatus()) != 0 {
+		t.Fatalf("other-task typed event must be ignored; snapshot=%q events=%d", got, len(pub.runStatus()))
+	}
+
+	// 已归属 session 的 busy：更新聚合并发布 idle→busy。
+	if err := m.handleAgentEvent(ctx, "t1", statusEvent("s1", domain.StatusBusy)); err != nil {
+		t.Fatalf("owned busy typed status event: %v", err)
+	}
+	if got := a.snapshotValue(); got != "busy" {
+		t.Fatalf("owned busy typed event snapshot = %q, want busy", got)
+	}
+	if rs := pub.runStatus(); len(rs) != 1 || rs[0].To != "busy" {
+		t.Fatalf("owned busy typed event publish = %+v", rs)
+	}
+
+	// 已归属 session 回 idle：聚合回 idle 并发布 busy→idle。
+	if err := m.handleAgentEvent(ctx, "t1", statusEvent("s1", domain.StatusIdle)); err != nil {
+		t.Fatalf("owned idle typed status event: %v", err)
+	}
+	if got := a.snapshotValue(); got != "idle" {
+		t.Fatalf("owned idle typed event snapshot = %q, want idle", got)
+	}
+	if rs := pub.runStatus(); len(rs) != 2 || rs[1].To != "idle" {
+		t.Fatalf("owned idle typed event publish = %+v", rs)
 	}
 }
 

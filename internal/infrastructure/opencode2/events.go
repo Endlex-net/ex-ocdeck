@@ -141,14 +141,21 @@ func translateV2Event(ev wireEvent, statusOf func(domain.SessionKey, domain.Agen
 		out, err := domain.NewSessionEvent(kind, sess)
 		return out, err == nil
 
-	case "session.execution.started", "session.execution.succeeded":
-		// 冻结映射（D8-1 实证 PASS）：execution.started→busy、succeeded→idle。
+	case "session.execution.started", "session.execution.succeeded",
+		"session.execution.failed", "session.execution.interrupted":
+		// 冻结映射（D8-1 实证 PASS）：execution.started→busy；
+		// succeeded/failed/interrupted 均为执行终态→idle。真实停止/失败流只发
+		// interrupted/failed、不跟随 succeeded（实证 20261016T090000Z-0bb6ac6c
+		// live/lifecycle/p1b-frames-1.jsonl:20 interrupted reason=user、
+		// 20261014T040930Z-1bc764c7 live/event/stream.ndjson:43 failed
+		// data.error），不映射则状态永停 busy。error/reason 载荷仅诊断，
+		// 不参与状态映射。
 		if !ok {
 			return domain.AgentEvent{}, false
 		}
-		state := domain.StatusBusy
-		if ev.Type == "session.execution.succeeded" {
-			state = domain.StatusIdle
+		state := domain.StatusIdle
+		if ev.Type == "session.execution.started" {
+			state = domain.StatusBusy
 		}
 		key := v2Namespace(sessionID)
 		if statusOf != nil {

@@ -1998,7 +1998,7 @@ func (m *Manager) handleAgentEvent(ctx context.Context, taskID string, ev domain
 	case domain.EventSessionError:
 		m.observeSessionErrorFromAgentEvent(ctx, taskID, ev)
 	case domain.EventStatusChanged:
-		m.applyAgentStatusEventFromAgent(taskID, ev)
+		return m.applyAgentStatusEventFromAgent(ctx, taskID, ev)
 	}
 	return nil
 }
@@ -2076,9 +2076,34 @@ func (m *Manager) observeSessionErrorFromAgentEvent(ctx context.Context, taskID 
 // applyAgentStatusEventFromAgentEvent 是 applySessionStatusEvent 的 typed 等价：
 // StatusChanged 负载直取（domain.AgentStatus → appagent.SessionStatusType 映射，
 // unknown 拒绝应用——与 ParseSessionStatusEvent 的三值枚举约束一致）。
-func (m *Manager) applyAgentStatusEventFromAgent(taskID string, ev domain.AgentEvent) {
+// B3b 等价归属反查（spec 模式 A「未命中一律忽略」）：共享 v2 事件流会携带他
+// 任务/未归属 session 的状态事件，未命中本任务 MUST NOT 写 agentStatus 状态
+// （残留他任务 busy 会造成假持续忙碌）；归属查询错误 fail-closed 上抛（与原始
+// 通道 handleSSEEvent 一致，由调用方收敛运行时）。
+func (m *Manager) applyAgentStatusEventFromAgent(ctx context.Context, taskID string, ev domain.AgentEvent) error {
 	if ev.Status == nil {
-		return
+		return nil
+	}
+	sid := ev.Key.UpstreamID
+	if sid == "" {
+		return nil
+	}
+	if m.lifecycle != nil {
+		owner, found, err := m.lifecycle.OwnerOf(ctx, ocdecksess.ID(sid))
+		if err != nil {
+			return fmt.Errorf("check session ownership %s: %w", sid, err)
+		}
+		if !found || owner != taskID {
+			return nil
+		}
+	} else {
+		owns, err := m.sessionBelongsToTask(ctx, taskID, sid)
+		if err != nil {
+			return fmt.Errorf("check session ownership %s: %w", sid, err)
+		}
+		if !owns {
+			return nil
+		}
 	}
 	var status appagent.SessionStatusType
 	switch ev.Status.State {
@@ -2089,17 +2114,18 @@ func (m *Manager) applyAgentStatusEventFromAgent(taskID string, ev domain.AgentE
 	case domain.StatusRetry:
 		status = appagent.StatusRetry
 	default:
-		return // unknown/缺枚举不 apply（与原始通道「未知枚举忽略」一致）
+		return nil // unknown/缺枚举不 apply（与原始通道「未知枚举忽略」一致）
 	}
 	rt := m.getRuntime(taskID)
 	if rt == nil {
-		return
+		return nil
 	}
-	op := agentStatusOp{kind: agentOpStatusEvent, sessionID: ev.Key.UpstreamID, status: status}
+	op := agentStatusOp{kind: agentOpStatusEvent, sessionID: sid, status: status}
 	if ev.Status.State == domain.StatusRetry {
 		op.retry = &appnotif.RetryDetail{Attempt: ev.Status.Attempt, Message: ev.Status.Message, Next: ev.Status.NextAt}
 	}
 	m.applyAgentStatusAndCommit(taskID, rt, op)
+	return nil
 }
 
 // handleSSEEvent 处理 SSE 事件：session.created/updated → upsert；session.deleted → 删行。

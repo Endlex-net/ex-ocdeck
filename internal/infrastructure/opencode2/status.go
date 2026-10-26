@@ -3,8 +3,8 @@
 //     上报 status 能力 CapUnknown（不得推导 idle/busy、不得用 CapUnsupported
 //     ——D8-0 精确规则）；
 //   - 实证通过（1.2 PASS）后按冻结映射切换并转为 CapAvailable（D8-1）：
-//     busy = session.execution.started、idle = session.execution.succeeded，
-//     Session.Info.outcome 仅诊断不映射；未知枚举跳过。
+//     busy = session.execution.started；succeeded/failed/interrupted 均为
+//     执行终态 → idle，Session.Info.outcome 仅诊断不映射；未知枚举跳过。
 //
 // 切换经 ProviderOptions.StatusVerified 显式装配决策（D8-0 保守规则在切换前
 // 适用）；事件侧状态由事件路径经 recordStatus 维护。
