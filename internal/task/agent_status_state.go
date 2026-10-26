@@ -131,10 +131,17 @@ func (a *agentStatusState) apply(op agentStatusOp) agentStatusDelta {
 	var factID uint64 // 仅 agentOpInvalidate 实际落态时分配（见该 case）
 	switch op.kind {
 	case agentOpStatusEvent:
-		// 归属反查已在调用方完成；断流后防御性忽略。状态事件是新事实：清除强制
-		// 失效标记（lock-timeout 失效 ≠ 断流，不冻结连接代，恢复可发布）。retry
-		// 态附加保留最近详情、非 retry 态清除（D3；不影响聚合与发布行为）。
+		// 归属反查已在调用方完成，apply 层对未知 session 再做一次成员 fail-closed：
+		// 共享 v2 事件流会携带他任务/未归属 session 的状态事件，写入是加性的且在
+		// 重连前从不剪枝，残留他任务 busy 会让所有未挂起/活跃任务显示「工作中」。
+		// 故 op.sessionID 不在 a.sessions 时一律 no-op（不插入、不清除失效标记、
+		// 不 bump 写代）；断流后防御性忽略。已归属 session 的新事实：清除强制失效
+		// 标记（lock-timeout 失效 ≠ 断流，不冻结连接代，恢复可发布）。retry 态附加
+		// 保留最近详情、非 retry 态清除（D3；不影响聚合与发布行为）。
 		if a.connected {
+			if _, ok := a.sessions[op.sessionID]; !ok {
+				break // 未知/他任务 session：fail-closed 忽略，不污染 owned 聚合
+			}
 			a.sessions[op.sessionID] = op.status
 			if op.retry != nil && op.status == appagent.StatusRetry {
 				a.retries[op.sessionID] = *op.retry

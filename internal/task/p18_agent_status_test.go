@@ -682,6 +682,44 @@ func TestP18_TypedStatusEvent_OwnershipGate(t *testing.T) {
 	}
 }
 
+// TestP18_Apply_StatusEvent_ForeignSessionNoOp 验证 apply 层对未知 session 的
+// fail-closed：共享 v2 全局事件流会携带他任务/未归属 session 的状态事件，调用方
+// 的 OwnerOf 反查不足以兜底——agentOpStatusEvent 的写入是加性的且在重连前从不剪枝，
+// 残留他任务 busy 会让所有未挂起/活跃任务显示「工作中」。故 op.sessionID 不在
+// a.sessions 时 MUST NOT 插入、不清除失效标记、不 bump 写代、不发布；已归属 session
+// 的 busy 仍正常聚合与发布。
+func TestP18_Apply_StatusEvent_ForeignSessionNoOp(t *testing.T) {
+	store := newMockStore()
+	seedActiveTask(store, "t1", "p1")
+	m, pub, _ := newP18Manager(t, store, newMockProc(), newMockOC(true))
+	_, a := p18ReadyRuntime(m, "t1", "s1") // idle, owned={s1}
+
+	if got := a.snapshotValue(); got != "idle" {
+		t.Fatalf("initial aggregate = %q, want idle", got)
+	}
+	if rs := pub.runStatus(); len(rs) != 0 {
+		t.Fatalf("initial publish must be empty; got %v", rs)
+	}
+
+	// 他任务/未归属 session 的 busy：直接经唯一 apply 写入，MUST be no-op。
+	m.applyAgentStatusAndCommit("t1", m.getRuntime("t1"), p18StatusOp("s-foreign", opencode.StatusBusy))
+	if got := a.snapshotValue(); got != "idle" {
+		t.Fatalf("foreign busy must not change aggregate; got %q, want idle", got)
+	}
+	if rs := pub.runStatus(); len(rs) != 0 {
+		t.Fatalf("foreign busy must not publish; got %v", rs)
+	}
+
+	// 已归属 session 的 busy：仍正常聚合为 busy 并发布 idle→busy。
+	m.applyAgentStatusAndCommit("t1", m.getRuntime("t1"), p18StatusOp("s1", opencode.StatusBusy))
+	if got := a.snapshotValue(); got != "busy" {
+		t.Fatalf("owned busy aggregate = %q, want busy", got)
+	}
+	if rs := pub.runStatus(); len(rs) != 1 || rs[0].From != "idle" || rs[0].To != "busy" || !rs[0].Available {
+		t.Fatalf("owned busy publish = %+v, want one idle→busy available", rs)
+	}
+}
+
 // TestP18_ModeB_Equivalents 验证模式 B 等价分支（经参数化 modeA=false 直接调用，
 // 无全局翻转、无运行时切换）：忽略状态事件、valid 周期探测失败退回并单次发布、
 // 同 epoch 重试成功恢复 valid（design D4 模式矩阵）。
