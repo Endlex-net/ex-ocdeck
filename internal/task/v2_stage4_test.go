@@ -6000,3 +6000,167 @@ func TestV2_TypedCreated_NeverClaims(t *testing.T) {
 		t.Fatalf("B first build commit must succeed (candidate not stolen by A): %v", err)
 	}
 }
+
+// ---- v2 子 session 归属恢复：父已认领 → 认领子 → 子 busy 聚合 ----
+
+// v2TypedCreatedWithParent 构造带父的 v2 typed session.created 事件（与 opencode2
+// 适配层翻译产物同构：testdata/sse_frames.txt evt_09 子 created 形态——parentID 钉父，
+// 无 location）。
+func v2TypedCreatedWithParent(t *testing.T, child, parent string) domain.AgentEvent {
+	t.Helper()
+	sess := domain.AgentSession{
+		Key: domain.SessionKey{
+			ProviderID:         ocdeckstore.ProviderIDV2,
+			ProviderInstanceID: ocdeckstore.ProviderInstanceV2Default,
+			UpstreamID:         child,
+		},
+		Parent:    &domain.SessionKey{UpstreamID: parent},
+		CreatedAt: 100, UpdatedAt: 100,
+	}
+	ev, err := domain.NewSessionEvent(domain.EventSessionCreated, sess)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ev
+}
+
+// v2TypedStatusEvent 构造 v2 typed StatusChanged 事件（真实契约形状，与
+// TestP18_TypedStatusEvent_OwnershipGate 同源）。
+func v2TypedStatusEvent(t *testing.T, sid string, state domain.AgentStatus) domain.AgentEvent {
+	t.Helper()
+	ev, err := domain.NewStatusEvent(domain.SessionKey{
+		ProviderID:         ocdeckstore.ProviderIDV2,
+		ProviderInstanceID: ocdeckstore.ProviderInstanceV2Default,
+		UpstreamID:         sid,
+	}, domain.StatusDetail{State: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ev
+}
+
+// TestV2_TypedCreated_ParentOwned_ClaimsChild 验证父已归属本任务时，v2 typed
+// session.created(子) 认领子并钉 parentID；随后 typed StatusChanged(子,busy) 经
+// OwnerOf + 成员 fail-closed 正常聚合为 busy 并发布（恢复 agent_status.go §21
+// 「父 idle + 子 busy MUST show busy」语义）。使用 p18 mock harness（lifecycle
+// OwnerOf 可用、claim 落 store.sessions）。
+func TestV2_TypedCreated_ParentOwned_ClaimsChild(t *testing.T) {
+	store := newMockStore()
+	seedActiveTask(store, "t1", "p1")
+	// 父 session 已归属本任务（claim 守卫的输入）。
+	store.sessions["t1"] = []SessionRow{{TaskID: "t1", SessionID: "s-parent"}}
+	m, pub, _ := newP18Manager(t, store, newMockProc(), newMockOC(true))
+	_, a := p18ReadyRuntime(m, "t1", "s-parent") // owned={s-parent}, idle
+	ctx := context.Background()
+
+	if got := a.snapshotValue(); got != "idle" {
+		t.Fatalf("initial aggregate = %q, want idle", got)
+	}
+
+	// 子 session.created（父=s-parent 已归属 t1）→ 认领子。
+	if err := m.handleAgentEvent(ctx, "t1", v2TypedCreatedWithParent(t, "s-child", "s-parent")); err != nil {
+		t.Fatalf("typed created with owned parent must claim child without error: %v", err)
+	}
+	// 认领落库：子行归属 t1、parentID 钉父。
+	rows := store.sessions["t1"]
+	var childRow *SessionRow
+	for i := range rows {
+		if rows[i].SessionID == "s-child" {
+			childRow = &rows[i]
+		}
+	}
+	if childRow == nil {
+		t.Fatalf("child session must be claimed; sessions[t1]=%+v", rows)
+	}
+	if childRow.ParentID != "s-parent" {
+		t.Fatalf("child row ParentID = %q, want s-parent", childRow.ParentID)
+	}
+	// noteAgentSessionClaimed 加入 owned 成员，仍全 idle → 聚合 idle，无新发布。
+	if got := a.snapshotValue(); got != "idle" {
+		t.Fatalf("after child claim aggregate = %q, want idle", got)
+	}
+
+	// typed StatusChanged(子,busy) → OwnerOf 命中 t1 + 子在 owned 成员 → 聚合 busy。
+	if err := m.handleAgentEvent(ctx, "t1", v2TypedStatusEvent(t, "s-child", domain.StatusBusy)); err != nil {
+		t.Fatalf("typed status busy for owned child: %v", err)
+	}
+	if got := a.snapshotValue(); got != "busy" {
+		t.Fatalf("after child busy aggregate = %q, want busy", got)
+	}
+	if rs := pub.runStatus(); len(rs) != 1 || rs[0].From != "idle" || rs[0].To != "busy" || !rs[0].Available {
+		t.Fatalf("child busy publish = %+v, want one idle→busy available", rs)
+	}
+}
+
+// TestV2_TypedCreated_ParentForeign_NotClaimed 验证父归属他任务时，v2 typed
+// session.created(子) 不认领（不重开跨任务偷 candidate：他任务的子也属他任务域），
+// 快照不变、无发布。
+func TestV2_TypedCreated_ParentForeign_NotClaimed(t *testing.T) {
+	store := newMockStore()
+	seedActiveTask(store, "t1", "p1")
+	store.sessions["t1"] = []SessionRow{{TaskID: "t1", SessionID: "s-parent-t1"}}
+	// 父归属他任务 t2（共享流上到达 t1 的他任务子 created 形态）。
+	store.sessions["t2"] = []SessionRow{{TaskID: "t2", SessionID: "s-parent-t2"}}
+	m, pub, _ := newP18Manager(t, store, newMockProc(), newMockOC(true))
+	_, a := p18ReadyRuntime(m, "t1", "s-parent-t1") // owned={s-parent-t1}, idle
+	ctx := context.Background()
+
+	// 子 created 父=s-parent-t2（属 t2）→ 不认领，无错误。
+	if err := m.handleAgentEvent(ctx, "t1", v2TypedCreatedWithParent(t, "s-child-foreign", "s-parent-t2")); err != nil {
+		t.Fatalf("typed created with foreign parent must be dropped without error: %v", err)
+	}
+	for _, rows := range store.sessions {
+		for _, r := range rows {
+			if r.SessionID == "s-child-foreign" {
+				t.Fatalf("foreign-parent child must not be claimed; row=%+v", r)
+			}
+		}
+	}
+	if got := a.snapshotValue(); got != "idle" {
+		t.Fatalf("aggregate after foreign-parent created = %q, want idle", got)
+	}
+	if n := len(pub.runStatus()); n != 0 {
+		t.Fatalf("foreign-parent created must not publish; events=%d", n)
+	}
+
+	// 即便随后收到该子的 busy 状态事件，OwnerOf 未命中 → 仍忽略，快照不变。
+	if err := m.handleAgentEvent(ctx, "t1", v2TypedStatusEvent(t, "s-child-foreign", domain.StatusBusy)); err != nil {
+		t.Fatalf("typed status busy for foreign child: %v", err)
+	}
+	if got := a.snapshotValue(); got != "idle" {
+		t.Fatalf("aggregate after foreign child busy = %q, want idle", got)
+	}
+	if n := len(pub.runStatus()); n != 0 {
+		t.Fatalf("foreign child busy must not publish; events=%d", n)
+	}
+}
+
+// TestV2_TypedCreated_ParentUnowned_NotClaimed 验证父未归属任何任务（孤儿父）
+// 时，v2 typed session.created(子) 不认领——避免未对齐落账前抢归属。fail-closed
+// 丢弃、无错误、快照不变。
+func TestV2_TypedCreated_ParentUnowned_NotClaimed(t *testing.T) {
+	store := newMockStore()
+	seedActiveTask(store, "t1", "p1")
+	store.sessions["t1"] = []SessionRow{{TaskID: "t1", SessionID: "s-parent"}}
+	m, pub, _ := newP18Manager(t, store, newMockProc(), newMockOC(true))
+	_, a := p18ReadyRuntime(m, "t1", "s-parent")
+	ctx := context.Background()
+
+	// 子 created 父=s-orphan-parent（未归属任何任务）→ fail-closed 丢弃。
+	if err := m.handleAgentEvent(ctx, "t1", v2TypedCreatedWithParent(t, "s-child-orphan", "s-orphan-parent")); err != nil {
+		t.Fatalf("typed created with unowned parent must be dropped without error: %v", err)
+	}
+	for _, rows := range store.sessions {
+		for _, r := range rows {
+			if r.SessionID == "s-child-orphan" {
+				t.Fatalf("unowned-parent child must not be claimed; row=%+v", r)
+			}
+		}
+	}
+	if got := a.snapshotValue(); got != "idle" {
+		t.Fatalf("aggregate after unowned-parent created = %q, want idle", got)
+	}
+	if n := len(pub.runStatus()); n != 0 {
+		t.Fatalf("unowned-parent created must not publish; events=%d", n)
+	}
+}

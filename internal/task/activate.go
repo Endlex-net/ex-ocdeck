@@ -1881,28 +1881,49 @@ func (m *Manager) handleAgentEvent(ctx context.Context, taskID string, ev domain
 		if sess == nil || sess.Key.UpstreamID == "" {
 			return nil
 		}
-		// v2 typed created MUST NOT claim（跨任务偷 candidate 事故修复）：v2 SSE
-		// 是共享 serve 的全局事件流（归属键仅 data.sessionID，envelope location
-		// 可选且未实证），任何活跃任务都会收到他任务 candidate 的 created 广播
-		// ——claim 会在首建任务提交前抢走归属（CommitFirstBuild/CommitAdoption
+		// v2 typed created 反偷 candidate 守卫（跨任务偷 candidate 事故修复）：
+		// v2 SSE 是共享 serve 的全局事件流（归属键仅 data.sessionID，envelope
+		// location 可选且未实证），任何活跃任务都会收到他任务 candidate 的 created
+		// 广播——claim 会在首建任务提交前抢走归属（CommitFirstBuild/CommitAdoption
 		// 守卫 fail-closed 拒绝提交 → 候选被误回收、激活失败，容器实测事故链）。
 		// v2 归属唯一合法来源 = 首建/承接原子提交协议 + 对齐（design D4 替换表：
 		// 事件消费在提交成功后=消费非认领；D3 attach 钉住 binding 原 session，
-		// 无外部认领流程；子 session 归属由对齐落账）。丢弃 + debug 日志（非协议
-		// 违约，不 fatal）。v1 原始通道（B3a 目录防线 + claim）行为不变。
-		if sess.Key.ProviderID == store.ProviderIDV2 {
-			debugf("v2 typed session.created %s ignored: ownership only via atomic commit/align, never event claim", sess.Key.UpstreamID)
-			return nil
-		}
+		// 无外部认领流程）。
+		//
+		// 例外：后台 subagent 是独立子 session（带 parentID），且子 session 永不
+		// 进入 task_sessions 直到对齐落账，故「父 idle + 子 busy」会被聚合漏成
+		// idle（agent_status.go §21 历史约束）。当父 session 已被本任务认领时，
+		// 子 session.created 可安全认领——认领后 typed StatusChanged(child) 经
+		// OwnerOf + 成员 fail-closed 正常聚合（parent 未认领/属他任务/查不到一律
+		// 丢弃 + debug 日志，与既有 drop 同为加性路径，不 fatal 运行时）。v1 原始
+		// 通道（B3a 目录防线 + claim）行为不变。
 		sid := sess.Key.UpstreamID
+		var parentID string
+		if sess.Parent != nil {
+			parentID = sess.Parent.UpstreamID
+		}
+		if sess.Key.ProviderID == store.ProviderIDV2 {
+			if parentID == "" {
+				debugf("v2 typed session.created %s ignored: parentless candidate, ownership only via atomic commit/align", sid)
+				return nil
+			}
+			// 仅当父已归属本任务时才认领子；查不到/属他任务/查询错误一律 fail-closed
+			// 丢弃（加性捕获路径，匹配既有 unowned created drop：debug 日志，非 fatal）。
+			parentOwned, perr := m.sessionOwnedByTask(ctx, taskID, parentID)
+			if perr != nil {
+				debugf("v2 typed session.created %s ignored: parent %s ownership lookup error: %v", sid, parentID, perr)
+				return nil
+			}
+			if !parentOwned {
+				debugf("v2 typed session.created %s ignored: parent %s not owned by task %s", sid, parentID, taskID)
+				return nil
+			}
+			// 父已归属本任务 → 落入下方共享 claim 块（认领子，parentID 钉父）。
+		}
 		// created 零值时间可（C8：适配层不要求时间字段存在）。
 		createdAt, lastSeen := sess.CreatedAt, sess.UpdatedAt
 		if lastSeen < createdAt {
 			lastSeen = createdAt
-		}
-		var parentID string
-		if sess.Parent != nil {
-			parentID = sess.Parent.UpstreamID
 		}
 		// 评审 I5：会话写端口保留完整 SessionKey（事件携带 provider/instance 命名
 		// 空间——v2 会话归属行落 v2 命名空间）。事件 key 命名空间为空（未感知
@@ -2310,6 +2331,23 @@ func (m *Manager) sessionBelongsToTask(ctx context.Context, taskID, sid string) 
 		}
 	}
 	return false, nil
+}
+
+// sessionOwnedByTask 反查 sessionID 是否归属 taskID，沿用 applyAgentStatusEventFromAgent
+// 的归属反查契约（lifecycle.OwnerOf 优先，legacy 回退 sessionBelongsToTask）。供 v2
+// typed session.created 的父子归属守卫复用：父已归属本任务才认领子 session。
+func (m *Manager) sessionOwnedByTask(ctx context.Context, taskID, sid string) (bool, error) {
+	if m.lifecycle != nil {
+		owner, found, err := m.lifecycle.OwnerOf(ctx, ocdecksess.ID(sid))
+		if err != nil {
+			return false, err
+		}
+		if !found || owner != taskID {
+			return false, nil
+		}
+		return true, nil
+	}
+	return m.sessionBelongsToTask(ctx, taskID, sid)
 }
 
 // alignSessions 全量对齐（design.md §4 + add-plain-dir-project D8）：
