@@ -682,6 +682,87 @@ func TestP18_TypedStatusEvent_OwnershipGate(t *testing.T) {
 	}
 }
 
+// TestP18_TypedAttentionEvent_OwnershipGate 验证 typed Attention 事件归属
+// fail-closed（与 StatusChanged 同源，spec 模式 A「未命中一律忽略」）：共享 v2
+// 全局事件流会携带他任务/未归属 session 的 permission.asked，MUST NOT 写入本任务
+// pending 集合（否则所有未挂起任务误显「等待人工」）；归属反查永不返回错误（注意力
+// 事件处理不得中断 SSE 消费循环）；已归属 session 的 asked/resolved 正常 apply。
+func TestP18_TypedAttentionEvent_OwnershipGate(t *testing.T) {
+	store := newMockStore()
+	seedActiveTask(store, "t1", "p1")
+	store.sessions["t1"] = []SessionRow{{TaskID: "t1", SessionID: "s1"}}
+	// 他任务归属 session（共享流上到达 t1 的事件形态）。
+	store.sessions["t2"] = []SessionRow{{TaskID: "t2", SessionID: "s2"}}
+	m, pub, _ := newP18Manager(t, store, newMockProc(), newMockOC(true))
+	// p18ReadyRuntime 不初始化 attention 状态；显式 ensure 后 apply 才非 no-op。
+	_, _ = p18ReadyRuntime(m, "t1", "s1")
+	rt := m.getRuntime("t1")
+	rt.ensureAttentionState()
+	ctx := context.Background()
+
+	// typed 注意力事件（真实契约形状：NewAttentionEvent + v2 命名空间 SessionKey）。
+	attEvent := func(kind domain.EventKind, sid, reqID string) domain.AgentEvent {
+		ev, err := domain.NewAttentionEvent(kind, domain.Attention{
+			ID:      reqID,
+			Kind:    domain.AttentionPermission,
+			Session: domain.SessionKey{ProviderID: ocdeckstore.ProviderIDV2, ProviderInstanceID: ocdeckstore.ProviderInstanceV2Default, UpstreamID: sid},
+			Permission: &domain.PermissionPayload{
+				ID:         reqID,
+				SessionID:  sid,
+				Permission: "bash",
+				Patterns:   []string{"rm -rf /tmp/x"},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ev
+	}
+
+	// 基线：t1 attention 为空快照。
+	if snap, ok := m.Attention("t1"); !ok || len(snap.Permissions) != 0 {
+		t.Fatalf("baseline attention = %+v ok=%v, want empty permissions", snap, ok)
+	}
+
+	// 孤儿（未归属）session 的 asked：忽略，不写 pending。
+	if err := m.handleAgentEvent(ctx, "t1", attEvent(domain.EventAttentionRaised, "s-orphan", "r-orphan")); err != nil {
+		t.Fatalf("orphan attention event: %v", err)
+	}
+	if snap, _ := m.Attention("t1"); len(snap.Permissions) != 0 {
+		t.Fatalf("orphan asked must not add pending permission; got %+v", snap.Permissions)
+	}
+
+	// 他任务归属 session 的 asked：同样忽略。
+	if err := m.handleAgentEvent(ctx, "t1", attEvent(domain.EventAttentionRaised, "s2", "r-foreign")); err != nil {
+		t.Fatalf("other-task attention event: %v", err)
+	}
+	if snap, _ := m.Attention("t1"); len(snap.Permissions) != 0 {
+		t.Fatalf("other-task asked must not add pending permission; got %+v", snap.Permissions)
+	}
+
+	// 已归属 session（s1）的 asked：写入 pending。
+	if err := m.handleAgentEvent(ctx, "t1", attEvent(domain.EventAttentionRaised, "s1", "r-owned")); err != nil {
+		t.Fatalf("owned asked attention event: %v", err)
+	}
+	snap, _ := m.Attention("t1")
+	if len(snap.Permissions) != 1 || snap.Permissions[0].ID != "r-owned" || snap.Permissions[0].SessionID != "s1" {
+		t.Fatalf("owned asked must add pending permission r-owned/s1; got %+v", snap.Permissions)
+	}
+
+	// 已归属 session 的 resolved：移除 pending。
+	if err := m.handleAgentEvent(ctx, "t1", attEvent(domain.EventAttentionResolved, "s1", "r-owned")); err != nil {
+		t.Fatalf("owned resolved attention event: %v", err)
+	}
+	if snap, _ := m.Attention("t1"); len(snap.Permissions) != 0 {
+		t.Fatalf("owned resolved must remove pending permission; got %+v", snap.Permissions)
+	}
+
+	// 归属守卫期间不应产生 run_status 发布（attention 路径不触达状态聚合）。
+	if rs := pub.runStatus(); len(rs) != 0 {
+		t.Fatalf("attention events must not publish run_status; got %d", len(rs))
+	}
+}
+
 // TestP18_Apply_StatusEvent_ForeignSessionNoOp 验证 apply 层对未知 session 的
 // fail-closed：共享 v2 全局事件流会携带他任务/未归属 session 的状态事件，调用方
 // 的 OwnerOf 反查不足以兜底——agentOpStatusEvent 的写入是加性的且在重连前从不剪枝，

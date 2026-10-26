@@ -2007,15 +2007,7 @@ func (m *Manager) handleAgentEvent(ctx context.Context, taskID string, ev domain
 			return nil
 		}
 		aev := attentionEventFromAgentEvent(*ev.Attention, ev.Kind == domain.EventAttentionResolved)
-		if rt := m.getRuntime(taskID); rt != nil {
-			if rt.applyAttentionEvent(aev) {
-				m.commitAttentionChanged(taskID, rt, true)
-			}
-			// task-permission-mode D4 (a)：SSE asked 应用后扫描（与原始通道同义）。
-			if aev.Type == appagent.AttentionPermission && aev.Kind == appagent.AttentionAsked {
-				m.judgeScan(rt)
-			}
-		}
+		m.applyOwnedAttentionEvent(ctx, taskID, aev)
 	case domain.EventSessionError:
 		m.observeSessionErrorFromAgentEvent(ctx, taskID, ev)
 	case domain.EventStatusChanged:
@@ -2056,6 +2048,46 @@ func attentionEventFromAgentEvent(att domain.Attention, resolved bool) appagent.
 		}
 	}
 	return out
+}
+
+// applyOwnedAttentionEvent 在归属守卫通过后应用一个注意力事件（typed/raw 共享，
+// 防止 v2 共享全局事件流上他任务/未归属 session 的 permission.asked/question
+// 污染本任务 pending 集合，造成所有未挂起任务误显「等待人工」）。
+//
+// 归属键 = aev.SessionID（attentionEventFromAgentEvent 复制自 att.Session.UpstreamID；
+// ParseAttentionEvent 复制自 properties.sessionID）。空 SessionID 无法归属 → drop。
+// 归属反查错误/未归属/未找到一律 fail-closed drop + debugf（加性捕获路径，与
+// v2 typed created parent-lookup drop 同源：activate.go:1912-1919，非 fatal）。
+// 注意力事件处理永不返回错误——不得让归属反查失败中断 SSE 消费循环。
+//
+// 已归属 session：apply + commitAttentionChanged + judgeScan 行为与既有 inline 实现一致。
+func (m *Manager) applyOwnedAttentionEvent(ctx context.Context, taskID string, aev appagent.AttentionEvent) {
+	sid := aev.SessionID
+	if sid == "" {
+		debugf("task %s: attention event %s/%s ignored: empty sessionID, cannot attribute", taskID, aev.Type, aev.Kind)
+		return
+	}
+	owned, err := m.sessionOwnedByTask(ctx, taskID, sid)
+	if err != nil {
+		debugf("task %s: attention event %s/%s for session %s ignored: ownership lookup error: %v", taskID, aev.Type, aev.Kind, sid, err)
+		return
+	}
+	if !owned {
+		debugf("task %s: attention event %s/%s for session %s ignored: session not owned by task", taskID, aev.Type, aev.Kind, sid)
+		return
+	}
+	rt := m.getRuntime(taskID)
+	if rt == nil {
+		return
+	}
+	if rt.applyAttentionEvent(aev) {
+		m.commitAttentionChanged(taskID, rt, true)
+	}
+	// task-permission-mode D4 (a)：SSE asked 应用后扫描（准入未过自然拒绝；
+	// judged-set 保证重放/重复 asked 不放大判定）。
+	if aev.Type == appagent.AttentionPermission && aev.Kind == appagent.AttentionAsked {
+		m.judgeScan(rt)
+	}
 }
 
 // observeSessionErrorFromAgentEvent 是 observeSessionErrorEvent 的 typed 等价
@@ -2260,21 +2292,13 @@ func (m *Manager) handleSSEEvent(ctx context.Context, taskID, wtPath string, ev 
 		}
 		m.noteAgentSessionDeleted(taskID, sid)
 	default:
-		// D6 注意力事件：permission/question v1+v2 家族。ParseAttentionEvent 命中则应用，
-		// 未知/缺字段静默忽略。注意力事件处理永不返回错误（不影响任务状态机）。
+		// D6 注意力事件：permission/question v1+v2 家族。ParseAttentionEvent 命中则
+		// 经归属守卫应用（见 applyOwnedAttentionEvent），未知/缺字段静默忽略。
+		// 注意力事件处理永不返回错误（不影响任务状态机）。
 		// P1.4.5：apply 返回 changed，经 commit helper 发布 serve_runtime.attention_changed
 		//（NoopPublisher 阶段调用位就绪无实际发布）。
 		if aev, ok := appagent.ParseAttentionEvent(ev); ok {
-			if rt := m.getRuntime(taskID); rt != nil {
-				if rt.applyAttentionEvent(aev) {
-					m.commitAttentionChanged(taskID, rt, true)
-				}
-				// task-permission-mode D4 (a)：SSE asked 应用后扫描。准入未过自然拒绝
-				//（暂缓或忽略）；judged-set 保证重放/重复 asked 不放大判定。
-				if aev.Type == appagent.AttentionPermission && aev.Kind == appagent.AttentionAsked {
-					m.judgeScan(rt)
-				}
-			}
+			m.applyOwnedAttentionEvent(ctx, taskID, aev)
 			return nil
 		}
 		// task-notifications D2：session.error 在 B3b 归属反查之前消费（attention/

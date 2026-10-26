@@ -46,6 +46,7 @@ ocdeck 对 opencode v2 的兼容性按**冻结基线**声明，当前锚点：
 - 回复 `POST /api/session/{id}/permission/{requestID}/reply?directory=<d>` body `{decision: "once"|"always"|"reject"}` → **204**（query 形态与 design D7 一致，R2 once/reject 实证 204）；重复回复 / 幽灵 `per_` id → **404 PermissionNotFoundError**。〔实证〕R2 `live/attention/once-facts.json` + `reject-facts.json`
 - pending 仅存于 session 级 `GET /api/session/{id}/permission`；全局 `GET /api/permission/request` 必须带 `location[directory]` deepObject 过滤（否则返回空 `{location, data:[]}`）；`/api/permission/saved` 仅存已保存规则（非 pending，`{data: []}` 初始为空）。〔实证〕R2 `live/attention/pending-observation.json`
 - permission ID `^per`；升起事件 `permission.asked`（data 含 per id / sessionID / action / resources）。〔实证〕R2 `live/event/perm-frames.jsonl`；〔静态schema〕`packages/schema/src/permission.ts`（`isStartingWith("per")`、`permission.asked` 定义）
+- 完成事件 `permission.replied`（data 含 sessionID / requestID / reply）。`reply ∈ {once, always, reject}`，同一 permission 的 `replied.requestID === asked.id`。`reply` 仅诊断（once/always=批准、reject=拒绝），归一化统一映射 SPI `EventAttentionResolved`（replied/rejected 不分流独立 Kind，下游 `removePermLocked` 按 RequestID 命中处置一致）。〔实证〕run 20261016T090000Z-0bb6ac6c `live/attention/p1b-stream.ndjson:37`（reply=once）、`:109`（reply=reject）；`:33`（对应 asked.id）
 
 ## 6. Question → Form 等价
 

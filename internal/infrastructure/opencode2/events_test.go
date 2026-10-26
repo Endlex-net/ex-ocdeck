@@ -209,6 +209,86 @@ func TestEvents_TerminalExecutionEventsMapIdle(t *testing.T) {
 	_ = es.Close()
 }
 
+// TestEvents_PermissionRepliedMapsResolved 回归：v2 审批完成/拒绝后 TUI 未消
+// 掉审批标记——translateV2Event 原只映射 permission.asked、replied 帧被 default
+// 丢弃，removePermLocked 永不触发。实证形态：permission.replied data
+// {sessionID, requestID, reply}，reply∈{once,always,reject}（once/reject 实证
+// evidence/20261016T090000Z-0bb6ac6c/live/attention/p1b-stream.ndjson:37/:109）；
+// asked.id === replied.requestID（同一条 permission）。reply 仅诊断，
+// EventAttentionResolved 统一覆盖 replied/rejected，MUST NOT 据此推导 idle/busy。
+func TestEvents_PermissionRepliedMapsResolved(t *testing.T) {
+	var clientRef *Client
+	srv := httptestServerFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/event" {
+			t.Errorf("path: %s", r.URL.Path)
+			w.WriteHeader(404)
+			return
+		}
+		writeSSE(t, w, "data: {\"id\":\"e0\",\"type\":\"server.connected\",\"data\":{}}\n\n"+
+			// asked（once 链）。
+			"data: {\"id\":\"e1\",\"type\":\"permission.asked\",\"data\":{\"id\":\"per_once01\",\"sessionID\":\"ses_fixture01a\",\"action\":\"shell\",\"resources\":[\"touch /tmp/m\"]}}\n\n"+
+			// replied once：requestID === asked.id。
+			"data: {\"id\":\"e2\",\"type\":\"permission.replied\",\"data\":{\"sessionID\":\"ses_fixture01a\",\"requestID\":\"per_once01\",\"reply\":\"once\"}}\n\n"+
+			// asked（reject 链）。
+			"data: {\"id\":\"e3\",\"type\":\"permission.asked\",\"data\":{\"id\":\"per_rej02\",\"sessionID\":\"ses_fixture01a\",\"action\":\"shell\",\"resources\":[\"rm -rf /tmp/m\"]}}\n\n"+
+			// replied reject：requestID === asked.id。
+			"data: {\"id\":\"e4\",\"type\":\"permission.replied\",\"data\":{\"sessionID\":\"ses_fixture01a\",\"requestID\":\"per_rej02\",\"reply\":\"reject\"}}\n\n")
+		<-r.Context().Done()
+	})
+	setMasterSecret(t)
+	p := NewSPIProvider(ProviderOptions{StatusVerified: true})
+	p.newClient = func(port int, password string, opts Options) *Client {
+		c := NewClient(port, password, opts)
+		c.baseURL = srv.URL
+		clientRef = c
+		return c
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	es, err := p.Events().Subscribe(ctx, testBinding(t))
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	es.SetCallbacks(func() {}, nil)
+
+	wantKey := testSessionKey()
+	// asked(once) → raised。
+	raised := expectEvent(t, es, domain.EventAttentionRaised)
+	if raised.Attention.ID != "per_once01" ||
+		raised.Attention.Kind != domain.AttentionPermission ||
+		raised.Attention.Session != wantKey ||
+		raised.Attention.Permission == nil || raised.Attention.Permission.Permission != "shell" {
+		t.Fatalf("raised(once) attention: %+v", raised.Attention)
+	}
+	// replied(once) → resolved，ID === requestID，Permission 负载非 nil（不变量），
+	// Permission/Patterns 允许空（诊断字段不参与匹配）。
+	resolvedOnce := expectEvent(t, es, domain.EventAttentionResolved)
+	if resolvedOnce.Attention.ID != "per_once01" ||
+		resolvedOnce.Attention.Kind != domain.AttentionPermission ||
+		resolvedOnce.Attention.Session != wantKey ||
+		resolvedOnce.Attention.Permission == nil || resolvedOnce.Attention.Permission.ID != "per_once01" {
+		t.Fatalf("resolved(once) attention: %+v", resolvedOnce.Attention)
+	}
+	// asked(reject) → raised。
+	raised2 := expectEvent(t, es, domain.EventAttentionRaised)
+	if raised2.Attention.ID != "per_rej02" {
+		t.Fatalf("raised(reject) attention ID: %+v", raised2.Attention)
+	}
+	// replied(reject) 同样映射 resolved（不分流 rejected Kind）。
+	resolvedRej := expectEvent(t, es, domain.EventAttentionResolved)
+	if resolvedRej.Attention.ID != "per_rej02" ||
+		resolvedRej.Attention.Session != wantKey {
+		t.Fatalf("resolved(reject) attention: %+v", resolvedRej.Attention)
+	}
+
+	// replied 为已知事件，MUST NOT 走保守丢弃。
+	if clientRef == nil || clientRef.MalformedCount() != 0 {
+		t.Fatalf("replied must not count as conservative drops: %v", clientRef)
+	}
+	cancel()
+	_ = es.Close()
+}
+
 func TestEvents_Reconnect_SnapshotSelfHeal(t *testing.T) {
 	var conns int32
 	srv := httptestServerFunc(t, func(w http.ResponseWriter, r *http.Request) {

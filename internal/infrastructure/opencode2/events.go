@@ -165,8 +165,7 @@ func translateV2Event(ev wireEvent, statusOf func(domain.SessionKey, domain.Agen
 		return out, err == nil
 
 	case "permission.asked":
-		// attention 补证已冻结部分：data{id, sessionID, action, resources, save}
-		//（R2 perm-frames.jsonl）；resolution 事件名未实证 → 保守不映射。
+		// data{id, sessionID, action, resources, save}（R2 perm-frames.jsonl）。
 		id, okID := eventString(ev, "id")
 		if !okID || !ok {
 			return domain.AgentEvent{}, false
@@ -182,6 +181,30 @@ func translateV2Event(ev wireEvent, statusOf func(domain.SessionKey, domain.Agen
 			},
 		}
 		out, err := domain.NewAttentionEvent(domain.EventAttentionRaised, att)
+		return out, err == nil
+
+	case "permission.replied":
+		// data{sessionID, requestID, reply}：审批完成（once/always）与拒绝
+		//（reject）共用同一事件名。reply 载荷仅诊断——EventAttentionResolved
+		// 已覆盖两类终态（activate.go attentionEventFromAgentEvent resolved →
+		// AttentionReplied；removePermLocked 按 RequestID 命中，replied/rejected
+		// 处置一致），MUST NOT 据此推导 idle/busy。Attention.ID = requestID，与
+		// asked 的 data.id 同值，removePermLocked 据此命中。
+		// 实证：evidence/20261016T090000Z-0bb6ac6c/live/attention/p1b-stream.ndjson
+		// :37 reply=once、:109 reply=reject（asked.id === replied.requestID）。
+		requestID, okReq := eventString(ev, "requestID")
+		if !okReq || !ok {
+			return domain.AgentEvent{}, false
+		}
+		att := domain.Attention{
+			ID:      requestID,
+			Kind:    domain.AttentionPermission,
+			Session: v2Namespace(sessionID),
+			Permission: &domain.PermissionPayload{
+				ID: requestID, SessionID: sessionID,
+			},
+		}
+		out, err := domain.NewAttentionEvent(domain.EventAttentionResolved, att)
 		return out, err == nil
 
 	default:

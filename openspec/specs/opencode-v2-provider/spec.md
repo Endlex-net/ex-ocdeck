@@ -44,6 +44,11 @@
 - **WHEN** 发起事件订阅
 - **THEN** 仅在观测到可解析的首帧 `server.connected` 后才将订阅视为建立；进程存活不等于握手成立
 
+#### Scenario: permission.replied 归一化为 AttentionResolved
+
+- **WHEN** v2 上游发出 `permission.replied` 事件且 `data.requestID` 命中此前 `permission.asked` 升起的同一 permission（`replied.requestID === asked.id`），`data.sessionID` 归属当前任务 session
+- **THEN** 归一化为 SPI `EventAttentionResolved`，`Attention.ID = data.requestID`（与 asked 升起时的 ID 同值，下游 `removePermLocked` 据此命中移除 pending）；`reply ∈ {once, always, reject}` 仅作诊断，批准与拒绝统一映射为 `AttentionResolved`、MUST NOT 分流独立 rejected Kind；MUST NOT 据 `permission.replied` 推导 session idle/busy 状态（idle/busy 仅由执行边界事件 `session.execution.*` 决定）
+
 ### Requirement: v2 attention 通道
 
 系统 SHALL 经 v2 permission/form 端点兑现 SPI AttentionIO：pending permission 快照 MUST 读 session 级 `GET /api/session/{id}/permission?directory=<d>`（实证：pending 仅存于 session 级端点；全局 `/api/permission/request` 不带 `location[directory]` deepObject 过滤时返回空，MUST NOT 作为 pending 来源）；`/api/permission/saved` 仅存已保存规则，MUST NOT 并入 pending 视图。question 的等价能力为 form 族（`GET /api/session/{id}/form`，pending 判定 = `state.status="pending"`；上游无 question 端点）。permission 回复 MUST 使用 `POST /api/session/{id}/permission/{requestID}/reply?directory=<d>`（body `{decision: once|always|reject}`，204）；form 回复 MUST 使用 `POST /api/session/{id}/form/{formID}/reply`（body `{answer}`，204）。无 pending 项时 MUST 返回空视图而非错误。端点 4xx/5xx 或不可解析响应 MUST 如实报错并透出能力健康，不得吞错返回空。逐方法 wire↔SPI 映射 MUST 遵循 design D7 映射表，表中标注【待实证】的项在冻结前 MUST 保持保守语义。
