@@ -207,6 +207,52 @@ func translateV2Event(ev wireEvent, statusOf func(domain.SessionKey, domain.Agen
 		out, err := domain.NewAttentionEvent(domain.EventAttentionResolved, att)
 		return out, err == nil
 
+	case "form.created":
+		// data.form 为嵌套 Form.Info{id, sessionID, title, fields[]}，归属取
+		// form.sessionID（MUST NOT 读 data.sessionID）。fields 形态违约 →
+		// 保守丢弃，与 REST ListSessionForms/GetForm 的解析口径一致。
+		formRaw, err := json.Marshal(ev.Data["form"])
+		if err != nil {
+			return domain.AgentEvent{}, false
+		}
+		var info wireFormInfo
+		// fields 为 required：omitted/null → nil 视为违约；[] 为合法空列表。
+		if err := json.Unmarshal(formRaw, &info); err != nil || info.ID == "" || info.SessionID == "" || info.Fields == nil {
+			return domain.AgentEvent{}, false
+		}
+		fields, err := mapFormFields(info.Fields)
+		if err != nil {
+			return domain.AgentEvent{}, false
+		}
+		att := domain.Attention{
+			ID:      info.ID,
+			Kind:    domain.AttentionQuestion,
+			Session: v2Namespace(info.SessionID),
+			Question: &domain.QuestionPayload{
+				ID: info.ID, SessionID: info.SessionID, Title: info.Title, Fields: fields,
+			},
+		}
+		out, err := domain.NewAttentionEvent(domain.EventAttentionRaised, att)
+		return out, err == nil
+
+	case "form.replied", "form.cancelled":
+		// data{id, sessionID}：replied 另带诊断 answer，不参与映射；两者都是
+		// 注意力终态，MUST NOT 据此推导 idle/busy（仅 session.execution.* 驱动）。
+		id, okID := eventString(ev, "id")
+		if !okID || !ok {
+			return domain.AgentEvent{}, false
+		}
+		att := domain.Attention{
+			ID:      id,
+			Kind:    domain.AttentionQuestion,
+			Session: v2Namespace(sessionID),
+			Question: &domain.QuestionPayload{
+				ID: id, SessionID: sessionID,
+			},
+		}
+		out, err := domain.NewAttentionEvent(domain.EventAttentionResolved, att)
+		return out, err == nil
+
 	default:
 		// 未知事件与错误族：MUST NOT 猜测为 SessionError，保守丢弃+记录
 		//（stream failure 由调用方按 streamFailureType 先行识别计数）。

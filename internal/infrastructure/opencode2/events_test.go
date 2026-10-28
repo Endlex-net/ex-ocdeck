@@ -147,7 +147,7 @@ func TestEvents_FixtureStreamNormalization(t *testing.T) {
 
 // TestEvents_TerminalExecutionEventsMapIdle 回归：真实停止/失败的 v2 会话只发
 // session.execution.interrupted / session.execution.failed、不跟随 succeeded
-//（实证 evidence/20261016T090000Z-0bb6ac6c live/lifecycle/p1b-frames-1.jsonl:20
+// （实证 evidence/20261016T090000Z-0bb6ac6c live/lifecycle/p1b-frames-1.jsonl:20
 // interrupted reason=user、evidence/20261014T040930Z-1bc764c7 live/event/
 // stream.ndjson:43 failed data.error）——两者均为执行终态，MUST 映射回 idle，
 // 否则 UI 永久 busy。error/reason 载荷仅诊断，不参与映射。
@@ -287,6 +287,123 @@ func TestEvents_PermissionRepliedMapsResolved(t *testing.T) {
 	}
 	cancel()
 	_ = es.Close()
+}
+
+// TestEvents_FormLifecycleMapsQuestionAttention 回归：v2 question 对应 form 事件族，
+// 原 translateV2Event default 丢弃 form.created/replied/cancelled，attention.questions
+// 永空、UI 停留在工作中。form.created 归属取嵌套 data.form.sessionID（无 data.sessionID），
+// replied/cancelled 归属取 data.sessionID；replied 的 answer 仅诊断。
+// 三者都只生成 attention 事件，MUST NOT 据此推导 idle/busy。
+func TestEvents_FormLifecycleMapsQuestionAttention(t *testing.T) {
+	var clientRef *Client
+	srv := httptestServerFunc(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/event" {
+			t.Errorf("path: %s", r.URL.Path)
+			w.WriteHeader(404)
+			return
+		}
+		writeSSE(t, w, "data: {\"id\":\"e0\",\"type\":\"server.connected\",\"data\":{}}\n\n"+
+			// created（replied 链）：无 data.sessionID，归属仅凭 form.sessionID。
+			"data: {\"id\":\"e1\",\"type\":\"form.created\",\"data\":{\"form\":{\"id\":\"frm_q01\",\"sessionID\":\"ses_fixture01a\",\"title\":\"Pick\",\"fields\":[{\"key\":\"lang\",\"type\":\"enum\",\"title\":\"Language\",\"description\":\"Pick one\",\"required\":true,\"options\":[{\"value\":\"go\",\"label\":\"Go\"},{\"value\":\"rs\",\"label\":\"Rust\"}],\"hidden\":true},{\"key\":\"tags\",\"type\":\"multiselect\",\"options\":[{\"value\":\"a\",\"label\":\"A\"}]},{\"key\":\"name\",\"type\":\"string\"}]}}}\n\n"+
+			// replied：诊断 answer 不影响映射。
+			"data: {\"id\":\"e2\",\"type\":\"form.replied\",\"data\":{\"id\":\"frm_q01\",\"sessionID\":\"ses_fixture01a\",\"answer\":{\"lang\":\"go\"}}}\n\n"+
+			// created（cancelled 链）。
+			"data: {\"id\":\"e3\",\"type\":\"form.created\",\"data\":{\"form\":{\"id\":\"frm_q02\",\"sessionID\":\"ses_fixture01a\",\"title\":\"Again\",\"fields\":[]}}}\n\n"+
+			"data: {\"id\":\"e4\",\"type\":\"form.cancelled\",\"data\":{\"id\":\"frm_q02\",\"sessionID\":\"ses_fixture01a\"}}\n\n")
+		<-r.Context().Done()
+	})
+	setMasterSecret(t)
+	p := NewSPIProvider(ProviderOptions{StatusVerified: true})
+	p.newClient = func(port int, password string, opts Options) *Client {
+		c := NewClient(port, password, opts)
+		c.baseURL = srv.URL
+		clientRef = c
+		return c
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	es, err := p.Events().Subscribe(ctx, testBinding(t))
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	es.SetCallbacks(func() {}, nil)
+
+	wantKey := testSessionKey()
+	raised := expectEvent(t, es, domain.EventAttentionRaised)
+	q := raised.Attention.Question
+	if raised.Attention.ID != "frm_q01" || raised.Attention.Kind != domain.AttentionQuestion ||
+		raised.Attention.Session != wantKey || q == nil ||
+		q.ID != "frm_q01" || q.SessionID != "ses_fixture01a" || q.Title != "Pick" ||
+		len(q.Fields) != 3 {
+		t.Fatalf("raised(created) attention: %+v", raised.Attention)
+	}
+	lang := q.Fields[0]
+	if lang.Key != "lang" || lang.Type != string(domain.QuestionTypeSelect) || lang.Label != "Language" ||
+		lang.Prompt != "Pick one" || !lang.Required || len(lang.Options) != 2 ||
+		lang.Options[1].Value != "rs" || lang.Options[1].Label != "Rust" ||
+		!strings.Contains(string(lang.Metadata), `"hidden"`) {
+		t.Fatalf("enum field mapping: %+v", lang)
+	}
+	if q.Fields[1].Type != string(domain.QuestionTypeMultiselect) || q.Fields[1].Metadata != nil {
+		t.Fatalf("multiselect field mapping: %+v", q.Fields[1])
+	}
+
+	resolvedReplied := expectEvent(t, es, domain.EventAttentionResolved)
+	if resolvedReplied.Attention.ID != "frm_q01" || resolvedReplied.Attention.Kind != domain.AttentionQuestion ||
+		resolvedReplied.Attention.Session != wantKey ||
+		resolvedReplied.Attention.Question == nil || resolvedReplied.Attention.Question.ID != "frm_q01" {
+		t.Fatalf("resolved(replied) attention: %+v", resolvedReplied.Attention)
+	}
+
+	raised2 := expectEvent(t, es, domain.EventAttentionRaised)
+	if raised2.Attention.ID != "frm_q02" || raised2.Attention.Kind != domain.AttentionQuestion ||
+		raised2.Attention.Session != wantKey || raised2.Attention.Question == nil {
+		t.Fatalf("raised(created2) attention: %+v", raised2.Attention)
+	}
+	resolvedCancelled := expectEvent(t, es, domain.EventAttentionResolved)
+	if resolvedCancelled.Attention.ID != "frm_q02" || resolvedCancelled.Attention.Session != wantKey ||
+		resolvedCancelled.Attention.Question == nil {
+		t.Fatalf("resolved(cancelled) attention: %+v", resolvedCancelled.Attention)
+	}
+
+	// form 事件为已知事件，MUST NOT 走保守丢弃。
+	if clientRef == nil || clientRef.MalformedCount() != 0 {
+		t.Fatalf("form events must not count as conservative drops: %v", clientRef)
+	}
+	cancel()
+	_ = es.Close()
+}
+
+// TestTranslateV2Event_FormMalformedDrops 形态违约的 form 事件保守丢弃（ok=false，
+// 不产出部分事件）：缺必填 ID / 归属、form 非对象、字段解析失败与 REST 口径一致。
+func TestTranslateV2Event_FormMalformedDrops(t *testing.T) {
+	frames := map[string]string{
+		"created without form":         `{"id":"e","type":"form.created","data":{"sessionID":"ses_fixture01a"}}`,
+		"created form not object":      `{"id":"e","type":"form.created","data":{"form":"frm_x"}}`,
+		"created fields omitted":       `{"id":"e","type":"form.created","data":{"form":{"id":"frm_x","sessionID":"ses_fixture01a","title":"t"}}}`,
+		"created fields null":          `{"id":"e","type":"form.created","data":{"form":{"id":"frm_x","sessionID":"ses_fixture01a","title":"t","fields":null}}}`,
+		"created missing form id":      `{"id":"e","type":"form.created","data":{"form":{"sessionID":"ses_fixture01a","title":"t","fields":[]}}}`,
+		"created missing form session": `{"id":"e","type":"form.created","data":{"sessionID":"ses_fixture01a","form":{"id":"frm_x","title":"t","fields":[]}}}`,
+		"created field missing key":    `{"id":"e","type":"form.created","data":{"form":{"id":"frm_x","sessionID":"ses_fixture01a","fields":[{"type":"string"}]}}}`,
+		"created field missing type":   `{"id":"e","type":"form.created","data":{"form":{"id":"frm_x","sessionID":"ses_fixture01a","fields":[{"key":"k"}]}}}`,
+		"created fields not array":     `{"id":"e","type":"form.created","data":{"form":{"id":"frm_x","sessionID":"ses_fixture01a","fields":"k"}}}`,
+		"created options malformed":    `{"id":"e","type":"form.created","data":{"form":{"id":"frm_x","sessionID":"ses_fixture01a","fields":[{"key":"k","type":"enum","options":"x"}]}}}`,
+		"replied missing id":           `{"id":"e","type":"form.replied","data":{"sessionID":"ses_fixture01a","answer":{}}}`,
+		"replied missing session":      `{"id":"e","type":"form.replied","data":{"id":"frm_x","form":{"id":"frm_x","sessionID":"ses_fixture01a"}}}`,
+		"cancelled missing id":         `{"id":"e","type":"form.cancelled","data":{"sessionID":"ses_fixture01a"}}`,
+		"cancelled missing session":    `{"id":"e","type":"form.cancelled","data":{"id":"frm_x"}}`,
+	}
+	for name, frame := range frames {
+		t.Run(name, func(t *testing.T) {
+			ev, err := parseWireEvent([]byte(frame))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if out, ok := translateV2Event(ev, nil); ok {
+				t.Fatalf("malformed form must drop, got %+v", out)
+			}
+		})
+	}
 }
 
 func TestEvents_Reconnect_SnapshotSelfHeal(t *testing.T) {
