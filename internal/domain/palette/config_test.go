@@ -14,7 +14,7 @@ var testFold = strings.ToLower
 
 func TestDefaultConfig(t *testing.T) {
 	c := DefaultConfig()
-	if c.Hotkey != "mod+k" || c.TriggerWord != "new" || c.MatchMode != MatchModeExactThen {
+	if c.Hotkey != "mod+k" || c.WorkbenchFullscreenHotkey != "mod+shift+f" || c.TriggerWord != "new" || c.MatchMode != MatchModeExactThen {
 		t.Fatalf("default config mismatch: %+v", c)
 	}
 	if !maps.Equal(c.CommandTriggers, DefaultCommandTriggers()) {
@@ -108,6 +108,55 @@ func TestConfigValidate(t *testing.T) {
 				t.Fatalf("fixture length")
 			}
 		})
+	}
+}
+
+// TestHotkeysConflictMatrix 跨动作冲突：key 相同且展开 mask 集合有交集即冲突；
+// 与 web/src/__tests__/hotkey.test.ts hotkeysConflict 同组用例。
+func TestHotkeysConflictMatrix(t *testing.T) {
+	cases := []struct {
+		name         string
+		hotkey       string
+		workbench    string
+		wantConflict bool
+	}{
+		{"mod vs meta same key", "mod+shift+f", "meta+shift+f", true},
+		{"mod vs ctrl same key", "mod+shift+f", "ctrl+shift+f", true},
+		{"mod vs mod same key", "mod+shift+f", "mod+shift+f", true},
+		{"meta vs ctrl no overlap", "meta+shift+f", "ctrl+shift+f", false},
+		{"meta vs meta+ctrl", "meta+shift+f", "meta+ctrl+shift+f", false},
+		{"alt differs", "alt+shift+f", "mod+shift+f", false},
+		{"different key", "mod+shift+f", "mod+shift+g", false},
+		{"default pair ok", "mod+k", "mod+shift+f", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := DefaultConfig()
+			c.Hotkey = tc.hotkey
+			c.WorkbenchFullscreenHotkey = tc.workbench
+			if got := hotkeysConflict(tc.hotkey, tc.workbench); got != tc.wantConflict {
+				t.Fatalf("hotkeysConflict(%q,%q)=%v want %v", tc.hotkey, tc.workbench, got, tc.wantConflict)
+			}
+			if err := c.Validate(testFold); (err != nil) != tc.wantConflict {
+				t.Fatalf("Validate() err=%v wantConflict=%v", err, tc.wantConflict)
+			}
+		})
+	}
+}
+
+func TestWorkbenchFullscreenHotkeyValidate(t *testing.T) {
+	mut := func(hk string) Config {
+		c := DefaultConfig()
+		c.WorkbenchFullscreenHotkey = hk
+		return c
+	}
+	for _, hk := range []string{"", "k", "shift+f", "mod+banana", "mod+K", "mod+t", "mod+b"} {
+		if err := mut(hk).Validate(testFold); err == nil {
+			t.Fatalf("workbenchFullscreenHotkey %q must be rejected", hk)
+		}
+	}
+	if err := mut("ctrl+alt+g").Validate(testFold); err != nil {
+		t.Fatalf("ctrl+alt+g must validate: %v", err)
 	}
 }
 

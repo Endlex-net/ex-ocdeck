@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import { navigate } from '../router';
 import { resolveBackHref, type FromSource } from '../router';
 import { useMediaQuery, useProjects, useProjectsRefresh } from '../hooks';
 import { debugMark } from '../debug';
 import { subscribeTask } from '../sse';
+import { formatHotkey, matchHotkey } from '../hotkey';
 import {
   isGitlessTask,
   isTransitional,
@@ -24,6 +25,7 @@ import { DeleteTaskModal } from '../components/DeleteTaskModal';
 import { GitPanel } from '../components/GitPanel';
 import { EnvEditor } from '../components/EnvEditor';
 import { AgentStatusBadge } from '../components/AgentStatusBadge';
+import { CompactTaskNav } from '../components/CompactTaskNav';
 import { InitStatusBadge } from '../components/InitStatusBadge';
 import { PermissionModeBadge } from '../components/PermissionModeBadge';
 import { LifecycleLogModal } from '../components/LifecycleLogModal';
@@ -42,7 +44,16 @@ import {
   TAB_FOCUS_TARGET_TUI,
   type TabFocusIntent,
 } from '../terminal/tab-focus-intent';
-import { BranchIcon, CaretDownIcon, MoreIcon, SourceRefIcon, WarnIcon, InfoIcon } from '../icons';
+import {
+  BranchIcon,
+  CaretDownIcon,
+  MoreIcon,
+  SidebarCollapseIcon,
+  SidebarExpandIcon,
+  SourceRefIcon,
+  WarnIcon,
+  InfoIcon,
+} from '../icons';
 
 // tab 键即 tab-local intent target 键（fix-ai-auto-permission-and-tab-focus design D3 闭合定义）
 const TUI_TAB = TAB_FOCUS_TARGET_TUI;
@@ -172,11 +183,14 @@ function WorkbenchOverflow({
 export function TaskWorkbenchPage({
   taskID,
   from = 'home',
+  workbenchFullscreenHotkey,
 }: {
   taskID: string;
   /** 来源感知返回链接（归一后）：home → #/，projects → #/projects#<projectID>。
    *  legacy fromActive 已废弃（P8 路由归一：active → home）。 */
   from?: FromSource;
+  /** 工作台网页全屏热键（canonical，如 mod+shift+f），由 App 从 palette 配置快照下发。 */
+  workbenchFullscreenHotkey: string;
 }) {
   // 页面任务 = 详情读模型（详情 SSE 帧 / 详情 GET / 两次专用保存合并，D8）：
   // 通用 PATCH 响应不含 effective_permission_mode，回写须 mergeTaskInfoPatch 合并保留
@@ -201,10 +215,16 @@ export function TaskWorkbenchPage({
   // ≤767px 侧栏任务组隐藏，页头任务切换器承担任务直达（design D12 裁决 3）
   const isMobile = useMediaQuery('(max-width: 767px)');
   const [switcherOpen, setSwitcherOpen] = useState(false);
+  // 网页全屏（Zen，design D1）：会话态仅属于本页实例，不持久化；离页/切任务由 unmount 重置
+  const [zenRequested, setZenRequested] = useState(false);
+  const [taskRailVisible, setTaskRailVisible] = useState(true);
   // 共享 store refresh：任务操作成功后同步侧栏/指挥中心（tasks 8.8 refresh 审计）
   const refreshShared = useProjectsRefresh();
   // 页头任务切换器数据源：与侧栏同一共享 store（design D8/D12）
   const { projects } = useProjects();
+  // 工作台可呈现：loading/404 不可呈现；普通流 error 不影响呈现
+  const workbenchPresentable = task !== null && !notFound;
+  const zenActive = zenRequested && workbenchPresentable;
 
   const switchTab = (t: string) => {
     setTab(t);
@@ -410,6 +430,54 @@ export function TaskWorkbenchPage({
     debugMark('odterm:task-render');
   }, [task]);
 
+  // 统一退出：仅不可呈现时清请求、rail 复位；设置标签与普通流 error 均保持 Zen
+  useEffect(() => {
+    if (!workbenchPresentable) {
+      setZenRequested(false);
+      setTaskRailVisible(true);
+    }
+  }, [workbenchPresentable]);
+
+  // body 标记是 zenActive 的派生副作用（隐藏 AppShell 侧栏与 resize handle），卸载即清理
+  useLayoutEffect(() => {
+    if (!zenActive) return;
+    document.body.classList.add('od-workbench-zen');
+    return () => document.body.classList.remove('od-workbench-zen');
+  }, [zenActive]);
+
+  // 热键（design D3）：window capture 先于终端 textarea 等下游监听；IME 放行，
+  // 非资格页与未精确命中的键（含裸 Esc）不消费；repeat 只消费不切换
+  const zenEligibleRef = useRef(false);
+  zenEligibleRef.current = workbenchPresentable && tab !== SETTINGS_TAB;
+  const workbenchHotkeyRef = useRef(workbenchFullscreenHotkey);
+  workbenchHotkeyRef.current = workbenchFullscreenHotkey;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.isComposing || e.key === 'Process' || e.keyCode === 229) return;
+      if (!zenEligibleRef.current || !matchHotkey(e, workbenchHotkeyRef.current)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.repeat) return;
+      setZenRequested((v) => !v);
+      setTaskRailVisible(true);
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, []);
+
+  // 任务轨显隐切换后焦点转移到新出现的按钮（隐藏→展开钮，展开→隐藏钮），避免卸载后丢焦
+  const railToggleRef = useRef<HTMLButtonElement>(null);
+  const railFocusPending = useRef(false);
+  useEffect(() => {
+    if (!railFocusPending.current) return;
+    railFocusPending.current = false;
+    railToggleRef.current?.focus();
+  }, [taskRailVisible]);
+  const toggleTaskRail = () => {
+    railFocusPending.current = true;
+    setTaskRailVisible((v) => !v);
+  };
+
   if (notFound) {
     // fullbleed 工作台路由无外层 padding；用自持边距容器（非已删 .page）
     return (
@@ -447,401 +515,450 @@ export function TaskWorkbenchPage({
     status === 'deletion_failed' && (task?.last_error ?? '').startsWith('pre-delete:');
 
   return (
-    <div className={`workbench${isNarrow ? ' workbench-narrow' : ''}`}>
-      <header className="page-header">
-        {/* 来源感知返回（design.md D3 归一映射）：home → #/，projects → #/projects#<projectID>。
-            窄屏同样保留返回入口；任务未加载时回退 home。 */}
-        <button
-          className="btn btn-small btn-ghost"
-          onClick={() => navigate(resolveBackHref(from, task?.project_id))}
-        >
-          ← {from === 'projects' ? '任务列表' : '指挥中心'}
-        </button>
-        {/* 页头任务切换器：≤767px 侧栏任务组隐藏时的任务直达入口（design D12 裁决 3）。
-            切换执行 navigate(#/task/:id) + key={taskID} 重挂载，数据来自共享 store。 */}
-        {isMobile ? (
-          <div className="wb-switcher" ref={switcherRef}>
-            <button
-              className="wb-switcher-btn"
-              aria-haspopup="true"
-              aria-expanded={switcherOpen}
-              title="切换任务"
-              onClick={() => setSwitcherOpen((o) => !o)}
-            >
-              <span className="wb-switcher-title">{task?.name ?? '…'}</span>
-              <CaretDownIcon />
-            </button>
-            {switcherOpen && (
-              <div className="wb-switcher-menu" role="menu">
-                {switcherGroups.map(([projName, items]) => (
-                  <div key={projName}>
-                    <div className="wb-sw-group">{projName}</div>
-                    {items.map((t) => (
-                      <button
-                        key={t.taskID}
-                        className={`wb-sw-item${t.current ? ' current' : ''}`}
-                        role="menuitem"
-                        onClick={() => {
-                          setSwitcherOpen(false);
-                          // 导航焦点请求信号（design D3）：navigate 照常，信号为附加调用
-                          requestTerminalFocus(t.taskID);
-                          navigate(`/task/${t.taskID}`);
-                        }}
-                      >
-                        {/* 有待答问题/待授权限时蓝点（等待人工 > 运行态） */}
-                        <span
-                          className={`od-agent od-agent-${t.attentionCount > 0 ? 'attention' : (t.agentStatus ?? '')}`}
-                          title={t.attentionCount > 0 ? `等待人工处理：${t.attentionCount} 个待处理请求` : undefined}
-                        ><span className="od-agent-dot" /></span>
-                        <span className="wb-sw-name">{t.name}</span>
-                        {/* gitless 任务（dir/local-path）不渲染分支名，整段移除不留占位 */}
-                        {!t.gitless && <span className="mono">{t.branch}</span>}
-                      </button>
-                    ))}
-                  </div>
-                ))}
-                <a
-                  className="wb-sw-all"
-                  href="#/"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    setSwitcherOpen(false);
-                    navigate('/');
-                  }}
-                >
-                  查看全部任务 →
-                </a>
-              </div>
-            )}
+    <div className={`workbench${isNarrow ? ' workbench-narrow' : ''}${zenActive ? ' workbench-zen' : ''}`}>
+      {/* Zen 桌面任务轨（design D2）：展开时与 workbench-main 同级；隐藏后仅保留左下浮动按钮。 */}
+      {zenActive && !isMobile && taskRailVisible && (
+        <aside className="zen-task-rail" aria-label="任务状态">
+          <div className="zen-task-rail-list">
+            <CompactTaskNav projects={projects} currentTaskID={taskID} variant="zen" />
           </div>
-        ) : (
-          <span className="page-title">{task?.name ?? '…'}</span>
-        )}
-        {/* 页头分支区（两行布局 v3：上行当前 / 下行来源）：dir 整段不渲染；local-path
-            （repo 项目）展示文件系统当前分支（仅当前行；空串/获取失败静默降级不展示）；
-            worktree 保留 branch 非空外层条件（branch 为空整段不渲染，即使 base_ref 非空），
-            base_ref 非空时两行「上当前（提亮 --fg）/ 下来源（弱化 muted·0.7 + ↳ 静态图标）」，
-            空串仅当前行。10px meta 级，⎇ 图标对齐首行。
-            分支名 button 化点击复制（所见即所得；截断显示不影响复制完整名）；同名不去重。
-            tooltip 下沉到各 button（唯一模板集），容器 span 不挂 title。 */}
-        {task && isLocalPathRepo && localPathBranch !== '' && (
-          <span className="header-meta mono header-meta-branches">
-            <BranchIcon />
-            <span className="branch-rows">
-              <button
-                type="button"
-                className="branch-copy branch-copy-cur"
-                aria-label={`复制当前分支 ${localPathBranch}`}
-                title={currentBranchTooltip(localPathBranch)}
-                onClick={() => copyBranchName(localPathBranch)}
-              >
-                {localPathBranch}
-              </button>
-            </span>
-          </span>
-        )}
-        {task && !isBranchless && !!task.branch && (
-          <span className="header-meta mono header-meta-branches">
-            <BranchIcon />
-            <span className="branch-rows">
-              <button
-                type="button"
-                className="branch-copy branch-copy-cur"
-                aria-label={`复制当前分支 ${task.branch}`}
-                title={currentBranchTooltip(task.branch)}
-                onClick={() => copyBranchName(task.branch)}
-              >
-                {task.branch}
-              </button>
-              {baseShort !== '' && (
-                <span className="branch-src-row">
-                  <SourceRefIcon />
-                  <button
-                    type="button"
-                    className="branch-copy branch-copy-src"
-                    aria-label={`复制来源分支 ${baseShort}`}
-                    title={sourceBranchTooltip(baseShort, task.base_ref ?? '')}
-                    onClick={() => copyBranchName(baseShort)}
-                  >
-                    {baseShort}
-                  </button>
-                </span>
-              )}
-            </span>
-          </span>
-        )}
-        {task && <StatusBadge status={task.status} />}
-        {task && <InitStatusBadge task={task} />}
-        {/* 权限模式只读展示（task-permission-mode D7）：与状态徽标同组，创建后不可修改 */}
-        {task && <PermissionModeBadge task={task} />}
-        {task?.init_status === 'failed' && !isNarrow && (
+          <button
+            ref={railToggleRef}
+            type="button"
+            className="zen-rail-toggle"
+            aria-label="隐藏任务轨"
+            title="隐藏任务轨"
+            onClick={toggleTaskRail}
+          >
+            <SidebarCollapseIcon />
+          </button>
+        </aside>
+      )}
+      {zenActive && !isMobile && !taskRailVisible && (
+        <button
+          ref={railToggleRef}
+          type="button"
+          className="zen-rail-toggle zen-rail-expand-floating"
+          aria-label="展开任务轨"
+          title="展开任务轨"
+          onClick={toggleTaskRail}
+        >
+          <SidebarExpandIcon />
+        </button>
+      )}
+      <div className="workbench-main">
+        <header className="page-header">
+          {/* 来源感知返回（design.md D3 归一映射）：home → #/，projects → #/projects#<projectID>。
+              窄屏同样保留返回入口；任务未加载时回退 home。 */}
           <button
             className="btn btn-small btn-ghost"
-            title={task.init_error || 'init 失败'}
-            onClick={() => setLogView('init')}
+            onClick={() => navigate(resolveBackHref(from, task?.project_id))}
           >
-            日志
+            ← {from === 'projects' ? '任务列表' : '指挥中心'}
           </button>
-        )}
-        {task && <AgentStatusBadge agentStatus={task.agentStatus} attention={task.attention} />}
-        <span className="header-spacer" />
-        {error && !isNarrow && <span className="header-error">{error}</span>}
-        {task && !isNarrow && (
-          <>
-            {/* 「在编辑器中打开」快捷入口（add-frontend-tool-quick-open）：header-spacer 之后、主操作之前 */}
-            <OpenInEditorMenu worktreePath={task.worktree_path} />
-            {/* 主操作按状态机呈现（actionsFor：活跃=挂起；挂起=激活/归档；归档=恢复；失败=重试） */}
-            <TaskActions task={task} onDone={onTaskActionDone} onError={setError} />
-            {/* 「⋯」溢出菜单：删除等次级操作（对齐设计稿 task-workbench.html 页头 wb-overflow） */}
-            <WorkbenchOverflow
-              key="wide"
-              task={task}
-              onShowInitLog={() => setLogView('init')}
-              onDelete={() => setDeleting(true)}
-            />
-          </>
-        )}
-        {/* 窄屏（design D3）：主操作图标化保留在 header，次级操作（init 日志/删除）收同一「⋯」溢出菜单。 */}
-        {task && isNarrow && (
-          <>
-            <OpenInEditorMenu worktreePath={task.worktree_path} />
-            <TaskActions task={task} onDone={onTaskActionDone} onError={setError} compact />
-            <WorkbenchOverflow
-              key="narrow"
-              task={task}
-              onShowInitLog={() => setLogView('init')}
-              onDelete={() => setDeleting(true)}
-            />
-          </>
-        )}
-      </header>
-
-      {/* 窄屏：操作错误从 header 移出为整宽提示条，避免挤占标题/操作空间 */}
-      {isNarrow && error && <div className="alert-bar alert-error mono">{error}</div>}
-
-      {task?.last_error && (
-        <div className="alert-bar alert-error mono" title={task.last_error}>
-          <WarnIcon /> {task.last_error}
-          {preDeleteFailed && (
-            <button className="btn btn-small" onClick={() => setLogView('pre-delete')}>
-              查看 pre-delete 日志
+          {/* 页头任务切换器：≤767px 侧栏任务组隐藏时的任务直达入口（design D12 裁决 3）。
+              切换执行 navigate(#/task/:id) + key={taskID} 重挂载，数据来自共享 store。 */}
+          {isMobile ? (
+            <div className="wb-switcher" ref={switcherRef}>
+              <button
+                className="wb-switcher-btn"
+                aria-haspopup="true"
+                aria-expanded={switcherOpen}
+                title="切换任务"
+                onClick={() => setSwitcherOpen((o) => !o)}
+              >
+                <span className="wb-switcher-title">{task?.name ?? '…'}</span>
+                <CaretDownIcon />
+              </button>
+              {switcherOpen && (
+                <div className="wb-switcher-menu" role="menu">
+                  {switcherGroups.map(([projName, items]) => (
+                    <div key={projName}>
+                      <div className="wb-sw-group">{projName}</div>
+                      {items.map((t) => (
+                        <button
+                          key={t.taskID}
+                          className={`wb-sw-item${t.current ? ' current' : ''}`}
+                          role="menuitem"
+                          onClick={() => {
+                            setSwitcherOpen(false);
+                            // 导航焦点请求信号（design D3）：navigate 照常，信号为附加调用
+                            requestTerminalFocus(t.taskID);
+                            navigate(`/task/${t.taskID}`);
+                          }}
+                        >
+                          {/* 有待答问题/待授权限时蓝点（等待人工 > 运行态） */}
+                          <span
+                            className={`od-agent od-agent-${t.attentionCount > 0 ? 'attention' : (t.agentStatus ?? '')}`}
+                            title={t.attentionCount > 0 ? `等待人工处理：${t.attentionCount} 个待处理请求` : undefined}
+                          ><span className="od-agent-dot" /></span>
+                          <span className="wb-sw-name">{t.name}</span>
+                          {/* gitless 任务（dir/local-path）不渲染分支名，整段移除不留占位 */}
+                          {!t.gitless && <span className="mono">{t.branch}</span>}
+                        </button>
+                      ))}
+                    </div>
+                  ))}
+                  <a
+                    className="wb-sw-all"
+                    href="#/"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      setSwitcherOpen(false);
+                      navigate('/');
+                    }}
+                  >
+                    查看全部任务 →
+                  </a>
+                </div>
+              )}
+            </div>
+          ) : (
+            <span className="page-title">{task?.name ?? '…'}</span>
+          )}
+          {/* 页头分支区（两行布局 v3：上行当前 / 下行来源）：dir 整段不渲染；local-path
+              （repo 项目）展示文件系统当前分支（仅当前行；空串/获取失败静默降级不展示）；
+              worktree 保留 branch 非空外层条件（branch 为空整段不渲染，即使 base_ref 非空），
+              base_ref 非空时两行「上当前（提亮 --fg）/ 下来源（弱化 muted·0.7 + ↳ 静态图标）」，
+              空串仅当前行。10px meta 级，⎇ 图标对齐首行。
+              分支名 button 化点击复制（所见即所得；截断显示不影响复制完整名）；同名不去重。
+              tooltip 下沉到各 button（唯一模板集），容器 span 不挂 title。 */}
+          {task && isLocalPathRepo && localPathBranch !== '' && (
+            <span className="header-meta mono header-meta-branches">
+              <BranchIcon />
+              <span className="branch-rows">
+                <button
+                  type="button"
+                  className="branch-copy branch-copy-cur"
+                  aria-label={`复制当前分支 ${localPathBranch}`}
+                  title={currentBranchTooltip(localPathBranch)}
+                  onClick={() => copyBranchName(localPathBranch)}
+                >
+                  {localPathBranch}
+                </button>
+              </span>
+            </span>
+          )}
+          {task && !isBranchless && !!task.branch && (
+            <span className="header-meta mono header-meta-branches">
+              <BranchIcon />
+              <span className="branch-rows">
+                <button
+                  type="button"
+                  className="branch-copy branch-copy-cur"
+                  aria-label={`复制当前分支 ${task.branch}`}
+                  title={currentBranchTooltip(task.branch)}
+                  onClick={() => copyBranchName(task.branch)}
+                >
+                  {task.branch}
+                </button>
+                {baseShort !== '' && (
+                  <span className="branch-src-row">
+                    <SourceRefIcon />
+                    <button
+                      type="button"
+                      className="branch-copy branch-copy-src"
+                      aria-label={`复制来源分支 ${baseShort}`}
+                      title={sourceBranchTooltip(baseShort, task.base_ref ?? '')}
+                      onClick={() => copyBranchName(baseShort)}
+                    >
+                      {baseShort}
+                    </button>
+                  </span>
+                )}
+              </span>
+            </span>
+          )}
+          {task && <StatusBadge status={task.status} />}
+          {task && <InitStatusBadge task={task} />}
+          {/* 权限模式只读展示（task-permission-mode D7）：与状态徽标同组，创建后不可修改 */}
+          {task && <PermissionModeBadge task={task} />}
+          {task?.init_status === 'failed' && !isNarrow && (
+            <button
+              className="btn btn-small btn-ghost"
+              title={task.init_error || 'init 失败'}
+              onClick={() => setLogView('init')}
+            >
+              日志
             </button>
           )}
-        </div>
-      )}
-      {task?.init_status === 'failed' && (
-        <div className="alert-bar alert-error">
-          <span className="mono" title={task.init_error}>
-            <WarnIcon /> init 失败：{task.init_error || '（无错误信息）'}
-          </span>
-          <button className="btn btn-small" onClick={() => setLogView('init')}>
-            查看日志
-          </button>
-          <RerunInitButton task={task} onDone={onTaskActionDone} onError={setError} />
-        </div>
-      )}
-      {notices.length > 0 && (
-        <div className="alert-bar alert-notice">
-          {notices.slice(-3).map((n, i) => (
-            <span key={i} className="mono" title={new Date(n.ts * 1000).toLocaleString()}>
-              <InfoIcon /> [{n.code}] {n.message}
-            </span>
-          ))}
-        </div>
-      )}
+          {task && <AgentStatusBadge agentStatus={task.agentStatus} attention={task.attention} />}
+          <span className="header-spacer" />
+          {error && !isNarrow && <span className="header-error">{error}</span>}
+          {task && !isNarrow && (
+            <>
+              {/* 「在编辑器中打开」快捷入口（add-frontend-tool-quick-open）：header-spacer 之后、主操作之前 */}
+              <OpenInEditorMenu worktreePath={task.worktree_path} />
+              {/* 主操作按状态机呈现（actionsFor：活跃=挂起；挂起=激活/归档；归档=恢复；失败=重试） */}
+              <TaskActions task={task} onDone={onTaskActionDone} onError={setError} />
+              {/* 「⋯」溢出菜单：删除等次级操作（对齐设计稿 task-workbench.html 页头 wb-overflow） */}
+              <WorkbenchOverflow
+                key="wide"
+                task={task}
+                onShowInitLog={() => setLogView('init')}
+                onDelete={() => setDeleting(true)}
+              />
+            </>
+          )}
+          {/* 窄屏（design D3）：主操作图标化保留在 header，次级操作（init 日志/删除）收同一「⋯」溢出菜单。 */}
+          {task && isNarrow && (
+            <>
+              <OpenInEditorMenu worktreePath={task.worktree_path} />
+              <TaskActions task={task} onDone={onTaskActionDone} onError={setError} compact />
+              <WorkbenchOverflow
+                key="narrow"
+                task={task}
+                onShowInitLog={() => setLogView('init')}
+                onDelete={() => setDeleting(true)}
+              />
+            </>
+          )}
+        </header>
 
-      <div className="tabstrip">
-        <button
-          className={`tab ${tab === TUI_TAB ? 'tab-active' : ''}`}
-          onClick={() => {
-            switchTab(TUI_TAB);
-            // 真实点击「终端」生成 tab-local 聚焦 intent（重复点击已激活 tab 也生成新 seq）
-            setFocusIntent(nextTabFocusIntent(TUI_TAB));
-          }}
-        >
-          终端
-        </button>
-        {shells.map((tid, i) => (
-          <span key={tid} className={`tab ${tab === tid ? 'tab-active' : ''}`}>
+        {/* 窄屏与 Zen 下页头隐藏：操作错误改为整宽提示条，避免挤占标题/操作空间 */}
+        {(isNarrow || zenActive) && error && <div className="alert-bar alert-error mono">{error}</div>}
+
+        {task?.last_error && (
+          <div className="alert-bar alert-error mono" title={task.last_error}>
+            <WarnIcon /> {task.last_error}
+            {preDeleteFailed && (
+              <button className="btn btn-small" onClick={() => setLogView('pre-delete')}>
+                查看 pre-delete 日志
+              </button>
+            )}
+          </div>
+        )}
+        {task?.init_status === 'failed' && (
+          <div className="alert-bar alert-error">
+            <span className="mono" title={task.init_error}>
+              <WarnIcon /> init 失败：{task.init_error || '（无错误信息）'}
+            </span>
+            <button className="btn btn-small" onClick={() => setLogView('init')}>
+              查看日志
+            </button>
+            <RerunInitButton task={task} onDone={onTaskActionDone} onError={setError} />
+          </div>
+        )}
+        {notices.length > 0 && (
+          <div className="alert-bar alert-notice">
+            {notices.slice(-3).map((n, i) => (
+              <span key={i} className="mono" title={new Date(n.ts * 1000).toLocaleString()}>
+                <InfoIcon /> [{n.code}] {n.message}
+              </span>
+            ))}
+          </div>
+        )}
+
+        <div className="tabstrip">
+          <div className="tabstrip-scroll">
             <button
-              className="tab-label"
+              className={`tab ${tab === TUI_TAB ? 'tab-active' : ''}`}
               onClick={() => {
-                switchTab(tid);
-                // target 为 shell tab 稳定 id（与 active={tab===tid} 同一键，非显示序号）
-                setFocusIntent(nextTabFocusIntent(tid));
+                switchTab(TUI_TAB);
+                // 真实点击「终端」生成 tab-local 聚焦 intent（重复点击已激活 tab 也生成新 seq）
+                setFocusIntent(nextTabFocusIntent(TUI_TAB));
               }}
             >
-              shell {i + 1}
+              终端
             </button>
+            {shells.map((tid, i) => (
+              <span key={tid} className={`tab ${tab === tid ? 'tab-active' : ''}`}>
+                <button
+                  className="tab-label"
+                  onClick={() => {
+                    switchTab(tid);
+                    // target 为 shell tab 稳定 id（与 active={tab===tid} 同一键，非显示序号）
+                    setFocusIntent(nextTabFocusIntent(tid));
+                  }}
+                >
+                  shell {i + 1}
+                </button>
+                <button
+                  className="tab-close"
+                  title="关闭终端"
+                  onClick={() => void closeShell(tid)}
+                >
+                  ×
+                </button>
+              </span>
+            ))}
             <button
-              className="tab-close"
-              title="关闭终端"
-              onClick={() => void closeShell(tid)}
+              className="tab tab-add"
+              title="新建 shell 终端"
+              disabled={addingShell}
+              onClick={() => void addShell()}
             >
-              ×
+              +
             </button>
-          </span>
-        ))}
-        <button
-          className="tab tab-add"
-          title="新建 shell 终端"
-          disabled={addingShell}
-          onClick={() => void addShell()}
-        >
-          +
-        </button>
-        <span className="tab-sep" />
-        {!isGitless && (
-          <button
-            className={`tab ${tab === GIT_TAB ? 'tab-active' : ''}`}
-            onClick={() => switchTab(GIT_TAB)}
-          >
-            Git
-          </button>
-        )}
-        <button
-          className={`tab ${tab === SETTINGS_TAB ? 'tab-active' : ''}`}
-          onClick={() => switchTab(SETTINGS_TAB)}
-        >
-          设置
-        </button>
-      </div>
-
-      {shellsError && (
-        <div className="alert-bar alert-error">
-          <span className="mono">获取 shell 终端列表失败：{shellsError}</span>
-          <button className="btn btn-small" onClick={() => void loadShells()}>
-            重试
-          </button>
-        </div>
-      )}
-
-      <div className="pane-area">
-        {/* TUI 终端：常驻挂载，隐藏不断开由 active 控制 */}
-        <div className={`pane ${tab === TUI_TAB ? '' : 'pane-hidden'}`}>
-          <TerminalView
-            wsPath={`/ws/terminal/${taskID}`}
-            active={tab === TUI_TAB && processReady}
-            focusIntent={focusIntent}
-          />
-          {tab === TUI_TAB && task && !processReady && (
-            <div className="terminal-overlay">
-              <div className="terminal-overlay-box">
-                {isTransitional(status) ? (
-                  <>
-                    <span className="spinner" aria-hidden />
-                    {/* spec（终端重开与恢复中语义）：恢复期统一显示「进程启动中」，
-                        不新增原因字段——activating 同时覆盖用户激活与自动重拉。 */}
-                    <span>{status === 'activating' ? '进程启动中' : '任务状态变更中'}…</span>
-                  </>
-                ) : status === 'suspended' ? (
-                  <>
-                    <span>任务已挂起，激活后可接入任务终端</span>
-                    {initBlock && <span className="terminal-overlay-reason">{initBlock}</span>}
-                    <span className="terminal-overlay-actions">
-                      <ActivateButton task={task} onDone={onTaskActionDone} onError={setError} />
-                      <RerunInitButton
-                        task={task}
-                        onDone={onTaskActionDone}
-                        onError={setError}
-                      />
-                    </span>
-                  </>
-                ) : (
-                  <span>任务当前状态（{status}）不可用终端</span>
-                )}
-              </div>
+            <span className="tab-sep" />
+            {!isGitless && (
+              <button
+                className={`tab ${tab === GIT_TAB ? 'tab-active' : ''}`}
+                onClick={() => switchTab(GIT_TAB)}
+              >
+                Git
+              </button>
+            )}
+            <button
+              className={`tab ${tab === SETTINGS_TAB ? 'tab-active' : ''}`}
+              onClick={() => switchTab(SETTINGS_TAB)}
+            >
+              设置
+            </button>
+          </div>
+          {/* 固定操作格：普通设置无入口；Zen 内包括设置均保留 out zen。 */}
+          {(zenActive || tab !== SETTINGS_TAB) && (
+            <div className="tabstrip-actions">
+              <button
+                className="btn btn-small btn-ghost"
+                title={`${zenActive ? '退出' : '进入'}网页全屏（${formatHotkey(workbenchFullscreenHotkey)}）`}
+                onClick={() => {
+                  setZenRequested((v) => !v);
+                  setTaskRailVisible(true);
+                }}
+              >
+                {zenActive ? 'out zen' : 'zen'}
+              </button>
             </div>
           )}
         </div>
-        {shells.map((tid) => (
-          <div key={tid} className={`pane ${tab === tid ? '' : 'pane-hidden'}`}>
-            <TerminalView wsPath={`/ws/terminal/shell/${tid}`} active={tab === tid} focusIntent={focusIntent} />
-          </div>
-        ))}
-        {visited.has(GIT_TAB) && !isGitless && (
-          <div className={`pane pane-scroll ${tab === GIT_TAB ? '' : 'pane-hidden'}`}>
-            <GitPanel
-              taskID={taskID}
-              active={tab === GIT_TAB}
-              agentBusy={task?.agentStatus === 'busy' || task?.agentStatus === 'retry'}
-              baseRef={task?.base_ref ?? ''}
-            />
+
+        {shellsError && (
+          <div className="alert-bar alert-error">
+            <span className="mono">获取 shell 终端列表失败：{shellsError}</span>
+            <button className="btn btn-small" onClick={() => void loadShells()}>
+              重试
+            </button>
           </div>
         )}
-        {visited.has(SETTINGS_TAB) && (
-          <div className={`pane pane-scroll ${tab === SETTINGS_TAB ? '' : 'pane-hidden'}`}>
-            <div className="settings-pane">
-              {task && (
-                <TaskInfoCard
-                  task={task}
-                  projectName={
-                    projects.find((p) => p.id === task.project_id)?.name ?? task.project_id
-                  }
-                  onSaved={(updated) => {
-                    // 保存成功：通用 PATCH 响应不含 effective，合并保留当前值
-                    //（整体替换会丢失「下次激活生效」提示，D8）；SSE 帧随后覆盖同源，
-                    // 并触发共享 store refresh（侧栏/指挥中心同步）
-                    setTask((prev) => (prev ? mergeTaskInfoPatch(prev, updated) : prev));
-                    void refreshShared().catch(() => {});
-                  }}
-                  onPermissionModeSaved={(view) => {
-                    // 模式端点响应仅合并两个模式字段（D8）
-                    setTask((prev) => (prev ? mergePermissionModeView(prev, view) : prev));
-                  }}
-                  onRefreshed={(fresh) => setTask(fresh)}
-                />
-              )}
-              <div className="settings-section">
-                <div className="settings-title">任务级环境变量</div>
-                <EnvEditor base={`/tasks/${taskID}/env`} />
-              </div>
-              <div className="settings-section">
-                <div className="settings-title">生命周期日志</div>
-                <div className="lc-log-entries">
-                  <button className="btn btn-small" onClick={() => setLogView('init')}>
-                    查看 init 日志
-                  </button>
-                  {preDeleteFailed && (
-                    <button className="btn btn-small" onClick={() => setLogView('pre-delete')}>
-                      查看 pre-delete 日志
-                    </button>
+
+        <div className="pane-area">
+          {/* TUI 终端：常驻挂载，隐藏不断开由 active 控制 */}
+          <div className={`pane ${tab === TUI_TAB ? '' : 'pane-hidden'}`}>
+            <TerminalView
+              wsPath={`/ws/terminal/${taskID}`}
+              active={tab === TUI_TAB && processReady}
+              focusIntent={focusIntent}
+            />
+            {tab === TUI_TAB && task && !processReady && (
+              <div className="terminal-overlay">
+                <div className="terminal-overlay-box">
+                  {isTransitional(status) ? (
+                    <>
+                      <span className="spinner" aria-hidden />
+                      {/* spec（终端重开与恢复中语义）：恢复期统一显示「进程启动中」，
+                          不新增原因字段——activating 同时覆盖用户激活与自动重拉。 */}
+                      <span>{status === 'activating' ? '进程启动中' : '任务状态变更中'}…</span>
+                    </>
+                  ) : status === 'suspended' ? (
+                    <>
+                      <span>任务已挂起，激活后可接入任务终端</span>
+                      {initBlock && <span className="terminal-overlay-reason">{initBlock}</span>}
+                      <span className="terminal-overlay-actions">
+                        <ActivateButton task={task} onDone={onTaskActionDone} onError={setError} />
+                        <RerunInitButton
+                          task={task}
+                          onDone={onTaskActionDone}
+                          onError={setError}
+                        />
+                      </span>
+                    </>
+                  ) : (
+                    <span>任务当前状态（{status}）不可用终端</span>
                   )}
                 </div>
               </div>
+            )}
+          </div>
+          {shells.map((tid) => (
+            <div key={tid} className={`pane ${tab === tid ? '' : 'pane-hidden'}`}>
+              <TerminalView wsPath={`/ws/terminal/shell/${tid}`} active={tab === tid} focusIntent={focusIntent} />
             </div>
+          ))}
+          {visited.has(GIT_TAB) && !isGitless && (
+            <div className={`pane pane-scroll ${tab === GIT_TAB ? '' : 'pane-hidden'}`}>
+              <GitPanel
+                taskID={taskID}
+                active={tab === GIT_TAB}
+                agentBusy={task?.agentStatus === 'busy' || task?.agentStatus === 'retry'}
+                baseRef={task?.base_ref ?? ''}
+              />
+            </div>
+          )}
+          {visited.has(SETTINGS_TAB) && (
+            <div className={`pane pane-scroll ${tab === SETTINGS_TAB ? '' : 'pane-hidden'}`}>
+              <div className="settings-pane">
+                {task && (
+                  <TaskInfoCard
+                    task={task}
+                    projectName={
+                      projects.find((p) => p.id === task.project_id)?.name ?? task.project_id
+                    }
+                    onSaved={(updated) => {
+                      // 保存成功：通用 PATCH 响应不含 effective，合并保留当前值
+                      //（整体替换会丢失「下次激活生效」提示，D8）；SSE 帧随后覆盖同源，
+                      // 并触发共享 store refresh（侧栏/指挥中心同步）
+                      setTask((prev) => (prev ? mergeTaskInfoPatch(prev, updated) : prev));
+                      void refreshShared().catch(() => {});
+                    }}
+                    onPermissionModeSaved={(view) => {
+                      // 模式端点响应仅合并两个模式字段（D8）
+                      setTask((prev) => (prev ? mergePermissionModeView(prev, view) : prev));
+                    }}
+                    onRefreshed={(fresh) => setTask(fresh)}
+                  />
+                )}
+                <div className="settings-section">
+                  <div className="settings-title">任务级环境变量</div>
+                  <EnvEditor base={`/tasks/${taskID}/env`} />
+                </div>
+                <div className="settings-section">
+                  <div className="settings-title">生命周期日志</div>
+                  <div className="lc-log-entries">
+                    <button className="btn btn-small" onClick={() => setLogView('init')}>
+                      查看 init 日志
+                    </button>
+                    {preDeleteFailed && (
+                      <button className="btn btn-small" onClick={() => setLogView('pre-delete')}>
+                        查看 pre-delete 日志
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {logView && task && (
+          <LifecycleLogModal
+            title={logView === 'init' ? 'init 日志' : 'pre-delete 日志'}
+            fetchLog={() =>
+              logView === 'init' ? api.getInitLog(task.id) : api.getPreDeleteLog(task.id)
+            }
+            onClose={() => setLogView(null)}
+          />
+        )}
+
+        {deleting && task && (
+          <DeleteTaskModal
+            task={task}
+            onClose={() => setDeleting(false)}
+            onDeleted={() => {
+              // 删除成功：触发共享 store refresh（侧栏/指挥中心同步）再导航离开（tasks 8.8）。
+              void refreshShared().catch(() => {});
+              navigate(resolveBackHref(from, task.project_id));
+            }}
+          />
+        )}
+
+        {/* 页头分支复制反馈（design D3）：.od-toast 固定底部居中；连续点击重显不节流 */}
+        {branchToast !== '' && (
+          <div className="od-toast mono" role="status">
+            {branchToast}
           </div>
         )}
       </div>
-
-      {logView && task && (
-        <LifecycleLogModal
-          title={logView === 'init' ? 'init 日志' : 'pre-delete 日志'}
-          fetchLog={() =>
-            logView === 'init' ? api.getInitLog(task.id) : api.getPreDeleteLog(task.id)
-          }
-          onClose={() => setLogView(null)}
-        />
-      )}
-
-      {deleting && task && (
-        <DeleteTaskModal
-          task={task}
-          onClose={() => setDeleting(false)}
-          onDeleted={() => {
-            // 删除成功：触发共享 store refresh（侧栏/指挥中心同步）再导航离开（tasks 8.8）。
-            void refreshShared().catch(() => {});
-            navigate(resolveBackHref(from, task.project_id));
-          }}
-        />
-      )}
-
-      {/* 页头分支复制反馈（design D3）：.od-toast 固定底部居中；连续点击重显不节流 */}
-      {branchToast !== '' && (
-        <div className="od-toast mono" role="status">
-          {branchToast}
-        </div>
-      )}
     </div>
   );
 }

@@ -70,6 +70,7 @@ describe('SettingsPage 通知子标签', () => {
         tab="notifications"
         paletteConfig={{
           hotkey: 'mod+k',
+          workbenchFullscreenHotkey: 'mod+shift+f',
           triggerWord: 'new',
           matchMode: 'exact-then-substring',
           commandTriggers: DEFAULT_COMMAND_TRIGGERS,

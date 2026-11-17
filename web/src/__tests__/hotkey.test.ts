@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatHotkey, matchHotkey, normalizeHotkey, validateCanonicalHotkey } from '../hotkey';
+import { formatHotkey, hotkeysConflict, matchHotkey, normalizeHotkey, validateCanonicalHotkey } from '../hotkey';
 
 function evt(partial: Partial<KeyboardEvent>): KeyboardEvent {
   return {
@@ -63,6 +63,23 @@ describe('validateCanonicalHotkey', () => {
   it.each(hotkeyValidateCases)('$name', ({ hotkey, wantErr }) => {
     const err = validateCanonicalHotkey(hotkey);
     expect(err !== null).toBe(wantErr);
+  });
+});
+
+/** 与 Go hotkeysConflict 同矩阵（key 相同且展开 mask 集合有交集即冲突）。 */
+describe('hotkeysConflict', () => {
+  it.each([
+    { name: 'mod vs meta same key', a: 'mod+shift+f', b: 'meta+shift+f', want: true },
+    { name: 'mod vs ctrl same key', a: 'mod+shift+f', b: 'ctrl+shift+f', want: true },
+    { name: 'mod vs mod identical', a: 'mod+k', b: 'mod+k', want: true },
+    { name: 'meta vs ctrl disjoint', a: 'meta+shift+f', b: 'ctrl+shift+f', want: false },
+    { name: 'meta vs meta+ctrl disjoint', a: 'meta+k', b: 'meta+ctrl+k', want: false },
+    { name: 'different key', a: 'mod+k', b: 'mod+shift+f', want: false },
+    { name: 'different alt', a: 'mod+alt+k', b: 'mod+k', want: false },
+    { name: 'different shift', a: 'mod+shift+k', b: 'mod+k', want: false },
+  ])('$name', ({ a, b, want }) => {
+    expect(hotkeysConflict(a, b)).toBe(want);
+    expect(hotkeysConflict(b, a)).toBe(want);
   });
 });
 

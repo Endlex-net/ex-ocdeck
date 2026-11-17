@@ -77,7 +77,13 @@ describe('SettingsPage 分支前缀子标签', () => {
       const u = mount(
         <SettingsPage
           tab="branch-prefix"
-          paletteConfig={{ hotkey: 'mod+k', triggerWord: 'new', matchMode: 'exact', commandTriggers: {} as never }}
+          paletteConfig={{
+            hotkey: 'mod+k',
+            workbenchFullscreenHotkey: 'mod+shift+f',
+            triggerWord: 'new',
+            matchMode: 'exact',
+            commandTriggers: {} as never,
+          }}
           paletteLoadState="ready"
           paletteLoadError=""
         />,

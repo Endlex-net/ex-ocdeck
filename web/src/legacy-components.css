@@ -483,10 +483,85 @@ select.input {
 /* ---------- 工作台布局 ---------- */
 
 .workbench {
+  position: relative;
   height: 100%;
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+/* 稳定的主内容列：Zen 与普通布局共用同一父节点，pane 不随布局切换重挂 */
+.workbench-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- 网页全屏（Zen）：仅改布局，不改 pane 父节点 ---------- */
+
+/* 全局侧栏与 resize handle 由 body 标记隐藏（design D1），Banner 不受影响 */
+body.od-workbench-zen .od-sidebar,
+body.od-workbench-zen .od-shell > .od-resize-handle {
+  display: none;
+}
+
+.workbench.workbench-zen {
+  flex-direction: row;
+}
+
+.workbench-zen .page-header {
+  display: none;
+}
+
+/* 桌面展开任务轨 44px；隐藏后仅保留左下浮动展开按钮，列表独立滚动 */
+.zen-task-rail {
+  flex: 0 0 44px;
+  width: 44px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  border-right: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.zen-task-rail-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  overflow-y: auto;
+  scroll-padding: 4px 1px;
+}
+
+.zen-rail-toggle {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  margin: 6px 0;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.zen-rail-expand-floating {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  z-index: 45;
+  margin: 0;
+  background: var(--bg);
+  border-color: var(--border);
+}
+
+.zen-rail-toggle:hover {
+  color: var(--fg);
+  background: var(--surface);
 }
 
 /* 工作台 404：fullbleed 路由下自持边距（替代已删 .page） */
@@ -503,6 +578,28 @@ select.input {
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   padding: 4px 8px 0;
+}
+
+/* 标签区可横向滚动；操作格固定在右侧，退出全屏入口任何视口都不被滚出 */
+.tabstrip-scroll {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.tabstrip-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.tabstrip-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  padding: 0 0 4px 8px;
 }
 
 .tab {
@@ -2110,17 +2207,8 @@ html[data-diff-style="goland"] .diff-view .diff-editor .cm-deletedLineGutter {
     padding: 1px 5px;
   }
 
-  .workbench .tabstrip {
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-
-  .workbench .tabstrip::-webkit-scrollbar {
-    display: none;
-  }
-
-  .workbench .tabstrip .tab,
-  .workbench .tabstrip .tab-sep {
+  .workbench .tabstrip-scroll .tab,
+  .workbench .tabstrip-scroll .tab-sep {
     flex-shrink: 0;
   }
 

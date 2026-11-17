@@ -138,7 +138,7 @@ describe('TaskWorkbenchPage 权限模式徽标接线（P3 gate F1）', () => {
     ['ai-auto', 'AI 自动识别'],
     ['ask', '人工批准'],
   ] as const)('详情流 task.permission_mode=%s → 页头徽标组显示「%s」', (mode, label) => {
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     expect(taskSub).not.toBeNull();
     act(() => taskSub!.onData(makeTask(mode)));
     const badge = headerBadge(container, label);
@@ -149,7 +149,7 @@ describe('TaskWorkbenchPage 权限模式徽标接线（P3 gate F1）', () => {
   });
 
   it('流推送不变更权限模式：连续两帧徽标文案稳定', () => {
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     act(() => taskSub!.onData(makeTask('all-approve')));
     expect(headerBadge(container, '全部批准')).not.toBeNull();
     act(() => taskSub!.onData(makeTask('all-approve')));
@@ -162,7 +162,7 @@ describe('effective 合并保留与提示收敛（fix-ai-auto-permission-and-tab
   it('模式不一致后保存任务名称（通用 PATCH 回写无 effective）：「下次激活生效」提示仍存在', async () => {
     // 运行中进程按 ask 处理，已保存值已改为 all-approve → 常驻提示
     const diverged = { ...makeTask('all-approve'), effective_permission_mode: 'ask' as const };
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     act(() => taskSub!.onData(diverged));
     await openSettings(container);
     expect(container.textContent).toContain('当前运行进程仍按「人工批准」处理，新模式将在下次激活生效');
@@ -182,7 +182,7 @@ describe('effective 合并保留与提示收敛（fix-ai-auto-permission-and-tab
   });
 
   it('详情 SSE 帧收敛两模式字段：不一致→提示出现；一致（如进程退出）→提示消失', async () => {
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     act(() => taskSub!.onData({ ...makeTask('all-approve'), effective_permission_mode: 'ask' }));
     await openSettings(container);
     // 详情读模型输出（D6）：已保存 all-approve、运行中按 ask → 提示出现
@@ -194,7 +194,7 @@ describe('effective 合并保留与提示收敛（fix-ai-auto-permission-and-tab
   });
 
   it('模式端点保存成功：仅合并两模式字段——页头徽标与提示更新、其余字段不回退', async () => {
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     act(() => taskSub!.onData(makeTask('ask')));
     await openSettings(container);
     // 查看态只读无选择器；进编辑态选值后随「保存」走专用模式端点

@@ -115,7 +115,7 @@ beforeEach(() => {
 
 describe('TaskWorkbenchPage 等待人工数据链路', () => {
   it('详情流 attention.questions 非空：页头徽标变蓝（覆盖 busy 绿点）', () => {
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     expect(taskSub).not.toBeNull();
     act(() =>
       taskSub!.onData(makeTask({ agentStatus: 'busy', attention: PENDING_QUESTION })),
@@ -128,7 +128,7 @@ describe('TaskWorkbenchPage 等待人工数据链路', () => {
   });
 
   it('详情流 attention 空数组：页头徽标保持运行态（busy 绿点）', () => {
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     act(() =>
       taskSub!.onData(
         makeTask({ agentStatus: 'busy', attention: { permissions: [], questions: [] } }),
@@ -140,7 +140,7 @@ describe('TaskWorkbenchPage 等待人工数据链路', () => {
   });
 
   it('流推送更新（question 出现 → 再清空）：徽标随帧切换 蓝 → 绿', () => {
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     act(() => taskSub!.onData(makeTask({ agentStatus: 'busy', attention: PENDING_QUESTION })));
     expect(container.querySelector('.od-agent-attention')).not.toBeNull();
     act(() =>
@@ -156,7 +156,7 @@ describe('TaskWorkbenchPage 等待人工数据链路', () => {
   it('任务切换器行（mobile）：共享 store attention_count>0 → 蓝点 + 计数 title', () => {
     mobile = true;
     storeProjects = makeProjects(2);
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     act(() => taskSub!.onData(makeTask({ agentStatus: 'busy' })));
     const btn = container.querySelector<HTMLButtonElement>('.wb-switcher-btn');
     expect(btn).not.toBeNull();
@@ -170,7 +170,7 @@ describe('TaskWorkbenchPage 等待人工数据链路', () => {
   it('任务切换器行（mobile）：attention_count=0 → 保持原运行态点', () => {
     mobile = true;
     storeProjects = makeProjects(0);
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     act(() => taskSub!.onData(makeTask({ agentStatus: 'busy' })));
     act(() =>
       container

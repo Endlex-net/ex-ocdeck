@@ -26,10 +26,11 @@ func (s *Server) registerPaletteConfigRoutes(mux *http.ServeMux) {
 }
 
 type paletteConfigDTO struct {
-	Hotkey          string            `json:"hotkey"`
-	TriggerWord     string            `json:"triggerWord"`
-	MatchMode       string            `json:"matchMode"`
-	CommandTriggers map[string]string `json:"commandTriggers"`
+	Hotkey                    string            `json:"hotkey"`
+	WorkbenchFullscreenHotkey string            `json:"workbenchFullscreenHotkey"`
+	TriggerWord               string            `json:"triggerWord"`
+	MatchMode                 string            `json:"matchMode"`
+	CommandTriggers           map[string]string `json:"commandTriggers"`
 }
 
 func paletteDTOFromStore(store *palette.Store) paletteConfigDTO {
@@ -37,11 +38,16 @@ func paletteDTOFromStore(store *palette.Store) paletteConfigDTO {
 	if store != nil {
 		cfg = store.Config()
 	}
+	return paletteDTOFromConfig(cfg)
+}
+
+func paletteDTOFromConfig(cfg domainpalette.Config) paletteConfigDTO {
 	return paletteConfigDTO{
-		Hotkey:          cfg.Hotkey,
-		TriggerWord:     cfg.TriggerWord,
-		MatchMode:       cfg.MatchMode,
-		CommandTriggers: cfg.CommandTriggers,
+		Hotkey:                    cfg.Hotkey,
+		WorkbenchFullscreenHotkey: cfg.WorkbenchFullscreenHotkey,
+		TriggerWord:               cfg.TriggerWord,
+		MatchMode:                 cfg.MatchMode,
+		CommandTriggers:           cfg.CommandTriggers,
 	}
 }
 
@@ -70,55 +76,56 @@ func (s *Server) handlePutPaletteConfig(w http.ResponseWriter, r *http.Request) 
 		writeJSONError(w, http.StatusBadRequest, CodeInvalidInput, "invalid request body")
 		return
 	}
-	cfg, status, msg := decodePalettePutBody(data)
+	in, status, msg := decodePalettePutBody(data)
 	if status != 0 {
 		writeJSONError(w, status, CodeInvalidInput, msg)
 		return
 	}
-	// Put 内部同参数复验；此处先验以区分 422（校验失败）与 500（写盘失败）。
-	if err := cfg.Validate(palette.FoldForMatch); err != nil {
-		writeJSONError(w, http.StatusUnprocessableEntity, CodeInvalidInput, err.Error())
-		return
-	}
-	if err := s.paletteConfig.Put(cfg); err != nil {
+	cfg, err := s.paletteConfig.PutDecoded(in)
+	if err != nil {
+		var validationErr *palette.ValidationError
+		if errors.As(err, &validationErr) {
+			writeJSONError(w, http.StatusUnprocessableEntity, CodeInvalidInput, err.Error())
+			return
+		}
 		writeJSONError(w, http.StatusInternalServerError, CodeInternal, "save palette config failed")
 		return
 	}
-	writePaletteConfig(w, paletteDTOFromStore(s.paletteConfig))
+	writePaletteConfig(w, paletteDTOFromConfig(cfg))
 }
 
 // decodePalettePutBody 按 spec 错误矩阵解码：空体/空白/语法/尾随第二值 → 400；
 // 顶层非对象/缺键/null/类型错误 → 422。超限在 ReadAll 处拦截，本函数不写盘。
-func decodePalettePutBody(data []byte) (domainpalette.Config, int, string) {
+func decodePalettePutBody(data []byte) (in palette.DecodedConfig, status int, msg string) {
 	if isEmptyOrWhitespace(data) {
-		return domainpalette.Config{}, http.StatusBadRequest, "request body is required"
+		return palette.DecodedConfig{}, http.StatusBadRequest, "request body is required"
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	var raw json.RawMessage
 	if err := dec.Decode(&raw); err != nil {
-		return domainpalette.Config{}, http.StatusBadRequest, "invalid JSON body"
+		return palette.DecodedConfig{}, http.StatusBadRequest, "invalid JSON body"
 	}
 	var extra json.RawMessage
 	if err := dec.Decode(&extra); err != io.EOF {
-		return domainpalette.Config{}, http.StatusBadRequest, "invalid JSON body"
+		return palette.DecodedConfig{}, http.StatusBadRequest, "invalid JSON body"
 	}
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return domainpalette.Config{}, http.StatusUnprocessableEntity, "palette config must be a JSON object"
+		return palette.DecodedConfig{}, http.StatusUnprocessableEntity, "palette config must be a JSON object"
 	}
-	cfg, err := palette.DecodeConfig(raw)
+	in, err := palette.DecodeConfig(raw)
 	if err != nil {
 		var typeErr *json.UnmarshalTypeError
 		if errors.As(err, &typeErr) {
-			return domainpalette.Config{}, http.StatusUnprocessableEntity, err.Error()
+			return palette.DecodedConfig{}, http.StatusUnprocessableEntity, err.Error()
 		}
 		var syntaxErr *json.SyntaxError
 		if errors.As(err, &syntaxErr) {
-			return domainpalette.Config{}, http.StatusBadRequest, "invalid JSON body"
+			return palette.DecodedConfig{}, http.StatusBadRequest, "invalid JSON body"
 		}
-		return domainpalette.Config{}, http.StatusUnprocessableEntity, err.Error()
+		return palette.DecodedConfig{}, http.StatusUnprocessableEntity, err.Error()
 	}
-	return cfg, 0, ""
+	return in, 0, ""
 }
 
 func isEmptyOrWhitespace(data []byte) bool {

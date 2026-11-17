@@ -134,7 +134,7 @@ function activeTab(container: HTMLElement): Element {
 
 async function renderWorkbench(shells: string[] = []) {
   shellIds = shells;
-  const page = mount(<TaskWorkbenchPage taskID="t1" />);
+  const page = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
   act(() => taskSub!.onData(makeTask({})));
   await flushUI();
   return page;

@@ -62,6 +62,7 @@ function isPaletteConfigDetail(raw: unknown): raw is PaletteConfig {
   const rec = raw as Record<string, unknown>;
   if (
     typeof rec.hotkey !== 'string' ||
+    typeof rec.workbenchFullscreenHotkey !== 'string' ||
     typeof rec.triggerWord !== 'string' ||
     (rec.matchMode !== 'exact' && rec.matchMode !== 'exact-then-substring')
   ) {
@@ -213,7 +214,7 @@ export function App() {
     page = <ProjectsManagePage />;
   } else if (res.page === 'task' && res.taskID) {
     // 工作台：?from 归一（active→home、projects→projects、未知→home），key={taskID} 重挂载（D8）。
-    page = <TaskWorkbenchPage key={res.taskID} taskID={res.taskID} from={res.from ?? 'home'} />;
+    page = <TaskWorkbenchPage key={res.taskID} taskID={res.taskID} from={res.from ?? 'home'} workbenchFullscreenHotkey={paletteConfig.workbenchFullscreenHotkey} />;
   } else {
     // 指挥中心（home）：任务优先首页。
     page = <CommandCenterPage matchMode={paletteConfig.matchMode} />;

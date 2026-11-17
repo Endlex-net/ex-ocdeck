@@ -230,7 +230,7 @@ describe('工作台移动任务切换器（Z-F1）', () => {
         summary('t-wt', { status: 'active', branch: 'ocdeck/wt' }),
       ]),
     ];
-    const { container } = renderPage(<TaskWorkbenchPage taskID="t-wt" />);
+    const { container } = renderPage(<TaskWorkbenchPage taskID="t-wt" workbenchFullscreenHotkey="mod+shift+f" />);
     await flushUI();
     act(() => taskSub!.onData(makeTask({ id: 't-wt' })));
 

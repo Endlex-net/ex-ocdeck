@@ -79,7 +79,7 @@ function makeTask(over: Partial<TaskDetail>): TaskDetail {
 const cleanups: Array<() => void> = [];
 
 function renderWorkbench(taskID = 't1') {
-  const utils = mount(<TaskWorkbenchPage taskID={taskID} />);
+  const utils = mount(<TaskWorkbenchPage taskID={taskID} workbenchFullscreenHotkey="mod+shift+f" />);
   // 幂等卸载：测试内手动卸载（任务切换场景）与 afterEach 兜底不重复 unmount
   let done = false;
   const unmount = () => {

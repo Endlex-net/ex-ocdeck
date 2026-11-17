@@ -33,6 +33,7 @@ export type PaletteCommandId =
 
 export type PaletteConfig = {
   hotkey: string;
+  workbenchFullscreenHotkey: string;
   triggerWord: string;
   matchMode: PaletteMatchMode;
   commandTriggers: Record<PaletteCommandId, string>;

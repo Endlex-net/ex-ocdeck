@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../api';
-import { formatHotkey, normalizeHotkey, validateCanonicalHotkey } from '../hotkey';
+import { formatHotkey, hotkeysConflict, normalizeHotkey, validateCanonicalHotkey } from '../hotkey';
 import { foldForMatch } from '../fuzzy-match';
 import {
   DEFAULT_COMMAND_TRIGGERS,
@@ -14,6 +14,7 @@ export type PaletteConfigLoadState = 'loading' | 'ready' | 'error';
 
 export const DEFAULT_PALETTE_CONFIG: PaletteConfig = {
   hotkey: 'mod+k',
+  workbenchFullscreenHotkey: 'mod+shift+f',
   triggerWord: 'new',
   matchMode: 'exact-then-substring',
   commandTriggers: DEFAULT_COMMAND_TRIGGERS,
@@ -112,6 +113,7 @@ export function PaletteConfigPanel({
 }) {
   const source = loadState === 'error' ? DEFAULT_PALETTE_CONFIG : config;
   const [hotkey, setHotkey] = useState(source.hotkey);
+  const [workbenchFullscreenHotkey, setWorkbenchFullscreenHotkey] = useState(source.workbenchFullscreenHotkey);
   const [triggerWord, setTriggerWord] = useState(source.triggerWord);
   const [matchMode, setMatchMode] = useState<PaletteMatchMode>(source.matchMode);
   const [commandTriggers, setCommandTriggers] = useState<Record<PaletteCommandId, string>>(
@@ -124,6 +126,7 @@ export function PaletteConfigPanel({
   useEffect(() => {
     const next = loadState === 'error' ? DEFAULT_PALETTE_CONFIG : config;
     setHotkey(next.hotkey);
+    setWorkbenchFullscreenHotkey(next.workbenchFullscreenHotkey);
     setTriggerWord(next.triggerWord);
     setMatchMode(next.matchMode);
     setCommandTriggers(next.commandTriggers);
@@ -132,8 +135,12 @@ export function PaletteConfigPanel({
   const commandErrors = validateCommandTriggers(commandTriggers, triggerWord);
   const hasCommandErrors = Object.keys(commandErrors).length > 0;
 
-  const hotkeyPreview = validateHotkeyDraft(hotkey);
-  const preview = 'canonical' in hotkeyPreview ? formatHotkey(hotkeyPreview.canonical) : '';
+  const previewOf = (raw: string) => {
+    const result = validateHotkeyDraft(raw);
+    return 'canonical' in result ? formatHotkey(result.canonical) : '';
+  };
+  const preview = previewOf(hotkey);
+  const fullscreenPreview = previewOf(workbenchFullscreenHotkey);
   const loading = loadState === 'loading';
 
   const save = async (e: React.FormEvent) => {
@@ -152,6 +159,15 @@ export function PaletteConfigPanel({
       setError(hotkeyResult.error);
       return;
     }
+    const fullscreenResult = validateHotkeyDraft(workbenchFullscreenHotkey);
+    if ('error' in fullscreenResult) {
+      setError(fullscreenResult.error);
+      return;
+    }
+    if (hotkeysConflict(hotkeyResult.canonical, fullscreenResult.canonical)) {
+      setError('唤起热键与工作台全屏热键实际冲突');
+      return;
+    }
     if (hasCommandErrors) {
       setError('指令触发词存在校验错误，请修正后重试');
       return;
@@ -161,11 +177,13 @@ export function PaletteConfigPanel({
     try {
       const saved = await api.putPaletteConfig({
         hotkey: hotkeyResult.canonical,
+        workbenchFullscreenHotkey: fullscreenResult.canonical,
         triggerWord,
         matchMode,
         commandTriggers,
       });
       setHotkey(saved.hotkey);
+      setWorkbenchFullscreenHotkey(saved.workbenchFullscreenHotkey);
       setTriggerWord(saved.triggerWord);
       setMatchMode(saved.matchMode);
       setCommandTriggers(saved.commandTriggers);
@@ -226,6 +244,26 @@ export function PaletteConfigPanel({
             </span>
           </div>
           <div className="od-hint">输入规范串（如 mod+k）或自由组合；保存时规范化。默认展示 ⌘K / Ctrl+K</div>
+        </div>
+
+        <div className="od-field">
+          <label className="od-label" htmlFor="palette-workbench-fullscreen-hotkey">
+            工作台全屏热键
+          </label>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <input
+              className="od-input mono"
+              id="palette-workbench-fullscreen-hotkey"
+              spellCheck={false}
+              style={{ maxWidth: 280 }}
+              value={workbenchFullscreenHotkey}
+              onChange={(e) => setWorkbenchFullscreenHotkey(e.target.value)}
+            />
+            <span className="muted mono" style={{ fontSize: '12.5px' }}>
+              {fullscreenPreview}
+            </span>
+          </div>
+          <div className="od-hint">切换工作台 Zen 布局；不得与唤起热键实际冲突。默认展示 ⌘⇧F / Ctrl+Shift+F</div>
         </div>
 
         <div className="od-field">

@@ -2,16 +2,18 @@ package palette
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"unicode/utf8"
 )
 
 const (
-	DefaultHotkey      = "mod+k"
-	DefaultTriggerWord = "new"
-	MatchModeExact     = "exact"
-	MatchModeExactThen = "exact-then-substring"
-	MaxTriggerCodePts  = 32
+	DefaultHotkey                    = "mod+k"
+	DefaultWorkbenchFullscreenHotkey = "mod+shift+f"
+	DefaultTriggerWord               = "new"
+	MatchModeExact                   = "exact"
+	MatchModeExactThen               = "exact-then-substring"
+	MaxTriggerCodePts                = 32
 )
 
 // PaletteCommandId 枚举（spec palette-config「命令面板配置读写 API」）。
@@ -40,10 +42,11 @@ var knownCommandIDs = map[string]struct{}{
 // Config 命令面板配置。磁盘/HTTP camelCase 映射由 adapter 负责，领域层用 Go 导出名。
 // CommandTriggers 键为 PaletteCommandId 枚举（恰 8 键），空串值 = 指令未启用。
 type Config struct {
-	Hotkey          string
-	TriggerWord     string
-	MatchMode       string
-	CommandTriggers map[string]string
+	Hotkey                    string
+	WorkbenchFullscreenHotkey string
+	TriggerWord               string
+	MatchMode                 string
+	CommandTriggers           map[string]string
 }
 
 // DefaultCommandTriggers 默认指令触发词表：cc/pro/reg + 5 空键。
@@ -62,10 +65,11 @@ func DefaultCommandTriggers() map[string]string {
 
 func DefaultConfig() Config {
 	return Config{
-		Hotkey:          DefaultHotkey,
-		TriggerWord:     DefaultTriggerWord,
-		MatchMode:       MatchModeExactThen,
-		CommandTriggers: DefaultCommandTriggers(),
+		Hotkey:                    DefaultHotkey,
+		WorkbenchFullscreenHotkey: DefaultWorkbenchFullscreenHotkey,
+		TriggerWord:               DefaultTriggerWord,
+		MatchMode:                 MatchModeExactThen,
+		CommandTriggers:           DefaultCommandTriggers(),
 	}
 }
 
@@ -77,6 +81,12 @@ func DefaultConfig() Config {
 func (c Config) Validate(fold func(string) string) error {
 	if err := validateCanonicalHotkey(c.Hotkey); err != nil {
 		return err
+	}
+	if err := validateCanonicalHotkey(c.WorkbenchFullscreenHotkey); err != nil {
+		return fmt.Errorf("workbenchFullscreenHotkey: %w", err)
+	}
+	if hotkeysConflict(c.Hotkey, c.WorkbenchFullscreenHotkey) {
+		return fmt.Errorf("hotkey %q conflicts with workbenchFullscreenHotkey %q", c.Hotkey, c.WorkbenchFullscreenHotkey)
 	}
 	if err := validateTriggerWord(c.TriggerWord); err != nil {
 		return err
@@ -179,6 +189,56 @@ func validateCanonicalHotkey(canonical string) error {
 		return fmt.Errorf("hotkey %q conflicts with sidebar ⌘B", canonical)
 	}
 	return nil
+}
+
+// modifier mask 位：与前端 hotkey.ts expandMasks 同一语义，mod 展开为 meta、ctrl、meta+ctrl。
+const (
+	maskMeta uint8 = 1 << iota
+	maskCtrl
+	maskAlt
+	maskShift
+)
+
+// hotkeysConflict 两个规范热键在实际按键匹配语义上冲突：key token 相同且展开后的
+// modifier mask 集合存在交集（spec palette-config「跨动作实际热键冲突」）。调用方须先
+// 通过 validateCanonicalHotkey。
+func hotkeysConflict(a, b string) bool {
+	keyA, masksA := expandHotkeyMasks(a)
+	keyB, masksB := expandHotkeyMasks(b)
+	if keyA != keyB {
+		return false
+	}
+	for _, ma := range masksA {
+		if slices.Contains(masksB, ma) {
+			return true
+		}
+	}
+	return false
+}
+
+func expandHotkeyMasks(canonical string) (key string, masks []uint8) {
+	parts := strings.Split(canonical, "+")
+	key = parts[len(parts)-1]
+	var base uint8
+	hasMod := false
+	for _, m := range parts[:len(parts)-1] {
+		switch m {
+		case "mod":
+			hasMod = true
+		case "meta":
+			base |= maskMeta
+		case "ctrl":
+			base |= maskCtrl
+		case "alt":
+			base |= maskAlt
+		case "shift":
+			base |= maskShift
+		}
+	}
+	if !hasMod {
+		return key, []uint8{base}
+	}
+	return key, []uint8{base | maskMeta, base | maskCtrl, base | maskMeta | maskCtrl}
 }
 
 func modifierIndex(m string) int {
