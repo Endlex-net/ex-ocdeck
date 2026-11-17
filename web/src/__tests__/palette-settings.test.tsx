@@ -41,6 +41,7 @@ function baseConfig(over: Partial<PaletteConfig> = {}): PaletteConfig {
   const { commandTriggers, ...rest } = over;
   return {
     hotkey: 'mod+k',
+    workbenchFullscreenHotkey: 'mod+shift+f',
     triggerWord: 'new',
     matchMode: 'exact-then-substring',
     commandTriggers: commandTriggers ?? DEFAULT_COMMAND_TRIGGERS,
@@ -197,10 +198,69 @@ describe('PaletteConfigPanel', () => {
     expect(putConfigMock).toHaveBeenCalledTimes(1);
     expect(putConfigMock.mock.calls[0][0]).toEqual({
       hotkey: 'mod+k',
+      workbenchFullscreenHotkey: 'mod+shift+f',
       triggerWord: 'new',
       matchMode: 'exact-then-substring',
       commandTriggers: DEFAULT_COMMAND_TRIGGERS,
     });
+  });
+
+  it('工作台全屏热键从快照初始化并展示默认只读预览', () => {
+    const { container } = renderPanel();
+    expect(container.querySelector<HTMLInputElement>('#palette-workbench-fullscreen-hotkey')?.value).toBe('mod+shift+f');
+    expect(container.textContent).toContain('⌘⇧F / Ctrl+Shift+F');
+  });
+
+  it('全屏热键 mod+shift+f 与唤起热键 meta+shift+f 实际冲突：不 PUT', async () => {
+    const { container } = renderPanel();
+    const fullscreen = container.querySelector<HTMLInputElement>('#palette-workbench-fullscreen-hotkey')!;
+    await act(async () => {
+      setInputValue(fullscreen, 'mod+shift+f');
+      setInputValue(container.querySelector<HTMLInputElement>('#palette-hotkey')!, 'meta+shift+f');
+    });
+    await submitForm(container);
+    expect(putConfigMock).not.toHaveBeenCalled();
+    expect(container.querySelector('.od-alert-danger')).not.toBeNull();
+  });
+
+  it('全屏热键非法（mod+t 保留组合）本地校验失败不 PUT', async () => {
+    const { container } = renderPanel();
+    await act(async () => {
+      setInputValue(container.querySelector<HTMLInputElement>('#palette-workbench-fullscreen-hotkey')!, 'mod+t');
+    });
+    await submitForm(container);
+    expect(putConfigMock).not.toHaveBeenCalled();
+    expect(container.querySelector('.od-alert-danger')).not.toBeNull();
+  });
+
+  it('meta+shift+f 与 ctrl+shift+f 不冲突，保存成功 PUT 完整五键并派发五键事件', async () => {
+    const saved = baseConfig({
+      hotkey: 'meta+shift+f',
+      workbenchFullscreenHotkey: 'ctrl+shift+f',
+    });
+    putConfigMock.mockResolvedValue(saved);
+    const { container } = renderPanel();
+    await act(async () => {
+      setInputValue(container.querySelector<HTMLInputElement>('#palette-hotkey')!, 'meta+shift+f');
+      setInputValue(container.querySelector<HTMLInputElement>('#palette-workbench-fullscreen-hotkey')!, 'ctrl+shift+f');
+    });
+    const changed = vi.fn();
+    window.addEventListener(PALETTE_CONFIG_CHANGED_EVENT, changed);
+    await submitForm(container);
+    window.removeEventListener(PALETTE_CONFIG_CHANGED_EVENT, changed);
+    expect(putConfigMock).toHaveBeenCalledTimes(1);
+    expect(putConfigMock.mock.calls[0][0].workbenchFullscreenHotkey).toBe('ctrl+shift+f');
+    expect(changed).toHaveBeenCalledTimes(1);
+    expect(changed.mock.calls[0][0].detail).toEqual(saved);
+  });
+
+  it('加载失败时全屏热键回退默认 mod+shift+f', () => {
+    const { container } = renderPanel({
+      config: baseConfig({ workbenchFullscreenHotkey: 'ctrl+alt+g' }),
+      loadState: 'error',
+      loadError: 'boom',
+    });
+    expect(container.querySelector<HTMLInputElement>('#palette-workbench-fullscreen-hotkey')?.value).toBe('mod+shift+f');
   });
 
   it('指令触发词小节固定 8 行并渲染默认词表（cc/pro/reg + 5 空键）', () => {

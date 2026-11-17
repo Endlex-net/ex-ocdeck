@@ -4,7 +4,9 @@ import { useMediaQuery, useProjects } from '../hooks';
 import { requestTerminalFocus } from '../terminal/focus-request';
 import { ResizeHandle, usePersistedSize } from './resize';
 import { ServerStatusBanner } from './ServerStatusBanner';
+import { CompactTaskNav } from './CompactTaskNav';
 import { orderSidebarGroups, transitionalLabel } from './sidebar-order';
+import { taskStatusDotClass } from './task-status';
 import type { Project } from '../types';
 import {
   HomeIcon,
@@ -123,7 +125,11 @@ export function AppShell({
           </a>
 
           <div className="od-nav-group">任务</div>
-          <SidebarTaskGroups projects={projects} currentTaskID={currentTaskID} />
+          {collapsed && !narrowTop ? (
+            <CompactTaskNav projects={projects} currentTaskID={currentTaskID} variant="sidebar" />
+          ) : (
+            <SidebarTaskGroups projects={projects} currentTaskID={currentTaskID} />
+          )}
 
           <div className="od-nav-group">管理</div>
           <a
@@ -244,7 +250,7 @@ function SidebarTaskGroups({ projects, currentTaskID }: { projects: Project[]; c
                 {transLabel ? (
                   <span className="od-spinner od-nav-task-spinner" aria-hidden />
                 ) : (
-                  <span className={`od-agent od-agent-${agentDotClass(t.agentStatus, t.attention_count)}`}>
+                  <span className={`od-agent od-agent-${taskStatusDotClass(t)}`}>
                     <span className="od-agent-dot"></span>
                   </span>
                 )}
@@ -261,15 +267,6 @@ function SidebarTaskGroups({ projects, currentTaskID }: { projects: Project[]; c
       ))}
     </>
   );
-}
-
-/** agent 状态点 class：等待人工（attention_count>0）蓝点优先于 idle/busy/retry；未知降级为 idle-off 不亮。 */
-function agentDotClass(agentStatus?: string, attentionCount = 0): 'idle' | 'busy' | 'retry' | 'attention' | 'idle-off' {
-  if (attentionCount > 0) return 'attention';
-  if (agentStatus === 'busy') return 'busy';
-  if (agentStatus === 'retry') return 'retry';
-  if (agentStatus === 'idle') return 'idle';
-  return 'idle-off';
 }
 
 /** 主题切换按钮图标：跟随当前有效主题循环（system 跟随时显示对应图标）。 */

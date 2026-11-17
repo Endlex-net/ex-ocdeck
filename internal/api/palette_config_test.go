@@ -35,14 +35,18 @@ func validPaletteJSON() string {
 
 // paletteConfigEqual Config/DTO 含 map 不可 ==，测试专用相等断言。
 func paletteConfigEqual(a, b paletteConfigDTO) bool {
-	return a.Hotkey == b.Hotkey && a.TriggerWord == b.TriggerWord && a.MatchMode == b.MatchMode &&
+	return a.Hotkey == b.Hotkey && a.WorkbenchFullscreenHotkey == b.WorkbenchFullscreenHotkey &&
+		a.TriggerWord == b.TriggerWord && a.MatchMode == b.MatchMode &&
 		maps.Equal(a.CommandTriggers, b.CommandTriggers)
 }
 
 func storeConfigEqual(a, b domainpalette.Config) bool {
-	return a.Hotkey == b.Hotkey && a.TriggerWord == b.TriggerWord && a.MatchMode == b.MatchMode &&
+	return a.Hotkey == b.Hotkey && a.WorkbenchFullscreenHotkey == b.WorkbenchFullscreenHotkey &&
+		a.TriggerWord == b.TriggerWord && a.MatchMode == b.MatchMode &&
 		maps.Equal(a.CommandTriggers, b.CommandTriggers)
 }
+
+const apiTriggersJSON = `{"command-center":"cc","projects":"pr","settings-appearance":"","settings-env":"","settings-opencode":"","settings-ai":"","settings-palette":"","register-project":"reg"}`
 
 func TestPaletteConfig_GET_DefaultsWhenFileMissing(t *testing.T) {
 	store := palette.LoadStore(t.TempDir())
@@ -62,7 +66,7 @@ func TestPaletteConfig_GET_DefaultsWhenFileMissing(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&dto); err != nil {
 		t.Fatal(err)
 	}
-	if dto.Hotkey != "mod+k" || dto.TriggerWord != "new" || dto.MatchMode != "exact-then-substring" {
+	if dto.Hotkey != "mod+k" || dto.WorkbenchFullscreenHotkey != "mod+shift+f" || dto.TriggerWord != "new" || dto.MatchMode != "exact-then-substring" {
 		t.Fatalf("default GET mismatch: %+v", dto)
 	}
 	// GET 返回全部 8 键（cc/pro/reg + 5 空键），空串 = 未启用。
@@ -161,6 +165,12 @@ func TestPaletteConfig_PUT_ErrorMatrix(t *testing.T) {
 		{"illegal hotkey", `{"hotkey":"k","triggerWord":"create","matchMode":"exact","commandTriggers":{"command-center":"cc","projects":"pr","settings-appearance":"","settings-env":"","settings-opencode":"","settings-ai":"","settings-palette":"","register-project":"reg"}}`, http.StatusUnprocessableEntity},
 		{"illegal triggerWord", `{"hotkey":"alt+k","triggerWord":"new ","matchMode":"exact","commandTriggers":{"command-center":"cc","projects":"pr","settings-appearance":"","settings-env":"","settings-opencode":"","settings-ai":"","settings-palette":"","register-project":"reg"}}`, http.StatusUnprocessableEntity},
 		{"illegal matchMode", `{"hotkey":"alt+k","triggerWord":"create","matchMode":"fuzzy","commandTriggers":{"command-center":"cc","projects":"pr","settings-appearance":"","settings-env":"","settings-opencode":"","settings-ai":"","settings-palette":"","register-project":"reg"}}`, http.StatusUnprocessableEntity},
+		{"workbench null", `{"hotkey":"alt+k","workbenchFullscreenHotkey":null,"triggerWord":"create","matchMode":"exact","commandTriggers":` + apiTriggersJSON + `}`, http.StatusUnprocessableEntity},
+		{"workbench type error", `{"hotkey":"alt+k","workbenchFullscreenHotkey":1,"triggerWord":"create","matchMode":"exact","commandTriggers":` + apiTriggersJSON + `}`, http.StatusUnprocessableEntity},
+		{"workbench empty string", `{"hotkey":"alt+k","workbenchFullscreenHotkey":"","triggerWord":"create","matchMode":"exact","commandTriggers":` + apiTriggersJSON + `}`, http.StatusUnprocessableEntity},
+		{"workbench non-canonical", `{"hotkey":"alt+k","workbenchFullscreenHotkey":"mod+K","triggerWord":"create","matchMode":"exact","commandTriggers":` + apiTriggersJSON + `}`, http.StatusUnprocessableEntity},
+		{"workbench reserved combo", `{"hotkey":"alt+k","workbenchFullscreenHotkey":"mod+t","triggerWord":"create","matchMode":"exact","commandTriggers":` + apiTriggersJSON + `}`, http.StatusUnprocessableEntity},
+		{"explicit cross-action conflict", `{"hotkey":"mod+shift+f","workbenchFullscreenHotkey":"meta+shift+f","triggerWord":"create","matchMode":"exact","commandTriggers":` + apiTriggersJSON + `}`, http.StatusUnprocessableEntity},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -334,10 +344,11 @@ func TestSetPaletteConfigStore_RebuildRoutesSmoke(t *testing.T) {
 	// GET 必须读到注入 store 的快照（setter 改 no-op 时此测试失败）
 	store := palette.LoadStore(t.TempDir())
 	seed := domainpalette.Config{
-		Hotkey:          "alt+k",
-		TriggerWord:     "create",
-		MatchMode:       "exact",
-		CommandTriggers: domainpalette.DefaultCommandTriggers(),
+		Hotkey:                    "alt+k",
+		WorkbenchFullscreenHotkey: "ctrl+alt+g",
+		TriggerWord:               "create",
+		MatchMode:                 "exact",
+		CommandTriggers:           domainpalette.DefaultCommandTriggers(),
 	}
 	if err := store.Put(seed); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -362,11 +373,115 @@ func TestSetPaletteConfigStore_RebuildRoutesSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !paletteConfigEqual(dto, paletteConfigDTO{
-		Hotkey:          seed.Hotkey,
-		TriggerWord:     seed.TriggerWord,
-		MatchMode:       seed.MatchMode,
-		CommandTriggers: seed.CommandTriggers,
+		Hotkey:                    seed.Hotkey,
+		WorkbenchFullscreenHotkey: seed.WorkbenchFullscreenHotkey,
+		TriggerWord:               seed.TriggerWord,
+		MatchMode:                 seed.MatchMode,
+		CommandTriggers:           seed.CommandTriggers,
 	}) {
 		t.Fatalf("GET must serve injected store snapshot, got %+v", dto)
+	}
+}
+
+// TestPaletteConfig_PUT_OldClientInheritsWorkbench 旧四键客户端省略新字段：沿用当前生效值，
+// 200 响应为完整五键且不重置为默认。
+func TestPaletteConfig_PUT_OldClientInheritsWorkbench(t *testing.T) {
+	dir := t.TempDir()
+	store := palette.LoadStore(dir)
+	seed := domainpalette.DefaultConfig()
+	seed.WorkbenchFullscreenHotkey = "ctrl+shift+g"
+	if err := store.Put(seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	s := newPaletteConfigServer(t, store)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	resp, err := http.DefaultClient.Do(authedReq("PUT", ts.URL+"/api/v1/palette/config", validPaletteJSON()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var dto paletteConfigDTO
+	if err := json.NewDecoder(resp.Body).Decode(&dto); err != nil {
+		t.Fatal(err)
+	}
+	if dto.Hotkey != "alt+k" || dto.WorkbenchFullscreenHotkey != "ctrl+shift+g" {
+		t.Fatalf("old client PUT must keep current workbench value, got %+v", dto)
+	}
+	if store.Config().Hotkey != "alt+k" || store.Config().WorkbenchFullscreenHotkey != "ctrl+shift+g" {
+		t.Fatalf("snapshot must keep inherited workbench value, got %+v", store.Config())
+	}
+	if !paletteConfigEqual(dto, paletteDTOFromConfig(store.Config())) {
+		t.Fatalf("PUT response must equal committed snapshot: %+v vs %+v", dto, paletteDTOFromConfig(store.Config()))
+	}
+}
+
+// TestPaletteConfig_PUT_OldClientInheritedConflict422 旧客户端省略新字段时，沿用值参与
+// 跨动作校验：与本次 hotkey 冲突 → 422，既有配置（含继承值）不变。
+func TestPaletteConfig_PUT_OldClientInheritedConflict422(t *testing.T) {
+	dir := t.TempDir()
+	store := palette.LoadStore(dir)
+	seed := domainpalette.DefaultConfig()
+	seed.WorkbenchFullscreenHotkey = "ctrl+shift+g"
+	if err := store.Put(seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	before, err := os.ReadFile(palette.ConfigPath(dir))
+	if err != nil {
+		t.Fatalf("read seed: %v", err)
+	}
+	s := newPaletteConfigServer(t, store)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	body := `{"hotkey":"mod+shift+g","triggerWord":"create","matchMode":"exact","commandTriggers":` + apiTriggersJSON + `}`
+	resp, err := http.DefaultClient.Do(authedReq("PUT", ts.URL+"/api/v1/palette/config", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", resp.StatusCode)
+	}
+	eb := mustParseErrorBody(t, resp.Body)
+	if eb.Error.Code != CodeInvalidInput {
+		t.Fatalf("code = %v, want invalid_input", eb.Error.Code)
+	}
+	if store.Config().WorkbenchFullscreenHotkey != "ctrl+shift+g" || store.Config().Hotkey != seed.Hotkey {
+		t.Fatalf("snapshot changed after inherited conflict: %+v", store.Config())
+	}
+	after, err := os.ReadFile(palette.ConfigPath(dir))
+	if err != nil {
+		t.Fatalf("read after: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("file changed after inherited conflict")
+	}
+}
+
+// TestPaletteConfig_PUT_WriteFailureNotValidation 写盘失败保持 500（非 422 校验错误）。
+func TestPaletteConfig_PUT_WriteFailureNotValidation(t *testing.T) {
+	dir := t.TempDir()
+	store := palette.LoadStore(dir)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	s := newPaletteConfigServer(t, store)
+	ts := httptest.NewServer(s.mux)
+	defer ts.Close()
+
+	body := `{"hotkey":"alt+k","workbenchFullscreenHotkey":"ctrl+alt+g","triggerWord":"create","matchMode":"exact","commandTriggers":` + apiTriggersJSON + `}`
+	resp, err := http.DefaultClient.Do(authedReq("PUT", ts.URL+"/api/v1/palette/config", body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", resp.StatusCode)
 	}
 }

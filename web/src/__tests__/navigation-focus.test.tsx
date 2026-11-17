@@ -306,7 +306,7 @@ describe('导航焦点请求生产点（点击 → 发布信号，导航照常�
 
 describe('工作台标签激活（只激活不消费）', () => {
   it('已驻留 TUI 时收到匹配请求 → 保持 TUI（不抖动）', () => {
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     act(() => taskSub!.onData(makeTask({})));
     act(() => fr.requestTerminalFocus('t1'));
     expect(activeTab(container)!.textContent).toBe('终端');
@@ -316,7 +316,7 @@ describe('工作台标签激活（只激活不消费）', () => {
   it('移动端任务切换器真实点击发信号（.wb-switcher-btn → .wb-sw-item）', async () => {
     storeIsMobile = true;
     storeProjects = makeProjects();
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     // 切换器随 task 渲染（加载阶段仅 wb-not-found）
     act(() => taskSub!.onData(makeTask({})));
     await act(async () => {
@@ -333,7 +333,7 @@ describe('工作台标签激活（只激活不消费）', () => {
   });
 
   it('其他任务的请求不切标签（从 Git tab 出发断言不切走）', async () => {
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     act(() => taskSub!.onData(makeTask({})));
     await act(async () => {
       gitTab(container)!.click();
@@ -350,12 +350,12 @@ describe('工作台标签激活（只激活不消费）', () => {
   it('加载阶段（task 未返回）离开目标任务 → 请求作废；返回后无新请求不聚焦', () => {
     act(() => fr.requestTerminalFocus('t1'));
     // 进入 t1 工作台：加载阶段无 TerminalView，仅工作台订阅存活
-    const w1 = mount(<TaskWorkbenchPage taskID="t1" />);
+    const w1 = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     // 未等数据返回即离开
     w1.unmount();
     expect(pendingReq()).toBeNull();
     // 5s 内返回 t1，无新显式请求
-    const w2 = mount(<TaskWorkbenchPage taskID="t1" />);
+    const w2 = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     act(() => taskSub!.onData(makeTask({})));
     act(() => lastSession().emitState('connected'));
     expect(lastSession().focusCalls).toBe(0);
@@ -363,7 +363,7 @@ describe('工作台标签激活（只激活不消费）', () => {
   });
 
   it('Git 标签 → 点击同任务 → TUI 激活 → connected 后聚焦（真实 TerminalView 消费）', async () => {
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     act(() => taskSub!.onData(makeTask({})));
     await act(async () => {
       gitTab(container)!.click();

@@ -144,6 +144,16 @@ func permAskedEvent(id, sid, perm string, patterns ...string) opencode.Event {
 	return opencode.Event{Type: "permission.asked", Properties: props}
 }
 
+// claimPermSession 以生产 claim 路径为 sid 建立本任务归属：permission.asked 经
+// applyOwnedAttentionEvent 归属守卫，未归属事件被 fail-closed drop。
+func claimPermSession(t *testing.T, store *mockStore, taskID, sid string) {
+	t.Helper()
+	res, err := store.ClaimTaskSession(context.Background(), taskID, sid, 1, 1, 1, "")
+	if err != nil || !res.Claimed {
+		t.Fatalf("claim session %s for task %s: claimed=%v err=%v", sid, taskID, res.Claimed, err)
+	}
+}
+
 // permRepliedEvent 构造 permission.replied SSE 事件（人工抢先了结模拟用）。
 func permRepliedEvent(sid, rid string) opencode.Event {
 	return opencode.Event{Type: "permission.replied", Properties: map[string]interface{}{
@@ -529,7 +539,8 @@ func TestJudgeScan_RuntimeRebuild_SameID_RejudgedOnce(t *testing.T) {
 // TestSSEAsked_AIAuto_JudgesOnce 触发点 (a)：SSE asked 应用后扫描；重放只判定一次。
 func TestSSEAsked_AIAuto_JudgesOnce(t *testing.T) {
 	judge := newFakeJudge(PermissionVerdictApprove)
-	m, _, oc, _, _ := newAutoTaskEnv(t, judge)
+	m, store, oc, _, _ := newAutoTaskEnv(t, judge)
+	claimPermSession(t, store, "t1", "s1")
 
 	ev := permAskedEvent("r1", "s1", "bash", "rm")
 	if err := m.handleSSEEvent(context.Background(), "t1", "/data/worktrees/p1/t1", ev); err != nil {
@@ -1161,6 +1172,7 @@ func TestResumeActive_AIAuto_PreCommitAskedGating(t *testing.T) {
 		row, _ := store.GetTask(context.Background(), "t1")
 		go func() { done <- m.resumeActive(context.Background(), row, AlignModeRepo) }()
 		<-gated.entered // watcher 恢复阶段（align 已完成、active 未提交）
+		claimPermSession(t, store, "t1", "s1")
 		if got := len(judge.judgeCalls()); got != 0 {
 			t.Fatalf("pre-commit MUST NOT judge, calls = %d", got)
 		}
@@ -1187,6 +1199,7 @@ func TestResumeActive_AIAuto_PreCommitAskedGating(t *testing.T) {
 		row, _ := store.GetTask(context.Background(), "t1")
 		go func() { done <- m.resumeActive(context.Background(), row, AlignModeRepo) }()
 		<-gated.entered
+		claimPermSession(t, store, "t1", "s1")
 		if err := m.handleSSEEvent(context.Background(), "t1", "/data/worktrees/p1/t1", permAskedEvent("r9", "s1", "edit", "file")); err != nil {
 			t.Fatalf("handleSSEEvent: %v", err)
 		}
@@ -1307,6 +1320,8 @@ func TestActivate_AIAuto_PreCommitAskedGating(t *testing.T) {
 	if snap := rt.attentionSnapshot(); len(snap.Permissions) != 1 || snap.Permissions[0].ID != "r1" {
 		t.Fatalf("align-registered pending must be observed, got %+v", snap.Permissions)
 	}
+	// 归属在 align 之后认领（complete 对齐会删除 OC 列表缺席的 owned 行）。
+	claimPermSession(t, store, "t1", "s1")
 	// 提交点前注入 asked：(a) 扫描因 DB 非 active（activating）暂缓，不登记 judged-set。
 	if err := m.handleSSEEvent(context.Background(), "t1", "/data/worktrees/p1/t1", permAskedEvent("r9", "s1", "edit", "file")); err != nil {
 		t.Fatalf("handleSSEEvent: %v", err)
@@ -1517,6 +1532,7 @@ func TestJudgeScan_SSEPathNotBlockedByDBPrecheck(t *testing.T) {
 	rt := initAutoPermState(t, m, store.mockStore, "t1")
 	rt.ensureAttentionState()
 	rt.setPermJudgeReady()
+	claimPermSession(t, store.mockStore, "t1", "s1")
 
 	done := make(chan error, 1)
 	go func() {

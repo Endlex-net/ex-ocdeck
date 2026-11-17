@@ -92,7 +92,7 @@ beforeEach(() => {
 
 describe('TaskWorkbenchPage Git 能力判定（add-local-path-task-mode 6.2）', () => {
   it('repo worktree：Git tab 显示、页头展示分支名（对照基线）', () => {
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     act(() => taskSub!.onData(makeTask({})));
     expect(container.querySelector('.header-meta')?.textContent).toContain('ocdeck/demo');
     expect(gitTab(container)).not.toBeUndefined();
@@ -100,7 +100,7 @@ describe('TaskWorkbenchPage Git 能力判定（add-local-path-task-mode 6.2）',
   });
 
   it('repo local-path：Git tab 显示；页头分支区由 gitStatus 驱动（空串降级不展示）', () => {
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     // 现实帧：branch 恒为空（D3）
     act(() => taskSub!.onData(makeTask({ mode: 'local-path', branch: '' })));
     expect(gitTab(container)).not.toBeUndefined();
@@ -115,7 +115,7 @@ describe('TaskWorkbenchPage Git 能力判定（add-local-path-task-mode 6.2）',
   });
 
   it('已驻留 Git tab 时收到 local-path 帧不回退（Git 能力不再按 mode 判定）', async () => {
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     act(() => taskSub!.onData(makeTask({ mode: 'worktree' })));
     expect(gitTab(container)).not.toBeUndefined();
 
@@ -135,7 +135,7 @@ describe('TaskWorkbenchPage Git 能力判定（add-local-path-task-mode 6.2）',
   });
 
   it('dir 任务仍隐藏 Git tab 与分支名；已驻留 Git tab 时回退 TUI（既有行为回归）', async () => {
-    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" />);
+    const { container, unmount } = mount(<TaskWorkbenchPage taskID="t1" workbenchFullscreenHotkey="mod+shift+f" />);
     // 先以 repo worktree 帧驻留 Git tab，再收到 dir 帧 → 回退 TUI
     act(() => taskSub!.onData(makeTask({ mode: 'worktree' })));
     await act(async () => {

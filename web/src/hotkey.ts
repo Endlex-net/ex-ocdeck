@@ -76,6 +76,18 @@ function expandMasks(seen: Set<string>): ModifierMask[] {
   return [{ meta: seen.has('meta'), ctrl: seen.has('ctrl'), alt, shift }];
 }
 
+/** 两个规范热键是否在实际按键匹配语义上冲突：key 相同且展开后的 mask 集合有交集。 */
+export function hotkeysConflict(a: string, b: string): boolean {
+  const pa = a.split('+');
+  const pb = b.split('+');
+  if (pa[pa.length - 1] !== pb[pb.length - 1]) return false;
+  const masksA = expandMasks(new Set(pa.slice(0, -1)));
+  const masksB = expandMasks(new Set(pb.slice(0, -1)));
+  return masksA.some((x) =>
+    masksB.some((y) => x.meta === y.meta && x.ctrl === y.ctrl && x.alt === y.alt && x.shift === y.shift),
+  );
+}
+
 function eventToken(e: Pick<KeyboardEvent, 'key' | 'code'>): string | null {
   const code = e.code;
   if (typeof code === 'string' && /^Digit[0-9]$/.test(code)) {

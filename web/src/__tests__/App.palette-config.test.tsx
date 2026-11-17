@@ -61,7 +61,11 @@ vi.mock('../pages/CommandCenterPage', () => ({
   ),
 }));
 vi.mock('../pages/ProjectsManagePage', () => ({ ProjectsManagePage: () => null }));
-vi.mock('../pages/TaskWorkbenchPage', () => ({ TaskWorkbenchPage: () => null }));
+vi.mock('../pages/TaskWorkbenchPage', () => ({
+  TaskWorkbenchPage: ({ workbenchFullscreenHotkey }: { workbenchFullscreenHotkey?: string }) => (
+    <div data-testid="workbench-props" data-hotkey={workbenchFullscreenHotkey} />
+  ),
+}));
 vi.mock('../components/CommandPalette', () => ({
   CommandPalette: ({
     triggerWord,
@@ -216,9 +220,24 @@ describe('App 命令面板配置代际', () => {
       name: 'commandTriggers 缺某键（7 键）',
       detail: {
         hotkey: 'alt+k',
+        workbenchFullscreenHotkey: 'mod+shift+f',
         triggerWord: 'stolen',
         matchMode: 'exact',
         commandTriggers: Object.fromEntries(Object.entries(DEFAULT_COMMAND_TRIGGERS).slice(0, 7)),
+      },
+    },
+    {
+      name: '四键事件（缺 workbenchFullscreenHotkey）',
+      detail: { hotkey: 'alt+k', triggerWord: 'stolen', matchMode: 'exact', commandTriggers: DEFAULT_COMMAND_TRIGGERS },
+    },
+    {
+      name: 'workbenchFullscreenHotkey 为 null',
+      detail: {
+        hotkey: 'alt+k',
+        workbenchFullscreenHotkey: null,
+        triggerWord: 'stolen',
+        matchMode: 'exact',
+        commandTriggers: DEFAULT_COMMAND_TRIGGERS,
       },
     },
   ])('事件 detail $name：不应用、不 GET', async ({ detail }) => {
@@ -471,5 +490,24 @@ describe('App 命令面板配置代际', () => {
     const next = formatHotkey('alt+k');
     expect(btn.title).toBe(`命令面板（${next}）`);
     expect(btn.querySelector('.od-palette-kbd')?.textContent).toBe(next);
+  });
+
+  it('工作台下发快照中的全屏热键，配置事件后立即使用新值', async () => {
+    window.location.hash = '#/task/t1';
+    getPaletteMock.mockResolvedValue(cfg());
+    const { container } = await renderApp();
+    const wb = () => container.querySelector('[data-testid="workbench-props"]');
+    expect(wb()?.getAttribute('data-hotkey')).toBe('mod+shift+f');
+
+    getPaletteMock.mockRejectedValueOnce(new Error('refetch skipped'));
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(PALETTE_CONFIG_CHANGED_EVENT, {
+          detail: cfg({ workbenchFullscreenHotkey: 'ctrl+alt+g' }),
+        }),
+      );
+    });
+    await flushUI();
+    expect(wb()?.getAttribute('data-hotkey')).toBe('ctrl+alt+g');
   });
 });

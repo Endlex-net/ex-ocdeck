@@ -3,6 +3,7 @@ package palette
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"maps"
@@ -49,7 +50,8 @@ func validCfg() domainpalette.Config {
 
 // configEqual Config 含 map 不可 ==，测试专用相等断言。
 func configEqual(a, b domainpalette.Config) bool {
-	return a.Hotkey == b.Hotkey && a.TriggerWord == b.TriggerWord && a.MatchMode == b.MatchMode &&
+	return a.Hotkey == b.Hotkey && a.WorkbenchFullscreenHotkey == b.WorkbenchFullscreenHotkey &&
+		a.TriggerWord == b.TriggerWord && a.MatchMode == b.MatchMode &&
 		maps.Equal(a.CommandTriggers, b.CommandTriggers)
 }
 
@@ -137,6 +139,8 @@ func TestLoadStore_WrongCaseKeys_DefaultAndLoadErr(t *testing.T) {
 	}
 }
 
+const storeTriggersJSON = `{"command-center":"cc","projects":"pr","settings-appearance":"","settings-env":"","settings-opencode":"","settings-ai":"","settings-palette":"","register-project":"reg"}`
+
 func TestDecodeConfig_ExactCamelCaseKeys(t *testing.T) {
 	if _, err := DecodeConfig([]byte(`{"Hotkey":"alt+k","triggerWord":"create","matchMode":"exact"}`)); err == nil {
 		t.Fatal("PascalCase Hotkey must not satisfy required hotkey")
@@ -145,12 +149,201 @@ func TestDecodeConfig_ExactCamelCaseKeys(t *testing.T) {
 	if _, err := DecodeConfig([]byte(`{"hotkey":"alt+k","triggerWord":"create","matchMode":"exact"}`)); err == nil {
 		t.Fatal("missing commandTriggers must be rejected by DecodeConfig")
 	}
-	cfg, err := DecodeConfig([]byte(`{"hotkey":"alt+k","triggerWord":"create","matchMode":"exact","commandTriggers":{"command-center":"cc","projects":"pr","settings-appearance":"","settings-env":"","settings-opencode":"","settings-ai":"","settings-palette":"","register-project":"reg"},"Hotkey":"k"}`))
+	dc, err := DecodeConfig([]byte(`{"hotkey":"alt+k","triggerWord":"create","matchMode":"exact","commandTriggers":` + storeTriggersJSON + `,"Hotkey":"k"}`))
 	if err != nil {
 		t.Fatalf("unknown Hotkey must be ignored: %v", err)
 	}
-	if cfg.Hotkey != "alt+k" {
-		t.Fatalf("Hotkey extra must not override hotkey, got %q", cfg.Hotkey)
+	if dc.Config.Hotkey != "alt+k" {
+		t.Fatalf("Hotkey extra must not override hotkey, got %q", dc.Config.Hotkey)
+	}
+}
+
+// TestDecodeConfig_WorkbenchFullscreenHotkeyPresence 新字段可省略（presence=false），
+// 显式 null / 非字符串报错；空串在 presence=true 下放行，交由 Validate 拒绝。
+func TestDecodeConfig_WorkbenchFullscreenHotkeyPresence(t *testing.T) {
+	const base = `"hotkey":"alt+k","triggerWord":"create","matchMode":"exact","commandTriggers":` + storeTriggersJSON
+	cases := []struct {
+		name        string
+		extra       string
+		wantErr     bool
+		wantPresent bool
+		wantValue   string
+	}{
+		{"omitted", ``, false, false, ""},
+		{"explicit", `,"workbenchFullscreenHotkey":"ctrl+alt+g"`, false, true, "ctrl+alt+g"},
+		{"empty string passes decode", `,"workbenchFullscreenHotkey":""`, false, true, ""},
+		{"null rejected", `,"workbenchFullscreenHotkey":null`, true, false, ""},
+		{"number rejected", `,"workbenchFullscreenHotkey":1`, true, false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dc, err := DecodeConfig([]byte(`{` + base + tc.extra + `}`))
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("DecodeConfig err=%v wantErr=%v", err, tc.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if dc.WorkbenchFullscreenHotkeyPresent != tc.wantPresent || dc.Config.WorkbenchFullscreenHotkey != tc.wantValue {
+				t.Fatalf("decoded = %+v", dc)
+			}
+		})
+	}
+}
+
+// putResult 承接 startPutDecodedWhileLocked 启动的 PutDecoded 结果。
+type putResult struct {
+	cfg domainpalette.Config
+	err error
+}
+
+// startPutDecodedWhileLocked 在调用方持有 s.mu 时启动 PutDecoded，返回结果 channel。
+// started 只证明 goroutine 已开始执行，并不证明它已阻塞在 s.mu 上；正确性不依赖这一点：
+// PutDecoded 第一步即 s.mu.Lock，而调用方持锁期间它不可能完成读快照与提交，因此其读取
+// 一定发生在调用方解锁之后。
+func startPutDecodedWhileLocked(t *testing.T, s *Store, in DecodedConfig) <-chan putResult {
+	t.Helper()
+	started := make(chan struct{})
+	done := make(chan putResult, 1)
+	go func() {
+		close(started)
+		cfg, err := s.PutDecoded(in)
+		done <- putResult{cfg, err}
+	}()
+	<-started
+	return done
+}
+
+// assertNotReturned 断言在持锁期间 PutDecoded 尚未返回（它不可能越过 s.mu 完成）。
+func assertNotReturned(t *testing.T, done <-chan putResult) {
+	t.Helper()
+	select {
+	case <-done:
+		t.Fatal("PutDecoded returned while store lock is held")
+	default:
+	}
+}
+
+// TestPutDecoded_InheritsUnderLock 旧四键请求在写锁内继承最新全屏热键。时序（确定性）：
+// 测试持锁 → 启动旧 PutDecoded（旧请求已构造，尚未过锁）→ 持锁时经真实 commitLocked
+// 提交 newer → 解锁，旧请求此后才进入临界区。因此它必须读到 newer 的全屏热键，而不是
+// 解码前或 handler 锁外预读的旧值。
+func TestPutDecoded_InheritsUnderLock(t *testing.T) {
+	dir := t.TempDir()
+	s := LoadStore(dir)
+	newer := validCfg()
+	newer.WorkbenchFullscreenHotkey = "ctrl+shift+g"
+	legacy := DecodedConfig{Config: validCfg()} // 旧四键，presence=false
+
+	s.mu.Lock()
+	done := startPutDecodedWhileLocked(t, s, legacy)
+	assertNotReturned(t, done)
+	if err := s.commitLocked(newer); err != nil {
+		s.mu.Unlock()
+		t.Fatalf("interleaved commit: %v", err)
+	}
+	s.mu.Unlock()
+	got := <-done
+
+	if got.err != nil {
+		t.Fatalf("legacy put: %v", got.err)
+	}
+	if got.cfg.WorkbenchFullscreenHotkey != "ctrl+shift+g" {
+		t.Fatalf("response must carry inherited value, got %q", got.cfg.WorkbenchFullscreenHotkey)
+	}
+	if !configEqual(s.Config(), got.cfg) {
+		t.Fatalf("snapshot %+v must equal committed response %+v", s.Config(), got.cfg)
+	}
+	if disk := LoadStore(dir).Config(); disk.WorkbenchFullscreenHotkey != "ctrl+shift+g" {
+		t.Fatalf("disk must hold inherited value, got %q", disk.WorkbenchFullscreenHotkey)
+	}
+}
+
+// TestPutDecoded_InheritedConflictRejectedKeepsLatest 继承的最新值与本次提交的 hotkey 冲突时
+// 返回 ValidationError，既有快照与文件保留交错提交的新值。
+func TestPutDecoded_InheritedConflictRejectedKeepsLatest(t *testing.T) {
+	dir := t.TempDir()
+	s := LoadStore(dir)
+	newer := validCfg()
+	newer.WorkbenchFullscreenHotkey = "ctrl+shift+g"
+	legacy := validCfg()
+	legacy.Hotkey = "mod+shift+g" // mod 展开含 ctrl，与继承的 ctrl+shift+g 冲突
+
+	s.mu.Lock()
+	done := startPutDecodedWhileLocked(t, s, DecodedConfig{Config: legacy})
+	assertNotReturned(t, done)
+	if err := s.commitLocked(newer); err != nil {
+		s.mu.Unlock()
+		t.Fatalf("interleaved commit: %v", err)
+	}
+	s.mu.Unlock()
+	got := <-done
+
+	var vErr *ValidationError
+	if !errors.As(got.err, &vErr) {
+		t.Fatalf("inherited conflict must be ValidationError, got %v", got.err)
+	}
+	if !configEqual(s.Config(), newer) {
+		t.Fatalf("snapshot must keep latest value, got %+v", s.Config())
+	}
+	if disk := LoadStore(dir).Config(); !configEqual(disk, newer) {
+		t.Fatalf("disk must keep latest value, got %+v", disk)
+	}
+}
+
+func TestPutDecoded_ExplicitValueWins(t *testing.T) {
+	s := LoadStore(t.TempDir())
+	explicit := validCfg()
+	explicit.WorkbenchFullscreenHotkey = "ctrl+alt+g"
+	got, err := s.PutDecoded(DecodedConfig{Config: explicit, WorkbenchFullscreenHotkeyPresent: true})
+	if err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if !configEqual(got, explicit) || !configEqual(s.Config(), explicit) {
+		t.Fatalf("explicit value must be committed, got %+v", got)
+	}
+}
+
+// TestLoadStore_MissingWorkbenchKey_FillsDefaultWithoutRewrite 旧文件缺新字段：补默认值，
+// 其余配置保持，加载不回写磁盘。
+func TestLoadStore_MissingWorkbenchKey_FillsDefaultWithoutRewrite(t *testing.T) {
+	dataDir := t.TempDir()
+	content := `{"hotkey":"alt+k","triggerWord":"create","matchMode":"exact","commandTriggers":` + storeTriggersJSON + `}`
+	writeRaw(t, dataDir, content)
+	st := LoadStore(dataDir).State()
+	if st.LoadErr != nil {
+		t.Fatalf("missing workbench key must not degrade, loadErr=%v", st.LoadErr)
+	}
+	want := validCfg()
+	want.WorkbenchFullscreenHotkey = domainpalette.DefaultWorkbenchFullscreenHotkey
+	want.CommandTriggers[domainpalette.CommandIDProjects] = "pr" // 文件内容覆盖默认词表
+	if !configEqual(st.Config, want) {
+		t.Fatalf("migrated config = %+v, want %+v", st.Config, want)
+	}
+	raw, err := os.ReadFile(ConfigPath(dataDir))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(raw) != content {
+		t.Fatalf("load must not rewrite legacy file: %s", raw)
+	}
+}
+
+// TestLoadStore_MissingWorkbenchKeyConflict_DegradesWhole 缺新字段补入的默认值与既有
+// hotkey 冲突时整体降级默认配置并告警。
+func TestLoadStore_MissingWorkbenchKeyConflict_DegradesWhole(t *testing.T) {
+	dataDir := t.TempDir()
+	writeRaw(t, dataDir, `{"hotkey":"meta+shift+f","triggerWord":"create","matchMode":"exact","commandTriggers":`+storeTriggersJSON+`}`)
+	logs := captureLogs(t)
+	st := LoadStore(dataDir).State()
+	if st.LoadErr == nil {
+		t.Fatal("default workbench hotkey conflicting with hotkey must set loadErr")
+	}
+	if !configEqual(st.Config, domainpalette.DefaultConfig()) {
+		t.Fatalf("must degrade to defaults, got %+v", st.Config)
+	}
+	if !strings.Contains(logs.String(), "palette config invalid") {
+		t.Fatalf("degrade must log invalid reason, got %q", logs.String())
 	}
 }
 
@@ -343,10 +536,10 @@ func TestPut_RoundTrip_CamelCase0600(t *testing.T) {
 	if err := json.Unmarshal(raw, &keys); err != nil {
 		t.Fatalf("unmarshal keys: %v", err)
 	}
-	if len(keys) != 4 {
-		t.Fatalf("disk JSON must have exactly 4 keys, got %d: %s", len(keys), raw)
+	if len(keys) != 5 {
+		t.Fatalf("disk JSON must have exactly 5 keys, got %d: %s", len(keys), raw)
 	}
-	for _, k := range []string{"hotkey", "triggerWord", "matchMode", "commandTriggers"} {
+	for _, k := range []string{"hotkey", "workbenchFullscreenHotkey", "triggerWord", "matchMode", "commandTriggers"} {
 		if _, ok := keys[k]; !ok {
 			t.Fatalf("missing camelCase key %q in %s", k, raw)
 		}

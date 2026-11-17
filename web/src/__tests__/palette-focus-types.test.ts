@@ -13,14 +13,16 @@ describe('palette-focus Lane A types/constants', () => {
     const mode: PaletteMatchMode = 'exact-then-substring';
     const cfg: PaletteConfig = {
       hotkey: 'mod+k',
+      workbenchFullscreenHotkey: 'mod+shift+f',
       triggerWord: 'new',
       matchMode: mode,
       commandTriggers: DEFAULT_COMMAND_TRIGGERS,
     };
     expect(cfg.matchMode).toBe('exact-then-substring');
+    expect(cfg.workbenchFullscreenHotkey).toBe('mod+shift+f');
   });
 
-  it('PaletteConfig 为四键形状；DEFAULT_COMMAND_TRIGGERS 恰 8 键（cc/pro/reg + 5 空）', () => {
+  it('DEFAULT_COMMAND_TRIGGERS 恰 8 键（cc/pro/reg + 5 空）', () => {
     expect(Object.keys(DEFAULT_COMMAND_TRIGGERS).sort()).toEqual([
       'command-center',
       'projects',
